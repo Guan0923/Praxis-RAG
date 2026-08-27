@@ -57,7 +57,7 @@ def ingest_path(path: Path, config: RagConfig) -> IngestStats:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Import Markdown/TXT documents into Qdrant with BGE-M3 and BM25 sparse vectors."
+        description="Import Markdown/TXT/PDF/DOCX documents into Qdrant with BGE-M3 and BM25 sparse vectors."
     )
     parser.add_argument("path", type=Path, help="Document file or directory")
     return parser.parse_args(argv)

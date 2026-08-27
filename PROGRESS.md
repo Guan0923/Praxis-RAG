@@ -444,3 +444,19 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 发布前扫描敏感文件和常见凭据格式，不包含用户 API Key、知识库数据或本地模型缓存。
 
 发布前验证：Ruff lint 通过，模块测试 39 项通过，`0.3.0` sdist/wheel 构建成功。独立仓库只包含源码、测试、调试 Console、文档和示例知识文件。
+
+## 2026-08-27 Phase 10 PDF 与 Word 文档读取
+
+本轮在现有“落盘 -> 文本切分 -> Embedding/BM25 -> Qdrant”链路前增加独立文档读取层，索引和检索协议保持不变：
+
+- [x] 使用 `pypdf` 提取带文本层的 `.pdf`，保留页间换行后进入现有切块器。
+- [x] 使用 `python-docx` 按正文顺序提取 `.docx` 段落和表格单元格。
+- [x] Console 文件选择器、上传提示和文档 API 支持 `.pdf`、`.docx`。
+- [x] PDF 加密、损坏、超页数和无文本层时返回可操作错误；扫描件明确提示先执行 OCR。
+- [x] DOCX 在解析前校验 ZIP 条目数、加密标记和解压总大小，避免压缩炸弹耗尽资源。
+- [x] 文档提取文本统一限制为 500 万字符；原有单文件 10 MiB 上传限制保持不变。
+- [x] 旧版二进制 `.doc` 仍不支持，需先转换为 `.docx`。
+
+新增解析依赖只运行在 RAG Service 内，不改变 MCP `search` 工具 Schema，也不会让 Agent 直接接触原始文件。验证覆盖真实最小 PDF、真实 DOCX 段落/表格、扫描件提示、损坏文档和扩展名发现。
+
+本轮验证：Ruff lint/format 通过，独立模块测试 47 项通过，Console JavaScript 语法通过；`0.4.0` sdist/wheel 构建成功，PDF/Word 依赖和 Console HTML/CSS/JS 均已包含在包元数据或 wheel 中。

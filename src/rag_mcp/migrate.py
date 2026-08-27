@@ -17,7 +17,7 @@ def namespace_for_legacy_user(user_id: str) -> str:
 
 
 def discover_legacy_sources(root: Path, selected_users: set[str]) -> list[tuple[str, list[Path]]]:
-    """Find preserved Markdown/TXT sources without changing either store."""
+    """Find preserved supported sources without changing either store."""
 
     result: list[tuple[str, list[Path]]] = []
     if not root.is_dir():

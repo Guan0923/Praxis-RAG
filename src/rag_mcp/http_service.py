@@ -81,7 +81,7 @@ def create_service_app(
 ) -> FastAPI:
     resolved_settings = settings or RagHttpSettings.from_env()
     resolved_runtime = runtime or RagServiceRuntime(RagConfig.from_env(), resolved_settings.data_root)
-    app = FastAPI(title="RAG MCP Service", version="0.2.0")
+    app = FastAPI(title="RAG MCP Service", version="0.4.0")
     app.state.runtime = resolved_runtime
 
     def tenant(

@@ -16,10 +16,11 @@ from uuid import uuid4
 from .chunking import chunk_document
 from .config import RagConfig
 from .contracts import SearchRequest
+from .document_readers import SUPPORTED_SUFFIXES, DocumentReadError
 from .mock import MockReranker
 from .orchestrator import RagOrchestrator
 
-SUPPORTED_EXTENSIONS = frozenset({".md", ".txt"})
+SUPPORTED_EXTENSIONS = SUPPORTED_SUFFIXES
 MAX_FILES_PER_BATCH = 10
 MAX_FILE_BYTES = 10 * 1024 * 1024
 _READ_SIZE = 1024 * 1024
@@ -85,13 +86,14 @@ class KnowledgeDocumentStore:
 
     def validate_uploads(self, items: list[tuple[str, object]]) -> None:
         if not items:
-            raise KnowledgeValidationError("请选择要上传的 Markdown 或 TXT 文件。")
+            raise KnowledgeValidationError("请选择要上传的 Markdown、TXT、PDF 或 DOCX 文件。")
         if len(items) > MAX_FILES_PER_BATCH:
             raise KnowledgeValidationError(f"单次最多上传 {MAX_FILES_PER_BATCH} 个知识文件。")
         for raw_name, _readable in items:
             name = self.sanitize_name(raw_name)
             if Path(name).suffix.casefold() not in SUPPORTED_EXTENSIONS:
-                raise KnowledgeValidationError(f"暂不支持该文件类型：{name}；请选择 .md 或 .txt。")
+                supported = "、".join(sorted(SUPPORTED_EXTENSIONS))
+                raise KnowledgeValidationError(f"暂不支持该文件类型：{name}；请选择 {supported}。")
 
     def store_and_index(self, raw_name: str, readable: object, ingester: DocumentIngester) -> dict[str, object]:
         """Replace one source and roll back the file if indexing fails."""
@@ -215,7 +217,10 @@ class DenseDocumentIngester:
         self._store = store
 
     def ingest(self, path: Path, *, source_root: Path) -> IndexedDocument:
-        chunks = chunk_document(path, source_root=source_root)
+        try:
+            chunks = chunk_document(path, source_root=source_root)
+        except DocumentReadError as exc:
+            raise KnowledgeValidationError(str(exc)) from exc
         if not chunks:
             raise KnowledgeValidationError(f"知识文件没有可索引的文本：{path.name}")
         vectors = self._embedder.embed_documents([chunk.text for chunk in chunks])

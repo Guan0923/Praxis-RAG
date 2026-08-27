@@ -43,8 +43,8 @@
 
         <section id="documentsView" class="view">
           <div class="panel upload">
-            <div><h2>上传知识</h2><p>上传后自动切块并生成 Dense + BM25 索引。</p></div>
-            <input id="fileInput" type="file" multiple accept=".md,.txt,text/markdown,text/plain" />
+            <div><h2>上传知识</h2><p>支持 Markdown、TXT、可提取文本的 PDF 和 DOCX，上传后自动切块并生成 Dense + BM25 索引。</p></div>
+            <input id="fileInput" type="file" multiple accept=".md,.txt,.pdf,.docx,text/markdown,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
             <button id="uploadButton" class="primary">上传并索引</button>
           </div>
           <div class="panel"><div class="panel-title"><h2>已索引文档</h2><span id="documentCount">0 个</span></div><div id="documents" class="documents"><div class="empty">正在读取文档…</div></div></div>

@@ -80,7 +80,9 @@ uv run --package mini-agent-rag-mcp rag-service
 
 Console 包含知识上传、文档删除、BM25/Embedding/Hybrid 检索、Reranker 切换、Top-K 结果、score、source、chunk_id 和阶段耗时。它直接访问同源 RAG API，不经过 Mini-Agent。调试页还提供“三模式对比”，固定关闭重排并并排展示三种 Retriever 的原始结果，避免 Cross Encoder 把不同召回重新排成相同顺序。
 
-首次上传或 Dense 检索时会下载并加载 BGE-M3。上传后会自动切分，并把 Dense Vector 与 BM25 Sparse Vector 写入 Qdrant。目前只接受 UTF-8 `.md` 和 `.txt`，每批最多 10 个文件，单文件最大 10 MiB。
+首次上传或 Dense 检索时会下载并加载 BGE-M3。上传后会自动提取文本、切分，并把 Dense Vector 与 BM25 Sparse Vector 写入 Qdrant。目前支持 UTF-8 `.md`/`.txt`、带文本层的 `.pdf` 和现代 Word `.docx`，每批最多 10 个文件，单文件最大 10 MiB。
+
+PDF 最多解析 1000 页；DOCX 解压后的内部文件总量最多 50 MiB；单个文档最多提取 500 万字符。扫描版 PDF 没有文本层，需要先用 OCR 软件转换；旧版二进制 `.doc` 需要先另存为 `.docx`。
 
 ## Namespace
 
@@ -173,7 +175,8 @@ uv run --package mini-agent-rag-mcp rag-mcp-debug --schema
 
 ## 当前限制
 
-- 文档解析只支持 Markdown/TXT；PDF、Word、Excel、网页抓取和图片 OCR 尚未实现。
+- 文档解析支持 Markdown/TXT、文本型 PDF 和 DOCX；旧版 `.doc`、Excel、网页抓取和图片 OCR 尚未实现。
+- 扫描版 PDF 当前不会自动 OCR，会返回明确提示；请先生成可搜索文本层后再上传。
 - `embedding` 使用 BGE-M3，默认 1024 维。
 - `hybrid` 使用 Qdrant Dense + Sparse 预取和 RRF 融合。
 - `cross_encoder` 使用真实 BGE Reranker；`bi_encoder` 仍是确定性 Mock。

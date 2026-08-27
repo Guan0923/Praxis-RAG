@@ -92,7 +92,7 @@ async function loadDocuments() {
 
 async function upload() {
   const files = Array.from($("fileInput").files || []);
-  if (!files.length) return toast("请先选择 Markdown 或 TXT 文件", true);
+  if (!files.length) return toast("请先选择 Markdown、TXT、PDF 或 DOCX 文件", true);
   const body = new FormData();
   files.forEach((file) => body.append("files", file));
   const button = $("uploadButton");

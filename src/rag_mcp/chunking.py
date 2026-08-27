@@ -7,7 +7,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-SUPPORTED_SUFFIXES = frozenset({".md", ".txt"})
+from .document_readers import SUPPORTED_SUFFIXES, read_document_text
+
 _WHITESPACE = re.compile(r"[ \t]+")
 _BREAK_CHARS = frozenset("\n。！？!?；;")
 
@@ -48,7 +49,7 @@ def chunk_document(
     chunk_size: int = 700,
     overlap: int = 100,
 ) -> list[DocumentChunk]:
-    """Read one UTF-8 Markdown/TXT document and split it into stable chunks."""
+    """Extract one supported document and split it into stable chunks."""
 
     if chunk_size < 100:
         raise ValueError("chunk_size must be at least 100 characters")
@@ -56,7 +57,7 @@ def chunk_document(
         raise ValueError("overlap must be non-negative and smaller than chunk_size")
 
     resolved = path.expanduser().resolve()
-    text = _normalize_text(resolved.read_text(encoding="utf-8-sig"))
+    text = _normalize_text(read_document_text(resolved))
     if not text:
         return []
     source = _source_name(resolved, source_root)
