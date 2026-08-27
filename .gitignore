@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+.venv/
+venv/
+
+build/
+dist/
+*.egg-info/
+
+.env
+.env.*
+!.env.example
+
+# Local RAG data, model caches, and vector database files must not be committed.
+.mini_agent-rag/
+models/
+model-cache/
+qdrant_storage/
