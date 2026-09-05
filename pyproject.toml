@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mini-agent-rag-mcp"
 version = "0.4.0"
-description = "A standalone Agentic RAG service, stdio MCP adapter, and debugging console."
+description = "A standalone Agentic RAG service with Streamable HTTP MCP and a debugging console."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115,<1",
     "httpx>=0.27,<1",
-    "mcp>=1.28,<2",
+    "mcp==2.1.1",
     "pypdf>=5,<7",
     "python-multipart>=0.0.20,<1",
     "python-docx>=1.1.2,<2",
@@ -29,7 +29,6 @@ Repository = "https://github.com/Guan0923/xinghe_rag"
 Issues = "https://github.com/Guan0923/xinghe_rag/issues"
 
 [project.scripts]
-rag-mcp = "rag_mcp.server:main"
 rag-mcp-debug = "rag_mcp.debug:main"
 rag-mcp-ingest = "rag_mcp.ingest:main"
 rag-service = "rag_mcp.http_service:main"

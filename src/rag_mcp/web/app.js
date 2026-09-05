@@ -291,7 +291,12 @@ function saveConnection() {
 function renderConfig() {
   $("namespace").value = state.namespace;
   $("token").value = state.token;
-  $("mcpConfig").textContent = `[servers.rag]\ncommand = "rag-mcp"\nenabled = true\n\n[servers.rag.env]\nRAG_SERVICE_URL = "${location.origin}"\nRAG_NAMESPACE = "${state.namespace}"${state.token ? '\n\n[servers.rag.env_refs]\nRAG_SERVICE_TOKEN = "env://RAG_SERVICE_TOKEN"' : ""}`;
+  const config = {
+    url: `${location.origin}/mcp`,
+    headers: { "X-RAG-Namespace": state.namespace },
+  };
+  if (state.token) config.headers.Authorization = "Bearer <RAG_SERVICE_TOKEN>";
+  $("mcpConfig").textContent = JSON.stringify(config, null, 2);
 }
 
 function switchView(name) {

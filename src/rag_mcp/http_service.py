@@ -5,17 +5,25 @@ from __future__ import annotations
 import hmac
 import os
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+import anyio
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.subscriptions import PromptsListChanged, ToolsListChanged
 from pydantic import BaseModel, Field
+from starlette.routing import Route
 
+from . import __version__
 from .config import RagConfig, RagConfigError
+from .catalog import PromptDefinition, ToolPatch
 from .contracts import RagOperationError, SearchValidationError
+from .mcp_http import McpHttpEndpoint
 from .service_knowledge import (
     MAX_FILE_BYTES,
     MAX_FILES_PER_BATCH,
@@ -27,6 +35,23 @@ from .service_knowledge import (
 
 _NAMESPACE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _WEB_ROOT = Path(__file__).with_name("web")
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_LOCAL_MCP_HOSTS = (
+    "127.0.0.1",
+    "127.0.0.1:*",
+    "localhost",
+    "localhost:*",
+    "[::1]",
+    "[::1]:*",
+)
+_LOCAL_MCP_ORIGINS = (
+    "http://127.0.0.1",
+    "http://127.0.0.1:*",
+    "http://localhost",
+    "http://localhost:*",
+    "http://[::1]",
+    "http://[::1]:*",
+)
 
 
 class ServiceRuntime(Protocol):
@@ -35,6 +60,7 @@ class ServiceRuntime(Protocol):
     def upload(self, namespace: str, items: list[tuple[str, object]]) -> dict[str, object]: ...
     def delete(self, namespace: str, name: str) -> dict[str, object]: ...
     def search(self, namespace: str, arguments: dict[str, object]) -> dict[str, object]: ...
+    def read_document(self, namespace: str, name: str) -> tuple[str, str]: ...
 
 
 @dataclass(frozen=True)
@@ -43,6 +69,9 @@ class RagHttpSettings:
     port: int = 8011
     data_root: Path = Path.home() / ".mini_agent-rag"
     token: str | None = None
+    admin_token: str | None = None
+    mcp_allowed_hosts: tuple[str, ...] = _LOCAL_MCP_HOSTS
+    mcp_allowed_origins: tuple[str, ...] = _LOCAL_MCP_ORIGINS
 
     @classmethod
     def from_env(cls) -> RagHttpSettings:
@@ -55,13 +84,23 @@ class RagHttpSettings:
             raise RagConfigError("RAG_SERVICE_PORT must be between 1 and 65535")
         token = os.getenv("RAG_SERVICE_TOKEN", "").strip() or None
         host = os.getenv("RAG_SERVICE_HOST", "127.0.0.1").strip() or "127.0.0.1"
-        if host not in {"127.0.0.1", "localhost", "::1"} and token is None:
-            raise RagConfigError("RAG_SERVICE_TOKEN is required when RAG_SERVICE_HOST is not loopback")
+        raw_allowed_hosts = os.getenv("RAG_MCP_ALLOWED_HOSTS")
+        raw_allowed_origins = os.getenv("RAG_MCP_ALLOWED_ORIGINS")
+        if host not in _LOOPBACK_HOSTS:
+            if token is None:
+                raise RagConfigError("RAG_SERVICE_TOKEN is required when RAG_SERVICE_HOST is not loopback")
+            if not raw_allowed_hosts or not raw_allowed_hosts.strip():
+                raise RagConfigError("RAG_MCP_ALLOWED_HOSTS is required for a non-loopback RAG service")
+            if not raw_allowed_origins or not raw_allowed_origins.strip():
+                raise RagConfigError("RAG_MCP_ALLOWED_ORIGINS is required for a non-loopback RAG service")
         return cls(
             host=host,
             port=port,
             data_root=Path(os.getenv("RAG_SERVICE_DATA_ROOT", str(Path.home() / ".mini_agent-rag"))),
             token=token,
+            admin_token=os.getenv("RAG_ADMIN_TOKEN", "").strip() or None,
+            mcp_allowed_hosts=_csv_setting(raw_allowed_hosts, _LOCAL_MCP_HOSTS),
+            mcp_allowed_origins=_csv_setting(raw_allowed_origins, _LOCAL_MCP_ORIGINS),
         )
 
 
@@ -81,21 +120,120 @@ def create_service_app(
 ) -> FastAPI:
     resolved_settings = settings or RagHttpSettings.from_env()
     resolved_runtime = runtime or RagServiceRuntime(RagConfig.from_env(), resolved_settings.data_root)
-    app = FastAPI(title="RAG MCP Service", version="0.4.0")
-    app.state.runtime = resolved_runtime
+    if resolved_settings.admin_token and resolved_settings.admin_token == resolved_settings.token:
+        raise RagConfigError("RAG_ADMIN_TOKEN must differ from RAG_SERVICE_TOKEN")
+
+    def matches(authorization, token):
+        return authorization is not None and hmac.compare_digest(
+            authorization.encode("utf-8"),
+            f"Bearer {token}".encode("utf-8"),
+        )
+
+    def namespace_from_header(value):
+        namespace = (value or "").strip()
+        if not _NAMESPACE_PATTERN.fullmatch(namespace):
+            raise HTTPException(status_code=400, detail="Invalid RAG namespace.")
+        return namespace
+
+    def tenant_from_headers(authorization: str | None, x_rag_namespace: str | None) -> str:
+        if resolved_settings.admin_token and matches(authorization, resolved_settings.admin_token):
+            raise HTTPException(status_code=401, detail="Use the service credential for ordinary requests.")
+        if resolved_settings.token and not matches(authorization, resolved_settings.token):
+            raise HTTPException(status_code=401, detail="RAG service authentication failed.")
+        return namespace_from_header(x_rag_namespace)
 
     def tenant(
         authorization: str | None = Header(default=None),
         x_rag_namespace: str | None = Header(default=None),
     ) -> str:
-        if resolved_settings.token:
-            expected = f"Bearer {resolved_settings.token}"
-            if authorization is None or not hmac.compare_digest(authorization, expected):
-                raise HTTPException(status_code=401, detail="RAG service authentication failed.")
-        namespace = (x_rag_namespace or "").strip()
-        if not _NAMESPACE_PATTERN.fullmatch(namespace):
-            raise HTTPException(status_code=400, detail="Invalid RAG namespace.")
-        return namespace
+        return tenant_from_headers(authorization, x_rag_namespace)
+
+    mcp_endpoint = McpHttpEndpoint(
+        resolved_runtime,
+        tenant_from_headers,
+        TransportSecuritySettings(
+            allowed_hosts=list(resolved_settings.mcp_allowed_hosts),
+            allowed_origins=list(resolved_settings.mcp_allowed_origins),
+        ),
+        resolved_settings.data_root,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        async with mcp_endpoint.run():
+            yield
+
+    app = FastAPI(title="RAG MCP Service", version=__version__, lifespan=lifespan)
+    app.state.runtime = resolved_runtime
+    app.state.mcp_endpoint = mcp_endpoint
+    app.router.routes.append(Route("/mcp", endpoint=mcp_endpoint, methods=["GET", "POST", "DELETE"]))
+
+    @app.exception_handler(KnowledgeError)
+    async def knowledge_error(_request, _error):
+        return JSONResponse({"detail": "Knowledge or MCP configuration operation failed."}, status_code=503)
+
+    def admin(
+        authorization: str | None = Header(default=None),
+        x_rag_namespace: str | None = Header(default=None),
+    ) -> str:
+        if not resolved_settings.admin_token:
+            raise HTTPException(status_code=403, detail="MCP administration is disabled.")
+        if not matches(authorization, resolved_settings.admin_token):
+            raise HTTPException(status_code=401, detail="MCP administration authentication failed.")
+        return namespace_from_header(x_rag_namespace)
+
+    @app.get("/v1/admin/tools")
+    async def admin_tools(namespace: str = Depends(admin)):
+        return {"tools": await anyio.to_thread.run_sync(mcp_endpoint.registry(namespace).configured)}
+
+    @app.patch("/v1/admin/tools/{name}")
+    async def patch_tool(name: str, body: ToolPatch, namespace: str = Depends(admin)):
+        registry = mcp_endpoint.registry(namespace)
+        entry = registry.entries.get(name)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Unknown registered tool.")
+        defaults = {"enabled": True, "description": entry.definition.description or ""}
+        async with mcp_endpoint.mutation_lock(namespace):
+            with anyio.CancelScope(shield=True):
+                changed = await anyio.to_thread.run_sync(registry.catalog.patch_tool, name, body, defaults)
+                if changed:
+                    await mcp_endpoint.publish(namespace, ToolsListChanged())
+                tools = await anyio.to_thread.run_sync(registry.configured)
+        return {"tool": next(item for item in tools if item["name"] == name), "changed": changed}
+
+    @app.get("/v1/admin/prompts")
+    async def admin_prompts(namespace: str = Depends(admin)):
+        data = await anyio.to_thread.run_sync(mcp_endpoint.catalogs.for_namespace(namespace).snapshot)
+        return {"prompts": [{"name": name, **prompt.model_dump()} for name, prompt in sorted(data.prompts.items())]}
+
+    @app.put("/v1/admin/prompts/{name}")
+    async def put_prompt(name: str, body: PromptDefinition, namespace: str = Depends(admin)):
+        async with mcp_endpoint.mutation_lock(namespace):
+            with anyio.CancelScope(shield=True):
+                try:
+                    changed = await anyio.to_thread.run_sync(
+                        mcp_endpoint.catalogs.for_namespace(namespace).put_prompt,
+                        name,
+                        body,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                if changed:
+                    await mcp_endpoint.publish(namespace, PromptsListChanged())
+        return {"name": name, "changed": changed}
+
+    @app.delete("/v1/admin/prompts/{name}")
+    async def delete_prompt(name: str, namespace: str = Depends(admin)):
+        async with mcp_endpoint.mutation_lock(namespace):
+            with anyio.CancelScope(shield=True):
+                try:
+                    await anyio.to_thread.run_sync(mcp_endpoint.catalogs.for_namespace(namespace).delete_prompt, name)
+                except KeyError as exc:
+                    raise HTTPException(status_code=404, detail="Unknown prompt.") from exc
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                await mcp_endpoint.publish(namespace, PromptsListChanged())
+        return {"deleted": name}
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -119,13 +257,18 @@ def create_service_app(
         }
 
     @app.post("/v1/documents")
-    def upload_documents(
+    async def upload_documents(
         files: list[UploadFile] = File(...),
         namespace: str = Depends(tenant),
     ) -> dict[str, object]:
         items = [(upload.filename or "", upload.file) for upload in files]
         try:
-            return resolved_runtime.upload(namespace, items)
+            async with mcp_endpoint.mutation_lock(namespace):
+                with anyio.CancelScope(shield=True):
+                    before = await anyio.to_thread.run_sync(resolved_runtime.list_documents, namespace)
+                    result = await anyio.to_thread.run_sync(resolved_runtime.upload, namespace, items)
+                    await mcp_endpoint.documents_changed(namespace, before, result["documents"])
+                    return result
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except KnowledgeError as exc:
@@ -134,9 +277,14 @@ def create_service_app(
             raise HTTPException(status_code=503, detail=f"RAG upload failed: {type(exc).__name__}") from exc
 
     @app.delete("/v1/documents/{name}")
-    def delete_document(name: str, namespace: str = Depends(tenant)) -> dict[str, object]:
+    async def delete_document(name: str, namespace: str = Depends(tenant)) -> dict[str, object]:
         try:
-            return resolved_runtime.delete(namespace, name)
+            async with mcp_endpoint.mutation_lock(namespace):
+                with anyio.CancelScope(shield=True):
+                    before = await anyio.to_thread.run_sync(resolved_runtime.list_documents, namespace)
+                    result = await anyio.to_thread.run_sync(resolved_runtime.delete, namespace, name)
+                    await mcp_endpoint.documents_changed(namespace, before, result["documents"])
+                    return result
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except KnowledgeError as exc:
@@ -158,6 +306,15 @@ def create_service_app(
     return app
 
 
+def _csv_setting(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    if raw is None:
+        return default
+    values = tuple(item.strip() for item in raw.split(",") if item.strip())
+    if not values:
+        raise RagConfigError("MCP host and origin allowlists must not be empty")
+    return values
+
+
 def main() -> int:
     import uvicorn
 
@@ -166,7 +323,7 @@ def main() -> int:
     runtime = app.state.runtime
     if getattr(runtime, "config", None) is not None and runtime.config.preload_model:
         runtime.warmup()
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    uvicorn.run(app, host=settings.host, port=settings.port, timeout_graceful_shutdown=5)
     return 0
 
 

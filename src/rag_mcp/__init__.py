@@ -7,4 +7,6 @@ changing the public ``search`` tool.
 
 from .orchestrator import RagOrchestrator, build_default_orchestrator
 
+__version__ = "0.4.0"
+
 __all__ = ["RagOrchestrator", "build_default_orchestrator"]

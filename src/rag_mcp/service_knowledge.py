@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import filecmp
 import os
 import re
 from collections.abc import Mapping
@@ -16,7 +17,7 @@ from uuid import uuid4
 from .chunking import chunk_document
 from .config import RagConfig
 from .contracts import SearchRequest
-from .document_readers import SUPPORTED_SUFFIXES, DocumentReadError
+from .document_readers import SUPPORTED_SUFFIXES, DocumentReadError, read_document_text
 from .mock import MockReranker
 from .orchestrator import RagOrchestrator
 
@@ -109,6 +110,10 @@ class KnowledgeDocumentStore:
             self._write_bounded(temporary, readable, name)
             if target.is_symlink():
                 raise KnowledgeValidationError(f"知识文件不能是符号链接：{name}")
+            previous = self._read_manifest().get(name)
+            if replaced and previous and filecmp.cmp(temporary, target, shallow=False):
+                temporary.unlink()
+                return dict(previous)
             if replaced:
                 os.replace(target, backup)
                 backed_up = True
@@ -331,6 +336,19 @@ class RagServiceRuntime:
         request = SearchRequest.from_arguments(dict(arguments))
         with tenant.lock, self._inference_lock:
             return tenant.orchestrator.search(request)
+
+    def read_document(self, namespace: str, name: str) -> tuple[str, str]:
+        tenant = self._tenant(namespace)
+        with tenant.lock:
+            if tenant.documents.sanitize_name(name) != name:
+                raise KnowledgeValidationError("Invalid document name")
+            record = next((item for item in tenant.documents.list_documents() if item["name"] == name), None)
+            if record is None:
+                raise KnowledgeValidationError("Document does not exist")
+            target = tenant.documents._confined_target(name)
+            if (tenant.documents.paths.knowledge_dir / name).is_symlink():
+                raise KnowledgeValidationError("Document cannot be a symbolic link")
+            return read_document_text(target), str(record["indexed_at"])
 
     def warmup(self) -> None:
         self._embedder.warmup()

@@ -29,7 +29,7 @@ class RagOrchestrator:
         self._warmup = warmup
 
     def warmup(self) -> None:
-        """Prepare optional heavyweight dependencies before serving stdio."""
+        """Prepare optional heavyweight dependencies before serving requests."""
 
         if self._warmup is not None:
             self._warmup()

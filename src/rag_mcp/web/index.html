@@ -53,13 +53,13 @@
         <section id="connectionView" class="view">
           <div class="panel form-panel">
             <h2>工作区与认证</h2>
-            <p>namespace 用于隔离不同知识库。MCP 进程必须配置相同的值。</p>
+            <p>namespace 用于隔离不同知识库。MCP HTTP 客户端必须发送相同的请求头。</p>
             <label>Namespace<input id="namespace" value="default" maxlength="64" /></label>
             <label>Service Token<input id="token" type="password" placeholder="本机 loopback 可留空" autocomplete="off" /></label>
             <button id="saveConnection" class="primary">保存到当前浏览器</button>
           </div>
           <div class="panel model-panel"><h2>模型状态</h2><div id="modelStatus" class="model-status">等待健康检查…</div></div>
-          <div class="panel code-panel"><h2>通用 stdio MCP 配置</h2><pre id="mcpConfig"></pre><p>工具内部名称为 <code>search</code>；宿主以 <code>rag</code> 为服务名时通常显示为 <code>mcp_rag_search</code>。</p></div>
+          <div class="panel code-panel"><h2>HTTP MCP 配置</h2><pre id="mcpConfig"></pre><p>协议：<code>2025-11-25</code> / <code>2026-07-28</code> · 工具、提示词、文档资源</p></div>
         </section>
         <div id="toast" role="status"></div>
       </main>

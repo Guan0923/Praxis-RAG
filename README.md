@@ -1,16 +1,15 @@
 # Standalone RAG MCP
 
-这是一个可独立安装和运行的 Agentic RAG 模组，不依赖 Mini-Agent Backend 或主前端。一个安装包提供两个进程：
+这是一个可独立安装和运行的 Agentic RAG 模组，不依赖 Mini-Agent Backend 或主前端。`rag-service` 一个进程同时提供：
 
-- `rag-service`：拥有知识源文件、切分、Embedding、BM25、Qdrant、Reranking、HTTP API 和独立 Web Console。
-- `rag-mcp`：标准 stdio MCP 适配器；收到 Agent 的 `search` 调用时才连接 `rag-service`。
+- 标准 Streamable HTTP MCP：`/mcp`
+- 知识管理和检索 REST API：`/v1/*`
+- 独立 Web Console：`/console`
+- 文本切分、Embedding、BM25、Qdrant 和 Reranking
 
 ```text
-浏览器 -> http://127.0.0.1:8011/console
-                         |
-任意 MCP Host -> rag-mcp |-> rag-service :8011 -> Qdrant :6333
-                         |
-                 同一个 namespace
+浏览器 ----------> http://127.0.0.1:8011/console
+MCP HTTP Client -> http://127.0.0.1:8011/mcp -> rag-service -> Qdrant :6333
 ```
 
 RAG 只返回证据，不生成最终回答。是否调用、是否改写查询、是否多跳检索以及如何组织答案，仍由 Agent 决定。
@@ -20,15 +19,15 @@ RAG 只返回证据，不生成最终回答。是否调用、是否改写查询�
 在本仓库中开发：
 
 ```powershell
-cd D:\mini_agent-main
-uv sync --all-packages --extra dense
+cd xinghe_rag
+uv sync --extra dense
 ```
 
 作为独立工具安装当前目录：
 
 ```powershell
-cd D:\mini_agent-main
-uv tool install --editable ".\rag_mcp[dense]"
+cd xinghe_rag
+uv tool install --editable ".[dense]"
 ```
 
 从独立 Git 仓库直接安装：
@@ -37,7 +36,7 @@ uv tool install --editable ".\rag_mcp[dense]"
 uv tool install "mini-agent-rag-mcp[dense] @ git+https://github.com/Guan0923/xinghe_rag.git"
 ```
 
-安装后，`rag-service`、`rag-mcp`、`rag-mcp-debug` 和 `rag-mcp-ingest` 都是独立命令。
+安装后，`rag-service`、`rag-mcp-debug`、`rag-mcp-ingest` 和 `rag-service-migrate` 都是独立命令。
 
 ## 启动
 
@@ -75,6 +74,7 @@ uv run --package mini-agent-rag-mcp rag-service
 默认地址：
 
 - Web Console：`http://127.0.0.1:8011/console`
+- MCP：`http://127.0.0.1:8011/mcp`
 - OpenAPI：`http://127.0.0.1:8011/docs`
 - 健康检查：`http://127.0.0.1:8011/health`
 
@@ -95,23 +95,28 @@ namespace 是一个独立知识库标识，例如 `default`、`product-manuals` 
 ~/.mini_agent-rag/<namespace>/manifest.json
 ```
 
-namespace 不在 Agent 可见的工具 Schema 中；它由 MCP 进程配置并通过 Header 发送给服务。
+namespace 不在 Agent 可见的工具 Schema 中；MCP HTTP 客户端必须在每个请求中发送 `X-RAG-Namespace`。同一个 MCP 会话不能切换 namespace，需要切换时应重新初始化会话。
 
-## 接入任意 stdio MCP Host
+## 接入 Streamable HTTP MCP Client
 
-通用配置：
+MCP 客户端使用以下连接信息：
 
-```toml
-[servers.rag]
-command = "rag-mcp"
-enabled = true
-
-[servers.rag.env]
-RAG_SERVICE_URL = "http://127.0.0.1:8011"
-RAG_NAMESPACE = "default"
+```json
+{
+  "url": "http://127.0.0.1:8011/mcp",
+  "headers": {
+    "X-RAG-Namespace": "default"
+  }
+}
 ```
 
-Mini-Agent 使用相同的用户级 `mcp/servers.toml` 配置。开启其 `capabilities.mcp=true` 后新建 Agent run，即会通过通用 MCP 加载器发现工具；Mini-Agent 没有 RAG 专用路由或内置 RAG ToolSpec。
+启用 Token 后还需要发送：
+
+```text
+Authorization: Bearer <RAG_SERVICE_TOKEN>
+```
+
+客户端可使用 MCP `2025-11-25` 或 `2026-07-28` 的 Streamable HTTP 传输。旧版先初始化，新版可发现服务或直接调用；具体流程见后面的“双版本”章节。取消调用只结束等待，不会强制终止已经进入模型或 Qdrant 的同步计算。
 
 MCP 内部工具名为 `search`。若 Host 使用 `rag` 作为 server 名，展示名通常是 `mcp_rag_search`。
 
@@ -132,46 +137,110 @@ MCP 内部工具名为 `search`。若 Host 使用 `rag` 作为 server 名，展�
 
 ## Token 与远程部署
 
-默认只监听 loopback。绑定非 loopback 地址时必须设置 Token：
+默认只监听 loopback。绑定非 loopback 地址时必须设置 Token，以及 MCP Host、Origin 白名单：
 
 ```powershell
 $env:RAG_SERVICE_HOST = "0.0.0.0"
 $env:RAG_SERVICE_TOKEN = "replace-with-a-random-secret"
+$env:RAG_MCP_ALLOWED_HOSTS = "rag.example.com"
+$env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 rag-service
 ```
 
-MCP 配置不要保存明文密钥：
+线上 MCP 客户端连接：
 
-```toml
-[servers.rag.env]
-RAG_SERVICE_URL = "https://rag.example.com"
-RAG_NAMESPACE = "product-manuals"
-
-[servers.rag.env_refs]
-RAG_SERVICE_TOKEN = "env://RAG_SERVICE_TOKEN"
+```json
+{
+  "url": "https://rag.example.com/mcp",
+  "headers": {
+    "X-RAG-Namespace": "product-manuals",
+    "Authorization": "Bearer <RAG_SERVICE_TOKEN>"
+  }
+}
 ```
 
 Console 的 Token 只保存到浏览器 `sessionStorage`。生产环境还应在 RAG Service 前配置 HTTPS、访问控制和请求大小限制。
 
-## 本地直连模式
-
-不配置 `RAG_SERVICE_URL` 时，`rag-mcp` 仍可在自己的进程中直接加载模型和连接 Qdrant，用于兼容或单进程部署。推荐日常使用远程适配模式，以避免 MCP Host 重复加载重模型：
-
-```text
-推荐：rag-mcp --HTTP--> rag-service --模型/Qdrant
-兼容：rag-mcp ----------> 模型/Qdrant
-```
-
 ## 开发与验证
 
 ```powershell
-uv run --no-sync python -m pytest rag_mcp/tests -q
-uv run --no-sync python -m ruff check rag_mcp
+uv run --no-sync python -m pytest tests -q
+uv run --no-sync python -m ruff check src tests
 uv run --package mini-agent-rag-mcp rag-mcp-debug "RRF 怎么融合 BM25 和 Dense？"
 uv run --package mini-agent-rag-mcp rag-mcp-debug --schema
 ```
 
-`rag-mcp` 是 stdio 服务，手工运行后等待 MCP 客户端输入、终端看起来没有输出是正常现象。浏览器调试应使用独立 Console。
+协议测试会启动真实本机 HTTP 服务，使用官方客户端和真实文件存储、PDF/Word 解析，但以可控检索器替代模型，不下载模型或连接 Qdrant。这不等于真实模型效果验证。
+
+### Conda 开发环境
+
+其他项目可能仍依赖 MCP 1.x。为避免改动共享环境，在激活 `dev` 后给本项目创建独立虚拟环境：
+
+```powershell
+conda activate dev
+python -m venv --system-site-packages .venv
+.venv\Scripts\python -m pip install -e .
+.venv\Scripts\python -m pytest tests -q
+.venv\Scripts\python -m rag_mcp.http_service
+```
+
+完整模型检索还需要安装 `.[dense]` 并准备模型及 Qdrant；上述协议测试不要求这些依赖。
+
+## MCP 双版本
+
+依赖固定为 `mcp==2.1.1`，同一个 `/mcp` 支持以下两种流程，客户端不能把新版版本号放进旧版 `initialize` 来切换流程：
+
+```text
+2025-11-25: initialize → notifications/initialized → tools/list / tools/call
+2026-07-28: server/discover（可选）→ tools/list / tools/call → subscriptions/listen（按需）
+```
+
+新版每次请求携带自己的协议信息，不要求先建立旧版会话。协议头和请求格式应由 SDK 处理。Python SDK `Client` 的 `mode="legacy"` 使用旧版，默认 `mode="auto"` 发现新版，`mode="2026-07-28"` 跳过发现直接使用新版。
+
+请求均携带 `X-RAG-Namespace` 和配置要求的 Service Token。旧会话不能跨 namespace 使用；订阅固定建立时的 namespace。工具调用取消只停止等待和发送结果，不强停后台模型线程。
+
+`search` 是首个本地注册工具。新增工具要在项目中登记定义、参数校验和执行函数；配置接口不能上传代码，也不能注册外部 HTTP 转发。
+
+## 工具与提示词管理
+
+设置独立的 `RAG_ADMIN_TOKEN` 开启管理接口；未设置时管理接口返回 403。它必须与 `RAG_SERVICE_TOKEN` 不同，二者不能互换。管理接口使用 `Authorization: Bearer <RAG_ADMIN_TOKEN>` 和 `X-RAG-Namespace`。普通 MCP/REST 请求使用 Service Token，Console 不保存或展示管理凭证。
+
+| 接口 | 行为 |
+|---|---|
+| `GET /v1/admin/tools` | 返回本 namespace 的已注册工具和启用状态 |
+| `PATCH /v1/admin/tools/{name}` | 仅支持 `enabled`、`description`；未知工具返回 404 |
+| `GET /v1/admin/prompts` | 返回提示词模板及正文 |
+| `PUT /v1/admin/prompts/{name}` | 新建或完整替换模板 |
+| `DELETE /v1/admin/prompts/{name}` | 删除模板，不存在返回 404 |
+
+工具修改示例：`{"enabled": false}`。提示词 PUT 请求示例：
+
+```json
+{
+  "description": "总结已读取的资料",
+  "arguments": [{"name": "text", "description": "资料正文", "required": true}],
+  "messages": [{"role": "user", "text": "请总结以下资料：\n{{text}}"}]
+}
+```
+
+模板仅替换 `{{argument}}`；参数必须是字符串，消息角色仅为 `user` 或 `assistant`，不执行表达式或代码。可选参数未提供时替换为空字符串。MCP 客户端通过 `prompts/list`、`prompts/get` 使用这些模板。
+
+配置保存在 `<RAG_SERVICE_DATA_ROOT>/<namespace>/mcp_catalog.json`，重启恢复，管理配置不会加载检索模型。管理 Token 仍可管理所有 namespace，不提供用户级权限隔离。配置修改请走管理接口，不手工编辑正在运行的配置文件。
+
+## 文档资源与订阅
+
+- `resources/list` 返回当前知识库已导入文档，列表每页最多 50 项，按 `nextCursor` 继续；`resources/templates/list` 返回分页地址规则。
+- 文档地址为 `rag://knowledge/<namespace>/<编码后的文件名>`，`resources/read` 默认读取第一页，不返回本地路径。
+- 正文按段落分页，每页最多 8000 字符；单段太长继续切页，不丢弃余下正文。这不是 PDF 原始页码，也不是自动识别的章节。
+- 返回标准文本资源，其中 `text` 是 JSON：`uri`、`text`、`page`、`total_pages`、`version`、`has_more`、`truncated` 和 `next_uri`。`truncated=true` 表示当前页未包含剩余正文，可继续读取 `next_uri`。
+- 下一页地址携带文档版本。文档替换后旧的下一页地址会报错，客户端应从文档 URI 重读。解析安全上限与上传规则不变，超限或解析失败明确报错，不静默截断整份文档。
+- 指定资源更新订阅使用稳定的文档 URI，不使用分页 URI；删除后通知订阅者，后续读取返回不存在。
+
+新版 `subscriptions/listen` 可选择工具列表、提示词列表、资源列表及指定文档更新。旧版仍使用列表变化通知与 `resources/subscribe`、`resources/unsubscribe`。通知只表示“发生变化”，客户端需要重新列出或读取内容。
+
+启停工具或修改描述、增删改提示词、上传替换删除文档都会在对应操作成功后通知。失败项和没有变化的重复操作不通知；同名相同内容上传跳过重复索引。通知不会跨 namespace。
+
+本轮仅支持**单进程、单 worker**。不提供跨进程通知、历史事件重放或断线补发。订阅断线后客户端重新订阅并读取最新状态。服务退出时释放会话与订阅，不部署 OAuth、账户系统或云服务。
 
 ## 当前限制
 

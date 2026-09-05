@@ -59,12 +59,12 @@ def test_mcp_definition_and_result_keep_the_public_contract() -> None:
     response = invoke_search(build_default_orchestrator(), {"query": "Agentic RAG"})
 
     assert definition.name == "search"
-    assert definition.inputSchema["required"] == ["query"]
-    assert definition.inputSchema["properties"]["candidate_k"]["default"] == 10
-    assert definition.annotations.readOnlyHint is True
-    assert definition.annotations.destructiveHint is False
+    assert definition.input_schema["required"] == ["query"]
+    assert definition.input_schema["properties"]["candidate_k"]["default"] == 10
+    assert definition.annotations.read_only_hint is True
+    assert definition.annotations.destructive_hint is False
     assert "exact codes/names" in definition.description
-    assert response.isError is not True
+    assert response.is_error is not True
     body = json.loads(response.content[0].text)
     assert body["results"][0]["document_id"] == "doc-agentic-rag"
     assert body["evidence_status"] == "found"
@@ -94,5 +94,5 @@ def test_empty_retrieval_explicitly_requires_an_insufficient_evidence_response()
 def test_mcp_validation_error_is_a_tool_error_not_a_server_crash() -> None:
     response = invoke_search(build_default_orchestrator(), {"query": ""})
 
-    assert response.isError is True
+    assert response.is_error is True
     assert "query" in response.content[0].text

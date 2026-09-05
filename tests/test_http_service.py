@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from rag_mcp.config import RagConfig
+from rag_mcp.config import RagConfig, RagConfigError
 from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.migrate import discover_legacy_sources, namespace_for_legacy_user
 from rag_mcp.service_knowledge import (
@@ -109,10 +109,28 @@ def test_standalone_console_is_served_by_the_rag_package(service) -> None:
     assert page.status_code == 200
     assert "RAG MCP Console" in page.text
     assert script.status_code == 200
-    assert "RAG_SERVICE_URL" in script.text
+    assert "JSON.stringify(config" in script.text
+    assert "/mcp" in script.text
     assert "三模式对比" in page.text
     assert "旧结果已清空" in script.text
     assert "retrieval_score" in script.text
+
+
+def test_remote_service_requires_explicit_mcp_allowlists(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RAG_MCP_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("RAG_MCP_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.setenv("RAG_SERVICE_HOST", "0.0.0.0")
+    monkeypatch.setenv("RAG_SERVICE_TOKEN", "test-token")
+
+    with pytest.raises(RagConfigError, match="RAG_MCP_ALLOWED_HOSTS"):
+        RagHttpSettings.from_env()
+
+    monkeypatch.setenv("RAG_MCP_ALLOWED_HOSTS", "rag.example.com")
+    monkeypatch.setenv("RAG_MCP_ALLOWED_ORIGINS", "https://app.example.com")
+    settings = RagHttpSettings.from_env()
+
+    assert settings.mcp_allowed_hosts == ("rag.example.com",)
+    assert settings.mcp_allowed_origins == ("https://app.example.com",)
 
 
 def test_tenant_api_requires_token_and_valid_namespace(service) -> None:
@@ -146,9 +164,11 @@ def test_upload_list_search_and_delete_use_header_namespace(service) -> None:
     assert runtime.search_arguments[0]["candidate_k"] == 10
     assert deleted.json()["documents"] == []
     assert runtime.calls == [
+        ("list", NAMESPACE),
         ("upload", NAMESPACE),
         ("list", NAMESPACE),
         ("search", NAMESPACE),
+        ("list", NAMESPACE),
         ("delete", NAMESPACE),
     ]
 
