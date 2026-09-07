@@ -1,0 +1,32 @@
+{
+  "date": "2026-09-07",
+  "reviewer": "assistant visual and source-structure comparison; not user certification",
+  "scope": "Twenty preselected source locations, not a document-wide accuracy score.",
+  "summary": {
+    "matches_selected_content": 15,
+    "incorrect": 4,
+    "partial": 1
+  },
+  "checks": [
+    {"id":1,"result":"matches_selected_content","note":"Original abstract and parsed text contain 80,863 pages and 11 classes."},
+    {"id":2,"result":"matches_selected_content","note":"Page 2 body proceeds down the left column then the right. Does not certify all pages or furniture ordering."},
+    {"id":3,"result":"matches_selected_content","note":"Table 1 retains Table and 34733 in the same row."},
+    {"id":4,"result":"matches_selected_content","note":"% of Total spans three columns; inter-annotator header spans seven columns, matching the source."},
+    {"id":5,"result":"matches_selected_content","note":"All-metal and fiber types are retained in the relevant paragraph."},
+    {"id":6,"result":"matches_selected_content","note":"Boots section precedes Stainless Steel; the cross-column continuation is retained."},
+    {"id":7,"result":"matches_selected_content","note":"Two picture boxes cover the separate figures and reference the correct Figure 7-26 and Figure 7-27 captions."},
+    {"id":8,"result":"matches_selected_content","note":"FDC expansion is retained in the abstract."},
+    {"id":9,"result":"incorrect","note":"Rotated table detected, but independent values share parsed cells. Rainfall 775 and 1156 are combined, so site/value association is unreliable."},
+    {"id":10,"result":"matches_selected_content","note":"Equation 1 retains the exponential, two negative fractions and geometric/color subscripts."},
+    {"id":11,"result":"incorrect","note":"Equation 2 is missing the ratio denominator and repeats the summation domains. It cannot be reconstructed correctly from the formula output."},
+    {"id":12,"result":"incorrect","note":"The scanned page visibly contains the complete exchange-value sentence, but the parsed output omits the start of the sentence and does not retain the selected phrase."},
+    {"id":13,"result":"incorrect","note":"The selected definition on scanned PDF page 5 is incomplete; normal conditions, average skill and labor intensity are not all retained."},
+    {"id":14,"result":"matches_selected_content","note":"The selected useful-labor passage retains social division of labor."},
+    {"id":15,"result":"matches_selected_content","note":"The OCR section retains 216 dpi on the correct source page."},
+    {"id":16,"result":"matches_selected_content","note":"The layout analysis section retains 72 dpi on the correct source page."},
+    {"id":17,"result":"matches_selected_content","note":"DOCX title and both phase headings are retained; no PDF page number was invented."},
+    {"id":18,"result":"matches_selected_content","note":"Both content-control tables have 24 rows and three columns; selected Author and Corporate Profiles row remains associated across all three cells."},
+    {"id":19,"result":"matches_selected_content","note":"Food table keeps Berries/150 and Grain/200 in their original rows and columns."},
+    {"id":20,"result":"partial","note":"All 11 embedded pictures and representative horizontal/vertical spans survive, but one original nested table is flattened into its parent: source has 11 tables and parsed output has 10. Source has 39 math objects; output has 40 formula items, so counts alone do not certify formula identity."}
+  ]
+}

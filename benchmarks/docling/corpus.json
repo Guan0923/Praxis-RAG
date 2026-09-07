@@ -1,0 +1,12 @@
+{
+  "documents": [
+    {"id": "doclaynet", "file": "doclaynet.pdf", "url": "https://raw.githubusercontent.com/docling-project/docling/025b27ca2c2f040b5b9628dccffd2611246990ca/tests/data/pdf/sources/2206.01062.pdf", "description": "DocLayNet research paper; English, columns, figures and tables"},
+    {"id": "aviation", "file": "aviation.pdf", "url": "https://raw.githubusercontent.com/docling-project/docling/025b27ca2c2f040b5b9628dccffd2611246990ca/tests/data/pdf/sources/amt_handbook_sample.pdf", "description": "Public aviation handbook sample distributed by Docling"},
+    {"id": "mineru_demo1", "file": "mineru_demo1.pdf", "url": "https://raw.githubusercontent.com/opendatalab/MinerU/4fe4bde114a23ee5dd637eae99b767f4669bf58c/demo/pdfs/demo1.pdf", "description": "Public PDF example distributed by MinerU"},
+    {"id": "mineru_demo2", "file": "mineru_demo2.pdf", "url": "https://raw.githubusercontent.com/opendatalab/MinerU/4fe4bde114a23ee5dd637eae99b767f4669bf58c/demo/pdfs/demo2.pdf", "description": "Public PDF example distributed by MinerU"},
+    {"id": "scan", "file": "scan.pdf", "url": "https://raw.githubusercontent.com/opendatalab/MinerU/4fe4bde114a23ee5dd637eae99b767f4669bf58c/demo/pdfs/small_ocr.pdf", "description": "Public OCR sample distributed by MinerU"},
+    {"id": "docling_report", "file": "docling_report.pdf", "url": "https://arxiv.org/pdf/2408.09869v1", "description": "Docling Technical Report, arXiv version 1"},
+    {"id": "rich_tables", "file": "rich_tables.docx", "url": "https://raw.githubusercontent.com/docling-project/docling/025b27ca2c2f040b5b9628dccffd2611246990ca/tests/data/docx/sources/docx_rich_tables_01.docx", "description": "Actual DOCX regression sample with rich tables; not a business accuracy guarantee"},
+    {"id": "word_document", "file": "word_document.docx", "url": "https://raw.githubusercontent.com/opendatalab/MinerU/4fe4bde114a23ee5dd637eae99b767f4669bf58c/demo/office_docs/docx_01.docx", "description": "Public Word example distributed by MinerU"}
+  ]
+}

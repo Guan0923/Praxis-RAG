@@ -1,0 +1,22 @@
+[
+  {"id":1,"document":"doclaynet","page":1,"kind":"text","expected":["80,863","11"],"description":"Abstract: 80,863 annotated pages and 11 classes."},
+  {"id":2,"document":"doclaynet","page":2,"kind":"manual","description":"Two-column body follows the left column before the right column; inspect numbered region overlay."},
+  {"id":3,"document":"doclaynet","page":4,"kind":"table","expected":["Table","34,733"],"description":"Table 1: Table annotation count is 34,733, in the same row."},
+  {"id":4,"document":"doclaynet","page":4,"kind":"manual","description":"Table 1 merged header: % of Total spans Train/Test/Val; inter-annotator heading spans seven columns."},
+  {"id":5,"document":"aviation","page":1,"kind":"text","expected":["all-metal","fiber"],"description":"Two types of self-locking nut: all-metal and fiber lock."},
+  {"id":6,"document":"aviation","page":1,"kind":"manual","description":"Boots section precedes Stainless Steel section, without interleaving columns."},
+  {"id":7,"document":"aviation","page":1,"kind":"manual","description":"Two separate picture regions with correct captions Figure 7-26 and Figure 7-27."},
+  {"id":8,"document":"mineru_demo1","page":1,"kind":"text","expected":["flow duration curve"],"description":"Abstract names flow duration curve (FDC)."},
+  {"id":9,"document":"mineru_demo1","page":5,"kind":"manual","description":"Rotated Table 1: keep site/catchment names associated with rainfall, planted area and species; inspect original orientation."},
+  {"id":10,"document":"mineru_demo2","page":2,"kind":"formula","description":"Equation (1): w(p,q)=exp(-Delta_g(p,q)/gamma_g-Delta_c(p,q)/gamma_c). Check signs, fractions and subscripts."},
+  {"id":11,"document":"mineru_demo2","page":2,"kind":"formula","description":"Equation (2): matching cost is the ratio of weighted sums. Check summation domains and denominator."},
+  {"id":12,"document":"scan","page":1,"kind":"text","expected":["量的关系","比例"],"description":"Scanned exchange-value definition: quantitative relationship and proportion."},
+  {"id":13,"document":"scan","page":5,"kind":"text","expected":["正常","熟练程度","劳动强度"],"description":"Scanned socially necessary labor definition: normal conditions, skill and intensity."},
+  {"id":14,"document":"scan","page":8,"kind":"text","expected":["社会分工"],"description":"Scanned useful labor and social division of labor."},
+  {"id":15,"document":"docling_report","page":4,"kind":"text","expected":["216","dpi"],"description":"Original technical report describes OCR at 216 dpi."},
+  {"id":16,"document":"docling_report","page":3,"kind":"text","expected":["72","dpi"],"description":"Original technical report describes layout inference at 72 dpi."},
+  {"id":17,"document":"rich_tables","kind":"text","expected":["Changes to the DOCLANG Core Spec","Phase 1","Phase 2"],"description":"DOCX title and two phase headings; source is original OOXML, not PDF pages."},
+  {"id":18,"document":"rich_tables","kind":"manual","description":"DOCX preserves both content-control tables with Feature/Action Needed/Comment headers and row associations."},
+  {"id":19,"document":"word_document","kind":"table","expected":["Grain","200","Blueberry","Strawberry","Cranberry","150"],"description":"DOCX foods table: grain 200; named berries 150, with correct row association."},
+  {"id":20,"document":"word_document","kind":"manual","description":"DOCX merged cells and embedded images survive; inspect original OOXML spans and media versus parsed structures. No invented page coordinates."}
+]
