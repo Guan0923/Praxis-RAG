@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import filecmp
+import hashlib
 import os
 import re
 from collections.abc import Mapping
@@ -15,9 +15,10 @@ from typing import Protocol
 from uuid import uuid4
 
 from .chunking import chunk_document
+from .chunk_strategies import ChunkingConfig, LEGACY_CONFIG
 from .config import RagConfig
 from .contracts import SearchRequest
-from .document_readers import SUPPORTED_SUFFIXES, DocumentReadError, read_document_text
+from .document_readers import SUPPORTED_SUFFIXES, read_document_text
 from .mock import MockReranker
 from .orchestrator import RagOrchestrator
 
@@ -46,7 +47,7 @@ class IndexedDocument:
 
 
 class DocumentIngester(Protocol):
-    def ingest(self, path: Path, *, source_root: Path) -> IndexedDocument: ...
+    def ingest(self, path: Path, *, source_root: Path, chunking: ChunkingConfig | None = None) -> IndexedDocument: ...
 
     def delete(self, document_id: str) -> None: ...
 
@@ -96,7 +97,28 @@ class KnowledgeDocumentStore:
                 supported = "、".join(sorted(SUPPORTED_EXTENSIONS))
                 raise KnowledgeValidationError(f"暂不支持该文件类型：{name}；请选择 {supported}。")
 
-    def store_and_index(self, raw_name: str, readable: object, ingester: DocumentIngester) -> dict[str, object]:
+    def find_duplicate(self, sha256: str, chunking: dict[str, object]) -> dict[str, object] | None:
+        manifest = self._read_manifest()
+        changed = False
+        found = None
+        for name, record in manifest.items():
+            path = self._confined_target(name)
+            if not path.is_file() or (self.paths.knowledge_dir / name).is_symlink():
+                continue
+            if not record.get("sha256"):
+                with path.open("rb") as stream:
+                    record["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+                record.setdefault("chunking", LEGACY_CONFIG.metadata("BAAI/bge-m3"))
+                changed = True
+            if record["sha256"] == sha256 and record.get("chunking", LEGACY_CONFIG.metadata("BAAI/bge-m3")) == chunking:
+                found = dict(record)
+                break
+        if changed:
+            self._write_manifest(manifest)
+        return found
+
+    def store_and_index(self, raw_name: str, readable: object, ingester: DocumentIngester,
+                        chunking: ChunkingConfig | None = None, tokenizer_model: str = "BAAI/bge-m3") -> dict[str, object]:
         """Replace one source and roll back the file if indexing fails."""
 
         name = self.sanitize_name(raw_name)
@@ -107,19 +129,20 @@ class KnowledgeDocumentStore:
         backed_up = False
         installed = False
         try:
-            self._write_bounded(temporary, readable, name)
+            sha256 = self._write_bounded(temporary, readable, name)
             if target.is_symlink():
                 raise KnowledgeValidationError(f"知识文件不能是符号链接：{name}")
-            previous = self._read_manifest().get(name)
-            if replaced and previous and filecmp.cmp(temporary, target, shallow=False):
+            configuration = (chunking or LEGACY_CONFIG).metadata(tokenizer_model)
+            previous = self.find_duplicate(sha256, configuration)
+            if previous:
                 temporary.unlink()
-                return dict(previous)
+                return {**previous, "skipped": True, "requested_name": name}
             if replaced:
                 os.replace(target, backup)
                 backed_up = True
             os.replace(temporary, target)
             installed = True
-            indexed = ingester.ingest(target, source_root=self.paths.knowledge_dir)
+            indexed = ingester.ingest(target, source_root=self.paths.knowledge_dir, chunking=chunking)
         except Exception:
             temporary.unlink(missing_ok=True)
             if installed:
@@ -129,6 +152,7 @@ class KnowledgeDocumentStore:
             raise
         backup.unlink(missing_ok=True)
         metadata = self._metadata(target, indexed)
+        metadata.update(sha256=sha256, chunking=configuration)
         manifest = self._read_manifest()
         manifest[name] = metadata
         self._write_manifest(manifest)
@@ -163,8 +187,9 @@ class KnowledgeDocumentStore:
             raise KnowledgeValidationError("知识文件路径必须位于租户知识目录内。")
         return target
 
-    def _write_bounded(self, target: Path, readable: object, name: str) -> None:
+    def _write_bounded(self, target: Path, readable: object, name: str) -> str:
         size = 0
+        digest = hashlib.sha256()
         with target.open("wb") as handle:
             while True:
                 chunk = readable.read(_READ_SIZE)  # type: ignore[attr-defined]
@@ -178,8 +203,10 @@ class KnowledgeDocumentStore:
                         f"单个知识文件不能超过 {MAX_FILE_BYTES // (1024 * 1024)} MiB：{name}"
                     )
                 handle.write(chunk)
+                digest.update(chunk)
             handle.flush()
             os.fsync(handle.fileno())
+        return digest.hexdigest()
 
     def _metadata(self, path: Path, indexed: IndexedDocument) -> dict[str, object]:
         stat = path.stat()
@@ -221,10 +248,11 @@ class DenseDocumentIngester:
         self._sparse_encoder = sparse_encoder
         self._store = store
 
-    def ingest(self, path: Path, *, source_root: Path) -> IndexedDocument:
+    def ingest(self, path: Path, *, source_root: Path, chunking: ChunkingConfig | None = None) -> IndexedDocument:
         try:
-            chunks = chunk_document(path, source_root=source_root)
-        except DocumentReadError as exc:
+            chunks = chunk_document(path, source_root=source_root, config=chunking,
+                                    tokenizer_model=self._config.embedding_model)
+        except ValueError as exc:
             raise KnowledgeValidationError(str(exc)) from exc
         if not chunks:
             raise KnowledgeValidationError(f"知识文件没有可索引的文本：{path.name}")
@@ -309,20 +337,40 @@ class RagServiceRuntime:
         with tenant.lock:
             return tenant.documents.list_documents()
 
-    def upload(self, namespace: str, items: list[tuple[str, object]]) -> dict[str, object]:
+    def chunking_metadata(self, chunking: ChunkingConfig) -> dict[str, object]:
+        return chunking.metadata(self.config.embedding_model)
+
+    def check_documents(self, namespace: str, items: list[dict[str, str]],
+                        chunking: ChunkingConfig) -> dict[str, object]:
+        tenant = self._tenant(namespace)
+        tenant.documents.validate_uploads([(item["name"], None) for item in items])
+        configuration = self.chunking_metadata(chunking)
+        with tenant.lock:
+            return {"files": [{"name": item["name"], "sha256": item["sha256"],
+                               "document": tenant.documents.find_duplicate(item["sha256"], configuration)}
+                              for item in items]}
+
+    def upload(self, namespace: str, items: list[tuple[str, object]],
+               chunking: ChunkingConfig | None = None) -> dict[str, object]:
         tenant = self._tenant(namespace)
         tenant.documents.validate_uploads(items)
+        model = self.config.embedding_model
         imported: list[dict[str, object]] = []
+        skipped: list[dict[str, object]] = []
         failed: list[dict[str, str]] = []
         with tenant.lock:
             for name, readable in items:
                 try:
                     with self._inference_lock:
-                        imported.append(tenant.documents.store_and_index(name, readable, tenant.ingester))
+                        record = tenant.documents.store_and_index(name, readable, tenant.ingester, chunking, model)
+                        if record.pop("skipped", False):
+                            skipped.append(record)
+                        else:
+                            imported.append(record)
                 except Exception as exc:
                     failed.append({"name": tenant.documents.sanitize_name(name), "error": _safe_error(exc)})
             documents = tenant.documents.list_documents()
-        return {"imported": imported, "failed": failed, "documents": documents}
+        return {"imported": imported, "skipped": skipped, "failed": failed, "documents": documents}
 
     def delete(self, namespace: str, name: str) -> dict[str, object]:
         tenant = self._tenant(namespace)

@@ -21,6 +21,7 @@ from mcp.client.subscriptions import SubscriptionLost
 from mcp.server.subscriptions import PromptsListChanged, ResourcesListChanged, ResourceUpdated, ToolsListChanged
 from mcp.shared.exceptions import MCPError
 from rag_mcp.document_readers import read_document_text
+from rag_mcp.config import RagConfig
 from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.resources import document_uri
 from rag_mcp.service_knowledge import IndexedDocument, KnowledgeDocumentStore, KnowledgePaths, RagServiceRuntime
@@ -32,7 +33,7 @@ ADMIN = {**AUTH, "Authorization": "Bearer admin-token"}
 class TestIngester:
     __test__ = False
 
-    def ingest(self, path, *, source_root):
+    def ingest(self, path, *, source_root, chunking=None):
         read_document_text(path)
         if path.name == "fail.txt":
             raise ValueError("controlled indexing failure")
@@ -46,6 +47,7 @@ class ProtocolRuntime(RagServiceRuntime):
     """Real document storage/reading; no model or Qdrant required for wire tests."""
 
     def __init__(self, root):
+        self.config = RagConfig()
         self.data_root = root
         self._tenants = {}
         self._tenant_lock = threading.RLock()
@@ -630,7 +632,7 @@ def test_partial_upload_notifications_and_resource_listing_pages(tmp_path):
                 for batch in range(5):
                     result = await http.post(
                         url + "/v1/documents",
-                        files=[("files", (f"{batch}-{number}.txt", b"page")) for number in range(10)],
+                        files=[("files", (f"{batch}-{number}.txt", f"page {batch}-{number}".encode())) for number in range(10)],
                     )
                     assert not result.json()["failed"]
                 page1 = await client.list_resources(cache_mode="refresh")

@@ -36,7 +36,7 @@ class FakeRuntime:
         self.calls.append(("list", namespace))
         return list(self.documents.setdefault(namespace, []))
 
-    def upload(self, namespace: str, items: list[tuple[str, object]]) -> dict[str, object]:
+    def upload(self, namespace: str, items: list[tuple[str, object]], chunking=None) -> dict[str, object]:
         self.calls.append(("upload", namespace))
         imported = []
         for name, readable in items:
@@ -177,7 +177,7 @@ class FakeIngester:
     def __init__(self) -> None:
         self.deleted: list[str] = []
 
-    def ingest(self, path: Path, *, source_root: Path) -> IndexedDocument:
+    def ingest(self, path: Path, *, source_root: Path, chunking=None) -> IndexedDocument:
         assert path.parent == source_root
         if "FAIL_INDEX" in path.read_text(encoding="utf-8"):
             raise RuntimeError("simulated index failure")

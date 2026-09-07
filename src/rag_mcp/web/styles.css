@@ -66,7 +66,14 @@ input, select { height: 40px; border: 1px solid var(--line); border-radius: 9px;
 .compare-item { padding: 11px 0; border-top: 1px solid var(--line); }
 .compare-item strong, .compare-item small { display: block; }
 .compare-item small { margin-top: 5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.upload { display: flex; align-items: center; gap: 18px; margin-bottom: 16px; }
+.upload { display: flex; flex-wrap: wrap; align-items: center; gap: 18px; margin-bottom: 16px; }
+.chunk-controls { display: grid; grid-template-columns: minmax(130px, 1.5fr) repeat(2, minmax(100px, 1fr)) auto; align-items: end; gap: 12px; width: 100%; }
+.chunk-controls label { min-width: 0; }
+.chunk-controls select, .chunk-controls input { width: 100%; min-width: 0; }
+.upload input[type="file"] { max-width: 100%; min-width: 0; }
+.upload-result { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.document > div { min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 900px) { .chunk-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .upload div { margin-right: auto; }
 .upload p, .form-panel p, .code-panel p { margin: 0; color: var(--muted); line-height: 1.6; }
 .panel-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }

@@ -43,10 +43,16 @@
 
         <section id="documentsView" class="view">
           <div class="panel upload">
-            <div><h2>上传知识</h2><p>支持 Markdown、TXT、可提取文本的 PDF 和 DOCX，上传后自动切块并生成 Dense + BM25 索引。</p></div>
+            <div class="upload-title"><h2>上传知识</h2></div>
             <input id="fileInput" type="file" multiple accept=".md,.txt,.pdf,.docx,text/markdown,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
-            <button id="uploadButton" class="primary">上传并索引</button>
+            <div class="chunk-controls">
+              <label>切分策略<select id="chunkStrategy" disabled><option>正在加载</option></select></label>
+              <label><span>块长度（<span class="chunk-unit">token</span>）</span><input id="chunkSize" type="number" min="1" value="512" step="1" /></label>
+              <label><span>重叠上限（<span class="chunk-unit">token</span>）</span><input id="chunkOverlap" type="number" min="0" value="64" step="1" /></label>
+              <button id="uploadButton" class="primary" disabled>上传并索引</button>
+            </div>
           </div>
+          <div id="uploadResult" class="upload-result" role="status" hidden></div>
           <div class="panel"><div class="panel-title"><h2>已索引文档</h2><span id="documentCount">0 个</span></div><div id="documents" class="documents"><div class="empty">正在读取文档…</div></div></div>
         </section>
 

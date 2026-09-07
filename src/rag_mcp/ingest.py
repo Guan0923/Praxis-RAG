@@ -35,7 +35,7 @@ def ingest_path(path: Path, config: RagConfig) -> IngestStats:
     failed_files = 0
     for document in documents:
         try:
-            chunks = chunk_document(document, source_root=source_root)
+            chunks = chunk_document(document, source_root=source_root, tokenizer_model=config.embedding_model)
             if not chunks:
                 print(f"SKIP {document}: empty document")
                 continue

@@ -2,6 +2,8 @@ const $ = (id) => document.getElementById(id);
 const state = {
   namespace: localStorage.getItem("rag.namespace") || "default",
   token: sessionStorage.getItem("rag.token") || "",
+  strategies: [],
+  uploading: false,
 };
 const retrievalLabels = { bm25: "BM25", embedding: "Embedding", hybrid: "Hybrid" };
 const rerankLabels = {
@@ -82,7 +84,7 @@ async function loadDocuments() {
     const data = await api("/v1/documents", { headers: headers() });
     $("documentCount").textContent = `${data.documents.length} 个`;
     $("documents").innerHTML = data.documents.length
-      ? data.documents.map((doc) => `<div class="document"><div><strong>${escapeHtml(doc.name)}</strong><small>${doc.chunk_count} chunks · ${formatBytes(doc.size)} · ${escapeHtml(doc.collection)}</small></div><button class="delete" data-name="${escapeHtml(doc.name)}">删除</button></div>`).join("")
+      ? data.documents.map((doc) => `<div class="document"><div><strong>${escapeHtml(doc.name)}</strong><small>${doc.chunk_count} chunks · ${formatBytes(doc.size)} · ${escapeHtml(chunkLabel(doc.chunking))} · ${escapeHtml(doc.collection)}</small></div><button class="delete" data-name="${escapeHtml(doc.name)}" ${state.uploading ? "disabled" : ""}>删除</button></div>`).join("")
       : '<div class="empty">当前 namespace 还没有知识文档。</div>';
     document.querySelectorAll(".delete").forEach((button) => button.addEventListener("click", () => removeDocument(button.dataset.name)));
   } catch (error) {
@@ -90,24 +92,86 @@ async function loadDocuments() {
   }
 }
 
+function chunkLabel(configuration) {
+  const config = configuration || { strategy: "character", chunk_size: 700, chunk_overlap: 100 };
+  const strategy = state.strategies.find((item) => item.id === config.strategy);
+  return `${strategy?.label || config.strategy} · ${config.chunk_size}/${config.chunk_overlap} ${config.strategy === "character" ? "字符" : "token"}`;
+}
+
+async function loadStrategies() {
+  try {
+    const data = await api("/v1/chunking/strategies", { headers: headers() });
+    state.strategies = data.strategies;
+    $("chunkStrategy").innerHTML = data.strategies.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`).join("");
+    $("chunkStrategy").value = data.default;
+    $("chunkStrategy").disabled = state.uploading;
+    $("uploadButton").disabled = state.uploading;
+    setStrategyDefaults();
+  } catch (error) {
+    $("uploadResult").hidden = false;
+    $("uploadResult").textContent = error.message;
+  }
+}
+
+function setStrategyDefaults() {
+  const strategy = state.strategies.find((item) => item.id === $("chunkStrategy").value);
+  if (!strategy) return;
+  $("chunkSize").value = strategy.chunk_size;
+  $("chunkSize").min = strategy.id === "character" ? "100" : "1";
+  $("chunkOverlap").value = strategy.chunk_overlap;
+  document.querySelectorAll(".chunk-unit").forEach((item) => { item.textContent = strategy.unit === "characters" ? "字符" : "token"; });
+}
+
+function uploadBusy(busy) {
+  state.uploading = busy;
+  ["fileInput", "chunkStrategy", "chunkSize", "chunkOverlap", "uploadButton", "namespace", "token", "saveConnection"].forEach((id) => { $(id).disabled = busy; });
+  document.querySelectorAll(".delete").forEach((button) => { button.disabled = busy; });
+}
+
 async function upload() {
+  if (state.uploading) return;
   const files = Array.from($("fileInput").files || []);
   if (!files.length) return toast("请先选择 Markdown、TXT、PDF 或 DOCX 文件", true);
-  const body = new FormData();
-  files.forEach((file) => body.append("files", file));
+  if (files.length > 10 || files.some((file) => file.size > 10 * 1024 * 1024 || file.size === 0)) return toast("每批最多 10 个非空文件，单文件不超过 10 MiB", true);
+  const configuration = { strategy: $("chunkStrategy").value, chunk_size: Number($("chunkSize").value), chunk_overlap: Number($("chunkOverlap").value) };
+  if (!Number.isInteger(configuration.chunk_size) || configuration.chunk_size < (configuration.strategy === "character" ? 100 : 1) || !Number.isInteger(configuration.chunk_overlap) || configuration.chunk_overlap < 0 || configuration.chunk_overlap >= configuration.chunk_size) return toast("请检查块长度和重叠上限", true);
+  const requestHeaders = headers();
   const button = $("uploadButton");
-  button.disabled = true;
-  button.textContent = "正在生成索引…";
+  uploadBusy(true);
+  button.textContent = "正在检查文件…";
+  $("uploadResult").hidden = true;
   try {
-    const data = await api("/v1/documents", { method: "POST", headers: headers(), body });
-    toast(`成功导入 ${data.imported.length} 个文件${data.failed.length ? `，失败 ${data.failed.length} 个` : ""}`, data.failed.length > 0);
-    $("fileInput").value = "";
+    if (!globalThis.crypto?.subtle) throw new Error("文件哈希需要 HTTPS 或 localhost 安全连接");
+    const fingerprints = [];
+    for (const file of files) {
+      const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+      fingerprints.push({ name: file.name, sha256: Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("") });
+    }
+    const checked = await api("/v1/documents/check", { method: "POST", headers: { ...requestHeaders, "Content-Type": "application/json" }, body: JSON.stringify({ files: fingerprints, ...configuration }) });
+    const skipped = checked.files.filter((item) => item.document).map((item) => ({ ...item.document, requested_name: item.name }));
+    const pending = files.filter((_, index) => !checked.files[index].document);
+    let data = { imported: [], skipped: [], failed: [] };
+    if (pending.length) {
+      const body = new FormData();
+      pending.forEach((file) => body.append("files", file));
+      Object.entries(configuration).forEach(([key, value]) => body.append(key, value));
+      button.textContent = "正在生成索引…";
+      data = await api("/v1/documents", { method: "POST", headers: requestHeaders, body });
+    }
+    skipped.push(...(data.skipped || []));
+    const summary = `新增 ${data.imported.length} 个，跳过 ${skipped.length} 个，失败 ${data.failed.length} 个`;
+    $("uploadResult").textContent = [summary, ...skipped.map((item) => `${item.requested_name || item.name}：已存在 ${item.name}`), ...data.failed.map((item) => `${item.name}：${item.error}`)].join("\n");
+    $("uploadResult").hidden = false;
+    toast(summary, data.failed.length > 0);
+    if (!data.failed.length) $("fileInput").value = "";
     await loadDocuments();
     await health();
   } catch (error) {
+    $("uploadResult").hidden = false;
+    $("uploadResult").textContent = error.message;
     toast(error.message, true);
   } finally {
-    button.disabled = false;
+    uploadBusy(false);
     button.textContent = "上传并索引";
   }
 }
@@ -277,6 +341,7 @@ function renderCompareColumn(outcome) {
 }
 
 function saveConnection() {
+  if (state.uploading) return;
   const namespace = $("namespace").value.trim();
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(namespace)) return toast("Namespace 只能包含字母、数字、点、下划线和横线", true);
   state.namespace = namespace;
@@ -286,6 +351,7 @@ function saveConnection() {
   renderConfig();
   toast("连接配置已保存");
   loadDocuments();
+  loadStrategies();
 }
 
 function renderConfig() {
@@ -324,7 +390,9 @@ $("refreshButton").addEventListener("click", health);
 $("searchButton").addEventListener("click", search);
 $("compareButton").addEventListener("click", compareRetrievals);
 $("uploadButton").addEventListener("click", upload);
+$("chunkStrategy").addEventListener("change", setStrategyDefaults);
 $("saveConnection").addEventListener("click", saveConnection);
 $("query").addEventListener("keydown", (event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") search(); });
 renderConfig();
 health();
+loadStrategies();

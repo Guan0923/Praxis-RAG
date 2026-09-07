@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Protocol
 
 import anyio
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
@@ -21,6 +21,7 @@ from starlette.routing import Route
 
 from . import __version__
 from .config import RagConfig, RagConfigError
+from .chunk_strategies import ChunkingConfig, strategy_catalog
 from .catalog import PromptDefinition, ToolPatch
 from .contracts import RagOperationError, SearchValidationError
 from .mcp_http import McpHttpEndpoint
@@ -57,7 +58,8 @@ _LOCAL_MCP_ORIGINS = (
 class ServiceRuntime(Protocol):
     def status(self) -> dict[str, object]: ...
     def list_documents(self, namespace: str) -> list[dict[str, object]]: ...
-    def upload(self, namespace: str, items: list[tuple[str, object]]) -> dict[str, object]: ...
+    def upload(self, namespace: str, items: list[tuple[str, object]], chunking: ChunkingConfig | None = None) -> dict[str, object]: ...
+    def check_documents(self, namespace: str, items: list[dict[str, str]], chunking: ChunkingConfig) -> dict[str, object]: ...
     def delete(self, namespace: str, name: str) -> dict[str, object]: ...
     def search(self, namespace: str, arguments: dict[str, object]) -> dict[str, object]: ...
     def read_document(self, namespace: str, name: str) -> tuple[str, str]: ...
@@ -111,6 +113,26 @@ class SearchBody(BaseModel):
     candidate_k: int = 10
     top_k: int = 5
     filters: dict[str, str | int | float | bool] = Field(default_factory=dict)
+
+
+class CheckFile(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class CheckDocumentsBody(BaseModel):
+    files: list[CheckFile] = Field(min_length=1, max_length=MAX_FILES_PER_BATCH)
+    strategy: str = "recursive"
+    chunk_size: int | None = Field(default=None, strict=True)
+    chunk_overlap: int | None = Field(default=None, strict=True)
+
+
+def _chunking_config(strategy: str, size: int | None, overlap: int | None) -> ChunkingConfig:
+    try:
+        return ChunkingConfig(strategy, size if size is not None else (700 if strategy == "character" else 512),
+                              overlap if overlap is not None else (100 if strategy == "character" else 64))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def create_service_app(
@@ -256,17 +278,35 @@ def create_service_app(
             "max_file_bytes": MAX_FILE_BYTES,
         }
 
+    @app.get("/v1/chunking/strategies")
+    def chunking_strategies(namespace: str = Depends(tenant)) -> dict[str, object]:
+        return strategy_catalog()
+
+    @app.post("/v1/documents/check")
+    def check_documents(body: CheckDocumentsBody, namespace: str = Depends(tenant)) -> dict[str, object]:
+        configuration = _chunking_config(body.strategy, body.chunk_size, body.chunk_overlap)
+        try:
+            return resolved_runtime.check_documents(namespace, [item.model_dump() for item in body.files], configuration)
+        except KnowledgeValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KnowledgeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
     @app.post("/v1/documents")
     async def upload_documents(
         files: list[UploadFile] = File(...),
+        strategy: str = Form("recursive"),
+        chunk_size: int | None = Form(None),
+        chunk_overlap: int | None = Form(None),
         namespace: str = Depends(tenant),
     ) -> dict[str, object]:
+        configuration = _chunking_config(strategy, chunk_size, chunk_overlap)
         items = [(upload.filename or "", upload.file) for upload in files]
         try:
             async with mcp_endpoint.mutation_lock(namespace):
                 with anyio.CancelScope(shield=True):
                     before = await anyio.to_thread.run_sync(resolved_runtime.list_documents, namespace)
-                    result = await anyio.to_thread.run_sync(resolved_runtime.upload, namespace, items)
+                    result = await anyio.to_thread.run_sync(resolved_runtime.upload, namespace, items, configuration)
                     await mcp_endpoint.documents_changed(namespace, before, result["documents"])
                     return result
         except KnowledgeValidationError as exc:

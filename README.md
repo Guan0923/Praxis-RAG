@@ -82,6 +82,38 @@ Console 包含知识上传、文档删除、BM25/Embedding/Hybrid 检索、Reran
 
 首次上传或 Dense 检索时会下载并加载 BGE-M3。上传后会自动提取文本、切分，并把 Dense Vector 与 BM25 Sparse Vector 写入 Qdrant。目前支持 UTF-8 `.md`/`.txt`、带文本层的 `.pdf` 和现代 Word `.docx`，每批最多 10 个文件，单文件最大 10 MiB。
 
+### 切分策略与上传去重
+
+Web Console 的“知识文档”页面可选择五种切分策略。网页及上传 API 默认使用 `recursive`，块长度为 512 token，重叠上限为 64 token；参数可调整。命令行导入仍使用原字符策略，不增加新参数。
+
+| 策略值 | 行为 |
+| --- | --- |
+| `character` | 原字符切分，默认 700 字符、100 字符重叠，优先在换行或标点处结束。 |
+| `token` | 使用 Embedding 模型的 tokenizer，按原文位置截取 token 窗口。 |
+| `sentence` | 完整句子合块，超长单句按 token 拆分。支持常见中英文断句和英文缩写，不做语言模型语义判断。 |
+| `recursive` | 段落、句子、token 逐级细分，再合并完整内容单元。 |
+| `structure` | Markdown 按标题；TXT 按空行段落；PDF 按页、段落、句子；DOCX 按标题样式及段落，表格过长按行处理。 |
+
+短内容按原文顺序合并，允许跨章节和 PDF 页面。重叠计入长度上限，句子重叠可能少于设置值或为零；超长句子使用 token 重叠。chunk 元数据记录字符位置、实际页码、标题路径和段落位置。位置对应读取层生成的文本，不是原文件字节位置。PDF 段落依赖提取文本中的空行，不保证还原视觉排版；扫描件仍需外部 OCR。
+
+- `GET /v1/chunking/strategies` 返回策略选项、单位和默认参数。
+- `POST /v1/documents` 在原 `files` multipart 字段外接收 `strategy`、`chunk_size`、`chunk_overlap`。
+- `POST /v1/documents/check` 接收 JSON：`{"files":[{"name":"guide.md","sha256":"64位小写十六进制哈希"}],"strategy":"recursive","chunk_size":512,"chunk_overlap":64}`，返回同序的 `files`，每项 `document` 为已有文档或 `null`。
+- 三个接口均沿用 `X-RAG-Namespace` 和服务认证。去重仅在同一 namespace 内比较文件 SHA-256、策略、长度、重叠及 tokenizer 标识；文件名不参与比较。
+- 浏览器先计算哈希并检查，命中则不发送文件正文。需要 HTTPS 或 localhost 安全连接。后端接收正文时重新计算哈希，并在租户锁内再次去重。
+- 上传结果分别包含 `imported`、`skipped`、`failed` 和 `documents`。更改参数会重新索引；改名但配置相同则返回已有文档，不新建别名。已有文档不会自动重建。
+- 旧清单首次检查时按需补齐哈希，缺失配置按原 700/100 字符策略解释。tokenizer 下载或加载失败会明确报错，不退回字符计数。
+
+真实验收（在已安装 `.[dense]` 和 `pytest` 的 `dl` 环境运行）：
+
+```powershell
+conda activate dl
+$env:RAG_REAL_SMOKE = "1"
+python -m pytest tests/test_real_chunking.py -q -s
+```
+
+该测试用真实 BGE-M3、BM25 和本地 Qdrant，在临时目录中验证五种策略及四种文件。浏览器验收另需 `playwright` 和本机 Edge：设置 `RAG_BROWSER_URL` 为独立测试服务地址后，运行 `tests/test_browser_chunking.py`；截图保存在 `.mini_agent-rag/chunking-ui/`。
+
 PDF 最多解析 1000 页；DOCX 解压后的内部文件总量最多 50 MiB；单个文档最多提取 500 万字符。扫描版 PDF 没有文本层，需要先用 OCR 软件转换；旧版二进制 `.doc` 需要先另存为 `.docx`。
 
 ## Namespace
