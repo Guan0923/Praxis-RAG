@@ -63,6 +63,7 @@ class QdrantStore:
         chunks: Sequence[DocumentChunk],
         vectors: Sequence[Sequence[float]],
         sparse_vectors: Sequence[SparseEmbedding] | None = None,
+        asset_payloads: Sequence[dict[str, object]] = (),
     ) -> int:
         """Replace one document with dense and optional sparse vectors."""
 
@@ -81,10 +82,10 @@ class QdrantStore:
 
         self.ensure_collection()
         document_id = next(iter(document_ids))
-        self._client.delete(
+        old_points, _ = self._client.scroll(
             collection_name=self.collection,
-            points_selector=models.FilterSelector(filter=_payload_filter(self._scoped({"document_id": document_id}))),
-            wait=True,
+            scroll_filter=_payload_filter(self._scoped({"document_id": document_id})),
+            limit=10_000, with_payload=True, with_vectors=True,
         )
         sparse_items: Sequence[SparseEmbedding | None]
         sparse_items = sparse_vectors if sparse_vectors is not None else [None] * len(chunks)
@@ -98,6 +99,7 @@ class QdrantStore:
                     id=str(uuid.uuid5(_POINT_NAMESPACE, f"{self.namespace or ''}\0{chunk.chunk_id}")),
                     vector=point_vectors,
                     payload={
+                        "record_type": "chunk",
                         "document_id": chunk.document_id,
                         "chunk_id": chunk.chunk_id,
                         "text": chunk.text,
@@ -108,8 +110,58 @@ class QdrantStore:
                     },
                 )
             )
-        self._client.upsert(collection_name=self.collection, points=points, wait=True)
-        return len(points)
+        for payload in asset_payloads:
+            if payload.get("document_id") != document_id or not payload.get("asset_id"):
+                raise ValueError("Asset payload must belong to the replaced document")
+            points.append(models.PointStruct(
+                id=self._point_id(str(payload["asset_id"])), vector={},
+                payload={**payload, **({"namespace": self.namespace} if self.namespace else {})},
+            ))
+        try:
+            self._client.upsert(collection_name=self.collection, points=points, wait=True)
+            keep_ids = {str(point.id) for point in points}
+            stale = [point.id for point in old_points if str(point.id) not in keep_ids]
+            if stale:
+                self._client.delete(collection_name=self.collection,
+                                    points_selector=models.PointIdsList(points=stale), wait=True)
+        except Exception:
+            self._restore_document(old_points, [point.id for point in points])
+            raise
+        return len(chunks)
+
+    def get_assets(self, asset_ids: Sequence[str]) -> dict[str, dict[str, object]]:
+        if not asset_ids:
+            return {}
+        self.ensure_collection()
+        points = self._client.retrieve(
+            collection_name=self.collection, ids=[self._point_id(value) for value in dict.fromkeys(asset_ids)],
+            with_payload=True, with_vectors=False,
+        )
+        result = {}
+        for point in points:
+            payload = dict(point.payload or {})
+            if payload.get("record_type") != "asset" or payload.get("namespace") != self.namespace:
+                continue
+            result[str(payload.get("asset_id"))] = payload
+        return result
+
+    def _point_id(self, item_id: str) -> str:
+        return str(uuid.uuid5(_POINT_NAMESPACE, f"{self.namespace or ''}\0{item_id}"))
+
+    def _restore_document(self, old_points: Sequence[Any], new_ids: Sequence[Any]) -> None:
+        old_ids = {str(point.id) for point in old_points}
+        introduced = [point_id for point_id in new_ids if str(point_id) not in old_ids]
+        try:
+            if old_points:
+                self._client.upsert(collection_name=self.collection, points=[
+                    models.PointStruct(id=point.id, vector=point.vector or {}, payload=dict(point.payload or {}))
+                    for point in old_points
+                ], wait=True)
+            if introduced:
+                self._client.delete(collection_name=self.collection,
+                                    points_selector=models.PointIdsList(points=introduced), wait=True)
+        except Exception:
+            pass
 
     def delete_document(self, document_id: str) -> None:
         """Delete every vector chunk belonging to one stable document id."""

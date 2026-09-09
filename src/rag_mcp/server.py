@@ -142,9 +142,16 @@ class ToolRegistry:
         except (RagConfigError, RagOperationError, SearchValidationError, KeyError) as exc:
             _trace(f"tool failed: {type(exc).__name__}")
             return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], is_error=True)
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
-        )
+        images = []
+        public_payload = json.loads(json.dumps(payload, ensure_ascii=False))
+        for result in public_payload.get("results", []):
+            asset = result.get("asset") if isinstance(result, dict) else None
+            if isinstance(asset, dict) and asset.get("type") == "image" and isinstance(asset.get("data"), str):
+                images.append(types.ImageContent(type="image", data=asset.pop("data"), mime_type=str(asset["mime_type"])))
+                asset["content_block"] = len(images)
+        return types.CallToolResult(content=[
+            types.TextContent(type="text", text=json.dumps(public_payload, ensure_ascii=False)), *images
+        ])
 
 
 def create_registry(executor: SearchExecutor, catalog: NamespaceCatalog | None = None) -> ToolRegistry:

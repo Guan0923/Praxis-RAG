@@ -27,13 +27,13 @@ uv sync --extra dense
 
 ```powershell
 cd xinghe_rag
-uv tool install --editable ".[dense]"
+uv tool install --editable ".[dense,pdf]"
 ```
 
 从独立 Git 仓库直接安装：
 
 ```powershell
-uv tool install "mini-agent-rag-mcp[dense] @ git+https://github.com/Guan0923/xinghe_rag.git"
+uv tool install "mini-agent-rag-mcp[dense,pdf] @ git+https://github.com/Guan0923/xinghe_rag.git"
 ```
 
 安装后，`rag-service`、`rag-mcp-debug`、`rag-mcp-ingest` 和 `rag-service-migrate` 都是独立命令。
@@ -57,10 +57,12 @@ docker start mini-agent-qdrant
 ```powershell
 $env:RAG_BACKEND = "qdrant"
 $env:QDRANT_URL = "http://127.0.0.1:6333"
-$env:RAG_COLLECTION = "mini_agent_phase3_hybrid"
-$env:RAG_EMBEDDING_DEVICE = "cpu"
-$env:RAG_RERANKER_DEVICE = "cpu"
+$env:RAG_COLLECTION = "mini_agent_knowledge_pdf_assets_v1"
+$env:RAG_EMBEDDING_DEVICE = "cuda:0"
+$env:RAG_RERANKER_DEVICE = "cuda:0"
 $env:RAG_SERVICE_DATA_ROOT = "$HOME/.mini_agent-rag"
+$env:RAG_PDF_PARSER_PYTHON = "C:/path/to/pdf-parser/python.exe"
+$env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
 
 rag-service
 ```
@@ -80,7 +82,7 @@ uv run --package mini-agent-rag-mcp rag-service
 
 Console 包含知识上传、文档删除、BM25/Embedding/Hybrid 检索、Reranker 切换、Top-K 结果、score、source、chunk_id 和阶段耗时。它直接访问同源 RAG API，不经过 Mini-Agent。调试页还提供“三模式对比”，固定关闭重排并并排展示三种 Retriever 的原始结果，避免 Cross Encoder 把不同召回重新排成相同顺序。
 
-首次上传或 Dense 检索时会下载并加载 BGE-M3。上传后会自动提取文本、切分，并把 Dense Vector 与 BM25 Sparse Vector 写入 Qdrant。目前支持 UTF-8 `.md`/`.txt`、带文本层的 `.pdf` 和现代 Word `.docx`，每批最多 10 个文件，单文件最大 10 MiB。
+首次上传或 Dense 检索时会下载并加载 BGE-M3。PDF 由独立 Docling 2.126.0 子进程解析，使用 PDFium、CUDA 和本机模型；图片或表格没有有效原文说明时，才使用固定版本的 Granite Vision 3.3 2B 生成检索描述。图片原图保存在租户目录，图表原始数据和检索文字写入 Qdrant。每批最多 10 个文件，单文件最大 10 MiB。
 
 ### 切分策略与上传去重
 
@@ -94,7 +96,7 @@ Web Console 的“知识文档”页面可选择五种切分策略。网页及�
 | `recursive` | 段落、句子、token 逐级细分，再合并完整内容单元。 |
 | `structure` | Markdown 按标题；TXT 按空行段落；PDF 按页、段落、句子；DOCX 按标题样式及段落，表格过长按行处理。 |
 
-短内容按原文顺序合并，允许跨章节和 PDF 页面。重叠计入长度上限，句子重叠可能少于设置值或为零；超长句子使用 token 重叠。chunk 元数据记录字符位置、实际页码、标题路径和段落位置。位置对应读取层生成的文本，不是原文件字节位置。PDF 段落依赖提取文本中的空行，不保证还原视觉排版；扫描件仍需外部 OCR。
+短内容按原文顺序合并，允许跨章节和 PDF 页面。重叠计入长度上限，句子重叠可能少于设置值或为零；超长句子使用 token 重叠。chunk 元数据记录字符位置、实际页码、标题路径和段落位置。PDF 正式上传按 Docling 的页码和版面顺序生成正文块；图片按原图注检索并返回原图，表格按表题、表头和行内容检索并返回行列及合并信息。扫描文本使用 Docling OCR；无法稳定恢复结构的表格会终止该文件入库。
 
 - `GET /v1/chunking/strategies` 返回策略选项、单位和默认参数。
 - `POST /v1/documents` 在原 `files` multipart 字段外接收 `strategy`、`chunk_size`、`chunk_overlap`。

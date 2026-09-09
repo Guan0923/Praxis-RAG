@@ -25,6 +25,11 @@ dense = [
     "FlagEmbedding>=1.3,<2",
     "transformers>=4.44,<5",
 ]
+pdf = [
+    "docling==2.126.0",
+    "torch>=2.7,<3",
+    "transformers>=4.57,<5",
+]
 
 [project.urls]
 Repository = "https://github.com/Guan0923/xinghe_rag"

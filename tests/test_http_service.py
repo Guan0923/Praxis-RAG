@@ -28,6 +28,7 @@ class FakeRuntime:
         self.documents: dict[str, list[dict[str, object]]] = {}
         self.calls: list[tuple[str, str]] = []
         self.search_arguments: list[dict[str, object]] = []
+        self.search_result: dict[str, object] | None = None
 
     def status(self) -> dict[str, object]:
         return {"status": "ok", "service": "rag-mcp-service", "collection": "test_hybrid"}
@@ -61,7 +62,7 @@ class FakeRuntime:
     def search(self, namespace: str, arguments: dict[str, object]) -> dict[str, object]:
         self.calls.append(("search", namespace))
         self.search_arguments.append(arguments)
-        return {"query": arguments["query"], "evidence_status": "no_evidence", "results": []}
+        return self.search_result or {"query": arguments["query"], "evidence_status": "no_evidence", "results": []}
 
 
 @pytest.fixture()
@@ -171,6 +172,19 @@ def test_upload_list_search_and_delete_use_header_namespace(service) -> None:
         ("list", NAMESPACE),
         ("delete", NAMESPACE),
     ]
+
+
+def test_http_search_keeps_image_base64_for_direct_clients(service) -> None:
+    runtime, client = service
+    runtime.search_result = {
+        "query": "figure", "evidence_status": "found",
+        "results": [{"asset": {"type": "image", "mime_type": "image/png", "data": "aW1hZ2U="}}],
+    }
+
+    response = client.post("/v1/search", headers=AUTH, json={"query": "figure"})
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["asset"]["data"] == "aW1hZ2U="
 
 
 class FakeIngester:

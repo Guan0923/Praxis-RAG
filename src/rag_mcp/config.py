@@ -24,7 +24,7 @@ class RagConfig:
     backend: BackendName = "mock"
     qdrant_url: str | None = None
     qdrant_path: Path | None = None
-    collection: str = "mini_agent_knowledge"
+    collection: str = "mini_agent_knowledge_pdf_assets_v1"
     embedding_model: str = "BAAI/bge-m3"
     embedding_device: str | None = None
     vector_size: int = DENSE_VECTOR_SIZE
@@ -37,6 +37,9 @@ class RagConfig:
     reranker_max_length: int = 512
     reranker_max_text_chars: int = 4_000
     preload_reranker: bool = False
+    pdf_parser_python: Path | None = None
+    pdf_models_path: Path | None = None
+    pdf_parse_timeout: int = 900
 
     @classmethod
     def from_env(cls) -> RagConfig:
@@ -54,7 +57,7 @@ class RagConfig:
         if raw_backend == "qdrant" and not qdrant_url and not qdrant_path:
             qdrant_url = "http://localhost:6333"
 
-        collection = os.getenv("RAG_COLLECTION", "mini_agent_knowledge").strip()
+        collection = os.getenv("RAG_COLLECTION", "mini_agent_knowledge_pdf_assets_v1").strip()
         if not collection:
             raise RagConfigError("RAG_COLLECTION must not be empty")
 
@@ -83,12 +86,20 @@ class RagConfig:
             reranker_max_length=_integer_env("RAG_RERANKER_MAX_LENGTH", 512, minimum=64, maximum=8_192),
             reranker_max_text_chars=_integer_env("RAG_RERANKER_MAX_TEXT_CHARS", 4_000, minimum=256, maximum=100_000),
             preload_reranker=_boolean_env("RAG_PRELOAD_RERANKER", default=False),
+            pdf_parser_python=_optional_path("RAG_PDF_PARSER_PYTHON"),
+            pdf_models_path=_optional_path("RAG_PDF_MODELS_PATH"),
+            pdf_parse_timeout=_integer_env("RAG_PDF_PARSE_TIMEOUT", 900, minimum=30, maximum=7_200),
         )
 
 
 def _optional_env(name: str) -> str | None:
     value = os.getenv(name)
     return value.strip() if value and value.strip() else None
+
+
+def _optional_path(name: str) -> Path | None:
+    value = _optional_env(name)
+    return Path(value).expanduser().resolve() if value else None
 
 
 def _boolean_env(name: str, *, default: bool) -> bool:

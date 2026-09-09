@@ -6,6 +6,7 @@ import json
 import hashlib
 import os
 import re
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -247,22 +248,62 @@ class DenseDocumentIngester:
         self._embedder = embedder
         self._sparse_encoder = sparse_encoder
         self._store = store
+        self._source_root: Path | None = None
 
     def ingest(self, path: Path, *, source_root: Path, chunking: ChunkingConfig | None = None) -> IndexedDocument:
+        parsed_pdf = None
         try:
-            chunks = chunk_document(path, source_root=source_root, config=chunking,
-                                    tokenizer_model=self._config.embedding_model)
+            if path.suffix.casefold() == ".pdf":
+                from .pdf_assets import parse_pdf
+
+                parsed_pdf = parse_pdf(
+                    path, source_root=source_root, config=chunking,
+                    tokenizer_model=self._config.embedding_model,
+                    parser_python=self._config.pdf_parser_python,
+                    models_path=self._config.pdf_models_path,
+                    timeout_seconds=self._config.pdf_parse_timeout,
+                )
+                chunks = parsed_pdf.chunks
+            else:
+                chunks = chunk_document(path, source_root=source_root, config=chunking,
+                                        tokenizer_model=self._config.embedding_model)
         except ValueError as exc:
             raise KnowledgeValidationError(str(exc)) from exc
         if not chunks:
             raise KnowledgeValidationError(f"知识文件没有可索引的文本：{path.name}")
-        vectors = self._embedder.embed_documents([chunk.text for chunk in chunks])
-        sparse_vectors = self._sparse_encoder.encode_documents([chunk.text for chunk in chunks])
-        count = self._store.replace_document(chunks, vectors, sparse_vectors)
+        try:
+            vectors = self._embedder.embed_documents([chunk.text for chunk in chunks])
+            sparse_vectors = self._sparse_encoder.encode_documents([chunk.text for chunk in chunks])
+        except Exception:
+            if parsed_pdf is not None:
+                shutil.rmtree(parsed_pdf.staging_dir, ignore_errors=True)
+            raise
+        final = backup = None
+        try:
+            asset_payloads = []
+            if parsed_pdf is not None:
+                from .pdf_assets import install_assets
+
+                final, backup = install_assets(parsed_pdf, source_root, chunks[0].document_id)
+                asset_payloads = [asset.payload(chunks[0].document_id, chunks[0].source) for asset in parsed_pdf.assets]
+            count = self._store.replace_document(chunks, vectors, sparse_vectors, asset_payloads)
+        except Exception:
+            if final is not None:
+                from .pdf_assets import rollback_assets
+
+                rollback_assets(final, backup)
+            raise
+        if backup is not None:
+            from .pdf_assets import finish_assets
+
+            finish_assets(backup)
+        self._source_root = source_root
         return IndexedDocument(chunks[0].document_id, count, self._config.collection)
 
     def delete(self, document_id: str) -> None:
         self._store.delete_document(document_id)
+        if self._source_root is not None:
+            shutil.rmtree(self._source_root / ".pdf-assets" / document_id, ignore_errors=True)
 
 
 @dataclass(frozen=True)
@@ -410,6 +451,7 @@ class RagServiceRuntime:
                 return existing
             from .retrievers.dense import DenseRetriever
             from .retrievers.hybrid import Bm25Retriever, HybridRetriever
+            from .pdf_assets import project_results
             from .storage.qdrant_store import QdrantStore
 
             store = QdrantStore(
@@ -430,6 +472,9 @@ class RagServiceRuntime:
                 },
                 implementation="rag-service-qdrant-hybrid-rerank-v1",
                 limitations=("bi_encoder remains a deterministic mock.",),
+                projector=lambda candidates: project_results(
+                    candidates, store, self.data_root / namespace / "knowledge" / ".pdf-assets"
+                ),
             )
             config = replace(self.config, namespace=namespace)
             resources = TenantResources(
