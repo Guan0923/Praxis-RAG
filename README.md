@@ -90,6 +90,41 @@ OCR 不再按默认置信度阈值丢弃已识别文字；低置信度内容保�
 
 每份 PDF 的原生 `document.json`、按阅读顺序保存的 `manifest.json`、正文 `document.md`、OCR 记录 `ocr.json` 和图片保存在知识目录的 `.pdf-assets/<document_id>/`。正文、图片、表格与公式保持 Docling 的遍历顺序；图注、表题、脚注保留原文关联，不按长度丢弃，也不猜配未关联注解。生成描述仅用于检索，不充当原文注解。命令行 PDF 导入和 MCP 正文读取使用同一份解析结果。
 
+### 前端开发与打包
+
+Console 使用 React、TypeScript 和 Ant Design，提供浅色与深色主题。主题和 Namespace 保存在当前浏览器；Service Token 仅保存在当前会话，MCP 配置示例不会显示真实 Token。
+
+正常运行仍只需启动 `rag-service`，通过 `/console` 打开页面，不需要 Node.js 或额外前端进程。仓库中的 `src/rag_mcp/web/` 是随 Python 包交付的构建文件，修改界面请编辑 `frontend/src/`，不要手动修改构建文件。
+
+```powershell
+conda activate dev
+cd frontend
+npm ci
+npm run build
+```
+
+构建会替换 `src/rag_mcp/web/` 中的旧文件；发布或打包 Python 包前，必须一起包含新的构建结果。仅开发时需要 Node.js 22.12+。
+
+需要热更新时，可以单独运行开发服务器：
+
+```powershell
+$env:RAG_DEV_API = "http://127.0.0.1:8011"
+npm run dev
+```
+
+访问终端输出地址下的 `/console/assets/`。开发服务器将 API 请求转发给 `RAG_DEV_API`；生产环境始终使用同源接口。
+
+真实浏览器验收必须指向独立测试服务和独立数据目录，测试会创建自己的 Namespace，并只清理其中的测试文档：
+
+```powershell
+conda activate dl
+$env:PYTHONPATH = "$PWD/src"
+$env:RAG_BROWSER_URL = "http://127.0.0.1:8021"
+python -m pytest tests/test_browser_chunking.py -v
+```
+
+测试需要 Python Playwright 和本机 Edge。截图写入 `.test-tmp/console-browser/`；真实上传、检索与重排使用实际模型，额外的失败和延迟响应测试使用浏览器拦截。
+
 ### 切分策略与上传去重
 
 Web Console 的“知识文档”页面可选择五种切分策略。网页及上传 API 默认使用 `recursive`，块长度为 512 token，重叠上限为 64 token；参数可调整。命令行导入仍使用原字符策略，不增加新参数。
