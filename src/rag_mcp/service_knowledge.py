@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -98,11 +99,13 @@ class KnowledgeDocumentStore:
                 supported = "、".join(sorted(SUPPORTED_EXTENSIONS))
                 raise KnowledgeValidationError(f"暂不支持该文件类型：{name}；请选择 {supported}。")
 
-    def find_duplicate(self, sha256: str, chunking: dict[str, object]) -> dict[str, object] | None:
+    def find_duplicate(self, sha256: str, chunking: dict[str, object], *, only_name: str | None = None) -> dict[str, object] | None:
         manifest = self._read_manifest()
         changed = False
         found = None
         for name, record in manifest.items():
+            if only_name is not None and name != only_name:
+                continue
             path = self._confined_target(name)
             if not path.is_file() or (self.paths.knowledge_dir / name).is_symlink():
                 continue
@@ -119,7 +122,8 @@ class KnowledgeDocumentStore:
         return found
 
     def store_and_index(self, raw_name: str, readable: object, ingester: DocumentIngester,
-                        chunking: ChunkingConfig | None = None, tokenizer_model: str = "BAAI/bge-m3") -> dict[str, object]:
+                        chunking: ChunkingConfig | None = None, tokenizer_model: str = "BAAI/bge-m3",
+                        *, deduplicate_across_names: bool = True) -> dict[str, object]:
         """Replace one source and roll back the file if indexing fails."""
 
         name = self.sanitize_name(raw_name)
@@ -134,7 +138,7 @@ class KnowledgeDocumentStore:
             if target.is_symlink():
                 raise KnowledgeValidationError(f"知识文件不能是符号链接：{name}")
             configuration = (chunking or LEGACY_CONFIG).metadata(tokenizer_model)
-            previous = self.find_duplicate(sha256, configuration)
+            previous = self.find_duplicate(sha256, configuration, only_name=None if deduplicate_across_names else name)
             if previous:
                 temporary.unlink()
                 return {**previous, "skipped": True, "requested_name": name}
@@ -412,6 +416,37 @@ class RagServiceRuntime:
                     failed.append({"name": tenant.documents.sanitize_name(name), "error": _safe_error(exc)})
             documents = tenant.documents.list_documents()
         return {"imported": imported, "skipped": skipped, "failed": failed, "documents": documents}
+
+    def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool) -> dict[str, object]:
+        tenant = self._tenant(namespace)
+        if tenant.documents.sanitize_name(name) != name:
+            raise KnowledgeValidationError("Invalid document name")
+        with tenant.lock:
+            records = tenant.documents.list_documents()
+            existing = next((item for item in records if item["name"] == name), None)
+            if overwrite and existing is None:
+                raise KnowledgeValidationError(f"Document does not exist: {name}")
+            if not overwrite and (any(str(item["name"]).casefold() == name.casefold() for item in records)
+                                  or tenant.documents._confined_target(name).exists()):
+                raise KnowledgeValidationError(f"Document already exists: {name}; use update_document")
+            configuration = ChunkingConfig()
+            if existing is not None:
+                saved = existing.get("chunking", LEGACY_CONFIG.metadata(self.config.embedding_model))
+                configuration = ChunkingConfig(str(saved["strategy"]), saved["chunk_size"], saved["chunk_overlap"])
+            readable = io.BytesIO(content)
+            tenant.documents.validate_uploads([(name, readable)])
+            try:
+                with self._inference_lock:
+                    record = tenant.documents.store_and_index(
+                        name, readable, tenant.ingester, configuration, self.config.embedding_model,
+                        deduplicate_across_names=False,
+                    )
+            except Exception as exc:
+                raise KnowledgeError(_safe_error(exc)) from exc
+            unchanged = record.pop("skipped", False)
+            record.pop("requested_name", None)
+            return {"status": "unchanged" if unchanged else ("updated" if overwrite else "added"),
+                    "document": record, "documents": tenant.documents.list_documents()}
 
     def delete(self, namespace: str, name: str) -> dict[str, object]:
         tenant = self._tenant(namespace)
