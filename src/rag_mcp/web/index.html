@@ -3,73 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="light" />
-    <title>RAG MCP Console</title>
-    <link rel="stylesheet" href="/console/assets/styles.css" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="data:," />
+    <title>星河知识库</title>
+    <script>
+      try {
+        document.documentElement.dataset.theme =
+          localStorage.getItem("rag.theme") === "dark" ? "dark" : "light";
+      } catch {
+        document.documentElement.dataset.theme = "light";
+      }
+    </script>
+    <script type="module" crossorigin src="/console/assets/assets/index-BIMQqo9P.js"></script>
+    <link rel="stylesheet" crossorigin href="/console/assets/assets/index-BqY4R_cL.css">
   </head>
   <body>
-    <div class="shell">
-      <aside>
-        <div class="brand"><span>R</span><div><strong>RAG MCP</strong><small>Standalone Console</small></div></div>
-        <nav>
-          <button class="nav active" data-view="search">检索调试</button>
-          <button class="nav" data-view="documents">知识文档</button>
-          <button class="nav" data-view="connection">连接配置</button>
-        </nav>
-        <div class="service-state"><i id="statusDot"></i><div><strong id="statusText">检查中</strong><small id="statusDetail">RAG Service :8011</small></div></div>
-      </aside>
-
-      <main>
-        <header><div><p>独立 RAG 工作台</p><h1 id="pageTitle">检索调试</h1></div><button id="refreshButton" class="ghost">刷新状态</button></header>
-
-        <section id="searchView" class="view active">
-          <div class="panel hero">
-            <label for="query">查询内容</label>
-            <textarea id="query" rows="4" placeholder="例如：星河 X7 出现 E03 应该怎么处理？"></textarea>
-            <div class="controls">
-              <label>检索方式<select id="retrieval"><option value="hybrid">Hybrid</option><option value="bm25">BM25</option><option value="embedding">Embedding</option></select></label>
-              <label>重排<select id="rerank"><option value="cross_encoder">Cross Encoder</option><option value="none">不重排</option><option value="bi_encoder">Bi Encoder（Mock）</option></select></label>
-              <label>候选数<input id="candidateK" type="number" min="1" max="100" value="10" /></label>
-              <label>返回数<input id="topK" type="number" min="1" max="10" value="5" /></label>
-              <div class="search-actions"><button id="searchButton" class="primary">运行检索</button><button id="compareButton" class="ghost">三模式对比</button></div>
-            </div>
-          </div>
-          <div id="searchError" class="search-error" role="alert" hidden></div>
-          <div class="metrics" id="metrics">
-            <article><span>实际检索方式</span><strong id="metricRetrieval">—</strong></article><article><span>实际重排方式</span><strong id="metricRerank">—</strong></article><article><span>候选 Chunk</span><strong id="metricCandidates">—</strong></article><article><span>证据状态</span><strong id="metricEvidence">—</strong></article><article><span>检索耗时</span><strong id="metricRetrievalMs">—</strong></article><article><span>重排耗时</span><strong id="metricRerankMs">—</strong></article>
-          </div>
-          <div id="results" class="results"><div class="empty">输入问题后运行检索，这里会展示 score、source、chunk_id 和原文。</div></div>
-        </section>
-
-        <section id="documentsView" class="view">
-          <div class="panel upload">
-            <div class="upload-title"><h2>上传知识</h2></div>
-            <input id="fileInput" type="file" multiple accept=".md,.txt,.pdf,.docx,text/markdown,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
-            <div class="chunk-controls">
-              <label>切分策略<select id="chunkStrategy" disabled><option>正在加载</option></select></label>
-              <label><span>块长度（<span class="chunk-unit">token</span>）</span><input id="chunkSize" type="number" min="1" value="512" step="1" /></label>
-              <label><span>重叠上限（<span class="chunk-unit">token</span>）</span><input id="chunkOverlap" type="number" min="0" value="64" step="1" /></label>
-              <button id="uploadButton" class="primary" disabled>上传并索引</button>
-            </div>
-          </div>
-          <div id="uploadResult" class="upload-result" role="status" hidden></div>
-          <div class="panel"><div class="panel-title"><h2>已索引文档</h2><span id="documentCount">0 个</span></div><div id="documents" class="documents"><div class="empty">正在读取文档…</div></div></div>
-        </section>
-
-        <section id="connectionView" class="view">
-          <div class="panel form-panel">
-            <h2>工作区与认证</h2>
-            <p>namespace 用于隔离不同知识库。MCP HTTP 客户端必须发送相同的请求头。</p>
-            <label>Namespace<input id="namespace" value="default" maxlength="64" /></label>
-            <label>Service Token<input id="token" type="password" placeholder="本机 loopback 可留空" autocomplete="off" /></label>
-            <button id="saveConnection" class="primary">保存到当前浏览器</button>
-          </div>
-          <div class="panel model-panel"><h2>模型状态</h2><div id="modelStatus" class="model-status">等待健康检查…</div></div>
-          <div class="panel code-panel"><h2>HTTP MCP 配置</h2><pre id="mcpConfig"></pre><p>协议：<code>2025-11-25</code> / <code>2026-07-28</code> · 工具、提示词、文档资源</p></div>
-        </section>
-        <div id="toast" role="status"></div>
-      </main>
-    </div>
-    <script src="/console/assets/app.js" defer></script>
+    <div id="root"></div>
   </body>
 </html>

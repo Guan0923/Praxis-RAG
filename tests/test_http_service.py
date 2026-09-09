@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -104,17 +105,30 @@ def test_runtime_health_reports_model_state_without_loading_models() -> None:
 def test_standalone_console_is_served_by_the_rag_package(service) -> None:
     _runtime, client = service
 
-    page = client.get("/")
-    script = client.get("/console/assets/app.js")
+    class Assets(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.urls = []
 
-    assert page.status_code == 200
-    assert "RAG MCP Console" in page.text
-    assert script.status_code == 200
-    assert "JSON.stringify(config" in script.text
-    assert "/mcp" in script.text
-    assert "三模式对比" in page.text
-    assert "旧结果已清空" in script.text
-    assert "retrieval_score" in script.text
+        def handle_starttag(self, tag, attrs):
+            attributes = dict(attrs)
+            if tag == "script" and attributes.get("src"):
+                self.urls.append(attributes["src"])
+            if tag == "link" and attributes.get("rel") == "stylesheet":
+                self.urls.append(attributes["href"])
+
+    for url in ("/", "/console"):
+        page = client.get(url)
+        assert page.status_code == 200
+        assert "星河知识库" in page.text
+        assets = Assets()
+        assets.feed(page.text)
+        assert len(assets.urls) >= 2
+        for asset in assets.urls:
+            assert asset.startswith("/console/assets/")
+            response = client.get(asset)
+            assert response.status_code == 200
+            assert response.content
 
 
 def test_remote_service_requires_explicit_mcp_allowlists(monkeypatch: pytest.MonkeyPatch) -> None:

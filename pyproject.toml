@@ -45,4 +45,4 @@ rag-service-migrate = "rag_mcp.migrate:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-rag_mcp = ["web/*"]
+rag_mcp = ["web/*", "web/assets/*"]
