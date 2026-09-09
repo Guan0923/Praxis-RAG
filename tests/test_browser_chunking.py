@@ -98,6 +98,7 @@ def test_browser_real_upload_search_and_themes(console_browser):
             page.get_by_role("button", name="切换深色主题").click()
             page.reload()
             expect(page.get_by_role("button", name="切换浅色主题")).to_be_visible()
+            navigate(page, "检索调试")
             page.get_by_label("查询内容", exact=True).fill("星河 X7 E03 温度传感器故障")
             page.get_by_role("button", name="运行检索", exact=True).click()
             expect(page.locator(".search-result").first).to_be_visible(timeout=180_000)
@@ -354,6 +355,7 @@ def test_browser_workspace_switch_real_documents(console_browser):
     expect(page.get_by_test_id("mcp-config")).to_contain_text(other)
     page.reload()
     expect(page.locator(".workspace-name")).to_have_text(other)
+    expect(page.get_by_role("heading", name="连接配置", exact=True)).to_be_visible()
 
     for width in (1440, 390, 320):
         page.set_viewport_size({"width": width, "height": 900})
@@ -362,7 +364,7 @@ def test_browser_workspace_switch_real_documents(console_browser):
         page.screenshot(path=str(output / f"workspace-switch-{width}.png"), full_page=True, animations="disabled")
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         page.keyboard.press("Escape")
-        page.get_by_role("heading", name="检索调试", exact=True).click()
+        page.get_by_role("heading", name="连接配置", exact=True).click()
 
     page.get_by_role("button", name="切换工作区", exact=True).click()
     page.get_by_role("menuitem", name=namespace, exact=True).click()

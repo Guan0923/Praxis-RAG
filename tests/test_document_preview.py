@@ -114,6 +114,8 @@ def test_browser_existing_pdf_content(tmp_path):
             for index, source in enumerate(sources):
                 page.get_by_role("button", name=source.name, exact=True).click()
                 rendered(1)
+                document_url = url + "/console#/workspaces/manuals/documents/" + quote(source.name, safe="")
+                expect(page).to_have_url(document_url)
                 count = len(PdfReader(source).pages)
                 expect(page.locator(".pdf-page-count")).to_have_text(f"/ {count}")
                 page.screenshot(path=str(output / f"pdf-preview-{index}-desktop.png"), full_page=True)
@@ -149,6 +151,23 @@ def test_browser_existing_pdf_content(tmp_path):
                 }""")
                 rendered(1)
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+                if count > 1:
+                    page.get_by_role("button", name="下一页", exact=True).click()
+                    rendered(2)
+                expect(page).to_have_url(document_url)
+                page.reload()
+                rendered(1)
+                expect(page.locator(".pdf-toolbar .ant-select")).to_contain_text("适合宽度")
+                expect(page).to_have_url(document_url)
+                with browser.new_context(viewport={"width": 1440, "height": 1000}) as linked_context:
+                    linked_context.add_init_script("if (location.protocol === 'http:') { localStorage.setItem('rag.namespace', 'other'); sessionStorage.setItem('rag.token', 'test-token'); }")
+                    linked = linked_context.new_page()
+                    requests = []
+                    linked.on("request", lambda request: requests.append(request) if "/v1/" in request.url else None)
+                    linked.goto(document_url)
+                    expect(linked.locator(".workspace-name")).to_have_text("manuals")
+                    expect(linked.locator(".pdf-viewport canvas")).to_have_attribute("aria-label", f"{source.name}，第 1 页", timeout=30000)
+                    assert requests and all(request.headers.get("x-rag-namespace") == "manuals" for request in requests)
                 page.get_by_role("button", name="切换深色主题", exact=True).click()
                 page.screenshot(path=str(output / f"pdf-preview-{index}-dark.png"), full_page=True)
                 page.get_by_role("button", name="切换浅色主题", exact=True).click()
