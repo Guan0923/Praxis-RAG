@@ -5,13 +5,13 @@ from __future__ import annotations
 import io
 from html.parser import HTMLParser
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from rag_mcp.config import RagConfig, RagConfigError
 from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.migrate import discover_legacy_sources, namespace_for_legacy_user
+from rag_mcp.model_api import ModelConnection
 from rag_mcp.service_knowledge import (
     IndexedDocument,
     KnowledgeDocumentStore,
@@ -100,7 +100,7 @@ def test_supported_rerankers_reach_runtime(service, rerank) -> None:
     assert runtime.search_arguments[-1]["rerank"] == rerank
 
 
-def test_runtime_health_reports_model_state_without_loading_models() -> None:
+def test_runtime_health_reports_http_configuration_without_calling_models() -> None:
     runtime = object.__new__(RagServiceRuntime)
     runtime.config = RagConfig(
         backend="qdrant",
@@ -109,14 +109,16 @@ def test_runtime_health_reports_model_state_without_loading_models() -> None:
         reranker_model="local/reranker",
         reranker_device="cpu",
     )
-    runtime._embedder = SimpleNamespace(is_loaded=True)
-    runtime._reranker = SimpleNamespace(is_loaded=False)
+    runtime._connections = {
+        "embedding": ModelConnection("http://localhost:9000/v1", "local/embedding"),
+        "reranker": ModelConnection(model="local/reranker"),
+    }
 
     status = runtime.status()
 
     assert status["models"] == {
-        "embedding": {"name": "local/embedding", "device": "cpu", "loaded": True},
-        "reranker": {"name": "local/reranker", "device": "cpu", "loaded": False},
+        "embedding": {"name": "local/embedding", "provider": "http", "configured": True},
+        "reranker": {"name": "local/reranker", "provider": "http", "configured": False},
     }
 
 

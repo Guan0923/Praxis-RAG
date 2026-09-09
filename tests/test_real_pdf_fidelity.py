@@ -17,6 +17,7 @@ from rag_mcp.pdf_content import PDF_PARSER_VERSION
 from rag_mcp.resources import document_uri
 from rag_mcp.service_knowledge import RagServiceRuntime
 from test_mcp_http import AUTH, mcp_client, running_service
+from model_api_test_support import configure_api_runtime
 
 
 def check_saved_fidelity(client, collection, folder, document_id):
@@ -89,6 +90,7 @@ def test_real_pdf_ingestion_resources_and_retrieval():
     report = {"root": str(root.resolve()), "parser_version": PDF_PARSER_VERSION, "documents": []}
     filenames = os.getenv("RAG_PDF_SAMPLE_FILES", "aviation.pdf,doclaynet.pdf,mineru_demo2.pdf,scan.pdf").split(",")
     try:
+        configure_api_runtime(runtime)
         with running_service(root / "data", runtime=runtime) as (url, _, _):
             async def scenario():
                 async with httpx.AsyncClient(headers=AUTH, timeout=1200) as http:
@@ -106,7 +108,7 @@ def test_real_pdf_ingestion_resources_and_retrieval():
                         record = payload["imported"][0]
                         folder = root / "data/manuals/knowledge/.pdf-assets" / record["document_id"]
                         manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-                        row["preservation"] = check_saved_fidelity(runtime._client, config.collection, folder, record["document_id"])
+                        row["preservation"] = check_saved_fidelity(runtime._client, runtime.config.collection, folder, record["document_id"])
                         row["parser"] = manifest["parser"]
                         row["metrics"] = manifest["metrics"]
                         row["formula_count"] = sum(block["kind"] == "formula" for block in manifest["blocks"])

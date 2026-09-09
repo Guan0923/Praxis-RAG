@@ -23,6 +23,7 @@ import {
 import { SearchPage } from "./SearchPage";
 import { DocumentsPage } from "./DocumentsPage";
 import { DocumentPreview } from "./DocumentPreview";
+import { ModelSettings } from "./ModelSettings";
 
 const pages = [
   { key: "search", label: "检索调试", icon: <SearchOutlined /> },
@@ -336,35 +337,14 @@ export function Console({
                 </Button>
               </Form>
             </div>
-            <div className="settings-section">
-              <h2>模型状态</h2>
-              {health?.models ? (
-                Object.entries(health.models).map(([key, model]) => (
-                  <div className="model-row" key={key}>
-                    <span>
-                      {key === "embedding" ? "Embedding" : "Reranker"}
-                    </span>
-                    <div>
-                      {model.name}
-                      <div className="secondary">
-                        device: {model.device || "auto"}
-                      </div>
-                    </div>
-                    <Badge
-                      status={model.loaded ? "success" : "default"}
-                      text={model.loaded ? "已载入" : "未载入"}
-                    />
-                  </div>
-                ))
-              ) : (
-                <Alert
-                  type="info"
-                  title={
-                    checking ? "正在检查模型状态" : "当前服务未报告模型状态"
-                  }
-                />
-              )}
-            </div>
+            <ModelSettings
+              connection={connection}
+              disabled={uploading}
+              onApplied={() => {
+                setRevision((value) => value + 1);
+                void refreshHealth();
+              }}
+            />
             <div className="settings-section">
               <h2>HTTP MCP 配置</h2>
               <pre className="config-code" data-testid="mcp-config">

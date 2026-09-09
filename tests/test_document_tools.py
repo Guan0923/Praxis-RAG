@@ -15,6 +15,7 @@ from mcp.server.subscriptions import ResourcesListChanged, ResourceUpdated
 from rag_mcp.config import RagConfig
 from rag_mcp.resources import document_uri
 from rag_mcp.service_knowledge import RagServiceRuntime
+from model_api_test_support import configure_api_runtime
 from test_document_readers import _write_text_pdf
 from test_mcp_http import ADMIN, AUTH, mcp_client, running_service
 
@@ -177,7 +178,7 @@ def test_real_mcp_add_update_delete_and_search(tmp_path):
     runtime.release = threading.Event()
     runtime.wire_responses = []
     try:
-        runtime.warmup()
+        configure_api_runtime(runtime)
         with running_service(tmp_path / "sources", runtime=runtime) as (url, _, _):
             async def scenario():
                 async with mcp_client(url, timeout=120) as client:

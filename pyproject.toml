@@ -21,6 +21,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+api = [
+    "transformers>=4.57,<5",
+]
 dense = [
     "FlagEmbedding>=1.3,<2",
     "transformers>=4.44,<5",

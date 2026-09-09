@@ -62,7 +62,8 @@ def test_changed_embedding_model_invalidates_character_dedup(tmp_path):
     runtime.config = replace(runtime.config, embedding_model="other-model")
     result = runtime.upload("models", [("same.txt", io.BytesIO(b"same model test"))], LEGACY_CONFIG)
     assert len(result["imported"]) == 1 and not result["skipped"]
-    assert result["imported"][0]["chunking"]["tokenizer"] == "other-model"
+    assert result["imported"][0]["chunking"]["embedding_model"] == "other-model"
+    assert result["imported"][0]["chunking"]["tokenizer"] == "BAAI/bge-m3"
 
 
 def test_preflight_api_auth_limits_and_server_hash(tmp_path):

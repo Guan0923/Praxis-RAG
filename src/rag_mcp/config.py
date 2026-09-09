@@ -27,6 +27,7 @@ class RagConfig:
     collection: str = "mini_agent_knowledge_pdf_assets_v1"
     embedding_model: str = "BAAI/bge-m3"
     embedding_device: str | None = None
+    chunk_tokenizer_model: str = "BAAI/bge-m3"
     vector_size: int = DENSE_VECTOR_SIZE
     preload_model: bool = False
     namespace: str | None = None
@@ -76,6 +77,7 @@ class RagConfig:
             collection=collection,
             embedding_model=os.getenv("RAG_EMBEDDING_MODEL", "BAAI/bge-m3").strip() or "BAAI/bge-m3",
             embedding_device=_optional_env("RAG_EMBEDDING_DEVICE"),
+            chunk_tokenizer_model=_optional_env("RAG_CHUNK_TOKENIZER_MODEL") or "BAAI/bge-m3",
             vector_size=vector_size,
             preload_model=_boolean_env("RAG_PRELOAD_MODEL", default=False),
             namespace=_optional_env("RAG_NAMESPACE"),

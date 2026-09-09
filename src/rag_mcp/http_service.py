@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from typing import Literal
+from urllib.parse import urlsplit
 
 import anyio
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.server.subscriptions import PromptsListChanged, ToolsListChanged
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.routing import Route
 
 from . import __version__
@@ -33,6 +38,7 @@ from .service_knowledge import (
     KnowledgeValidationError,
     RagServiceRuntime,
 )
+from .model_api import ModelAPIError
 
 _NAMESPACE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _WEB_ROOT = Path(__file__).with_name("web")
@@ -57,6 +63,8 @@ _LOCAL_MCP_ORIGINS = (
 
 class ServiceRuntime(Protocol):
     def status(self) -> dict[str, object]: ...
+    def model_settings(self) -> dict[str, object]: ...
+    def model_action(self, kind: str, values: dict[str, object], action: str) -> dict[str, object]: ...
     def list_documents(self, namespace: str) -> list[dict[str, object]]: ...
     def upload(self, namespace: str, items: list[tuple[str, object]], chunking: ChunkingConfig | None = None) -> dict[str, object]: ...
     def check_documents(self, namespace: str, items: list[dict[str, str]], chunking: ChunkingConfig) -> dict[str, object]: ...
@@ -106,6 +114,43 @@ class RagHttpSettings:
             mcp_allowed_hosts=_csv_setting(raw_allowed_hosts, _LOCAL_MCP_HOSTS),
             mcp_allowed_origins=_csv_setting(raw_allowed_origins, _LOCAL_MCP_ORIGINS),
         )
+
+
+class ModelSettingsBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base_url: str = Field(default="", max_length=2048)
+    model: str = Field(default="", max_length=512)
+    apikey: SecretStr = SecretStr("")
+
+    def values(self) -> dict[str, object]:
+        result = self.model_dump(exclude_unset=True)
+        if "apikey" in result:
+            result["apikey"] = self.apikey.get_secret_value()
+        return result
+
+
+def _local_model_request(request: Request) -> bool:
+    if not request.client:
+        return False
+    try:
+        if not ipaddress.ip_address(request.client.host).is_loopback:
+            return False
+        if request.url.hostname not in _LOOPBACK_HOSTS:
+            return False
+        if any(header in request.headers for header in (
+            "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip",
+        )) or request.headers.get("sec-fetch-site") == "cross-site":
+            return False
+        if origin := request.headers.get("origin"):
+            parsed = urlsplit(origin)
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            target_port = request.url.port or (443 if request.url.scheme == "https" else 80)
+            if (parsed.scheme != request.url.scheme or parsed.hostname != request.url.hostname
+                    or port != target_port or parsed.username or parsed.password):
+                return False
+        return True
+    except ValueError:
+        return False
 
 
 class SearchBody(BaseModel):
@@ -191,6 +236,42 @@ def create_service_app(
     app.state.runtime = resolved_runtime
     app.state.mcp_endpoint = mcp_endpoint
     app.router.routes.append(Route("/mcp", endpoint=mcp_endpoint, methods=["GET", "POST", "DELETE"]))
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, error):
+        if request.url.path.startswith("/v1/model-settings"):
+            return JSONResponse({"detail": "模型设置参数无效"}, status_code=422)
+        return await request_validation_exception_handler(request, error)
+
+    @app.exception_handler(ModelAPIError)
+    async def model_api_error(_request, error):
+        return JSONResponse({"detail": str(error)}, status_code=400)
+
+    def model_auth(authorization: str | None = Header(default=None)) -> None:
+        tenant_from_headers(authorization, "default")
+
+    def local_model_auth(request: Request, _auth=Depends(model_auth)) -> None:
+        if not _local_model_request(request):
+            raise HTTPException(status_code=403, detail="仅允许本机直接访问时修改或测试模型设置")
+
+    @app.get("/v1/model-settings")
+    def model_settings(request: Request, _auth=Depends(model_auth)):
+        return {"models": resolved_runtime.model_settings(), "writable": _local_model_request(request)}
+
+    @app.patch("/v1/model-settings/{kind}")
+    def save_model_settings(kind: Literal["embedding", "reranker"], body: ModelSettingsBody,
+                            _auth=Depends(local_model_auth)):
+        return resolved_runtime.model_action(kind, body.values(), "save")
+
+    @app.post("/v1/model-settings/{kind}/models")
+    def model_list(kind: Literal["embedding", "reranker"], body: ModelSettingsBody,
+                   _auth=Depends(local_model_auth)):
+        return resolved_runtime.model_action(kind, body.values(), "models")
+
+    @app.post("/v1/model-settings/{kind}/test")
+    def model_test(kind: Literal["embedding", "reranker"], body: ModelSettingsBody,
+                   _auth=Depends(local_model_auth)):
+        return resolved_runtime.model_action(kind, body.values(), "test")
 
     @app.exception_handler(KnowledgeError)
     async def knowledge_error(_request, _error):
@@ -380,10 +461,7 @@ def main() -> int:
 
     settings = RagHttpSettings.from_env()
     app = create_service_app(settings=settings)
-    runtime = app.state.runtime
-    if getattr(runtime, "config", None) is not None and runtime.config.preload_model:
-        runtime.warmup()
-    uvicorn.run(app, host=settings.host, port=settings.port, timeout_graceful_shutdown=5)
+    uvicorn.run(app, host=settings.host, port=settings.port, timeout_graceful_shutdown=5, proxy_headers=False)
     return 0
 
 

@@ -18,7 +18,7 @@ export type DocumentInfo = {
   collection: string;
   chunking?: Chunking;
 };
-export type ModelState = { name: string; device: string; loaded: boolean };
+export type ModelState = { name: string; configured: boolean; provider: "http" };
 export type Health = {
   backend?: string;
   collection?: string;

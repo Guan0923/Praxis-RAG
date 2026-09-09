@@ -100,3 +100,83 @@ Date: 2026-09-09
   remains non-blocking.
 - Local merge only; no push or existing-service restart. The independent
   frontend worktree and preview service were retained.
+
+# Model API Settings Validation
+
+Date: 2026-09-09
+
+Implemented in `.worktrees/model-api-settings` on `codex/model-api-settings`,
+created from local `main` at `f07df00`. No commit, merge, or push was performed.
+The original checkout and port-8011 service were not changed.
+
+## Behavior
+
+- Embedding and Reranker now use independently configured HTTP endpoints in
+  the standalone HTTP/MCP runtime. No local inference model is loaded there.
+- Console supports editable model lists, optional API keys, real connection
+  tests, and persistent immediate application. API keys are never returned
+  or stored in browser storage; Windows persistence uses DPAPI.
+- Configuration mutations and proxy/test requests require a direct local
+  request and existing service authentication. Remote configuration is read-only.
+- All runtime operations resolve their model dependencies under the same
+  configuration lock. Existing namespaces are refreshed together after saving.
+- Vector sizes are detected from responses. Occupied namespaces and stored
+  Qdrant points prevent changing embedding identity/dimension; changing empty
+  collection dimensions creates a new collection without deleting the old one.
+- Chunk tokenizer identity is separate from API model identity; both remain
+  part of upload deduplication metadata.
+
+## Verified Results
+
+- Frontend TypeScript check and production build passed. Existing Vite warning
+  for the approximately 1.03 MB main bundle remains non-blocking.
+- Focused HTTP, settings, MCP, document operations and dedup suite:
+  **64 passed, 1 opt-in skipped**, four existing legacy MCP warnings.
+- Settings boundary suite plus real browser acceptance: **21 passed**.
+  Includes a fresh Python process restoring persisted configuration and
+  decrypting its key, then successfully calling the configured API.
+- Real MCP acceptance: **1 passed**. Added, retrieved, updated, read, and
+  deleted a document using actual BGE embeddings through HTTP and real Qdrant.
+- Real browser acceptance used actual CUDA BGE-M3 and BGE Reranker behind an
+  independent HTTP test provider. Verified empty-key configuration, model
+  lists and manual entry, real testing/saving, upload with recursive token
+  chunking using a remote model alias, embedding retrieval with reranking,
+  occupied-model-change rejection, key non-disclosure/preservation/clearing,
+  remote read-only controls and browser reload persistence.
+- Screenshots at 1440, 390 and 320 pixels in both themes were inspected.
+  No horizontal overflow or unhandled page errors were detected.
+- Ruff on changed Python modules/tests and `git diff --check` passed.
+
+## Full-Suite Boundary
+
+The broader suite returned **145 passed, 12 skipped, 5 failed** before the
+additional fresh-process case was added. All five failures were reproduced
+against the original main checkout using the same environment: four require
+missing `docling_core`, and one expects an OCR error but receives a missing
+`docling` error. They are not counted as passing or changed in this work.
+Full real PDF parsing was not rerun for this model-API change.
+
+## Local Preview and Reproduction
+
+- Preview: `http://127.0.0.1:8031/console`.
+- Independent real test provider: `http://127.0.0.1:8032/v1`, with aliases
+  `served-embedding` and `served-reranker`. It uses already cached weights
+  in the `dl` environment and is not launched by production application code.
+- Both preview helpers are left running for inspection. The provider occupies
+  GPU memory; original service processes and data paths were not restarted.
+- RAG data/Qdrant and logs: `.test-tmp/model-api-acceptance/`;
+  provider logs: `.test-tmp/model-api-live/`;
+  screenshots: `.test-tmp/model-api-browser/`.
+- Python tests use the worktree-local `.venv` created from `conda activate dev`,
+  with `pip install -e ".[api]" playwright`. Shared environments were unchanged.
+
+```powershell
+conda activate dev
+$env:PYTHONPATH = "$PWD/src"
+.venv\Scripts\python -m pytest tests/test_model_api_settings.py tests/test_http_service.py tests/test_mcp_http.py tests/test_document_tools.py tests/test_upload_dedup.py -q
+$env:RAG_MODEL_API_TEST_URL = "http://127.0.0.1:8031"
+$env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
+.venv\Scripts\python -m pytest tests/test_real_model_api_ui.py -q -s
+$env:RAG_REAL_SMOKE = "1"
+.venv\Scripts\python -m pytest tests/test_document_tools.py -k real_mcp -q -s
+```

@@ -12,6 +12,7 @@ from rag_mcp.chunk_strategies import ChunkingConfig
 from rag_mcp.config import RagConfig
 from rag_mcp.service_knowledge import RagServiceRuntime
 from test_document_readers import _write_text_pdf
+from model_api_test_support import configure_api_runtime
 
 
 @pytest.mark.skipif(os.getenv("RAG_REAL_SMOKE") != "1", reason="Set RAG_REAL_SMOKE=1 for real model inference")
@@ -36,6 +37,7 @@ def test_real_model_ingestion_and_retrieval(tmp_path):
     document.save(word)
     report = []
     try:
+        configure_api_runtime(runtime)
         for strategy in ("character", "token", "sentence", "recursive", "structure"):
             namespace = f"smoke-{strategy}"
             chunking = ChunkingConfig(strategy, 700, 100) if strategy == "character" else ChunkingConfig(strategy, 64, 12)

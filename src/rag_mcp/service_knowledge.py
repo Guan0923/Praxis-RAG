@@ -11,6 +11,7 @@ import re
 import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from functools import wraps
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
@@ -24,6 +25,8 @@ from .contracts import SearchRequest
 from .document_readers import SUPPORTED_SUFFIXES, read_document_text
 from .orchestrator import RagOrchestrator
 from .pdf_content import PDF_PARSER_VERSION
+from .model_api import HTTPEmbedder, HTTPReranker, ModelAPIError, ModelConnection, ModelHTTPClient
+from .model_settings import KINDS, ModelSettingsStore, draft_connection
 
 SUPPORTED_EXTENSIONS = SUPPORTED_SUFFIXES
 MAX_FILES_PER_BATCH = 10
@@ -137,7 +140,7 @@ class KnowledgeDocumentStore:
 
     def store_and_index(self, raw_name: str, readable: object, ingester: DocumentIngester,
                         chunking: ChunkingConfig | None = None, tokenizer_model: str = "BAAI/bge-m3",
-                        *, deduplicate_across_names: bool = True) -> dict[str, object]:
+                        *, deduplicate_across_names: bool = True, embedding_model: str | None = None) -> dict[str, object]:
         """Replace one source and roll back the file if indexing fails."""
 
         name = self.sanitize_name(raw_name)
@@ -162,6 +165,8 @@ class KnowledgeDocumentStore:
             if target.is_symlink():
                 raise KnowledgeValidationError(f"知识文件不能是符号链接：{name}")
             configuration = _index_configuration(name, (chunking or LEGACY_CONFIG).metadata(tokenizer_model))
+            if embedding_model is not None:
+                configuration["embedding_model"] = embedding_model
             previous = self.find_duplicate(sha256, configuration, only_name=None if deduplicate_across_names else name)
             if previous:
                 temporary.unlink()
@@ -292,7 +297,7 @@ class DenseDocumentIngester:
 
                 parsed_pdf = parse_pdf(
                     path, source_root=source_root, config=chunking,
-                    tokenizer_model=self._config.embedding_model,
+                    tokenizer_model=self._config.chunk_tokenizer_model,
                     parser_python=self._config.pdf_parser_python,
                     models_path=self._config.pdf_models_path,
                     timeout_seconds=self._config.pdf_parse_timeout,
@@ -300,7 +305,7 @@ class DenseDocumentIngester:
                 chunks = parsed_pdf.chunks
             else:
                 chunks = chunk_document(path, source_root=source_root, config=chunking,
-                                        tokenizer_model=self._config.embedding_model)
+                                        tokenizer_model=self._config.chunk_tokenizer_model)
         except ValueError as exc:
             raise KnowledgeValidationError(str(exc)) from exc
         if not chunks:
@@ -354,6 +359,16 @@ class TenantResources:
     lock: RLock
 
 
+def _runtime_operation(method):
+    # Acquire before resolving a tenant: configuration changes cannot leave queued
+    # operations holding stale model/collection references.
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        with self._inference_lock:
+            return method(self, *args, **kwargs)
+    return run
+
+
 class RagServiceRuntime:
     """Long-lived model/Qdrant owner serving isolated tenant namespaces."""
 
@@ -362,8 +377,6 @@ class RagServiceRuntime:
             raise KnowledgeError("Standalone RAG service requires RAG_BACKEND=qdrant.")
         from qdrant_client import QdrantClient
 
-        from .embeddings import BgeM3Embedder
-        from .rerankers.cross_encoder import CrossEncoderReranker
         from .sparse import Bm25SparseEncoder
 
         self.config = config
@@ -371,22 +384,25 @@ class RagServiceRuntime:
         if self.data_root.is_symlink():
             raise KnowledgeError("RAG service data root cannot be a symbolic link.")
         self.data_root.mkdir(parents=True, exist_ok=True)
+        self._settings_store = ModelSettingsStore(self.data_root)
+        self._connections, collection = self._settings_store.load({
+            "embedding": ModelConnection(model=config.embedding_model),
+            "reranker": ModelConnection(model=config.reranker_model),
+        }, config.collection)
+        self.config = replace(config, collection=collection,
+                              embedding_model=self._connections["embedding"].model,
+                              reranker_model=self._connections["reranker"].model,
+                              vector_size=self._connections["embedding"].vector_size or config.vector_size)
+        self._model_checks: dict[str, dict[str, object]] = {}
         self._client = QdrantClient(
             url=config.qdrant_url,
             path=str(config.qdrant_path) if config.qdrant_path else None,
         )
-        self._embedder = BgeM3Embedder(
-            config.embedding_model,
-            device=config.embedding_device,
-            vector_size=config.vector_size,
-        )
+        self._embedder = HTTPEmbedder(self._connections["embedding"])
         self._sparse_encoder = Bm25SparseEncoder()
-        self._reranker = CrossEncoderReranker(
-            config.reranker_model,
-            device=config.reranker_device,
-            batch_size=config.reranker_batch_size,
+        self._reranker = HTTPReranker(
+            self._connections["reranker"],
             max_candidates=config.reranker_max_candidates,
-            max_length=config.reranker_max_length,
             max_text_chars=config.reranker_max_text_chars,
         )
         self._tenants: dict[str, TenantResources] = {}
@@ -399,28 +415,95 @@ class RagServiceRuntime:
             "service": "rag-mcp-service",
             "backend": self.config.backend,
             "collection": self.config.collection,
-            "models": {
-                "embedding": {
-                    "name": self.config.embedding_model,
-                    "device": self.config.embedding_device or "auto",
-                    "loaded": self._embedder.is_loaded,
-                },
-                "reranker": {
-                    "name": self.config.reranker_model,
-                    "device": self.config.reranker_device or "auto",
-                    "loaded": self._reranker.is_loaded,
-                },
-            },
+            "models": {kind: {"name": item.model, "configured": item.configured, "provider": "http"}
+                       for kind, item in self._connections.items()},
         }
 
+    def model_settings(self) -> dict[str, object]:
+        return {kind: {**item.public(), **self._model_checks.get(kind, {})}
+                for kind, item in self._connections.items()}
+
+    @_runtime_operation
+    def model_action(self, kind: str, values: dict[str, object], action: str) -> dict[str, object]:
+        if kind not in KINDS or action not in {"models", "test", "save"}:
+            raise ModelAPIError("未知模型设置操作")
+        current = self._connections[kind]
+        draft = draft_connection(current, values, require_model=action != "models")
+        if action == "models":
+            return {"models": ModelHTTPClient(draft).models()}
+        try:
+            if kind == "embedding":
+                vectors = HTTPEmbedder(draft).embed_documents(["connection test"])
+                draft = replace(draft, vector_size=len(vectors[0]))
+            else:
+                HTTPReranker(draft).scores("connection test", ["connection test"])
+        except ModelAPIError as exc:
+            if draft.base_url == current.base_url and draft.model == current.model and draft.api_key == current.api_key:
+                self._model_checks[kind] = {"status": "error", "last_error": str(exc),
+                                            "checked_at": datetime.now(UTC).isoformat()}
+            raise
+        checked = {"status": "ok", "last_error": "", "checked_at": datetime.now(UTC).isoformat()}
+        if action == "test":
+            if draft.base_url == current.base_url and draft.model == current.model and draft.api_key == current.api_key:
+                self._model_checks[kind] = checked
+            return {**draft.public(), **checked}
+
+        collection = self.config.collection
+        size = self.config.vector_size
+        if kind == "embedding":
+            size = draft.vector_size
+            occupied = self._has_indexed_documents()
+            current_size = self.config.vector_size
+            try:
+                if self._client.collection_exists(collection):
+                    current_size = self._client.get_collection(collection).config.params.vectors["dense"].size
+            except Exception as exc:
+                raise ModelAPIError("无法确认现有索引的向量长度，未修改配置") from exc
+            if occupied and (draft.model != self.config.embedding_model or size != current_size):
+                raise ModelAPIError("已有知识文档，不能更换 Embedding 模型或向量长度；请先清空所有工作区")
+            if size != current_size:
+                from .storage.qdrant_store import QdrantStore
+
+                collection = f"{self.config.collection[:120]}_api_{uuid4().hex[:12]}"
+                QdrantStore(collection=collection, vector_size=size, client=self._client).ensure_collection()
+        connections = {**self._connections, kind: draft}
+        config = replace(self.config, collection=collection, vector_size=size,
+                         embedding_model=connections["embedding"].model, reranker_model=connections["reranker"].model)
+        embedder = HTTPEmbedder(connections["embedding"])
+        reranker = HTTPReranker(connections["reranker"], max_candidates=config.reranker_max_candidates,
+                               max_text_chars=config.reranker_max_text_chars)
+        self._settings_store.save(connections, collection)
+        self.config = config
+        self._embedder, self._reranker = embedder, reranker
+        self._connections = connections
+        self._model_checks[kind] = checked
+        self._tenants.clear()
+        return {**draft.public(), **checked}
+
+    def _has_indexed_documents(self) -> bool:
+        try:
+            for manifest in self.data_root.glob("*/manifest.json"):
+                value = json.loads(manifest.read_text(encoding="utf-8"))
+                if not isinstance(value, dict):
+                    raise ValueError("invalid manifest")
+                if value:
+                    return True
+            if self._client.collection_exists(self.config.collection):
+                return self._client.count(collection_name=self.config.collection, exact=True).count > 0
+            return False
+        except Exception as exc:
+            raise ModelAPIError("无法确认知识库是否为空，未修改模型配置") from exc
+
+    @_runtime_operation
     def list_documents(self, namespace: str) -> list[dict[str, object]]:
         tenant = self._tenant(namespace)
         with tenant.lock:
             return tenant.documents.list_documents()
 
     def chunking_metadata(self, chunking: ChunkingConfig) -> dict[str, object]:
-        return chunking.metadata(self.config.embedding_model)
+        return {**chunking.metadata(self.config.chunk_tokenizer_model), "embedding_model": self.config.embedding_model}
 
+    @_runtime_operation
     def check_documents(self, namespace: str, items: list[dict[str, str]],
                         chunking: ChunkingConfig) -> dict[str, object]:
         tenant = self._tenant(namespace)
@@ -432,11 +515,12 @@ class RagServiceRuntime:
                                    item["sha256"], _index_configuration(item["name"], configuration))}
                               for item in items]}
 
+    @_runtime_operation
     def upload(self, namespace: str, items: list[tuple[str, object]],
                chunking: ChunkingConfig | None = None) -> dict[str, object]:
         tenant = self._tenant(namespace)
         tenant.documents.validate_uploads(items)
-        model = self.config.embedding_model
+        model = self.config.chunk_tokenizer_model
         imported: list[dict[str, object]] = []
         skipped: list[dict[str, object]] = []
         failed: list[dict[str, str]] = []
@@ -444,7 +528,8 @@ class RagServiceRuntime:
             for name, readable in items:
                 try:
                     with self._inference_lock:
-                        record = tenant.documents.store_and_index(name, readable, tenant.ingester, chunking, model)
+                        record = tenant.documents.store_and_index(name, readable, tenant.ingester, chunking, model,
+                                                                  embedding_model=self.config.embedding_model)
                         if record.pop("skipped", False):
                             skipped.append(record)
                         else:
@@ -454,6 +539,7 @@ class RagServiceRuntime:
             documents = tenant.documents.list_documents()
         return {"imported": imported, "skipped": skipped, "failed": failed, "documents": documents}
 
+    @_runtime_operation
     def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool) -> dict[str, object]:
         tenant = self._tenant(namespace)
         if tenant.documents.sanitize_name(name) != name:
@@ -468,15 +554,16 @@ class RagServiceRuntime:
                 raise KnowledgeValidationError(f"Document already exists: {name}; use update_document")
             configuration = ChunkingConfig()
             if existing is not None:
-                saved = existing.get("chunking", LEGACY_CONFIG.metadata(self.config.embedding_model))
+                saved = existing.get("chunking", LEGACY_CONFIG.metadata(self.config.chunk_tokenizer_model))
                 configuration = ChunkingConfig(str(saved["strategy"]), saved["chunk_size"], saved["chunk_overlap"])
             readable = io.BytesIO(content)
             tenant.documents.validate_uploads([(name, readable)])
             try:
                 with self._inference_lock:
                     record = tenant.documents.store_and_index(
-                        name, readable, tenant.ingester, configuration, self.config.embedding_model,
+                        name, readable, tenant.ingester, configuration, self.config.chunk_tokenizer_model,
                         deduplicate_across_names=False,
+                        embedding_model=self.config.embedding_model,
                     )
             except Exception as exc:
                 raise KnowledgeError(_safe_error(exc)) from exc
@@ -485,6 +572,7 @@ class RagServiceRuntime:
             return {"status": "unchanged" if unchanged else ("updated" if overwrite else "added"),
                     "document": record, "documents": tenant.documents.list_documents()}
 
+    @_runtime_operation
     def delete(self, namespace: str, name: str) -> dict[str, object]:
         tenant = self._tenant(namespace)
         with tenant.lock:
@@ -492,12 +580,14 @@ class RagServiceRuntime:
             documents = tenant.documents.list_documents()
         return {"deleted": deleted, "documents": documents}
 
+    @_runtime_operation
     def search(self, namespace: str, arguments: Mapping[str, object]) -> dict[str, object]:
         tenant = self._tenant(namespace)
         request = SearchRequest.from_arguments(dict(arguments))
         with tenant.lock, self._inference_lock:
             return tenant.orchestrator.search(request)
 
+    @_runtime_operation
     def read_document_file(self, namespace: str, name: str) -> bytes:
         tenant = self._tenant(namespace)
         with tenant.lock:
@@ -516,6 +606,7 @@ class RagServiceRuntime:
                 raise KnowledgeValidationError("Document exceeds the file size limit")
             return content
 
+    @_runtime_operation
     def read_document(self, namespace: str, name: str) -> tuple[str, str]:
         tenant = self._tenant(namespace)
         with tenant.lock:
@@ -537,11 +628,6 @@ class RagServiceRuntime:
             else:
                 text = read_document_text(target)
             return text, str(record["indexed_at"])
-
-    def warmup(self) -> None:
-        self._embedder.warmup()
-        if self.config.preload_reranker:
-            self._reranker.warmup()
 
     def _tenant(self, namespace: str) -> TenantResources:
         with self._tenant_lock:
@@ -588,6 +674,6 @@ class RagServiceRuntime:
 
 
 def _safe_error(exc: Exception) -> str:
-    if isinstance(exc, KnowledgeError):
+    if isinstance(exc, (KnowledgeError, ModelAPIError)):
         return str(exc)[:500]
     return f"知识库操作失败：{type(exc).__name__}"

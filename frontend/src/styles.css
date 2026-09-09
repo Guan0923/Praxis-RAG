@@ -429,6 +429,32 @@ h3 {
 .connection-form {
   max-width: 560px;
 }
+.model-key-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.model-key-row > .ant-form-item {
+  flex: 1;
+  min-width: 0;
+}
+.model-key-row > .ant-btn {
+  margin-top: 30px;
+  flex-shrink: 0;
+}
+.model-api-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.model-check-time,
+.model-api-error {
+  margin-top: 16px;
+  overflow-wrap: anywhere;
+}
+.model-api-form .ant-select {
+  width: 100%;
+}
 .model-row {
   display: grid;
   grid-template-columns: 100px minmax(0, 1fr) auto;

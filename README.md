@@ -20,20 +20,20 @@ RAG 只返回证据，不生成最终回答。是否调用、是否改写查询�
 
 ```powershell
 cd xinghe_rag
-uv sync --extra dense
+uv sync --extra api
 ```
 
 作为独立工具安装当前目录：
 
 ```powershell
 cd xinghe_rag
-uv tool install --editable ".[dense,pdf]"
+uv tool install --editable ".[api,pdf]"
 ```
 
 从独立 Git 仓库直接安装：
 
 ```powershell
-uv tool install "mini-agent-rag-mcp[dense,pdf] @ git+https://github.com/Guan0923/xinghe_rag.git"
+uv tool install "mini-agent-rag-mcp[api,pdf] @ git+https://github.com/Guan0923/xinghe_rag.git"
 ```
 
 安装后，`rag-service`、`rag-mcp-debug`、`rag-mcp-ingest` 和 `rag-service-migrate` 都是独立命令。
@@ -58,8 +58,6 @@ docker start mini-agent-qdrant
 $env:RAG_BACKEND = "qdrant"
 $env:QDRANT_URL = "http://127.0.0.1:6333"
 $env:RAG_COLLECTION = "mini_agent_knowledge_pdf_assets_v1"
-$env:RAG_EMBEDDING_DEVICE = "cuda:0"
-$env:RAG_RERANKER_DEVICE = "cuda:0"
 $env:RAG_SERVICE_DATA_ROOT = "$HOME/.mini_agent-rag"
 $env:RAG_PDF_PARSER_PYTHON = "C:/path/to/pdf-parser/python.exe"
 $env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
@@ -82,13 +80,39 @@ uv run --package mini-agent-rag-mcp rag-service
 
 Console 包含知识上传、文档删除、BM25/Embedding/Hybrid 检索、Reranker 切换、Top-K 结果、score、source、chunk_id 和阶段耗时。它直接访问同源 RAG API，不经过 Mini-Agent。调试页还提供“三模式对比”，固定关闭重排并并排展示三种 Retriever 的原始结果，避免 Cross Encoder 把不同召回重新排成相同顺序。
 
-首次上传或 Dense 检索时会下载并加载 BGE-M3。PDF 由独立 Docling 2.126.0 子进程解析，使用 PDFium、CUDA 和本机模型；图片或表格没有有效原文说明时，才使用固定版本的 Granite Vision 3.3 2B 生成检索描述。图片原图保存在租户目录，图表原始数据和检索文字写入 Qdrant。每批最多 10 个文件，单文件最大 10 MiB。
+启动后在“连接配置”中分别设置 Embedding 和 Reranker 的模型 API。RAG HTTP 服务不再加载本地 Embedding/Reranker 权重，也不控制推理框架的 CPU/GPU；本地推理框架需自行运行，再填写其地址与端口。未配置时，相应操作明确报错，不回退到本地模型。
+
+PDF 仍由独立 Docling 2.126.0 子进程解析，使用 PDFium、CUDA 和本机解析模型；图片或表格没有有效原文说明时，才使用固定版本的 Granite Vision 3.3 2B 生成检索描述。图片原图保存在租户目录，图表原始数据和检索文字写入 Qdrant。每批最多 10 个文件，单文件最大 10 MiB。
 
 PDF 公式使用本地 CodeFormulaV2 转为 LaTeX，开启生成缓存，并以紧裁剪、单公式推理减少相邻文字干扰。模型错误、空公式输出或生成被截断会导致该文件解析失败，不静默跳过。模型能够输出 LaTeX 不代表数学内容一定正确，复杂公式仍需要用原页验证。
 
 OCR 不再按默认置信度阈值丢弃已识别文字；低置信度内容保留，并在 `ocr.json`、解析清单和相关检索块的 `source_warnings` 中记录。保留文字不等于识别正确，扫描件仍可能有错字。
 
 每份 PDF 的原生 `document.json`、按阅读顺序保存的 `manifest.json`、正文 `document.md`、OCR 记录 `ocr.json` 和图片保存在知识目录的 `.pdf-assets/<document_id>/`。正文、图片、表格与公式保持 Docling 的遍历顺序；图注、表题、脚注保留原文关联，不按长度丢弃，也不猜配未关联注解。生成描述仅用于检索，不充当原文注解。命令行 PDF 导入和 MCP 正文读取使用同一份解析结果。
+
+### 模型 API 设置
+
+两组设置各自包含 `base_url`、`apikey` 和 `model`，支持不同提供方。密钥可为空；非空时仅以 `Authorization: Bearer ...` 发送。不自动重试或跟随重定向，连接超时为 5 秒、单次读写超时为 60 秒。
+
+- 地址按原样保留路径前缀，仅去除末尾斜杠。例如 `http://localhost:9000/v1` 对应 `/v1/models`、`/v1/embeddings`、`/v1/rerank`；不会自动补 `/v1`。
+- “获取模型列表”读取 `data[].id`；接口不可用时仍可手填。“测试连接”和“保存并应用”都会发送最小真实推理请求，远程服务可能计费。
+- Embedding 使用 `model`、`input`，读取 `data[].index` 和 `embedding`；Reranker 使用 `model`、`query`、`documents`、`top_n`，读取 `results[].index` 和 `relevance_score`。
+- 保存先验证，再等待进行中的操作结束，统一更新所有工作区。失败保留旧配置；已有文档时禁止更换 Embedding 名称或向量长度。空库需要不同向量长度时创建新集合，不删除旧集合。
+- 配置存于服务数据目录的 `model-api-settings.json`，优先于旧模型名称环境变量。Windows 密钥使用当前账号的 DPAPI 加密；其他系统使用权限为 `0600` 的配置文件。密钥不回显、不进入浏览器存储；编辑地址不会复用旧密钥。
+- 仅本机直连可修改、获取列表或测试；远程访问只读。接口检查实际连接地址、Host、Origin 和转发标头，并沿用 Service Token 认证。
+- `GET /v1/model-settings` 返回只读配置与 `writable`；`PATCH /v1/model-settings/{embedding|reranker}` 保存；`POST` 同一路径的 `/models`、`/test` 分别列模型和测试。请求省略 `apikey` 表示保留同地址旧密钥，传空字符串表示清除。
+- 切分 tokenizer 单独使用 `RAG_CHUNK_TOKENIZER_MODEL`，默认 `BAAI/bge-m3`，只加载分词文件，不加载推理权重。API 中的模型别名不会作为 tokenizer 下载地址；远端输入长度限制仍以实际服务为准。
+
+真实 API 浏览器验收需要独立 RAG 服务、独立数据目录和真正运行模型的推理服务：
+
+```powershell
+conda activate dev
+$env:RAG_MODEL_API_TEST_URL = "http://127.0.0.1:8031"
+$env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
+.venv\Scripts\python -m pytest tests/test_real_model_api_ui.py -q -s
+```
+
+本仓库的测试辅助服务 `tests/model_api_inference_server.py --port 8032` 在 `dl` 环境中使用真实缓存 BGE 模型提供验收接口（模型别名 `served-embedding`、`served-reranker`），不属于生产 RAG 服务。测试截图在 `.test-tmp/model-api-browser/`。
 
 ### 前端开发与打包
 
@@ -144,7 +168,7 @@ PDF 正文实际执行所选切分策略；公式整体保留，表格按完整�
 - `GET /v1/chunking/strategies` 返回策略选项、单位和默认参数。
 - `POST /v1/documents` 在原 `files` multipart 字段外接收 `strategy`、`chunk_size`、`chunk_overlap`。
 - `POST /v1/documents/check` 接收 JSON：`{"files":[{"name":"guide.md","sha256":"64位小写十六进制哈希"}],"strategy":"recursive","chunk_size":512,"chunk_overlap":64}`，返回同序的 `files`，每项 `document` 为已有文档或 `null`。
-- 三个接口均沿用 `X-RAG-Namespace` 和服务认证。去重仅在同一 namespace 内比较文件 SHA-256、策略、长度、重叠及 tokenizer 标识；文件名不参与比较。
+- 三个接口均沿用 `X-RAG-Namespace` 和服务认证。去重仅在同一 namespace 内比较文件 SHA-256、策略、长度、重叠、Embedding 模型及 tokenizer 标识；文件名不参与比较。
 - PDF 去重还比较 `pdf_parser_version`，解析器更新后重新上传会重新索引。旧 PDF 不自动迁移，缺少当前版本解析正文时 MCP 会要求显式重新导入，不回退到旧的纯文本提取。
 - 浏览器先计算哈希并检查，命中则不发送文件正文。需要 HTTPS 或 localhost 安全连接。后端接收正文时重新计算哈希，并在租户锁内再次去重。
 - 上传结果分别包含 `imported`、`skipped`、`failed` 和 `documents`。更改参数会重新索引；改名但配置相同则返回已有文档，不新建别名。已有文档不会自动重建。
@@ -155,6 +179,7 @@ PDF 正文实际执行所选切分策略；公式整体保留，表格按完整�
 ```powershell
 conda activate dl
 $env:RAG_REAL_SMOKE = "1"
+$env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
 python -m pytest tests/test_real_chunking.py -q -s
 ```
 
@@ -276,6 +301,7 @@ $env:PYTHONPATH = "$PWD/src"
 $env:HF_HUB_OFFLINE = "1"
 $env:TRANSFORMERS_OFFLINE = "1"
 $env:RAG_REAL_PDF = "1"
+$env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
 $env:RAG_PDF_PARSER_PYTHON = "C:/path/to/pdf-parser/python.exe"
 $env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
 $env:RAG_PDF_SAMPLES = "C:/path/to/pdf/samples"
@@ -294,12 +320,12 @@ $env:RAG_PDF_SAMPLE_FILES = "aviation.pdf,doclaynet.pdf,mineru_demo2.pdf,scan.pd
 ```powershell
 conda activate dev
 python -m venv --system-site-packages .venv
-.venv\Scripts\python -m pip install -e .
+.venv\Scripts\python -m pip install -e ".[api]"
 .venv\Scripts\python -m pytest tests -q
 .venv\Scripts\python -m rag_mcp.http_service
 ```
 
-完整模型检索还需要安装 `.[dense]` 并准备模型及 Qdrant；上述协议测试不要求这些依赖。
+HTTP 模型检索需要在控制台设置可用的模型 API，并准备 Qdrant；上述协议测试不调用模型。独立命令行的本地模型流程未改动，仍需要 `.[dense]`。
 
 ## MCP 双版本
 
@@ -361,11 +387,11 @@ HTTP MCP 注册搜索和三个文件管理工具；本地搜索调试入口仍�
 
 - 文档解析支持 Markdown/TXT、电子版和扫描版 PDF、DOCX；旧版 `.doc`、Excel、网页抓取和独立图片上传尚未实现。
 - PDF 使用本机 Docling、OCR 和公式模型；不能保证任意扫描件、旋转表格或复杂公式都准确。公式处理针对 Docling 检出的公式块，不保证所有行内数学符号转换为 LaTeX。明确的解析错误会失败，但不能自动识别所有内容错误。
-- `embedding` 使用 BGE-M3，默认 1024 维。
+- HTTP `embedding` 使用配置的兼容模型 API，向量长度由实际响应检测。
 - `hybrid` 使用 Qdrant Dense + Sparse 预取和 RRF 融合。
-- 重排仅支持 `none`（不重排）与 `cross_encoder`（真实 BGE Reranker）。
+- 重排仅支持 `none`（不重排）与 `cross_encoder`（调用配置的 Reranker API）。
 - Console 会同时展示 Cross Encoder 最终分数和重排前的 `retrieval_score`；请求失败时会清空旧结果并保留错误面板。
-- Cross Encoder 默认延迟加载。若首次调用因模型源网络不可达而失败，可先选择“不重排”或“三模式对比”验证召回，再准备本地模型缓存并重启服务。
+- 推理服务离线、认证失败或返回格式不兼容时明确报错；可选择“不重排”验证不依赖 Reranker 的召回流程。
 - 上传目前是同步请求，大文件索引期间网页会等待。
 - Console 用于本地开发调试，不提供账户系统或细粒度多用户权限。
 
