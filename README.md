@@ -161,7 +161,25 @@ Authorization: Bearer <RAG_SERVICE_TOKEN>
 
 客户端可使用 MCP `2025-11-25` 或 `2026-07-28` 的 Streamable HTTP 传输。旧版先初始化，新版可发现服务或直接调用；具体流程见后面的“双版本”章节。取消调用只结束等待，不会强制终止已经进入模型或 Qdrant 的同步计算。
 
-MCP 内部工具名为 `search`。若 Host 使用 `rag` 作为 server 名，展示名通常是 `mcp_rag_search`。
+MCP 提供 `search`、`add_document`、`update_document`、`delete_document` 四个工具。若 Host 使用 `rag` 作为 server 名，搜索工具展示名通常是 `mcp_rag_search`。
+
+### MCP 文件管理
+
+三个文件工具只操作连接时 `X-RAG-Namespace` 指定的知识库，使用普通 Service Token，不需要管理 Token。请仅向可信客户端提供具有写入权限的连接；工具提示不能替代权限控制。管理员可通过工具管理接口分别禁用这些工具。
+
+| 工具 | 参数 | 行为 |
+|---|---|---|
+| `add_document` | `name` 和 `content` 或 `content_base64` | 添加并建立索引；同名文件报错，不覆盖 |
+| `update_document` | `name` 和 `content` 或 `content_base64` | 完整替换已存在文件并重建索引，保留切分设置；不存在时报错 |
+| `delete_document` | `name` | 删除文件和索引；不存在时报错 |
+
+`name` 必须是含扩展名的准确文件名，不能传路径。支持 TXT、Markdown（`.md`）、PDF、DOCX，单文件最大 10 MiB。TXT/Markdown 可使用 UTF-8 文本 `content`；PDF/DOCX 必须由客户端读取文件后传标准 Base64 到 `content_base64`。两种内容参数只能传一种，不支持服务器路径或 URL。
+
+```json
+{"name": "manual.txt", "content": "E03 表示温度传感器故障。"}
+```
+
+新增使用默认递归切分。同内容不同文件名会分别保存，确保更新始终针对指定文件。同名、同内容、同切分设置的更新返回 `unchanged`。成功返回 `status`、`document` 和可读取的 `uri`；工具参数错误或操作失败返回 MCP `isError=true`。整个请求另有大小上限，超过后返回 HTTP 413；既有文档解析安全上限仍然适用。文件变更会发送资源更新通知。删除无法通过 MCP 撤销，更新前需要保留旧版本时应先读取或备份。
 
 工具输入：
 
@@ -261,7 +279,7 @@ python -m venv --system-site-packages .venv
 
 请求均携带 `X-RAG-Namespace` 和配置要求的 Service Token。旧会话不能跨 namespace 使用；订阅固定建立时的 namespace。工具调用取消只停止等待和发送结果，不强停后台模型线程。
 
-`search` 是首个本地注册工具。新增工具要在项目中登记定义、参数校验和执行函数；配置接口不能上传代码，也不能注册外部 HTTP 转发。
+HTTP MCP 注册搜索和三个文件管理工具；本地搜索调试入口仍只提供搜索。新增工具要在项目中登记定义、参数校验和执行函数；配置接口不能上传代码，也不能注册外部 HTTP 转发。
 
 ## 工具与提示词管理
 

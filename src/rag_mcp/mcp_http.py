@@ -7,6 +7,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from functools import partial
 
 import anyio
 from fastapi import HTTPException
@@ -31,7 +32,7 @@ from .catalog import CatalogStore
 from .document_readers import DocumentReadError
 from .resources import document_uri, parse_uri, resource_page
 from .server import create_registry, create_server
-from .service_knowledge import KnowledgeError
+from .service_knowledge import MAX_FILE_BYTES, KnowledgeError, KnowledgeValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ def _paginate(items, params):
 
 
 class NamespaceEndpoint:
-    def __init__(self, namespace, runtime, catalog, security):
+    def __init__(self, namespace, runtime, catalog, security, document_mutator):
         self.namespace = namespace
         self.runtime = runtime
         self.catalog = catalog
@@ -59,6 +60,7 @@ class NamespaceEndpoint:
         self.server = create_server(
             self,
             catalog,
+            document_mutator=document_mutator,
             on_list_prompts=self.list_prompts,
             on_get_prompt=self.get_prompt,
             on_list_resources=self.list_resources,
@@ -74,6 +76,8 @@ class NamespaceEndpoint:
             stateless=False,
             json_response=False,
             security_settings=security,
+            # JSON may escape one UTF-8 byte as six characters; leave room for the envelope.
+            max_request_body_size=6 * MAX_FILE_BYTES + 64 * 1024,
         )
 
     def search(self, request):
@@ -250,7 +254,31 @@ class McpHttpEndpoint:
             def search(inner, request):
                 return self.runtime.search(namespace, asdict(request))
 
-        return create_registry(Executor(), self.catalogs.for_namespace(namespace))
+        return create_registry(Executor(), self.catalogs.for_namespace(namespace), partial(self.mutate_document, namespace))
+
+    async def mutate_document(self, namespace, operation, request):
+        async with self.mutation_lock(namespace):
+            # Finish the storage change and notification together even if the caller disconnects.
+            with anyio.CancelScope(shield=True):
+                try:
+                    before = await anyio.to_thread.run_sync(self.runtime.list_documents, namespace)
+                    if operation == "delete_document":
+                        if request.name not in {item["name"] for item in before}:
+                            raise KnowledgeValidationError(f"Document does not exist: {request.name}")
+                        result = await anyio.to_thread.run_sync(self.runtime.delete, namespace, request.name)
+                        result.update(status="deleted", document=result.pop("deleted"))
+                    else:
+                        result = await anyio.to_thread.run_sync(partial(
+                            self.runtime.write_document, namespace, request.name, request.content,
+                            overwrite=operation == "update_document",
+                        ))
+                    await self.documents_changed(namespace, before, result.pop("documents"))
+                    return {**result, "uri": document_uri(namespace, request.name)}
+                except KnowledgeError:
+                    raise
+                except Exception as exc:
+                    logger.exception("MCP document mutation failed")
+                    raise KnowledgeError(f"Document operation failed: {type(exc).__name__}") from exc
 
     async def publish(self, namespace, event):
         peer = self.peers.get(namespace)
@@ -292,7 +320,8 @@ class McpHttpEndpoint:
                 if self._tasks is None:
                     await JSONResponse({"detail": "MCP service is not running"}, status_code=503)(scope, receive, send)
                     return
-                peer = NamespaceEndpoint(namespace, self.runtime, self.catalogs.for_namespace(namespace), self.security)
+                peer = NamespaceEndpoint(namespace, self.runtime, self.catalogs.for_namespace(namespace), self.security,
+                                         partial(self.mutate_document, namespace))
                 await self._tasks.start(peer.run)
                 self.peers[namespace] = peer
 

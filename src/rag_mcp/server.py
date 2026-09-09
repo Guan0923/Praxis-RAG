@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -19,6 +20,7 @@ from .config import RagConfigError
 from .contracts import RagOperationError, SearchRequest, SearchValidationError
 from .catalog import NamespaceCatalog
 from .orchestrator import build_default_orchestrator
+from .service_knowledge import KnowledgeError
 
 
 class SearchExecutor(Protocol):
@@ -101,7 +103,7 @@ def _trace(message: str) -> None:
 class RegisteredTool:
     definition: types.Tool
     validate: Callable[[dict[str, Any]], Any]
-    execute: Callable[[Any], dict[str, object]]
+    execute: Callable[[Any], dict[str, object] | Awaitable[dict[str, object]]]
 
 
 class ToolRegistry:
@@ -139,9 +141,27 @@ class ToolRegistry:
             _trace("tool execution started")
             payload = entry.execute(request)
             _trace("tool execution completed")
-        except (RagConfigError, RagOperationError, SearchValidationError, KeyError) as exc:
+        except (RagConfigError, RagOperationError, SearchValidationError, KnowledgeError, KeyError) as exc:
             _trace(f"tool failed: {type(exc).__name__}")
             return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], is_error=True)
+        return self.render(payload)
+
+    async def invoke_async(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
+        entry = self.entries.get(name)
+        if entry is None or not inspect.iscoroutinefunction(entry.execute):
+            return await asyncio.to_thread(self.invoke, name, arguments)
+        try:
+            definitions = await asyncio.to_thread(self.definitions)
+            if name not in {item.name for item in definitions}:
+                raise SearchValidationError(f"Unknown or disabled RAG tool: {name}")
+            request = await asyncio.to_thread(entry.validate, arguments)
+            payload = await entry.execute(request)
+        except (RagConfigError, RagOperationError, SearchValidationError, KnowledgeError, KeyError) as exc:
+            return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], is_error=True)
+        return self.render(payload)
+
+    @staticmethod
+    def render(payload: dict[str, object]) -> types.CallToolResult:
         images = []
         public_payload = json.loads(json.dumps(payload, ensure_ascii=False))
         for result in public_payload.get("results", []):
@@ -154,10 +174,13 @@ class ToolRegistry:
         ])
 
 
-def create_registry(executor: SearchExecutor, catalog: NamespaceCatalog | None = None) -> ToolRegistry:
-    return ToolRegistry(
-        [RegisteredTool(search_tool_definition(), SearchRequest.from_arguments, executor.search)], catalog
-    )
+def create_registry(executor: SearchExecutor, catalog: NamespaceCatalog | None = None, document_mutator=None) -> ToolRegistry:
+    entries = [RegisteredTool(search_tool_definition(), SearchRequest.from_arguments, executor.search)]
+    if document_mutator is not None:
+        from .document_tools import document_tool_entries
+
+        entries.extend(document_tool_entries(document_mutator))
+    return ToolRegistry(entries, catalog)
 
 
 class RagServer(Server):
@@ -170,15 +193,15 @@ class RagServer(Server):
         )
 
 
-def create_server(orchestrator: SearchExecutor | None = None, catalog=None, **handlers) -> Server:
-    registry = create_registry(orchestrator or build_default_orchestrator(), catalog)
+def create_server(orchestrator: SearchExecutor | None = None, catalog=None, document_mutator=None, **handlers) -> Server:
+    registry = create_registry(orchestrator or build_default_orchestrator(), catalog, document_mutator)
 
     async def list_tools(ctx, params) -> types.ListToolsResult:
         return types.ListToolsResult(tools=await asyncio.to_thread(registry.definitions))
 
     async def call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
         # Cancelling the wait never terminates synchronous inference already running.
-        return await asyncio.to_thread(registry.invoke, params.name, params.arguments or {})
+        return await registry.invoke_async(params.name, params.arguments or {})
 
     return RagServer(
         "mini-agent-rag",

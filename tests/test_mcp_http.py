@@ -141,12 +141,12 @@ def running_service(root: Path, *, admin_token="admin-token", runtime=None):
 
 
 @asynccontextmanager
-async def mcp_client(url, mode="auto", headers=None, hooks=None, message_handler=None):
-    async with httpx.AsyncClient(headers=headers or AUTH, timeout=5, event_hooks=hooks or {}) as http:
+async def mcp_client(url, mode="auto", headers=None, hooks=None, message_handler=None, timeout=5):
+    async with httpx.AsyncClient(headers=headers or AUTH, timeout=timeout, event_hooks=hooks or {}) as http:
         async with Client(
             streamable_http_client(url + "/mcp", http_client=http),
             mode=mode,
-            read_timeout_seconds=5,
+            read_timeout_seconds=timeout,
             message_handler=message_handler,
         ) as client:
             yield client
@@ -175,7 +175,9 @@ def test_both_protocol_lifecycles(tmp_path, mode):
                 if mode != "2026-07-28":
                     assert client.server_info.version == "0.4.0"
                     assert client.server_capabilities.tools.list_changed
-                assert [tool.name for tool in (await client.list_tools()).tools] == ["search"]
+                assert [tool.name for tool in (await client.list_tools()).tools] == [
+                    "search", "add_document", "update_document", "delete_document"
+                ]
                 for query in ("first", "second"):
                     result = await client.call_tool("search", {"query": query})
                     assert json.loads(result.content[0].text)["query"] == query
@@ -218,7 +220,7 @@ def test_modern_subscriptions_and_real_document_pages(tmp_path):
                     assert changed.json()["changed"]
                     with anyio.fail_after(2):
                         assert isinstance(await anext(sub), ToolsListChanged)
-                    assert not (await client.list_tools(cache_mode="refresh")).tools
+                    assert "search" not in {tool.name for tool in (await client.list_tools(cache_mode="refresh")).tools}
                     assert (await client.call_tool("search", {"query": "x"})).is_error
                     await http.patch(url + "/v1/admin/tools/search", headers=ADMIN, json={"enabled": True})
                     with anyio.fail_after(2):
