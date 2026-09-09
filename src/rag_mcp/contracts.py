@@ -6,10 +6,10 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 RetrievalMode = Literal["bm25", "embedding", "hybrid"]
-RerankMode = Literal["none", "cross_encoder", "bi_encoder"]
+RerankMode = Literal["none", "cross_encoder"]
 
 RETRIEVAL_MODES = frozenset({"bm25", "embedding", "hybrid"})
-RERANK_MODES = frozenset({"none", "cross_encoder", "bi_encoder"})
+RERANK_MODES = frozenset({"none", "cross_encoder"})
 ALLOWED_FILTERS = frozenset({"document_id", "source", "title"})
 
 
@@ -82,7 +82,7 @@ class SearchRequest:
 
         rerank = arguments.get("rerank", "cross_encoder")
         if rerank not in RERANK_MODES:
-            raise SearchValidationError("rerank must be none, cross_encoder, or bi_encoder")
+            raise SearchValidationError("rerank must be none or cross_encoder")
 
         candidate_k = _bounded_integer(arguments.get("candidate_k", 10), "candidate_k", minimum=1, maximum=100)
         top_k = _bounded_integer(arguments.get("top_k", 5), "top_k", minimum=1, maximum=10)

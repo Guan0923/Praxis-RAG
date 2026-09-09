@@ -363,7 +363,7 @@ HTTP MCP 注册搜索和三个文件管理工具；本地搜索调试入口仍�
 - PDF 使用本机 Docling、OCR 和公式模型；不能保证任意扫描件、旋转表格或复杂公式都准确。公式处理针对 Docling 检出的公式块，不保证所有行内数学符号转换为 LaTeX。明确的解析错误会失败，但不能自动识别所有内容错误。
 - `embedding` 使用 BGE-M3，默认 1024 维。
 - `hybrid` 使用 Qdrant Dense + Sparse 预取和 RRF 融合。
-- `cross_encoder` 使用真实 BGE Reranker；`bi_encoder` 仍是确定性 Mock。
+- 重排仅支持 `none`（不重排）与 `cross_encoder`（真实 BGE Reranker）。
 - Console 会同时展示 Cross Encoder 最终分数和重排前的 `retrieval_score`；请求失败时会清空旧结果并保留错误面板。
 - Cross Encoder 默认延迟加载。若首次调用因模型源网络不可达而失败，可先选择“不重排”或“三模式对比”验证召回，再准备本地模型缓存并重启服务。
 - 上传目前是同步请求，大文件索引期间网页会等待。

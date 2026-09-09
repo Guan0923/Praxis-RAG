@@ -14,7 +14,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one RAG search and print its JSON observation.")
     parser.add_argument("query", nargs="?", help="Question or retrieval query")
     parser.add_argument("--retrieval", choices=("bm25", "embedding", "hybrid"), default="hybrid")
-    parser.add_argument("--rerank", choices=("none", "cross_encoder", "bi_encoder"), default="cross_encoder")
+    parser.add_argument("--rerank", choices=("none", "cross_encoder"), default="cross_encoder")
     parser.add_argument("--candidate-k", type=int, default=10)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--filters", default="{}", help="JSON object using document_id, source, or title")

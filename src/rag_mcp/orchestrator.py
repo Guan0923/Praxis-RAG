@@ -111,7 +111,6 @@ def build_default_orchestrator(config: RagConfig | None = None) -> RagOrchestrat
         retrievers={"bm25": retriever, "embedding": retriever, "hybrid": retriever},
         rerankers={
             "cross_encoder": MockReranker("cross_encoder"),
-            "bi_encoder": MockReranker("bi_encoder"),
         },
         implementation="mock-v1",
         limitations=("All retrieval modes and rerankers are deterministic Phase-1 mocks.",),
@@ -171,9 +170,7 @@ def _build_qdrant_orchestrator(config: RagConfig) -> RagOrchestrator:
         },
         rerankers={
             "cross_encoder": cross_encoder,
-            "bi_encoder": MockReranker("bi_encoder"),
         },
         implementation="qdrant-hybrid-rerank-v1",
-        limitations=("bi_encoder remains a deterministic mock pending a measured need for a second reranker.",),
         warmup=warmup,
     )

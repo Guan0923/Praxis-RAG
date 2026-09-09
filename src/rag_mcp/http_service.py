@@ -12,7 +12,7 @@ from typing import Protocol
 
 import anyio
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.server.subscriptions import PromptsListChanged, ToolsListChanged
@@ -23,7 +23,7 @@ from . import __version__
 from .config import RagConfig, RagConfigError
 from .chunk_strategies import ChunkingConfig, strategy_catalog
 from .catalog import PromptDefinition, ToolPatch
-from .contracts import RagOperationError, SearchValidationError
+from .contracts import RagOperationError, RerankMode, SearchValidationError
 from .mcp_http import McpHttpEndpoint
 from .service_knowledge import (
     MAX_FILE_BYTES,
@@ -64,6 +64,7 @@ class ServiceRuntime(Protocol):
     def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool) -> dict[str, object]: ...
     def search(self, namespace: str, arguments: dict[str, object]) -> dict[str, object]: ...
     def read_document(self, namespace: str, name: str) -> tuple[str, str]: ...
+    def read_document_file(self, namespace: str, name: str) -> bytes: ...
 
 
 @dataclass(frozen=True)
@@ -110,7 +111,7 @@ class RagHttpSettings:
 class SearchBody(BaseModel):
     query: str
     retrieval: str = "hybrid"
-    rerank: str = "cross_encoder"
+    rerank: RerankMode = "cross_encoder"
     candidate_k: int = 10
     top_k: int = 5
     filters: dict[str, str | int | float | bool] = Field(default_factory=dict)
@@ -278,6 +279,24 @@ def create_service_app(
             "max_files_per_batch": MAX_FILES_PER_BATCH,
             "max_file_bytes": MAX_FILE_BYTES,
         }
+
+    @app.get("/v1/documents/{name}/content")
+    def document_content(name: str, namespace: str = Depends(tenant)) -> Response:
+        try:
+            if Path(name).suffix.casefold() == ".pdf":
+                content = resolved_runtime.read_document_file(namespace, name)
+                media_type = "application/pdf"
+            else:
+                content, _version = resolved_runtime.read_document(namespace, name)
+                media_type = "text/plain"
+            return Response(content, media_type=media_type, headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            })
+        except KnowledgeValidationError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (KnowledgeError, OSError) as exc:
+            raise HTTPException(status_code=503, detail="Document content could not be read.") from exc
 
     @app.get("/v1/chunking/strategies")
     def chunking_strategies(namespace: str = Depends(tenant)) -> dict[str, object]:

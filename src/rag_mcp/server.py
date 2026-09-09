@@ -40,7 +40,7 @@ SEARCH_TOOL_SCHEMA: dict[str, object] = {
         },
         "rerank": {
             "type": "string",
-            "enum": ["none", "cross_encoder", "bi_encoder"],
+            "enum": ["none", "cross_encoder"],
             "default": "cross_encoder",
         },
         "candidate_k": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},

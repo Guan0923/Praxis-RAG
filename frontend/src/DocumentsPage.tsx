@@ -35,6 +35,7 @@ import {
 type Props = {
   connection: Connection;
   active: boolean;
+  onOpenDocument: (name: string) => void;
   uploading: boolean;
   onUploading: (busy: boolean) => void;
   onHealth: () => Promise<void>;
@@ -43,6 +44,7 @@ type Props = {
 export function DocumentsPage({
   connection,
   active,
+  onOpenDocument,
   uploading,
   onUploading,
   onHealth,
@@ -325,7 +327,13 @@ export function DocumentsPage({
               <div className="document-name">
                 <FileTextOutlined />
                 <div>
-                  <strong>{doc.name}</strong>
+                  <button
+                    type="button"
+                    className="document-link"
+                    onClick={() => onOpenDocument(doc.name)}
+                  >
+                    {doc.name}
+                  </button>
                   <div className="secondary">
                     {doc.chunk_count} 个片段 · {formatBytes(doc.size)}
                   </div>

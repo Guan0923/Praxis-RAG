@@ -82,6 +82,24 @@ def test_health_is_available_without_tenant_credentials(service) -> None:
     assert response.json()["service"] == "rag-mcp-service"
 
 
+def test_removed_reranker_is_rejected_before_runtime(service) -> None:
+    runtime, client = service
+    response = client.post("/v1/search", headers=AUTH, json={"query": "test", "rerank": "bi_encoder"})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "rerank"]
+    assert not runtime.search_arguments
+    schema = client.get("/openapi.json").json()
+    assert schema["components"]["schemas"]["SearchBody"]["properties"]["rerank"]["enum"] == ["none", "cross_encoder"]
+
+
+@pytest.mark.parametrize("rerank", ["none", "cross_encoder"])
+def test_supported_rerankers_reach_runtime(service, rerank) -> None:
+    runtime, client = service
+    response = client.post("/v1/search", headers=AUTH, json={"query": "test", "rerank": rerank})
+    assert response.status_code == 200
+    assert runtime.search_arguments[-1]["rerank"] == rerank
+
+
 def test_runtime_health_reports_model_state_without_loading_models() -> None:
     runtime = object.__new__(RagServiceRuntime)
     runtime.config = RagConfig(

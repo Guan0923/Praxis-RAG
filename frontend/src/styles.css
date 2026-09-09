@@ -113,6 +113,24 @@ select {
   color: var(--text);
 }
 .workspace-name {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.workspace-switch.ant-btn {
+  height: auto;
+  min-height: 32px;
+  max-width: min(240px, 100%);
+  padding: 4px 8px;
+  color: var(--text);
+}
+.workspace-switch > .anticon {
+  flex-shrink: 0;
+}
+.workspace-option {
+  display: block;
+  max-width: 240px;
+  white-space: normal;
   overflow-wrap: anywhere;
 }
 .toolbar {
@@ -309,11 +327,92 @@ h3 {
 .document-name > div {
   min-width: 0;
 }
-.document-name strong {
+.breadcrumb-link,
+.document-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.breadcrumb-link:hover,
+.document-link:hover {
+  text-decoration: underline;
+}
+.breadcrumb-link:focus-visible,
+.document-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+.document-link {
   display: block;
+  max-width: 100%;
   overflow-wrap: anywhere;
   font-weight: 500;
   margin-bottom: 5px;
+}
+.document-heading {
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+.document-heading > .ant-btn {
+  flex-shrink: 0;
+}
+.document-heading h1 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.preview-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  color: var(--muted);
+}
+.document-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.8;
+}
+.pdf-toolbar,
+.pdf-page-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pdf-toolbar {
+  flex-wrap: wrap;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 16px;
+}
+.pdf-page-controls .ant-input-number {
+  width: 68px;
+}
+.pdf-page-count {
+  min-width: 40px;
+  font-variant-numeric: tabular-nums;
+}
+.pdf-toolbar .ant-select {
+  width: 120px;
+}
+.pdf-viewport {
+  width: 100%;
+  min-height: 160px;
+  overflow: auto;
+  max-height: 78vh;
+  overscroll-behavior: contain;
+  background: var(--sidebar);
+}
+.pdf-viewport canvas {
+  display: block;
+  margin: 0 auto;
+  background: #ffffff;
 }
 .mobile-document-details {
   display: none;

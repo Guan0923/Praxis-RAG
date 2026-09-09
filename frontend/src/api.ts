@@ -25,7 +25,7 @@ export type Health = {
   models?: { embedding: ModelState; reranker: ModelState };
 };
 export type Retrieval = "bm25" | "embedding" | "hybrid";
-export type Rerank = "none" | "cross_encoder" | "bi_encoder";
+export type Rerank = "none" | "cross_encoder";
 export type Hit = {
   rank: number;
   title?: string;
@@ -61,7 +61,6 @@ export const retrievalLabels = {
 export const rerankLabels = {
   none: "不重排",
   cross_encoder: "Cross Encoder",
-  bi_encoder: "Bi Encoder（Mock）",
 };
 
 export function readStorage(storage: Storage, key: string, fallback = "") {
@@ -72,13 +71,13 @@ export function readStorage(storage: Storage, key: string, fallback = "") {
   }
 }
 
-export async function api<T>(
+export async function apiResponse(
   path: string,
   connection?: Connection,
   options: RequestInit = {},
-): Promise<T> {
+): Promise<Response> {
   const headers = new Headers(options.headers);
-  headers.set("Accept", "application/json");
+  if (!headers.has("Accept")) headers.set("Accept", "application/json");
   if (connection) {
     headers.set("X-RAG-Namespace", connection.namespace);
     if (connection.token)
@@ -87,6 +86,7 @@ export async function api<T>(
   if (typeof options.body === "string")
     headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...options, headers });
+  if (response.ok) return response;
   let payload;
   try {
     payload = await response.json();
@@ -100,7 +100,20 @@ export async function api<T>(
         : JSON.stringify(payload.detail || "请求失败");
     throw new Error(`HTTP ${response.status}：${detail}`);
   }
-  return payload as T;
+  return response;
+}
+
+export async function api<T>(
+  path: string,
+  connection?: Connection,
+  options: RequestInit = {},
+): Promise<T> {
+  const response = await apiResponse(path, connection, options);
+  try {
+    return await response.json() as T;
+  } catch {
+    throw new Error(`HTTP ${response.status} 返回了无效 JSON`);
+  }
 }
 
 export function errorText(error: unknown): string {

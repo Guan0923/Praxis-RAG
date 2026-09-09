@@ -191,6 +191,7 @@ def test_browser_real_batch_failure_and_upload_lock(console_browser):
     expect(dialog.get_by_label("切分策略", exact=True)).to_be_disabled()
     expect(dialog.get_by_role("button", name="关闭", exact=True).last).to_be_disabled()
     expect(page.get_by_label("Namespace", exact=True)).to_be_disabled()
+    expect(page.get_by_role("button", name="切换工作区", exact=True)).to_be_disabled()
     expect(page.get_by_label("Service Token", exact=True)).to_be_disabled()
     page.keyboard.press("Escape")
     expect(dialog).to_be_visible()
@@ -243,3 +244,132 @@ def test_browser_validation_and_partial_comparison(console_browser):
     expect(page.locator(".metrics")).to_contain_text("2/3 成功")
     expect(page.get_by_text("HTTP 503：embedding unavailable", exact=True)).to_be_visible()
     assert len(requests) == 3
+
+
+def test_browser_document_name_navigation(console_browser):
+    page, expect, namespace, url, output = console_browser
+    names = ["设备维护 & 检查 #1.txt", "设备维护记录_" + "long-document-name-" * 6 + ".txt"]
+    for index, name in enumerate(names):
+        response = page.request.post(
+            url + "/v1/documents",
+            headers={"X-RAG-Namespace": namespace},
+            multipart={"files": {"name": name, "mimeType": "text/plain",
+                                 "buffer": f"文档导航验证 {index}：设备维护前必须关闭电源。".encode()}},
+            timeout=180_000,
+        )
+        assert response.ok and len(response.json()["imported"]) == 1, response.text()
+
+    navigate(page, "知识文档")
+    breadcrumb = page.get_by_role("navigation", name="当前位置")
+    detail = page.get_by_role("region", name="文档详情页面")
+    for name in names:
+        page.get_by_role("button", name=name, exact=True).click()
+        expect(detail.get_by_role("heading", name=name, exact=True)).to_be_visible()
+        expect(page.get_by_role("region", name="知识文档页面")).not_to_be_visible()
+        expect(breadcrumb.locator(":scope > *")).to_have_text(
+            ["工作区", "/", namespace, "/", "知识文档", "/", name]
+        )
+        expect(breadcrumb.locator('[aria-current="page"]')).to_have_text(name)
+        breadcrumb.get_by_role("button", name="知识文档", exact=True).click()
+        expect(page.get_by_role("heading", name="知识文档", exact=True)).to_be_visible()
+
+    name = names[-1]
+    document_button = page.get_by_role("button", name=name, exact=True)
+    document_button.focus()
+    page.keyboard.press("Enter")
+    expect(detail).to_be_visible()
+    for dark in (False, True):
+        if dark:
+            page.get_by_role("button", name="切换深色主题", exact=True).click()
+        for width in (1440, 390, 320):
+            page.set_viewport_size({"width": width, "height": 900})
+            expect(detail.get_by_role("heading", name=name, exact=True)).to_be_visible()
+            page.screenshot(path=str(output / f"document-detail-{'dark' if dark else 'light'}-{width}.png"),
+                            full_page=True, animations="disabled")
+            assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+    page.get_by_role("button", name="返回知识文档", exact=True).click()
+    expect(document_button).to_be_visible()
+    document_button.click()
+    navigate(page, "检索调试")
+    expect(breadcrumb.locator('[aria-current="page"]')).to_have_text("检索调试")
+    navigate(page, "知识文档")
+    expect(document_button).to_be_visible()
+    document_button.click()
+    navigate(page, "知识文档")
+    expect(document_button).to_be_visible()
+    document_button.click()
+    page.get_by_role("button", name="切换工作区", exact=True).click()
+    page.get_by_role("menuitem", name="其他工作区…", exact=True).click()
+    dialog = page.get_by_role("dialog", name="切换工作区", exact=True)
+    other = namespace + "-empty"
+    dialog.get_by_label("工作区名称", exact=True).fill(other)
+    dialog.get_by_role("button", name="切换", exact=True).click()
+    expect(detail).not_to_be_visible()
+    expect(breadcrumb.locator(":scope > *")).to_have_text(["工作区", "/", other, "/", "知识文档"])
+    expect(page.get_by_text("当前工作区暂无知识文档", exact=True)).to_be_visible()
+    page.get_by_role("button", name="切换工作区", exact=True).click()
+    page.get_by_role("menuitem", name=namespace, exact=True).click()
+    expect(document_button).to_be_visible()
+
+
+def test_browser_workspace_switch_real_documents(console_browser):
+    page, expect, namespace, url, output = console_browser
+    other = namespace + "-" + "x" * (63 - len(namespace))
+    headers = {"X-RAG-Namespace": namespace}
+    response = page.request.post(
+        url + "/v1/documents",
+        headers=headers,
+        multipart={"files": {"name": "workspace-switch.txt", "mimeType": "text/plain",
+                             "buffer": "工作区切换验证：星河设备维护前必须关闭电源。".encode()}},
+        timeout=180_000,
+    )
+    assert response.ok, response.text()
+    assert len(response.json()["imported"]) == 1, response.text()
+    navigate(page, "知识文档")
+    expect(page.get_by_text("workspace-switch.txt", exact=True)).to_be_visible()
+    navigate(page, "检索调试")
+    page.get_by_label("查询内容", exact=True).fill("星河设备维护")
+    select_option(page, "检索方式", "BM25")
+    select_option(page, "重排方式", "不重排")
+    page.get_by_role("button", name="运行检索", exact=True).click()
+    expect(page.locator(".search-result").first).to_be_visible(timeout=180_000)
+
+    page.get_by_role("button", name="切换工作区", exact=True).click()
+    page.get_by_role("menuitem", name="其他工作区…", exact=True).click()
+    dialog = page.get_by_role("dialog", name="切换工作区", exact=True)
+    dialog.get_by_label("工作区名称", exact=True).fill("../invalid")
+    dialog.get_by_role("button", name="切换", exact=True).click()
+    expect(dialog.get_by_text("使用 1–64 个字母、数字、点、下划线或横线，首位为字母或数字", exact=True)).to_be_visible()
+    dialog.get_by_label("工作区名称", exact=True).fill(other)
+    dialog.get_by_role("button", name="切换", exact=True).click()
+    expect(dialog).not_to_be_visible()
+    expect(page.locator(".workspace-name")).to_have_text(other)
+    expect(page.locator(".search-result")).to_have_count(0)
+    navigate(page, "知识文档")
+    expect(page.get_by_text("当前工作区暂无知识文档", exact=True)).to_be_visible()
+    expect(page.get_by_text("workspace-switch.txt", exact=True)).to_have_count(0)
+    navigate(page, "连接配置")
+    expect(page.get_by_label("Namespace", exact=True)).to_have_value(other)
+    expect(page.get_by_test_id("mcp-config")).to_contain_text(other)
+    page.reload()
+    expect(page.locator(".workspace-name")).to_have_text(other)
+
+    for width in (1440, 390, 320):
+        page.set_viewport_size({"width": width, "height": 900})
+        page.get_by_role("button", name="切换工作区", exact=True).click()
+        expect(page.get_by_role("menuitem", name=namespace, exact=True)).to_be_visible()
+        page.screenshot(path=str(output / f"workspace-switch-{width}.png"), full_page=True, animations="disabled")
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        page.keyboard.press("Escape")
+        page.get_by_role("heading", name="检索调试", exact=True).click()
+
+    page.get_by_role("button", name="切换工作区", exact=True).click()
+    page.get_by_role("menuitem", name=namespace, exact=True).click()
+    expect(page.locator(".workspace-name")).to_have_text(namespace)
+    navigate(page, "知识文档")
+    expect(page.get_by_text("workspace-switch.txt", exact=True)).to_be_visible()
+    navigate(page, "连接配置")
+    expect(page.get_by_label("Namespace", exact=True)).to_have_value(namespace)
+    page.get_by_role("button", name="保存配置", exact=True).click()
+    expect(page.locator(".workspace-name")).to_have_text(namespace)

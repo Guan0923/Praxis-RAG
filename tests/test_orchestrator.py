@@ -45,6 +45,7 @@ def test_search_filter_is_applied_before_ranking() -> None:
         ({}, "query"),
         ({"query": "x", "top_k": 6, "candidate_k": 5}, "top_k"),
         ({"query": "x", "retrieval": "sql"}, "retrieval"),
+        ({"query": "x", "rerank": "bi_encoder"}, "rerank"),
         ({"query": "x", "filters": {"raw_qdrant": "unsafe"}}, "Unsupported filters"),
         ({"query": "x", "unknown": True}, "Unknown search arguments"),
     ],
@@ -61,6 +62,7 @@ def test_mcp_definition_and_result_keep_the_public_contract() -> None:
     assert definition.name == "search"
     assert definition.input_schema["required"] == ["query"]
     assert definition.input_schema["properties"]["candidate_k"]["default"] == 10
+    assert definition.input_schema["properties"]["rerank"]["enum"] == ["none", "cross_encoder"]
     assert definition.annotations.read_only_hint is True
     assert definition.annotations.destructive_hint is False
     assert "exact codes/names" in definition.description
@@ -80,7 +82,7 @@ def test_empty_retrieval_explicitly_requires_an_insufficient_evidence_response()
     empty = EmptyRetriever()
     orchestrator = RagOrchestrator(
         {"bm25": empty, "embedding": empty, "hybrid": empty},
-        {"cross_encoder": MockReranker("cross_encoder"), "bi_encoder": MockReranker("bi_encoder")},
+        {"cross_encoder": MockReranker("cross_encoder")},
         implementation="empty-test",
     )
 
@@ -96,3 +98,14 @@ def test_mcp_validation_error_is_a_tool_error_not_a_server_crash() -> None:
 
     assert response.is_error is True
     assert "query" in response.content[0].text
+
+
+def test_removed_reranker_is_rejected_by_mcp_and_cli() -> None:
+    from rag_mcp.debug import parse_args
+
+    response = invoke_search(build_default_orchestrator(), {"query": "test", "rerank": "bi_encoder"})
+    assert response.is_error is True
+    assert "rerank must be none or cross_encoder" in response.content[0].text
+    with pytest.raises(SystemExit) as error:
+        parse_args(["test", "--rerank", "bi_encoder"])
+    assert error.value.code == 2

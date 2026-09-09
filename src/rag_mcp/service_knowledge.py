@@ -22,7 +22,6 @@ from .chunk_strategies import ChunkingConfig, LEGACY_CONFIG
 from .config import RagConfig
 from .contracts import SearchRequest
 from .document_readers import SUPPORTED_SUFFIXES, read_document_text
-from .mock import MockReranker
 from .orchestrator import RagOrchestrator
 from .pdf_content import PDF_PARSER_VERSION
 
@@ -499,6 +498,24 @@ class RagServiceRuntime:
         with tenant.lock, self._inference_lock:
             return tenant.orchestrator.search(request)
 
+    def read_document_file(self, namespace: str, name: str) -> bytes:
+        tenant = self._tenant(namespace)
+        with tenant.lock:
+            if tenant.documents.sanitize_name(name) != name:
+                raise KnowledgeValidationError("Invalid document name")
+            if not any(item["name"] == name for item in tenant.documents.list_documents()):
+                raise KnowledgeValidationError("Document does not exist")
+            target = tenant.documents._confined_target(name)
+            if (tenant.documents.paths.knowledge_dir / name).is_symlink():
+                raise KnowledgeValidationError("Document cannot be a symbolic link")
+            if not target.is_file():
+                raise KnowledgeValidationError("Document does not exist")
+            with target.open("rb") as source:
+                content = source.read(MAX_FILE_BYTES + 1)
+            if len(content) > MAX_FILE_BYTES:
+                raise KnowledgeValidationError("Document exceeds the file size limit")
+            return content
+
     def read_document(self, namespace: str, name: str) -> tuple[str, str]:
         tenant = self._tenant(namespace)
         with tenant.lock:
@@ -550,10 +567,8 @@ class RagServiceRuntime:
                 },
                 rerankers={
                     "cross_encoder": self._reranker,
-                    "bi_encoder": MockReranker("bi_encoder"),
                 },
                 implementation="rag-service-qdrant-hybrid-rerank-v1",
-                limitations=("bi_encoder remains a deterministic mock.",),
                 projector=lambda candidates: project_results(
                     candidates, store, self.data_root / namespace / "knowledge" / ".pdf-assets"
                 ),

@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { Alert, App, Badge, Button, Form, Input, Tooltip } from "antd";
+import {
+  Alert, App, Badge, Button, Dropdown, Form, Input, Modal, Tooltip,
+} from "antd";
 import {
   ApiOutlined,
+  ArrowLeftOutlined,
   BookOutlined,
   DatabaseOutlined,
+  DownOutlined,
   MoonOutlined,
   ReloadOutlined,
   SearchOutlined,
@@ -18,6 +22,7 @@ import {
 } from "./api";
 import { SearchPage } from "./SearchPage";
 import { DocumentsPage } from "./DocumentsPage";
+import { DocumentPreview } from "./DocumentPreview";
 
 const pages = [
   { key: "search", label: "检索调试", icon: <SearchOutlined /> },
@@ -25,6 +30,23 @@ const pages = [
   { key: "connection", label: "连接配置", icon: <ApiOutlined /> },
 ] as const;
 type Page = (typeof pages)[number]["key"];
+const namespacePattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+function recentWorkspaces(): string[] {
+  try {
+    const saved: unknown = JSON.parse(
+      readStorage(localStorage, "rag.workspaces", "[]"),
+    );
+    return Array.isArray(saved)
+      ? saved.filter(
+          (name): name is string =>
+            typeof name === "string" && namespacePattern.test(name),
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
 
 export function Console({
   dark,
@@ -35,6 +57,7 @@ export function Console({
 }) {
   const { message } = App.useApp();
   const [view, setView] = useState<Page>("search");
+  const [documentName, setDocumentName] = useState<string>();
   const [connection, setConnection] = useState<Connection>(() => ({
     namespace: readStorage(localStorage, "rag.namespace", "default"),
     token: readStorage(sessionStorage, "rag.token"),
@@ -46,6 +69,10 @@ export function Console({
   const [checking, setChecking] = useState(false);
   const healthRequest = useRef<AbortController | null>(null);
   const [form] = Form.useForm<Connection>();
+  const [workspaceForm] = Form.useForm<{ namespace: string }>();
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [recent, setRecent] = useState(recentWorkspaces);
+  const workspaceNames = [...new Set([connection.namespace, "default", ...recent])];
 
   async function refreshHealth() {
     healthRequest.current?.abort();
@@ -74,22 +101,35 @@ export function Console({
     return () => healthRequest.current?.abort();
   }, []);
 
-  function saveConnection(values: Connection) {
-    if (uploading) return;
+  function saveConnection(values: Connection, notice = "连接配置已保存") {
+    if (uploading) return false;
     const next = {
       namespace: values.namespace.trim(),
       token: values.token || "",
     };
+    const nextRecent = [
+      ...new Set([next.namespace, connection.namespace, ...recent]),
+    ].slice(0, 20);
     try {
       localStorage.setItem("rag.namespace", next.namespace);
       sessionStorage.setItem("rag.token", next.token);
+      localStorage.setItem("rag.workspaces", JSON.stringify(nextRecent));
     } catch {
       void message.error("浏览器无法保存配置，请检查存储权限");
-      return;
+      return false;
     }
     setConnection(next);
+    setDocumentName(undefined);
+    setRecent(nextRecent);
+    form.setFieldsValue(next);
     setRevision((value) => value + 1);
-    void message.success("连接配置已保存");
+    void message.success(notice);
+    return true;
+  }
+  function switchWorkspace(namespace: string) {
+    if (saveConnection({ ...connection, namespace }, "工作区已切换")) {
+      setWorkspaceOpen(false);
+    }
   }
   const config = {
     url: `${location.origin}/mcp`,
@@ -121,6 +161,7 @@ export function Console({
               className={view === page.key ? "nav-active" : ""}
               onClick={() => {
                 setView(page.key);
+                setDocumentName(undefined);
                 if (page.key === "connection") void refreshHealth();
               }}
             >
@@ -138,13 +179,60 @@ export function Console({
       </aside>
       <main className="workspace">
         <header className="topbar">
-          <div className="breadcrumb">
+          <nav className="breadcrumb" aria-label="当前位置">
             <span>工作区</span>
             <span>/</span>
-            <span className="workspace-name">{connection.namespace}</span>
+            <Dropdown
+              trigger={["click"]}
+              disabled={uploading}
+              menu={{
+                selectable: true,
+                selectedKeys: [connection.namespace],
+                items: [
+                  ...workspaceNames.map((name) => ({
+                    key: name,
+                    label: <span className="workspace-option">{name}</span>,
+                  })),
+                  { type: "divider" },
+                  { key: ":other", label: "其他工作区…" },
+                ],
+                onClick: ({ key }) => {
+                  if (key === ":other") {
+                    workspaceForm.resetFields();
+                    setWorkspaceOpen(true);
+                  } else if (key !== connection.namespace) {
+                    switchWorkspace(key);
+                  }
+                },
+              }}
+            >
+              <Button
+                type="text"
+                className="workspace-switch"
+                aria-label="切换工作区"
+                disabled={uploading}
+              >
+                <span className="workspace-name">{connection.namespace}</span>
+                <DownOutlined />
+              </Button>
+            </Dropdown>
             <span>/</span>
-            <span>{title}</span>
-          </div>
+            {view === "documents" && documentName !== undefined ? (
+              <>
+                <button
+                  type="button"
+                  className="breadcrumb-link"
+                  onClick={() => setDocumentName(undefined)}
+                >
+                  知识文档
+                </button>
+                <span>/</span>
+                <span className="break-text" aria-current="page">{documentName}</span>
+              </>
+            ) : (
+              <span aria-current="page">{title}</span>
+            )}
+          </nav>
           <div className="toolbar">
             <Tooltip title="刷新服务状态">
               <Button
@@ -178,15 +266,35 @@ export function Console({
             <section hidden={view !== "search"} aria-label="检索调试页面">
               <SearchPage connection={connection} onHealth={refreshHealth} />
             </section>
-            <section hidden={view !== "documents"} aria-label="知识文档页面">
+            <section hidden={view !== "documents" || documentName !== undefined} aria-label="知识文档页面">
               <DocumentsPage
                 connection={connection}
-                active={view === "documents"}
+                active={view === "documents" && documentName === undefined}
+                onOpenDocument={setDocumentName}
                 uploading={uploading}
                 onUploading={setUploading}
                 onHealth={refreshHealth}
               />
             </section>
+            {view === "documents" && documentName !== undefined && (
+              <section aria-label="文档详情页面">
+                <div className="page-heading document-heading">
+                  <Tooltip title="返回知识文档">
+                    <Button
+                      aria-label="返回知识文档"
+                      icon={<ArrowLeftOutlined />}
+                      onClick={() => setDocumentName(undefined)}
+                    />
+                  </Tooltip>
+                  <h1>{documentName}</h1>
+                </div>
+                <DocumentPreview
+                  key={`${revision}:${documentName}`}
+                  name={documentName}
+                  connection={connection}
+                />
+              </section>
+            )}
           </div>
           <section hidden={view !== "connection"} aria-label="连接配置页面">
             <div className="page-heading">
@@ -198,7 +306,7 @@ export function Console({
                 form={form}
                 layout="vertical"
                 initialValues={connection}
-                onFinish={saveConnection}
+                onFinish={(values) => saveConnection(values)}
                 disabled={uploading}
                 className="connection-form"
               >
@@ -208,7 +316,7 @@ export function Console({
                   rules={[
                     { required: true, message: "请输入 Namespace" },
                     {
-                      pattern: /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/,
+                      pattern: namespacePattern,
                       transform: (value) => value?.trim(),
                       message:
                         "使用 1–64 个字母、数字、点、下划线或横线，首位为字母或数字",
@@ -266,6 +374,39 @@ export function Console({
           </section>
         </div>
       </main>
+      <Modal
+        title="切换工作区"
+        forceRender
+        open={workspaceOpen}
+        onCancel={() => setWorkspaceOpen(false)}
+        onOk={() => workspaceForm.submit()}
+        okText="切换"
+        cancelText="取消"
+        okButtonProps={{ disabled: uploading }}
+      >
+        <Form
+          name="workspace-switch"
+          form={workspaceForm}
+          layout="vertical"
+          onFinish={({ namespace }) => switchWorkspace(namespace.trim())}
+          disabled={uploading}
+        >
+          <Form.Item
+            name="namespace"
+            label="工作区名称"
+            rules={[
+              { required: true, whitespace: true, message: "请输入工作区名称" },
+              {
+                pattern: namespacePattern,
+                transform: (value) => value?.trim(),
+                message: "使用 1–64 个字母、数字、点、下划线或横线，首位为字母或数字",
+              },
+            ]}
+          >
+            <Input maxLength={64} autoComplete="off" />
+          </Form.Item>
+        </Form>
+      </Modal>
     </div>
   );
 }
