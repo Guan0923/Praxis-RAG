@@ -10,7 +10,7 @@ import os
 import re
 import shutil
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import wraps
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +25,7 @@ from .contracts import SearchRequest
 from .document_readers import SUPPORTED_SUFFIXES, read_document_text
 from .orchestrator import RagOrchestrator
 from .pdf_content import PDF_PARSER_VERSION
+from .word_reader import WORD_PARSER_VERSION
 from .model_api import HTTPEmbedder, HTTPReranker, ModelAPIError, ModelConnection, ModelHTTPClient
 from .model_settings import KINDS, ModelSettingsStore, draft_connection
 
@@ -38,6 +39,8 @@ _WINDOWS_RESERVED = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 def _index_configuration(name: str, configuration: dict) -> dict:
     if Path(name).suffix.casefold() == ".pdf":
         return {**configuration, "pdf_parser_version": PDF_PARSER_VERSION}
+    if Path(name).suffix.casefold() in {".doc", ".docx"}:
+        return {**configuration, "word_parser_version": WORD_PARSER_VERSION}
     return configuration
 
 
@@ -56,6 +59,8 @@ class IndexedDocument:
     document_id: str
     chunk_count: int
     collection: str
+    diagnostics: list[dict] = field(default_factory=list)
+    skipped_object_count: int = 0
 
 
 class DocumentIngester(Protocol):
@@ -119,11 +124,11 @@ class KnowledgeDocumentStore:
             path = self._confined_target(name)
             if not path.is_file() or (self.paths.knowledge_dir / name).is_symlink():
                 continue
-            if chunking.get("pdf_parser_version"):
+            if chunking.get("pdf_parser_version") or chunking.get("word_parser_version"):
                 from .chunking import _source_name, _stable_id
 
                 document_id = _stable_id("doc", _source_name(path, self.paths.knowledge_dir).casefold())
-                cached = self.paths.knowledge_dir / ".pdf-assets" / document_id
+                cached = self.paths.knowledge_dir / (".word-assets" if chunking.get("word_parser_version") else ".pdf-assets") / document_id
                 if not (cached / "document.md").is_file() or not (cached / "manifest.json").is_file():
                     continue
             if not record.get("sha256"):
@@ -254,6 +259,8 @@ class KnowledgeDocumentStore:
             "document_id": indexed.document_id,
             "chunk_count": indexed.chunk_count,
             "collection": indexed.collection,
+            "diagnostics": indexed.diagnostics,
+            "skipped_object_count": indexed.skipped_object_count,
         }
 
     def _read_manifest(self) -> dict[str, dict[str, object]]:
@@ -290,19 +297,32 @@ class DenseDocumentIngester:
 
     def ingest_and_publish(self, path: Path, *, source_root: Path, chunking: ChunkingConfig | None = None,
                            publish: Callable[[IndexedDocument], None] | None = None) -> IndexedDocument:
-        parsed_pdf = None
+        parsed_assets = None
         try:
             if path.suffix.casefold() == ".pdf":
                 from .pdf_assets import parse_pdf
 
-                parsed_pdf = parse_pdf(
+                parsed_assets = parse_pdf(
                     path, source_root=source_root, config=chunking,
                     tokenizer_model=self._config.chunk_tokenizer_model,
                     parser_python=self._config.pdf_parser_python,
                     models_path=self._config.pdf_models_path,
                     timeout_seconds=self._config.pdf_parse_timeout,
                 )
-                chunks = parsed_pdf.chunks
+                chunks = parsed_assets.chunks
+            elif path.suffix.casefold() in {".doc", ".docx"}:
+                from .word_assets import parse_word
+
+                parsed_assets = parse_word(
+                    path, source_root=source_root, config=chunking,
+                    tokenizer_model=self._config.chunk_tokenizer_model,
+                    converter=self._config.word_converter_path,
+                    convert_timeout=self._config.word_convert_timeout,
+                    parser_python=self._config.pdf_parser_python,
+                    models_path=self._config.pdf_models_path,
+                    timeout_seconds=self._config.pdf_parse_timeout,
+                )
+                chunks = parsed_assets.chunks
             else:
                 chunks = chunk_document(path, source_root=source_root, config=chunking,
                                         tokenizer_model=self._config.chunk_tokenizer_model)
@@ -314,18 +334,19 @@ class DenseDocumentIngester:
             vectors = self._embedder.embed_documents([chunk.text for chunk in chunks])
             sparse_vectors = self._sparse_encoder.encode_documents([chunk.text for chunk in chunks])
         except Exception:
-            if parsed_pdf is not None:
-                shutil.rmtree(parsed_pdf.staging_dir, ignore_errors=True)
+            if parsed_assets is not None:
+                shutil.rmtree(parsed_assets.staging_dir, ignore_errors=True)
             raise
         final = backup = None
         try:
             asset_payloads = []
-            if parsed_pdf is not None:
+            if parsed_assets is not None:
                 from .pdf_assets import install_assets
 
-                final, backup = install_assets(parsed_pdf, source_root, chunks[0].document_id)
-                asset_payloads = [asset.payload(chunks[0].document_id, chunks[0].source) for asset in parsed_pdf.assets]
-            indexed = IndexedDocument(chunks[0].document_id, len(chunks), self._config.collection)
+                final, backup = install_assets(parsed_assets, source_root, chunks[0].document_id)
+                asset_payloads = [asset.payload(chunks[0].document_id, chunks[0].source) for asset in parsed_assets.assets]
+            indexed = IndexedDocument(chunks[0].document_id, len(chunks), self._config.collection,
+                                      getattr(parsed_assets, "diagnostics", []), getattr(parsed_assets, "skipped_object_count", 0))
             count = self._store.replace_document(
                 chunks, vectors, sparse_vectors, asset_payloads,
                 after_write=(lambda: publish(indexed)) if publish is not None else None,
@@ -335,20 +356,21 @@ class DenseDocumentIngester:
                 from .pdf_assets import rollback_assets
 
                 rollback_assets(final, backup)
-            elif parsed_pdf is not None:
-                shutil.rmtree(parsed_pdf.staging_dir, ignore_errors=True)
+            elif parsed_assets is not None:
+                shutil.rmtree(parsed_assets.staging_dir, ignore_errors=True)
             raise
         if backup is not None:
             from .pdf_assets import finish_assets
 
             finish_assets(backup)
         self._source_root = source_root
-        return IndexedDocument(chunks[0].document_id, count, self._config.collection)
+        return replace(indexed, chunk_count=count)
 
     def delete(self, document_id: str) -> None:
         self._store.delete_document(document_id)
         if self._source_root is not None:
             shutil.rmtree(self._source_root / ".pdf-assets" / document_id, ignore_errors=True)
+            shutil.rmtree(self._source_root / ".word-assets" / document_id, ignore_errors=True)
 
 
 @dataclass(frozen=True)
@@ -625,6 +647,13 @@ class RagServiceRuntime:
                     text = read_pdf_content(target, tenant.documents.paths.knowledge_dir)
                 except ValueError as exc:
                     raise KnowledgeValidationError(str(exc)) from exc
+            elif target.suffix.casefold() in {".doc", ".docx"} and record.get("chunking", {}).get("word_parser_version"):
+                from .word_assets import read_word_content
+
+                try:
+                    text = read_word_content(target, tenant.documents.paths.knowledge_dir)
+                except ValueError as exc:
+                    raise KnowledgeValidationError(str(exc)) from exc
             else:
                 text = read_document_text(target)
             return text, str(record["indexed_at"])
@@ -656,7 +685,8 @@ class RagServiceRuntime:
                 },
                 implementation="rag-service-qdrant-hybrid-rerank-v1",
                 projector=lambda candidates: project_results(
-                    candidates, store, self.data_root / namespace / "knowledge" / ".pdf-assets"
+                    candidates, store, self.data_root / namespace / "knowledge" / ".pdf-assets",
+                    word_assets_root=self.data_root / namespace / "knowledge" / ".word-assets",
                 ),
             )
             config = replace(self.config, namespace=namespace)

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { AssetView } from "./AssetView";
 import {
   Alert,
   Button,
@@ -69,7 +70,12 @@ function Result({ item, rerank }: { item: Hit; rerank: Rerank }) {
         <div className="result-source">
           {item.source} · {item.chunk_id} · {item.document_id}
         </div>
-        <p className="result-text">{item.text}</p>
+        {item.metadata?.location && <div className="secondary">
+          {item.metadata.location.headings?.join(" / ")}
+          {item.metadata.location.paragraph ? ` · 第 ${item.metadata.location.paragraph} 段` : ""}
+        </div>}
+        {item.asset ? <AssetView asset={item.asset} source={item.source} /> : <p className="result-text">{item.text}</p>}
+        {item.asset?.type === "image" && item.metadata?.footnotes?.map((note, index) => <p className="asset-note" key={index}>{note.text}</p>)}
       </div>
     </article>
   );

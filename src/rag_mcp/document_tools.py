@@ -30,13 +30,13 @@ class DocumentRequest:
             return cls(name)
         suffix = Path(name).suffix.casefold()
         if suffix not in SUPPORTED_EXTENSIONS:
-            raise KnowledgeValidationError("Supported files: .txt, .md, .pdf, .docx")
+            raise KnowledgeValidationError("Supported files: .txt, .md, .pdf, .docx, .doc")
         if ("content" in arguments) == ("content_base64" in arguments):
             raise KnowledgeValidationError("Provide exactly one of content or content_base64")
         if "content" in arguments:
             text = arguments["content"]
             if suffix not in {".txt", ".md"}:
-                raise KnowledgeValidationError("PDF and DOCX require content_base64")
+                raise KnowledgeValidationError("PDF, DOCX and DOC require content_base64")
             if not isinstance(text, str) or len(text) > MAX_FILE_BYTES:
                 raise KnowledgeValidationError("content must be text no larger than 10 MiB")
             try:
@@ -71,7 +71,7 @@ def document_tool_entries(mutate):
                                "description": "Exact filename including extension; no directory path."}}
         schema = {"type": "object", "properties": properties, "required": ["name"], "additionalProperties": False}
         if writing:
-            description += " Supply content for UTF-8 TXT/Markdown, or content_base64 for file bytes (required for PDF/DOCX). Maximum decoded size: 10 MiB. No server paths or URLs."
+            description += " Supply content for UTF-8 TXT/Markdown, or content_base64 for file bytes (required for PDF/DOCX/DOC). Maximum decoded size: 10 MiB. No server paths or URLs."
             properties.update(
                 content={"type": "string", "minLength": 1, "maxLength": MAX_FILE_BYTES},
                 content_base64={"type": "string", "minLength": 1, "maxLength": 4 * ((MAX_FILE_BYTES + 2) // 3)},

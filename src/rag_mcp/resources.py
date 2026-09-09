@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 from .pdf_content import FORMULA_BLOCK
@@ -40,9 +41,12 @@ def parse_uri(namespace: str, uri: str) -> tuple[str, int, str | None]:
     return name, page, version
 
 
-def paragraph_pages(text: str) -> list[str]:
+def paragraph_pages(text: str, *, protect_inline_math: bool = False) -> list[str]:
     pages: list[str] = []
     formulas = [(match.start(), match.end()) for match in FORMULA_BLOCK.finditer(text)]
+    if protect_inline_math:
+        formulas.extend((match.start(), match.end()) for match in re.finditer(r"(?<!\$)\$(?!\$)[^$]+\$(?!\$)", text))
+        formulas.sort()
     start = 0
     while start < len(text):
         if len(text) - start <= PAGE_CHARACTERS:
@@ -62,7 +66,7 @@ def paragraph_pages(text: str) -> list[str]:
 def resource_page(namespace: str, name: str, text: str, version: str, page: int, expected: str | None) -> dict:
     if expected is not None and expected != version:
         raise ValueError("Document changed; read its document URI again")
-    pages = paragraph_pages(text)
+    pages = paragraph_pages(text, protect_inline_math=Path(name).suffix.lower() in {".doc", ".docx"})
     if page > len(pages):
         raise ValueError("Page does not exist")
     uri = document_uri(namespace, name)

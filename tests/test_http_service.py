@@ -193,7 +193,7 @@ def test_upload_list_search_and_delete_use_header_namespace(service) -> None:
     deleted = client.delete("/v1/documents/manual.md", headers=AUTH)
 
     assert uploaded.status_code == 200
-    assert set(listing.json()["supported_extensions"]) == {".docx", ".md", ".pdf", ".txt"}
+    assert set(listing.json()["supported_extensions"]) == {".doc", ".docx", ".md", ".pdf", ".txt"}
     assert listing.json()["documents"][0]["name"] == "manual.md"
     assert search.json()["evidence_status"] == "no_evidence"
     assert runtime.search_arguments[0]["candidate_k"] == 10
@@ -257,8 +257,9 @@ def test_service_owned_store_accepts_document_formats_and_confines_names(tmp_pat
         ]
     )
 
+    store.validate_uploads([("legacy.doc", io.BytesIO(b"doc"))])
     with pytest.raises(KnowledgeValidationError, match="暂不支持"):
-        store.validate_uploads([("legacy.doc", io.BytesIO(b"doc"))])
+        store.validate_uploads([("unsupported.exe", io.BytesIO(b"binary"))])
 
     assert store.sanitize_name("../outside.md") == "_outside.md"
     assert store.paths.knowledge_dir in store._confined_target("safe.md").parents

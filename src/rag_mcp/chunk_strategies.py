@@ -157,7 +157,7 @@ def structure_ranges(document: DocumentContent, suffix: str) -> list[tuple[int, 
             section += 1
         if suffix == ".pdf":
             key = ("page", block.page)
-        elif suffix in {".md", ".docx"} and block.headings:
+        elif suffix in {".md", ".docx", ".doc"} and block.headings:
             key = ("section", section, block.headings, block.table)
         elif block.table is not None:
             key = ("table", block.table)

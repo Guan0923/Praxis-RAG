@@ -15,6 +15,7 @@ dependencies = [
     "pypdf>=5,<7",
     "python-multipart>=0.0.20,<1",
     "python-docx>=1.1.2,<2",
+    "docxlatex==1.2.3",
     "markdown-it-py>=3,<5",
     "qdrant-client>=1.12,<2",
     "uvicorn>=0.30,<1",

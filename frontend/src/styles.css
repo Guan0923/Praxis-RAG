@@ -596,3 +596,13 @@ h3 {
     font-size: 16px;
   }
 }
+/* Document evidence uses unframed figures and scrollable, semantic tables. */
+.result-asset { margin: 12px 0; max-width: 100%; }
+.result-asset .ant-image { max-width: 100%; }
+.result-asset .ant-image-img { max-width: 100%; max-height: 420px; object-fit: contain; }
+.result-asset figcaption { margin: 8px 0; font-weight: 600; overflow-wrap: anywhere; }
+.asset-table-scroll { max-width: 100%; overflow-x: auto; margin: 8px 0; }
+.asset-table { border-collapse: collapse; min-width: 100%; font-size: 13px; }
+.asset-table td { border: 1px solid #9998; padding: 8px; min-width: 72px; max-width: 360px; white-space: pre-wrap; overflow-wrap: anywhere; vertical-align: top; }
+.asset-note, .word-diagnostics { font-size: 13px; overflow-wrap: anywhere; }
+.result-body { min-width: 0; }

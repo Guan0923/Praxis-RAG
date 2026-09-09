@@ -73,23 +73,24 @@ def test_password_protected_pdf_has_safe_error(tmp_path: Path) -> None:
         read_document_text(source)
 
 
-def test_ingester_exposes_pdf_read_error_as_safe_validation_error(tmp_path: Path) -> None:
+def test_ingester_exposes_pdf_read_error_as_safe_validation_error(tmp_path: Path, monkeypatch) -> None:
     source = tmp_path / "scan.pdf"
     writer = PdfWriter()
     writer.add_blank_page(width=612, height=792)
     with source.open("wb") as handle:
         writer.write(handle)
     ingester = DenseDocumentIngester(RagConfig(backend="qdrant"), object(), object(), object())
-
-    with pytest.raises(KnowledgeValidationError, match="OCR"):
+    def failed_parse(*args, **kwargs):
+        raise ValueError("PDF parser failed")
+    monkeypatch.setattr("rag_mcp.pdf_assets.parse_pdf", failed_parse)
+    with pytest.raises(KnowledgeValidationError, match="PDF parser failed"):
         ingester.ingest(source, source_root=tmp_path)
 
 
-def test_discovery_includes_pdf_and_docx_but_not_legacy_doc(tmp_path: Path) -> None:
-    expected = [tmp_path / name for name in ("a.md", "b.pdf", "c.docx", "d.txt")]
+def test_discovery_includes_pdf_and_word(tmp_path: Path) -> None:
+    expected = [tmp_path / name for name in ("a.md", "b.pdf", "c.docx", "d.txt", "legacy.doc")]
     for path in expected:
         path.write_bytes(b"fixture")
-    (tmp_path / "legacy.doc").write_bytes(b"fixture")
 
     assert discover_documents(tmp_path) == expected
 

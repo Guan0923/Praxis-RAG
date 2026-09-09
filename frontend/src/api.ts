@@ -17,7 +17,21 @@ export type DocumentInfo = {
   chunk_count: number;
   collection: string;
   chunking?: Chunking;
+  diagnostics?: WordDiagnostic[];
+  skipped_object_count?: number;
 };
+export type WordLocation = { part?: string; paragraph?: number; headings?: string[]; scope?: string };
+export type WordDiagnostic = { kind: string; message: string; location?: WordLocation; text?: string; asset_ids?: string[] };
+export type AssetTable = {
+  rows: string[][];
+  cells?: { row?: number; col?: number; row_span?: number; col_span?: number; text?: string;
+    start_row_offset_idx?: number; end_row_offset_idx?: number; start_col_offset_idx?: number;
+    end_col_offset_idx?: number; nested_tables?: string[] }[];
+  num_rows?: number; num_cols?: number; nested_tables?: Record<string, AssetTable>;
+  caption?: string; footnotes?: string[];
+};
+export type SearchAsset = { mime_type?: string; data?: string; caption?: string;
+  location?: WordLocation; page?: number } & ({ type: "image" } | ({ type: "table" } & AssetTable));
 export type ModelState = { name: string; configured: boolean; provider: "http" };
 export type Health = {
   backend?: string;
@@ -32,9 +46,11 @@ export type Hit = {
   source: string;
   chunk_id: string;
   document_id: string;
-  text: string;
+  text?: string;
   score: number;
-  metadata?: { retrieval_score?: number };
+  asset?: SearchAsset;
+  metadata?: { retrieval_score?: number; location?: WordLocation;
+    captions?: { text: string }[]; footnotes?: { text: string }[] };
 };
 export type SearchResult = {
   retrieval: Retrieval;

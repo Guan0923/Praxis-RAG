@@ -41,6 +41,8 @@ class RagConfig:
     pdf_parser_python: Path | None = None
     pdf_models_path: Path | None = None
     pdf_parse_timeout: int = 900
+    word_converter_path: Path | None = None
+    word_convert_timeout: int = 120
 
     @classmethod
     def from_env(cls) -> RagConfig:
@@ -91,6 +93,8 @@ class RagConfig:
             pdf_parser_python=_optional_path("RAG_PDF_PARSER_PYTHON"),
             pdf_models_path=_optional_path("RAG_PDF_MODELS_PATH"),
             pdf_parse_timeout=_integer_env("RAG_PDF_PARSE_TIMEOUT", 900, minimum=30, maximum=7_200),
+            word_converter_path=_optional_path("RAG_WORD_CONVERTER_PATH"),
+            word_convert_timeout=_integer_env("RAG_WORD_CONVERT_TIMEOUT", 120, minimum=1, maximum=7_200),
         )
 
 

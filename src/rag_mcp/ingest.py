@@ -37,7 +37,7 @@ def ingest_path(path: Path, config: RagConfig) -> IngestStats:
     failed_files = 0
     for document in documents:
         try:
-            if document.suffix.casefold() == ".pdf":
+            if document.suffix.casefold() in {".pdf", ".doc", ".docx"}:
                 indexed = ingester.ingest(document, source_root=source_root)
                 imported_chunks += indexed.chunk_count
                 imported_files += 1
@@ -65,7 +65,7 @@ def ingest_path(path: Path, config: RagConfig) -> IngestStats:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Import Markdown/TXT/PDF/DOCX documents into Qdrant with BGE-M3 and BM25 sparse vectors."
+        description="Import Markdown/TXT/PDF/DOCX/DOC documents into Qdrant with BGE-M3 and BM25 sparse vectors."
     )
     parser.add_argument("path", type=Path, help="Document file or directory")
     return parser.parse_args(argv)

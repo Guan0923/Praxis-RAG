@@ -293,7 +293,8 @@ def _validate_table(table: dict[str, object], reference: str) -> None:
             raise RuntimeError(f"Wide table structure is unreliable after rotation/OCR: {reference}")
 
 
-def _describe_missing(assets: list[dict[str, object]], output: Path, models: Path) -> None:
+def _describe_missing(assets: list[dict[str, object]], output: Path, models: Path, *,
+                      compile_model: bool = True, max_image_edge: int | None = None) -> None:
     import torch
     from PIL import Image
     from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
@@ -315,12 +316,18 @@ def _describe_missing(assets: list[dict[str, object]], output: Path, models: Pat
         enabled=True, enable_remote_services=False, artifacts_path=models, options=options,
         accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA, num_threads=4),
     )
+    if not compile_model:
+        model.model = getattr(model.model, "_orig_mod", model.model)
+        model.model.eval()
     for asset in assets:
         image_path = output / str(asset.pop("_vision_file"))
         if not image_path.is_file():
             raise RuntimeError(f"Vision input is missing: {image_path.name}")
         with Image.open(image_path) as image:
-            descriptions = list(model._annotate_images([image.convert("RGB")]))
+            rgb = image.convert("RGB")
+            if max_image_edge is not None:
+                rgb.thumbnail((max_image_edge, max_image_edge))
+            descriptions = list(model._annotate_images([rgb]))
         if len(descriptions) != 1 or not descriptions[0].strip():
             raise RuntimeError(f"Granite Vision returned no description for {asset['asset_id']}")
         asset["generated_description"] = _clean_description(descriptions[0])

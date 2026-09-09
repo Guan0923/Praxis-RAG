@@ -108,7 +108,7 @@ def parse_pdf(path: Path, *, source_root: Path, config: ChunkingConfig | None,
 
 
 def install_assets(parsed: ParsedPdf, source_root: Path, document_id: str) -> tuple[Path, Path | None]:
-    final = source_root / ".pdf-assets" / document_id
+    final = source_root / getattr(parsed, "assets_subdir", ".pdf-assets") / document_id
     backup = None
     if final.exists():
         backup = final.with_name(f".{final.name}.backup")
@@ -134,7 +134,7 @@ def finish_assets(backup: Path | None) -> None:
         shutil.rmtree(backup, ignore_errors=True)
 
 
-def project_results(candidates, store, assets_root: Path) -> list[dict[str, object]]:
+def project_results(candidates, store, assets_root: Path, *, word_assets_root: Path | None = None) -> list[dict[str, object]]:
     """Hydrate ranked asset hits while keeping generated descriptions private."""
 
     asset_ids = [str(c.metadata["asset_id"]) for c in candidates if c.metadata.get("asset_id")]
@@ -157,14 +157,21 @@ def project_results(candidates, store, assets_root: Path) -> list[dict[str, obje
         caption = str(asset.get("caption") or "")
         common["metadata"].update(captions=asset.get("captions", []), footnotes=asset.get("footnotes", []),
                                   caption_source=asset.get("caption_source", "none"))
+        if asset.get("asset_storage") == "word":
+            common["metadata"].pop("page", None)
+            common["metadata"].pop("bbox", None)
+            common["metadata"]["location"] = asset.get("location")
         if asset.get("asset_kind") == "picture":
             relative = asset.get("image_file")
             if not isinstance(relative, str):
                 continue
-            image = (assets_root / relative).resolve()
-            if assets_root.resolve() not in image.parents or not image.is_file():
+            root = word_assets_root if asset.get("asset_storage") == "word" else assets_root
+            if root is None:
                 continue
-            common["asset"] = {"type": "image", "mime_type": "image/png",
+            image = (root / relative).resolve()
+            if root.resolve() not in image.parents or not image.is_file():
+                continue
+            common["asset"] = {"type": "image", "mime_type": asset.get("mime_type") or "image/png",
                                "data": base64.b64encode(image.read_bytes()).decode("ascii"),
                                "caption": caption, "page": asset.get("page"), "bbox": asset.get("bbox")}
         else:
@@ -177,6 +184,12 @@ def project_results(candidates, store, assets_root: Path) -> list[dict[str, obje
                                "header_rows": table.get("header_rows", []),
                                "cells": table.get("cells", []), "num_rows": table.get("num_rows", 0),
                                "num_cols": table.get("num_cols", 0), "footnotes": table.get("footnotes", [])}
+            if asset.get("asset_storage") == "word":
+                common["asset"].update(nested_tables=table.get("nested_tables", {}), parent_cell=table.get("parent_cell"))
+        if asset.get("asset_storage") == "word":
+            common["asset"].pop("page", None)
+            common["asset"].pop("bbox", None)
+            common["asset"]["location"] = asset.get("location")
         results.append(common)
     return results
 

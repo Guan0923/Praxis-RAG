@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import re
 from zipfile import BadZipFile, ZipFile
 
-SUPPORTED_SUFFIXES = frozenset({".docx", ".md", ".pdf", ".txt"})
+SUPPORTED_SUFFIXES = frozenset({".doc", ".docx", ".md", ".pdf", ".txt"})
 MAX_PDF_PAGES = 1_000
 MAX_DOCX_MEMBERS = 10_000
 MAX_DOCX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
@@ -55,7 +55,7 @@ def read_document(path: Path) -> DocumentContent:
         pages = _pdf_pages(resolved)
         original = "\n\n".join(page.text for page in pages)
         blocks = [SourceBlock(part, page=page.page) for page in pages for part in _paragraphs(page.text)]
-    elif suffix == ".docx":
+    elif suffix in {".doc", ".docx"}:
         blocks = _docx_blocks(resolved)
         original = _join_docx(blocks)
     elif suffix == ".md":
@@ -189,50 +189,31 @@ def _join_docx(blocks: list[SourceBlock]) -> str:
 
 
 def _docx_blocks(path: Path) -> list[SourceBlock]:
-    _validate_docx_archive(path)
-    from docx import Document
-    from docx.table import Table
-
+    import os
+    from .word_converter import word_source
+    from .word_reader import parse_docx
     try:
-        document = Document(path)
-        blocks: list[SourceBlock] = []
-        headings: list[tuple[int, str]] = []
-        table_index = 0
-        extracted_characters = 0
-        for block in document.iter_inner_content():
-            if isinstance(block, Table):
-                table_index += 1
-                values = [
-                    " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip()) for row in block.rows
-                ]
-                text = "\n".join(value for value in values if value)
-                new_blocks = [SourceBlock(value, "table_row", headings=tuple(h[1] for h in headings), table=table_index) for value in values if value]
-            else:
-                text = block.text.strip()
-                style = block.style
-                level = None
-                seen: set[str] = set()
-                while style is not None and style.style_id not in seen:
-                    seen.add(style.style_id)
-                    match = re.fullmatch(r"Heading\s*([1-9])", style.name or "", re.IGNORECASE)
-                    if match:
-                        level = int(match[1])
-                        break
-                    style = style.base_style
-                if level is not None:
-                    headings = [item for item in headings if item[0] < level] + [(level, text)]
-                new_blocks = [SourceBlock(text, "heading" if level is not None else "paragraph", headings=tuple(h[1] for h in headings))]
-            if not text:
-                continue
-            extracted_characters += len(text)
-            if extracted_characters > MAX_EXTRACTED_CHARACTERS:
-                raise DocumentReadError(f"文档提取文本过大：{path.name}")
-            blocks.extend(new_blocks)
+        with word_source(path, timeout=int(os.getenv("RAG_WORD_CONVERT_TIMEOUT", "120"))) as source:
+            manifest = parse_docx(source)
+        assets = {asset["asset_id"]: asset for asset in manifest["assets"]}
+        blocks = []
+        for item in manifest["blocks"]:
+            headings = tuple(item["location"]["headings"])
+            asset = assets.get(item.get("asset_id"))
+            if asset and asset["kind"] == "table":
+                index = list(assets).index(asset["asset_id"]) + 1
+                for row in asset["table"]["rows"]:
+                    value = " | ".join(str(cell).replace("\n", " ").replace("|", r"\|") for cell in row)
+                    blocks.append(SourceBlock(value, "table_row", headings=headings, table=index))
+            elif asset:
+                blocks.append(SourceBlock(f"[Image: {asset['asset_id']}]", "picture", headings=headings))
+            elif item["text"]:
+                blocks.append(SourceBlock(item["text"], item["kind"], headings=headings))
+        return blocks
     except DocumentReadError:
         raise
     except Exception as exc:
-        raise DocumentReadError(f"Word 文件损坏或格式无效：{path.name}") from exc
-    return blocks
+        raise DocumentReadError(f"Word 解析失败：{path.name}；{exc}") from exc
 
 
 def _validate_docx_archive(path: Path) -> None:

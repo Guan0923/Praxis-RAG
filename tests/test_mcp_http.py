@@ -35,15 +35,17 @@ class TestIngester:
 
     def ingest(self, path, *, source_root, chunking=None):
         text = read_document_text(path)
-        if path.suffix == ".pdf":
+        if path.suffix in {".pdf", ".doc", ".docx"}:
             # Protocol fixture supplies a saved parse; GPU parsing is tested separately.
             from rag_mcp.chunking import _source_name, _stable_id
             from rag_mcp.pdf_content import PDF_PARSER_VERSION
+            from rag_mcp.word_reader import WORD_PARSER_VERSION
 
             document_id = _stable_id("doc", _source_name(path, source_root).casefold())
-            folder = source_root / ".pdf-assets" / document_id
+            is_word = path.suffix != ".pdf"
+            folder = source_root / (".word-assets" if is_word else ".pdf-assets") / document_id
             folder.mkdir(parents=True, exist_ok=True)
-            (folder / "manifest.json").write_text(json.dumps({"version": PDF_PARSER_VERSION}), encoding="utf-8")
+            (folder / "manifest.json").write_text(json.dumps({"version": WORD_PARSER_VERSION if is_word else PDF_PARSER_VERSION}), encoding="utf-8")
             (folder / "document.md").write_text(text, encoding="utf-8")
         if path.name == "fail.txt":
             raise ValueError("controlled indexing failure")

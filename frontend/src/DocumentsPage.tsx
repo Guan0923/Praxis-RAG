@@ -336,6 +336,7 @@ export function DocumentsPage({
                   </button>
                   <div className="secondary">
                     {doc.chunk_count} 个片段 · {formatBytes(doc.size)}
+                    {!!doc.skipped_object_count && <div>已跳过 {doc.skipped_object_count} 个对象</div>}
                   </div>
                   <div className="mobile-document-details secondary">
                     {chunkLabel(doc.chunking, strategies)}
@@ -420,7 +421,7 @@ export function DocumentsPage({
         <div className="upload-dialog">
           <Upload.Dragger
             multiple
-            accept=".md,.txt,.pdf,.docx"
+            accept=".md,.txt,.pdf,.docx,.doc"
             disabled={uploading}
             beforeUpload={() => false}
             fileList={files}
@@ -431,7 +432,7 @@ export function DocumentsPage({
             </p>
             <p>选择文档</p>
             <p className="secondary">
-              MD / TXT / PDF / DOCX · 每批最多 10 个 · 单文件 10 MiB
+              MD / TXT / PDF / DOCX / DOC · 每批最多 10 个 · 单文件 10 MiB
             </p>
           </Upload.Dragger>
           {strategyError && (
@@ -523,13 +524,18 @@ export function DocumentsPage({
             )}
             {report && (
               <Alert
-                type={report.failed.length ? "warning" : "success"}
+                type={report.failed.length || report.imported.some((item) => item.skipped_object_count) ? "warning" : "success"}
                 showIcon
                 title={summary}
                 description={
                   <div className="upload-report">
                     {report.imported.map((item, index) => (
-                      <div key={`import-${index}`}>{item.name}：已索引</div>
+                      <div key={`import-${index}`}>{item.name}：已索引
+                        {!!item.skipped_object_count && <div>已跳过 {item.skipped_object_count} 个对象</div>}
+                        {item.diagnostics?.map((diagnostic, d) => <div key={d}>
+                          第 {diagnostic.location?.paragraph} 段：{diagnostic.text || diagnostic.message}
+                        </div>)}
+                      </div>
                     ))}
                     {report.skipped.map((item, index) => (
                       <div key={`skip-${index}`}>

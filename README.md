@@ -185,7 +185,28 @@ python -m pytest tests/test_real_chunking.py -q -s
 
 该测试用真实 BGE-M3、BM25 和本地 Qdrant，在临时目录中验证五种策略及四种文件。浏览器验收另需 `playwright` 和本机 Edge：设置 `RAG_BROWSER_URL` 为独立测试服务地址后，运行 `tests/test_browser_chunking.py`；截图保存在 `.mini_agent-rag/chunking-ui/`。
 
-PDF 最多解析 1000 页；DOCX 解压后的内部文件总量最多 50 MiB；单个文档最多提取 500 万字符。扫描版 PDF 使用本地 OCR；旧版二进制 `.doc` 需要先另存为 `.docx`。
+PDF 最多解析 1000 页；DOCX 解压后的内部文件总量最多 50 MiB；单个文档最多提取 500 万字符。扫描版 PDF 使用本地 OCR；旧版二进制 `.doc` 由独立 LibreOffice 进程转换后解析。
+
+### Word 解析和图片检索
+
+```powershell
+$env:RAG_WORD_CONVERTER_PATH = "C:/Program Files/LibreOffice/program/soffice.exe"
+$env:RAG_WORD_CONVERT_TIMEOUT = "120"
+# 无图注的图片使用已有 Docling + Granite Vision 环境和模型目录。
+$env:RAG_PDF_PARSER_PYTHON = "C:/path/to/pdf-parser/python.exe"
+$env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
+```
+
+- DOCX 读取正文、内容控件、文本框、页眉页脚、脚注尾注及嵌套表格。只保留最终正文，忽略删除和移出修订。
+- 表格保留空列、合并范围、嵌套单元格、表题及表注。每行检索文字携带表头，命中后返回完整结构。
+- 原生公式通过 `docxlatex` 转为 LaTeX；不支持的公式结构、损坏内容、外链图片及未能提取的原生图表会明确拒绝入库。
+- 图片保存原始字节。真实图注用于检索；没有图注时生成简短视觉描述，仅用于索引，不冒充图注。Word 视觉推理缩放输入到最长边 384 像素，不改变保存的原图；拒答或无效描述导致入库失败。
+- 图注、表注按编号、明确引用和相邻关系关联。仍有歧义的对象不保存，注释文字保留，上传结果与文档详情显示跳过数量、位置和原因。
+- Word 资产保存在知识目录内的 `.word-assets`，与源文件和索引一同更新、回滚和删除。旧文档需重新上传才能使用新解析结果，不会自动重建已有知识库。
+- REST 图片结果的 `asset.data` 是 Base64，`asset.mime_type` 是实际类型；MCP 返回图片内容块。Word 使用章节、段落和对象位置，不提供虚构页码或坐标。控制台支持图片下载和表格展示。
+- DOC 转换使用独立临时目录及 LibreOffice 配置，禁用宏和链接更新。DOC 原文件仍保留；其图片字节以转换后的 DOCX 为准。转换超时、工具缺失或加密文档会报错，不降级成不完整文本。
+
+真实验收：在 `dev` 的隔离环境运行 `tests/test_real_word_fidelity.py`，设置 `RAG_REAL_WORD=1`、上述转换/模型配置，以及指向测试模型服务的 `RAG_MODEL_PROVIDER_URL`、`RAG_TEST_EMBEDDING_MODEL`。涉及 PyTorch 的进程使用 `dl` 或基于 `dl` 的模型环境。测试使用 `.test-tmp/word-real` 下的独立数据，不访问正式知识库。控制台验收使用 `RAG_WORD_PREVIEW_URL` 和 `tests/test_browser_word.py`。
 
 ## Namespace
 
@@ -233,7 +254,7 @@ MCP 提供 `search`、`add_document`、`update_document`、`delete_document` 四
 | `update_document` | `name` 和 `content` 或 `content_base64` | 完整替换已存在文件并重建索引，保留切分设置；不存在时报错 |
 | `delete_document` | `name` | 删除文件和索引；不存在时报错 |
 
-`name` 必须是含扩展名的准确文件名，不能传路径。支持 TXT、Markdown（`.md`）、PDF、DOCX，单文件最大 10 MiB。TXT/Markdown 可使用 UTF-8 文本 `content`；PDF/DOCX 必须由客户端读取文件后传标准 Base64 到 `content_base64`。两种内容参数只能传一种，不支持服务器路径或 URL。
+`name` 必须是含扩展名的准确文件名，不能传路径。支持 TXT、Markdown（`.md`）、PDF、DOCX、DOC，单文件最大 10 MiB。TXT/Markdown 可使用 UTF-8 文本 `content`；PDF/DOCX/DOC 必须由客户端读取文件后传标准 Base64 到 `content_base64`。两种内容参数只能传一种，不支持服务器路径或 URL。
 
 ```json
 {"name": "manual.txt", "content": "E03 表示温度传感器故障。"}
@@ -385,7 +406,7 @@ HTTP MCP 注册搜索和三个文件管理工具；本地搜索调试入口仍�
 
 ## 当前限制
 
-- 文档解析支持 Markdown/TXT、电子版和扫描版 PDF、DOCX；旧版 `.doc`、Excel、网页抓取和独立图片上传尚未实现。
+- 文档解析支持 Markdown/TXT、电子版和扫描版 PDF、DOCX，以及安装 LibreOffice 后的 DOC；Excel、网页抓取和独立图片上传尚未实现。
 - PDF 使用本机 Docling、OCR 和公式模型；不能保证任意扫描件、旋转表格或复杂公式都准确。公式处理针对 Docling 检出的公式块，不保证所有行内数学符号转换为 LaTeX。明确的解析错误会失败，但不能自动识别所有内容错误。
 - HTTP `embedding` 使用配置的兼容模型 API，向量长度由实际响应检测。
 - `hybrid` 使用 Qdrant Dense + Sparse 预取和 RRF 融合。
