@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert, App, Badge, Button, Dropdown, Form, Input, Modal, Tooltip,
 } from "antd";
@@ -23,14 +23,13 @@ import {
 import { SearchPage } from "./SearchPage";
 import { DocumentsPage } from "./DocumentsPage";
 import { DocumentPreview } from "./DocumentPreview";
+import { namespacePattern, useConsoleRoute } from "./navigation";
 
 const pages = [
   { key: "search", label: "检索调试", icon: <SearchOutlined /> },
   { key: "documents", label: "知识文档", icon: <DatabaseOutlined /> },
   { key: "connection", label: "连接配置", icon: <ApiOutlined /> },
 ] as const;
-type Page = (typeof pages)[number]["key"];
-const namespacePattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 
 function recentWorkspaces(): string[] {
   try {
@@ -56,14 +55,15 @@ export function Console({
   toggleTheme: () => void;
 }) {
   const { message } = App.useApp();
-  const [view, setView] = useState<Page>("search");
-  const [documentName, setDocumentName] = useState<string>();
-  const [connection, setConnection] = useState<Connection>(() => ({
-    namespace: readStorage(localStorage, "rag.namespace", "default"),
-    token: readStorage(sessionStorage, "rag.token"),
-  }));
-  const [revision, setRevision] = useState(0);
   const [uploading, setUploading] = useState(false);
+  const onNavigationBlocked = useCallback(() => {
+    void message.warning("文档正在上传，请完成后再切换工作区");
+  }, [message]);
+  const { route, navigate } = useConsoleRoute(uploading, onNavigationBlocked);
+  const { page: view, documentName, namespace } = route;
+  const [token, setToken] = useState(() => readStorage(sessionStorage, "rag.token"));
+  const connection = useMemo<Connection>(() => ({ namespace, token }), [namespace, token]);
+  const [revision, setRevision] = useState(0);
   const [health, setHealth] = useState<Health>();
   const [healthError, setHealthError] = useState("");
   const [checking, setChecking] = useState(false);
@@ -73,6 +73,18 @@ export function Console({
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [recent, setRecent] = useState(recentWorkspaces);
   const workspaceNames = [...new Set([connection.namespace, "default", ...recent])];
+
+  useEffect(() => {
+    const nextRecent = [...new Set([namespace, ...recentWorkspaces()])].slice(0, 20);
+    try {
+      localStorage.setItem("rag.namespace", namespace);
+      localStorage.setItem("rag.workspaces", JSON.stringify(nextRecent));
+    } catch {
+      void message.error("浏览器无法保存工作区，请检查存储权限");
+    }
+    setRecent(nextRecent);
+    form.setFieldsValue({ namespace, token });
+  }, [namespace, token, form, message]);
 
   async function refreshHealth() {
     healthRequest.current?.abort();
@@ -107,20 +119,14 @@ export function Console({
       namespace: values.namespace.trim(),
       token: values.token || "",
     };
-    const nextRecent = [
-      ...new Set([next.namespace, connection.namespace, ...recent]),
-    ].slice(0, 20);
     try {
-      localStorage.setItem("rag.namespace", next.namespace);
       sessionStorage.setItem("rag.token", next.token);
-      localStorage.setItem("rag.workspaces", JSON.stringify(nextRecent));
     } catch {
       void message.error("浏览器无法保存配置，请检查存储权限");
       return false;
     }
-    setConnection(next);
-    setDocumentName(undefined);
-    setRecent(nextRecent);
+    navigate({ namespace: next.namespace, page: view });
+    setToken(next.token);
     form.setFieldsValue(next);
     setRevision((value) => value + 1);
     void message.success(notice);
@@ -160,8 +166,7 @@ export function Console({
               aria-current={view === page.key ? "page" : undefined}
               className={view === page.key ? "nav-active" : ""}
               onClick={() => {
-                setView(page.key);
-                setDocumentName(undefined);
+                navigate({ namespace, page: page.key });
                 if (page.key === "connection") void refreshHealth();
               }}
             >
@@ -222,7 +227,7 @@ export function Console({
                 <button
                   type="button"
                   className="breadcrumb-link"
-                  onClick={() => setDocumentName(undefined)}
+                  onClick={() => navigate({ namespace, page: "documents" })}
                 >
                   知识文档
                 </button>
@@ -262,7 +267,7 @@ export function Console({
               description={healthError}
             />
           )}
-          <div key={revision}>
+          <div key={`${namespace}:${revision}`}>
             <section hidden={view !== "search"} aria-label="检索调试页面">
               <SearchPage connection={connection} onHealth={refreshHealth} />
             </section>
@@ -270,7 +275,7 @@ export function Console({
               <DocumentsPage
                 connection={connection}
                 active={view === "documents" && documentName === undefined}
-                onOpenDocument={setDocumentName}
+                onOpenDocument={(name) => navigate({ namespace, page: "documents", documentName: name })}
                 uploading={uploading}
                 onUploading={setUploading}
                 onHealth={refreshHealth}
@@ -283,7 +288,7 @@ export function Console({
                     <Button
                       aria-label="返回知识文档"
                       icon={<ArrowLeftOutlined />}
-                      onClick={() => setDocumentName(undefined)}
+                      onClick={() => navigate({ namespace, page: "documents" })}
                     />
                   </Tooltip>
                   <h1>{documentName}</h1>
