@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import hashlib
 import os
 import re
 import shutil
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,12 +23,19 @@ from .contracts import SearchRequest
 from .document_readers import SUPPORTED_SUFFIXES, read_document_text
 from .mock import MockReranker
 from .orchestrator import RagOrchestrator
+from .pdf_content import PDF_PARSER_VERSION
 
 SUPPORTED_EXTENSIONS = SUPPORTED_SUFFIXES
 MAX_FILES_PER_BATCH = 10
 MAX_FILE_BYTES = 10 * 1024 * 1024
 _READ_SIZE = 1024 * 1024
 _WINDOWS_RESERVED = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _index_configuration(name: str, configuration: dict) -> dict:
+    if Path(name).suffix.casefold() == ".pdf":
+        return {**configuration, "pdf_parser_version": PDF_PARSER_VERSION}
+    return configuration
 
 
 class KnowledgeError(RuntimeError):
@@ -106,6 +114,13 @@ class KnowledgeDocumentStore:
             path = self._confined_target(name)
             if not path.is_file() or (self.paths.knowledge_dir / name).is_symlink():
                 continue
+            if chunking.get("pdf_parser_version"):
+                from .chunking import _source_name, _stable_id
+
+                document_id = _stable_id("doc", _source_name(path, self.paths.knowledge_dir).casefold())
+                cached = self.paths.knowledge_dir / ".pdf-assets" / document_id
+                if not (cached / "document.md").is_file() or not (cached / "manifest.json").is_file():
+                    continue
             if not record.get("sha256"):
                 with path.open("rb") as stream:
                     record["sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -129,11 +144,21 @@ class KnowledgeDocumentStore:
         replaced = target.exists()
         backed_up = False
         installed = False
+        metadata = None
+
+        def publish(indexed):
+            nonlocal metadata
+            metadata = self._metadata(target, indexed)
+            metadata.update(sha256=sha256, chunking=configuration)
+            manifest = self._read_manifest()
+            manifest[name] = metadata
+            self._write_manifest(manifest)
+
         try:
             sha256 = self._write_bounded(temporary, readable, name)
             if target.is_symlink():
                 raise KnowledgeValidationError(f"知识文件不能是符号链接：{name}")
-            configuration = (chunking or LEGACY_CONFIG).metadata(tokenizer_model)
+            configuration = _index_configuration(name, (chunking or LEGACY_CONFIG).metadata(tokenizer_model))
             previous = self.find_duplicate(sha256, configuration)
             if previous:
                 temporary.unlink()
@@ -143,7 +168,11 @@ class KnowledgeDocumentStore:
                 backed_up = True
             os.replace(temporary, target)
             installed = True
-            indexed = ingester.ingest(target, source_root=self.paths.knowledge_dir, chunking=chunking)
+            transactional = getattr(ingester, "ingest_and_publish", None)
+            if transactional is not None:
+                transactional(target, source_root=self.paths.knowledge_dir, chunking=chunking, publish=publish)
+            else:
+                publish(ingester.ingest(target, source_root=self.paths.knowledge_dir, chunking=chunking))
         except Exception:
             temporary.unlink(missing_ok=True)
             if installed:
@@ -151,12 +180,10 @@ class KnowledgeDocumentStore:
             if backed_up and backup.exists():
                 os.replace(backup, target)
             raise
-        backup.unlink(missing_ok=True)
-        metadata = self._metadata(target, indexed)
-        metadata.update(sha256=sha256, chunking=configuration)
-        manifest = self._read_manifest()
-        manifest[name] = metadata
-        self._write_manifest(manifest)
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError:
+            logging.getLogger(__name__).warning("Indexed document published; source backup cleanup failed: %s", backup)
         return metadata
 
     def delete(self, name: str, ingester: DocumentIngester) -> dict[str, object]:
@@ -243,14 +270,18 @@ class KnowledgeDocumentStore:
 class DenseDocumentIngester:
     """Index documents with service-owned shared model dependencies."""
 
-    def __init__(self, config: RagConfig, embedder, sparse_encoder, store) -> None:
+    def __init__(self, config: RagConfig, embedder, sparse_encoder, store, *, source_root: Path | None = None) -> None:
         self._config = config
         self._embedder = embedder
         self._sparse_encoder = sparse_encoder
         self._store = store
-        self._source_root: Path | None = None
+        self._source_root = source_root
 
     def ingest(self, path: Path, *, source_root: Path, chunking: ChunkingConfig | None = None) -> IndexedDocument:
+        return self.ingest_and_publish(path, source_root=source_root, chunking=chunking)
+
+    def ingest_and_publish(self, path: Path, *, source_root: Path, chunking: ChunkingConfig | None = None,
+                           publish: Callable[[IndexedDocument], None] | None = None) -> IndexedDocument:
         parsed_pdf = None
         try:
             if path.suffix.casefold() == ".pdf":
@@ -286,12 +317,18 @@ class DenseDocumentIngester:
 
                 final, backup = install_assets(parsed_pdf, source_root, chunks[0].document_id)
                 asset_payloads = [asset.payload(chunks[0].document_id, chunks[0].source) for asset in parsed_pdf.assets]
-            count = self._store.replace_document(chunks, vectors, sparse_vectors, asset_payloads)
+            indexed = IndexedDocument(chunks[0].document_id, len(chunks), self._config.collection)
+            count = self._store.replace_document(
+                chunks, vectors, sparse_vectors, asset_payloads,
+                after_write=(lambda: publish(indexed)) if publish is not None else None,
+            )
         except Exception:
             if final is not None:
                 from .pdf_assets import rollback_assets
 
                 rollback_assets(final, backup)
+            elif parsed_pdf is not None:
+                shutil.rmtree(parsed_pdf.staging_dir, ignore_errors=True)
             raise
         if backup is not None:
             from .pdf_assets import finish_assets
@@ -388,7 +425,8 @@ class RagServiceRuntime:
         configuration = self.chunking_metadata(chunking)
         with tenant.lock:
             return {"files": [{"name": item["name"], "sha256": item["sha256"],
-                               "document": tenant.documents.find_duplicate(item["sha256"], configuration)}
+                               "document": tenant.documents.find_duplicate(
+                                   item["sha256"], _index_configuration(item["name"], configuration))}
                               for item in items]}
 
     def upload(self, namespace: str, items: list[tuple[str, object]],
@@ -437,7 +475,16 @@ class RagServiceRuntime:
             target = tenant.documents._confined_target(name)
             if (tenant.documents.paths.knowledge_dir / name).is_symlink():
                 raise KnowledgeValidationError("Document cannot be a symbolic link")
-            return read_document_text(target), str(record["indexed_at"])
+            if target.suffix.casefold() == ".pdf":
+                from .pdf_assets import read_pdf_content
+
+                try:
+                    text = read_pdf_content(target, tenant.documents.paths.knowledge_dir)
+                except ValueError as exc:
+                    raise KnowledgeValidationError(str(exc)) from exc
+            else:
+                text = read_document_text(target)
+            return text, str(record["indexed_at"])
 
     def warmup(self) -> None:
         self._embedder.warmup()
@@ -479,7 +526,10 @@ class RagServiceRuntime:
             config = replace(self.config, namespace=namespace)
             resources = TenantResources(
                 documents=KnowledgeDocumentStore(KnowledgePaths(self.data_root / namespace)),
-                ingester=DenseDocumentIngester(config, self._embedder, self._sparse_encoder, store),
+                ingester=DenseDocumentIngester(
+                    config, self._embedder, self._sparse_encoder, store,
+                    source_root=self.data_root / namespace / "knowledge",
+                ),
                 orchestrator=orchestrator,
                 lock=RLock(),
             )

@@ -9,6 +9,7 @@ from pathlib import Path
 from .chunking import chunk_document, discover_documents
 from .config import RagConfig, RagConfigError
 from .orchestrator import build_qdrant_dependencies
+from .service_knowledge import DenseDocumentIngester
 
 
 @dataclass(frozen=True)
@@ -30,11 +31,18 @@ def ingest_path(path: Path, config: RagConfig) -> IngestStats:
     documents = discover_documents(resolved_path)
     source_root = resolved_path if resolved_path.is_dir() else resolved_path.parent
     embedder, sparse_encoder, store = build_qdrant_dependencies(config)
+    ingester = DenseDocumentIngester(config, embedder, sparse_encoder, store)
     imported_files = 0
     imported_chunks = 0
     failed_files = 0
     for document in documents:
         try:
+            if document.suffix.casefold() == ".pdf":
+                indexed = ingester.ingest(document, source_root=source_root)
+                imported_chunks += indexed.chunk_count
+                imported_files += 1
+                print(f"OK   {document} ({indexed.chunk_count} chunks)")
+                continue
             chunks = chunk_document(document, source_root=source_root, tokenizer_model=config.embedding_model)
             if not chunks:
                 print(f"SKIP {document}: empty document")

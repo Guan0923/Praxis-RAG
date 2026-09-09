@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
+from .pdf_content import FORMULA_BLOCK
+
 PAGE_CHARACTERS = 8000
 
 
@@ -40,6 +42,7 @@ def parse_uri(namespace: str, uri: str) -> tuple[str, int, str | None]:
 
 def paragraph_pages(text: str) -> list[str]:
     pages: list[str] = []
+    formulas = [(match.start(), match.end()) for match in FORMULA_BLOCK.finditer(text)]
     start = 0
     while start < len(text):
         if len(text) - start <= PAGE_CHARACTERS:
@@ -47,6 +50,10 @@ def paragraph_pages(text: str) -> list[str]:
             break
         end = text.rfind("\n\n", start, start + PAGE_CHARACTERS)
         end = end + 2 if end >= start else start + PAGE_CHARACTERS
+        for formula_start, formula_end in formulas:
+            if formula_start < end < formula_end:
+                end = formula_start if formula_start > start else formula_end
+                break
         pages.append(text[start:end])
         start = end
     return pages or [""]

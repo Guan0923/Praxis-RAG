@@ -84,6 +84,12 @@ Console 包含知识上传、文档删除、BM25/Embedding/Hybrid 检索、Reran
 
 首次上传或 Dense 检索时会下载并加载 BGE-M3。PDF 由独立 Docling 2.126.0 子进程解析，使用 PDFium、CUDA 和本机模型；图片或表格没有有效原文说明时，才使用固定版本的 Granite Vision 3.3 2B 生成检索描述。图片原图保存在租户目录，图表原始数据和检索文字写入 Qdrant。每批最多 10 个文件，单文件最大 10 MiB。
 
+PDF 公式使用本地 CodeFormulaV2 转为 LaTeX，开启生成缓存，并以紧裁剪、单公式推理减少相邻文字干扰。模型错误、空公式输出或生成被截断会导致该文件解析失败，不静默跳过。模型能够输出 LaTeX 不代表数学内容一定正确，复杂公式仍需要用原页验证。
+
+OCR 不再按默认置信度阈值丢弃已识别文字；低置信度内容保留，并在 `ocr.json`、解析清单和相关检索块的 `source_warnings` 中记录。保留文字不等于识别正确，扫描件仍可能有错字。
+
+每份 PDF 的原生 `document.json`、按阅读顺序保存的 `manifest.json`、正文 `document.md`、OCR 记录 `ocr.json` 和图片保存在知识目录的 `.pdf-assets/<document_id>/`。正文、图片、表格与公式保持 Docling 的遍历顺序；图注、表题、脚注保留原文关联，不按长度丢弃，也不猜配未关联注解。生成描述仅用于检索，不充当原文注解。命令行 PDF 导入和 MCP 正文读取使用同一份解析结果。
+
 ### 切分策略与上传去重
 
 Web Console 的“知识文档”页面可选择五种切分策略。网页及上传 API 默认使用 `recursive`，块长度为 512 token，重叠上限为 64 token；参数可调整。命令行导入仍使用原字符策略，不增加新参数。
@@ -98,10 +104,13 @@ Web Console 的“知识文档”页面可选择五种切分策略。网页及�
 
 短内容按原文顺序合并，允许跨章节和 PDF 页面。重叠计入长度上限，句子重叠可能少于设置值或为零；超长句子使用 token 重叠。chunk 元数据记录字符位置、实际页码、标题路径和段落位置。PDF 正式上传按 Docling 的页码和版面顺序生成正文块；图片按原图注检索并返回原图，表格按表题、表头和行内容检索并返回行列及合并信息。扫描文本使用 Docling OCR；无法稳定恢复结构的表格会终止该文件入库。
 
+PDF 正文实际执行所选切分策略；公式整体保留，表格按完整行附带全部表头层级入库，不跨图表或公式边界拼接正文。表格的 `header_rows` 保存多层表头，`cells` 保存合并范围，空列不会被删除。不可拆分的公式、图注或表格行可以超过目标块长度，但不得超过 Embedding 模型输入上限，超过时明确报错。PDF 块记录原始引用、页码及位置；跨页原文保留全部 `locations`，`page` 是起始页。普通正文的字符偏移对应当前连续正文段，不是 PDF 文件字节位置；来源的 `charspan` 对应 Docling 原始元素。
+
 - `GET /v1/chunking/strategies` 返回策略选项、单位和默认参数。
 - `POST /v1/documents` 在原 `files` multipart 字段外接收 `strategy`、`chunk_size`、`chunk_overlap`。
 - `POST /v1/documents/check` 接收 JSON：`{"files":[{"name":"guide.md","sha256":"64位小写十六进制哈希"}],"strategy":"recursive","chunk_size":512,"chunk_overlap":64}`，返回同序的 `files`，每项 `document` 为已有文档或 `null`。
 - 三个接口均沿用 `X-RAG-Namespace` 和服务认证。去重仅在同一 namespace 内比较文件 SHA-256、策略、长度、重叠及 tokenizer 标识；文件名不参与比较。
+- PDF 去重还比较 `pdf_parser_version`，解析器更新后重新上传会重新索引。旧 PDF 不自动迁移，缺少当前版本解析正文时 MCP 会要求显式重新导入，不回退到旧的纯文本提取。
 - 浏览器先计算哈希并检查，命中则不发送文件正文。需要 HTTPS 或 localhost 安全连接。后端接收正文时重新计算哈希，并在租户锁内再次去重。
 - 上传结果分别包含 `imported`、`skipped`、`failed` 和 `documents`。更改参数会重新索引；改名但配置相同则返回已有文档，不新建别名。已有文档不会自动重建。
 - 旧清单首次检查时按需补齐哈希，缺失配置按原 700/100 字符策略解释。tokenizer 下载或加载失败会明确报错，不退回字符计数。
@@ -116,7 +125,7 @@ python -m pytest tests/test_real_chunking.py -q -s
 
 该测试用真实 BGE-M3、BM25 和本地 Qdrant，在临时目录中验证五种策略及四种文件。浏览器验收另需 `playwright` 和本机 Edge：设置 `RAG_BROWSER_URL` 为独立测试服务地址后，运行 `tests/test_browser_chunking.py`；截图保存在 `.mini_agent-rag/chunking-ui/`。
 
-PDF 最多解析 1000 页；DOCX 解压后的内部文件总量最多 50 MiB；单个文档最多提取 500 万字符。扫描版 PDF 没有文本层，需要先用 OCR 软件转换；旧版二进制 `.doc` 需要先另存为 `.docx`。
+PDF 最多解析 1000 页；DOCX 解压后的内部文件总量最多 50 MiB；单个文档最多提取 500 万字符。扫描版 PDF 使用本地 OCR；旧版二进制 `.doc` 需要先另存为 `.docx`。
 
 ## Namespace
 
@@ -204,7 +213,26 @@ uv run --package mini-agent-rag-mcp rag-mcp-debug "RRF 怎么融合 BM25 和 Den
 uv run --package mini-agent-rag-mcp rag-mcp-debug --schema
 ```
 
-协议测试会启动真实本机 HTTP 服务，使用官方客户端和真实文件存储、PDF/Word 解析，但以可控检索器替代模型，不下载模型或连接 Qdrant。这不等于真实模型效果验证。
+协议测试会启动真实本机 HTTP 服务，使用官方客户端和真实文件存储，但以可控检索器和 PDF 解析结果替代模型，不下载模型或连接 Qdrant。这不等于真实模型效果验证。
+
+本地 GPU 的 PDF 完整链路验收使用 `tests/test_real_pdf_fidelity.py`。先激活 `dl`，指定已安装依赖的解析器 Python、本地模型目录和样本目录，再执行：
+
+```powershell
+conda activate dl
+$env:PYTHONPATH = "$PWD/src"
+$env:HF_HUB_OFFLINE = "1"
+$env:TRANSFORMERS_OFFLINE = "1"
+$env:RAG_REAL_PDF = "1"
+$env:RAG_PDF_PARSER_PYTHON = "C:/path/to/pdf-parser/python.exe"
+$env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
+$env:RAG_PDF_SAMPLES = "C:/path/to/pdf/samples"
+$env:RAG_PDF_SAMPLE_FILES = "aviation.pdf,doclaynet.pdf,mineru_demo2.pdf,scan.pdf"
+& $env:RAG_PDF_PARSER_PYTHON -m pytest tests/test_real_pdf_fidelity.py -q -s
+```
+
+此测试在独立临时目录启动 HTTP 服务和本地 Qdrant，调用真实 Docling、CodeFormulaV2、OCR、BGE-M3；检查上传、重复检测、检索和 MCP 全文读取。耗时、显存分配峰值、公式与图表数量、检索结果写入 `.test-tmp/pdf-fidelity-real/<run>/report.json`。这些检查证明链路保留情况，不等于公式语义或版面识别准确率；仍须对照原页和原生结果检查。
+
+本轮实测结果及未解决样例见 [PDF 修复验证记录](benchmarks/PDF_VALIDATION.md)。
 
 ### Conda 开发环境
 
@@ -265,7 +293,7 @@ python -m venv --system-site-packages .venv
 
 - `resources/list` 返回当前知识库已导入文档，列表每页最多 50 项，按 `nextCursor` 继续；`resources/templates/list` 返回分页地址规则。
 - 文档地址为 `rag://knowledge/<namespace>/<编码后的文件名>`，`resources/read` 默认读取第一页，不返回本地路径。
-- 正文按段落分页，每页最多 8000 字符；单段太长继续切页，不丢弃余下正文。这不是 PDF 原始页码，也不是自动识别的章节。
+- 正文按段落分页，通常每页最多 8000 字符；长公式独占一页且不截断，可以超过此值。单个公式已在入库时受模型输入上限约束。这不是 PDF 原始页码，也不是自动识别的章节。
 - 返回标准文本资源，其中 `text` 是 JSON：`uri`、`text`、`page`、`total_pages`、`version`、`has_more`、`truncated` 和 `next_uri`。`truncated=true` 表示当前页未包含剩余正文，可继续读取 `next_uri`。
 - 下一页地址携带文档版本。文档替换后旧的下一页地址会报错，客户端应从文档 URI 重读。解析安全上限与上传规则不变，超限或解析失败明确报错，不静默截断整份文档。
 - 指定资源更新订阅使用稳定的文档 URI，不使用分页 URI；删除后通知订阅者，后续读取返回不存在。
@@ -278,8 +306,8 @@ python -m venv --system-site-packages .venv
 
 ## 当前限制
 
-- 文档解析支持 Markdown/TXT、文本型 PDF 和 DOCX；旧版 `.doc`、Excel、网页抓取和图片 OCR 尚未实现。
-- 扫描版 PDF 当前不会自动 OCR，会返回明确提示；请先生成可搜索文本层后再上传。
+- 文档解析支持 Markdown/TXT、电子版和扫描版 PDF、DOCX；旧版 `.doc`、Excel、网页抓取和独立图片上传尚未实现。
+- PDF 使用本机 Docling、OCR 和公式模型；不能保证任意扫描件、旋转表格或复杂公式都准确。公式处理针对 Docling 检出的公式块，不保证所有行内数学符号转换为 LaTeX。明确的解析错误会失败，但不能自动识别所有内容错误。
 - `embedding` 使用 BGE-M3，默认 1024 维。
 - `hybrid` 使用 Qdrant Dense + Sparse 预取和 RRF 融合。
 - `cross_encoder` 使用真实 BGE Reranker；`bi_encoder` 仍是确定性 Mock。

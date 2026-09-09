@@ -6,11 +6,14 @@ import argparse
 import gc
 import json
 import re
+import time
 from pathlib import Path
 
-_CAPTION = re.compile(r"^\s*(fig(?:ure)?|图|table|表)\s*[.:：-]?\s*([\w.-]+)", re.IGNORECASE)
+from .pdf_content import PDF_PARSER_VERSION
+
 _DOCLING_VERSION = "2.126.0"
 _GRANITE_REVISION = "bf66a8244401a8e26d2ff429aa82df8550a289e5"
+_FORMULA_REVISION = "ecedbe111d15c2dc60bfd4a823cbe80127b58af4"
 
 
 def main() -> None:
@@ -31,33 +34,56 @@ def convert(source: Path, output: Path, models: Path | None) -> dict[str, object
     from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
     from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
     from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import EasyOcrOptions, PdfPipelineOptions, TableFormerMode, TableStructureOptions
+    from docling.datamodel.pipeline_options import CodeFormulaVlmOptions, EasyOcrOptions, PdfPipelineOptions, TableFormerMode, TableStructureOptions
+    from docling.datamodel.vlm_engine_options import TransformersVlmEngineOptions
     from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling_core.types.doc import ImageRefMode
 
     if docling.__version__ != _DOCLING_VERSION:
         raise RuntimeError(f"Docling {_DOCLING_VERSION} is required, found {docling.__version__}")
     if not torch.cuda.is_available():
         raise RuntimeError("Granite Vision and Docling PDF parsing require a CUDA GPU")
+    started = time.perf_counter()
+    torch.cuda.reset_peak_memory_stats()
+    formula = CodeFormulaVlmOptions.from_preset("codeformulav2")
+    formula.model_spec.revision = _FORMULA_REVISION
+    formula.extract_code = False
+    formula.engine_options = TransformersVlmEngineOptions(
+        device=AcceleratorDevice.CUDA, compile_model=False, use_kv_cache=True,
+    )
     options = PdfPipelineOptions(
         artifacts_path=models,
         accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA, num_threads=4),
         ocr_options=EasyOcrOptions(lang=["ch_sim", "en"], use_gpu=True, download_enabled=False,
-                                   model_storage_directory=str(models / "EasyOcr") if models else None),
+                                   model_storage_directory=str(models / "EasyOcr") if models else None,
+                                   confidence_threshold=0.0),
         table_structure_options=TableStructureOptions(mode=TableFormerMode.ACCURATE, do_cell_matching=False),
-        do_ocr=True, do_table_structure=True, do_formula_enrichment=False, do_code_enrichment=False,
+        code_formula_options=formula,
+        do_ocr=True, do_table_structure=True, do_formula_enrichment=True, do_code_enrichment=False,
         do_picture_description=False, do_picture_classification=False, enable_remote_services=False,
         generate_page_images=True, generate_picture_images=True, generate_table_images=True, images_scale=2.0,
+        generate_parsed_pages=True,
     )
     converter = DocumentConverter(
         allowed_formats=[InputFormat.PDF],
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options, backend=PyPdfiumDocumentBackend)},
     )
+    converter.initialize_pipeline(InputFormat.PDF)
+    cache = _enable_formula_cache(converter)
     result = converter.convert(source, raises_on_error=False, max_file_size=10 * 1024 * 1024, max_num_pages=1000)
-    if result.status.value not in {"success", "partial_success"} or result.errors:
+    if result.status.value != "success" or result.errors:
         raise RuntimeError("; ".join(str(error) for error in result.errors) or f"Docling status: {result.status.value}")
     doc = result.document
+    # Embedded images survive staging-directory renames and Windows path limits.
+    doc.save_as_json(output / "document.json", image_mode=ImageRefMode.EMBEDDED)
     manifest = _export(doc, output)
-    del converter, result
+    manifest["warnings"] = _ocr_diagnostics(result.pages, output)
+    manifest["parser"] = {"version": PDF_PARSER_VERSION, "docling": _DOCLING_VERSION,
+                          "formula_model": "docling-project/CodeFormulaV2",
+                          "formula_revision": _FORMULA_REVISION, "formula_cache": cache,
+                          "formula_crop_scale": 3.0, "formula_crop_expansion": 0.0, "formula_batch_size": 1,
+                          "ocr_confidence_threshold": 0.0}
+    del converter, result, doc
     gc.collect()
     torch.cuda.empty_cache()
     missing = [asset for asset in manifest["assets"] if not asset["caption"]]
@@ -65,34 +91,105 @@ def convert(source: Path, output: Path, models: Path | None) -> dict[str, object
         if models is None:
             raise RuntimeError("RAG_PDF_MODELS_PATH is required when a figure or table has no caption")
         _describe_missing(missing, output, models)
+    manifest["metrics"] = {"seconds": round(time.perf_counter() - started, 3),
+                           "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated()}
     return manifest
+
+
+def _ocr_diagnostics(pages, output: Path) -> list[dict]:
+    records, warnings = [], []
+    for page in pages:
+        cells = [cell for cell in page.cells if cell.from_ocr]
+        for cell in cells:
+            records.append({"page": page.page_no, "text": cell.text, "confidence": cell.confidence,
+                            "bbox": cell.rect.to_bounding_box().model_dump(mode="json")})
+        low = sum(cell.confidence < 0.5 for cell in cells)
+        if low:
+            warnings.append({"page": page.page_no, "kind": "low_confidence_ocr", "count": low,
+                             "message": "Low-confidence OCR text was retained, not discarded; verify against the PDF."})
+    (output / "ocr.json").write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    return warnings
+
+
+def _enable_formula_cache(converter) -> bool:
+    from docling.models.stages.code_formula.code_formula_vlm_model import CodeFormulaVlmModel
+    from docling.models.utils.generation_utils import build_generation_config
+
+    stages = [stage for pipeline in converter.initialized_pipelines.values()
+              for stage in pipeline.enrichment_pipe if isinstance(stage, CodeFormulaVlmModel)]
+    if len(stages) != 1:
+        raise RuntimeError("Expected one CodeFormulaV2 stage")
+    engine = stages[0].engine
+    engine.vlm_model.generation_config.use_cache = True
+    engine.generation_config.use_cache = True
+    requested = build_generation_config(engine.generation_config, use_cache=True)
+    effective, _ = engine.vlm_model._prepare_generation_config(requested)
+    if effective.use_cache is not True:
+        raise RuntimeError("Formula generation cache was overridden")
+    # Tight high-resolution crops avoid including adjacent prose in formula input.
+    stages[0].images_scale = 3.0
+    stages[0].expansion_factor = 0.0
+    stages[0].elements_batch_size = 1
+    stages[0].engine = _CheckedFormulaEngine(engine)
+    return True
+
+
+class _CheckedFormulaEngine:
+    """Keep truncated model output out of a successful document."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def __getattr__(self, name):
+        return getattr(self.engine, name)
+
+    def predict_batch(self, inputs):
+        outputs = []
+        for item in inputs:
+            output = self.engine.predict_batch([item])[0]
+            if (output.metadata.get("num_tokens", 0) >= item.max_new_tokens
+                    or "</formula>" not in output.text):
+                raise RuntimeError("Formula generation did not finish; document was not indexed")
+            outputs.append(output)
+        return outputs
 
 
 def _export(doc, output: Path) -> dict[str, object]:
     from docling_core.types.doc import DocItemLabel, PictureItem, TableItem
 
-    linked = {ref.cref for item in [*doc.pictures, *doc.tables] for ref in [*item.captions, *item.footnotes]}
-    loose = [item for item, _ in doc.iterate_items() if item.label == DocItemLabel.CAPTION and item.self_ref not in linked]
+    owners: dict[str, list[str]] = {}
+    for item in [*doc.pictures, *doc.tables]:
+        for ref in [*item.captions, *item.footnotes]:
+            owners.setdefault(ref.cref, []).append(item.self_ref)
     blocks, assets = [], []
+    seen = set()
     picture_dir = output / "pictures"
     picture_dir.mkdir(exist_ok=True)
     for item, _ in doc.iterate_items():
-        if item.label in {DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER, DocItemLabel.CAPTION}:
+        if item.self_ref in seen or item.label in {DocItemLabel.PAGE_HEADER, DocItemLabel.PAGE_FOOTER}:
             continue
+        seen.add(item.self_ref)
         page, bbox = _location(item)
+        base = {"ref": item.self_ref, "kind": item.label.value, "page": page,
+                "bbox": bbox, "locations": _locations(item), "order": len(blocks), "text": ""}
+        if isinstance(item, (PictureItem, TableItem)):
+            captions = _annotations(item.captions, doc)
+            footnotes = _annotations(item.footnotes, doc)
+            caption = "\n".join(part["text"] for part in captions)
+            origin = "document" if caption else "none"
+            base["asset_id"] = item.self_ref
         if isinstance(item, PictureItem):
             image_name = f"picture-{len([a for a in assets if a['kind'] == 'picture'])}.png"
             image = item.get_image(doc)
             if image is None:
                 raise RuntimeError(f"Picture crop is empty: {item.self_ref}")
             image.save(picture_dir / image_name, format="PNG")
-            caption, origin = _caption(item, doc, loose, "picture")
             assets.append({"asset_id": item.self_ref, "kind": "picture", "page": page, "bbox": bbox,
                            "caption": caption, "caption_source": origin, "generated_description": "",
+                           "captions": captions, "footnotes": footnotes,
                            "image_file": f"pictures/{image_name}", "table": None,
                            "_vision_file": f"pictures/{image_name}"})
         elif isinstance(item, TableItem):
-            caption, origin = _caption(item, doc, loose, "table")
             table = _table_data(item, doc)
             _validate_table(table, item.self_ref)
             image_name = f"table-{len([a for a in assets if a['kind'] == 'table'])}.png"
@@ -101,15 +198,30 @@ def _export(doc, output: Path) -> dict[str, object]:
                 image.save(output / image_name, format="PNG")
             assets.append({"asset_id": item.self_ref, "kind": "table", "page": page, "bbox": bbox,
                            "caption": caption, "caption_source": origin, "generated_description": "",
+                           "captions": captions, "footnotes": footnotes,
                            "image_file": None, "table": table, "_vision_file": image_name})
         else:
             text = str(getattr(item, "text", "") or "").strip()
-            if text:
-                blocks.append({"text": text, "kind": item.label.value, "page": page, "bbox": bbox})
+            if item.label == DocItemLabel.FORMULA:
+                if not text:
+                    raise RuntimeError(f"Formula extraction returned empty LaTeX: page {page}, {item.self_ref}")
+                base.update(latex=text, original_text=str(getattr(item, "orig", "") or ""))
+                number = re.search(r"\((\d+(?:[A-Za-z]|\.\d+)?)\)\s*[,.;]?\s*$", base["original_text"])
+                base["equation_number"] = number.group(1) if number else None
+                text = "$$\n" + text + "\n$$"
+                if number and not re.search(r"\(\s*" + re.escape(number.group(1)) + r"\s*\)", base["latex"]):
+                    text += "\n\n(" + number.group(1) + ")"
+            if not text:
+                continue
+            base["text"] = text
+            if item.label in {DocItemLabel.CAPTION, DocItemLabel.FOOTNOTE}:
+                base["associated_assets"] = owners.get(item.self_ref, [])
+                base["association"] = "document" if item.self_ref in owners else "unlinked"
+        blocks.append(base)
     for asset in assets:
         if asset["kind"] == "table" and not asset["table"]["rows"]:
             raise RuntimeError(f"Table structure is empty: {asset['asset_id']}")
-    return {"blocks": blocks, "assets": assets}
+    return {"version": PDF_PARSER_VERSION, "blocks": blocks, "assets": assets}
 
 
 def _location(item) -> tuple[int, dict[str, object]]:
@@ -119,50 +231,30 @@ def _location(item) -> tuple[int, dict[str, object]]:
     return int(prov.page_no), prov.bbox.model_dump(mode="json")
 
 
-def _valid_caption(text: str) -> bool:
-    value = " ".join(text.split()).strip()
-    if len(value) < 8:
-        return False
-    match = _CAPTION.match(value)
-    return not match or len(value[match.end():].strip(" .:：-")) >= 4
+def _locations(item) -> list[dict]:
+    return [{"page": int(prov.page_no), "bbox": prov.bbox.model_dump(mode="json"),
+             "charspan": list(prov.charspan)} for prov in item.prov]
 
 
-def _caption(item, doc, loose, kind: str) -> tuple[str, str]:
-    linked = " ".join(part for part in [item.caption_text(doc), _ref_text(item.footnotes, doc)] if part)
-    if _valid_caption(linked):
-        return linked, "document"
-    page, bbox = _location(item)
-    expected = "table" if kind == "table" else "figure"
-    candidates = []
-    for caption in loose:
-        text = str(getattr(caption, "text", "") or "").strip()
-        if not _valid_caption(text) or not caption.prov or caption.prov[0].page_no != page:
+def _annotations(refs, doc) -> list[dict[str, object]]:
+    result = []
+    seen = set()
+    for ref in refs:
+        if ref.cref in seen:
             continue
-        match = _CAPTION.match(text)
-        if match:
-            token = match.group(1).casefold()
-            caption_kind = "table" if token in {"table", "表"} else "figure"
-            if caption_kind != expected:
-                continue
-        other = caption.prov[0].bbox
-        overlap = max(0.0, min(bbox.r, other.r) - max(bbox.l, other.l))
-        width = max(1.0, min(bbox.r - bbox.l, other.r - other.l))
-        if overlap / width < 0.35:
-            continue
-        distance = min(abs(bbox.b - other.t), abs(other.b - bbox.t))
-        candidates.append((distance, text, caption))
-    candidates.sort(key=lambda value: value[0])
-    if candidates and (len(candidates) == 1 or candidates[0][0] + 12 < candidates[1][0]):
-        loose.remove(candidates[0][2])
-        return candidates[0][1], "position"
-    return "", "none"
+        seen.add(ref.cref)
+        item = ref.resolve(doc)
+        page, bbox = _location(item)
+        result.append({"ref": ref.cref, "text": str(getattr(item, "text", "") or ""),
+                       "page": page, "bbox": bbox, "locations": _locations(item)})
+    return result
 
 
 def _table_data(item, doc) -> dict[str, object]:
     data = item.data
     rows = [["" for _ in range(data.num_cols)] for _ in range(data.num_rows)]
     cells = []
-    headers = ["" for _ in range(data.num_cols)]
+    header_indices = set()
     for cell in data.table_cells:
         raw = cell.model_dump(mode="json")
         text = str(cell.text or "").strip()
@@ -172,16 +264,18 @@ def _table_data(item, doc) -> dict[str, object]:
             for col in range(max(0, col_start), min(data.num_cols, col_end)):
                 rows[row][col] = text
         if cell.column_header:
-            for col in range(max(0, col_start), min(data.num_cols, col_end)):
-                headers[col] = text
+            header_indices.update(range(max(0, row_start), min(data.num_rows, row_end)))
         cells.append({key: raw.get(key) for key in (
             "text", "row_span", "col_span", "start_row_offset_idx", "end_row_offset_idx",
             "start_col_offset_idx", "end_col_offset_idx", "column_header", "row_header", "row_section"
         )})
-    footnote = _ref_text(item.footnotes, doc)
-    footnotes = [footnote] if footnote else []
+    header_rows = [list(rows[index]) for index in sorted(header_indices)]
+    headers = ["\n".join(dict.fromkeys(row[col] for row in header_rows if row[col]))
+               for col in range(data.num_cols)]
+    footnotes = [part["text"] for part in _annotations(item.footnotes, doc)]
     return {"num_rows": data.num_rows, "num_cols": data.num_cols, "orientation": data.orientation.value,
-            "headers": headers, "rows": rows, "cells": cells, "footnotes": footnotes}
+            "headers": headers, "header_rows": header_rows,
+            "rows": rows, "cells": cells, "footnotes": footnotes}
 
 
 def _validate_table(table: dict[str, object], reference: str) -> None:
@@ -197,16 +291,6 @@ def _validate_table(table: dict[str, object], reference: str) -> None:
         capacity = max(1, len(leading) * num_cols)
         if header_count < max(2, num_cols // 3) and occupied / capacity < 0.4:
             raise RuntimeError(f"Wide table structure is unreliable after rotation/OCR: {reference}")
-
-
-def _ref_text(refs, doc) -> str:
-    parts = []
-    for ref in refs:
-        resolved = ref.resolve(doc)
-        text = str(getattr(resolved, "text", "") or "").strip()
-        if text:
-            parts.append(text)
-    return " ".join(parts)
 
 
 def _describe_missing(assets: list[dict[str, object]], output: Path, models: Path) -> None:
@@ -240,7 +324,7 @@ def _describe_missing(assets: list[dict[str, object]], output: Path, models: Pat
         if len(descriptions) != 1 or not descriptions[0].strip():
             raise RuntimeError(f"Granite Vision returned no description for {asset['asset_id']}")
         asset["generated_description"] = _clean_description(descriptions[0])
-        asset["caption_source"] = "granite_vision"
+        asset["description_source"] = "granite_vision"
     for asset in assets:
         asset.pop("_vision_file", None)
     del model

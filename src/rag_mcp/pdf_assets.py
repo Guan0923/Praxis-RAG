@@ -9,12 +9,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .chunking import DocumentChunk, _source_name, _stable_id, _title
+from .chunking import DocumentChunk, _source_name, _stable_id
 from .chunk_strategies import ChunkingConfig, LEGACY_CONFIG
+from .pdf_content import PDF_PARSER_VERSION, content_chunks, render_content
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,8 @@ class PdfAsset:
     generated_description: str
     image_file: str | None
     table: dict[str, object] | None
+    captions: list[dict] = field(default_factory=list)
+    footnotes: list[dict] = field(default_factory=list)
 
     def payload(self, document_id: str, source: str) -> dict[str, object]:
         return {
@@ -36,6 +39,7 @@ class PdfAsset:
             "caption": self.caption, "caption_source": self.caption_source,
             "generated_description": self.generated_description, "image_file": self.image_file,
             "table": self.table,
+            "captions": self.captions, "footnotes": self.footnotes,
         }
 
 
@@ -72,27 +76,35 @@ def parse_pdf(path: Path, *, source_root: Path, config: ChunkingConfig | None,
     except subprocess.TimeoutExpired as exc:
         shutil.rmtree(staging, ignore_errors=True)
         raise ValueError(f"PDF 解析超过 {timeout_seconds} 秒：{path.name}") from exc
+    except OSError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise ValueError(f"PDF parser could not start: {type(exc).__name__}") from exc
     if result.returncode != 0 or not manifest.is_file():
         shutil.rmtree(staging, ignore_errors=True)
-        detail = (result.stderr or result.stdout or "PDF parser exited without a manifest").strip()[-800:]
+        detail = (result.stderr or result.stdout or "PDF parser exited without a manifest").strip().splitlines()[-1][-400:]
         raise ValueError(f"PDF 解析失败：{path.name}；{detail}")
     try:
         raw = json.loads(manifest.read_text(encoding="utf-8"))
-        blocks, raw_assets = raw["blocks"], raw["assets"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        if raw["version"] != PDF_PARSER_VERSION:
+            raise ValueError("PDF parser version mismatch; reimport this document")
+        raw_assets = raw["assets"]
+        text = render_content(raw)
+        (staging / "document.md").write_text(text, encoding="utf-8")
+        for item in raw_assets:
+            item["asset_id"] = f"{document_id}:{item['asset_id']}"
+            if item.get("image_file"):
+                item["image_file"] = f"{document_id}/{item['image_file']}"
+        for block in raw["blocks"]:
+            if block.get("asset_id"):
+                block["asset_id"] = f"{document_id}:{block['asset_id']}"
+        assets = [_asset_from_manifest(item) for item in raw_assets]
+        chunks = content_chunks(raw, document_id, source, path.stem, config or LEGACY_CONFIG, tokenizer_model)
+        if not chunks:
+            raise ValueError(f"PDF 没有可索引的内容：{path.name}")
+        return ParsedPdf(chunks, assets, staging)
+    except Exception:
         shutil.rmtree(staging, ignore_errors=True)
-        raise ValueError(f"PDF 解析结果无效：{path.name}") from exc
-    for item in raw_assets:
-        item["asset_id"] = f"{document_id}:{item['asset_id']}"
-        if item.get("image_file"):
-            item["image_file"] = f"{document_id}/{item['image_file']}"
-    assets = [_asset_from_manifest(item) for item in raw_assets]
-    chunks = _manifest_chunks(blocks, assets, document_id, source, path.stem,
-                              config or LEGACY_CONFIG, tokenizer_model)
-    if not chunks:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise ValueError(f"PDF 没有可索引的正文、图片说明或表格内容：{path.name}")
-    return ParsedPdf(chunks, assets, staging)
+        raise
 
 
 def install_assets(parsed: ParsedPdf, source_root: Path, document_id: str) -> tuple[Path, Path | None]:
@@ -102,7 +114,12 @@ def install_assets(parsed: ParsedPdf, source_root: Path, document_id: str) -> tu
         backup = final.with_name(f".{final.name}.backup")
         shutil.rmtree(backup, ignore_errors=True)
         os.replace(final, backup)
-    os.replace(parsed.staging_dir, final)
+    try:
+        os.replace(parsed.staging_dir, final)
+    except Exception:
+        if backup is not None:
+            os.replace(backup, final)
+        raise
     return final, backup
 
 
@@ -134,10 +151,12 @@ def project_results(candidates, store, assets_root: Path) -> list[dict[str, obje
         common: dict[str, object] = {
             "rank": rank, "document_id": candidate.document_id, "chunk_id": candidate.chunk_id,
             "title": candidate.title, "source": candidate.source, "score": round(candidate.score, 6),
-            "metadata": {"asset_id": str(asset_id), "asset_kind": asset.get("asset_kind"),
+            "metadata": {**candidate.metadata, "asset_id": str(asset_id), "asset_kind": asset.get("asset_kind"),
                          "page": asset.get("page"), "bbox": asset.get("bbox")},
         }
         caption = str(asset.get("caption") or "")
+        common["metadata"].update(captions=asset.get("captions", []), footnotes=asset.get("footnotes", []),
+                                  caption_source=asset.get("caption_source", "none"))
         if asset.get("asset_kind") == "picture":
             relative = asset.get("image_file")
             if not isinstance(relative, str):
@@ -154,6 +173,8 @@ def project_results(candidates, store, assets_root: Path) -> list[dict[str, obje
                 continue
             common["asset"] = {"type": "table", "caption": caption, "page": asset.get("page"),
                                "bbox": asset.get("bbox"), "rows": table.get("rows", []),
+                               "headers": table.get("headers", []),
+                               "header_rows": table.get("header_rows", []),
                                "cells": table.get("cells", []), "num_rows": table.get("num_rows", 0),
                                "num_cols": table.get("num_cols", 0), "footnotes": table.get("footnotes", [])}
         results.append(common)
@@ -166,34 +187,17 @@ def _asset_from_manifest(item: dict[str, Any]) -> PdfAsset:
                     str(item.get("caption_source") or "none"),
                     str(item.get("generated_description") or ""),
                     str(item["image_file"]) if item.get("image_file") else None,
-                    dict(item["table"]) if isinstance(item.get("table"), dict) else None)
+                    dict(item["table"]) if isinstance(item.get("table"), dict) else None,
+                    list(item.get("captions", [])), list(item.get("footnotes", [])))
 
 
-def _manifest_chunks(blocks, assets, document_id, source, fallback_title, config, tokenizer_model):
-    texts = [str(block.get("text") or "").strip() for block in blocks]
-    title = _title("\n".join(texts), fallback_title)
-    base = {"document_suffix": ".pdf", "chunking": config.metadata(tokenizer_model)}
-    entries: list[tuple[str, dict[str, object]]] = []
-    for block in blocks:
-        text = str(block.get("text") or "").strip()
-        if text:
-            entries.append((text, {"page": block.get("page"), "kind": block.get("kind", "paragraph")}))
-    for asset in assets:
-        if asset.kind == "picture":
-            text = asset.caption or asset.generated_description
-            if text:
-                entries.append((text, {"asset_id": asset.asset_id, "asset_kind": "picture", "page": asset.page}))
-        elif asset.table:
-            caption = asset.caption or asset.generated_description
-            headers = [str(value) for value in asset.table.get("headers", []) if str(value).strip()]
-            for row_number, row in enumerate(asset.table.get("rows", [])):
-                values = [str(value) for value in row]
-                text = "\n".join(part for part in [caption, " | ".join(headers), " | ".join(values)] if part)
-                if text.strip():
-                    entries.append((text, {"asset_id": asset.asset_id, "asset_kind": "table",
-                                           "page": asset.page, "table_row": row_number}))
-    chunks = []
-    for index, (text, extra) in enumerate(entries):
-        chunks.append(DocumentChunk(document_id, _stable_id("chunk", f"{document_id}\0{index}\0{text}"),
-                                    text, title, source, {"chunk_index": index, **base, **extra}))
-    return chunks
+def read_pdf_content(path: Path, source_root: Path) -> str:
+    document_id = _stable_id("doc", _source_name(path.resolve(), source_root.resolve()).casefold())
+    folder = source_root / ".pdf-assets" / document_id
+    try:
+        manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+        if manifest.get("version") != PDF_PARSER_VERSION:
+            raise ValueError("PDF parser version changed; explicitly reimport this PDF")
+        return (folder / "document.md").read_text(encoding="utf-8")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("Saved PDF content is unavailable; explicitly reimport this PDF") from exc

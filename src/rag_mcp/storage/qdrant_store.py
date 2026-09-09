@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +64,8 @@ class QdrantStore:
         vectors: Sequence[Sequence[float]],
         sparse_vectors: Sequence[SparseEmbedding] | None = None,
         asset_payloads: Sequence[dict[str, object]] = (),
+        *,
+        after_write: Callable[[], None] | None = None,
     ) -> int:
         """Replace one document with dense and optional sparse vectors."""
 
@@ -82,11 +84,17 @@ class QdrantStore:
 
         self.ensure_collection()
         document_id = next(iter(document_ids))
-        old_points, _ = self._client.scroll(
-            collection_name=self.collection,
-            scroll_filter=_payload_filter(self._scoped({"document_id": document_id})),
-            limit=10_000, with_payload=True, with_vectors=True,
-        )
+        old_points = []
+        offset = None
+        while True:
+            page, offset = self._client.scroll(
+                collection_name=self.collection,
+                scroll_filter=_payload_filter(self._scoped({"document_id": document_id})),
+                offset=offset, limit=256, with_payload=True, with_vectors=True,
+            )
+            old_points.extend(page)
+            if offset is None:
+                break
         sparse_items: Sequence[SparseEmbedding | None]
         sparse_items = sparse_vectors if sparse_vectors is not None else [None] * len(chunks)
         points = []
@@ -124,6 +132,8 @@ class QdrantStore:
             if stale:
                 self._client.delete(collection_name=self.collection,
                                     points_selector=models.PointIdsList(points=stale), wait=True)
+            if after_write is not None:
+                after_write()
         except Exception:
             self._restore_document(old_points, [point.id for point in points])
             raise
@@ -160,8 +170,8 @@ class QdrantStore:
             if introduced:
                 self._client.delete(collection_name=self.collection,
                                     points_selector=models.PointIdsList(points=introduced), wait=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError("Qdrant replacement failed and the previous index could not be restored") from exc
 
     def delete_document(self, document_id: str) -> None:
         """Delete every vector chunk belonging to one stable document id."""
