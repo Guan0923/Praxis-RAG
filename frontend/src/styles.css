@@ -429,6 +429,61 @@ h3 {
 .connection-form {
   max-width: 560px;
 }
+.knowledge-base-create > .ant-form,
+.knowledge-base-create > .page-alert {
+  max-width: 560px;
+}
+.knowledge-admin-field {
+  flex: 1;
+  min-width: 0;
+}
+.knowledge-admin-field label {
+  display: block;
+  margin-bottom: 8px;
+}
+.upload-settings-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.key-auth-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  max-width: 560px;
+  margin-bottom: 24px;
+}
+.key-auth-form .ant-form-item {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+}
+.key-namespaces {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.key-namespaces .ant-tag {
+  margin: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.created-key {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 20px 0 4px;
+}
+.created-key code {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
 .model-key-row {
   display: flex;
   align-items: flex-start;
@@ -477,9 +532,97 @@ h3 {
   overflow-wrap: anywhere;
 }
 .upload-dialog {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 20px;
   padding-top: 12px;
+}
+.knowledge-upload-modal .ant-modal-body {
+  max-height: calc(100dvh - 210px);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+.knowledge-upload-modal .ant-modal-footer {
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+  margin-top: 20px;
+}
+.upload-dialog > * {
+  min-width: 0;
+  flex-shrink: 0;
+}
+.upload-selection {
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  background: var(--sidebar);
+  overflow: hidden;
+}
+.upload-selection .ant-upload-drag {
+  height: auto;
+  min-height: 160px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.upload-dialog .ant-upload-drag .ant-upload-btn {
+  padding: 16px;
+}
+.upload-selected-files {
+  margin: 0 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.upload-files-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+.upload-file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.upload-file-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.upload-file-icon {
+  flex-shrink: 0;
+  color: var(--accent);
+  font-size: 20px;
+}
+.upload-file-details {
+  flex: 1;
+  min-width: 0;
+}
+.upload-file-name {
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+  margin-bottom: 2px;
+}
+.upload-file-row > .ant-btn {
+  flex-shrink: 0;
+}
+.upload-dialog .ant-form {
+  border-top: 1px solid var(--line);
+  padding-top: 20px;
+}
+.upload-dialog .ant-form-item {
+  margin-bottom: 16px;
+}
+.upload-dialog .ant-alert-description {
+  max-height: 180px;
+  overflow-y: auto;
 }
 .upload-icon {
   color: var(--accent);
@@ -529,7 +672,7 @@ h3 {
     padding: 0 0 16px;
   }
   .sidebar nav {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
     gap: 4px;
   }
   .sidebar nav .ant-btn {

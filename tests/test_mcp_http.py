@@ -22,12 +22,15 @@ from mcp.server.subscriptions import PromptsListChanged, ResourcesListChanged, R
 from mcp.shared.exceptions import MCPError
 from rag_mcp.document_readers import read_document_text
 from rag_mcp.config import RagConfig
+from rag_mcp.chunk_strategies import ChunkingConfig
+from rag_mcp.knowledge_bases import KnowledgeBaseStore
+from rag_mcp.model_api import ModelConnection
 from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.resources import document_uri
 from rag_mcp.service_knowledge import IndexedDocument, KnowledgeDocumentStore, KnowledgePaths, RagServiceRuntime
 
 AUTH = {"Authorization": "Bearer test-token", "X-RAG-Namespace": "manuals"}
-ADMIN = {**AUTH, "Authorization": "Bearer admin-token"}
+ADMIN = {"X-RAG-Namespace": "manuals"}
 
 
 class TestIngester:
@@ -60,6 +63,7 @@ class ProtocolRuntime(RagServiceRuntime):
 
     def __init__(self, root):
         self.config = RagConfig()
+        self._connections = {"embedding": ModelConnection("http://unused.invalid/v1", self.config.embedding_model, vector_size=self.config.vector_size)}
         self.data_root = root
         self._tenants = {}
         self._tenant_lock = threading.RLock()
@@ -91,12 +95,14 @@ class ProtocolRuntime(RagServiceRuntime):
 
 
 @contextmanager
-def running_service(root: Path, *, admin_token="admin-token", runtime=None):
+def running_service(root: Path, *, runtime=None):
     runtime = runtime or ProtocolRuntime(root)
+    for namespace in ("manuals", "other"):
+        if KnowledgeBaseStore(runtime.data_root).get(namespace) is None:
+            runtime.create_knowledge_base(namespace, ChunkingConfig(), runtime.config.vector_size)
     settings = RagHttpSettings(
         data_root=root,
         token="test-token",
-        admin_token=admin_token,
         mcp_allowed_hosts=("127.0.0.1:*",),
         mcp_allowed_origins=("http://127.0.0.1:*",),
     )
@@ -175,6 +181,7 @@ def test_both_protocol_lifecycles(tmp_path, mode):
             ) as client:
                 assert client.protocol_version == ("2025-11-25" if mode == "legacy" else "2026-07-28")
                 if mode != "2026-07-28":
+                    assert client.server_info.name == "Praxis-RAG"
                     assert client.server_info.version == "0.4.0"
                     assert client.server_capabilities.tools.list_changed
                 assert [tool.name for tool in (await client.list_tools()).tools] == [
@@ -318,7 +325,7 @@ def test_cancellation_keeps_other_calls_usable(tmp_path, mode):
         anyio.run(scenario)
 
 
-def test_http_security_and_admin_credentials(tmp_path):
+def test_http_security_and_local_management(tmp_path):
     with running_service(tmp_path) as (url, app, runtime):
 
         async def scenario():
@@ -342,7 +349,7 @@ def test_http_security_and_admin_credentials(tmp_path):
                     ({**base, "Authorization": "Bearer admin-token"}, 401),
                 ]:
                     assert (await http.post(url + "/mcp", headers=headers, json=request)).status_code == status
-                assert (await http.get(url + "/v1/admin/tools", headers=AUTH)).status_code == 401
+                assert (await http.get(url + "/v1/admin/tools", headers=AUTH)).status_code == 200
                 assert (await http.get(url + "/v1/admin/tools", headers=ADMIN)).status_code == 200
                 assert not runtime._tenants  # configuration does not initialize retrieval dependencies
                 assert (
@@ -355,9 +362,9 @@ def test_http_security_and_admin_credentials(tmp_path):
         anyio.run(scenario)
 
 
-def test_no_admin_token_disables_management(tmp_path):
-    with running_service(tmp_path, admin_token=None) as (url, _, _):
-        assert httpx.get(url + "/v1/admin/tools", headers=ADMIN).status_code == 403
+def test_local_management_needs_no_credential(tmp_path):
+    with running_service(tmp_path) as (url, _, _):
+        assert httpx.get(url + "/v1/admin/tools", headers=ADMIN).status_code == 200
 
 
 def test_namespace_sessions_and_subscription_filters(tmp_path, monkeypatch):

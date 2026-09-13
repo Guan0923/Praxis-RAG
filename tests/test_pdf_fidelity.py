@@ -150,12 +150,13 @@ def test_old_pdf_version_does_not_deduplicate(tmp_path):
 
     runtime = ProtocolRuntime(tmp_path)
     # Only exercise the preflight: the PDF record deliberately predates this parser.
+    runtime.create_knowledge_base("tenant", ChunkingConfig(), runtime.config.vector_size)
     documents = runtime._tenant("tenant").documents
     source = documents.paths.knowledge_dir / "paper.pdf"
     source.write_bytes(b"pdf")
     documents._write_manifest({"paper.pdf": {"name": "paper.pdf", "sha256": "a" * 64,
                                            "chunking": ChunkingConfig().metadata("BAAI/bge-m3")}})
-    response = runtime.check_documents("tenant", [{"name": "paper.pdf", "sha256": "a" * 64}], ChunkingConfig())
+    response = runtime.check_documents("tenant", [{"name": "paper.pdf", "sha256": "a" * 64}])
     assert response["files"][0]["document"] is None
     with pytest.raises(ValueError, match="reimport"):
         read_pdf_content(source, documents.paths.knowledge_dir)

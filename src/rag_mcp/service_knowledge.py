@@ -28,6 +28,7 @@ from .pdf_content import PDF_PARSER_VERSION
 from .word_reader import WORD_PARSER_VERSION
 from .model_api import HTTPEmbedder, HTTPReranker, ModelAPIError, ModelConnection, ModelHTTPClient
 from .model_settings import KINDS, ModelSettingsStore, draft_connection
+from .knowledge_bases import KnowledgeBaseStore
 
 SUPPORTED_EXTENSIONS = SUPPORTED_SUFFIXES
 MAX_FILES_PER_BATCH = 10
@@ -434,7 +435,7 @@ class RagServiceRuntime:
     def status(self) -> dict[str, object]:
         return {
             "status": "ok",
-            "service": "rag-mcp-service",
+            "service": "praxis-rag",
             "backend": self.config.backend,
             "collection": self.config.collection,
             "models": {kind: {"name": item.model, "configured": item.configured, "provider": "http"}
@@ -474,6 +475,9 @@ class RagServiceRuntime:
         size = self.config.vector_size
         if kind == "embedding":
             size = draft.vector_size
+            if any(item["vector_size"] != size or item["embedding_model"] != draft.model
+                   for item in KnowledgeBaseStore(self.data_root).list()):
+                raise ModelAPIError("已有知识库绑定当前 Embedding 模型和向量维度，不能更换模型或维度")
             occupied = self._has_indexed_documents()
             current_size = self.config.vector_size
             try:
@@ -517,20 +521,64 @@ class RagServiceRuntime:
             raise ModelAPIError("无法确认知识库是否为空，未修改模型配置") from exc
 
     @_runtime_operation
+    def knowledge_base_defaults(self) -> dict[str, object]:
+        return {"vector_size": self.config.vector_size, "embedding_model": self.config.embedding_model,
+                "tokenizer": self.config.chunk_tokenizer_model,
+                "embedding_configured": self._connections["embedding"].configured and self._connections["embedding"].vector_size is not None}
+
+    @_runtime_operation
+    def create_knowledge_base(self, namespace: str, chunking: ChunkingConfig, vector_size: int) -> dict:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", namespace):
+            raise KnowledgeValidationError("知识库标识无效")
+        store = KnowledgeBaseStore(self.data_root)
+        if store.get(namespace) is not None:
+            raise KnowledgeValidationError("该知识库已存在，创建参数不可修改")
+        embedding = self._connections["embedding"]
+        if not embedding.configured or embedding.vector_size is None:
+            raise KnowledgeValidationError("请先在模型配置中保存并验证 Embedding 模型")
+        if vector_size != self.config.vector_size:
+            raise KnowledgeValidationError(f"向量维度必须与当前 Embedding 模型一致：{self.config.vector_size}")
+        documents = KnowledgeDocumentStore(KnowledgePaths(self.data_root / namespace)).list_documents()
+        if documents:
+            raise KnowledgeValidationError("该 Namespace 已有文档，请使用新的知识库标识")
+        settings = {"namespace": namespace, "vector_size": vector_size,
+                    "embedding_model": self.config.embedding_model,
+                    "tokenizer": self.config.chunk_tokenizer_model,
+                    "strategy": chunking.strategy, "chunk_size": chunking.chunk_size,
+                    "chunk_overlap": chunking.chunk_overlap,
+                    "created_at": datetime.now(UTC).isoformat()}
+        store.create(settings)
+        return settings
+
+    @_runtime_operation
+    def knowledge_base(self, namespace: str) -> dict:
+        settings = KnowledgeBaseStore(self.data_root).get(namespace)
+        if settings is None:
+            raise KnowledgeValidationError("请先在接入配置中创建知识库")
+        return settings
+
+    def _knowledge_chunking(self, namespace: str) -> ChunkingConfig:
+        settings = self.knowledge_base(namespace)
+        if settings["embedding_model"] != self.config.embedding_model or settings["vector_size"] != self.config.vector_size:
+            raise KnowledgeValidationError("当前 Embedding 模型与知识库创建配置不一致")
+        return ChunkingConfig(settings["strategy"], settings["chunk_size"], settings["chunk_overlap"])
+
+    @_runtime_operation
     def list_documents(self, namespace: str) -> list[dict[str, object]]:
         tenant = self._tenant(namespace)
         with tenant.lock:
             return tenant.documents.list_documents()
 
-    def chunking_metadata(self, chunking: ChunkingConfig) -> dict[str, object]:
-        return {**chunking.metadata(self.config.chunk_tokenizer_model), "embedding_model": self.config.embedding_model}
+    def chunking_metadata(self, namespace: str, chunking: ChunkingConfig) -> dict[str, object]:
+        settings = self.knowledge_base(namespace)
+        return {**chunking.metadata(settings["tokenizer"]), "embedding_model": settings["embedding_model"]}
 
     @_runtime_operation
-    def check_documents(self, namespace: str, items: list[dict[str, str]],
-                        chunking: ChunkingConfig) -> dict[str, object]:
+    def check_documents(self, namespace: str, items: list[dict[str, str]]) -> dict[str, object]:
+        chunking = self._knowledge_chunking(namespace)
         tenant = self._tenant(namespace)
         tenant.documents.validate_uploads([(item["name"], None) for item in items])
-        configuration = self.chunking_metadata(chunking)
+        configuration = self.chunking_metadata(namespace, chunking)
         with tenant.lock:
             return {"files": [{"name": item["name"], "sha256": item["sha256"],
                                "document": tenant.documents.find_duplicate(
@@ -538,11 +586,11 @@ class RagServiceRuntime:
                               for item in items]}
 
     @_runtime_operation
-    def upload(self, namespace: str, items: list[tuple[str, object]],
-               chunking: ChunkingConfig | None = None) -> dict[str, object]:
+    def upload(self, namespace: str, items: list[tuple[str, object]]) -> dict[str, object]:
+        chunking = self._knowledge_chunking(namespace)
         tenant = self._tenant(namespace)
         tenant.documents.validate_uploads(items)
-        model = self.config.chunk_tokenizer_model
+        model = self.knowledge_base(namespace)["tokenizer"]
         imported: list[dict[str, object]] = []
         skipped: list[dict[str, object]] = []
         failed: list[dict[str, str]] = []
@@ -563,6 +611,7 @@ class RagServiceRuntime:
 
     @_runtime_operation
     def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool) -> dict[str, object]:
+        configuration = self._knowledge_chunking(namespace)
         tenant = self._tenant(namespace)
         if tenant.documents.sanitize_name(name) != name:
             raise KnowledgeValidationError("Invalid document name")
@@ -574,16 +623,12 @@ class RagServiceRuntime:
             if not overwrite and (any(str(item["name"]).casefold() == name.casefold() for item in records)
                                   or tenant.documents._confined_target(name).exists()):
                 raise KnowledgeValidationError(f"Document already exists: {name}; use update_document")
-            configuration = ChunkingConfig()
-            if existing is not None:
-                saved = existing.get("chunking", LEGACY_CONFIG.metadata(self.config.chunk_tokenizer_model))
-                configuration = ChunkingConfig(str(saved["strategy"]), saved["chunk_size"], saved["chunk_overlap"])
             readable = io.BytesIO(content)
             tenant.documents.validate_uploads([(name, readable)])
             try:
                 with self._inference_lock:
                     record = tenant.documents.store_and_index(
-                        name, readable, tenant.ingester, configuration, self.config.chunk_tokenizer_model,
+                        name, readable, tenant.ingester, configuration, self.knowledge_base(namespace)["tokenizer"],
                         deduplicate_across_names=False,
                         embedding_model=self.config.embedding_model,
                     )
@@ -668,9 +713,17 @@ class RagServiceRuntime:
             from .pdf_assets import project_results
             from .storage.qdrant_store import QdrantStore
 
+            config = replace(self.config, namespace=namespace)
+            settings = KnowledgeBaseStore(self.data_root).get(namespace)
+            if settings:
+                if settings["vector_size"] != config.vector_size or settings["embedding_model"] != config.embedding_model:
+                    raise KnowledgeValidationError("当前 Embedding 模型与知识库创建配置不一致")
+                config = replace(config, vector_size=settings["vector_size"],
+                                 chunk_tokenizer_model=settings["tokenizer"])
+
             store = QdrantStore(
-                collection=self.config.collection,
-                vector_size=self.config.vector_size,
+                collection=config.collection,
+                vector_size=config.vector_size,
                 namespace=namespace,
                 client=self._client,
             )
@@ -689,7 +742,6 @@ class RagServiceRuntime:
                     word_assets_root=self.data_root / namespace / "knowledge" / ".word-assets",
                 ),
             )
-            config = replace(self.config, namespace=namespace)
             resources = TenantResources(
                 documents=KnowledgeDocumentStore(KnowledgePaths(self.data_root / namespace)),
                 ingester=DenseDocumentIngester(

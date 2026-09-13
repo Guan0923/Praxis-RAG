@@ -11,6 +11,13 @@ export type Chunking = {
   chunk_size: number;
   chunk_overlap: number;
 };
+export type KnowledgeBase = Chunking & {
+  namespace: string;
+  vector_size: number;
+  embedding_model: string;
+  tokenizer: string;
+  created_at: string;
+};
 export type DocumentInfo = {
   name: string;
   size: number;
@@ -103,20 +110,17 @@ export async function apiResponse(
     headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...options, headers });
   if (response.ok) return response;
-  let payload;
+  const body = await response.text();
+  let detail = body || response.statusText;
   try {
-    payload = await response.json();
+    const payload = JSON.parse(body);
+    detail = typeof payload.detail === "string"
+      ? payload.detail
+      : JSON.stringify(payload.detail ?? payload);
   } catch {
-    throw new Error(`HTTP ${response.status} 返回了无效 JSON`);
+    // Keep non-JSON server diagnostics intact.
   }
-  if (!response.ok) {
-    const detail =
-      typeof payload.detail === "string"
-        ? payload.detail
-        : JSON.stringify(payload.detail || "请求失败");
-    throw new Error(`HTTP ${response.status}：${detail}`);
-  }
-  return response;
+  throw new Error(`${options.method || "GET"} ${path}\nHTTP ${response.status}：${detail}`);
 }
 
 export async function api<T>(
@@ -125,11 +129,7 @@ export async function api<T>(
   options: RequestInit = {},
 ): Promise<T> {
   const response = await apiResponse(path, connection, options);
-  try {
-    return await response.json() as T;
-  } catch {
-    throw new Error(`HTTP ${response.status} 返回了无效 JSON`);
-  }
+  return await response.json() as T;
 }
 
 export function errorText(error: unknown): string {

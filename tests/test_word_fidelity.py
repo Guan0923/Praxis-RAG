@@ -278,11 +278,12 @@ def test_previous_word_parser_is_not_deduplicated(tmp_path):
     from test_mcp_http import ProtocolRuntime
     from rag_mcp.chunk_strategies import ChunkingConfig
     runtime = ProtocolRuntime(tmp_path)
+    runtime.create_knowledge_base("tenant", ChunkingConfig(), runtime.config.vector_size)
     documents = runtime._tenant("tenant").documents
     (documents.paths.knowledge_dir / "old.docx").write_bytes(b"old word")
     documents._write_manifest({"old.docx": {"name": "old.docx", "sha256": "a"*64,
                                "chunking": ChunkingConfig().metadata("BAAI/bge-m3")}})
-    result = runtime.check_documents("tenant", [{"name": "old.docx", "sha256": "a"*64}], ChunkingConfig())
+    result = runtime.check_documents("tenant", [{"name": "old.docx", "sha256": "a"*64}])
     assert result["files"][0]["document"] is None
 
 

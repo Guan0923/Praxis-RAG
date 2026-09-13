@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { readStorage } from "./api";
 
 export const namespacePattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
-export type ConsolePage = "search" | "documents" | "connection";
+export type ConsolePage = "search" | "documents" | "create" | "api-keys" | "models";
 export type ConsoleRoute = {
   namespace: string;
   page: ConsolePage;
@@ -17,15 +17,18 @@ function savedNamespace() {
 export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRoute {
   const fallback: ConsoleRoute = { namespace: fallbackNamespace, page: "search" };
   try {
+    if (hash === "#/api-keys" || hash === "#/models") {
+      return { namespace: fallbackNamespace, page: hash === "#/api-keys" ? "api-keys" : "models" };
+    }
     const parts = hash.slice(1).split("/");
     if (!hash.startsWith("#/") || parts[1] !== "workspaces") return fallback;
-    const namespace = decodeURIComponent(parts[2] || "");
-    const page = parts[3];
+    const namespace = fallbackNamespace;
+    const page = parts[2];
     if (!namespacePattern.test(namespace)) return fallback;
-    if (page !== "search" && page !== "documents" && page !== "connection") return fallback;
-    if (parts.length === 4) return { namespace, page };
-    if (parts.length !== 5 || page !== "documents") return fallback;
-    const documentName = decodeURIComponent(parts[4]);
+    if (page !== "search" && page !== "documents" && page !== "create") return fallback;
+    if (parts.length === 3) return { namespace, page };
+    if (parts.length !== 4 || page !== "documents") return fallback;
+    const documentName = decodeURIComponent(parts[3]);
     if (!documentName || documentName === "." || documentName === ".." || /[/\\\x00-\x1f]/.test(documentName)) return fallback;
     return { namespace, page, documentName };
   } catch {
@@ -34,7 +37,8 @@ export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRout
 }
 
 export function routeHash(route: ConsoleRoute) {
-  const base = `#/workspaces/${encodeURIComponent(route.namespace)}/${route.page}`;
+  if (route.page === "api-keys" || route.page === "models") return "#/" + route.page;
+  const base = `#/workspaces/${route.page}`;
   return route.page === "documents" && route.documentName !== undefined
     ? `${base}/${encodeURIComponent(route.documentName)}` : base;
 }
@@ -54,7 +58,7 @@ export function useConsoleRoute(uploading: boolean, onBlocked: () => void) {
       if (replace) history.replaceState(history.state, "", hash);
       else history.pushState(null, "", hash);
     }
-    if (routeHash(current.current) !== hash) {
+    if (routeHash(current.current) !== hash || current.current.namespace !== next.namespace) {
       current.current = next;
       setRoute(next);
     }

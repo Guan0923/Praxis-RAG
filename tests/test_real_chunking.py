@@ -41,8 +41,9 @@ def test_real_model_ingestion_and_retrieval(tmp_path):
         for strategy in ("character", "token", "sentence", "recursive", "structure"):
             namespace = f"smoke-{strategy}"
             chunking = ChunkingConfig(strategy, 700, 100) if strategy == "character" else ChunkingConfig(strategy, 64, 12)
+            runtime.create_knowledge_base(namespace, chunking, runtime.config.vector_size)
             files = [(path.name, io.BytesIO(path.read_bytes())) for path in (markdown, plain, pdf, word)]
-            result = runtime.upload(namespace, files, chunking)
+            result = runtime.upload(namespace, files)
             assert not result["failed"], result
             assert len(result["imported"]) == 4
             for retrieval in ("embedding", "bm25", "hybrid"):
@@ -51,9 +52,9 @@ def test_real_model_ingestion_and_retrieval(tmp_path):
                 assert search["results"], search
                 assert any("E03" in item["text"] for item in search["results"])
             fingerprint = hashlib.sha256(markdown.read_bytes()).hexdigest()
-            checked = runtime.check_documents(namespace, [{"name": "renamed.md", "sha256": fingerprint}], chunking)
+            checked = runtime.check_documents(namespace, [{"name": "renamed.md", "sha256": fingerprint}])
             assert checked["files"][0]["document"]["name"] == markdown.name
-            duplicate = runtime.upload(namespace, [("renamed.md", io.BytesIO(markdown.read_bytes()))], chunking)
+            duplicate = runtime.upload(namespace, [("renamed.md", io.BytesIO(markdown.read_bytes()))])
             assert len(duplicate["skipped"]) == 1 and not duplicate["imported"]
             report.append({"strategy": strategy, "documents": 4,
                            "chunks": sum(item["chunk_count"] for item in result["imported"]),

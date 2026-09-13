@@ -14,14 +14,14 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 import anyio
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.server.subscriptions import PromptsListChanged, ToolsListChanged
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from starlette.routing import Route
 
 from . import __version__
@@ -39,6 +39,8 @@ from .service_knowledge import (
     RagServiceRuntime,
 )
 from .model_api import ModelAPIError
+from .startup_config import load_service_config
+from .api_keys import ApiKeyError, ApiKeyStore
 
 _NAMESPACE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _WEB_ROOT = Path(__file__).with_name("web")
@@ -66,8 +68,11 @@ class ServiceRuntime(Protocol):
     def model_settings(self) -> dict[str, object]: ...
     def model_action(self, kind: str, values: dict[str, object], action: str) -> dict[str, object]: ...
     def list_documents(self, namespace: str) -> list[dict[str, object]]: ...
-    def upload(self, namespace: str, items: list[tuple[str, object]], chunking: ChunkingConfig | None = None) -> dict[str, object]: ...
-    def check_documents(self, namespace: str, items: list[dict[str, str]], chunking: ChunkingConfig) -> dict[str, object]: ...
+    def upload(self, namespace: str, items: list[tuple[str, object]]) -> dict[str, object]: ...
+    def check_documents(self, namespace: str, items: list[dict[str, str]]) -> dict[str, object]: ...
+    def knowledge_base_defaults(self) -> dict[str, object]: ...
+    def create_knowledge_base(self, namespace: str, chunking: ChunkingConfig, vector_size: int) -> dict: ...
+    def knowledge_base(self, namespace: str) -> dict: ...
     def delete(self, namespace: str, name: str) -> dict[str, object]: ...
     def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool) -> dict[str, object]: ...
     def search(self, namespace: str, arguments: dict[str, object]) -> dict[str, object]: ...
@@ -79,9 +84,8 @@ class ServiceRuntime(Protocol):
 class RagHttpSettings:
     host: str = "127.0.0.1"
     port: int = 8011
-    data_root: Path = Path.home() / ".mini_agent-rag"
+    data_root: Path = Path.home() / ".praxis-rag" / "data"
     token: str | None = None
-    admin_token: str | None = None
     mcp_allowed_hosts: tuple[str, ...] = _LOCAL_MCP_HOSTS
     mcp_allowed_origins: tuple[str, ...] = _LOCAL_MCP_ORIGINS
 
@@ -108,12 +112,35 @@ class RagHttpSettings:
         return cls(
             host=host,
             port=port,
-            data_root=Path(os.getenv("RAG_SERVICE_DATA_ROOT", str(Path.home() / ".mini_agent-rag"))),
+            data_root=Path(os.getenv("RAG_SERVICE_DATA_ROOT", str(Path.home() / ".praxis-rag" / "data"))).expanduser(),
             token=token,
-            admin_token=os.getenv("RAG_ADMIN_TOKEN", "").strip() or None,
             mcp_allowed_hosts=_csv_setting(raw_allowed_hosts, _LOCAL_MCP_HOSTS),
             mcp_allowed_origins=_csv_setting(raw_allowed_origins, _LOCAL_MCP_ORIGINS),
         )
+
+
+class ApiKeyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=80)
+    namespaces: list[str] = Field(min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value):
+        if not value.strip():
+            raise ValueError("请输入密钥名称")
+        return value.strip()
+
+    @field_validator("namespaces")
+    @classmethod
+    def clean_namespaces(cls, values):
+        if any(not _NAMESPACE_PATTERN.fullmatch(value) for value in values):
+            raise ValueError("Namespace 格式无效")
+        return list(dict.fromkeys(values))
+
+
+class ApiKeyUpdateBody(ApiKeyBody):
+    enabled: bool
 
 
 class ModelSettingsBody(BaseModel):
@@ -168,7 +195,14 @@ class CheckFile(BaseModel):
 
 
 class CheckDocumentsBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     files: list[CheckFile] = Field(min_length=1, max_length=MAX_FILES_PER_BATCH)
+
+
+class CreateKnowledgeBaseBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    namespace: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    vector_size: int = Field(strict=True, ge=1, le=65536)
     strategy: str = "recursive"
     chunk_size: int | None = Field(default=None, strict=True)
     chunk_overlap: int | None = Field(default=None, strict=True)
@@ -188,9 +222,8 @@ def create_service_app(
     settings: RagHttpSettings | None = None,
 ) -> FastAPI:
     resolved_settings = settings or RagHttpSettings.from_env()
+    key_store = ApiKeyStore(resolved_settings.data_root)
     resolved_runtime = runtime or RagServiceRuntime(RagConfig.from_env(), resolved_settings.data_root)
-    if resolved_settings.admin_token and resolved_settings.admin_token == resolved_settings.token:
-        raise RagConfigError("RAG_ADMIN_TOKEN must differ from RAG_SERVICE_TOKEN")
 
     def matches(authorization, token):
         return authorization is not None and hmac.compare_digest(
@@ -204,18 +237,29 @@ def create_service_app(
             raise HTTPException(status_code=400, detail="Invalid RAG namespace.")
         return namespace
 
-    def tenant_from_headers(authorization: str | None, x_rag_namespace: str | None) -> str:
-        if resolved_settings.admin_token and matches(authorization, resolved_settings.admin_token):
-            raise HTTPException(status_code=401, detail="Use the service credential for ordinary requests.")
-        if resolved_settings.token and not matches(authorization, resolved_settings.token):
-            raise HTTPException(status_code=401, detail="RAG service authentication failed.")
-        return namespace_from_header(x_rag_namespace)
+    def tenant_from_headers(authorization: str | None, x_rag_namespace: str | None,
+                            request: Request) -> str:
+        if resolved_settings.token and matches(authorization, resolved_settings.token):
+            return namespace_from_header(x_rag_namespace)
+        if authorization and authorization.startswith("Bearer "):
+            try:
+                namespaces = key_store.namespaces_for_key(authorization[7:])
+            except ApiKeyError as exc:
+                raise HTTPException(status_code=401, detail=str(exc)) from exc
+            namespace = namespace_from_header(x_rag_namespace)
+            if namespace not in namespaces:
+                raise HTTPException(status_code=403, detail="API Key 未获授权访问此 Namespace")
+            return namespace
+        if not authorization and not resolved_settings.token and _local_model_request(request):
+            return namespace_from_header(x_rag_namespace)
+        raise HTTPException(status_code=401, detail="RAG service authentication failed.")
 
     def tenant(
+        request: Request,
         authorization: str | None = Header(default=None),
         x_rag_namespace: str | None = Header(default=None),
     ) -> str:
-        return tenant_from_headers(authorization, x_rag_namespace)
+        return tenant_from_headers(authorization, x_rag_namespace, request)
 
     mcp_endpoint = McpHttpEndpoint(
         resolved_runtime,
@@ -232,7 +276,7 @@ def create_service_app(
         async with mcp_endpoint.run():
             yield
 
-    app = FastAPI(title="RAG MCP Service", version=__version__, lifespan=lifespan)
+    app = FastAPI(title="Praxis-RAG", version=__version__, lifespan=lifespan)
     app.state.runtime = resolved_runtime
     app.state.mcp_endpoint = mcp_endpoint
     app.router.routes.append(Route("/mcp", endpoint=mcp_endpoint, methods=["GET", "POST", "DELETE"]))
@@ -247,44 +291,75 @@ def create_service_app(
     async def model_api_error(_request, error):
         return JSONResponse({"detail": str(error)}, status_code=400)
 
-    def model_auth(authorization: str | None = Header(default=None)) -> None:
-        tenant_from_headers(authorization, "default")
-
-    def local_model_auth(request: Request, _auth=Depends(model_auth)) -> None:
+    def local_admin(request: Request) -> None:
         if not _local_model_request(request):
-            raise HTTPException(status_code=403, detail="仅允许本机直接访问时修改或测试模型设置")
+            raise HTTPException(status_code=403, detail="仅允许本机直接访问管理接口")
+
+    @app.get("/v1/admin/api-keys", dependencies=[Depends(local_admin)])
+    def list_api_keys():
+        return JSONResponse({"keys": key_store.list()}, headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/admin/api-keys", dependencies=[Depends(local_admin)])
+    def create_api_key(body: ApiKeyBody):
+        return JSONResponse(key_store.create(body.name, body.namespaces), status_code=201,
+                            headers={"Cache-Control": "no-store"})
+
+    @app.put("/v1/admin/api-keys/{key_id}", dependencies=[Depends(local_admin)])
+    def update_api_key(key_id: str, body: ApiKeyUpdateBody):
+        item = key_store.update(key_id, body.name, body.namespaces, body.enabled)
+        if item is None:
+            raise HTTPException(status_code=404, detail="API Key 不存在")
+        return item
+
+    @app.get("/v1/admin/api-keys/{key_id}/mcp-config", dependencies=[Depends(local_admin)])
+    def api_key_mcp_config(key_id: str, request: Request,
+                           x_rag_namespace: str | None = Header(default=None)):
+        namespace = namespace_from_header(x_rag_namespace)
+        try:
+            secret = key_store.secret_for_namespace(key_id, namespace)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return JSONResponse({"url": str(request.base_url).rstrip("/") + "/mcp",
+                             "headers": {"Authorization": "Bearer " + secret, "X-RAG-Namespace": namespace}},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.delete("/v1/admin/api-keys/{key_id}", dependencies=[Depends(local_admin)])
+    def delete_api_key(key_id: str):
+        if not key_store.delete(key_id):
+            raise HTTPException(status_code=404, detail="API Key 不存在")
+        return Response(status_code=204)
 
     @app.get("/v1/model-settings")
-    def model_settings(request: Request, _auth=Depends(model_auth)):
+    def model_settings(request: Request, _auth=Depends(local_admin)):
         return {"models": resolved_runtime.model_settings(), "writable": _local_model_request(request)}
 
     @app.patch("/v1/model-settings/{kind}")
     def save_model_settings(kind: Literal["embedding", "reranker"], body: ModelSettingsBody,
-                            _auth=Depends(local_model_auth)):
+                            _auth=Depends(local_admin)):
         return resolved_runtime.model_action(kind, body.values(), "save")
 
     @app.post("/v1/model-settings/{kind}/models")
     def model_list(kind: Literal["embedding", "reranker"], body: ModelSettingsBody,
-                   _auth=Depends(local_model_auth)):
+                   _auth=Depends(local_admin)):
         return resolved_runtime.model_action(kind, body.values(), "models")
 
     @app.post("/v1/model-settings/{kind}/test")
     def model_test(kind: Literal["embedding", "reranker"], body: ModelSettingsBody,
-                   _auth=Depends(local_model_auth)):
+                   _auth=Depends(local_admin)):
         return resolved_runtime.model_action(kind, body.values(), "test")
 
     @app.exception_handler(KnowledgeError)
-    async def knowledge_error(_request, _error):
-        return JSONResponse({"detail": "Knowledge or MCP configuration operation failed."}, status_code=503)
+    async def knowledge_error(_request, error):
+        return JSONResponse({"detail": str(error)}, status_code=503)
 
     def admin(
-        authorization: str | None = Header(default=None),
         x_rag_namespace: str | None = Header(default=None),
+        _auth=Depends(local_admin),
     ) -> str:
-        if not resolved_settings.admin_token:
-            raise HTTPException(status_code=403, detail="MCP administration is disabled.")
-        if not matches(authorization, resolved_settings.admin_token):
-            raise HTTPException(status_code=401, detail="MCP administration authentication failed.")
         return namespace_from_header(x_rag_namespace)
 
     @app.get("/v1/admin/tools")
@@ -361,6 +436,25 @@ def create_service_app(
             "max_file_bytes": MAX_FILE_BYTES,
         }
 
+    @app.get("/v1/admin/knowledge-bases/defaults", dependencies=[Depends(local_admin)])
+    def knowledge_base_defaults():
+        return {**resolved_runtime.knowledge_base_defaults(), **strategy_catalog()}
+
+    @app.post("/v1/admin/knowledge-bases", dependencies=[Depends(local_admin)], status_code=201)
+    def create_knowledge_base(body: CreateKnowledgeBaseBody):
+        configuration = _chunking_config(body.strategy, body.chunk_size, body.chunk_overlap)
+        try:
+            return resolved_runtime.create_knowledge_base(body.namespace, configuration, body.vector_size)
+        except KnowledgeValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/knowledge-base")
+    def knowledge_base(namespace: str = Depends(tenant)):
+        try:
+            return {**resolved_runtime.knowledge_base(namespace), "strategies": strategy_catalog()["strategies"]}
+        except KnowledgeValidationError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/v1/documents/{name}/content")
     def document_content(name: str, namespace: str = Depends(tenant)) -> Response:
         try:
@@ -376,8 +470,6 @@ def create_service_app(
             })
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (KnowledgeError, OSError) as exc:
-            raise HTTPException(status_code=503, detail="Document content could not be read.") from exc
 
     @app.get("/v1/chunking/strategies")
     def chunking_strategies(namespace: str = Depends(tenant)) -> dict[str, object]:
@@ -385,9 +477,8 @@ def create_service_app(
 
     @app.post("/v1/documents/check")
     def check_documents(body: CheckDocumentsBody, namespace: str = Depends(tenant)) -> dict[str, object]:
-        configuration = _chunking_config(body.strategy, body.chunk_size, body.chunk_overlap)
         try:
-            return resolved_runtime.check_documents(namespace, [item.model_dump() for item in body.files], configuration)
+            return resolved_runtime.check_documents(namespace, [item.model_dump() for item in body.files])
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except KnowledgeError as exc:
@@ -395,27 +486,24 @@ def create_service_app(
 
     @app.post("/v1/documents")
     async def upload_documents(
+        request: Request,
         files: list[UploadFile] = File(...),
-        strategy: str = Form("recursive"),
-        chunk_size: int | None = Form(None),
-        chunk_overlap: int | None = Form(None),
         namespace: str = Depends(tenant),
     ) -> dict[str, object]:
-        configuration = _chunking_config(strategy, chunk_size, chunk_overlap)
+        if any(name != "files" for name in await request.form()):
+            raise HTTPException(status_code=400, detail="上传仅接受文件，切分和向量参数由知识库配置决定")
         items = [(upload.filename or "", upload.file) for upload in files]
         try:
             async with mcp_endpoint.mutation_lock(namespace):
                 with anyio.CancelScope(shield=True):
                     before = await anyio.to_thread.run_sync(resolved_runtime.list_documents, namespace)
-                    result = await anyio.to_thread.run_sync(resolved_runtime.upload, namespace, items, configuration)
+                    result = await anyio.to_thread.run_sync(resolved_runtime.upload, namespace, items)
                     await mcp_endpoint.documents_changed(namespace, before, result["documents"])
                     return result
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except KnowledgeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail=f"RAG upload failed: {type(exc).__name__}") from exc
 
     @app.delete("/v1/documents/{name}")
     async def delete_document(name: str, namespace: str = Depends(tenant)) -> dict[str, object]:
@@ -430,8 +518,6 @@ def create_service_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except KnowledgeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail=f"RAG deletion failed: {type(exc).__name__}") from exc
 
     @app.post("/v1/search")
     def search(body: SearchBody, namespace: str = Depends(tenant)) -> dict[str, object]:
@@ -441,8 +527,6 @@ def create_service_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except (KnowledgeError, RagOperationError) as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail=f"RAG search failed: {type(exc).__name__}") from exc
 
     return app
 
@@ -459,6 +543,7 @@ def _csv_setting(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
 def main() -> int:
     import uvicorn
 
+    load_service_config()
     settings = RagHttpSettings.from_env()
     app = create_service_app(settings=settings)
     uvicorn.run(app, host=settings.host, port=settings.port, timeout_graceful_shutdown=5, proxy_headers=False)

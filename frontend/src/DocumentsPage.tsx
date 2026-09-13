@@ -4,10 +4,7 @@ import {
   App,
   Button,
   Empty,
-  Form,
-  InputNumber,
   Modal,
-  Select,
   Table,
   Tooltip,
   Upload,
@@ -25,10 +22,10 @@ import {
   chunkLabel,
   errorText,
   formatBytes,
-  type Chunking,
+  type KnowledgeBase,
+  type Strategy,
   type Connection,
   type DocumentInfo,
-  type Strategy,
   type UploadResult,
 } from "./api";
 
@@ -53,20 +50,15 @@ export function DocumentsPage({
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [listError, setListError] = useState("");
+  const [knowledgeBase, setKnowledgeBase] = useState<KnowledgeBase>();
   const [strategies, setStrategies] = useState<Strategy[]>([]);
-  const [strategyError, setStrategyError] = useState("");
+  const [settingsError, setSettingsError] = useState("");
   const [open, setOpen] = useState(false);
   const [files, setFiles] = useState<UploadFile[]>([]);
   const [uploadError, setUploadError] = useState("");
   const [report, setReport] = useState<UploadResult>();
   const [stage, setStage] = useState("");
   const [deleting, setDeleting] = useState<string>();
-  const [form] = Form.useForm<Chunking>();
-  const strategyId = Form.useWatch("strategy", form);
-  const unit =
-    strategies.find((item) => item.id === strategyId)?.unit === "characters"
-      ? "字符"
-      : "token";
   const lifetime = useRef(new AbortController());
   const listRequest = useRef<AbortController | null>(null);
   const listSequence = useRef(0);
@@ -98,29 +90,23 @@ export function DocumentsPage({
         setLoading(false);
     }
   }
-  async function loadStrategies() {
-    setStrategyError("");
+  async function loadKnowledgeBase() {
+    setSettingsError("");
     try {
-      const data = await api<{ default: string; strategies: Strategy[] }>(
-        "/v1/chunking/strategies",
+      const data = await api<KnowledgeBase & { strategies: Strategy[] }>(
+        "/v1/knowledge-base",
         connection,
         { signal: lifetime.current.signal },
       );
       if (lifetime.current.signal.aborted) return;
+      setKnowledgeBase(data);
       setStrategies(data.strategies);
-      const initial = data.strategies.find((item) => item.id === data.default);
-      if (initial)
-        form.setFieldsValue({
-          strategy: initial.id,
-          chunk_size: initial.chunk_size,
-          chunk_overlap: initial.chunk_overlap,
-        });
     } catch (error) {
-      if (!lifetime.current.signal.aborted) setStrategyError(errorText(error));
+      if (!lifetime.current.signal.aborted) setSettingsError(errorText(error));
     }
   }
   useEffect(() => {
-    void loadStrategies();
+    void loadKnowledgeBase();
     return () => {
       lifetime.current.abort();
       listRequest.current?.abort();
@@ -132,12 +118,11 @@ export function DocumentsPage({
   }, [active]);
 
   async function upload() {
-    if (mutation.current || !strategies.length) return;
+    if (mutation.current || !knowledgeBase) return;
     mutation.current = true;
     setUploadError("");
     setReport(undefined);
     try {
-      const config = await form.validateFields();
       const selected = files
         .map((file) => file.originFileObj)
         .filter((file): file is NonNullable<typeof file> => !!file);
@@ -174,7 +159,7 @@ export function DocumentsPage({
         files: { name: string; document?: DocumentInfo }[];
       }>("/v1/documents/check", connection, {
         ...options,
-        body: JSON.stringify({ files: fingerprints, ...config }),
+        body: JSON.stringify({ files: fingerprints }),
       });
       const skipped = checked.files
         .filter((item) => item.document)
@@ -187,9 +172,6 @@ export function DocumentsPage({
         setStage("正在生成索引");
         const body = new FormData();
         pending.forEach((file) => body.append("files", file));
-        Object.entries(config).forEach(([key, value]) =>
-          body.append(key, String(value)),
-        );
         result = await api<UploadResult>("/v1/documents", connection, {
           ...options,
           body,
@@ -206,11 +188,7 @@ export function DocumentsPage({
       void onHealth();
     } catch (error) {
       if (!lifetime.current.signal.aborted)
-        setUploadError(
-          error && typeof error === "object" && "errorFields" in error
-            ? "请检查切分参数"
-            : errorText(error),
-        );
+        setUploadError(errorText(error));
     } finally {
       mutation.current = false;
       if (!lifetime.current.signal.aborted) {
@@ -387,6 +365,7 @@ export function DocumentsPage({
       />
       <Modal
         title="上传知识文档"
+        className="knowledge-upload-modal"
         open={open}
         forceRender
         width={640}
@@ -410,7 +389,7 @@ export function DocumentsPage({
               type="primary"
               icon={<UploadOutlined />}
               loading={uploading}
-              disabled={uploading || !strategies.length || !!deleting}
+              disabled={uploading || !knowledgeBase || !files.length || !!deleting}
               onClick={() => void upload()}
             >
               {stage || "上传并索引"}
@@ -419,12 +398,14 @@ export function DocumentsPage({
         }
       >
         <div className="upload-dialog">
+          <div className="upload-selection">
           <Upload.Dragger
             multiple
             accept=".md,.txt,.pdf,.docx,.doc"
             disabled={uploading}
             beforeUpload={() => false}
             fileList={files}
+            showUploadList={false}
             onChange={({ fileList }) => setFiles(fileList)}
           >
             <p className="upload-icon">
@@ -435,84 +416,40 @@ export function DocumentsPage({
               MD / TXT / PDF / DOCX / DOC · 每批最多 10 个 · 单文件 10 MiB
             </p>
           </Upload.Dragger>
-          {strategyError && (
-            <Alert
-              type="error"
-              showIcon
-              title="切分策略加载失败"
-              description={strategyError}
-              action={
-                <Button size="small" onClick={() => void loadStrategies()}>
-                  重试
-                </Button>
-              }
-            />
+          {files.length > 0 && (
+            <section className="upload-selected-files" aria-label="待上传文件">
+              <div className="upload-files-heading">
+                <span>待上传文件 <span className="secondary">{files.length} / 10</span></span>
+                <Button type="text" size="small" disabled={uploading} onClick={() => setFiles([])}>清空</Button>
+              </div>
+              <ul className="upload-file-list">
+                {files.map((file) => (
+                  <li className="upload-file-row" key={file.uid}>
+                    <FileTextOutlined className="upload-file-icon" />
+                    <div className="upload-file-details">
+                      <div className="upload-file-name">{file.name}</div>
+                      <div className="secondary">{formatBytes(file.size ?? 0)}</div>
+                    </div>
+                    <Tooltip title="移除文件">
+                      <Button type="text" danger aria-label={`移除 ${file.name}`} icon={<DeleteOutlined />} disabled={uploading}
+                        onClick={() => setFiles((current) => current.filter((item) => item.uid !== file.uid))} />
+                    </Tooltip>
+                  </li>
+                ))}
+              </ul>
+            </section>
           )}
-          <Form form={form} layout="vertical" disabled={uploading}>
-            <Form.Item
-              name="strategy"
-              label="切分策略"
-              rules={[{ required: true, message: "请选择切分策略" }]}
-            >
-              <Select
-                virtual={false}
-                loading={!strategies.length && !strategyError}
-                options={strategies.map((item) => ({
-                  value: item.id,
-                  label: item.label,
-                }))}
-                onChange={(id) => {
-                  const item = strategies.find((item) => item.id === id)!;
-                  form.setFieldsValue({
-                    chunk_size: item.chunk_size,
-                    chunk_overlap: item.chunk_overlap,
-                  });
-                }}
-              />
-            </Form.Item>
-            <div className="chunk-controls">
-              <Form.Item
-                name="chunk_size"
-                label={`块长度（${unit}）`}
-                dependencies={["strategy"]}
-                rules={[
-                  {
-                    required: true,
-                    type: "integer",
-                    min: strategyId === "character" ? 100 : 1,
-                    max: 100000,
-                    message: "请输入有效的整数块长度",
-                  },
-                ]}
-              >
-                <InputNumber
-                  min={strategyId === "character" ? 100 : 1}
-                  max={100000}
-                />
-              </Form.Item>
-              <Form.Item
-                name="chunk_overlap"
-                label={`重叠上限（${unit}）`}
-                dependencies={["chunk_size"]}
-                rules={[
-                  {
-                    required: true,
-                    type: "integer",
-                    min: 0,
-                    message: "请输入非负整数",
-                  },
-                  ({ getFieldValue }) => ({
-                    validator: (_, value) =>
-                      value >= getFieldValue("chunk_size")
-                        ? Promise.reject(new Error("重叠上限必须小于块长度"))
-                        : Promise.resolve(),
-                  }),
-                ]}
-              >
-                <InputNumber min={0} />
-              </Form.Item>
+          </div>
+          {settingsError && (
+            <Alert type="error" showIcon title="知识库配置未就绪" description={settingsError}
+              action={<Button size="small" onClick={() => void loadKnowledgeBase()}>重试</Button>} />
+          )}
+          {knowledgeBase && (
+            <div className="upload-settings-summary">
+              <span>{chunkLabel(knowledgeBase, strategies)}</span>
+              <span>向量维度 {knowledgeBase.vector_size}</span>
             </div>
-          </Form>
+          )}
           <div aria-live="polite">
             {uploadError && (
               <Alert

@@ -62,7 +62,7 @@ SEARCH_TOOL_SCHEMA: dict[str, object] = {
 
 
 def search_tool_definition() -> types.Tool:
-    """Describe the stable action space exposed to Mini-Agent."""
+    """Describe the stable action space exposed to MCP clients."""
 
     return types.Tool(
         name="search",
@@ -204,7 +204,7 @@ def create_server(orchestrator: SearchExecutor | None = None, catalog=None, docu
         return await registry.invoke_async(params.name, params.arguments or {})
 
     return RagServer(
-        "mini-agent-rag",
+        "Praxis-RAG",
         version=__version__,
         on_list_tools=list_tools,
         on_call_tool=call_tool,

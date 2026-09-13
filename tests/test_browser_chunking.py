@@ -104,7 +104,7 @@ def test_browser_real_upload_search_and_themes(console_browser):
             expect(page.locator(".search-result").first).to_be_visible(timeout=180_000)
         for width in (1440, 390, 320):
             page.set_viewport_size({"width": width, "height": 1000 if width == 1440 else 844})
-            for name, slug in (("检索调试", "search"), ("知识文档", "documents"), ("连接配置", "connection")):
+            for name, slug in (("检索调试", "search"), ("知识文档", "documents"), ("接入配置", "connection")):
                 navigate(page, name)
                 page.screenshot(path=str(output / f"{appearance}-{width}-{slug}.png"), full_page=True, animations="disabled")
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), (appearance, width, name)
@@ -124,14 +124,14 @@ def test_browser_real_upload_search_and_themes(console_browser):
             dialog.get_by_role("button", name="关闭", exact=True).last.click()
 
     page.set_viewport_size({"width": 1440, "height": 1000})
-    navigate(page, "连接配置")
-    page.get_by_label("Service Token", exact=True).fill("browser-test-placeholder")
+    navigate(page, "接入配置")
+    page.get_by_label("API Key", exact=True).fill("browser-test-placeholder")
     page.get_by_role("button", name="保存配置", exact=True).click()
-    expect(page.get_by_test_id("mcp-config")).to_contain_text("<RAG_SERVICE_TOKEN>")
+    expect(page.get_by_test_id("mcp-config")).to_contain_text("<API_KEY>")
     expect(page.get_by_test_id("mcp-config")).not_to_contain_text("browser-test-placeholder")
     assert page.evaluate("sessionStorage.getItem('rag.token')") == "browser-test-placeholder"
     assert page.evaluate("localStorage.getItem('rag.token')") is None
-    page.get_by_label("Service Token", exact=True).fill("")
+    page.get_by_label("API Key", exact=True).fill("")
     page.get_by_role("button", name="保存配置", exact=True).click()
     navigate(page, "知识文档")
     page.get_by_role("button", name="删除 maintenance.md", exact=True).click()
@@ -163,7 +163,7 @@ def test_browser_failure_and_namespace_race(console_browser):
     page.get_by_role("button", name="运行检索", exact=True).click()
     expect(page.get_by_role("button", name="三模式对比", exact=True)).to_be_disabled()
     page.get_by_label("查询内容", exact=True).press("Control+Enter")
-    navigate(page, "连接配置")
+    navigate(page, "接入配置")
     page.get_by_label("Namespace", exact=True).fill(namespace + "-other")
     page.get_by_role("button", name="保存配置", exact=True).click()
     expect(page.locator(".workspace-name")).to_have_text(namespace + "-other")
@@ -193,7 +193,7 @@ def test_browser_real_batch_failure_and_upload_lock(console_browser):
     expect(dialog.get_by_role("button", name="关闭", exact=True).last).to_be_disabled()
     expect(page.get_by_label("Namespace", exact=True)).to_be_disabled()
     expect(page.get_by_role("button", name="切换工作区", exact=True)).to_be_disabled()
-    expect(page.get_by_label("Service Token", exact=True)).to_be_disabled()
+    expect(page.get_by_label("API Key", exact=True)).to_be_disabled()
     page.keyboard.press("Escape")
     expect(dialog).to_be_visible()
     assert len(pending) == 1
@@ -211,7 +211,7 @@ def test_browser_document_response_isolation(console_browser):
     page.route("**/v1/documents", lambda route: pending.append(route))
     with page.expect_request("**/v1/documents"):
         navigate(page, "知识文档")
-    navigate(page, "连接配置")
+    navigate(page, "接入配置")
     page.get_by_label("Namespace", exact=True).fill(namespace + "-new")
     page.get_by_role("button", name="保存配置", exact=True).click()
     expect(page.locator(".workspace-name")).to_have_text(namespace + "-new")
@@ -350,12 +350,12 @@ def test_browser_workspace_switch_real_documents(console_browser):
     navigate(page, "知识文档")
     expect(page.get_by_text("当前工作区暂无知识文档", exact=True)).to_be_visible()
     expect(page.get_by_text("workspace-switch.txt", exact=True)).to_have_count(0)
-    navigate(page, "连接配置")
+    navigate(page, "接入配置")
     expect(page.get_by_label("Namespace", exact=True)).to_have_value(other)
     expect(page.get_by_test_id("mcp-config")).to_contain_text(other)
     page.reload()
     expect(page.locator(".workspace-name")).to_have_text(other)
-    expect(page.get_by_role("heading", name="连接配置", exact=True)).to_be_visible()
+    expect(page.get_by_role("heading", name="接入配置", exact=True)).to_be_visible()
 
     for width in (1440, 390, 320):
         page.set_viewport_size({"width": width, "height": 900})
@@ -364,14 +364,14 @@ def test_browser_workspace_switch_real_documents(console_browser):
         page.screenshot(path=str(output / f"workspace-switch-{width}.png"), full_page=True, animations="disabled")
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         page.keyboard.press("Escape")
-        page.get_by_role("heading", name="连接配置", exact=True).click()
+        page.get_by_role("heading", name="接入配置", exact=True).click()
 
     page.get_by_role("button", name="切换工作区", exact=True).click()
     page.get_by_role("menuitem", name=namespace, exact=True).click()
     expect(page.locator(".workspace-name")).to_have_text(namespace)
     navigate(page, "知识文档")
     expect(page.get_by_text("workspace-switch.txt", exact=True)).to_be_visible()
-    navigate(page, "连接配置")
+    navigate(page, "接入配置")
     expect(page.get_by_label("Namespace", exact=True)).to_have_value(namespace)
     page.get_by_role("button", name="保存配置", exact=True).click()
     expect(page.locator(".workspace-name")).to_have_text(namespace)

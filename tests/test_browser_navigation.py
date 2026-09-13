@@ -7,12 +7,13 @@ from urllib.parse import quote
 
 import pytest
 from playwright.sync_api import expect, sync_playwright
+from rag_mcp.chunk_strategies import ChunkingConfig
 
 from test_mcp_http import ProtocolRuntime, running_service
 
 
 DOCUMENT = "维护 #100% & A.txt"
-LABELS = {"search": "检索调试", "documents": "知识文档", "connection": "连接配置"}
+LABELS = {"search": "检索调试", "documents": "知识文档", "connection": "接入配置"}
 
 
 class NavigationRuntime(ProtocolRuntime):
@@ -22,18 +23,19 @@ class NavigationRuntime(ProtocolRuntime):
         self.check_started = threading.Event()
         self.check_release = threading.Event()
 
-    def check_documents(self, namespace, items, chunking):
+    def check_documents(self, namespace, items):
         if self.pause_check:
             self.check_started.set()
             if not self.check_release.wait(20):
                 raise RuntimeError("Upload test timed out")
-        return super().check_documents(namespace, items, chunking)
+        return super().check_documents(namespace, items)
 
 
 @pytest.fixture()
 def navigation_browser(tmp_path):
     runtime = NavigationRuntime(tmp_path / "service")
     for namespace in ("alpha", "beta"):
+        runtime.create_knowledge_base(namespace, ChunkingConfig("character", 700, 100), runtime.config.vector_size)
         result = runtime.upload(namespace, [(DOCUMENT, io.BytesIO(f"{namespace} 的文档内容".encode()))])
         assert len(result["imported"]) == 1, result
     with running_service(runtime.data_root, runtime=runtime) as (url, _app, _runtime):
@@ -188,18 +190,17 @@ def test_missing_document_and_auth_errors_keep_document_address(navigation_brows
     expect(page.locator(".document-text")).to_have_text("alpha 的文档内容")
 
 
-def test_connection_form_updates_url_and_history(navigation_browser):
+def test_connection_workspace_updates_url_and_history(navigation_browser):
     page, _context, url, _runtime = navigation_browser
     page.goto(address(url, view="connection"))
-    page.get_by_label("Namespace", exact=True).fill("beta")
-    page.get_by_role("button", name="保存配置", exact=True).click()
+    switch_workspace(page, "beta")
     expect(page).to_have_url(address(url, "beta", "connection"))
     page.go_back()
-    expect(page.get_by_label("Namespace", exact=True)).to_have_value("alpha")
+    expect(page.locator(".workspace-name")).to_have_text("alpha")
     expect(page.get_by_test_id("mcp-config")).to_contain_text('"X-RAG-Namespace": "alpha"')
     page.go_forward()
-    expect(page.get_by_label("Namespace", exact=True)).to_have_value("beta")
-    expect(page.get_by_role("heading", name="连接配置", exact=True)).to_be_visible()
+    expect(page.locator(".workspace-name")).to_have_text("beta")
+    expect(page.get_by_role("heading", name="接入配置", exact=True)).to_be_visible()
 
 
 @pytest.mark.parametrize("action", ["hash", "back", "same-workspace"])
@@ -210,7 +211,7 @@ def test_upload_survives_url_navigation(navigation_browser, action):
     runtime.pause_check = True
     page.get_by_role("button", name="上传文档", exact=True).click()
     dialog = page.get_by_role("dialog", name="上传知识文档")
-    expect(dialog.get_by_label("切分策略", exact=True)).to_be_enabled()
+    expect(dialog.get_by_role("combobox")).to_have_count(0)
     dialog.locator('input[type="file"]').set_input_files({
         "name": "upload-navigation.txt", "mimeType": "text/plain", "buffer": b"Real upload during navigation",
     })

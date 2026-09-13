@@ -68,6 +68,7 @@ function ModelForm({ kind, initial, connection, disabled, onApplied }: {
   const [saved, setSaved] = useState(initial);
   const [checked, setChecked] = useState<ModelState>(initial);
   const [options, setOptions] = useState<{ value: string }[]>([]);
+  const [modelQuery, setModelQuery] = useState("");
   const [busy, setBusy] = useState<"models" | "test" | "save">();
   const [error, setError] = useState("");
   const [keyEdited, setKeyEdited] = useState(false);
@@ -96,6 +97,7 @@ function ModelForm({ kind, initial, connection, disabled, onApplied }: {
         });
         if (lifetime.current.signal.aborted) return;
         setOptions(result.models.map((model) => ({ value: model })));
+        setModelQuery("");
         void message.info(result.models.length ? `已获取 ${result.models.length} 个模型` : "模型列表为空，可手动填写");
       } else {
         const result = await api<ModelState>(action === "save" ? endpoint : `${endpoint}/test`, connection, {
@@ -185,7 +187,10 @@ function ModelForm({ kind, initial, connection, disabled, onApplied }: {
           options={options}
           maxLength={512}
           allowClear
-          filterOption={(input, option) => (option?.value || "").toLowerCase().includes(input.toLowerCase())}
+          onFocus={() => setModelQuery("")}
+          onSearch={setModelQuery}
+          onSelect={() => setModelQuery("")}
+          filterOption={(_, option) => (option?.value || "").toLowerCase().includes(modelQuery.toLowerCase())}
         />
       </Form.Item>
       <div className="model-api-actions">

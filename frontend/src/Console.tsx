@@ -9,6 +9,8 @@ import {
   DatabaseOutlined,
   DownOutlined,
   MoonOutlined,
+  KeyOutlined,
+  SettingOutlined,
   ReloadOutlined,
   SearchOutlined,
   SunOutlined,
@@ -24,12 +26,16 @@ import { SearchPage } from "./SearchPage";
 import { DocumentsPage } from "./DocumentsPage";
 import { DocumentPreview } from "./DocumentPreview";
 import { ModelSettings } from "./ModelSettings";
+import { ApiKeysPage } from "./ApiKeysPage";
+import { CreateKnowledgeBase } from "./CreateKnowledgeBase";
 import { namespacePattern, useConsoleRoute } from "./navigation";
 
 const pages = [
   { key: "search", label: "检索调试", icon: <SearchOutlined /> },
   { key: "documents", label: "知识文档", icon: <DatabaseOutlined /> },
-  { key: "connection", label: "连接配置", icon: <ApiOutlined /> },
+  { key: "api-keys", label: "API Key", icon: <KeyOutlined /> },
+  { key: "models", label: "模型配置", icon: <SettingOutlined /> },
+  { key: "create", label: "创建知识库", icon: <ApiOutlined /> },
 ] as const;
 
 function recentWorkspaces(): string[] {
@@ -58,7 +64,7 @@ export function Console({
   const { message } = App.useApp();
   const [uploading, setUploading] = useState(false);
   const onNavigationBlocked = useCallback(() => {
-    void message.warning("文档正在上传，请完成后再切换工作区");
+    void message.warning("文档正在上传，请完成后再选择知识库");
   }, [message]);
   const { route, navigate } = useConsoleRoute(uploading, onNavigationBlocked);
   const { page: view, documentName, namespace } = route;
@@ -69,7 +75,6 @@ export function Console({
   const [healthError, setHealthError] = useState("");
   const [checking, setChecking] = useState(false);
   const healthRequest = useRef<AbortController | null>(null);
-  const [form] = Form.useForm<Connection>();
   const [workspaceForm] = Form.useForm<{ namespace: string }>();
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
   const [recent, setRecent] = useState(recentWorkspaces);
@@ -84,8 +89,7 @@ export function Console({
       void message.error("浏览器无法保存工作区，请检查存储权限");
     }
     setRecent(nextRecent);
-    form.setFieldsValue({ namespace, token });
-  }, [namespace, token, form, message]);
+  }, [namespace, message]);
 
   async function refreshHealth() {
     healthRequest.current?.abort();
@@ -128,7 +132,6 @@ export function Console({
     }
     navigate({ namespace: next.namespace, page: view });
     setToken(next.token);
-    form.setFieldsValue(next);
     setRevision((value) => value + 1);
     void message.success(notice);
     return true;
@@ -138,15 +141,6 @@ export function Console({
       setWorkspaceOpen(false);
     }
   }
-  const config = {
-    url: `${location.origin}/mcp`,
-    headers: {
-      "X-RAG-Namespace": connection.namespace,
-      ...(connection.token
-        ? { Authorization: "Bearer <RAG_SERVICE_TOKEN>" }
-        : {}),
-    },
-  };
   const title = pages.find((page) => page.key === view)!.label;
   const themeLabel = dark ? "切换浅色主题" : "切换深色主题";
 
@@ -155,7 +149,7 @@ export function Console({
       <aside className="sidebar">
         <div className="brand">
           <BookOutlined />
-          <span>星河知识库</span>
+          <span>Praxis-RAG</span>
         </div>
         <nav aria-label="主导航">
           {pages.map((page) => (
@@ -168,7 +162,7 @@ export function Console({
               className={view === page.key ? "nav-active" : ""}
               onClick={() => {
                 navigate({ namespace, page: page.key });
-                if (page.key === "connection") void refreshHealth();
+                if (page.key === "create") void refreshHealth();
               }}
             >
               {page.label}
@@ -186,6 +180,7 @@ export function Console({
       <main className="workspace">
         <header className="topbar">
           <nav className="breadcrumb" aria-label="当前位置">
+            {view === "api-keys" || view === "models" || view === "create" ? <><span>全局设置</span><span>/</span></> : <>
             <span>工作区</span>
             <span>/</span>
             <Dropdown
@@ -200,7 +195,7 @@ export function Console({
                     label: <span className="workspace-option">{name}</span>,
                   })),
                   { type: "divider" },
-                  { key: ":other", label: "其他工作区…" },
+                  { key: ":other", label: "其他知识库…" },
                 ],
                 onClick: ({ key }) => {
                   if (key === ":other") {
@@ -215,7 +210,7 @@ export function Console({
               <Button
                 type="text"
                 className="workspace-switch"
-                aria-label="切换工作区"
+                aria-label="选择知识库"
                 disabled={uploading}
               >
                 <span className="workspace-name">{connection.namespace}</span>
@@ -223,6 +218,7 @@ export function Console({
               </Button>
             </Dropdown>
             <span>/</span>
+            </>}
             {view === "documents" && documentName !== undefined ? (
               <>
                 <button
@@ -302,65 +298,32 @@ export function Console({
               </section>
             )}
           </div>
-          <section hidden={view !== "connection"} aria-label="连接配置页面">
-            <div className="page-heading">
-              <h1>连接配置</h1>
-            </div>
-            <div className="settings-section">
-              <h2>工作区与认证</h2>
-              <Form
-                form={form}
-                layout="vertical"
-                initialValues={connection}
-                onFinish={(values) => saveConnection(values)}
-                disabled={uploading}
-                className="connection-form"
-              >
-                <Form.Item
-                  name="namespace"
-                  label="Namespace"
-                  rules={[
-                    { required: true, message: "请输入 Namespace" },
-                    {
-                      pattern: namespacePattern,
-                      transform: (value) => value?.trim(),
-                      message:
-                        "使用 1–64 个字母、数字、点、下划线或横线，首位为字母或数字",
-                    },
-                  ]}
-                >
-                  <Input maxLength={64} />
-                </Form.Item>
-                <Form.Item name="token" label="Service Token">
-                  <Input.Password
-                    autoComplete="off"
-                    placeholder="本机连接可留空"
-                  />
-                </Form.Item>
-                <Button htmlType="submit" type="primary" disabled={uploading}>
-                  保存配置
-                </Button>
-              </Form>
-            </div>
+          {view === "api-keys" && <ApiKeysPage namespaces={workspaceNames} />}
+          {view === "models" && <section aria-label="模型配置页面">
+            <div className="page-heading"><h1>模型配置</h1></div>
             <ModelSettings
-              connection={connection}
+              connection={{ namespace: "default", token: "" }}
               disabled={uploading}
               onApplied={() => {
                 setRevision((value) => value + 1);
                 void refreshHealth();
               }}
             />
-            <div className="settings-section">
-              <h2>HTTP MCP 配置</h2>
-              <pre className="config-code" data-testid="mcp-config">
-                {JSON.stringify(config, null, 2)}
-              </pre>
+          </section>}
+          <section hidden={view !== "create"} aria-label="创建知识库页面">
+            <div className="page-heading">
+              <h1>创建知识库</h1>
             </div>
+            <CreateKnowledgeBase disabled={uploading} onCreated={(namespace) => {
+              if (saveConnection({ ...connection, namespace }, "已切换到新知识库")) {
+                navigate({ namespace, page: "documents" });
+              }
+            }} />
           </section>
         </div>
       </main>
       <Modal
-        title="切换工作区"
+        title="选择知识库"
         forceRender
         open={workspaceOpen}
         onCancel={() => setWorkspaceOpen(false)}
@@ -378,9 +341,9 @@ export function Console({
         >
           <Form.Item
             name="namespace"
-            label="工作区名称"
+            label="知识库名称"
             rules={[
-              { required: true, whitespace: true, message: "请输入工作区名称" },
+              { required: true, whitespace: true, message: "请输入知识库名称" },
               {
                 pattern: namespacePattern,
                 transform: (value) => value?.trim(),

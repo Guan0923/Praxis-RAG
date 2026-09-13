@@ -182,13 +182,14 @@ def test_storage_failure_does_not_replace_runtime(runtime, provider, monkeypatch
 def test_nonempty_cold_workspace_and_vector_length_guard(runtime, provider):
     url, state = provider
     save(runtime, url)
-    result = runtime.upload("cold", [("one.txt", io.BytesIO(b"First document for model API storage checks."))], ChunkingConfig("character", 100, 0))
+    runtime.create_knowledge_base("cold", ChunkingConfig("character", 100, 0), 3)
+    result = runtime.upload("cold", [("one.txt", io.BytesIO(b"First document for model API storage checks."))])
     assert result["imported"], result
     runtime._tenants.clear()
-    with pytest.raises(ModelAPIError, match="已有知识文档"):
+    with pytest.raises(ModelAPIError, match="已有知识库"):
         save(runtime, url, model="embed-b")
     state["size"] = 4
-    with pytest.raises(ModelAPIError, match="已有知识文档"):
+    with pytest.raises(ModelAPIError, match="已有知识库"):
         save(runtime, url)
     state["size"] = 3
     save(runtime, url, kind="reranker")
@@ -196,17 +197,19 @@ def test_nonempty_cold_workspace_and_vector_length_guard(runtime, provider):
     runtime.delete("cold", "one.txt")
     old_collection = runtime.config.collection
     state["size"] = 5
-    save(runtime, url, model="embed-b")
-    assert runtime.config.vector_size == 5 and runtime.config.collection != old_collection
+    with pytest.raises(ModelAPIError, match="已有知识库"):
+        save(runtime, url, model="embed-b")
+    assert runtime.config.vector_size == 3 and runtime.config.collection == old_collection
     assert runtime._client.collection_exists(old_collection)
 
 
 def test_existing_points_block_model_change_even_without_manifest(runtime, provider):
     url, _ = provider
     save(runtime, url)
-    runtime.upload("orphan", [("one.txt", io.BytesIO(b"Stored points must not be ignored."))], ChunkingConfig("character", 100, 0))
+    runtime.create_knowledge_base("orphan", ChunkingConfig("character", 100, 0), 3)
+    runtime.upload("orphan", [("one.txt", io.BytesIO(b"Stored points must not be ignored."))])
     (runtime.data_root / "orphan" / "manifest.json").unlink()
-    with pytest.raises(ModelAPIError, match="已有知识文档"):
+    with pytest.raises(ModelAPIError, match="已有知识库"):
         save(runtime, url, model="different")
 
 
@@ -234,16 +237,16 @@ def test_remote_and_forwarded_settings_actions_are_rejected(runtime, provider, h
             response = client.request(method, "/v1/model-settings/embedding" + suffix,
                                       headers=headers, json={"base_url": url, "model": "embed-a"})
             assert response.status_code == 403
-        assert not client.get("/v1/model-settings", headers=headers).json()["writable"]
+        assert client.get("/v1/model-settings", headers=headers).status_code == 403
     assert not state["requests"]
 
 
 def test_remote_peer_and_service_auth_and_validation_redaction(runtime):
     app = create_service_app(runtime, settings=RagHttpSettings(data_root=runtime.data_root, token="service-key"))
     with TestClient(app, base_url="http://127.0.0.1", client=("192.0.2.10", 12)) as client:
-        assert client.get("/v1/model-settings").status_code == 401
+        assert client.get("/v1/model-settings").status_code == 403
         headers = {"Authorization": "Bearer service-key"}
-        assert not client.get("/v1/model-settings", headers=headers).json()["writable"]
+        assert client.get("/v1/model-settings", headers=headers).status_code == 403
         assert client.post("/v1/model-settings/embedding/models", headers=headers, json={}).status_code == 403
     with local_client(runtime) as client:
         response = client.patch("/v1/model-settings/embedding", json={"apikey": "never-echo-this", "model": []})

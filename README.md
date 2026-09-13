@@ -1,419 +1,103 @@
-# Standalone RAG MCP
+# Praxis-RAG
 
-这是一个可独立安装和运行的 Agentic RAG 模组，不依赖 Mini-Agent Backend 或主前端。`rag-service` 一个进程同时提供：
+**面向 AI 助手和业务应用的独立知识库与检索服务。**
 
-- 标准 Streamable HTTP MCP：`/mcp`
-- 知识管理和检索 REST API：`/v1/*`
-- 独立 Web Console：`/console`
-- 文本切分、Embedding、BM25、Qdrant 和 Reranking
+Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可以在网页中上传和管理资料，比较检索结果，也可以让 AI 助手通过 MCP 连接知识库，查找资料、读取正文和维护文档。
 
-```text
-浏览器 ----------> http://127.0.0.1:8011/console
-MCP HTTP Client -> http://127.0.0.1:8011/mcp -> rag-service -> Qdrant :6333
-```
+它负责提供资料和出处，**不直接生成最终回答**。如何提问、是否继续查找、如何组织答案，由接入的 AI 助手或业务应用决定。
 
-RAG 只返回证据，不生成最终回答。是否调用、是否改写查询、是否多跳检索以及如何组织答案，仍由 Agent 决定。
+## 适用场景
 
-## 安装
+- **产品与售后知识库**：从手册、操作说明和故障记录中查找处理步骤，并返回对应资料。
+- **团队文档检索**：按工作区整理项目资料，让网页、AI 助手和业务系统访问同一份知识库。
+- **研究资料查阅**：检索 PDF 正文、表格、图片说明和公式，再对照原文核查。
+- **检索方案调试**：比较关键词检索、语义检索和混合检索，调整切分方式与结果排序。
 
-在本仓库中开发：
+## 主要功能
 
-```powershell
-cd xinghe_rag
-uv sync --extra api
-```
+### 文档导入与管理
 
-作为独立工具安装当前目录：
+支持 Markdown、TXT、PDF 和 Word（`.docx`、`.doc`，后者需 LibreOffice）。通过网页批量上传、查看和删除文档；相同内容与索引配置的重复上传可以跳过，减少重复处理。旧版 Word 索引在重新上传时重新解析，不会自动重建已有知识库。
 
-```powershell
-cd xinghe_rag
-uv tool install --editable ".[api,pdf]"
-```
+文档详情页支持文本阅读，以及 PDF 翻页、缩放和原文件下载。不同工作区分别管理文档，切换工作区后可继续浏览和检索对应资料。
 
-从独立 Git 仓库直接安装：
+### PDF 内容解析
 
-```powershell
-uv tool install "mini-agent-rag-mcp[api,pdf] @ git+https://github.com/Guan0923/xinghe_rag.git"
-```
+PDF 通过独立的本地 Docling 解析进程处理，支持电子版与扫描版文档：
 
-安装后，`rag-service`、`rag-mcp-debug`、`rag-mcp-ingest` 和 `rag-service-migrate` 都是独立命令。
+- 提取正文和 OCR 识别文字，保留页码与来源位置。
+- 保存图片原图、表格结构和公式内容；公式转为 LaTeX。
+- 优先使用原始图注与表题，缺少有效说明时生成辅助检索描述。
+- 保存解析正文、结构记录和 OCR 警告，便于对照原文件检查。
 
-## 启动
+解析结果不等于原文一定被准确还原。扫描质量、复杂版面、表格和公式都可能影响结果，重要内容仍需核对原页。
 
-### 1. 启动 Qdrant
+### 多种检索方式
 
-```powershell
-docker run -d --name mini-agent-qdrant -p 6333:6333 -p 6334:6334 -v mini_agent_qdrant_data:/qdrant/storage qdrant/qdrant:latest
-```
-
-容器已经创建过时执行：
-
-```powershell
-docker start mini-agent-qdrant
-```
-
-### 2. 启动 RAG Service 和独立前端
-
-```powershell
-$env:RAG_BACKEND = "qdrant"
-$env:QDRANT_URL = "http://127.0.0.1:6333"
-$env:RAG_COLLECTION = "mini_agent_knowledge_pdf_assets_v1"
-$env:RAG_SERVICE_DATA_ROOT = "$HOME/.mini_agent-rag"
-$env:RAG_PDF_PARSER_PYTHON = "C:/path/to/pdf-parser/python.exe"
-$env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
-
-rag-service
-```
-
-仓库开发环境中也可以执行：
-
-```powershell
-uv run --package mini-agent-rag-mcp rag-service
-```
-
-默认地址：
-
-- Web Console：`http://127.0.0.1:8011/console`
-- MCP：`http://127.0.0.1:8011/mcp`
-- OpenAPI：`http://127.0.0.1:8011/docs`
-- 健康检查：`http://127.0.0.1:8011/health`
-
-Console 包含知识上传、文档删除、BM25/Embedding/Hybrid 检索、Reranker 切换、Top-K 结果、score、source、chunk_id 和阶段耗时。它直接访问同源 RAG API，不经过 Mini-Agent。调试页还提供“三模式对比”，固定关闭重排并并排展示三种 Retriever 的原始结果，避免 Cross Encoder 把不同召回重新排成相同顺序。
-
-启动后在“连接配置”中分别设置 Embedding 和 Reranker 的模型 API。RAG HTTP 服务不再加载本地 Embedding/Reranker 权重，也不控制推理框架的 CPU/GPU；本地推理框架需自行运行，再填写其地址与端口。未配置时，相应操作明确报错，不回退到本地模型。
-
-PDF 仍由独立 Docling 2.126.0 子进程解析，使用 PDFium、CUDA 和本机解析模型；图片或表格没有有效原文说明时，才使用固定版本的 Granite Vision 3.3 2B 生成检索描述。图片原图保存在租户目录，图表原始数据和检索文字写入 Qdrant。每批最多 10 个文件，单文件最大 10 MiB。
-
-PDF 公式使用本地 CodeFormulaV2 转为 LaTeX，开启生成缓存，并以紧裁剪、单公式推理减少相邻文字干扰。模型错误、空公式输出或生成被截断会导致该文件解析失败，不静默跳过。模型能够输出 LaTeX 不代表数学内容一定正确，复杂公式仍需要用原页验证。
-
-OCR 不再按默认置信度阈值丢弃已识别文字；低置信度内容保留，并在 `ocr.json`、解析清单和相关检索块的 `source_warnings` 中记录。保留文字不等于识别正确，扫描件仍可能有错字。
-
-每份 PDF 的原生 `document.json`、按阅读顺序保存的 `manifest.json`、正文 `document.md`、OCR 记录 `ocr.json` 和图片保存在知识目录的 `.pdf-assets/<document_id>/`。正文、图片、表格与公式保持 Docling 的遍历顺序；图注、表题、脚注保留原文关联，不按长度丢弃，也不猜配未关联注解。生成描述仅用于检索，不充当原文注解。命令行 PDF 导入和 MCP 正文读取使用同一份解析结果。
-
-### 模型 API 设置
-
-两组设置各自包含 `base_url`、`apikey` 和 `model`，支持不同提供方。密钥可为空；非空时仅以 `Authorization: Bearer ...` 发送。不自动重试或跟随重定向，连接超时为 5 秒、单次读写超时为 60 秒。
-
-- 地址按原样保留路径前缀，仅去除末尾斜杠。例如 `http://localhost:9000/v1` 对应 `/v1/models`、`/v1/embeddings`、`/v1/rerank`；不会自动补 `/v1`。
-- “获取模型列表”读取 `data[].id`；接口不可用时仍可手填。“测试连接”和“保存并应用”都会发送最小真实推理请求，远程服务可能计费。
-- Embedding 使用 `model`、`input`，读取 `data[].index` 和 `embedding`；Reranker 使用 `model`、`query`、`documents`、`top_n`，读取 `results[].index` 和 `relevance_score`。
-- 保存先验证，再等待进行中的操作结束，统一更新所有工作区。失败保留旧配置；已有文档时禁止更换 Embedding 名称或向量长度。空库需要不同向量长度时创建新集合，不删除旧集合。
-- 配置存于服务数据目录的 `model-api-settings.json`，优先于旧模型名称环境变量。Windows 密钥使用当前账号的 DPAPI 加密；其他系统使用权限为 `0600` 的配置文件。密钥不回显、不进入浏览器存储；编辑地址不会复用旧密钥。
-- 仅本机直连可修改、获取列表或测试；远程访问只读。接口检查实际连接地址、Host、Origin 和转发标头，并沿用 Service Token 认证。
-- `GET /v1/model-settings` 返回只读配置与 `writable`；`PATCH /v1/model-settings/{embedding|reranker}` 保存；`POST` 同一路径的 `/models`、`/test` 分别列模型和测试。请求省略 `apikey` 表示保留同地址旧密钥，传空字符串表示清除。
-- 切分 tokenizer 单独使用 `RAG_CHUNK_TOKENIZER_MODEL`，默认 `BAAI/bge-m3`，只加载分词文件，不加载推理权重。API 中的模型别名不会作为 tokenizer 下载地址；远端输入长度限制仍以实际服务为准。
-
-真实 API 浏览器验收需要独立 RAG 服务、独立数据目录和真正运行模型的推理服务：
-
-```powershell
-conda activate dev
-$env:RAG_MODEL_API_TEST_URL = "http://127.0.0.1:8031"
-$env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
-.venv\Scripts\python -m pytest tests/test_real_model_api_ui.py -q -s
-```
-
-本仓库的测试辅助服务 `tests/model_api_inference_server.py --port 8032` 在 `dl` 环境中使用真实缓存 BGE 模型提供验收接口（模型别名 `served-embedding`、`served-reranker`），不属于生产 RAG 服务。测试截图在 `.test-tmp/model-api-browser/`。
-
-### 前端开发与打包
-
-Console 使用 React、TypeScript 和 Ant Design，提供浅色与深色主题。主题和 Namespace 保存在当前浏览器；Service Token 仅保存在当前会话，MCP 配置示例不会显示真实 Token。
-
-正常运行仍只需启动 `rag-service`，通过 `/console` 打开页面，不需要 Node.js 或额外前端进程。仓库中的 `src/rag_mcp/web/` 是随 Python 包交付的构建文件，修改界面请编辑 `frontend/src/`，不要手动修改构建文件。
-
-```powershell
-conda activate dev
-cd frontend
-npm ci
-npm run build
-```
-
-构建会替换 `src/rag_mcp/web/` 中的旧文件；发布或打包 Python 包前，必须一起包含新的构建结果。仅开发时需要 Node.js 22.12+。
-
-需要热更新时，可以单独运行开发服务器：
-
-```powershell
-$env:RAG_DEV_API = "http://127.0.0.1:8011"
-npm run dev
-```
-
-访问终端输出地址下的 `/console/assets/`。开发服务器将 API 请求转发给 `RAG_DEV_API`；生产环境始终使用同源接口。
-
-真实浏览器验收必须指向独立测试服务和独立数据目录，测试会创建自己的 Namespace，并只清理其中的测试文档：
-
-```powershell
-conda activate dl
-$env:PYTHONPATH = "$PWD/src"
-$env:RAG_BROWSER_URL = "http://127.0.0.1:8021"
-python -m pytest tests/test_browser_chunking.py -v
-```
-
-测试需要 Python Playwright 和本机 Edge。截图写入 `.test-tmp/console-browser/`；真实上传、检索与重排使用实际模型，额外的失败和延迟响应测试使用浏览器拦截。
-
-### 切分策略与上传去重
-
-Web Console 的“知识文档”页面可选择五种切分策略。网页及上传 API 默认使用 `recursive`，块长度为 512 token，重叠上限为 64 token；参数可调整。命令行导入仍使用原字符策略，不增加新参数。
-
-| 策略值 | 行为 |
+| 方式 | 用途 |
 | --- | --- |
-| `character` | 原字符切分，默认 700 字符、100 字符重叠，优先在换行或标点处结束。 |
-| `token` | 使用 Embedding 模型的 tokenizer，按原文位置截取 token 窗口。 |
-| `sentence` | 完整句子合块，超长单句按 token 拆分。支持常见中英文断句和英文缩写，不做语言模型语义判断。 |
-| `recursive` | 段落、句子、token 逐级细分，再合并完整内容单元。 |
-| `structure` | Markdown 按标题；TXT 按空行段落；PDF 按页、段落、句子；DOCX 按标题样式及段落，表格过长按行处理。 |
+| 关键词检索（BM25） | 查找型号、术语、故障码等明确词语。 |
+| 语义检索（Embedding） | 按含义查找相关内容，不要求提问与原文用词完全相同。 |
+| 混合检索（Hybrid） | 合并关键词与语义检索的候选结果。 |
+| 结果重排（Reranker，可选） | 对候选内容再次排序，优先展示与问题更相关的片段。 |
 
-短内容按原文顺序合并，允许跨章节和 PDF 页面。重叠计入长度上限，句子重叠可能少于设置值或为零；超长句子使用 token 重叠。chunk 元数据记录字符位置、实际页码、标题路径和段落位置。PDF 正式上传按 Docling 的页码和版面顺序生成正文块；图片按原图注检索并返回原图，表格按表题、表头和行内容检索并返回行列及合并信息。扫描文本使用 Docling OCR；无法稳定恢复结构的表格会终止该文件入库。
+检索页展示内容片段、来源、分数和各阶段耗时，也支持三种检索方式并排比较。返回结果表示找到了候选资料，并不保证资料足以回答问题。
 
-PDF 正文实际执行所选切分策略；公式整体保留，表格按完整行附带全部表头层级入库，不跨图表或公式边界拼接正文。表格的 `header_rows` 保存多层表头，`cells` 保存合并范围，空列不会被删除。不可拆分的公式、图注或表格行可以超过目标块长度，但不得超过 Embedding 模型输入上限，超过时明确报错。PDF 块记录原始引用、页码及位置；跨页原文保留全部 `locations`，`page` 是起始页。普通正文的字符偏移对应当前连续正文段，不是 PDF 文件字节位置；来源的 `charspan` 对应 Docling 原始元素。
+### 可调整的文档切分
 
-- `GET /v1/chunking/strategies` 返回策略选项、单位和默认参数。
-- `POST /v1/documents` 在原 `files` multipart 字段外接收 `strategy`、`chunk_size`、`chunk_overlap`。
-- `POST /v1/documents/check` 接收 JSON：`{"files":[{"name":"guide.md","sha256":"64位小写十六进制哈希"}],"strategy":"recursive","chunk_size":512,"chunk_overlap":64}`，返回同序的 `files`，每项 `document` 为已有文档或 `null`。
-- 三个接口均沿用 `X-RAG-Namespace` 和服务认证。去重仅在同一 namespace 内比较文件 SHA-256、策略、长度、重叠、Embedding 模型及 tokenizer 标识；文件名不参与比较。
-- PDF 去重还比较 `pdf_parser_version`，解析器更新后重新上传会重新索引。旧 PDF 不自动迁移，缺少当前版本解析正文时 MCP 会要求显式重新导入，不回退到旧的纯文本提取。
-- 浏览器先计算哈希并检查，命中则不发送文件正文。需要 HTTPS 或 localhost 安全连接。后端接收正文时重新计算哈希，并在租户锁内再次去重。
-- 上传结果分别包含 `imported`、`skipped`、`failed` 和 `documents`。更改参数会重新索引；改名但配置相同则返回已有文档，不新建别名。已有文档不会自动重建。
-- 旧清单首次检查时按需补齐哈希，缺失配置按原 700/100 字符策略解释。tokenizer 下载或加载失败会明确报错，不退回字符计数。
+提供按字符、token、句子、递归和文档结构五种切分方式，并可调整片段长度与重叠量。你可以根据手册、短文或长篇资料的特点，选择合适的处理方式。
 
-真实验收（在已安装 `.[dense]` 和 `pytest` 的 `dl` 环境运行）：
+PDF 的公式与表格行会按内容边界处理，减少在切分过程中拆散内容；超过模型输入上限时明确报错。
 
-```powershell
-conda activate dl
-$env:RAG_REAL_SMOKE = "1"
-$env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
-python -m pytest tests/test_real_chunking.py -q -s
-```
+### 接入 AI 助手与业务系统
 
-该测试用真实 BGE-M3、BM25 和本地 Qdrant，在临时目录中验证五种策略及四种文件。浏览器验收另需 `playwright` 和本机 Edge：设置 `RAG_BROWSER_URL` 为独立测试服务地址后，运行 `tests/test_browser_chunking.py`；截图保存在 `.mini_agent-rag/chunking-ui/`。
+同一个服务提供三种入口，无需另外部署前端服务：
 
-PDF 最多解析 1000 页；DOCX 解压后的内部文件总量最多 50 MiB；单个文档最多提取 500 万字符。扫描版 PDF 使用本地 OCR；旧版二进制 `.doc` 由独立 LibreOffice 进程转换后解析。
+| 入口 | 能力 |
+| --- | --- |
+| Web Console：`/console` | 文档管理、检索调试、工作区切换和模型连接配置。 |
+| MCP：`/mcp` | 搜索、添加、更新和删除文档，分页读取正文，使用提示词模板及订阅变更。 |
+| REST API：`/v1/*` | 将知识管理与检索接入现有应用；交互式接口文档位于 `/docs`。 |
 
-### Word 解析和图片检索
+管理员可以启停已注册的 MCP 工具、调整工具说明和管理提示词模板。文档写入与删除工具应只向可信客户端开放。
 
-```powershell
-$env:RAG_WORD_CONVERTER_PATH = "C:/Program Files/LibreOffice/program/soffice.exe"
-$env:RAG_WORD_CONVERT_TIMEOUT = "120"
-# 无图注的图片使用已有 Docling + Granite Vision 环境和模型目录。
-$env:RAG_PDF_PARSER_PYTHON = "C:/path/to/pdf-parser/python.exe"
-$env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
-```
+### 独立部署与模型连接
 
-- DOCX 读取正文、内容控件、文本框、页眉页脚、脚注尾注及嵌套表格。只保留最终正文，忽略删除和移出修订。
-- 表格保留空列、合并范围、嵌套单元格、表题及表注。每行检索文字携带表头，命中后返回完整结构。
-- 原生公式通过 `docxlatex` 转为 LaTeX；不支持的公式结构、损坏内容、外链图片及未能提取的原生图表会明确拒绝入库。
-- 图片保存原始字节。真实图注用于检索；没有图注时生成简短视觉描述，仅用于索引，不冒充图注。Word 视觉推理缩放输入到最长边 384 像素，不改变保存的原图；拒答或无效描述导致入库失败。
-- 图注、表注按编号、明确引用和相邻关系关联。仍有歧义的对象不保存，注释文字保留，上传结果与文档详情显示跳过数量、位置和原因。
-- Word 资产保存在知识目录内的 `.word-assets`，与源文件和索引一同更新、回滚和删除。旧文档需重新上传才能使用新解析结果，不会自动重建已有知识库。
-- REST 图片结果的 `asset.data` 是 Base64，`asset.mime_type` 是实际类型；MCP 返回图片内容块。Word 使用章节、段落和对象位置，不提供虚构页码或坐标。控制台支持图片下载和表格展示。
-- DOC 转换使用独立临时目录及 LibreOffice 配置，禁用宏和链接更新。DOC 原文件仍保留；其图片字节以转换后的 DOCX 为准。转换超时、工具缺失或加密文档会报错，不降级成不完整文本。
+Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保存检索索引；文档及解析产物保存在服务的数据目录中。
 
-真实验收：在 `dev` 的隔离环境运行 `tests/test_real_word_fidelity.py`，设置 `RAG_REAL_WORD=1`、上述转换/模型配置，以及指向测试模型服务的 `RAG_MODEL_PROVIDER_URL`、`RAG_TEST_EMBEDDING_MODEL`。涉及 PyTorch 的进程使用 `dl` 或基于 `dl` 的模型环境。测试使用 `.test-tmp/word-real` 下的独立数据，不访问正式知识库。控制台验收使用 `RAG_WORD_PREVIEW_URL` 和 `tests/test_browser_word.py`。
+语义检索和重排分别连接模型 API，可使用不同提供方，也可连接自行部署的本地推理服务。HTTP 服务本身不加载这两类模型的权重；PDF 解析仍需要单独准备本地环境和模型。
 
-## Namespace
+**数据是否离开本机取决于你的模型配置。** 使用远程模型 API 时，查询和相关文档内容会发送给对应服务，测试连接也会发出真实模型请求，可能产生费用。
 
-namespace 是一个独立知识库标识，例如 `default`、`product-manuals` 或 `team-a`。Console 与 MCP 配置必须使用相同值，否则 Agent 检索不到网页上传的文档。
+## 使用流程
 
-允许 1～64 个字符，只能包含字母、数字、点、下划线和横线。知识源文件位于：
+1. 安装 Praxis-RAG，准备 Qdrant，并按需配置 PDF 解析环境。
+2. 启动 `rag-service`，打开 `http://127.0.0.1:8011/console`。
+3. 在“连接配置”中填写并测试模型 API，选择工作区。
+4. 上传文档，在“检索调试”中检查返回内容与来源。
+5. 将同一工作区接入 MCP 客户端或业务系统。
 
-```text
-~/.mini_agent-rag/<namespace>/knowledge/
-~/.mini_agent-rag/<namespace>/manifest.json
-```
+服务启动时自动读取 `~/.praxis-rag/config.toml`，首次运行会创建默认配置；新知识文件默认保存在 `~/.praxis-rag/data/`。已有知识库请在配置中指定原来的数据目录和数据库位置，不会自动迁移。
 
-namespace 不在 Agent 可见的工具 Schema 中；MCP HTTP 客户端必须在每个请求中发送 `X-RAG-Namespace`。同一个 MCP 会话不能切换 namespace，需要切换时应重新初始化会话。
+安装步骤、配置文件、模型接口要求和接入示例见 [使用与部署指南](docs/USAGE.md)。
 
-## 接入 Streamable HTTP MCP Client
+## 使用边界
 
-MCP 客户端使用以下连接信息：
+- 当前支持单进程、单 worker；上传与索引是同步操作，大文件处理期间需要等待。
+- 每批最多上传 10 个文件，单文件最大 10 MiB。暂不支持 Excel、网页抓取和独立图片上传。
+- Word 保留内容控件、嵌套表格、空列、合并范围和原生公式；图片按原字节返回。未知公式结构、原生图表和 OLE 等无法可靠读取的内容明确拒绝入库；图表关联有歧义时按规则跳过并显示原因。配置与限制见 [Word 解析说明](docs/USAGE.md#word-解析和图片检索)。
+- 工作区用于划分知识库，不是用户级权限系统。目前没有账户体系或细粒度多用户授权。
+- 默认仅监听本机。远程部署需要配置访问令牌、允许访问的域名与来源，并在服务前设置 HTTPS 和访问控制。
+- 订阅通知不提供历史重放或断线补发，重新连接后需要读取最新状态。
 
-```json
-{
-  "url": "http://127.0.0.1:8011/mcp",
-  "headers": {
-    "X-RAG-Namespace": "default"
-  }
-}
-```
+## 项目文档
 
-启用 Token 后还需要发送：
+| 文档 | 内容 |
+| --- | --- |
+| [使用与部署](docs/USAGE.md) | 安装、启动、模型配置、MCP 与 REST 接入、开发和测试。 |
+| [验证记录](VALIDATION.md) | 已执行的验证及其覆盖范围。 |
+| [PDF 验证记录](benchmarks/PDF_VALIDATION.md) | PDF 解析实测结果与未解决样例。 |
+| [Word 验证记录](benchmarks/WORD_VALIDATION.md) | DOC/DOCX、图片检索、表格和浏览器实测结果及限制。 |
+| [历史开发记录](PROGRESS.md) | 项目早期开发阶段记录，不作为当前功能清单。 |
 
-```text
-Authorization: Bearer <RAG_SERVICE_TOKEN>
-```
-
-客户端可使用 MCP `2025-11-25` 或 `2026-07-28` 的 Streamable HTTP 传输。旧版先初始化，新版可发现服务或直接调用；具体流程见后面的“双版本”章节。取消调用只结束等待，不会强制终止已经进入模型或 Qdrant 的同步计算。
-
-MCP 提供 `search`、`add_document`、`update_document`、`delete_document` 四个工具。若 Host 使用 `rag` 作为 server 名，搜索工具展示名通常是 `mcp_rag_search`。
-
-### MCP 文件管理
-
-三个文件工具只操作连接时 `X-RAG-Namespace` 指定的知识库，使用普通 Service Token，不需要管理 Token。请仅向可信客户端提供具有写入权限的连接；工具提示不能替代权限控制。管理员可通过工具管理接口分别禁用这些工具。
-
-| 工具 | 参数 | 行为 |
-|---|---|---|
-| `add_document` | `name` 和 `content` 或 `content_base64` | 添加并建立索引；同名文件报错，不覆盖 |
-| `update_document` | `name` 和 `content` 或 `content_base64` | 完整替换已存在文件并重建索引，保留切分设置；不存在时报错 |
-| `delete_document` | `name` | 删除文件和索引；不存在时报错 |
-
-`name` 必须是含扩展名的准确文件名，不能传路径。支持 TXT、Markdown（`.md`）、PDF、DOCX、DOC，单文件最大 10 MiB。TXT/Markdown 可使用 UTF-8 文本 `content`；PDF/DOCX/DOC 必须由客户端读取文件后传标准 Base64 到 `content_base64`。两种内容参数只能传一种，不支持服务器路径或 URL。
-
-```json
-{"name": "manual.txt", "content": "E03 表示温度传感器故障。"}
-```
-
-新增使用默认递归切分。同内容不同文件名会分别保存，确保更新始终针对指定文件。同名、同内容、同切分设置的更新返回 `unchanged`。成功返回 `status`、`document` 和可读取的 `uri`；工具参数错误或操作失败返回 MCP `isError=true`。整个请求另有大小上限，超过后返回 HTTP 413；既有文档解析安全上限仍然适用。文件变更会发送资源更新通知。删除无法通过 MCP 撤销，更新前需要保留旧版本时应先读取或备份。
-
-工具输入：
-
-```json
-{
-  "query": "星河 X7 出现 E03 应该怎么处理？",
-  "retrieval": "hybrid",
-  "rerank": "cross_encoder",
-  "candidate_k": 10,
-  "top_k": 5,
-  "filters": {}
-}
-```
-
-允许的 filter 只有 `document_id`、`source` 和 `title`，不接受原始 Qdrant Filter。
-
-## Token 与远程部署
-
-默认只监听 loopback。绑定非 loopback 地址时必须设置 Token，以及 MCP Host、Origin 白名单：
-
-```powershell
-$env:RAG_SERVICE_HOST = "0.0.0.0"
-$env:RAG_SERVICE_TOKEN = "replace-with-a-random-secret"
-$env:RAG_MCP_ALLOWED_HOSTS = "rag.example.com"
-$env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
-rag-service
-```
-
-线上 MCP 客户端连接：
-
-```json
-{
-  "url": "https://rag.example.com/mcp",
-  "headers": {
-    "X-RAG-Namespace": "product-manuals",
-    "Authorization": "Bearer <RAG_SERVICE_TOKEN>"
-  }
-}
-```
-
-Console 的 Token 只保存到浏览器 `sessionStorage`。生产环境还应在 RAG Service 前配置 HTTPS、访问控制和请求大小限制。
-
-## 开发与验证
-
-```powershell
-uv run --no-sync python -m pytest tests -q
-uv run --no-sync python -m ruff check src tests
-uv run --package mini-agent-rag-mcp rag-mcp-debug "RRF 怎么融合 BM25 和 Dense？"
-uv run --package mini-agent-rag-mcp rag-mcp-debug --schema
-```
-
-协议测试会启动真实本机 HTTP 服务，使用官方客户端和真实文件存储，但以可控检索器和 PDF 解析结果替代模型，不下载模型或连接 Qdrant。这不等于真实模型效果验证。
-
-本地 GPU 的 PDF 完整链路验收使用 `tests/test_real_pdf_fidelity.py`。先激活 `dl`，指定已安装依赖的解析器 Python、本地模型目录和样本目录，再执行：
-
-```powershell
-conda activate dl
-$env:PYTHONPATH = "$PWD/src"
-$env:HF_HUB_OFFLINE = "1"
-$env:TRANSFORMERS_OFFLINE = "1"
-$env:RAG_REAL_PDF = "1"
-$env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
-$env:RAG_PDF_PARSER_PYTHON = "C:/path/to/pdf-parser/python.exe"
-$env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
-$env:RAG_PDF_SAMPLES = "C:/path/to/pdf/samples"
-$env:RAG_PDF_SAMPLE_FILES = "aviation.pdf,doclaynet.pdf,mineru_demo2.pdf,scan.pdf"
-& $env:RAG_PDF_PARSER_PYTHON -m pytest tests/test_real_pdf_fidelity.py -q -s
-```
-
-此测试在独立临时目录启动 HTTP 服务和本地 Qdrant，调用真实 Docling、CodeFormulaV2、OCR、BGE-M3；检查上传、重复检测、检索和 MCP 全文读取。耗时、显存分配峰值、公式与图表数量、检索结果写入 `.test-tmp/pdf-fidelity-real/<run>/report.json`。这些检查证明链路保留情况，不等于公式语义或版面识别准确率；仍须对照原页和原生结果检查。
-
-本轮实测结果及未解决样例见 [PDF 修复验证记录](benchmarks/PDF_VALIDATION.md)。
-
-### Conda 开发环境
-
-其他项目可能仍依赖 MCP 1.x。为避免改动共享环境，在激活 `dev` 后给本项目创建独立虚拟环境：
-
-```powershell
-conda activate dev
-python -m venv --system-site-packages .venv
-.venv\Scripts\python -m pip install -e ".[api]"
-.venv\Scripts\python -m pytest tests -q
-.venv\Scripts\python -m rag_mcp.http_service
-```
-
-HTTP 模型检索需要在控制台设置可用的模型 API，并准备 Qdrant；上述协议测试不调用模型。独立命令行的本地模型流程未改动，仍需要 `.[dense]`。
-
-## MCP 双版本
-
-依赖固定为 `mcp==2.1.1`，同一个 `/mcp` 支持以下两种流程，客户端不能把新版版本号放进旧版 `initialize` 来切换流程：
-
-```text
-2025-11-25: initialize → notifications/initialized → tools/list / tools/call
-2026-07-28: server/discover（可选）→ tools/list / tools/call → subscriptions/listen（按需）
-```
-
-新版每次请求携带自己的协议信息，不要求先建立旧版会话。协议头和请求格式应由 SDK 处理。Python SDK `Client` 的 `mode="legacy"` 使用旧版，默认 `mode="auto"` 发现新版，`mode="2026-07-28"` 跳过发现直接使用新版。
-
-请求均携带 `X-RAG-Namespace` 和配置要求的 Service Token。旧会话不能跨 namespace 使用；订阅固定建立时的 namespace。工具调用取消只停止等待和发送结果，不强停后台模型线程。
-
-HTTP MCP 注册搜索和三个文件管理工具；本地搜索调试入口仍只提供搜索。新增工具要在项目中登记定义、参数校验和执行函数；配置接口不能上传代码，也不能注册外部 HTTP 转发。
-
-## 工具与提示词管理
-
-设置独立的 `RAG_ADMIN_TOKEN` 开启管理接口；未设置时管理接口返回 403。它必须与 `RAG_SERVICE_TOKEN` 不同，二者不能互换。管理接口使用 `Authorization: Bearer <RAG_ADMIN_TOKEN>` 和 `X-RAG-Namespace`。普通 MCP/REST 请求使用 Service Token，Console 不保存或展示管理凭证。
-
-| 接口 | 行为 |
-|---|---|
-| `GET /v1/admin/tools` | 返回本 namespace 的已注册工具和启用状态 |
-| `PATCH /v1/admin/tools/{name}` | 仅支持 `enabled`、`description`；未知工具返回 404 |
-| `GET /v1/admin/prompts` | 返回提示词模板及正文 |
-| `PUT /v1/admin/prompts/{name}` | 新建或完整替换模板 |
-| `DELETE /v1/admin/prompts/{name}` | 删除模板，不存在返回 404 |
-
-工具修改示例：`{"enabled": false}`。提示词 PUT 请求示例：
-
-```json
-{
-  "description": "总结已读取的资料",
-  "arguments": [{"name": "text", "description": "资料正文", "required": true}],
-  "messages": [{"role": "user", "text": "请总结以下资料：\n{{text}}"}]
-}
-```
-
-模板仅替换 `{{argument}}`；参数必须是字符串，消息角色仅为 `user` 或 `assistant`，不执行表达式或代码。可选参数未提供时替换为空字符串。MCP 客户端通过 `prompts/list`、`prompts/get` 使用这些模板。
-
-配置保存在 `<RAG_SERVICE_DATA_ROOT>/<namespace>/mcp_catalog.json`，重启恢复，管理配置不会加载检索模型。管理 Token 仍可管理所有 namespace，不提供用户级权限隔离。配置修改请走管理接口，不手工编辑正在运行的配置文件。
-
-## 文档资源与订阅
-
-- `resources/list` 返回当前知识库已导入文档，列表每页最多 50 项，按 `nextCursor` 继续；`resources/templates/list` 返回分页地址规则。
-- 文档地址为 `rag://knowledge/<namespace>/<编码后的文件名>`，`resources/read` 默认读取第一页，不返回本地路径。
-- 正文按段落分页，通常每页最多 8000 字符；长公式独占一页且不截断，可以超过此值。单个公式已在入库时受模型输入上限约束。这不是 PDF 原始页码，也不是自动识别的章节。
-- 返回标准文本资源，其中 `text` 是 JSON：`uri`、`text`、`page`、`total_pages`、`version`、`has_more`、`truncated` 和 `next_uri`。`truncated=true` 表示当前页未包含剩余正文，可继续读取 `next_uri`。
-- 下一页地址携带文档版本。文档替换后旧的下一页地址会报错，客户端应从文档 URI 重读。解析安全上限与上传规则不变，超限或解析失败明确报错，不静默截断整份文档。
-- 指定资源更新订阅使用稳定的文档 URI，不使用分页 URI；删除后通知订阅者，后续读取返回不存在。
-
-新版 `subscriptions/listen` 可选择工具列表、提示词列表、资源列表及指定文档更新。旧版仍使用列表变化通知与 `resources/subscribe`、`resources/unsubscribe`。通知只表示“发生变化”，客户端需要重新列出或读取内容。
-
-启停工具或修改描述、增删改提示词、上传替换删除文档都会在对应操作成功后通知。失败项和没有变化的重复操作不通知；同名相同内容上传跳过重复索引。通知不会跨 namespace。
-
-本轮仅支持**单进程、单 worker**。不提供跨进程通知、历史事件重放或断线补发。订阅断线后客户端重新订阅并读取最新状态。服务退出时释放会话与订阅，不部署 OAuth、账户系统或云服务。
-
-## 当前限制
-
-- 文档解析支持 Markdown/TXT、电子版和扫描版 PDF、DOCX，以及安装 LibreOffice 后的 DOC；Excel、网页抓取和独立图片上传尚未实现。
-- PDF 使用本机 Docling、OCR 和公式模型；不能保证任意扫描件、旋转表格或复杂公式都准确。公式处理针对 Docling 检出的公式块，不保证所有行内数学符号转换为 LaTeX。明确的解析错误会失败，但不能自动识别所有内容错误。
-- HTTP `embedding` 使用配置的兼容模型 API，向量长度由实际响应检测。
-- `hybrid` 使用 Qdrant Dense + Sparse 预取和 RRF 融合。
-- 重排仅支持 `none`（不重排）与 `cross_encoder`（调用配置的 Reranker API）。
-- Console 会同时展示 Cross Encoder 最终分数和重排前的 `retrieval_score`；请求失败时会清空旧结果并保留错误面板。
-- 推理服务离线、认证失败或返回格式不兼容时明确报错；可选择“不重排”验证不依赖 Reranker 的召回流程。
-- 上传目前是同步请求，大文件索引期间网页会等待。
-- Console 用于本地开发调试，不提供账户系统或细粒度多用户权限。
-
-历史阶段和本轮变更记录见 [PROGRESS.md](PROGRESS.md)。
+产品名为 **Praxis-RAG**，Python 安装包名为 `praxis-rag`。启动命令仍为 `rag-service`，内部模块仍为 `rag_mcp`；本次更名不迁移现有知识库数据。

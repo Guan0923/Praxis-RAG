@@ -34,7 +34,7 @@ def test_model_settings_real_browser_flow():
 
         try:
             page.goto(url + "/console")
-            navigate("连接配置")
+            navigate("模型配置")
             for kind, model in [("Embedding", "served-embedding"), ("Reranker", "served-reranker")]:
                 section = page.get_by_role("region", name=kind + " 模型配置", exact=True)
                 section.get_by_label("base_url", exact=True).fill(provider + "/")
@@ -50,7 +50,7 @@ def test_model_settings_real_browser_flow():
                 expect(section.get_by_label("apikey", exact=True)).to_have_value("")
 
             page.reload()
-            navigate("连接配置")
+            navigate("模型配置")
             expect(page.get_by_role("region", name="Embedding 模型配置").get_by_label("model", exact=True)).to_have_value("served-embedding")
             expect(page.get_by_text("device:", exact=False)).to_have_count(0)
             for theme in ("light", "dark"):
@@ -78,7 +78,7 @@ def test_model_settings_real_browser_flow():
             expect(page.locator(".result-text").first).to_contain_text("E03")
             expect(page.locator(".scores").first).to_contain_text("召回")
             page.screenshot(path=str(output / "real-embedding-rerank.png"), full_page=True, animations="disabled")
-            navigate("连接配置")
+            navigate("模型配置")
             embedding = page.get_by_role("region", name="Embedding 模型配置")
             embedding.get_by_label("model", exact=True).fill("BAAI/bge-m3")
             embedding.get_by_role("button", name="保存并应用", exact=True).click()
@@ -111,8 +111,8 @@ def test_model_settings_real_browser_flow():
             readonly_context = browser.new_context(extra_http_headers={"X-Forwarded-For": "192.0.2.1"})
             readonly = readonly_context.new_page()
             readonly.goto(url + "/console")
-            readonly.get_by_role("navigation").get_by_role("button", name="连接配置", exact=True).click()
-            expect(readonly.get_by_text("模型设置只读", exact=True)).to_be_visible()
+            readonly.get_by_role("navigation").get_by_role("button", name="模型配置", exact=True).click()
+            expect(readonly.get_by_text("HTTP 403", exact=False)).to_be_visible()
             for button in readonly.get_by_role("button", name="保存并应用", exact=True).all():
                 expect(button).to_be_disabled()
             readonly_context.close()

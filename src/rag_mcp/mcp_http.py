@@ -298,9 +298,12 @@ class McpHttpEndpoint:
     async def __call__(self, scope, receive, send):
         request = Request(scope, receive)
         try:
-            namespace = self._tenant(request.headers.get("authorization"), request.headers.get("x-rag-namespace"))
+            if not request.headers.get("authorization"):
+                raise HTTPException(status_code=401, detail="MCP 请求必须提供 Authorization: Bearer <API_KEY>",
+                                    headers={"WWW-Authenticate": "Bearer"})
+            namespace = self._tenant(request.headers.get("authorization"), request.headers.get("x-rag-namespace"), request)
         except HTTPException as exc:
-            await JSONResponse({"detail": exc.detail}, status_code=exc.status_code)(scope, receive, send)
+            await JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)(scope, receive, send)
             return
         rejection = await self._security.validate_request(request, is_post=request.method == "POST")
         if rejection is not None:
