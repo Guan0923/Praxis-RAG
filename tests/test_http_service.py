@@ -110,18 +110,10 @@ def test_runtime_health_reports_http_configuration_without_calling_models() -> N
         reranker_model="local/reranker",
         reranker_device="cpu",
     )
-    runtime._connections = {
-        "embedding": ModelConnection("http://localhost:9000/v1", "local/embedding"),
-        "reranker": ModelConnection(model="local/reranker"),
-    }
-
     status = runtime.status()
 
     assert status["service"] == "praxis-rag"
-    assert status["models"] == {
-        "embedding": {"name": "local/embedding", "provider": "http", "configured": True},
-        "reranker": {"name": "local/reranker", "provider": "http", "configured": False},
-    }
+    assert "models" not in status
 
 
 def test_standalone_console_is_served_by_the_rag_package(service) -> None:

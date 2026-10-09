@@ -87,8 +87,10 @@ def test_real_word_ingestion_search_and_mcp():
     runtime = RagServiceRuntime(config, root / "data")
     runtime.release, runtime.wire_responses = threading.Event(), []
     report = {"root": str(root), "version": WORD_PARSER_VERSION, "documents": []}
-    runtime.model_action("embedding", {"base_url": os.environ["RAG_MODEL_PROVIDER_URL"],
-                                      "model": os.environ.get("RAG_TEST_EMBEDDING_MODEL", "bge-m3:latest")}, "save")
+    from rag_mcp.chunk_strategies import ChunkingConfig
+    runtime.create_knowledge_base("manuals", ChunkingConfig(strategy="character", chunk_size=700, chunk_overlap=100),
+        os.environ.get("RAG_TEST_EMBEDDING_MODEL", "bge-m3:latest"),
+        embedding={"base_url": os.environ["RAG_MODEL_PROVIDER_URL"]})
     try:
         with running_service(root / "data", runtime=runtime) as (url, _, _):
             with httpx.Client(base_url=url, headers=AUTH, timeout=900, trust_env=False) as client:

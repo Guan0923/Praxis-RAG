@@ -30,38 +30,24 @@ def test_model_settings_real_browser_flow():
         page.on("pageerror", lambda error: errors.append(str(error)))
 
         def navigate(name):
-            page.get_by_role("navigation").get_by_role("button", name=name, exact=True).click()
+            page.get_by_role("navigation", name="主导航").get_by_role("button", name=name, exact=True).click()
 
         try:
             page.goto(url + "/console")
-            navigate("模型配置")
-            for kind, model in [("Embedding", "served-embedding"), ("Reranker", "served-reranker")]:
-                section = page.get_by_role("region", name=kind + " 模型配置", exact=True)
-                section.get_by_label("base_url", exact=True).fill(provider + "/")
-                section.get_by_role("button", name="获取模型列表", exact=True).click()
-                expect(section.get_by_role("button", name="获取模型列表", exact=True)).to_be_enabled(timeout=10_000)
-                section.get_by_label("model", exact=True).fill("served")
+            navigate("创建知识库")
+            creation = page.locator(".knowledge-base-form")
+            creation.get_by_label("知识库标识（Namespace）", exact=True).fill(namespace)
+            creation.get_by_role("switch", name="启用 Reranker").click()
+            for kind, model in [("Embedding", os.getenv("RAG_TEST_EMBEDDING_MODEL", "served-embedding")), ("Reranker", os.getenv("RAG_TEST_RERANKER_MODEL", "served-reranker"))]:
+                creation.get_by_label(kind + " URL", exact=True).fill(provider)
+                creation.get_by_label(kind + " 模型", exact=True).click()
                 page.get_by_role("option", name=model, exact=True).click()
-                section.get_by_role("button", name="测试连接", exact=True).click()
-                expect(section.get_by_text("连接成功", exact=True)).to_be_visible(timeout=180_000)
-                section.get_by_role("button", name="保存并应用", exact=True).click()
-                expect(section.get_by_role("button", name="保存并应用", exact=True)).to_be_enabled(timeout=180_000)
-                expect(section.get_by_label("base_url", exact=True)).to_have_value(provider)
-                expect(section.get_by_label("apikey", exact=True)).to_have_value("")
-
-            page.reload()
-            navigate("模型配置")
-            expect(page.get_by_role("region", name="Embedding 模型配置").get_by_label("model", exact=True)).to_have_value("served-embedding")
-            expect(page.get_by_text("device:", exact=False)).to_have_count(0)
-            for theme in ("light", "dark"):
-                if theme == "dark":
-                    page.get_by_role("button", name="切换深色主题", exact=True).click()
-                for width in (1440, 390, 320):
-                    page.set_viewport_size({"width": width, "height": 1000})
-                    page.screenshot(path=str(output / f"model-settings-{theme}-{width}.png"), full_page=True, animations="disabled")
-                    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            for width in (1440, 390, 320):
+                page.set_viewport_size({"width": width, "height": 1000})
+                page.screenshot(path=str(output / f"creation-{width}.png"), full_page=True)
             page.set_viewport_size({"width": 1440, "height": 1050})
-            navigate("知识文档")
+            creation.get_by_role("button", name="创建知识库", exact=True).click()
+            expect(page.get_by_role("button", name="上传文档", exact=True)).to_be_visible(timeout=180_000)
             page.get_by_role("button", name="上传文档", exact=True).click()
             dialog = page.get_by_role("dialog", name="上传知识文档")
             text = ("# 星河设备维护\n\nE03 表示温度传感器故障。先关闭电源，检查传感器连接，再重新启动设备。\n" * 3).encode()
@@ -73,49 +59,19 @@ def test_model_settings_real_browser_flow():
             page.get_by_label("查询内容", exact=True).fill("E03 温度传感器故障怎么处理")
             page.get_by_label("检索方式", exact=True).click()
             page.get_by_role("option", name="Embedding", exact=True).click()
+            page.get_by_label("重排方式", exact=True).click()
+            page.get_by_role("option", name="Cross Encoder", exact=True).click()
             page.get_by_role("button", name="运行检索", exact=True).click()
             expect(page.locator(".search-result").first).to_be_visible(timeout=180_000)
             expect(page.locator(".result-text").first).to_contain_text("E03")
             expect(page.locator(".scores").first).to_contain_text("召回")
             page.screenshot(path=str(output / "real-embedding-rerank.png"), full_page=True, animations="disabled")
-            navigate("模型配置")
-            embedding = page.get_by_role("region", name="Embedding 模型配置")
-            embedding.get_by_label("model", exact=True).fill("BAAI/bge-m3")
-            embedding.get_by_role("button", name="保存并应用", exact=True).click()
-            expect(embedding.get_by_text("已有知识文档", exact=False)).to_be_visible(timeout=180_000)
-            saved = context.request.get(url + "/v1/model-settings").json()
-            assert saved["models"]["embedding"]["model"] == "served-embedding"
-
-            # A missing list endpoint never prevents manual model entry.
-            reranker = page.get_by_role("region", name="Reranker 模型配置")
-            reranker.get_by_label("base_url", exact=True).fill(provider + "/missing")
-            reranker.get_by_role("button", name="获取模型列表", exact=True).click()
-            expect(reranker.get_by_text("HTTP 404", exact=False)).to_be_visible()
-            reranker.get_by_label("base_url", exact=True).fill(provider)
-            reranker.get_by_label("model", exact=True).fill("served-reranker")
-            reranker.get_by_role("button", name="保存并应用", exact=True).click()
-            expect(reranker.get_by_text("连接成功", exact=True)).to_be_visible(timeout=180_000)
-            reranker.get_by_label("apikey", exact=True).fill("ui-test-only-key")
-            reranker.get_by_role("button", name="保存并应用", exact=True).click()
-            expect(reranker.get_by_label("apikey", exact=True)).to_have_value("", timeout=180_000)
-            expect(reranker.get_by_label("apikey", exact=True)).to_have_attribute("placeholder", "已保存")
-            assert "ui-test-only-key" not in page.evaluate("JSON.stringify({...localStorage,...sessionStorage})")
-            with page.expect_request(lambda request: request.method == "PATCH" and request.url.endswith("/reranker")) as request:
-                reranker.get_by_role("button", name="保存并应用", exact=True).click()
-            assert "apikey" not in request.value.post_data_json
-            expect(reranker.get_by_role("button", name="保存并应用", exact=True)).to_be_enabled(timeout=180_000)
-            reranker.get_by_role("button", name="清除 Reranker 已保存的 apikey", exact=True).click()
-            reranker.get_by_role("button", name="保存并应用", exact=True).click()
-            expect(reranker.get_by_role("button", name="清除 Reranker 已保存的 apikey", exact=True)).to_have_count(0, timeout=180_000)
-
-            readonly_context = browser.new_context(extra_http_headers={"X-Forwarded-For": "192.0.2.1"})
-            readonly = readonly_context.new_page()
-            readonly.goto(url + "/console")
-            readonly.get_by_role("navigation").get_by_role("button", name="模型配置", exact=True).click()
-            expect(readonly.get_by_text("HTTP 403", exact=False)).to_be_visible()
-            for button in readonly.get_by_role("button", name="保存并应用", exact=True).all():
-                expect(button).to_be_disabled()
-            readonly_context.close()
+            navigate("知识库")
+            page.get_by_role("button", name="配置 " + namespace, exact=True).click()
+            editor = page.locator(".ant-drawer .knowledge-base-form")
+            expect(editor.get_by_label("Embedding URL", exact=True)).to_have_value(provider)
+            editor.get_by_role("button", name="保存配置", exact=True).click()
+            expect(page.locator(".ant-drawer")).to_have_count(0, timeout=180_000)
             assert not errors, errors
         finally:
             listing = context.request.get(url + "/v1/documents", headers={"X-RAG-Namespace": namespace})

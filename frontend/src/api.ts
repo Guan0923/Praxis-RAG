@@ -11,10 +11,17 @@ export type Chunking = {
   chunk_size: number;
   chunk_overlap: number;
 };
+export type ProviderSettings = { base_url: string; api_key_set: boolean };
 export type KnowledgeBase = Chunking & {
+  embedding: ProviderSettings;
+  reranker: ProviderSettings;
+  updated_at?: string;
+  reembedded_at?: string;
   namespace: string;
   vector_size: number;
   embedding_model: string;
+  reranker_model: string;
+  collection: string;
   tokenizer: string;
   created_at: string;
 };
@@ -39,11 +46,9 @@ export type AssetTable = {
 };
 export type SearchAsset = { mime_type?: string; data?: string; caption?: string;
   location?: WordLocation; page?: number } & ({ type: "image" } | ({ type: "table" } & AssetTable));
-export type ModelState = { name: string; configured: boolean; provider: "http" };
 export type Health = {
   backend?: string;
   collection?: string;
-  models?: { embedding: ModelState; reranker: ModelState };
 };
 export type Retrieval = "bm25" | "embedding" | "hybrid";
 export type Rerank = "none" | "cross_encoder";

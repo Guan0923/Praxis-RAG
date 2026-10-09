@@ -41,6 +41,7 @@ from .service_knowledge import (
 from .model_api import ModelAPIError
 from .startup_config import load_service_config
 from .api_keys import ApiKeyError, ApiKeyStore
+from .knowledge_bases import public_settings
 
 _NAMESPACE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _WEB_ROOT = Path(__file__).with_name("web")
@@ -65,13 +66,14 @@ _LOCAL_MCP_ORIGINS = (
 
 class ServiceRuntime(Protocol):
     def status(self) -> dict[str, object]: ...
-    def model_settings(self) -> dict[str, object]: ...
-    def model_action(self, kind: str, values: dict[str, object], action: str) -> dict[str, object]: ...
     def list_documents(self, namespace: str) -> list[dict[str, object]]: ...
     def upload(self, namespace: str, items: list[tuple[str, object]]) -> dict[str, object]: ...
     def check_documents(self, namespace: str, items: list[dict[str, str]]) -> dict[str, object]: ...
-    def knowledge_base_defaults(self) -> dict[str, object]: ...
-    def create_knowledge_base(self, namespace: str, chunking: ChunkingConfig, vector_size: int) -> dict: ...
+    def list_knowledge_bases(self) -> list[dict]: ...
+    def create_knowledge_base(self, namespace: str, chunking: ChunkingConfig, embedding_model: str, reranker_model: str = "", *, embedding: dict, reranker: dict | None = None) -> dict: ...
+    def knowledge_base_models(self, kind: str, values: dict, namespace: str | None = None) -> list[str]: ...
+    def knowledge_base_key(self, namespace: str, kind: str) -> str: ...
+    def update_knowledge_base(self, namespace: str, values: dict, *, reembed: bool = False) -> dict: ...
     def knowledge_base(self, namespace: str) -> dict: ...
     def delete(self, namespace: str, name: str) -> dict[str, object]: ...
     def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool) -> dict[str, object]: ...
@@ -143,10 +145,9 @@ class ApiKeyUpdateBody(ApiKeyBody):
     enabled: bool
 
 
-class ModelSettingsBody(BaseModel):
+class ProviderSettingsBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     base_url: str = Field(default="", max_length=2048)
-    model: str = Field(default="", max_length=512)
     apikey: SecretStr = SecretStr("")
 
     def values(self) -> dict[str, object]:
@@ -199,10 +200,33 @@ class CheckDocumentsBody(BaseModel):
     files: list[CheckFile] = Field(min_length=1, max_length=MAX_FILES_PER_BATCH)
 
 
+class ModelListBody(ProviderSettingsBody):
+    namespace: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+class UpdateKnowledgeBaseBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    embedding: ProviderSettingsBody | None = None
+    reranker: ProviderSettingsBody | None = None
+    embedding_model: str | None = Field(default=None, min_length=1, max_length=512)
+    reranker_model: str | None = Field(default=None, max_length=512)
+    reembed: bool = False
+
+    def values(self) -> dict:
+        result = self.model_dump(exclude_unset=True, exclude_none=True, exclude={"reembed"})
+        for kind in ("embedding", "reranker"):
+            if kind in result:
+                result[kind] = getattr(self, kind).values()
+        return result
+
+
 class CreateKnowledgeBaseBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     namespace: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-    vector_size: int = Field(strict=True, ge=1, le=65536)
+    embedding: ProviderSettingsBody
+    reranker: ProviderSettingsBody = Field(default_factory=ProviderSettingsBody)
+    embedding_model: str = Field(min_length=1, max_length=512)
+    reranker_model: str = Field(default="", max_length=512)
     strategy: str = "recursive"
     chunk_size: int | None = Field(default=None, strict=True)
     chunk_overlap: int | None = Field(default=None, strict=True)
@@ -283,8 +307,9 @@ def create_service_app(
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, error):
-        if request.url.path.startswith("/v1/model-settings"):
-            return JSONResponse({"detail": "模型设置参数无效"}, status_code=422)
+        if request.url.path.startswith("/v1/admin/knowledge-bases"):
+            return JSONResponse({"detail": [{key: item[key] for key in ("type", "loc", "msg")}
+                                            for item in error.errors()]}, status_code=422)
         return await request_validation_exception_handler(request, error)
 
     @app.exception_handler(ModelAPIError)
@@ -332,25 +357,6 @@ def create_service_app(
         if not key_store.delete(key_id):
             raise HTTPException(status_code=404, detail="API Key 不存在")
         return Response(status_code=204)
-
-    @app.get("/v1/model-settings")
-    def model_settings(request: Request, _auth=Depends(local_admin)):
-        return {"models": resolved_runtime.model_settings(), "writable": _local_model_request(request)}
-
-    @app.patch("/v1/model-settings/{kind}")
-    def save_model_settings(kind: Literal["embedding", "reranker"], body: ModelSettingsBody,
-                            _auth=Depends(local_admin)):
-        return resolved_runtime.model_action(kind, body.values(), "save")
-
-    @app.post("/v1/model-settings/{kind}/models")
-    def model_list(kind: Literal["embedding", "reranker"], body: ModelSettingsBody,
-                   _auth=Depends(local_admin)):
-        return resolved_runtime.model_action(kind, body.values(), "models")
-
-    @app.post("/v1/model-settings/{kind}/test")
-    def model_test(kind: Literal["embedding", "reranker"], body: ModelSettingsBody,
-                   _auth=Depends(local_admin)):
-        return resolved_runtime.model_action(kind, body.values(), "test")
 
     @app.exception_handler(KnowledgeError)
     async def knowledge_error(_request, error):
@@ -436,22 +442,61 @@ def create_service_app(
             "max_file_bytes": MAX_FILE_BYTES,
         }
 
+    @app.get("/v1/admin/knowledge-bases", dependencies=[Depends(local_admin)])
+    def list_knowledge_bases():
+        return JSONResponse({"knowledge_bases": resolved_runtime.list_knowledge_bases()},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/v1/admin/knowledge-bases/models/{kind}", dependencies=[Depends(local_admin)])
+    def knowledge_base_models(kind: Literal["embedding", "reranker"], body: ModelListBody):
+        return JSONResponse({"models": resolved_runtime.knowledge_base_models(kind, body.values(), body.namespace)},
+                            headers={"Cache-Control": "no-store"})
+
     @app.get("/v1/admin/knowledge-bases/defaults", dependencies=[Depends(local_admin)])
     def knowledge_base_defaults():
-        return {**resolved_runtime.knowledge_base_defaults(), **strategy_catalog()}
+        return strategy_catalog()
 
     @app.post("/v1/admin/knowledge-bases", dependencies=[Depends(local_admin)], status_code=201)
     def create_knowledge_base(body: CreateKnowledgeBaseBody):
         configuration = _chunking_config(body.strategy, body.chunk_size, body.chunk_overlap)
         try:
-            return resolved_runtime.create_knowledge_base(body.namespace, configuration, body.vector_size)
+            return JSONResponse(resolved_runtime.create_knowledge_base(
+                body.namespace, configuration, body.embedding_model, body.reranker_model,
+                embedding=body.embedding.values(), reranker=body.reranker.values()),
+                status_code=201, headers={"Cache-Control": "no-store"})
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/admin/knowledge-bases/{namespace}", dependencies=[Depends(local_admin)])
+    def knowledge_base_details(namespace: str):
+        try:
+            return JSONResponse(public_settings(resolved_runtime.knowledge_base(namespace)),
+                                headers={"Cache-Control": "no-store"})
+        except KnowledgeValidationError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/v1/admin/knowledge-bases/{namespace}/key/{kind}", dependencies=[Depends(local_admin)])
+    def knowledge_base_key(namespace: str, kind: Literal["embedding", "reranker"]):
+        return JSONResponse({"apikey": resolved_runtime.knowledge_base_key(namespace, kind)},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.patch("/v1/admin/knowledge-bases/{namespace}", dependencies=[Depends(local_admin)])
+    async def update_knowledge_base(namespace: str, body: UpdateKnowledgeBaseBody):
+        try:
+            async with mcp_endpoint.mutation_lock(namespace):
+                with anyio.CancelScope(shield=True):
+                    result = await anyio.to_thread.run_sync(
+                        lambda: resolved_runtime.update_knowledge_base(namespace, body.values(), reembed=body.reembed))
+            return JSONResponse(result, headers={"Cache-Control": "no-store"})
+        except KnowledgeValidationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RagOperationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.get("/v1/knowledge-base")
     def knowledge_base(namespace: str = Depends(tenant)):
         try:
-            return {**resolved_runtime.knowledge_base(namespace), "strategies": strategy_catalog()["strategies"]}
+            return {**public_settings(resolved_runtime.knowledge_base(namespace)), "strategies": strategy_catalog()["strategies"]}
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

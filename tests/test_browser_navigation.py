@@ -35,7 +35,7 @@ class NavigationRuntime(ProtocolRuntime):
 def navigation_browser(tmp_path):
     runtime = NavigationRuntime(tmp_path / "service")
     for namespace in ("alpha", "beta"):
-        runtime.create_knowledge_base(namespace, ChunkingConfig("character", 700, 100), runtime.config.vector_size)
+        runtime.create_knowledge_base(namespace, ChunkingConfig("character", 700, 100), runtime.config.embedding_model)
         result = runtime.upload(namespace, [(DOCUMENT, io.BytesIO(f"{namespace} 的文档内容".encode()))])
         assert len(result["imported"]) == 1, result
     with running_service(runtime.data_root, runtime=runtime) as (url, _app, _runtime):

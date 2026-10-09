@@ -16,19 +16,19 @@ from test_mcp_http import ProtocolRuntime
 def test_dedup_configuration_rename_and_namespace(tmp_path):
     runtime = ProtocolRuntime(tmp_path)
     config = ChunkingConfig()
-    runtime.create_knowledge_base("alpha", config, 1024)
-    runtime.create_knowledge_base("beta", config, 1024)
+    runtime.create_knowledge_base("alpha", config, runtime.config.embedding_model)
+    runtime.create_knowledge_base("beta", config, runtime.config.embedding_model)
     first = runtime.upload("alpha", [("first.txt", io.BytesIO(b"unique content"))])
     renamed = runtime.upload("alpha", [("renamed.txt", io.BytesIO(b"unique content"))])
     assert len(first["imported"]) == 1 and len(renamed["skipped"]) == 1
     assert renamed["skipped"][0]["name"] == "first.txt"
     assert not (tmp_path / "alpha/knowledge/renamed.txt").exists()
-    runtime.create_knowledge_base("smaller", ChunkingConfig("recursive", 256, 32), 1024)
+    runtime.create_knowledge_base("smaller", ChunkingConfig("recursive", 256, 32), runtime.config.embedding_model)
     changed = runtime.upload("smaller", [("first.txt", io.BytesIO(b"unique content"))])
     assert changed["imported"][0]["chunking"]["chunk_size"] == 256
     other = runtime.upload("beta", [("first.txt", io.BytesIO(b"unique content"))])
     assert len(other["imported"]) == 1
-    runtime.create_knowledge_base("sentence", ChunkingConfig("sentence"), 1024)
+    runtime.create_knowledge_base("sentence", ChunkingConfig("sentence"), runtime.config.embedding_model)
     changed_strategy = runtime.upload("sentence", [("first.txt", io.BytesIO(b"unique content"))])
     assert len(changed_strategy["imported"]) == 1
 
@@ -36,8 +36,8 @@ def test_dedup_configuration_rename_and_namespace(tmp_path):
 def test_batch_and_concurrent_duplicates(tmp_path):
     runtime = ProtocolRuntime(tmp_path)
     config = ChunkingConfig()
-    runtime.create_knowledge_base("batch", config, 1024)
-    runtime.create_knowledge_base("parallel", config, 1024)
+    runtime.create_knowledge_base("batch", config, runtime.config.embedding_model)
+    runtime.create_knowledge_base("parallel", config, runtime.config.embedding_model)
     batch = runtime.upload("batch", [("a.txt", io.BytesIO(b"same")), ("b.txt", io.BytesIO(b"same"))])
     assert (len(batch["imported"]), len(batch["skipped"])) == (1, 1)
     def upload(index):
@@ -50,7 +50,7 @@ def test_batch_and_concurrent_duplicates(tmp_path):
 
 def test_legacy_records_and_missing_sources(tmp_path):
     runtime = ProtocolRuntime(tmp_path)
-    runtime.create_knowledge_base("legacy", LEGACY_CONFIG, 1024)
+    runtime.create_knowledge_base("legacy", LEGACY_CONFIG, runtime.config.embedding_model)
     runtime.upload("legacy", [("old.txt", io.BytesIO(b"old"))])
     store = runtime._tenant("legacy").documents
     manifest = store._read_manifest()
@@ -64,20 +64,20 @@ def test_legacy_records_and_missing_sources(tmp_path):
     assert store.find_duplicate(fingerprint, LEGACY_CONFIG.metadata("BAAI/bge-m3")) is None
 
 
-def test_changed_embedding_model_is_rejected_before_indexing(tmp_path):
+def test_knowledge_base_keeps_model_when_global_default_changes(tmp_path):
     from dataclasses import replace
     runtime = ProtocolRuntime(tmp_path)
-    runtime.create_knowledge_base("models", LEGACY_CONFIG, 1024)
+    runtime.create_knowledge_base("models", LEGACY_CONFIG, runtime.config.embedding_model)
     runtime.upload("models", [("same.txt", io.BytesIO(b"same model test"))])
     runtime.config = replace(runtime.config, embedding_model="other-model")
-    with pytest.raises(KnowledgeValidationError, match="创建配置不一致"):
-        runtime.upload("models", [("same.txt", io.BytesIO(b"same model test"))])
+    result = runtime.upload("models", [("same.txt", io.BytesIO(b"same model test"))])
+    assert result["skipped"][0]["chunking"]["embedding_model"] != "other-model"
 
 
 def test_preflight_api_auth_limits_and_server_hash(tmp_path):
     runtime = ProtocolRuntime(tmp_path)
-    runtime.create_knowledge_base("alpha", ChunkingConfig(), 1024)
-    runtime.create_knowledge_base("beta", ChunkingConfig(), 1024)
+    runtime.create_knowledge_base("alpha", ChunkingConfig(), runtime.config.embedding_model)
+    runtime.create_knowledge_base("beta", ChunkingConfig(), runtime.config.embedding_model)
     client = TestClient(create_service_app(runtime, settings=RagHttpSettings(data_root=tmp_path, token="secret")))
     headers = {"Authorization": "Bearer secret", "X-RAG-Namespace": "alpha"}
     fingerprint = hashlib.sha256(b"actual bytes").hexdigest()

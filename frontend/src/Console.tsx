@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert, App, Badge, Button, Dropdown, Form, Input, Modal, Tooltip,
+  Alert, App, Badge, Button, Dropdown, Tooltip,
 } from "antd";
 import {
   ApiOutlined,
@@ -25,34 +25,18 @@ import {
 import { SearchPage } from "./SearchPage";
 import { DocumentsPage } from "./DocumentsPage";
 import { DocumentPreview } from "./DocumentPreview";
-import { ModelSettings } from "./ModelSettings";
+import { KnowledgeBasesPage } from "./KnowledgeBasesPage";
 import { ApiKeysPage } from "./ApiKeysPage";
 import { CreateKnowledgeBase } from "./CreateKnowledgeBase";
-import { namespacePattern, useConsoleRoute } from "./navigation";
+import { useConsoleRoute } from "./navigation";
 
 const pages = [
   { key: "search", label: "检索调试", icon: <SearchOutlined /> },
   { key: "documents", label: "知识文档", icon: <DatabaseOutlined /> },
   { key: "api-keys", label: "API Key", icon: <KeyOutlined /> },
-  { key: "models", label: "模型配置", icon: <SettingOutlined /> },
+  { key: "knowledge-bases", label: "知识库", icon: <SettingOutlined /> },
   { key: "create", label: "创建知识库", icon: <ApiOutlined /> },
 ] as const;
-
-function recentWorkspaces(): string[] {
-  try {
-    const saved: unknown = JSON.parse(
-      readStorage(localStorage, "rag.workspaces", "[]"),
-    );
-    return Array.isArray(saved)
-      ? saved.filter(
-          (name): name is string =>
-            typeof name === "string" && namespacePattern.test(name),
-        )
-      : [];
-  } catch {
-    return [];
-  }
-}
 
 export function Console({
   dark,
@@ -75,20 +59,44 @@ export function Console({
   const [healthError, setHealthError] = useState("");
   const [checking, setChecking] = useState(false);
   const healthRequest = useRef<AbortController | null>(null);
-  const [workspaceForm] = Form.useForm<{ namespace: string }>();
-  const [workspaceOpen, setWorkspaceOpen] = useState(false);
-  const [recent, setRecent] = useState(recentWorkspaces);
-  const workspaceNames = [...new Set([connection.namespace, "default", ...recent])];
+  const [workspaceNames, setWorkspaceNames] = useState<string[]>([]);
+  const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState(false);
+  const workspaceRequest = useRef<AbortController | null>(null);
+
+  async function loadWorkspaces() {
+    workspaceRequest.current?.abort();
+    const controller = new AbortController();
+    workspaceRequest.current = controller;
+    setLoadingWorkspaces(true);
+    setWorkspaceError(false);
+    setWorkspaceNames([]);
+    try {
+      const data = await api<{ knowledge_bases: { namespace: string }[] }>(
+        "/v1/admin/knowledge-bases", undefined, { signal: controller.signal, cache: "no-store" },
+      );
+      if (!controller.signal.aborted) setWorkspaceNames(data.knowledge_bases.map((item) => item.namespace));
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setWorkspaceError(true);
+        void message.error(errorText(error));
+      }
+    } finally {
+      if (!controller.signal.aborted) setLoadingWorkspaces(false);
+    }
+  }
 
   useEffect(() => {
-    const nextRecent = [...new Set([namespace, ...recentWorkspaces()])].slice(0, 20);
+    if (view === "api-keys") void loadWorkspaces();
+    return () => workspaceRequest.current?.abort();
+  }, [view]);
+
+  useEffect(() => {
     try {
       localStorage.setItem("rag.namespace", namespace);
-      localStorage.setItem("rag.workspaces", JSON.stringify(nextRecent));
     } catch {
       void message.error("浏览器无法保存工作区，请检查存储权限");
     }
-    setRecent(nextRecent);
   }, [namespace, message]);
 
   async function refreshHealth() {
@@ -137,11 +145,8 @@ export function Console({
     return true;
   }
   function switchWorkspace(namespace: string) {
-    if (saveConnection({ ...connection, namespace }, "工作区已切换")) {
-      setWorkspaceOpen(false);
-    }
+    saveConnection({ ...connection, namespace }, "知识库已切换");
   }
-  const title = pages.find((page) => page.key === view)!.label;
   const themeLabel = dark ? "切换浅色主题" : "切换深色主题";
 
   return (
@@ -179,62 +184,33 @@ export function Console({
       </aside>
       <main className="workspace">
         <header className="topbar">
-          <nav className="breadcrumb" aria-label="当前位置">
-            {view === "api-keys" || view === "models" || view === "create" ? <><span>全局设置</span><span>/</span></> : <>
-            <span>工作区</span>
-            <span>/</span>
+          {(view === "search" || view === "documents") && (
             <Dropdown
               trigger={["click"]}
+              onOpenChange={(open) => { if (open) void loadWorkspaces(); }}
               disabled={uploading}
               menu={{
                 selectable: true,
                 selectedKeys: [connection.namespace],
-                items: [
-                  ...workspaceNames.map((name) => ({
-                    key: name,
-                    label: <span className="workspace-option">{name}</span>,
-                  })),
-                  { type: "divider" },
-                  { key: ":other", label: "其他知识库…" },
-                ],
+                items: loadingWorkspaces || workspaceError || workspaceNames.length === 0 ? [{
+                  key: ":status",
+                  label: loadingWorkspaces ? "加载中…" : workspaceError ? "知识库列表加载失败" : "暂无知识库",
+                  disabled: true,
+                }] : workspaceNames.map((name) => ({
+                  key: name,
+                  label: <span className="workspace-option">{name}</span>,
+                })),
                 onClick: ({ key }) => {
-                  if (key === ":other") {
-                    workspaceForm.resetFields();
-                    setWorkspaceOpen(true);
-                  } else if (key !== connection.namespace) {
-                    switchWorkspace(key);
-                  }
+                  if (key !== connection.namespace) switchWorkspace(key);
                 },
               }}
             >
-              <Button
-                type="text"
-                className="workspace-switch"
-                aria-label="选择知识库"
-                disabled={uploading}
-              >
+              <Button className="workspace-switch" aria-label="选择知识库" disabled={uploading}>
                 <span className="workspace-name">{connection.namespace}</span>
                 <DownOutlined />
               </Button>
             </Dropdown>
-            <span>/</span>
-            </>}
-            {view === "documents" && documentName !== undefined ? (
-              <>
-                <button
-                  type="button"
-                  className="breadcrumb-link"
-                  onClick={() => navigate({ namespace, page: "documents" })}
-                >
-                  知识文档
-                </button>
-                <span>/</span>
-                <span className="break-text" aria-current="page">{documentName}</span>
-              </>
-            ) : (
-              <span aria-current="page">{title}</span>
-            )}
-          </nav>
+          )}
           <div className="toolbar">
             <Tooltip title="刷新服务状态">
               <Button
@@ -299,22 +275,14 @@ export function Console({
             )}
           </div>
           {view === "api-keys" && <ApiKeysPage namespaces={workspaceNames} />}
-          {view === "models" && <section aria-label="模型配置页面">
-            <div className="page-heading"><h1>模型配置</h1></div>
-            <ModelSettings
-              connection={{ namespace: "default", token: "" }}
-              disabled={uploading}
-              onApplied={() => {
-                setRevision((value) => value + 1);
-                void refreshHealth();
-              }}
-            />
-          </section>}
+          {view === "knowledge-bases" && <KnowledgeBasesPage disabled={uploading}
+            onCreate={() => navigate({ namespace, page: "create" })}
+            onChanged={() => { setRevision((value) => value + 1); void refreshHealth(); }} />}
           <section hidden={view !== "create"} aria-label="创建知识库页面">
             <div className="page-heading">
               <h1>创建知识库</h1>
             </div>
-            <CreateKnowledgeBase disabled={uploading} onCreated={(namespace) => {
+            <CreateKnowledgeBase active={view === "create"} disabled={uploading} onCreated={(namespace) => {
               if (saveConnection({ ...connection, namespace }, "已切换到新知识库")) {
                 navigate({ namespace, page: "documents" });
               }
@@ -322,39 +290,6 @@ export function Console({
           </section>
         </div>
       </main>
-      <Modal
-        title="选择知识库"
-        forceRender
-        open={workspaceOpen}
-        onCancel={() => setWorkspaceOpen(false)}
-        onOk={() => workspaceForm.submit()}
-        okText="切换"
-        cancelText="取消"
-        okButtonProps={{ disabled: uploading }}
-      >
-        <Form
-          name="workspace-switch"
-          form={workspaceForm}
-          layout="vertical"
-          onFinish={({ namespace }) => switchWorkspace(namespace.trim())}
-          disabled={uploading}
-        >
-          <Form.Item
-            name="namespace"
-            label="知识库名称"
-            rules={[
-              { required: true, whitespace: true, message: "请输入知识库名称" },
-              {
-                pattern: namespacePattern,
-                transform: (value) => value?.trim(),
-                message: "使用 1–64 个字母、数字、点、下划线或横线，首位为字母或数字",
-              },
-            ]}
-          >
-            <Input maxLength={64} autoComplete="off" />
-          </Form.Item>
-        </Form>
-      </Modal>
     </div>
   );
 }

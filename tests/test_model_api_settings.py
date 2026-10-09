@@ -21,7 +21,7 @@ from rag_mcp.service_knowledge import RagServiceRuntime
 
 @pytest.fixture()
 def provider():
-    state = {"requests": [], "key": "", "size": 3, "error": None, "delay": 0}
+    state = {"requests": [], "key": "", "size": 3, "sizes": {}, "error": None, "delay": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -44,7 +44,7 @@ def provider():
             elif self.path == "/custom/v1/models":
                 result = {"data": [{"id": "embed-a"}, {"id": "rank-a"}]}
             elif self.path == "/custom/v1/embeddings":
-                result = {"data": [{"index": i, "embedding": [float(i + 1)] * state["size"]}
+                result = {"data": [{"index": i, "embedding": [float(i + 1)] * state["sizes"].get(body["model"], state["size"])}
                                    for i in reversed(range(len(body["input"])))]}
             elif self.path == "/custom/v1/rerank":
                 result = {"results": [{"index": i, "relevance_score": 1 / (i + 1)}
@@ -82,187 +82,143 @@ def local_client(runtime, **kwargs):
                       base_url="http://127.0.0.1", client=("127.0.0.1", 12345), **kwargs)
 
 
-def save(runtime, url, kind="embedding", **fields):
-    return runtime.model_action(kind, {"base_url": url, "model": "embed-a" if kind == "embedding" else "rank-a", **fields}, "save")
+def create(runtime, url, namespace="alpha", model="embed-a", key=""):
+    return runtime.create_knowledge_base(namespace, ChunkingConfig("character", 120, 20), model,
+                                         embedding={"base_url": url, "apikey": key})
 
 
-def test_empty_key_prefix_and_response_order(provider):
+def test_connection_models_and_per_base_secret_storage(runtime, provider):
     url, state = provider
-    connection = ModelConnection(url, "embed-a")
-    assert ModelHTTPClient(connection).models() == ["embed-a", "rank-a"]
-    assert HTTPEmbedder(connection).embed_documents(["one", "two"]) == [[1.0] * 3, [2.0] * 3]
-    assert HTTPReranker(connection).scores("query", ["one", "two"]) == [(0, 1.0), (1, 0.5)]
-    assert all("Authorization" not in headers for _, headers, _ in state["requests"])
-
-
-@pytest.mark.parametrize("failure", [(404, {}), (200, []), (200, {"data": [{"index": 0, "embedding": []}]}),
-                                    (200, {"data": [{"index": True, "embedding": [1]}]}),
-                                    (200, {"data": [{"index": 0, "embedding": [float("nan")]}]})])
-def test_failed_save_keeps_live_and_saved_settings(runtime, provider, failure):
-    url, state = provider
-    save(runtime, url)
-    before = runtime._settings_store.path.read_bytes()
-    original = runtime._embedder
-    state["error"] = failure
-    with pytest.raises(ModelAPIError):
-        save(runtime, url, model="bad")
-    assert runtime._embedder is original
-    assert runtime._settings_store.path.read_bytes() == before
-
-
-def test_auth_key_preservation_clear_and_protected_restart(runtime, provider):
-    url, state = provider
-    state["key"] = "test-only-api-secret"
     with local_client(runtime) as client:
-        body = {"base_url": url, "model": "embed-a", "apikey": state["key"]}
-        response = client.patch("/v1/model-settings/embedding", json=body)
-        assert response.status_code == 200, response.text
-        assert response.json()["api_key_set"]
-        assert state["key"] not in response.text
-        assert state["key"] not in runtime._settings_store.path.read_text()
-        reread, _ = runtime._settings_store.load({}, "unused")
-        assert reread["embedding"].api_key == state["key"]
-        body.pop("apikey")
-        assert client.patch("/v1/model-settings/embedding", json=body).status_code == 200
-        response = client.post("/v1/model-settings/embedding/test", json={**body, "apikey": "wrong"})
-        assert response.status_code == 400 and "401" in response.text
-        assert runtime._connections["embedding"].api_key == state["key"]
-        state["key"] = ""
-        response = client.patch("/v1/model-settings/embedding", json={**body, "apikey": ""})
-        assert response.status_code == 200 and not response.json()["api_key_set"]
+        response = client.post("/v1/admin/knowledge-bases/models/embedding", json={"base_url": url, "apikey": "private-test-key"})
+        assert response.json() == {"models": ["embed-a", "rank-a"]}
+        assert state["requests"][-1][1]["Authorization"] == "Bearer private-test-key"
+        created = client.post("/v1/admin/knowledge-bases", json={"namespace": "alpha", "embedding_model": "embed-a",
+                              "embedding": {"base_url": url, "apikey": "private-test-key"}, "strategy": "character",
+                              "chunk_size": 120, "chunk_overlap": 20})
+        assert created.status_code == 201, created.text
+        assert created.json()["embedding"] == {"base_url": url, "api_key_set": True}
+        for path in ("/v1/admin/knowledge-bases", "/v1/admin/knowledge-bases/alpha", "/v1/knowledge-base"):
+            result = client.get(path, headers={"X-RAG-Namespace": "alpha"})
+            assert "private-test-key" not in result.text and "protected_key" not in result.text
+        revealed = client.get("/v1/admin/knowledge-bases/alpha/key/embedding")
+        assert revealed.json() == {"apikey": "private-test-key"}
+        assert revealed.headers["cache-control"] == "no-store"
+        client.post("/v1/admin/knowledge-bases/models/embedding", json={"namespace": "alpha", "base_url": url})
+        assert state["requests"][-1][1]["Authorization"] == "Bearer private-test-key"
+        client.post("/v1/admin/knowledge-bases/models/embedding", json={"namespace": "alpha", "base_url": url.replace("127.0.0.1", "localhost")})
         assert "Authorization" not in state["requests"][-1][1]
+        assert client.get("/v1/model-settings").status_code == 404
 
 
-def test_address_change_does_not_forward_saved_key(runtime, provider):
+def test_model_change_is_blocked_without_reembedding(runtime, provider):
     url, state = provider
-    save(runtime, url, apikey="test-secret")
-    alias = url.replace("127.0.0.1", "localhost")
-    runtime.model_action("embedding", {"base_url": alias}, "test")
-    assert "Authorization" not in state["requests"][-1][1]
+    initial = create(runtime, url)
+    with local_client(runtime) as client:
+        state["requests"].clear()
+        response = client.patch("/v1/admin/knowledge-bases/alpha", json={"embedding_model": "embed-b"})
+        assert response.status_code == 409 and "re embedding" in response.text
+        assert not state["requests"]
+        assert client.get("/v1/admin/knowledge-bases/alpha").json() == initial
 
 
-def test_new_process_restores_settings_and_decrypts_key(runtime, provider):
+def test_reembedding_publishes_complete_index_and_survives_restart(runtime, provider):
+    from uuid import uuid4
+    from qdrant_client import models
+    from rag_mcp.knowledge_bases import model_connection
+
     url, state = provider
-    state["key"] = "process-test-only-key"
-    save(runtime, url, apikey=state["key"])
-    root, qdrant = str(runtime.data_root), str(runtime.config.qdrant_path)
+    state["sizes"] = {"embed-a": 3, "embed-b": 5}
+    alpha = create(runtime, url, key="alpha-key")
+    beta = create(runtime, url, "beta", key="beta-key")
+    for namespace in ("alpha", "beta"):
+        result = runtime.upload(namespace, [("same.txt", io.BytesIO((namespace + " document. ").encode() * 30))])
+        assert len(result["imported"]) == 1, result
+    document = runtime.list_documents("alpha")[0]
+    asset = {"namespace": "alpha", "document_id": document["document_id"], "record_type": "asset", "asset_id": "test-image", "caption": "preserved asset"}
+    runtime._client.upsert(collection_name=alpha["collection"], points=[models.PointStruct(id=str(uuid4()), vector={}, payload=asset)])
+    old_points, _ = runtime._client.scroll(collection_name=alpha["collection"], limit=100, with_vectors=True)
+    old_manifest = (runtime.data_root / "alpha/manifest.json").read_bytes()
+    with local_client(runtime) as client:
+        response = client.patch("/v1/admin/knowledge-bases/alpha", json={"embedding_model": "embed-b", "reembed": True})
+        assert response.status_code == 200, response.text
+        updated = response.json()
+        assert updated["vector_size"] == 5 and updated["collection"] != alpha["collection"]
+        new_points, _ = runtime._client.scroll(collection_name=updated["collection"], limit=100, with_vectors=True)
+        assert {point.id for point in new_points} == {point.id for point in old_points}
+        assert any(point.payload == asset for point in new_points)
+        assert all(len(point.vector["dense"]) == 5 for point in new_points if point.payload["record_type"] == "chunk")
+        assert runtime._client.scroll(collection_name=alpha["collection"], limit=100, with_vectors=True)[0] == old_points
+        assert (runtime.data_root / "alpha/manifest.json").read_bytes() == old_manifest
+        assert runtime.knowledge_base("beta")["collection"] == beta["collection"]
+        assert model_connection(runtime.knowledge_base("beta"), "embedding").api_key == "beta-key"
+        record = runtime.list_documents("alpha")[0]
+        assert record["collection"] == updated["collection"] and record["chunking"]["embedding_model"] == "embed-b"
+        assert runtime.search("alpha", {"query": "document", "retrieval": "embedding", "rerank": "none"})["results"]
+        assert state["requests"][-1][2]["model"] == "embed-b"
+        assert state["requests"][-1][1]["Authorization"] == "Bearer alpha-key"
+    config, root = runtime.config, runtime.data_root
     runtime._client.close()
-    script = """
-import json, sys
-from pathlib import Path
-from rag_mcp.config import RagConfig
-from rag_mcp.service_knowledge import RagServiceRuntime
-runtime = RagServiceRuntime(RagConfig(backend='qdrant', qdrant_path=Path(sys.argv[2])), Path(sys.argv[1]))
-try:
-    runtime.model_action('embedding', {}, 'test')
-    print(json.dumps(runtime.model_settings()))
-finally:
-    runtime._client.close()
-"""
-    result = subprocess.run([sys.executable, "-c", script, root, qdrant],
-                            capture_output=True, text=True, check=True, timeout=30)
-    restored = json.loads(result.stdout)["embedding"]
-    assert restored["model"] == "embed-a" and restored["vector_size"] == 3
-    assert restored["api_key_set"] and restored["status"] == "ok"
-    assert state["key"] not in result.stdout + result.stderr
+    restarted = RagServiceRuntime(config, root)
+    try:
+        assert restarted.list_documents("alpha")[0]["collection"] == updated["collection"]
+        assert restarted.search("alpha", {"query": "document", "retrieval": "embedding", "rerank": "none"})["results"]
+    finally:
+        restarted._client.close()
 
 
-def test_storage_failure_does_not_replace_runtime(runtime, provider, monkeypatch):
-    url, _ = provider
-    save(runtime, url)
-    before = runtime._connections
-    def fail(*_args):
-        raise ModelAPIError("save failed")
-    monkeypatch.setattr(runtime._settings_store, "save", fail)
-    with pytest.raises(ModelAPIError, match="save failed"):
-        save(runtime, url, kind="reranker")
-    assert runtime._connections is before
+@pytest.mark.parametrize("failure", ["upsert", "publish"])
+def test_failed_reembedding_preserves_old_configuration_and_index(runtime, provider, monkeypatch, failure):
+    from rag_mcp.knowledge_bases import KnowledgeBaseStore
 
-
-def test_nonempty_cold_workspace_and_vector_length_guard(runtime, provider):
     url, state = provider
-    save(runtime, url)
-    runtime.create_knowledge_base("cold", ChunkingConfig("character", 100, 0), 3)
-    result = runtime.upload("cold", [("one.txt", io.BytesIO(b"First document for model API storage checks."))])
-    assert result["imported"], result
-    runtime._tenants.clear()
-    with pytest.raises(ModelAPIError, match="已有知识库"):
-        save(runtime, url, model="embed-b")
-    state["size"] = 4
-    with pytest.raises(ModelAPIError, match="已有知识库"):
-        save(runtime, url)
-    state["size"] = 3
-    save(runtime, url, kind="reranker")
-    assert runtime.search("cold", {"query": "document", "retrieval": "embedding", "rerank": "cross_encoder"})["results"]
-    runtime.delete("cold", "one.txt")
-    old_collection = runtime.config.collection
-    state["size"] = 5
-    with pytest.raises(ModelAPIError, match="已有知识库"):
-        save(runtime, url, model="embed-b")
-    assert runtime.config.vector_size == 3 and runtime.config.collection == old_collection
-    assert runtime._client.collection_exists(old_collection)
+    original = create(runtime, url)
+    runtime.upload("alpha", [("one.txt", io.BytesIO(b"Original document. " * 30))])
+    collections = {item.name for item in runtime._client.get_collections().collections}
+    settings = runtime.knowledge_base("alpha")
+    manifest = (runtime.data_root / "alpha/manifest.json").read_bytes()
+    if failure == "upsert":
+        upsert = runtime._client.upsert
+        def fail_after_write(*args, **kwargs):
+            upsert(*args, **kwargs)
+            raise ModelAPIError("controlled partial reembedding failure")
+        monkeypatch.setattr(runtime._client, "upsert", fail_after_write)
+    else:
+        def fail_publish(*_args):
+            raise ModelAPIError("controlled configuration commit failure")
+        monkeypatch.setattr(KnowledgeBaseStore, "update", fail_publish)
+    with local_client(runtime) as client:
+        response = client.patch("/v1/admin/knowledge-bases/alpha", json={"embedding_model": "embed-b", "reembed": True})
+        assert response.status_code == 400, response.text
+    assert runtime.knowledge_base("alpha") == settings
+    assert runtime.list_documents("alpha")[0]["collection"] == original["collection"]
+    assert (runtime.data_root / "alpha/manifest.json").read_bytes() == manifest
+    assert {item.name for item in runtime._client.get_collections().collections} == collections
+    assert runtime.search("alpha", {"query": "document", "retrieval": "embedding", "rerank": "none"})["results"]
 
 
-def test_existing_points_block_model_change_even_without_manifest(runtime, provider):
-    url, _ = provider
-    save(runtime, url)
-    runtime.create_knowledge_base("orphan", ChunkingConfig("character", 100, 0), 3)
-    runtime.upload("orphan", [("one.txt", io.BytesIO(b"Stored points must not be ignored."))])
-    (runtime.data_root / "orphan" / "manifest.json").unlink()
-    with pytest.raises(ModelAPIError, match="已有知识库"):
-        save(runtime, url, model="different")
-
-
-def test_configuration_waits_for_current_operation_and_refreshes_tenants(runtime, provider):
-    url, _ = provider
-    save(runtime, url)
-    old = runtime._tenant("first")
-    runtime._tenant("second")
-    with ThreadPoolExecutor() as executor:
-        with runtime._inference_lock:
-            task = executor.submit(save, runtime, url, "reranker")
-            time.sleep(0.05)
-            assert not task.done()
-        task.result(timeout=5)
-    assert runtime._tenant("first") is not old
-    assert runtime._tenant("second").orchestrator._rerankers["cross_encoder"] is runtime._reranker
+def test_key_and_reranker_edits_do_not_reembed(runtime, provider):
+    url, state = provider
+    original = create(runtime, url)
+    with local_client(runtime) as client:
+        response = client.patch("/v1/admin/knowledge-bases/alpha", json={"embedding": {"apikey": "new-key"},
+                                "reranker_model": "rank-a", "reranker": {"base_url": url}})
+        assert response.status_code == 200, response.text
+        assert response.json()["collection"] == original["collection"]
+        assert response.json()["reranker_model"] == "rank-a"
+        assert client.get("/v1/admin/knowledge-bases/alpha/key/embedding").json()["apikey"] == "new-key"
+        assert client.patch("/v1/admin/knowledge-bases/alpha", json={"embedding": {"apikey": ""}}).status_code == 200
+        assert client.get("/v1/admin/knowledge-bases/alpha/key/embedding").json()["apikey"] == ""
 
 
 @pytest.mark.parametrize("headers", [{"Origin": "https://evil.example"}, {"Host": "remote.example"},
                                     {"X-Forwarded-For": "127.0.0.1"}, {"Sec-Fetch-Site": "cross-site"}])
-def test_remote_and_forwarded_settings_actions_are_rejected(runtime, provider, headers):
-    url, state = provider
+def test_management_requires_direct_local_access(runtime, provider, headers):
+    create(runtime, provider[0])
     with local_client(runtime) as client:
-        for suffix, method in [("", "PATCH"), ("/models", "POST"), ("/test", "POST")]:
-            response = client.request(method, "/v1/model-settings/embedding" + suffix,
-                                      headers=headers, json={"base_url": url, "model": "embed-a"})
-            assert response.status_code == 403
-        assert client.get("/v1/model-settings", headers=headers).status_code == 403
-    assert not state["requests"]
-
-
-def test_remote_peer_and_service_auth_and_validation_redaction(runtime):
-    app = create_service_app(runtime, settings=RagHttpSettings(data_root=runtime.data_root, token="service-key"))
-    with TestClient(app, base_url="http://127.0.0.1", client=("192.0.2.10", 12)) as client:
-        assert client.get("/v1/model-settings").status_code == 403
-        headers = {"Authorization": "Bearer service-key"}
-        assert client.get("/v1/model-settings", headers=headers).status_code == 403
-        assert client.post("/v1/model-settings/embedding/models", headers=headers, json={}).status_code == 403
-    with local_client(runtime) as client:
-        response = client.patch("/v1/model-settings/embedding", json={"apikey": "never-echo-this", "model": []})
+        assert client.get("/v1/admin/knowledge-bases/alpha", headers=headers).status_code == 403
+        assert client.get("/v1/admin/knowledge-bases/alpha/key/embedding", headers=headers).status_code == 403
+        assert client.patch("/v1/admin/knowledge-bases/alpha", headers=headers, json={}).status_code == 403
+        assert client.post("/v1/admin/knowledge-bases/models/embedding", headers=headers, json={}).status_code == 403
+        response = client.patch("/v1/admin/knowledge-bases/alpha", json={"embedding_model": [], "embedding": {"apikey": "never-echo-this"}})
         assert response.status_code == 422 and "never-echo-this" not in response.text
-
-
-def test_timeout_and_no_automatic_retry(provider):
-    url, state = provider
-    state["delay"] = 0.2
-    with pytest.raises(ModelAPIError, match="超时"):
-        HTTPEmbedder(ModelConnection(url, "test"), timeout=0.03).embed_query("test")
-    assert len(state["requests"]) == 1
-
-
-def test_missing_config_and_offline_are_explicit(runtime):
-    with pytest.raises(ModelAPIError, match="尚未配置"):
-        runtime._embedder.embed_query("test")
-    with pytest.raises(ModelAPIError, match="无法连接"):
-        HTTPEmbedder(ModelConnection("http://127.0.0.1:1", "test")).embed_query("test")

@@ -278,7 +278,7 @@ def test_previous_word_parser_is_not_deduplicated(tmp_path):
     from test_mcp_http import ProtocolRuntime
     from rag_mcp.chunk_strategies import ChunkingConfig
     runtime = ProtocolRuntime(tmp_path)
-    runtime.create_knowledge_base("tenant", ChunkingConfig(), runtime.config.vector_size)
+    runtime.create_knowledge_base("tenant", ChunkingConfig(), runtime.config.embedding_model, runtime.config.reranker_model, **runtime.provider_settings)
     documents = runtime._tenant("tenant").documents
     (documents.paths.knowledge_dir / "old.docx").write_bytes(b"old word")
     documents._write_manifest({"old.docx": {"name": "old.docx", "sha256": "a"*64,

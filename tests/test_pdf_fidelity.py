@@ -150,7 +150,7 @@ def test_old_pdf_version_does_not_deduplicate(tmp_path):
 
     runtime = ProtocolRuntime(tmp_path)
     # Only exercise the preflight: the PDF record deliberately predates this parser.
-    runtime.create_knowledge_base("tenant", ChunkingConfig(), runtime.config.vector_size)
+    runtime.create_knowledge_base("tenant", ChunkingConfig(), runtime.config.embedding_model, runtime.config.reranker_model, **runtime.provider_settings)
     documents = runtime._tenant("tenant").documents
     source = documents.paths.knowledge_dir / "paper.pdf"
     source.write_bytes(b"pdf")

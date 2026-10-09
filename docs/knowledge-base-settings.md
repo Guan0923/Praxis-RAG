@@ -1,24 +1,31 @@
-# Knowledge-base creation settings
+# Knowledge-base configuration
 
-Create a knowledge base in the connection page before uploading documents.
-Creation requires administrator access, using the same rule as API Key management.
+Create Knowledge Base combines connection URL, API key, model selection and chunk
+settings. Opening a model dropdown fetches models using that form's URL and key.
+Embedding is required; Reranker is optional. Creation probes vector dimensions.
 
-The stored settings are namespace, chunk strategy, chunk size, chunk overlap,
-vector size, embedding model and tokenizer. They are persisted in
-`RAG_SERVICE_DATA_ROOT/knowledge-bases.sqlite3`. There is no update endpoint.
+The sidebar Knowledge Bases page lists each registered configuration and opens an
+editable drawer. Keys are masked; explicit reveal requires direct local access.
+Each knowledge base stores independent protected credentials, models, dimensions
+and collection in knowledge-bases.sqlite3. No global model settings are used.
 
-The service currently shares one embedding model and Qdrant collection across
-namespaces. The chosen vector size must match the saved, verified model output.
-Configure the model before creating a knowledge base. Once a knowledge base is
-created, changing the global embedding model or dimension is rejected, even if
-that knowledge base is empty.
+Changing the Embedding URL, model or vector dimensions requires reembedding.
+Existing chunks and assets are copied into a new collection with new embeddings.
+Only after every chunk succeeds does a single database update activate the new
+configuration. Failure preserves the original configuration and index. Original
+source files and manifests are unchanged; the old collection is retained.
+Key-only and Reranker changes do not rebuild the Embedding index.
 
-- `GET /v1/admin/knowledge-bases/defaults` returns creation defaults and strategies.
-- `POST /v1/admin/knowledge-bases` creates the immutable settings.
-- `GET /v1/knowledge-base` returns the current namespace settings after key authorization.
-- Uploads accept files only. Preflight accepts only the file fingerprints.
-- HTTP uploads and MCP document additions/updates use the stored chunk settings.
+- GET /v1/admin/knowledge-bases lists registered and populated namespaces.
+- GET /v1/admin/knowledge-bases/defaults returns chunk strategies.
+- POST /v1/admin/knowledge-bases/models/{embedding|reranker} fetches model names.
+- POST /v1/admin/knowledge-bases creates a knowledge base with provider settings.
+- GET /v1/admin/knowledge-bases/{namespace} returns redacted settings.
+- PATCH /v1/admin/knowledge-bases/{namespace} edits settings; reembed=true rebuilds.
+- GET /v1/admin/knowledge-bases/{namespace}/key/{kind} explicitly reveals a key.
+- GET /v1/knowledge-base returns redacted settings for the authenticated namespace.
 
-Existing documents are not migrated or reindexed. Namespaces with documents but
-without saved knowledge-base settings remain readable; create a new namespace
-for new uploads. Creation cannot overwrite an existing populated namespace.
+Management requires direct local access. Omitted keys retain saved credentials
+only for the same URL; an empty key clears them. Keys never enter browser storage.
+Legacy manifest-only namespaces remain listed without an editable configuration;
+they are not automatically migrated or assigned inferred provider credentials.

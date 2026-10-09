@@ -88,7 +88,7 @@ class ModelHTTPClient:
             not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"].strip()
             for item in data
         ):
-            raise ModelAPIError("模型列表格式无效，可手动填写 model")
+            raise ModelAPIError("模型列表格式无效")
         return list(dict.fromkeys(item["id"] for item in data))
 
 
@@ -97,7 +97,7 @@ class HTTPEmbedder(ModelHTTPClient):
         if not texts:
             return []
         if not self.connection.configured:
-            raise ModelAPIError("Embedding 尚未配置，请在连接配置中保存模型 API")
+            raise ModelAPIError("Embedding 尚未配置，请配置服务地址并为知识库选择模型")
         vectors: list[list[float]] = []
         dimension = self.connection.vector_size
         for start in range(0, len(texts), 32):
@@ -134,7 +134,7 @@ class HTTPReranker(ModelHTTPClient):
 
     def scores(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
         if not self.connection.configured:
-            raise ModelAPIError("Reranker 尚未配置，请在连接配置中保存模型 API")
+            raise ModelAPIError("Reranker 尚未配置，请配置服务地址并为知识库选择模型")
         data = self.request("rerank", {"model": self.connection.model, "query": query,
                                        "documents": documents, "top_n": len(documents)}).get("results")
         if not isinstance(data, list) or len(data) != len(documents):

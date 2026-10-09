@@ -100,17 +100,8 @@ select {
   padding: 14px 32px;
   border-bottom: 1px solid var(--line);
 }
-.breadcrumb {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-  color: var(--muted);
-  font-size: 12px;
-  min-width: 0;
-}
-.breadcrumb > :last-child {
-  color: var(--text);
+.topbar > .toolbar {
+  margin-left: auto;
 }
 .workspace-name {
   min-width: 0;
@@ -327,7 +318,6 @@ h3 {
 .document-name > div {
   min-width: 0;
 }
-.breadcrumb-link,
 .document-link {
   border: 0;
   padding: 0;
@@ -337,11 +327,9 @@ h3 {
   text-align: left;
   cursor: pointer;
 }
-.breadcrumb-link:hover,
 .document-link:hover {
   text-decoration: underline;
 }
-.breadcrumb-link:focus-visible,
 .document-link:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
@@ -687,9 +675,6 @@ h3 {
     padding: 10px 16px;
     gap: 8px;
   }
-  .breadcrumb {
-    gap: 6px;
-  }
   .page-content {
     padding: 24px 16px 40px;
   }
@@ -749,3 +734,20 @@ h3 {
 .asset-table td { border: 1px solid #9998; padding: 8px; min-width: 72px; max-width: 360px; white-space: pre-wrap; overflow-wrap: anywhere; vertical-align: top; }
 .asset-note, .word-diagnostics { font-size: 13px; overflow-wrap: anywhere; }
 .result-body { min-width: 0; }
+
+.knowledge-base-form {
+  max-width: 720px;
+}
+.knowledge-provider {
+  border-top: 1px solid var(--line);
+  padding: 20px 0 4px;
+}
+.knowledge-base-summary {
+  margin-bottom: 24px;
+}
+.knowledge-provider-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-wrap: anywhere;
+}

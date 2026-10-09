@@ -92,7 +92,7 @@ uv run --package praxis-rag rag-service
 
 Console 包含知识上传、文档删除、BM25/Embedding/Hybrid 检索、Reranker 切换、Top-K 结果、score、source、chunk_id 和阶段耗时。它直接访问同源 RAG API，不经过 Mini-Agent。调试页还提供“三模式对比”，固定关闭重排并并排展示三种 Retriever 的原始结果，避免 Cross Encoder 把不同召回重新排成相同顺序。
 
-启动后在“连接配置”中分别设置 Embedding 和 Reranker 的模型 API。RAG HTTP 服务不再加载本地 Embedding/Reranker 权重，也不控制推理框架的 CPU/GPU；本地推理框架需自行运行，再填写其地址与端口。未配置时，相应操作明确报错，不回退到本地模型。
+启动后在“模型配置”中分别设置 Embedding 和 Reranker 的 URL 和 Key；模型在创建知识库时选择。RAG HTTP 服务不再加载本地 Embedding/Reranker 权重，也不控制推理框架的 CPU/GPU；本地推理框架需自行运行，再填写其地址与端口。未配置时，相应操作明确报错，不回退到本地模型。
 
 PDF 仍由独立 Docling 2.126.0 子进程解析，使用 PDFium、CUDA 和本机解析模型；图片或表格没有有效原文说明时，才使用固定版本的 Granite Vision 3.3 2B 生成检索描述。图片原图保存在租户目录，图表原始数据和检索文字写入 Qdrant。每批最多 10 个文件，单文件最大 10 MiB。
 
@@ -102,18 +102,17 @@ OCR 不再按默认置信度阈值丢弃已识别文字；低置信度内容保�
 
 每份 PDF 的原生 `document.json`、按阅读顺序保存的 `manifest.json`、正文 `document.md`、OCR 记录 `ocr.json` 和图片保存在知识目录的 `.pdf-assets/<document_id>/`。正文、图片、表格与公式保持 Docling 的遍历顺序；图注、表题、脚注保留原文关联，不按长度丢弃，也不猜配未关联注解。生成描述仅用于检索，不充当原文注解。命令行 PDF 导入和 MCP 正文读取使用同一份解析结果。
 
-### 模型 API 设置
+### 知识库模型配置
 
-两组设置各自包含 `base_url`、`apikey` 和 `model`，支持不同提供方。密钥可为空；非空时仅以 `Authorization: Bearer ...` 发送。不自动重试或跟随重定向，连接超时为 5 秒、单次读写超时为 60 秒。
+创建知识库时填写 Embedding 的 URL、Key 并从下拉列表选择模型；Reranker 可选，每个知识库独立保存配置。侧边栏“知识库”可以查看和修改配置，Key 默认隐藏，点击眼睛后按需读取。
 
-- 地址按原样保留路径前缀，仅去除末尾斜杠。例如 `http://localhost:9000/v1` 对应 `/v1/models`、`/v1/embeddings`、`/v1/rerank`；不会自动补 `/v1`。
-- “获取模型列表”读取 `data[].id`；接口不可用时仍可手填。“测试连接”和“保存并应用”都会发送最小真实推理请求，远程服务可能计费。
-- Embedding 使用 `model`、`input`，读取 `data[].index` 和 `embedding`；Reranker 使用 `model`、`query`、`documents`、`top_n`，读取 `results[].index` 和 `relevance_score`。
-- 保存先验证，再等待进行中的操作结束，统一更新所有工作区。失败保留旧配置；已有文档时禁止更换 Embedding 名称或向量长度。空库需要不同向量长度时创建新集合，不删除旧集合。
-- 配置存于服务数据目录的 `model-api-settings.json`，优先于旧模型名称环境变量。Windows 密钥使用当前账号的 DPAPI 加密；其他系统使用权限为 `0600` 的配置文件。密钥不回显、不进入浏览器存储；编辑地址不会复用旧密钥。
-- 仅本机直连可修改、获取列表或测试；远程访问只读。接口检查实际连接地址、Host、Origin 和转发标头，并沿用 Service Token 认证。
-- `GET /v1/model-settings` 返回只读配置与 `writable`；`PATCH /v1/model-settings/{embedding|reranker}` 保存；`POST` 同一路径的 `/models`、`/test` 分别列模型和测试。请求省略 `apikey` 表示保留同地址旧密钥，传空字符串表示清除。
-- 切分 tokenizer 单独使用 `RAG_CHUNK_TOKENIZER_MODEL`，默认 `BAAI/bge-m3`，只加载分词文件，不加载推理权重。API 中的模型别名不会作为 tokenizer 下载地址；远端输入长度限制仍以实际服务为准。
+- 修改 Embedding URL、模型或向量长度必须重新向量化：使用已有片段建立新索引，全部成功后才切换配置；失败保留原索引。原文件、附件和旧集合不删除。
+- 仅修改 Key 或 Reranker 不需要重新向量化。模型列表使用当前表单中的 URL/Key 获取。
+- URL 保留路径前缀，例如服务要求 /v1 时应填写完整地址；不自动补 /v1。创建和保存会验证实际模型调用。
+- 配置保存于 knowledge-bases.sqlite3；Windows Key 使用 DPAPI 加密，其他系统限制文件权限。Key 不进入浏览器存储，修改地址不会复用旧 Key。
+- 管理接口仅允许本机直连；普通文档和检索接口仍使用服务 API Key，不能与模型提供方 Key 混用。
+- POST /v1/admin/knowledge-bases 创建；PATCH /v1/admin/knowledge-bases/{namespace} 修改，reembed=true 执行重新向量化。旧全局 /v1/model-settings 接口已移除。
+- 分词器由 RAG_CHUNK_TOKENIZER_MODEL 指定，与远端模型别名分开配置。重新向量化不重新切分文档。
 
 真实 API 浏览器验收需要独立 RAG 服务、独立数据目录和真正运行模型的推理服务：
 
@@ -168,7 +167,7 @@ Web Console 的“知识文档”页面可选择五种切分策略。网页及�
 | 策略值 | 行为 |
 | --- | --- |
 | `character` | 原字符切分，默认 700 字符、100 字符重叠，优先在换行或标点处结束。 |
-| `token` | 使用 Embedding 模型的 tokenizer，按原文位置截取 token 窗口。 |
+| `token` | 使用服务配置的 tokenizer，按原文位置截取 token 窗口。 |
 | `sentence` | 完整句子合块，超长单句按 token 拆分。支持常见中英文断句和英文缩写，不做语言模型语义判断。 |
 | `recursive` | 段落、句子、token 逐级细分，再合并完整内容单元。 |
 | `structure` | Markdown 按标题；TXT 按空行段落；PDF 按页、段落、句子；DOCX 按标题样式及段落，表格过长按行处理。 |

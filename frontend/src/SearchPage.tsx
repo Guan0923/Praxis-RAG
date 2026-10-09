@@ -191,7 +191,7 @@ export function SearchPage({
         initialValues={{
           query: "",
           retrieval: "hybrid",
-          rerank: "cross_encoder",
+          rerank: "none",
           candidate_k: 10,
           top_k: 5,
         }}

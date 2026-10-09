@@ -27,8 +27,8 @@ from .orchestrator import RagOrchestrator
 from .pdf_content import PDF_PARSER_VERSION
 from .word_reader import WORD_PARSER_VERSION
 from .model_api import HTTPEmbedder, HTTPReranker, ModelAPIError, ModelConnection, ModelHTTPClient
-from .model_settings import KINDS, ModelSettingsStore, draft_connection
-from .knowledge_bases import KnowledgeBaseStore
+from .model_settings import KINDS, draft_connection
+from .knowledge_bases import KnowledgeBaseStore, model_connection, public_settings, stored_connection
 
 SUPPORTED_EXTENSIONS = SUPPORTED_SUFFIXES
 MAX_FILES_PER_BATCH = 10
@@ -95,7 +95,8 @@ class KnowledgePaths:
 class KnowledgeDocumentStore:
     """Atomically persist tenant sources and their non-secret manifest."""
 
-    def __init__(self, paths: KnowledgePaths) -> None:
+    def __init__(self, paths: KnowledgePaths, *, index_settings: dict | None = None) -> None:
+        self.index_settings = index_settings
         self.paths = paths
         self.paths.ensure()
 
@@ -272,7 +273,14 @@ class KnowledgeDocumentStore:
             raise KnowledgeError("知识库清单无法读取。") from exc
         if not isinstance(value, dict):
             raise KnowledgeError("知识库清单格式无效。")
-        return {str(key): dict(item) for key, item in value.items() if isinstance(item, dict)}
+        records = {str(key): dict(item) for key, item in value.items() if isinstance(item, dict)}
+        if self.index_settings:
+            # The committed knowledge-base configuration owns the active index.
+            for record in records.values():
+                record["collection"] = self.index_settings["collection"]
+                if "chunking" in record:
+                    record["chunking"] = {**record["chunking"], "embedding_model": self.index_settings["embedding_model"]}
+        return records
 
     def _write_manifest(self, value: dict[str, dict[str, object]]) -> None:
         temporary = self.paths.root / f".manifest-{uuid4().hex}.tmp"
@@ -407,27 +415,11 @@ class RagServiceRuntime:
         if self.data_root.is_symlink():
             raise KnowledgeError("RAG service data root cannot be a symbolic link.")
         self.data_root.mkdir(parents=True, exist_ok=True)
-        self._settings_store = ModelSettingsStore(self.data_root)
-        self._connections, collection = self._settings_store.load({
-            "embedding": ModelConnection(model=config.embedding_model),
-            "reranker": ModelConnection(model=config.reranker_model),
-        }, config.collection)
-        self.config = replace(config, collection=collection,
-                              embedding_model=self._connections["embedding"].model,
-                              reranker_model=self._connections["reranker"].model,
-                              vector_size=self._connections["embedding"].vector_size or config.vector_size)
-        self._model_checks: dict[str, dict[str, object]] = {}
         self._client = QdrantClient(
             url=config.qdrant_url,
             path=str(config.qdrant_path) if config.qdrant_path else None,
         )
-        self._embedder = HTTPEmbedder(self._connections["embedding"])
         self._sparse_encoder = Bm25SparseEncoder()
-        self._reranker = HTTPReranker(
-            self._connections["reranker"],
-            max_candidates=config.reranker_max_candidates,
-            max_text_chars=config.reranker_max_text_chars,
-        )
         self._tenants: dict[str, TenantResources] = {}
         self._tenant_lock = RLock()
         self._inference_lock = RLock()
@@ -438,129 +430,121 @@ class RagServiceRuntime:
             "service": "praxis-rag",
             "backend": self.config.backend,
             "collection": self.config.collection,
-            "models": {kind: {"name": item.model, "configured": item.configured, "provider": "http"}
-                       for kind, item in self._connections.items()},
         }
 
-    def model_settings(self) -> dict[str, object]:
-        return {kind: {**item.public(), **self._model_checks.get(kind, {})}
-                for kind, item in self._connections.items()}
+    @_runtime_operation
+    def knowledge_base_models(self, kind: str, values: dict, namespace: str | None = None) -> list[str]:
+        current = model_connection(self.knowledge_base(namespace), kind) if namespace else ModelConnection()
+        return ModelHTTPClient(draft_connection(current, values)).models()
 
     @_runtime_operation
-    def model_action(self, kind: str, values: dict[str, object], action: str) -> dict[str, object]:
-        if kind not in KINDS or action not in {"models", "test", "save"}:
-            raise ModelAPIError("未知模型设置操作")
-        current = self._connections[kind]
-        draft = draft_connection(current, values, require_model=action != "models")
-        if action == "models":
-            return {"models": ModelHTTPClient(draft).models()}
-        try:
-            if kind == "embedding":
-                vectors = HTTPEmbedder(draft).embed_documents(["connection test"])
-                draft = replace(draft, vector_size=len(vectors[0]))
-            else:
-                HTTPReranker(draft).scores("connection test", ["connection test"])
-        except ModelAPIError as exc:
-            if draft.base_url == current.base_url and draft.model == current.model and draft.api_key == current.api_key:
-                self._model_checks[kind] = {"status": "error", "last_error": str(exc),
-                                            "checked_at": datetime.now(UTC).isoformat()}
-            raise
-        checked = {"status": "ok", "last_error": "", "checked_at": datetime.now(UTC).isoformat()}
-        if action == "test":
-            if draft.base_url == current.base_url and draft.model == current.model and draft.api_key == current.api_key:
-                self._model_checks[kind] = checked
-            return {**draft.public(), **checked}
-
-        collection = self.config.collection
-        size = self.config.vector_size
-        if kind == "embedding":
-            size = draft.vector_size
-            if any(item["vector_size"] != size or item["embedding_model"] != draft.model
-                   for item in KnowledgeBaseStore(self.data_root).list()):
-                raise ModelAPIError("已有知识库绑定当前 Embedding 模型和向量维度，不能更换模型或维度")
-            occupied = self._has_indexed_documents()
-            current_size = self.config.vector_size
-            try:
-                if self._client.collection_exists(collection):
-                    current_size = self._client.get_collection(collection).config.params.vectors["dense"].size
-            except Exception as exc:
-                raise ModelAPIError("无法确认现有索引的向量长度，未修改配置") from exc
-            if occupied and (draft.model != self.config.embedding_model or size != current_size):
-                raise ModelAPIError("已有知识文档，不能更换 Embedding 模型或向量长度；请先清空所有工作区")
-            if size != current_size:
-                from .storage.qdrant_store import QdrantStore
-
-                collection = f"{self.config.collection[:120]}_api_{uuid4().hex[:12]}"
-                QdrantStore(collection=collection, vector_size=size, client=self._client).ensure_collection()
-        connections = {**self._connections, kind: draft}
-        config = replace(self.config, collection=collection, vector_size=size,
-                         embedding_model=connections["embedding"].model, reranker_model=connections["reranker"].model)
-        embedder = HTTPEmbedder(connections["embedding"])
-        reranker = HTTPReranker(connections["reranker"], max_candidates=config.reranker_max_candidates,
-                               max_text_chars=config.reranker_max_text_chars)
-        self._settings_store.save(connections, collection)
-        self.config = config
-        self._embedder, self._reranker = embedder, reranker
-        self._connections = connections
-        self._model_checks[kind] = checked
-        self._tenants.clear()
-        return {**draft.public(), **checked}
-
-    def _has_indexed_documents(self) -> bool:
-        try:
-            for manifest in self.data_root.glob("*/manifest.json"):
-                value = json.loads(manifest.read_text(encoding="utf-8"))
-                if not isinstance(value, dict):
-                    raise ValueError("invalid manifest")
-                if value:
-                    return True
-            if self._client.collection_exists(self.config.collection):
-                return self._client.count(collection_name=self.config.collection, exact=True).count > 0
-            return False
-        except Exception as exc:
-            raise ModelAPIError("无法确认知识库是否为空，未修改模型配置") from exc
+    def knowledge_base_key(self, namespace: str, kind: str) -> str:
+        return model_connection(self.knowledge_base(namespace), kind).api_key
 
     @_runtime_operation
-    def knowledge_base_defaults(self) -> dict[str, object]:
-        return {"vector_size": self.config.vector_size, "embedding_model": self.config.embedding_model,
-                "tokenizer": self.config.chunk_tokenizer_model,
-                "embedding_configured": self._connections["embedding"].configured and self._connections["embedding"].vector_size is not None}
+    def list_knowledge_bases(self) -> list[dict]:
+        registered = {item["namespace"]: public_settings(item) for item in KnowledgeBaseStore(self.data_root).list()}
+        namespaces = set(registered)
+        documents = {}
+        for manifest in self.data_root.glob("*/manifest.json"):
+            records = KnowledgeDocumentStore(KnowledgePaths(manifest.parent)).list_documents()
+            documents[manifest.parent.name] = len(records)
+            if records:
+                namespaces.add(manifest.parent.name)
+        return [{**registered.get(namespace, {"namespace": namespace}),
+                 "configured": namespace in registered, "document_count": documents.get(namespace, 0)}
+                for namespace in sorted(namespaces)]
 
     @_runtime_operation
-    def create_knowledge_base(self, namespace: str, chunking: ChunkingConfig, vector_size: int) -> dict:
+    def create_knowledge_base(self, namespace: str, chunking: ChunkingConfig,
+                              embedding_model: str, reranker_model: str = "",
+                              *, embedding: dict, reranker: dict | None = None) -> dict:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", namespace):
             raise KnowledgeValidationError("知识库标识无效")
         store = KnowledgeBaseStore(self.data_root)
         if store.get(namespace) is not None:
-            raise KnowledgeValidationError("该知识库已存在，创建参数不可修改")
-        embedding = self._connections["embedding"]
-        if not embedding.configured or embedding.vector_size is None:
-            raise KnowledgeValidationError("请先在模型配置中保存并验证 Embedding 模型")
-        if vector_size != self.config.vector_size:
-            raise KnowledgeValidationError(f"向量维度必须与当前 Embedding 模型一致：{self.config.vector_size}")
-        documents = KnowledgeDocumentStore(KnowledgePaths(self.data_root / namespace)).list_documents()
-        if documents:
+            raise KnowledgeValidationError("该知识库已存在，请在知识库页面修改配置")
+        if KnowledgeDocumentStore(KnowledgePaths(self.data_root / namespace)).list_documents():
             raise KnowledgeValidationError("该 Namespace 已有文档，请使用新的知识库标识")
+        embedding_model = embedding_model.strip()
+        reranker_model = reranker_model.strip()
+        if not embedding_model:
+            raise KnowledgeValidationError("请选择 Embedding 模型")
+        embedding_connection = replace(draft_connection(ModelConnection(), embedding), model=embedding_model)
+        vector_size = len(HTTPEmbedder(embedding_connection).embed_query("connection test"))
+        reranker_connection = ModelConnection()
+        if reranker_model:
+            reranker_connection = replace(draft_connection(ModelConnection(), reranker or {}), model=reranker_model)
+            HTTPReranker(reranker_connection).scores("connection test", ["connection test"])
         settings = {"namespace": namespace, "vector_size": vector_size,
-                    "embedding_model": self.config.embedding_model,
+                    "embedding_model": embedding_model, "reranker_model": reranker_model,
+                    "embedding": stored_connection(embedding_connection), "reranker": stored_connection(reranker_connection),
+                    "collection": f"knowledge_{uuid4().hex}",
                     "tokenizer": self.config.chunk_tokenizer_model,
                     "strategy": chunking.strategy, "chunk_size": chunking.chunk_size,
                     "chunk_overlap": chunking.chunk_overlap,
                     "created_at": datetime.now(UTC).isoformat()}
         store.create(settings)
-        return settings
+        self._tenants.pop(namespace, None)
+        return public_settings(settings)
 
     @_runtime_operation
     def knowledge_base(self, namespace: str) -> dict:
         settings = KnowledgeBaseStore(self.data_root).get(namespace)
         if settings is None:
-            raise KnowledgeValidationError("请先在接入配置中创建知识库")
+            raise KnowledgeValidationError("该知识库没有配置记录，请先创建知识库")
         return settings
+
+    @_runtime_operation
+    def update_knowledge_base(self, namespace: str, values: dict, *, reembed: bool = False) -> dict:
+        from .storage.qdrant_store import QdrantStore
+
+        current = self.knowledge_base(namespace)
+        old_embedding = model_connection(current, "embedding")
+        old_reranker = model_connection(current, "reranker")
+        embedding = replace(draft_connection(old_embedding, values.get("embedding", {})),
+                            model=values.get("embedding_model", old_embedding.model).strip(), vector_size=None)
+        if not embedding.model:
+            raise KnowledgeValidationError("请选择 Embedding 模型")
+        changed_embedding = embedding.model != old_embedding.model or embedding.base_url != old_embedding.base_url
+        if changed_embedding and not reembed:
+            raise KnowledgeValidationError("修改 Embedding URL 或模型前，必须重新向量化（re embedding）")
+        reranker_model = values.get("reranker_model", old_reranker.model).strip()
+        reranker = ModelConnection()
+        if reranker_model:
+            reranker = replace(draft_connection(old_reranker, values.get("reranker", {})), model=reranker_model)
+            HTTPReranker(reranker).scores("connection test", ["connection test"])
+        size = len(HTTPEmbedder(embedding).embed_query("connection test"))
+        if size != current["vector_size"] and not reembed:
+            raise KnowledgeValidationError("Embedding 向量长度已改变，必须重新向量化（re embedding）")
+        embedding = replace(embedding, vector_size=size)
+        updated = {**current, "embedding": stored_connection(embedding), "reranker": stored_connection(reranker),
+                   "embedding_model": embedding.model, "reranker_model": reranker.model,
+                   "vector_size": size, "updated_at": datetime.now(UTC).isoformat()}
+        staging = f"knowledge_{uuid4().hex}" if reembed else None
+        try:
+            if staging:
+                records = self.list_documents(namespace)
+                source = QdrantStore(collection=current["collection"], vector_size=current["vector_size"],
+                                     namespace=namespace, client=self._client)
+                source.reembed_into(staging, HTTPEmbedder(embedding),
+                                    {item["document_id"]: item["chunk_count"] for item in records})
+                updated.update(collection=staging, reembedded_at=datetime.now(UTC).isoformat())
+            # A single SQLite commit publishes the complete index and its credentials.
+            KnowledgeBaseStore(self.data_root).update(updated)
+        except Exception:
+            if staging:
+                try:
+                    if self._client.collection_exists(staging):
+                        self._client.delete_collection(staging)
+                except Exception:
+                    logging.getLogger(__name__).exception("Failed to remove unpublished index %s", staging)
+            raise
+        self._tenants.pop(namespace, None)
+        return public_settings(updated)
 
     def _knowledge_chunking(self, namespace: str) -> ChunkingConfig:
         settings = self.knowledge_base(namespace)
-        if settings["embedding_model"] != self.config.embedding_model or settings["vector_size"] != self.config.vector_size:
-            raise KnowledgeValidationError("当前 Embedding 模型与知识库创建配置不一致")
         return ChunkingConfig(settings["strategy"], settings["chunk_size"], settings["chunk_overlap"])
 
     @_runtime_operation
@@ -599,7 +583,7 @@ class RagServiceRuntime:
                 try:
                     with self._inference_lock:
                         record = tenant.documents.store_and_index(name, readable, tenant.ingester, chunking, model,
-                                                                  embedding_model=self.config.embedding_model)
+                                                                  embedding_model=self.knowledge_base(namespace)["embedding_model"])
                         if record.pop("skipped", False):
                             skipped.append(record)
                         else:
@@ -630,7 +614,7 @@ class RagServiceRuntime:
                     record = tenant.documents.store_and_index(
                         name, readable, tenant.ingester, configuration, self.knowledge_base(namespace)["tokenizer"],
                         deduplicate_across_names=False,
-                        embedding_model=self.config.embedding_model,
+                        embedding_model=self.knowledge_base(namespace)["embedding_model"],
                     )
             except Exception as exc:
                 raise KnowledgeError(_safe_error(exc)) from exc
@@ -716,10 +700,13 @@ class RagServiceRuntime:
             config = replace(self.config, namespace=namespace)
             settings = KnowledgeBaseStore(self.data_root).get(namespace)
             if settings:
-                if settings["vector_size"] != config.vector_size or settings["embedding_model"] != config.embedding_model:
-                    raise KnowledgeValidationError("当前 Embedding 模型与知识库创建配置不一致")
-                config = replace(config, vector_size=settings["vector_size"],
+                config = replace(config, collection=settings["collection"], vector_size=settings["vector_size"],
+                                 embedding_model=settings["embedding_model"], reranker_model=settings["reranker_model"],
                                  chunk_tokenizer_model=settings["tokenizer"])
+            embedder = HTTPEmbedder(model_connection(settings, "embedding") if settings else ModelConnection())
+            reranker = HTTPReranker(model_connection(settings, "reranker") if settings else ModelConnection(),
+                                   max_candidates=config.reranker_max_candidates,
+                                   max_text_chars=config.reranker_max_text_chars)
 
             store = QdrantStore(
                 collection=config.collection,
@@ -730,11 +717,11 @@ class RagServiceRuntime:
             orchestrator = RagOrchestrator(
                 retrievers={
                     "bm25": Bm25Retriever(self._sparse_encoder, store),
-                    "embedding": DenseRetriever(self._embedder, store),
-                    "hybrid": HybridRetriever(self._embedder, self._sparse_encoder, store),
+                    "embedding": DenseRetriever(embedder, store),
+                    "hybrid": HybridRetriever(embedder, self._sparse_encoder, store),
                 },
                 rerankers={
-                    "cross_encoder": self._reranker,
+                    "cross_encoder": reranker,
                 },
                 implementation="rag-service-qdrant-hybrid-rerank-v1",
                 projector=lambda candidates: project_results(
@@ -743,9 +730,9 @@ class RagServiceRuntime:
                 ),
             )
             resources = TenantResources(
-                documents=KnowledgeDocumentStore(KnowledgePaths(self.data_root / namespace)),
+                documents=KnowledgeDocumentStore(KnowledgePaths(self.data_root / namespace), index_settings=settings),
                 ingester=DenseDocumentIngester(
-                    config, self._embedder, self._sparse_encoder, store,
+                    config, embedder, self._sparse_encoder, store,
                     source_root=self.data_root / namespace / "knowledge",
                 ),
                 orchestrator=orchestrator,

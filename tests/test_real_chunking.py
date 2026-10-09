@@ -41,7 +41,7 @@ def test_real_model_ingestion_and_retrieval(tmp_path):
         for strategy in ("character", "token", "sentence", "recursive", "structure"):
             namespace = f"smoke-{strategy}"
             chunking = ChunkingConfig(strategy, 700, 100) if strategy == "character" else ChunkingConfig(strategy, 64, 12)
-            runtime.create_knowledge_base(namespace, chunking, runtime.config.vector_size)
+            runtime.create_knowledge_base(namespace, chunking, runtime.config.embedding_model, runtime.config.reranker_model, **runtime.provider_settings)
             files = [(path.name, io.BytesIO(path.read_bytes())) for path in (markdown, plain, pdf, word)]
             result = runtime.upload(namespace, files)
             assert not result["failed"], result

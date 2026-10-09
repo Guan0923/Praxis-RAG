@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { readStorage } from "./api";
 
 export const namespacePattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
-export type ConsolePage = "search" | "documents" | "create" | "api-keys" | "models";
+export type ConsolePage = "search" | "documents" | "create" | "api-keys" | "knowledge-bases";
 export type ConsoleRoute = {
   namespace: string;
   page: ConsolePage;
@@ -17,8 +17,8 @@ function savedNamespace() {
 export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRoute {
   const fallback: ConsoleRoute = { namespace: fallbackNamespace, page: "search" };
   try {
-    if (hash === "#/api-keys" || hash === "#/models") {
-      return { namespace: fallbackNamespace, page: hash === "#/api-keys" ? "api-keys" : "models" };
+    if (hash === "#/api-keys" || hash === "#/knowledge-bases") {
+      return { namespace: fallbackNamespace, page: hash === "#/api-keys" ? "api-keys" : "knowledge-bases" };
     }
     const parts = hash.slice(1).split("/");
     if (!hash.startsWith("#/") || parts[1] !== "workspaces") return fallback;
@@ -37,7 +37,7 @@ export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRout
 }
 
 export function routeHash(route: ConsoleRoute) {
-  if (route.page === "api-keys" || route.page === "models") return "#/" + route.page;
+  if (route.page === "api-keys" || route.page === "knowledge-bases") return "#/" + route.page;
   const base = `#/workspaces/${route.page}`;
   return route.page === "documents" && route.documentName !== undefined
     ? `${base}/${encodeURIComponent(route.documentName)}` : base;

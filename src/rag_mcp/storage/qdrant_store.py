@@ -139,6 +139,39 @@ class QdrantStore:
             raise
         return len(chunks)
 
+    def reembed_into(self, collection: str, embedder, expected_chunks: dict[str, int]) -> None:
+        """Copy this namespace into an unpublished index, replacing only dense vectors."""
+        from collections import Counter
+
+        target = QdrantStore(collection=collection, vector_size=embedder.connection.vector_size,
+                             namespace=self.namespace, client=self._client)
+        target.ensure_collection()
+        copied = Counter()
+        offset = None
+        if self._client.collection_exists(self.collection):
+            while True:
+                points, offset = self._client.scroll(
+                    collection_name=self.collection, scroll_filter=_payload_filter(self._scoped({})),
+                    offset=offset, limit=64, with_payload=True, with_vectors=True,
+                )
+                chunks = [point for point in points if (point.payload or {}).get("record_type") == "chunk"]
+                vectors = embedder.embed_documents([point.payload["text"] for point in chunks])
+                dense = {str(point.id): vector for point, vector in zip(chunks, vectors, strict=True)}
+                replacements = []
+                for point in points:
+                    vector = dict(point.vector or {})
+                    if str(point.id) in dense:
+                        vector[DENSE_VECTOR_NAME] = dense[str(point.id)]
+                        copied[point.payload["document_id"]] += 1
+                    replacements.append(models.PointStruct(id=point.id, vector=vector, payload=point.payload))
+                if replacements:
+                    self._client.upsert(collection_name=collection, points=replacements, wait=True)
+                if offset is None:
+                    break
+        if dict(copied) != expected_chunks:
+            from ..contracts import RagOperationError
+            raise RagOperationError("文档清单与索引片段数量不一致，未切换模型；请检查现有索引")
+
     def get_assets(self, asset_ids: Sequence[str]) -> dict[str, dict[str, object]]:
         if not asset_ids:
             return {}

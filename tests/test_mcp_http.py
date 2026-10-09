@@ -73,6 +73,14 @@ class ProtocolRuntime(RagServiceRuntime):
         self.finished = threading.Event()
         self.wire_responses = []
 
+    def create_knowledge_base(self, namespace, chunking, embedding_model, reranker_model=""):
+        settings = {"namespace": namespace, "vector_size": self.config.vector_size,
+                    "embedding_model": embedding_model, "reranker_model": reranker_model,
+                    "collection": self.config.collection, "tokenizer": self.config.chunk_tokenizer_model,
+                    **chunking.metadata(self.config.chunk_tokenizer_model)}
+        KnowledgeBaseStore(self.data_root).create(settings)
+        return settings
+
     def _tenant(self, namespace):
         with self._tenant_lock:
             if namespace not in self._tenants:
@@ -97,9 +105,10 @@ class ProtocolRuntime(RagServiceRuntime):
 @contextmanager
 def running_service(root: Path, *, runtime=None):
     runtime = runtime or ProtocolRuntime(root)
-    for namespace in ("manuals", "other"):
-        if KnowledgeBaseStore(runtime.data_root).get(namespace) is None:
-            runtime.create_knowledge_base(namespace, ChunkingConfig(), runtime.config.vector_size)
+    if isinstance(runtime, ProtocolRuntime):
+        for namespace in ("manuals", "other"):
+            if KnowledgeBaseStore(runtime.data_root).get(namespace) is None:
+                runtime.create_knowledge_base(namespace, ChunkingConfig(), runtime.config.embedding_model)
     settings = RagHttpSettings(
         data_root=root,
         token="test-token",
@@ -114,7 +123,7 @@ def running_service(root: Path, *, runtime=None):
 
         async def __call__(self, scope, receive, send):
             chunks = []
-            if scope["type"] == "http" and scope["path"] == "/mcp":
+            if isinstance(runtime, ProtocolRuntime) and scope["type"] == "http" and scope["path"] == "/mcp":
                 runtime.wire_responses.append(chunks)
 
             async def record(message):
@@ -140,7 +149,8 @@ def running_service(root: Path, *, runtime=None):
     try:
         yield f"http://127.0.0.1:{sock.getsockname()[1]}", app, runtime
     finally:
-        runtime.release.set()
+        if isinstance(runtime, ProtocolRuntime):
+            runtime.release.set()
         server.should_exit = True
         thread.join(6)
         sock.close()
