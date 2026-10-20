@@ -70,7 +70,7 @@ def convert(source: Path, output: Path, models: Path | None) -> dict[str, object
     )
     converter.initialize_pipeline(InputFormat.PDF)
     cache = _enable_formula_cache(converter)
-    result = converter.convert(source, raises_on_error=False, max_file_size=10 * 1024 * 1024, max_num_pages=1000)
+    result = converter.convert(source, raises_on_error=False, max_file_size=100 * 1024 * 1024, max_num_pages=1000)
     if result.status.value != "success" or result.errors:
         raise RuntimeError("; ".join(str(error) for error in result.errors) or f"Docling status: {result.status.value}")
     doc = result.document

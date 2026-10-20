@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug FastAPI - dev",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "C:\\Users\\Administrator\\miniconda3\\envs\\dev\\python.exe",
+            "module": "rag_mcp.http_service",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}\\src",
+                "PYTHONUTF8": "1",
+                "RAG_SERVICE_HOST": "127.0.0.1",
+                "RAG_SERVICE_PORT": "8011",
+                "RAG_PDF_PARSER_PYTHON": "C:\\Users\\Administrator\\miniconda3\\envs\\dev\\python.exe",
+                "RAG_PDF_MODELS_PATH": "${workspaceFolder}\\.worktrees\\docling-upgrade\\.mini_agent-rag\\docling-benchmark\\models"
+            }
+        }
+    ]
+}
