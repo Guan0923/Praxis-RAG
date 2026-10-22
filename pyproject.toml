@@ -19,6 +19,9 @@ dependencies = [
     "markdown-it-py>=3,<5",
     "qdrant-client>=1.12,<2",
     "uvicorn>=0.30,<1",
+    "sqlalchemy>=2,<3",
+    "pymysql>=1.1,<2",
+    "cryptography>=42,<47",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +47,7 @@ rag-mcp-debug = "rag_mcp.debug:main"
 rag-mcp-ingest = "rag_mcp.ingest:main"
 rag-service = "rag_mcp.http_service:main"
 rag-service-migrate = "rag_mcp.migrate:main"
+rag-state-migrate = "rag_mcp.state.migrate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

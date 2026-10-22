@@ -8,6 +8,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 from typing import Literal
@@ -42,6 +43,8 @@ from .model_api import ModelAPIError
 from .startup_config import load_service_config
 from .api_keys import ApiKeyError, ApiKeyStore
 from .knowledge_bases import public_settings
+from .state.store import StateStores
+from .state.uploads import UploadConflict
 
 _NAMESPACE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _WEB_ROOT = Path(__file__).with_name("web")
@@ -67,7 +70,7 @@ _LOCAL_MCP_ORIGINS = (
 class ServiceRuntime(Protocol):
     def status(self) -> dict[str, object]: ...
     def list_documents(self, namespace: str) -> list[dict[str, object]]: ...
-    def upload(self, namespace: str, items: list[tuple[str, object]]) -> dict[str, object]: ...
+    def upload(self, namespace: str, items: list[tuple[str, object]], *, idempotency_key: str | None = None) -> dict[str, object]: ...
     def check_documents(self, namespace: str, items: list[dict[str, str]]) -> dict[str, object]: ...
     def list_knowledge_bases(self) -> list[dict]: ...
     def create_knowledge_base(self, namespace: str, chunking: ChunkingConfig, embedding_model: str, reranker_model: str = "", *, embedding: dict, reranker: dict | None = None) -> dict: ...
@@ -76,7 +79,7 @@ class ServiceRuntime(Protocol):
     def update_knowledge_base(self, namespace: str, values: dict, *, reembed: bool = False) -> dict: ...
     def knowledge_base(self, namespace: str) -> dict: ...
     def delete(self, namespace: str, name: str) -> dict[str, object]: ...
-    def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool) -> dict[str, object]: ...
+    def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool, idempotency_key: str | None = None) -> dict[str, object]: ...
     def search(self, namespace: str, arguments: dict[str, object]) -> dict[str, object]: ...
     def read_document(self, namespace: str, name: str) -> tuple[str, str]: ...
     def read_document_file(self, namespace: str, name: str) -> bytes: ...
@@ -246,8 +249,9 @@ def create_service_app(
     settings: RagHttpSettings | None = None,
 ) -> FastAPI:
     resolved_settings = settings or RagHttpSettings.from_env()
-    key_store = ApiKeyStore(resolved_settings.data_root)
     resolved_runtime = runtime or RagServiceRuntime(RagConfig.from_env(), resolved_settings.data_root)
+    state = getattr(resolved_runtime, "state", None) or StateStores.create(resolved_settings.data_root)
+    key_store = ApiKeyStore(state)
 
     def matches(authorization, token):
         return authorization is not None and hmac.compare_digest(
@@ -292,13 +296,22 @@ def create_service_app(
             allowed_hosts=list(resolved_settings.mcp_allowed_hosts),
             allowed_origins=list(resolved_settings.mcp_allowed_origins),
         ),
-        resolved_settings.data_root,
+        state,
     )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        async with mcp_endpoint.run():
-            yield
+        start_recovery = getattr(resolved_runtime, "start_upload_recovery", None)
+        stop_recovery = getattr(resolved_runtime, "stop_upload_recovery", None)
+        try:
+            if callable(start_recovery):
+                await anyio.to_thread.run_sync(start_recovery)
+            async with mcp_endpoint.run():
+                yield
+        finally:
+            if callable(stop_recovery):
+                with anyio.CancelScope(shield=True):
+                    await anyio.to_thread.run_sync(stop_recovery)
 
     app = FastAPI(title="Praxis-RAG", version=__version__, lifespan=lifespan)
     app.state.runtime = resolved_runtime
@@ -311,6 +324,10 @@ def create_service_app(
             return JSONResponse({"detail": [{key: item[key] for key in ("type", "loc", "msg")}
                                             for item in error.errors()]}, status_code=422)
         return await request_validation_exception_handler(request, error)
+
+    @app.exception_handler(UploadConflict)
+    async def upload_conflict(_request, _error):
+        return JSONResponse({"detail": "Upload conflicts with another operation or idempotency key."}, status_code=409)
 
     @app.exception_handler(ModelAPIError)
     async def model_api_error(_request, error):
@@ -534,6 +551,10 @@ def create_service_app(
         request: Request,
         files: list[UploadFile] = File(...),
         namespace: str = Depends(tenant),
+        idempotency_key: str | None = Header(
+            default=None, alias="Idempotency-Key", min_length=1, max_length=128,
+            description="Non-secret retry key for this upload submission; not a credential.",
+        ),
     ) -> dict[str, object]:
         if any(name != "files" for name in await request.form()):
             raise HTTPException(status_code=400, detail="上传仅接受文件，切分和向量参数由知识库配置决定")
@@ -542,7 +563,10 @@ def create_service_app(
             async with mcp_endpoint.mutation_lock(namespace):
                 with anyio.CancelScope(shield=True):
                     before = await anyio.to_thread.run_sync(resolved_runtime.list_documents, namespace)
-                    result = await anyio.to_thread.run_sync(resolved_runtime.upload, namespace, items)
+                    upload = partial(resolved_runtime.upload, namespace, items)
+                    if idempotency_key is not None:
+                        upload = partial(upload, idempotency_key=idempotency_key)
+                    result = await anyio.to_thread.run_sync(upload)
                     await mcp_endpoint.documents_changed(namespace, before, result["documents"])
                     return result
         except KnowledgeValidationError as exc:

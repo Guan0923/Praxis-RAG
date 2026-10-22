@@ -7,7 +7,8 @@ Embedding is required; Reranker is optional. Creation probes vector dimensions.
 The sidebar Knowledge Bases page lists each registered configuration and opens an
 editable drawer. Keys are masked; explicit reveal requires direct local access.
 Each knowledge base stores independent protected credentials, models, dimensions
-and collection in knowledge-bases.sqlite3. No global model settings are used.
+and collection in the shared `knowledge_bases` table (MySQL in production).
+No global model settings are used.
 
 Changing the Embedding URL, model or vector dimensions requires reembedding.
 Existing chunks and assets are copied into a new collection with new embeddings.

@@ -224,7 +224,7 @@ def test_word_chunk_strategies_preserve_table_headers(tmp_path, strategy):
     table = doc.add_table(rows=2, cols=2)
     table.cell(0, 0).text, table.cell(0, 1).text = "Model", "Limit"
     table.cell(1, 0).text, table.cell(1, 1).text = "ZX256", "90"
-    parsed = parse_word(save(doc, tmp_path), source_root=tmp_path, config=ChunkingConfig(strategy, 256, 16),
+    parsed = parse_word(save(doc, tmp_path), source_name="spec.docx", config=ChunkingConfig(strategy, 256, 16),
                         tokenizer_model="BAAI/bge-m3")
     rows = [c.text for c in parsed.chunks if c.metadata.get("asset_kind") == "table"]
     assert len(rows) == 2 and all("Model | Limit" in row for row in rows)
@@ -235,17 +235,21 @@ def test_word_asset_and_index_rollback_on_publication_failure(tmp_path, monkeypa
     from types import SimpleNamespace
     from qdrant_client import QdrantClient
     from rag_mcp.config import RagConfig
-    from rag_mcp.service_knowledge import DenseDocumentIngester, KnowledgeDocumentStore, KnowledgePaths
+    from rag_mcp.service_knowledge import DenseDocumentIngester, KnowledgeDocumentStore
+    from rag_mcp.state.store import StateStores
     from rag_mcp.storage.qdrant_store import QdrantStore
     from rag_mcp.sparse import Bm25SparseEncoder
     from rag_mcp.word_assets import read_word_content
 
-    documents = KnowledgeDocumentStore(KnowledgePaths(tmp_path / "tenant"))
+    state = StateStores.create(tmp_path / "state")
+    documents = KnowledgeDocumentStore(state, "tenant")
     client = QdrantClient(":memory:")
-    store = QdrantStore(collection="word_rollback", client=client, namespace="tenant")
+    store = QdrantStore(collection="word_rollback", client=client, namespace="tenant",
+                        active_versions=lambda: state.uploads.active_versions("tenant"))
     config = RagConfig(backend="qdrant", collection="word_rollback")
     embedder = SimpleNamespace(embed_documents=lambda texts: [[1.0]+[0.0]*1023 for _ in texts])
     ingester = DenseDocumentIngester(config, embedder, Bm25SparseEncoder(), store)
+
     def content(caption):
         doc = Document()
         doc.add_paragraph("Figure 1: " + caption, style="Caption")
@@ -253,20 +257,22 @@ def test_word_asset_and_index_rollback_on_publication_failure(tmp_path, monkeypa
         stream = io.BytesIO()
         doc.save(stream)
         return stream.getvalue()
+
     try:
         original = content("Previous")
         added = documents.store_and_index("image.docx", io.BytesIO(original), ingester)
-        source = documents.paths.knowledge_dir / "image.docx"
-        before = read_word_content(source, documents.paths.knowledge_dir)
-        def fail(_value):
-            raise OSError("controlled disk failure")
-        monkeypatch.setattr(documents, "_write_manifest", fail)
+        before = read_word_content(state, "tenant", "image.docx", added["chunking"])
+        original_upsert = state.documents.upsert
+        monkeypatch.setattr(state.documents, "upsert",
+                            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("controlled disk failure")))
         with pytest.raises(OSError, match="controlled disk failure"):
             documents.store_and_index("image.docx", io.BytesIO(content("Replacement")), ingester)
-        assert source.read_bytes() == original
-        assert read_word_content(source, documents.paths.knowledge_dir) == before
-        images = list((documents.paths.knowledge_dir / ".word-assets" / added["document_id"] / "images").glob("*"))
-        assert len(images) == 1 and images[0].read_bytes() == jpeg()
+        monkeypatch.setattr(state.documents, "upsert", original_upsert)
+        assert documents.read_source("image.docx") == original
+        assert read_word_content(state, "tenant", "image.docx", added["chunking"]) == before
+        keys = state.blobs.list_keys("tenant", "word-assets", document_id=added["document_id"])
+        images = [key for key in keys if "/images/" in key]
+        assert len(images) == 1 and state.blobs.get("tenant", "word-assets", images[0]) == jpeg()
         hits = store.dense_search([1.0]+[0.0]*1023, limit=10, filters={})
         assert any("Previous" in hit.payload["text"] for hit in hits)
         assert all("Replacement" not in hit.payload["text"] for hit in hits)
@@ -274,15 +280,16 @@ def test_word_asset_and_index_rollback_on_publication_failure(tmp_path, monkeypa
         client.close()
 
 
+
 def test_previous_word_parser_is_not_deduplicated(tmp_path):
     from test_mcp_http import ProtocolRuntime
     from rag_mcp.chunk_strategies import ChunkingConfig
     runtime = ProtocolRuntime(tmp_path)
-    runtime.create_knowledge_base("tenant", ChunkingConfig(), runtime.config.embedding_model, runtime.config.reranker_model, **runtime.provider_settings)
-    documents = runtime._tenant("tenant").documents
-    (documents.paths.knowledge_dir / "old.docx").write_bytes(b"old word")
-    documents._write_manifest({"old.docx": {"name": "old.docx", "sha256": "a"*64,
-                               "chunking": ChunkingConfig().metadata("BAAI/bge-m3")}})
+    runtime.create_knowledge_base("tenant", ChunkingConfig(), runtime.config.embedding_model)
+    runtime.state.blobs.put("tenant", "source", "old.docx", b"old word", document_id="doc-old")
+    runtime.state.documents.upsert("tenant", {"name": "old.docx", "document_id": "doc-old",
+                                              "sha256": "a"*64, "chunking": ChunkingConfig().metadata("BAAI/bge-m3"),
+                                              "collection": "c"})
     result = runtime.check_documents("tenant", [{"name": "old.docx", "sha256": "a"*64}])
     assert result["files"][0]["document"] is None
 

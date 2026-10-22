@@ -78,7 +78,7 @@ def test_http_rejects_per_upload_configuration_and_allows_local_creation(runtime
 def test_list_includes_document_workspaces_without_creation_record(runtime):
     runtime.create_knowledge_base("praxis", ChunkingConfig("character", 120, 20), "test-model", embedding={"base_url": runtime.provider_url})
     runtime.upload("praxis", [("existing.txt", io.BytesIO(b"Existing document. " * 30))])
-    KnowledgeBaseStore(runtime.data_root).path.unlink()
+    KnowledgeBaseStore(runtime.state).delete("praxis")
     app = create_service_app(runtime, settings=RagHttpSettings(data_root=runtime.data_root))
     with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 1234)) as client:
         response = client.get("/v1/admin/knowledge-bases")

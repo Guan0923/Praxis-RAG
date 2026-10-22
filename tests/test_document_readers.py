@@ -84,7 +84,7 @@ def test_ingester_exposes_pdf_read_error_as_safe_validation_error(tmp_path: Path
         raise ValueError("PDF parser failed")
     monkeypatch.setattr("rag_mcp.pdf_assets.parse_pdf", failed_parse)
     with pytest.raises(KnowledgeValidationError, match="PDF parser failed"):
-        ingester.ingest(source, source_root=tmp_path)
+        ingester.ingest(source, source_name="scan.pdf")
 
 
 def test_discovery_includes_pdf_and_word(tmp_path: Path) -> None:

@@ -2,11 +2,18 @@
 
 from fastapi.testclient import TestClient
 import anyio
+import base64
 import httpx2 as httpx
 import json
-import os
+
+import pytest
 
 from rag_mcp.http_service import RagHttpSettings, create_service_app
+
+
+@pytest.fixture(autouse=True)
+def _portable_encryption(monkeypatch):
+    monkeypatch.setenv("RAG_STATE_ENCRYPTION_KEY", "base64:" + base64.b64encode(b"k" * 32).decode())
 
 
 class Runtime:
@@ -29,10 +36,9 @@ def test_key_lifecycle_and_persistence(tmp_path):
         assert client.get("/v1/documents", headers={**headers, "X-RAG-Namespace": "other"}).status_code == 403
         assert client.get("/v1/admin/api-keys", headers=headers).status_code == 200
         assert key["key"] not in client.get("/v1/admin/api-keys", headers=admin).text
-        if os.name == "nt":
-            assert key["key"].encode() not in (tmp_path / "api-keys.sqlite3").read_bytes()
-        else:
-            assert (tmp_path / "api-keys.sqlite3").stat().st_mode & 0o077 == 0
+        database = (tmp_path / "state.sqlite3").read_bytes()
+        assert key["key"].encode() not in database
+        assert b"dpapi:" not in database
         assert client.post("/v1/admin/api-keys", headers=admin,
                            json={"name": "empty", "namespaces": []}).status_code == 422
     with TestClient(create_service_app(Runtime(), settings=settings), base_url="http://127.0.0.1", client=("127.0.0.1", 1234)) as client:
@@ -117,15 +123,15 @@ def test_mcp_requires_authorization_even_on_localhost(tmp_path):
 
 def test_digest_only_keys_are_preserved_but_cannot_be_exported(tmp_path):
     import hashlib
-    import sqlite3
     from rag_mcp.api_keys import ApiKeyStore
 
     secret = "prk_legacy_test_key"
-    with sqlite3.connect(tmp_path / "api-keys.sqlite3") as db:
-        db.execute("CREATE TABLE api_keys (id TEXT PRIMARY KEY, name TEXT, prefix TEXT, digest TEXT, namespaces TEXT, enabled INTEGER, created_at TEXT)")
-        db.execute("INSERT INTO api_keys VALUES (?, ?, ?, ?, ?, ?, ?)",
-                   ("old", "Old key", secret[:12], hashlib.sha256(secret.encode()).hexdigest(), '["alpha"]', 1, "2026-09-13"))
     store = ApiKeyStore(tmp_path)
+    store.repository.import_row(
+        key_id="old", name="Old key", prefix=secret[:12],
+        digest=hashlib.sha256(secret.encode()).hexdigest(),
+        namespaces=["alpha"], enabled=True, created_at="2026-09-13", protected_key=None,
+    )
     assert store.namespaces_for_key(secret) == ["alpha"]
     assert not store.list()[0]["exportable"]
     settings = RagHttpSettings(data_root=tmp_path)

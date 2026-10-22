@@ -19,9 +19,14 @@ class DocumentRequest:
 
     @classmethod
     def from_arguments(cls, arguments, *, writing: bool):
-        allowed = {"name", "content", "content_base64"} if writing else {"name"}
+        allowed = {"name", "content", "content_base64", "idempotency_key"} if writing else {"name"}
         if set(arguments) - allowed:
             raise KnowledgeValidationError("Unknown document arguments")
+        idempotency_key = arguments.get("idempotency_key")
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128
+        ):
+            raise KnowledgeValidationError("idempotency_key must be a string of 1 to 128 characters")
         name = arguments.get("name")
         if (not isinstance(name, str) or KnowledgeDocumentStore.sanitize_name(name) != name
                 or PureWindowsPath(name).is_reserved()):
@@ -53,7 +58,12 @@ class DocumentRequest:
                 raise KnowledgeValidationError("content_base64 is not valid Base64") from exc
         if not content or len(content) > MAX_FILE_BYTES:
             raise KnowledgeValidationError("File must be non-empty and no larger than 10 MiB")
-        return cls(name, content)
+        return DocumentWriteRequest(name, content, idempotency_key)
+
+
+@dataclass(frozen=True)
+class DocumentWriteRequest(DocumentRequest):
+    idempotency_key: str | None = None
 
 
 def document_tool_entries(mutate):
@@ -75,6 +85,10 @@ def document_tool_entries(mutate):
             properties.update(
                 content={"type": "string", "minLength": 1, "maxLength": MAX_FILE_BYTES},
                 content_base64={"type": "string", "minLength": 1, "maxLength": 4 * ((MAX_FILE_BYTES + 2) // 3)},
+                idempotency_key={
+                    "type": ["string", "null"], "minLength": 1, "maxLength": 128, "default": None,
+                    "description": "Optional non-secret retry key; reuse only for the same write. Not a credential.",
+                },
             )
             schema["oneOf"] = [{"required": ["content"]}, {"required": ["content_base64"]}]
 

@@ -27,7 +27,8 @@ from rag_mcp.knowledge_bases import KnowledgeBaseStore
 from rag_mcp.model_api import ModelConnection
 from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.resources import document_uri
-from rag_mcp.service_knowledge import IndexedDocument, KnowledgeDocumentStore, KnowledgePaths, RagServiceRuntime
+from rag_mcp.service_knowledge import IndexedDocument, KnowledgeDocumentStore, RagServiceRuntime
+from rag_mcp.state.store import StateStores
 
 AUTH = {"Authorization": "Bearer test-token", "X-RAG-Namespace": "manuals"}
 ADMIN = {"X-RAG-Namespace": "manuals"}
@@ -36,23 +37,30 @@ ADMIN = {"X-RAG-Namespace": "manuals"}
 class TestIngester:
     __test__ = False
 
-    def ingest(self, path, *, source_root, chunking=None):
+    def ingest(self, path, *, source_name, chunking=None):
         text = read_document_text(path)
-        if path.suffix in {".pdf", ".doc", ".docx"}:
-            # Protocol fixture supplies a saved parse; GPU parsing is tested separately.
-            from rag_mcp.chunking import _source_name, _stable_id
+        artifacts_dir = None
+        artifacts_bucket = None
+        if path.suffix in {".pdf", ".doc", ".docx"}:            # Protocol fixture supplies a saved parse; GPU parsing is tested separately.
+            from rag_mcp.chunking import _stable_id
             from rag_mcp.pdf_content import PDF_PARSER_VERSION
             from rag_mcp.word_reader import WORD_PARSER_VERSION
+            import tempfile
 
-            document_id = _stable_id("doc", _source_name(path, source_root).casefold())
+            document_id = _stable_id("doc", source_name.casefold())
             is_word = path.suffix != ".pdf"
-            folder = source_root / (".word-assets" if is_word else ".pdf-assets") / document_id
-            folder.mkdir(parents=True, exist_ok=True)
-            (folder / "manifest.json").write_text(json.dumps({"version": WORD_PARSER_VERSION if is_word else PDF_PARSER_VERSION}), encoding="utf-8")
-            (folder / "document.md").write_text(text, encoding="utf-8")
+            artifacts_dir = Path(tempfile.mkdtemp(prefix="test-assets-"))
+            artifacts_bucket = "word-assets" if is_word else "pdf-assets"
+            (artifacts_dir / "manifest.json").write_text(
+                json.dumps({"version": WORD_PARSER_VERSION if is_word else PDF_PARSER_VERSION}), encoding="utf-8"
+            )
+            (artifacts_dir / "document.md").write_text(text, encoding="utf-8")
+        else:
+            document_id = source_name
         if path.name == "fail.txt":
             raise ValueError("controlled indexing failure")
-        return IndexedDocument(path.name, 1, "test")
+        return IndexedDocument(document_id, 1, "test", artifacts_dir=artifacts_dir,
+                               artifacts_bucket=artifacts_bucket)
 
     def delete(self, document_id):
         pass
@@ -65,6 +73,7 @@ class ProtocolRuntime(RagServiceRuntime):
         self.config = RagConfig()
         self._connections = {"embedding": ModelConnection("http://unused.invalid/v1", self.config.embedding_model, vector_size=self.config.vector_size)}
         self.data_root = root
+        self.state = StateStores.create(root)
         self._tenants = {}
         self._tenant_lock = threading.RLock()
         self._inference_lock = threading.RLock()
@@ -78,14 +87,15 @@ class ProtocolRuntime(RagServiceRuntime):
                     "embedding_model": embedding_model, "reranker_model": reranker_model,
                     "collection": self.config.collection, "tokenizer": self.config.chunk_tokenizer_model,
                     **chunking.metadata(self.config.chunk_tokenizer_model)}
-        KnowledgeBaseStore(self.data_root).create(settings)
+        KnowledgeBaseStore(self.state).create(settings)
         return settings
 
     def _tenant(self, namespace):
         with self._tenant_lock:
             if namespace not in self._tenants:
                 self._tenants[namespace] = SimpleNamespace(
-                    documents=KnowledgeDocumentStore(KnowledgePaths(self.data_root / namespace)),
+                    state=self.state,
+                    documents=KnowledgeDocumentStore(self.state, namespace),
                     ingester=TestIngester(),
                     lock=threading.RLock(),
                 )
@@ -107,7 +117,7 @@ def running_service(root: Path, *, runtime=None):
     runtime = runtime or ProtocolRuntime(root)
     if isinstance(runtime, ProtocolRuntime):
         for namespace in ("manuals", "other"):
-            if KnowledgeBaseStore(runtime.data_root).get(namespace) is None:
+            if KnowledgeBaseStore(runtime.state).get(namespace) is None:
                 runtime.create_knowledge_base(namespace, ChunkingConfig(), runtime.config.embedding_model)
     settings = RagHttpSettings(
         data_root=root,
@@ -459,21 +469,18 @@ def test_noop_and_failed_writes_do_not_notify(tmp_path, monkeypatch):
                     assert (await http.post(url + "/v1/documents", files={"files": ("fail.txt", b"bad")})).json()[
                         "failed"
                     ]
-                    import os
+                    from rag_mcp.state.repositories import StateError
 
-                    catalog = app.state.mcp_endpoint.catalogs.for_namespace("manuals")
-                    original_replace = os.replace
+                    def fail_mutate(*_args, **_kwargs):
+                        raise StateError("controlled database failure")
 
-                    def fail_replace(source, target):
-                        if Path(target).name == "mcp_catalog.json":
-                            raise OSError("controlled atomic replacement failure")
-                        return original_replace(source, target)
-
-                    monkeypatch.setattr("rag_mcp.catalog.os.replace", fail_replace)
+                    monkeypatch.setattr(app.state.mcp_endpoint.state.catalogs, "mutate", fail_mutate)
                     failed = await http.patch(url + "/v1/admin/tools/search", headers=ADMIN, json={"enabled": False})
                     assert failed.status_code == 503
                     assert (await client.list_tools(cache_mode="refresh")).tools
-                    assert not list(catalog.root.glob(".mcp-catalog-*.tmp"))
+                    with anyio.move_on_after(0.2) as timeout:
+                        await anext(sub)
+                    assert timeout.cancel_called
                     with anyio.move_on_after(0.2) as timeout:
                         await anext(sub)
                     assert timeout.cancel_called

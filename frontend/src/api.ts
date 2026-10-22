@@ -33,6 +33,7 @@ export type DocumentInfo = {
   chunking?: Chunking;
   diagnostics?: WordDiagnostic[];
   skipped_object_count?: number;
+  operation_id?: string;
 };
 export type WordLocation = { part?: string; paragraph?: number; headings?: string[]; scope?: string };
 export type WordDiagnostic = { kind: string; message: string; location?: WordLocation; text?: string; asset_ids?: string[] };
@@ -78,7 +79,7 @@ export type SearchResult = {
 export type UploadResult = {
   imported: DocumentInfo[];
   skipped: (DocumentInfo & { requested_name?: string })[];
-  failed: { name: string; error: string }[];
+  failed: { name: string; error: string; operation_id?: string }[];
 };
 
 export const retrievalLabels = {

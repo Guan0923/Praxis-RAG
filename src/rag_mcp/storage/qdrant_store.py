@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -30,12 +31,14 @@ class QdrantStore:
         vector_size: int = DENSE_VECTOR_SIZE,
         namespace: str | None = None,
         client: Any | None = None,
+        active_versions: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         if url and path:
             raise ValueError("Set only one of url and path")
         self.collection = collection
         self.vector_size = vector_size
         self.namespace = namespace.strip() if namespace else None
+        self._active_versions = active_versions
         self._client = client or QdrantClient(url=url, path=str(path) if path else None)
 
     def ensure_collection(self) -> None:
@@ -57,6 +60,150 @@ class QdrantStore:
             },
             sparse_vectors_config={SPARSE_VECTOR_NAME: _sparse_vector_params()},
         )
+
+    def stage_version(
+        self,
+        chunks: Sequence[DocumentChunk],
+        vectors: Sequence[Sequence[float]],
+        sparse_vectors: Sequence[SparseEmbedding] | None,
+        asset_payloads: Sequence[dict[str, object]],
+        version: str,
+    ) -> int:
+        """Idempotently upsert one unpublished version without touching other points.
+
+        Publication is controlled only by the active_versions provider; staging
+        never changes visibility or removes previously stored versions.
+        """
+        if not version.strip():
+            raise ValueError("version must not be empty")
+        if len(chunks) != len(vectors):
+            raise ValueError("Chunk and vector counts must match")
+        if sparse_vectors is not None and len(chunks) != len(sparse_vectors):
+            raise ValueError("Chunk and sparse vector counts must match")
+        if not chunks:
+            return 0
+        document_ids = {chunk.document_id for chunk in chunks}
+        if len(document_ids) != 1:
+            raise ValueError("stage_version accepts chunks from exactly one document")
+        document_id = next(iter(document_ids))
+        if not document_id.strip():
+            raise ValueError("document_id must not be empty")
+        for vector in vectors:
+            if len(vector) != self.vector_size:
+                raise ValueError(f"Dense vector must have {self.vector_size} dimensions")
+        sparse_items: Sequence[SparseEmbedding | None]
+        sparse_items = sparse_vectors if sparse_vectors is not None else [None] * len(chunks)
+        points = []
+        for chunk, vector, sparse in zip(chunks, vectors, sparse_items, strict=True):
+            point_vectors: dict[str, Any] = {DENSE_VECTOR_NAME: list(vector)}
+            if sparse is not None and sparse.indices:
+                point_vectors[SPARSE_VECTOR_NAME] = _qdrant_sparse(sparse)
+            points.append(models.PointStruct(
+                id=self._version_point_id("chunk", chunk.chunk_id, version, document_id),
+                vector=point_vectors,
+                payload={
+                    "record_type": "chunk", "document_id": chunk.document_id,
+                    "chunk_id": chunk.chunk_id, "text": chunk.text,
+                    "title": chunk.title, "source": chunk.source,
+                    "metadata": {**dict(chunk.metadata), "upload_version": version}, "upload_version": version,
+                    **({"namespace": self.namespace} if self.namespace else {}),
+                },
+            ))
+        for payload in asset_payloads:
+            if payload.get("document_id") != document_id or not payload.get("asset_id"):
+                raise ValueError("Asset payload must belong to the staged document")
+            asset_payload = dict(payload)
+            asset_payload.pop("namespace", None)
+            points.append(models.PointStruct(
+                id=self._version_point_id("asset", str(payload["asset_id"]), version, document_id),
+                vector={},
+                payload={
+                    **asset_payload, "record_type": "asset", "upload_version": version,
+                    **({"namespace": self.namespace} if self.namespace else {}),
+                },
+            ))
+        self.ensure_collection()
+        self._client.upsert(collection_name=self.collection, points=points, wait=True)
+        return len(chunks)
+
+    def _version_point_id(self, record_type: str, item_id: str, version: str, document_id: str) -> str:
+        name = json.dumps(["version", self.namespace, document_id, version, record_type, item_id])
+        return str(uuid.uuid5(_POINT_NAMESPACE, name))
+
+    def delete_version(self, document_id: str, version: str) -> None:
+        """Delete only this document's version in this namespace, idempotently."""
+        if not document_id.strip() or not version.strip():
+            raise ValueError("document_id and version must not be empty")
+        if not self._client.collection_exists(self.collection):
+            return
+        self._client.delete(
+            collection_name=self.collection,
+            points_selector=models.FilterSelector(filter=self._version_scope_filter({
+                "document_id": document_id, "upload_version": version,
+            })),
+            wait=True,
+        )
+
+    def delete_legacy(self, document_id: str) -> None:
+        """Idempotently delete only this document's unversioned scoped points."""
+        if not document_id.strip():
+            raise ValueError("document_id must not be empty")
+        if not self._client.collection_exists(self.collection):
+            return
+        query_filter = self._version_scope_filter({"document_id": document_id})
+        query_filter.must = list(query_filter.must or []) + [models.IsEmptyCondition(
+            is_empty=models.PayloadField(key="upload_version"),
+        )]
+        self._client.delete(
+            collection_name=self.collection,
+            points_selector=models.FilterSelector(filter=query_filter),
+            wait=True,
+        )
+
+    def remove_old_versions(self, document_id: str, keep_version: str) -> None:
+        """Remove legacy and non-kept versions after publication, idempotently."""
+        if not document_id.strip() or not keep_version.strip():
+            raise ValueError("document_id and keep_version must not be empty")
+        if not self._client.collection_exists(self.collection):
+            return
+        query_filter = self._version_scope_filter({"document_id": document_id})
+        query_filter.must_not = [models.FieldCondition(
+            key="upload_version", match=models.MatchValue(value=keep_version),
+        )]
+        self._client.delete(
+            collection_name=self.collection,
+            points_selector=models.FilterSelector(filter=query_filter),
+            wait=True,
+        )
+
+    def cleanup_versions(self, document_id: str, keep_version: str) -> None:
+        """Remove every scoped version except the published version."""
+        self.remove_old_versions(document_id, keep_version)
+
+    def _version_scope_filter(self, values: dict[str, str | int | float | bool]) -> models.Filter:
+        query_filter = _payload_filter(self._scoped(values))
+        if self.namespace is None:
+            query_filter.must = list(query_filter.must or []) + [models.IsEmptyCondition(
+                is_empty=models.PayloadField(key="namespace"),
+            )]
+        return query_filter
+
+    def _query_filter(self, values: dict[str, str | int | float | bool]) -> models.Filter:
+        active = dict(self._active_versions()) if self._active_versions is not None else {}
+        legacy = models.Filter(must=[models.IsEmptyCondition(
+            is_empty=models.PayloadField(key="upload_version"),
+        )])
+        if active:
+            legacy.must_not = [models.FieldCondition(
+                key="document_id", match=models.MatchAny(any=list(active)),
+            )]
+        publication = models.Filter(should=[
+            _payload_filter({"document_id": document_id, "upload_version": version})
+            for document_id, version in active.items() if version
+        ] + [legacy])
+        query_filter = self._version_scope_filter(values)
+        query_filter.must = list(query_filter.must or []) + [publication]
+        return query_filter
 
     def replace_document(
         self,
@@ -89,7 +236,7 @@ class QdrantStore:
         while True:
             page, offset = self._client.scroll(
                 collection_name=self.collection,
-                scroll_filter=_payload_filter(self._scoped({"document_id": document_id})),
+                scroll_filter=self._version_scope_filter({"document_id": document_id}),
                 offset=offset, limit=256, with_payload=True, with_vectors=True,
             )
             old_points.extend(page)
@@ -151,11 +298,11 @@ class QdrantStore:
         if self._client.collection_exists(self.collection):
             while True:
                 points, offset = self._client.scroll(
-                    collection_name=self.collection, scroll_filter=_payload_filter(self._scoped({})),
+                    collection_name=self.collection, scroll_filter=self._query_filter({}),
                     offset=offset, limit=64, with_payload=True, with_vectors=True,
                 )
                 chunks = [point for point in points if (point.payload or {}).get("record_type") == "chunk"]
-                vectors = embedder.embed_documents([point.payload["text"] for point in chunks])
+                vectors = embedder.embed_documents([point.payload["text"] for point in chunks]) if chunks else []
                 dense = {str(point.id): vector for point, vector in zip(chunks, vectors, strict=True)}
                 replacements = []
                 for point in points:
@@ -176,10 +323,18 @@ class QdrantStore:
         if not asset_ids:
             return {}
         self.ensure_collection()
-        points = self._client.retrieve(
-            collection_name=self.collection, ids=[self._point_id(value) for value in dict.fromkeys(asset_ids)],
-            with_payload=True, with_vectors=False,
-        )
+        points = []
+        offset = None
+        query = self._query_filter({"record_type": "asset"})
+        query.must = list(query.must or []) + [models.FieldCondition(
+            key="asset_id", match=models.MatchAny(any=list(dict.fromkeys(asset_ids))))]
+        while True:
+            page, offset = self._client.scroll(
+                collection_name=self.collection, scroll_filter=query, offset=offset,
+                limit=256, with_payload=True, with_vectors=False)
+            points.extend(page)
+            if offset is None:
+                break
         result = {}
         for point in points:
             payload = dict(point.payload or {})
@@ -214,7 +369,7 @@ class QdrantStore:
         self.ensure_collection()
         self._client.delete(
             collection_name=self.collection,
-            points_selector=models.FilterSelector(filter=_payload_filter(self._scoped({"document_id": document_id}))),
+            points_selector=models.FilterSelector(filter=self._version_scope_filter({"document_id": document_id})),
             wait=True,
         )
 
@@ -234,7 +389,7 @@ class QdrantStore:
             collection_name=self.collection,
             query=list(vector),
             using=DENSE_VECTOR_NAME,
-            query_filter=_payload_filter(self._scoped(filters)) if filters or self.namespace else None,
+            query_filter=self._query_filter(filters),
             limit=limit,
             with_payload=True,
         )
@@ -267,7 +422,7 @@ class QdrantStore:
             collection_name=self.collection,
             query=_qdrant_sparse(vector),
             using=SPARSE_VECTOR_NAME,
-            query_filter=_payload_filter(self._scoped(filters)) if filters or self.namespace else None,
+            query_filter=self._query_filter(filters),
             limit=limit,
             with_payload=True,
         )
@@ -288,7 +443,7 @@ class QdrantStore:
         if not sparse.indices:
             return self.dense_search(dense, limit=limit, filters=filters)
         self.ensure_collection()
-        query_filter = _payload_filter(self._scoped(filters)) if filters or self.namespace else None
+        query_filter = self._query_filter(filters)
         response = self._client.query_points(
             collection_name=self.collection,
             prefetch=[

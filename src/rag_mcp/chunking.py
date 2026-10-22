@@ -47,6 +47,7 @@ def chunk_document(
     path: Path,
     *,
     source_root: Path | None = None,
+    source_name: str | None = None,
     chunk_size: int = 700,
     overlap: int = 100,
     config: ChunkingConfig | None = None,
@@ -55,7 +56,7 @@ def chunk_document(
     """Extract one supported document and split it into stable chunks."""
 
     if config is not None and config.strategy != "character":
-        return _token_chunks(path, source_root, config, tokenizer_model)
+        return _token_chunks(path, source_root, config, tokenizer_model, source_name=source_name)
     if config is not None:
         chunk_size, overlap = config.chunk_size, config.chunk_overlap
     if chunk_size < 100:
@@ -68,7 +69,7 @@ def chunk_document(
     text = _normalize_text(document.original_text)
     if not text:
         return []
-    source = _source_name(resolved, source_root)
+    source = source_name or _source_name(resolved, source_root)
     document_id = _stable_id("doc", source.casefold())
     title = _title(text, resolved.stem)
     spans = []
@@ -100,13 +101,14 @@ def chunk_document(
     return chunks
 
 
-def _token_chunks(path: Path, root: Path | None, config: ChunkingConfig, model: str) -> list[DocumentChunk]:
+def _token_chunks(path: Path, root: Path | None, config: ChunkingConfig, model: str,
+                  *, source_name: str | None = None) -> list[DocumentChunk]:
     resolved = path.expanduser().resolve()
     document = read_document(resolved)
     if not document.text.strip():
         return []
     budget = TokenBudget(get_tokenizer(model), config)
-    source = _source_name(resolved, root)
+    source = source_name or _source_name(resolved, root)
     document_id = _stable_id("doc", source.casefold())
     title = _title(document.text, resolved.stem)
     result = []

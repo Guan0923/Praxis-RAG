@@ -1,12 +1,13 @@
 """Knowledge-base configuration and protected per-base provider credentials."""
 
-import json
-import os
+from __future__ import annotations
+
 from pathlib import Path
-import sqlite3
 
 from .model_api import ModelConnection
 from .model_settings import KINDS, _protect, _unprotect
+from .state.store import StateStores
+from .state.repositories import StateConflict
 
 
 def stored_connection(connection: ModelConnection) -> dict:
@@ -28,51 +29,27 @@ def public_settings(settings: dict) -> dict:
 
 
 class KnowledgeBaseStore:
-    def __init__(self, root: Path):
-        self.path = root / "knowledge-bases.sqlite3"
+    """Compatibility facade over the shared knowledge-base repository."""
+
+    def __init__(self, state: StateStores | Path):
+        self._owned = state if isinstance(state, StateStores) else StateStores.create(state)
+        self.state = self._owned
+        self.repository = self._owned.knowledge_bases
 
     def list(self) -> list[dict]:
-        if not self.path.exists():
-            return []
-        db = sqlite3.connect(self.path)
-        try:
-            return [json.loads(row[0]) for row in db.execute("SELECT settings FROM knowledge_bases ORDER BY namespace")]
-        finally:
-            db.close()
+        return self.repository.list()
 
     def get(self, namespace: str) -> dict | None:
-        if not self.path.exists():
-            return None
-        db = sqlite3.connect(self.path)
-        try:
-            row = db.execute("SELECT settings FROM knowledge_bases WHERE namespace = ?", (namespace,)).fetchone()
-            return json.loads(row[0]) if row else None
-        finally:
-            db.close()
+        return self.repository.get(namespace)
 
     def create(self, settings: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.touch(mode=0o600, exist_ok=True)
-        if os.name != "nt":
-            self.path.chmod(0o600)
-        db = sqlite3.connect(self.path)
         try:
-            with db:
-                db.execute("CREATE TABLE IF NOT EXISTS knowledge_bases (namespace TEXT PRIMARY KEY, settings TEXT NOT NULL)")
-                db.execute("INSERT INTO knowledge_bases VALUES (?, ?)",
-                           (settings["namespace"], json.dumps(settings, ensure_ascii=False)))
-        finally:
-            db.close()
+            self.repository.create(settings)
+        except StateConflict as exc:
+            raise LookupError("该知识库已存在") from exc
 
     def update(self, settings: dict) -> None:
-        if os.name != "nt":
-            self.path.chmod(0o600)
-        db = sqlite3.connect(self.path)
-        try:
-            with db:
-                changed = db.execute("UPDATE knowledge_bases SET settings = ? WHERE namespace = ?",
-                                     (json.dumps(settings, ensure_ascii=False), settings["namespace"])).rowcount
-                if not changed:
-                    raise LookupError("知识库不存在")
-        finally:
-            db.close()
+        self.repository.update(settings)
+
+    def delete(self, namespace: str) -> bool:
+        return self.repository.delete(namespace)

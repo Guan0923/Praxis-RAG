@@ -2,14 +2,12 @@
 
 import hashlib
 import io
-import pytest
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi.testclient import TestClient
 
 from rag_mcp.chunk_strategies import ChunkingConfig, LEGACY_CONFIG
 from rag_mcp.http_service import RagHttpSettings, create_service_app
-from rag_mcp.service_knowledge import KnowledgeValidationError
 from test_mcp_http import ProtocolRuntime
 
 
@@ -53,14 +51,14 @@ def test_legacy_records_and_missing_sources(tmp_path):
     runtime.create_knowledge_base("legacy", LEGACY_CONFIG, runtime.config.embedding_model)
     runtime.upload("legacy", [("old.txt", io.BytesIO(b"old"))])
     store = runtime._tenant("legacy").documents
-    manifest = store._read_manifest()
-    manifest["old.txt"].pop("sha256")
-    manifest["old.txt"].pop("chunking")
-    store._write_manifest(manifest)
+    record = runtime.state.documents.get("legacy", "old.txt")
+    record.pop("sha256")
+    record.pop("chunking")
+    runtime.state.documents.upsert("legacy", record)
     fingerprint = hashlib.sha256(b"old").hexdigest()
     assert store.find_duplicate(fingerprint, LEGACY_CONFIG.metadata("BAAI/bge-m3"))["name"] == "old.txt"
-    assert store._read_manifest()["old.txt"]["sha256"] == fingerprint
-    (store.paths.knowledge_dir / "old.txt").unlink()
+    assert runtime.state.documents.get("legacy", "old.txt")["sha256"] == fingerprint
+    runtime.state.blobs.delete_key("legacy", "source", "old.txt")
     assert store.find_duplicate(fingerprint, LEGACY_CONFIG.metadata("BAAI/bge-m3")) is None
 
 

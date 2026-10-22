@@ -11,14 +11,13 @@ from fastapi.testclient import TestClient
 from rag_mcp.config import RagConfig, RagConfigError
 from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.migrate import discover_legacy_sources, namespace_for_legacy_user
-from rag_mcp.model_api import ModelConnection
 from rag_mcp.service_knowledge import (
     IndexedDocument,
     KnowledgeDocumentStore,
-    KnowledgePaths,
     KnowledgeValidationError,
     RagServiceRuntime,
 )
+from rag_mcp.state.store import StateStores
 
 NAMESPACE = "user-0123456789abcdef"
 AUTH = {"Authorization": "Bearer test-token", "X-RAG-Namespace": NAMESPACE}
@@ -110,6 +109,8 @@ def test_runtime_health_reports_http_configuration_without_calling_models() -> N
         reranker_model="local/reranker",
         reranker_device="cpu",
     )
+    from types import SimpleNamespace
+    runtime.state = SimpleNamespace(describe=lambda: {"backend": "sqlite"})
     status = runtime.status()
 
     assert status["service"] == "praxis-rag"
@@ -219,30 +220,31 @@ class FakeIngester:
     def __init__(self) -> None:
         self.deleted: list[str] = []
 
-    def ingest(self, path: Path, *, source_root: Path, chunking=None) -> IndexedDocument:
-        assert path.parent == source_root
+    def ingest(self, path: Path, *, source_name: str, chunking=None) -> IndexedDocument:
         if "FAIL_INDEX" in path.read_text(encoding="utf-8"):
             raise RuntimeError("simulated index failure")
-        return IndexedDocument(f"doc-{path.stem}", 1, "test_hybrid")
+        return IndexedDocument(f"doc-{Path(source_name).stem}", 1, "test_hybrid")
 
     def delete(self, document_id: str) -> None:
         self.deleted.append(document_id)
 
 
 def test_service_owned_store_rolls_back_failed_replacement(tmp_path: Path) -> None:
-    store = KnowledgeDocumentStore(KnowledgePaths(tmp_path / NAMESPACE))
+    state = StateStores.create(tmp_path / "state")
+    store = KnowledgeDocumentStore(state, NAMESPACE)
     ingester = FakeIngester()
     store.store_and_index("guide.md", io.BytesIO(b"first"), ingester)
 
     with pytest.raises(RuntimeError, match="simulated"):
         store.store_and_index("guide.md", io.BytesIO(b"FAIL_INDEX"), ingester)
 
-    assert (store.paths.knowledge_dir / "guide.md").read_text(encoding="utf-8") == "first"
+    assert store.read_source("guide.md") == b"first"
     assert store.list_documents()[0]["document_id"] == "doc-guide"
 
 
 def test_service_owned_store_accepts_document_formats_and_confines_names(tmp_path: Path) -> None:
-    store = KnowledgeDocumentStore(KnowledgePaths(tmp_path / NAMESPACE))
+    state = StateStores.create(tmp_path / "state")
+    store = KnowledgeDocumentStore(state, NAMESPACE)
 
     store.validate_uploads(
         [
@@ -256,7 +258,6 @@ def test_service_owned_store_accepts_document_formats_and_confines_names(tmp_pat
         store.validate_uploads([("unsupported.exe", io.BytesIO(b"binary"))])
 
     assert store.sanitize_name("../outside.md") == "_outside.md"
-    assert store.paths.knowledge_dir in store._confined_target("safe.md").parents
 
 
 def test_legacy_migration_preview_discovers_sources_without_moving_them(tmp_path: Path) -> None:

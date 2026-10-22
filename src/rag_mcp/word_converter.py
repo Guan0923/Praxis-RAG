@@ -7,11 +7,11 @@ import shutil
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 
 @contextmanager
-def word_source(path: Path, converter: Path | None = None, timeout: int = 120):
+def word_source(path: Path, converter: Path | None = None, timeout: int = 120, *, workspace: Path | None = None):
     if path.suffix.lower() != ".doc":
         yield path
         return
@@ -25,8 +25,10 @@ def word_source(path: Path, converter: Path | None = None, timeout: int = 120):
                 break
     if not executable:
         raise ValueError("DOC conversion requires LibreOffice; set RAG_WORD_CONVERTER_PATH")
-    with TemporaryDirectory(prefix="rag-word-") as directory:
+    directory_context = TemporaryDirectory(prefix="rag-word-") if workspace is None else nullcontext(workspace)
+    with directory_context as directory:
         root = Path(directory)
+        root.mkdir(parents=True, exist_ok=True)
         profile = root / "profile"
         user = profile / "user"
         user.mkdir(parents=True)

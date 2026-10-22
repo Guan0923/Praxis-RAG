@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 from threading import RLock
 from typing import Literal
-from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, model_validator
 
 from .service_knowledge import KnowledgeError
+from .state.repositories import StateError
+from .state.store import StateStores
 
 NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
 _PLACEHOLDER = re.compile(r"\{\{([A-Za-z0-9_.-]+)\}\}")
@@ -92,72 +92,73 @@ class CatalogData(BaseModel):
 
 
 class NamespaceCatalog:
-    def __init__(self, root: Path) -> None:
-        self.root = root
+    """One namespace's tool/prompt settings stored in the shared database."""
+
+    def __init__(self, state: StateStores, namespace: str) -> None:
+        self.state = state
+        self.namespace = namespace
         self.lock = RLock()
 
     def snapshot(self) -> CatalogData:
         with self.lock:
-            path = self._path()
             try:
-                return (
-                    CatalogData.model_validate_json(path.read_text(encoding="utf-8"))
-                    if path.exists()
-                    else CatalogData()
-                )
-            except (OSError, ValueError) as exc:
+                raw = self.state.catalogs.load(self.namespace)
+            except StateError as exc:
+                raise KnowledgeError("MCP configuration cannot be read") from exc
+            if raw is None:
+                return CatalogData()
+            try:
+                return CatalogData.model_validate_json(raw)
+            except ValueError as exc:
                 raise KnowledgeError("MCP configuration cannot be read") from exc
 
-    def _path(self) -> Path:
-        if self.root.is_symlink() or (self.root / "mcp_catalog.json").is_symlink():
-            raise KnowledgeError("MCP configuration cannot be a symbolic link")
-        return self.root / "mcp_catalog.json"
+    def _mutate(self, transform):
+        with self.lock:
+            def apply(raw: str | None):
+                try:
+                    data = CatalogData() if raw is None else CatalogData.model_validate_json(raw)
+                except ValueError as exc:
+                    raise KnowledgeError("MCP configuration cannot be read") from exc
+                changed, result = transform(data)
+                return data.model_dump_json(indent=2), result, changed
 
-    def _save(self, data: CatalogData) -> None:
-        target = self._path()
-        temporary = self.root / f".mcp-catalog-{uuid4().hex}.tmp"
-        try:
-            self.root.mkdir(parents=True, exist_ok=True)
-            with temporary.open("x", encoding="utf-8") as handle:
-                handle.write(data.model_dump_json(indent=2))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, target)
-        except OSError as exc:
-            raise KnowledgeError("MCP configuration cannot be saved") from exc
-        finally:
-            temporary.unlink(missing_ok=True)
+            try:
+                return self.state.catalogs.mutate(self.namespace, apply)
+            except StateError as exc:
+                raise KnowledgeError("MCP configuration cannot be saved") from exc
 
     def patch_tool(self, name: str, patch: ToolPatch, defaults: dict[str, object]) -> bool:
-        with self.lock:
-            data = self.snapshot()
+        def apply(data: CatalogData):
             previous = {**defaults, **data.tools.get(name, {})}
             updated = {**previous, **patch.model_dump(exclude_unset=True)}
             if previous == updated:
-                return False
+                return False, False
             data.tools[name] = updated
-            self._save(data)
-            return True
+            return True, True
+
+        return bool(self._mutate(apply))
 
     def put_prompt(self, name: str, prompt: PromptDefinition) -> bool:
         self._validate_name(name)
-        with self.lock:
-            data = self.snapshot()
+
+        def apply(data: CatalogData):
             if data.prompts.get(name) == prompt:
-                return False
+                return False, False
             data.prompts[name] = prompt
-            self._save(data)
-            return True
+            return True, True
+
+        return bool(self._mutate(apply))
 
     def delete_prompt(self, name: str) -> bool:
         self._validate_name(name)
-        with self.lock:
-            data = self.snapshot()
+
+        def apply(data: CatalogData):
             if name not in data.prompts:
                 raise KeyError(name)
             del data.prompts[name]
-            self._save(data)
-            return True
+            return True, True
+
+        return bool(self._mutate(apply))
 
     @staticmethod
     def _validate_name(name: str) -> None:
@@ -166,10 +167,9 @@ class NamespaceCatalog:
 
 
 class CatalogStore:
-    def __init__(self, data_root: Path) -> None:
-        if data_root.expanduser().is_symlink():
-            raise KnowledgeError("MCP data root cannot be a symbolic link")
-        self.root = data_root.expanduser().resolve()
+    def __init__(self, state: StateStores | Path) -> None:
+        self._owned = state if isinstance(state, StateStores) else StateStores.create(state)
+        self.state = self._owned
         self._catalogs: dict[str, NamespaceCatalog] = {}
         self._lock = RLock()
 
@@ -178,5 +178,5 @@ class CatalogStore:
             raise ValueError("Invalid namespace")
         with self._lock:
             if namespace not in self._catalogs:
-                self._catalogs[namespace] = NamespaceCatalog(self.root / namespace)
+                self._catalogs[namespace] = NamespaceCatalog(self.state, namespace)
             return self._catalogs[namespace]

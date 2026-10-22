@@ -172,8 +172,10 @@ export function DocumentsPage({
         setStage("正在生成索引");
         const body = new FormData();
         pending.forEach((file) => body.append("files", file));
+        const idempotencyKey = crypto.randomUUID();
         result = await api<UploadResult>("/v1/documents", connection, {
           ...options,
+          headers: { "Idempotency-Key": idempotencyKey },
           body,
         });
       }

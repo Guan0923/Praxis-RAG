@@ -103,7 +103,7 @@ def test_ten_mib_file_fits_base64_transport(tmp_path, mode):
     from rag_mcp.service_knowledge import MAX_FILE_BYTES
 
     content = ("\u4e2d" * (MAX_FILE_BYTES // 3)).encode() + b"x" * (MAX_FILE_BYTES % 3)
-    with running_service(tmp_path) as (url, _, _):
+    with running_service(tmp_path) as (url, _, runtime):
         async def scenario():
             async with mcp_client(url, mode, timeout=30) as client:
                 result = payload(await client.call_tool("add_document", {
@@ -114,7 +114,7 @@ def test_ten_mib_file_fits_base64_transport(tmp_path, mode):
                     "name": "large.txt", "content_base64": base64.b64encode(content + b"x").decode(),
                 })
                 assert rejected.is_error
-                assert (tmp_path / "manuals/knowledge/large.txt").stat().st_size == MAX_FILE_BYTES
+                assert len(runtime.state.blobs.get("manuals", "source", "large.txt")) == MAX_FILE_BYTES
         anyio.run(scenario)
 
 

@@ -15,6 +15,7 @@ from rag_mcp.pdf_assets import project_results
 from rag_mcp.pdf_worker import _validate_table
 from rag_mcp.server import RegisteredTool, ToolRegistry, search_tool_definition
 from rag_mcp.storage.qdrant_store import QdrantStore
+from rag_mcp.state.store import StateStores
 
 
 def _vector() -> list[float]:
@@ -26,7 +27,7 @@ def _chunk(asset_id: str, kind: str = "picture") -> DocumentChunk:
                          {"asset_id": asset_id, "asset_kind": kind, "page": 2})
 
 
-def test_qdrant_asset_has_no_vector_and_projection_returns_original_image() -> None:
+def test_qdrant_asset_has_no_vector_and_projection_returns_original_image(tmp_path) -> None:
     client = QdrantClient(":memory:")
     store = QdrantStore(collection="pdf-assets", client=client, namespace="tenant")
     asset_id = "doc-1:#/pictures/0"
@@ -44,7 +45,10 @@ def test_qdrant_asset_has_no_vector_and_projection_returns_original_image() -> N
     candidate = Candidate("doc-1", "chunk-picture", "PDF", "manual.pdf", "private retrieval description",
                           0.9, {"asset_id": asset_id, "asset_kind": "picture", "page": 2})
 
-    result = project_results([candidate], store, root)[0]
+    state = StateStores.create(tmp_path)
+    state.blobs.put("tenant", "pdf-assets", "doc-1/pictures/image.png", image)
+    result = project_results([candidate], store, state, "tenant")[0]
+    state.close()
 
     assert base64.b64decode(result["asset"]["data"]) == image
     encoded = json.dumps(result, ensure_ascii=False)
@@ -53,7 +57,7 @@ def test_qdrant_asset_has_no_vector_and_projection_returns_original_image() -> N
     assert "must stay private" not in encoded
 
 
-def test_table_projection_preserves_cells_and_spans() -> None:
+def test_table_projection_preserves_cells_and_spans(tmp_path) -> None:
     client = QdrantClient(":memory:")
     store = QdrantStore(collection="pdf-table", client=client, namespace="tenant")
     asset_id = "doc-1:#/tables/0"
@@ -69,7 +73,9 @@ def test_table_projection_preserves_cells_and_spans() -> None:
     candidate = Candidate("doc-1", "chunk-table", "PDF", "manual.pdf", "private", 0.8,
                           {"asset_id": asset_id, "asset_kind": "table"})
 
-    asset = project_results([candidate], store, Path(".test-tmp/pdf-assets-tests/table").resolve())[0]["asset"]
+    state = StateStores.create(tmp_path)
+    asset = project_results([candidate], store, state, "tenant")[0]["asset"]
+    state.close()
 
     assert asset["rows"][1] == ["A", "1.25"]
     assert asset["cells"][0]["col_span"] == 2

@@ -1,6 +1,7 @@
 """Opt-in real CUDA PDF parsing, HTTP ingestion, Qdrant retrieval and MCP reads."""
 
 import hashlib
+import io
 import json
 import os
 import threading
@@ -20,13 +21,16 @@ from test_mcp_http import AUTH, mcp_client, running_service
 from model_api_test_support import configure_api_runtime
 
 
-def check_saved_fidelity(client, collection, folder, document_id):
+def check_saved_fidelity(client, collection, state, namespace, document_id):
     from docling_core.types.doc import DoclingDocument
     from qdrant_client import models
     from rag_mcp.pdf_content import table_row_text
 
-    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-    native = DoclingDocument.load_from_json(folder / "document.json")
+    bucket = "pdf-assets"
+    manifest = json.loads(state.blobs.get_text(namespace, bucket, f"{document_id}/manifest.json"))
+    native = DoclingDocument.load_from_json(
+        io.BytesIO(state.blobs.get(namespace, bucket, f"{document_id}/document.json"))
+    )
     native_items = {item.self_ref: item for item, _ in native.iterate_items()}
     native_order = list(native_items)
     order = [native_order.index(block["ref"]) for block in manifest["blocks"]]
@@ -43,14 +47,14 @@ def check_saved_fidelity(client, collection, folder, document_id):
         if offset is None:
             break
     chunks = [point for point in payloads if point["record_type"] == "chunk"]
-    ocr = json.loads((folder / "ocr.json").read_text(encoding="utf-8"))
+    ocr = json.loads(state.blobs.get_text(namespace, bucket, f"{document_id}/ocr.json"))
     low_pages = {cell["page"] for cell in ocr if cell["confidence"] < 0.5}
     assert low_pages == {warning["page"] for warning in manifest.get("warnings", [])}
     for point in chunks:
         metadata = point["metadata"]
         if low_pages.intersection(metadata.get("pages", [metadata.get("page")])):
             assert metadata.get("source_warnings")
-    body = (folder / "document.md").read_text(encoding="utf-8")
+    body = state.blobs.get_text(namespace, bucket, f"{document_id}/document.md")
     formulas = [item for item in native.texts if item.label.value == "formula"]
     for item in formulas:
         block = next(block for block in manifest["blocks"] if block["ref"] == item.self_ref)
@@ -68,7 +72,7 @@ def check_saved_fidelity(client, collection, folder, document_id):
             headers = "\n".join(table_row_text(row) for row in asset["table"]["header_rows"])
             assert all(headers in point["text"] for point in rows)
         else:
-            assert (folder / asset["image_file"]).is_file()
+            assert state.blobs.get(namespace, bucket, asset["image_file"]) is not None
     return {"native_order_preserved": True, "formula_latex_preserved": len(formulas),
             "assets_preserved": len(manifest["assets"]), "indexed_chunks": len(chunks)}
 
@@ -106,9 +110,10 @@ def test_real_pdf_ingestion_resources_and_retrieval():
                         if payload.get("failed") or not payload.get("imported"):
                             continue
                         record = payload["imported"][0]
-                        folder = root / "data/manuals/knowledge/.pdf-assets" / record["document_id"]
-                        manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-                        row["preservation"] = check_saved_fidelity(runtime._client, runtime.config.collection, folder, record["document_id"])
+                        manifest = json.loads(runtime.state.blobs.get_text(
+                            "manuals", "pdf-assets", f"{record['document_id']}/manifest.json"))
+                        row["preservation"] = check_saved_fidelity(
+                            runtime._client, runtime.config.collection, runtime.state, "manuals", record["document_id"])
                         row["parser"] = manifest["parser"]
                         row["metrics"] = manifest["metrics"]
                         row["formula_count"] = sum(block["kind"] == "formula" for block in manifest["blocks"])
@@ -123,7 +128,8 @@ def test_real_pdf_ingestion_resources_and_retrieval():
                             "strategy": "recursive", "chunk_size": 256, "chunk_overlap": 32,
                         })
                         assert checked.json()["files"][0]["document"]["name"] == name
-                        original_text = (folder / "document.md").read_text(encoding="utf-8")
+                        original_text = runtime.state.blobs.get_text(
+                            "manuals", "pdf-assets", f"{record['document_id']}/document.md")
                         pages = []
                         async with mcp_client(url) as client:
                             uri = document_uri("manuals", name)

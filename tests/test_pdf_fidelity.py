@@ -3,6 +3,7 @@
 import copy
 import io
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,8 +15,9 @@ from rag_mcp.config import RagConfig
 from rag_mcp.pdf_assets import ParsedPdf, read_pdf_content
 from rag_mcp.pdf_content import PDF_PARSER_VERSION, content_chunks, render_content
 from rag_mcp.resources import paragraph_pages
-from rag_mcp.service_knowledge import DenseDocumentIngester, KnowledgeDocumentStore, KnowledgePaths
+from rag_mcp.service_knowledge import DenseDocumentIngester, KnowledgeDocumentStore
 from rag_mcp.sparse import Bm25SparseEncoder
+from rag_mcp.state.store import StateStores
 from rag_mcp.storage.qdrant_store import QdrantStore
 
 
@@ -107,59 +109,57 @@ def test_docling_export_preserves_short_and_unlinked_captions(tmp_path):
 
 def test_pdf_publish_failure_restores_source_assets_manifest_and_vectors(tmp_path, monkeypatch):
     import rag_mcp.pdf_assets as assets_module
+    import tempfile
 
-    paths = KnowledgePaths(tmp_path / "tenant")
-    documents = KnowledgeDocumentStore(paths)
+    state = StateStores.create(tmp_path / "state")
+    documents = KnowledgeDocumentStore(state, "tenant")
     client = QdrantClient(":memory:")
-    store = QdrantStore(collection="rollback", client=client, namespace="tenant")
+    store = QdrantStore(collection="rollback", client=client, namespace="tenant",
+                        active_versions=lambda: state.uploads.active_versions("tenant"))
     config = RagConfig(backend="qdrant", collection="rollback")
     embedder = SimpleNamespace(embed_documents=lambda texts: [[1.0] + [0.0] * 1023 for _ in texts])
     ingester = DenseDocumentIngester(config, embedder, Bm25SparseEncoder(), store)
     document_id = _stable_id("doc", "paper.pdf")
 
-    def parsed(path, **kwargs):
+    def parsed(path, *, source_name, **kwargs):
         data = manifest_fixture()
         data["blocks"][0]["text"] = path.read_text(encoding="utf-8")
         data["assets"] = []
         data["blocks"] = [data["blocks"][0]]
-        stage = paths.knowledge_dir / ".pdf-assets" / ".stage"
-        stage.mkdir(parents=True)
+        stage = Path(tempfile.mkdtemp(prefix="pdf-stage-"))
         (stage / "manifest.json").write_text(json.dumps(data), encoding="utf-8")
         (stage / "document.md").write_text(render_content(data), encoding="utf-8")
-        chunks = content_chunks(data, document_id, "paper.pdf", "Paper", ChunkingConfig(), "BAAI/bge-m3")
+        chunks = content_chunks(data, document_id, source_name, "Paper", ChunkingConfig(), "BAAI/bge-m3")
         return ParsedPdf(chunks, [], stage)
 
     monkeypatch.setattr(assets_module, "parse_pdf", parsed)
     documents.store_and_index("paper.pdf", io.BytesIO(b"old formula"), ingester, ChunkingConfig())
-    old_manifest = copy.deepcopy(documents._read_manifest())
-    original_write = documents._write_manifest
-    monkeypatch.setattr(documents, "_write_manifest", lambda value: (_ for _ in ()).throw(OSError("disk full")))
+    old_record = copy.deepcopy(state.documents.get("tenant", "paper.pdf"))
+    original_upsert = state.documents.upsert
+    monkeypatch.setattr(state.documents, "upsert",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")))
     with pytest.raises(OSError, match="disk full"):
         documents.store_and_index("paper.pdf", io.BytesIO(b"new formula"), ingester, ChunkingConfig())
-    monkeypatch.setattr(documents, "_write_manifest", original_write)
-    assert documents._read_manifest() == old_manifest
-    path = paths.knowledge_dir / "paper.pdf"
-    assert path.read_bytes() == b"old formula"
-    assert read_pdf_content(path, paths.knowledge_dir) == "old formula"
+    monkeypatch.setattr(state.documents, "upsert", original_upsert)
+    assert state.documents.get("tenant", "paper.pdf") == old_record
+    assert documents.read_source("paper.pdf") == b"old formula"
+    assert read_pdf_content(state, "tenant", "paper.pdf", old_record["chunking"]) == "old formula"
     assert store.dense_search([1.0] + [0.0] * 1023, limit=10, filters={})[0].payload["text"] == "old formula"
     client.close()
 
 
 def test_old_pdf_version_does_not_deduplicate(tmp_path):
-    from test_mcp_http import ProtocolRuntime
-
-    runtime = ProtocolRuntime(tmp_path)
-    # Only exercise the preflight: the PDF record deliberately predates this parser.
-    runtime.create_knowledge_base("tenant", ChunkingConfig(), runtime.config.embedding_model, runtime.config.reranker_model, **runtime.provider_settings)
-    documents = runtime._tenant("tenant").documents
-    source = documents.paths.knowledge_dir / "paper.pdf"
-    source.write_bytes(b"pdf")
-    documents._write_manifest({"paper.pdf": {"name": "paper.pdf", "sha256": "a" * 64,
-                                           "chunking": ChunkingConfig().metadata("BAAI/bge-m3")}})
-    response = runtime.check_documents("tenant", [{"name": "paper.pdf", "sha256": "a" * 64}])
-    assert response["files"][0]["document"] is None
+    state = StateStores.create(tmp_path / "state")
+    documents = KnowledgeDocumentStore(state, "tenant")
+    state.blobs.put("tenant", "source", "paper.pdf", b"pdf", document_id="doc-paper")
+    state.documents.upsert("tenant", {
+        "name": "paper.pdf", "document_id": "doc-paper", "sha256": "a" * 64,
+        "chunking": ChunkingConfig().metadata("BAAI/bge-m3"), "collection": "c",
+    })
+    configuration = {**ChunkingConfig().metadata("BAAI/bge-m3"), "pdf_parser_version": PDF_PARSER_VERSION}
+    assert documents.find_duplicate("a" * 64, configuration) is None
     with pytest.raises(ValueError, match="reimport"):
-        read_pdf_content(source, documents.paths.knowledge_dir)
+        read_pdf_content(state, "tenant", "paper.pdf", {"pdf_parser_version": "old"})
 
 
 def test_truncated_formula_output_is_rejected():
@@ -174,15 +174,14 @@ def test_truncated_formula_output_is_rejected():
     assert engine.predict_batch([SimpleNamespace(max_new_tokens=2048)])[0] is response
 
 
-def test_asset_install_failure_restores_previous_directory(tmp_path):
-    from rag_mcp.pdf_assets import install_assets
-
-    folder = tmp_path / ".pdf-assets" / "doc"
-    folder.mkdir(parents=True)
-    (folder / "document.md").write_text("previous", encoding="utf-8")
-    with pytest.raises(OSError):
-        install_assets(ParsedPdf([], [], tmp_path / "missing-stage"), tmp_path, "doc")
-    assert (folder / "document.md").read_text(encoding="utf-8") == "previous"
+def test_blob_replacement_rolls_back_with_transaction(tmp_path):
+    state = StateStores.create(tmp_path / "state")
+    state.blobs.put("tenant", "pdf-assets", "doc/document.md", b"previous")
+    with pytest.raises(OSError, match="controlled"):
+        with state.engine.begin() as conn:
+            state.blobs.put("tenant", "pdf-assets", "doc/document.md", b"next", conn=conn)
+            raise OSError("controlled")
+    assert state.blobs.get("tenant", "pdf-assets", "doc/document.md") == b"previous"
 
 
 def test_native_table_export_keeps_empty_columns_and_merged_cells():
@@ -260,7 +259,9 @@ def test_asset_projection_preserves_source_references(tmp_path):
     store = SimpleNamespace(get_assets=lambda ids: {"table": {
         "asset_kind": "table", "page": 1, "table": {"rows": [["1", "", "3"]], "headers": ["A", "", "C"]},
     }})
-    result = project_results([candidate], store, tmp_path)[0]
+    state = StateStores.create(tmp_path / "state")
+    result = project_results([candidate], store, state, "tenant")[0]
+    state.close()
     assert result["metadata"]["refs"] == ["#/tables/0"]
     assert result["metadata"]["source_warnings"] == metadata["source_warnings"]
     assert result["asset"]["headers"] == ["A", "", "C"]

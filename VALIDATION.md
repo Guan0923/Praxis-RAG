@@ -1,3 +1,22 @@
+# Durable upload validation — 2026-10-21
+
+- HTTP/MCP uploads now share write-ahead operation/step logs, renewable MySQL
+  leases, immutable version staging, atomic head publication and recovery.
+- Python regression (excluding three unavailable browser modules): 329 passed,
+  18 skipped, four existing MCP deprecation warnings. After the final version-byte
+  deletion check, focused transaction/protocol regression: 143 passed, 2 skipped.
+- Real MySQL 8 / Qdrant integration: 4 passed in a disposable
+  `praxis_txn_test_*` schema and dedicated `txn_test_*` collections. Tests cover
+  replay, partial Qdrant write failure, MySQL publication rollback and abrupt
+  child-process exit before publication. Test schema/collections were removed.
+- Fault injection covers source reception, parsing, JSON/Markdown rendering,
+  chunking/tokenization, embedding, sparse encoding and both storage phases.
+- Ruff F/E9 checks passed for changed source and transaction tests.
+- Production console assets rebuilt successfully with Vite. `npm run build`
+  typecheck remains blocked by a missing platform TypeScript `tsc.exe`, including
+  after restoring declared optional dependencies; no compiler success is claimed.
+- No production document/index migration was performed by this validation.
+
 # Chunking Integration Validation
 
 Date: 2026-09-07

@@ -135,10 +135,10 @@ def test_reembedding_publishes_complete_index_and_survives_restart(runtime, prov
         result = runtime.upload(namespace, [("same.txt", io.BytesIO((namespace + " document. ").encode() * 30))])
         assert len(result["imported"]) == 1, result
     document = runtime.list_documents("alpha")[0]
-    asset = {"namespace": "alpha", "document_id": document["document_id"], "record_type": "asset", "asset_id": "test-image", "caption": "preserved asset"}
+    asset = {"namespace": "alpha", "document_id": document["document_id"], "record_type": "asset", "asset_id": "test-image", "caption": "preserved asset", "upload_version": document["operation_id"]}
     runtime._client.upsert(collection_name=alpha["collection"], points=[models.PointStruct(id=str(uuid4()), vector={}, payload=asset)])
     old_points, _ = runtime._client.scroll(collection_name=alpha["collection"], limit=100, with_vectors=True)
-    old_manifest = (runtime.data_root / "alpha/manifest.json").read_bytes()
+    old_documents = runtime.state.documents.list("alpha")
     with local_client(runtime) as client:
         response = client.patch("/v1/admin/knowledge-bases/alpha", json={"embedding_model": "embed-b", "reembed": True})
         assert response.status_code == 200, response.text
@@ -149,7 +149,7 @@ def test_reembedding_publishes_complete_index_and_survives_restart(runtime, prov
         assert any(point.payload == asset for point in new_points)
         assert all(len(point.vector["dense"]) == 5 for point in new_points if point.payload["record_type"] == "chunk")
         assert runtime._client.scroll(collection_name=alpha["collection"], limit=100, with_vectors=True)[0] == old_points
-        assert (runtime.data_root / "alpha/manifest.json").read_bytes() == old_manifest
+        assert runtime.state.documents.list("alpha") == old_documents
         assert runtime.knowledge_base("beta")["collection"] == beta["collection"]
         assert model_connection(runtime.knowledge_base("beta"), "embedding").api_key == "beta-key"
         record = runtime.list_documents("alpha")[0]
@@ -169,14 +169,12 @@ def test_reembedding_publishes_complete_index_and_survives_restart(runtime, prov
 
 @pytest.mark.parametrize("failure", ["upsert", "publish"])
 def test_failed_reembedding_preserves_old_configuration_and_index(runtime, provider, monkeypatch, failure):
-    from rag_mcp.knowledge_bases import KnowledgeBaseStore
-
     url, state = provider
     original = create(runtime, url)
     runtime.upload("alpha", [("one.txt", io.BytesIO(b"Original document. " * 30))])
     collections = {item.name for item in runtime._client.get_collections().collections}
     settings = runtime.knowledge_base("alpha")
-    manifest = (runtime.data_root / "alpha/manifest.json").read_bytes()
+    documents = runtime.state.documents.list("alpha")
     if failure == "upsert":
         upsert = runtime._client.upsert
         def fail_after_write(*args, **kwargs):
@@ -186,13 +184,13 @@ def test_failed_reembedding_preserves_old_configuration_and_index(runtime, provi
     else:
         def fail_publish(*_args):
             raise ModelAPIError("controlled configuration commit failure")
-        monkeypatch.setattr(KnowledgeBaseStore, "update", fail_publish)
+        monkeypatch.setattr(runtime.state.knowledge_bases, "update", fail_publish)
     with local_client(runtime) as client:
         response = client.patch("/v1/admin/knowledge-bases/alpha", json={"embedding_model": "embed-b", "reembed": True})
-        assert response.status_code == 400, response.text
+        assert response.status_code == 503, response.text
     assert runtime.knowledge_base("alpha") == settings
     assert runtime.list_documents("alpha")[0]["collection"] == original["collection"]
-    assert (runtime.data_root / "alpha/manifest.json").read_bytes() == manifest
+    assert runtime.state.documents.list("alpha") == documents
     assert {item.name for item in runtime._client.get_collections().collections} == collections
     assert runtime.search("alpha", {"query": "document", "retrieval": "embedding", "rerank": "none"})["results"]
 

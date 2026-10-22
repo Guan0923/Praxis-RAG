@@ -5,18 +5,18 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .chunking import DocumentChunk, _source_name, _stable_id, _split_ranges
+from .chunking import DocumentChunk, _stable_id, _split_ranges
 from .chunk_strategies import ChunkingConfig, LEGACY_CONFIG, TokenBudget, get_tokenizer, split_content
 from .document_readers import DocumentContent, SourceBlock, SourceSpan
+from .state.schema import WORD_ASSET_BUCKET
 from .word_converter import word_source
 from .word_reader import WORD_PARSER_VERSION, parse_docx, render_word
+from .workspace import cleanup_workspace, create_workspace, run_bounded
 
 
 @dataclass(frozen=True)
@@ -114,16 +114,19 @@ def word_chunks(manifest, document_id, source, title, config, tokenizer_model):
     return chunks
 
 
-def parse_word(path, *, source_root, config, tokenizer_model, converter=None, convert_timeout=120,
-               parser_python=None, models_path=None, timeout_seconds=900):
-    source = _source_name(path, source_root)
-    document_id = _stable_id("doc", source.casefold())
-    assets_root = source_root / ".word-assets"
-    assets_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{document_id}-", dir=assets_root))
+def parse_word(path, *, source_name, config, tokenizer_model, converter=None, convert_timeout=120,
+               parser_python=None, models_path=None, timeout_seconds=900, workspace=None, trace=None):
+    document_id = _stable_id("doc", source_name.casefold())
+    managed = workspace is not None
+    staging = workspace or create_workspace("rag-word-")
+    trace = trace or (lambda _name, action: action())
+    staging.mkdir(parents=True, exist_ok=True)
     try:
-        with word_source(path, converter, convert_timeout) as converted:
-            raw = parse_docx(converted, staging)
+        def parse():
+            options = {"workspace": staging / "conversion"} if managed else {}
+            with word_source(path, converter, convert_timeout, **options) as converted:
+                return parse_docx(converted, staging)
+        raw = trace("parse", parse)
         manifest = staging / "manifest.json"
         manifest.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
         if any(asset["kind"] == "picture" and not asset["caption"] for asset in raw["assets"]):
@@ -133,9 +136,7 @@ def parse_word(path, *, source_root, config, tokenizer_model, converter=None, co
             command = [str(parser_python or sys.executable), "-m", "rag_mcp.word_vision_worker", "--manifest", str(manifest)]
             if models_path:
                 command.extend(["--models", str(models_path)])
-            result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                    timeout=timeout_seconds, env=environment,
-                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            result = trace("image_description", lambda: run_bounded(command, timeout=timeout_seconds, env=environment))
             if result.returncode:
                 detail = (result.stderr or result.stdout).strip().splitlines()[-1][-400:]
                 raise ValueError(f"Word image description failed: {detail}")
@@ -160,27 +161,33 @@ def parse_word(path, *, source_root, config, tokenizer_model, converter=None, co
                 asset["table"]["caption"] = asset["caption"]
                 asset["table"]["nested_tables"] = {a["asset_id"]: a["table"] for a in raw["assets"]
                     if a["table"] and (a["table"].get("parent_cell") or {}).get("asset_id") == asset["asset_id"]}
-        chunks = word_chunks(raw, document_id, source, path.stem, config or LEGACY_CONFIG, tokenizer_model)
+        def render():
+            manifest.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+            (staging / "document.md").write_text(render_word(raw), encoding="utf-8")
+        trace("render_artifacts", render)
+        chunks = trace("chunking_tokenizer", lambda: word_chunks(
+            raw, document_id, source_name, Path(source_name).stem, config or LEGACY_CONFIG, tokenizer_model))
         if not chunks:
             raise ValueError(f"Word document has no indexable content: {path.name}")
-        manifest.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
-        (staging / "document.md").write_text(render_word(raw), encoding="utf-8")
         return ParsedWord(chunks, [WordAsset(a) for a in raw["assets"]], staging, raw["diagnostics"], raw["skipped_object_count"])
     except (subprocess.TimeoutExpired, OSError) as exc:
-        shutil.rmtree(staging, ignore_errors=True)
+        if not managed:
+            cleanup_workspace(staging)
         raise ValueError(f"Word parsing failed: {path.name}: {exc}") from exc
     except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
+        if not managed:
+            cleanup_workspace(staging)
         raise
 
 
-def read_word_content(path, source_root):
-    document_id = _stable_id("doc", _source_name(path.resolve(), source_root.resolve()).casefold())
-    folder = source_root / ".word-assets" / document_id
+def read_word_content(state, namespace, source_name, chunking):
+    if chunking.get("word_parser_version") != WORD_PARSER_VERSION:
+        raise ValueError("Word parser changed; reimport this document")
+    document_id = _stable_id("doc", source_name.casefold())
     try:
-        manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
-        if manifest.get("version") != WORD_PARSER_VERSION:
-            raise ValueError("Word parser changed; reimport this document")
-        return (folder / "document.md").read_text(encoding="utf-8")
-    except (OSError, json.JSONDecodeError) as exc:
+        text = state.blobs.get_text(namespace, WORD_ASSET_BUCKET, f"{document_id}/document.md")
+    except (OSError, UnicodeDecodeError) as exc:
         raise ValueError("Saved Word content unavailable; reimport this document") from exc
+    if text is None:
+        raise ValueError("Saved Word content unavailable; reimport this document")
+    return text

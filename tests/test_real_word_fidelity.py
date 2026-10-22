@@ -106,14 +106,13 @@ def test_real_word_ingestion_search_and_mcp():
                     report["documents"].append(result["imported"][0])
                 assert upload("captioned.docx")["skipped"]
                 assert report["documents"][-1]["skipped_object_count"] == 2
-                knowledge = root / "data/manuals/knowledge"
                 captioned = report["documents"][1]
-                folder = knowledge / ".word-assets" / captioned["document_id"]
-                saved = (folder / "document.md").read_text(encoding="utf-8")
+                saved = runtime.state.blobs.get_text(
+                    "manuals", "word-assets", f"{captioned['document_id']}/document.md")
                 assert "ZXNESTED638" in saved and "ZXHEADER554" in saved and r"\frac{x}{2}" in saved
                 assert client.get("/v1/documents/captioned.docx/content").text == saved
-                vision_folder = knowledge / ".word-assets" / report["documents"][0]["document_id"]
-                vision = json.loads((vision_folder / "manifest.json").read_text(encoding="utf-8"))["assets"][0]
+                vision = json.loads(runtime.state.blobs.get_text(
+                    "manuals", "word-assets", f"{report['documents'][0]['document_id']}/manifest.json"))["assets"][0]
                 assert vision["generated_description"] and not vision["caption"]
                 assert sum(term in vision["generated_description"].lower() for term in ("pump", "control", "panel", "green", "pressure", "indicator")) >= 2, vision["generated_description"]
                 report["vision_description"] = vision["generated_description"]
@@ -130,10 +129,11 @@ def test_real_word_ingestion_search_and_mcp():
                 assert table["footnotes"] == ["Note: values in kPa"]
                 assert any(hit.get("asset", {}).get("type") == "image" for hit in search(vision["generated_description"], "hybrid", "vision.docx"))
                 assert any("ZXLEGACY816" in hit.get("text", "") for hit in search("ZXLEGACY816"))
-                before = (knowledge / "captioned.docx").read_bytes()
+                before = runtime.state.blobs.get("manuals", "source", "captioned.docx")
                 failed = client.post("/v1/documents", files={"files": ("captioned.docx", b"broken zip")}).json()
-                assert failed["failed"] and (knowledge / "captioned.docx").read_bytes() == before
-                assert (folder / "document.md").read_text(encoding="utf-8") == saved
+                assert failed["failed"] and runtime.state.blobs.get("manuals", "source", "captioned.docx") == before
+                assert runtime.state.blobs.get_text(
+                    "manuals", "word-assets", f"{captioned['document_id']}/document.md") == saved
                 assert any(hit.get("asset", {}).get("type") == "image" for hit in search("ZXIMAGE731"))
 
             async def mcp_check():
@@ -152,11 +152,14 @@ def test_real_word_ingestion_search_and_mcp():
                 replacement.save(stream)
                 response = client.post("/v1/documents", files={"files": ("captioned.docx", stream.getvalue())}).json()
                 assert response["imported"] and not response["failed"]
-                assert not list((folder / "images").glob("*"))
+                replaced_id = response["imported"][0]["document_id"]
+                assert not any("/images/" in key for key in runtime.state.blobs.list_keys(
+                    "manuals", "word-assets", document_id=replaced_id))
                 response = client.post("/v1/search", json={"query": "ZXIMAGE731", "retrieval": "bm25", "rerank": "none"}).json()
                 assert not response["results"]
                 assert client.delete("/v1/documents/captioned.docx").status_code == 200
-                assert not folder.exists()
+                assert runtime.state.documents.get("manuals", "captioned.docx") is None
+                assert runtime.state.blobs.list_keys("manuals", "word-assets", document_id=replaced_id) == []
             report["checks"] = {"doc_conversion": True, "real_vision": True, "original_image_bytes": True,
                 "table_structure": True, "http_and_mcp": True, "failed_replace_preserved_old": True,
                 "replacement_removed_old_assets": True, "delete_removed_assets": True}

@@ -33,6 +33,7 @@ from .document_readers import DocumentReadError
 from .resources import document_uri, parse_uri, resource_page
 from .server import create_registry, create_server
 from .service_knowledge import MAX_FILE_BYTES, KnowledgeError, KnowledgeValidationError
+from .state.uploads import UploadConflict
 
 logger = logging.getLogger(__name__)
 
@@ -223,12 +224,13 @@ class NamespaceEndpoint:
 
 
 class McpHttpEndpoint:
-    def __init__(self, runtime, tenant, security, data_root):
+    def __init__(self, runtime, tenant, security, state):
         self.runtime = runtime
         self._tenant = tenant
         self.security = security
         self._security = TransportSecurityMiddleware(security)
-        self.catalogs = CatalogStore(data_root)
+        self.catalogs = CatalogStore(state)
+        self.state = state
         self.peers: dict[str, NamespaceEndpoint] = {}
         self._lock = anyio.Lock()
         self._mutations: dict[str, anyio.Lock] = {}
@@ -268,12 +270,19 @@ class McpHttpEndpoint:
                         result = await anyio.to_thread.run_sync(self.runtime.delete, namespace, request.name)
                         result.update(status="deleted", document=result.pop("deleted"))
                     else:
-                        result = await anyio.to_thread.run_sync(partial(
+                        write = partial(
                             self.runtime.write_document, namespace, request.name, request.content,
                             overwrite=operation == "update_document",
-                        ))
+                        )
+                        if request.idempotency_key is not None:
+                            write = partial(write, idempotency_key=request.idempotency_key)
+                        result = await anyio.to_thread.run_sync(write)
                     await self.documents_changed(namespace, before, result.pop("documents"))
                     return {**result, "uri": document_uri(namespace, request.name)}
+                except UploadConflict as exc:
+                    raise KnowledgeValidationError(
+                        "Upload conflicts with another operation or idempotency key."
+                    ) from exc
                 except KnowledgeError:
                     raise
                 except Exception as exc:

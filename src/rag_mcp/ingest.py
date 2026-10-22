@@ -38,7 +38,8 @@ def ingest_path(path: Path, config: RagConfig) -> IngestStats:
     for document in documents:
         try:
             if document.suffix.casefold() in {".pdf", ".doc", ".docx"}:
-                indexed = ingester.ingest(document, source_root=source_root)
+                source_name = document.relative_to(source_root).as_posix()
+                indexed = ingester.ingest(document, source_name=source_name)
                 imported_chunks += indexed.chunk_count
                 imported_files += 1
                 print(f"OK   {document} ({indexed.chunk_count} chunks)")

@@ -15,14 +15,15 @@ from test_mcp_http import AUTH, ProtocolRuntime, running_service
 
 
 def seed_document(runtime, source, namespace="manuals"):
-    store = runtime._tenant(namespace).documents
-    shutil.copyfile(source, store.paths.knowledge_dir / source.name)
-    manifest = store._read_manifest()
-    manifest[source.name] = {
-        "name": source.name, "size": source.stat().st_size, "chunk_count": 0,
-        "collection": "preview", "indexed_at": "preview-test",
-    }
-    store._write_manifest(manifest)
+    from rag_mcp.chunking import _stable_id
+
+    document_id = _stable_id("doc", source.name.casefold())
+    runtime.state.blobs.put(namespace, "source", source.name, source.read_bytes(), document_id=document_id)
+    runtime.state.documents.upsert(namespace, {
+        "name": source.name, "document_id": document_id, "size": source.stat().st_size,
+        "sha256": "0" * 64, "chunk_count": 0, "collection": "preview",
+        "indexed_at": "preview-test", "chunking": {},
+    })
 
 
 def test_document_content_authentication_and_original_bytes(tmp_path):
@@ -49,21 +50,16 @@ def test_document_content_authentication_and_original_bytes(tmp_path):
         response = client.get("/v1/documents/notes.txt/content", headers=AUTH)
         assert response.text == "维护前关闭电源。"
         assert response.headers["content-type"].startswith("text/plain")
-        (runtime.data_root / "manuals/knowledge" / pdf.name).unlink()
+        runtime.state.blobs.delete_key("manuals", "source", pdf.name)
         assert client.get(url, headers=AUTH).status_code == 404
 
 
-def test_document_file_rejects_symbolic_link(tmp_path):
+def test_document_file_requires_stored_source(tmp_path):
     runtime = ProtocolRuntime(tmp_path / "service")
     source = tmp_path / "private.pdf"
     _write_text_pdf(source, "Private source")
     seed_document(runtime, source)
-    target = runtime.data_root / "manuals/knowledge" / source.name
-    target.unlink()
-    try:
-        target.symlink_to(source)
-    except OSError:
-        pytest.skip("Symbolic links are unavailable")
+    runtime.state.blobs.delete_key("manuals", "source", source.name)
     with pytest.raises(KnowledgeValidationError):
         runtime.read_document_file("manuals", source.name)
 

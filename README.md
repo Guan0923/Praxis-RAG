@@ -63,7 +63,7 @@ PDF 的公式与表格行会按内容边界处理，减少在切分过程中拆�
 
 ### 独立部署与模型连接
 
-Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保存检索索引；文档及解析产物保存在服务的数据目录中。
+Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保存检索索引；源文件、PDF/Word 解析产物、文档清单、知识库配置、MCP 配置和 API Key 保存在共享状态数据库（生产环境使用 MySQL，本地开发和测试可使用 SQLite 文件）。
 
 语义检索和重排分别连接模型 API，可使用不同提供方，也可连接自行部署的本地推理服务。HTTP 服务本身不加载这两类模型的权重；PDF 解析仍需要单独准备本地环境和模型。
 
@@ -71,19 +71,19 @@ Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保�
 
 ## 使用流程
 
-1. 安装 Praxis-RAG，准备 Qdrant，并按需配置 PDF 解析环境。
+1. 安装 Praxis-RAG。仓库自带 `docker-compose.yml`，执行 `.\scripts\start-stack.ps1` 可启动 MySQL、Qdrant、导入旧状态并运行服务；详细配置见 [共享状态存储](docs/state-storage.md)。
 2. 启动 `rag-service`，打开 `http://127.0.0.1:8011/console`。
 3. 在“连接配置”中填写并测试模型 API，选择工作区。
 4. 上传文档，在“检索调试”中检查返回内容与来源。
 5. 将同一工作区接入 MCP 客户端或业务系统。
 
-服务启动时自动读取 `~/.praxis-rag/config.toml`，首次运行会创建默认配置；新知识文件默认保存在 `~/.praxis-rag/data/`。已有知识库请在配置中指定原来的数据目录和数据库位置，不会自动迁移。
+服务启动时自动读取 `~/.praxis-rag/config.toml`，首次运行会创建默认配置。生产环境请配置 `RAG_MYSQL_HOST`（以及 `RAG_MYSQL_USER`、`RAG_MYSQL_DATABASE`、`RAG_MYSQL_PASSWORD`）或显式 `RAG_STATE_URL`，并设置 `RAG_STATE_ENCRYPTION_KEY` 以便多实例解密密钥。已有 SQLite/本地文件数据使用 `rag-state-migrate` 显式迁移，不会自动迁移；详见 [共享状态存储](docs/state-storage.md)。
 
 安装步骤、配置文件、模型接口要求和接入示例见 [使用与部署指南](docs/USAGE.md)。
 
 ## 使用边界
 
-- 当前支持单进程、单 worker；上传与索引是同步操作，大文件处理期间需要等待。
+- HTTP/MCP 上传使用持久化事务日志、文档租约和版本发布；失败及进程重启后可幂等补偿。MySQL 决定版本可见性，Qdrant 保存版本化索引。它是可恢复业务事务，不是跨数据库 ACID；通知仍为实例内投递。详见 [事务与恢复](docs/state-storage.md#durable-upload-transactions)。
 - 每批最多上传 10 个文件，单文件最大 10 MiB。暂不支持 Excel、网页抓取和独立图片上传。
 - Word 保留内容控件、嵌套表格、空列、合并范围和原生公式；图片按原字节返回。未知公式结构、原生图表和 OLE 等无法可靠读取的内容明确拒绝入库；图表关联有歧义时按规则跳过并显示原因。配置与限制见 [Word 解析说明](docs/USAGE.md#word-解析和图片检索)。
 - 工作区用于划分知识库，不是用户级权限系统。目前没有账户体系或细粒度多用户授权。
@@ -95,6 +95,7 @@ Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保�
 | 文档 | 内容 |
 | --- | --- |
 | [使用与部署](docs/USAGE.md) | 安装、启动、模型配置、MCP 与 REST 接入、开发和测试。 |
+| [共享状态存储](docs/state-storage.md) | MySQL 配置、表结构、密钥加密、迁移与多实例注意事项。 |
 | [验证记录](VALIDATION.md) | 已执行的验证及其覆盖范围。 |
 | [PDF 验证记录](benchmarks/PDF_VALIDATION.md) | PDF 解析实测结果与未解决样例。 |
 | [Word 验证记录](benchmarks/WORD_VALIDATION.md) | DOC/DOCX、图片检索、表格和浏览器实测结果及限制。 |

@@ -40,7 +40,19 @@ uv tool install "praxis-rag[api,pdf] @ git+https://github.com/Guan0923/xinghe_ra
 
 ## 启动
 
-### 1. 启动 Qdrant
+### 1. 启动 Qdrant 和 MySQL（本地 Docker）
+
+仓库自带 `docker-compose.yml`，会同时启动 MySQL 8 和 Qdrant：
+
+```powershell
+Copy-Item .env.example .env
+# 编辑 .env，填入 RAG_MYSQL_PASSWORD、MYSQL_ROOT_PASSWORD、RAG_STATE_ENCRYPTION_KEY
+.\scripts\start-stack.ps1 -MigrateOnly
+```
+
+MySQL 默认映射到 `127.0.0.1:3307`，避免和已有的 3306 冲突；Qdrant 使用 `6333/6334`。停止但保留数据：`.\scripts\stop-stack.ps1`。
+
+也可以手动启动 Qdrant：
 
 ```powershell
 docker run -d --name mini-agent-qdrant -p 6333:6333 -p 6334:6334 -v mini_agent_qdrant_data:/qdrant/storage qdrant/qdrant:latest
@@ -52,7 +64,24 @@ docker run -d --name mini-agent-qdrant -p 6333:6333 -p 6334:6334 -v mini_agent_q
 docker start mini-agent-qdrant
 ```
 
-### 2. 启动 RAG Service 和独立前端
+### 2. 启动共享状态数据库
+
+生产环境使用 MySQL 8.0+（`utf8mb4`，InnoDB）。创建数据库和账号后，通过环境变量或 `config.toml` 配置：
+
+```powershell
+$env:RAG_MYSQL_HOST = "127.0.0.1"
+$env:RAG_MYSQL_PORT = "3307"
+$env:RAG_MYSQL_USER = "rag"
+$env:RAG_MYSQL_DATABASE = "praxis_rag"
+$env:RAG_MYSQL_PASSWORD = "<password>"
+$env:RAG_STATE_ENCRYPTION_KEY = "base64:<32-byte-key>"
+```
+
+也可以直接设置完整的 SQLAlchemy URL（包含用户名、密码、主机和数据库，字符需 URL 编码）：`RAG_STATE_URL = "<SQLAlchemy MySQL URL>"`。未配置 MySQL 时，服务回退到 `RAG_SERVICE_DATA_ROOT/state.sqlite3`，仅适合本地开发和测试。表结构、迁移与多实例说明见 [共享状态存储](state-storage.md)。
+
+### 3. 启动 RAG Service 和独立前端
+
+本地使用 Compose 时，直接执行 `.\scripts\start-stack.ps1`（不带 `-MigrateOnly`）会加载 `.env`、启动依赖、迁移旧状态并运行服务。手动配置环境变量时也可以直接执行：
 
 ```powershell
 rag-service
@@ -69,13 +98,18 @@ RAG_SERVICE_DATA_ROOT = "~/.praxis-rag/data"
 QDRANT_URL = "http://127.0.0.1:6333"
 RAG_COLLECTION = "mini_agent_knowledge_pdf_assets_v1"
 RAG_WORD_CONVERT_TIMEOUT = "120"
+RAG_MYSQL_HOST = "127.0.0.1"
+RAG_MYSQL_PORT = "3306"
+RAG_MYSQL_USER = "rag"
+RAG_MYSQL_DATABASE = "praxis_rag"
+# RAG_STATE_URL = "<SQLAlchemy MySQL URL>"
 ```
 
-配置值使用带引号的字符串。Windows 路径建议使用 `/`，例如 `C:/models`。DOC 转换器和 PDF/Word 图片模型路径也可写入该节，键名与下文环境变量相同。修改后重启生效；配置格式错误会明确报错，不忽略文件继续运行。
+配置值使用带引号的字符串。Windows 路径建议使用 `/`，例如 `C:/models`。DOC 转换器和 PDF/Word 图片模型路径也可写入该节，键名与下文环境变量相同。修改后重启生效；配置格式错误会明确报错，不忽略文件继续运行。`RAG_MYSQL_PASSWORD` 和 `RAG_STATE_ENCRYPTION_KEY` 只从环境变量读取，不要写入配置文件。
 
 环境变量优先于文件；`RAG_CONFIG_FILE` 可指定其他配置文件（指定的文件必须存在）。设置 `QDRANT_PATH` 环境变量时不会再套用文件中的 `QDRANT_URL`，反之亦然。若使用本地数据库文件，请删除配置中的 `QDRANT_URL`，改为 `QDRANT_PATH = "~/.praxis-rag/qdrant"`，不要同时配置两者。
 
-知识文件默认保存在 `~/.praxis-rag/data/`，控制台保存的模型连接设置位于其中的 `model-api-settings.json`。不读写 `~/.praxis/`。已有知识库不自动迁移：继续使用时，请将 `RAG_SERVICE_DATA_ROOT`、数据库位置及集合名设为原值。Qdrant 仍需按所选连接方式准备；配置文件不会代替数据库服务。
+源文件、PDF/Word 解析产物、文档清单、知识库配置、MCP 配置和 API Key 默认保存在共享状态数据库 `state.sqlite3`（仅本地开发）；生产环境使用 MySQL。Qdrant 仍需按所选连接方式准备；配置文件不会代替数据库服务。已有 SQLite/本地文件数据请先执行 `rag-state-migrate`，详见 [共享状态存储](state-storage.md)。
 
 仓库开发环境中也可以执行：
 
@@ -94,13 +128,13 @@ Console 包含知识上传、文档删除、BM25/Embedding/Hybrid 检索、Reran
 
 启动后在“模型配置”中分别设置 Embedding 和 Reranker 的 URL 和 Key；模型在创建知识库时选择。RAG HTTP 服务不再加载本地 Embedding/Reranker 权重，也不控制推理框架的 CPU/GPU；本地推理框架需自行运行，再填写其地址与端口。未配置时，相应操作明确报错，不回退到本地模型。
 
-PDF 仍由独立 Docling 2.126.0 子进程解析，使用 PDFium、CUDA 和本机解析模型；图片或表格没有有效原文说明时，才使用固定版本的 Granite Vision 3.3 2B 生成检索描述。图片原图保存在租户目录，图表原始数据和检索文字写入 Qdrant。每批最多 10 个文件，单文件最大 10 MiB。
+PDF 仍由独立 Docling 2.126.0 子进程解析，使用 PDFium、CUDA 和本机解析模型；图片或表格没有有效原文说明时，才使用固定版本的 Granite Vision 3.3 2B 生成检索描述。解析产物（含图片原图）保存在共享状态数据库，图表原始数据和检索文字写入 Qdrant。每批最多 10 个文件，单文件最大 10 MiB。
 
 PDF 公式使用本地 CodeFormulaV2 转为 LaTeX，开启生成缓存，并以紧裁剪、单公式推理减少相邻文字干扰。模型错误、空公式输出或生成被截断会导致该文件解析失败，不静默跳过。模型能够输出 LaTeX 不代表数学内容一定正确，复杂公式仍需要用原页验证。
 
 OCR 不再按默认置信度阈值丢弃已识别文字；低置信度内容保留，并在 `ocr.json`、解析清单和相关检索块的 `source_warnings` 中记录。保留文字不等于识别正确，扫描件仍可能有错字。
 
-每份 PDF 的原生 `document.json`、按阅读顺序保存的 `manifest.json`、正文 `document.md`、OCR 记录 `ocr.json` 和图片保存在知识目录的 `.pdf-assets/<document_id>/`。正文、图片、表格与公式保持 Docling 的遍历顺序；图注、表题、脚注保留原文关联，不按长度丢弃，也不猜配未关联注解。生成描述仅用于检索，不充当原文注解。命令行 PDF 导入和 MCP 正文读取使用同一份解析结果。
+每份 PDF 的原生 `document.json`、按阅读顺序保存的 `manifest.json`、正文 `document.md`、OCR 记录 `ocr.json` 和图片保存在共享数据库 `blobs` 表的 `pdf-assets` 桶中，键为 `<document_id>/...`。正文、图片、表格与公式保持 Docling 的遍历顺序；图注、表题、脚注保留原文关联，不按长度丢弃，也不猜配未关联注解。生成描述仅用于检索，不充当原文注解。命令行 PDF 导入和 MCP 正文读取使用同一份解析结果。
 
 ### 知识库模型配置
 
@@ -109,7 +143,7 @@ OCR 不再按默认置信度阈值丢弃已识别文字；低置信度内容保�
 - 修改 Embedding URL、模型或向量长度必须重新向量化：使用已有片段建立新索引，全部成功后才切换配置；失败保留原索引。原文件、附件和旧集合不删除。
 - 仅修改 Key 或 Reranker 不需要重新向量化。模型列表使用当前表单中的 URL/Key 获取。
 - URL 保留路径前缀，例如服务要求 /v1 时应填写完整地址；不自动补 /v1。创建和保存会验证实际模型调用。
-- 配置保存于 knowledge-bases.sqlite3；Windows Key 使用 DPAPI 加密，其他系统限制文件权限。Key 不进入浏览器存储，修改地址不会复用旧 Key。
+- 配置保存在共享状态数据库的 `knowledge_bases` 表；Windows Key 使用 DPAPI 加密，其他系统使用状态加密密钥，多实例部署必须设置 `RAG_STATE_ENCRYPTION_KEY`。Key 不进入浏览器存储，修改地址不会复用旧 Key。
 - 管理接口仅允许本机直连；普通文档和检索接口仍使用服务 API Key，不能与模型提供方 Key 混用。
 - POST /v1/admin/knowledge-bases 创建；PATCH /v1/admin/knowledge-bases/{namespace} 修改，reembed=true 执行重新向量化。旧全局 /v1/model-settings 接口已移除。
 - 分词器由 RAG_CHUNK_TOKENIZER_MODEL 指定，与远端模型别名分开配置。重新向量化不重新切分文档。
@@ -213,7 +247,7 @@ $env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
 - 原生公式通过 `docxlatex` 转为 LaTeX；不支持的公式结构、损坏内容、外链图片及未能提取的原生图表会明确拒绝入库。
 - 图片保存原始字节。真实图注用于检索；没有图注时生成简短视觉描述，仅用于索引，不冒充图注。Word 视觉推理缩放输入到最长边 384 像素，不改变保存的原图；拒答或无效描述导致入库失败。
 - 图注、表注按编号、明确引用和相邻关系关联。仍有歧义的对象不保存，注释文字保留，上传结果与文档详情显示跳过数量、位置和原因。
-- Word 资产保存在知识目录内的 `.word-assets`，与源文件和索引一同更新、回滚和删除。旧文档需重新上传才能使用新解析结果，不会自动重建已有知识库。
+- Word 资产保存在共享数据库 `blobs` 表的 `word-assets` 桶中，与源文件和索引一同更新、回滚和删除。旧文档需重新上传才能使用新解析结果，不会自动重建已有知识库。
 - REST 图片结果的 `asset.data` 是 Base64，`asset.mime_type` 是实际类型；MCP 返回图片内容块。Word 使用章节、段落和对象位置，不提供虚构页码或坐标。控制台支持图片下载和表格展示。
 - DOC 转换使用独立临时目录及 LibreOffice 配置，禁用宏和链接更新。DOC 原文件仍保留；其图片字节以转换后的 DOCX 为准。转换超时、工具缺失或加密文档会报错，不降级成不完整文本。
 
@@ -398,7 +432,7 @@ HTTP MCP 注册搜索和三个文件管理工具；本地搜索调试入口仍�
 
 模板仅替换 `{{argument}}`；参数必须是字符串，消息角色仅为 `user` 或 `assistant`，不执行表达式或代码。可选参数未提供时替换为空字符串。MCP 客户端通过 `prompts/list`、`prompts/get` 使用这些模板。
 
-配置保存在 `<RAG_SERVICE_DATA_ROOT>/<namespace>/mcp_catalog.json`，重启恢复，管理配置不会加载检索模型。管理 Token 仍可管理所有 namespace，不提供用户级权限隔离。配置修改请走管理接口，不手工编辑正在运行的配置文件。
+配置保存在共享状态数据库的 `mcp_catalogs` 表，重启恢复，管理配置不会加载检索模型。管理 Token 仍可管理所有 namespace，不提供用户级权限隔离。配置修改请走管理接口，不手工编辑数据库记录。
 
 ## 文档资源与订阅
 

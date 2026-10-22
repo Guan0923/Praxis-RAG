@@ -19,9 +19,11 @@ with the knowledge base selected on the page.
   work or streams already accepted by the service.
 - Management endpoints require direct local access, independently of managed keys.
 - Metadata, authentication digests and recoverable protected keys are persisted
-  in `RAG_SERVICE_DATA_ROOT/api-keys.sqlite3`. Windows uses the existing DPAPI
-  protection; other platforms use the existing private-file protection with
-  owner-only database permissions. Export responses are marked no-store.
+  in the shared state database (`api_keys` table; MySQL in production).
+  Set `RAG_STATE_ENCRYPTION_KEY` so every service instance can decrypt the
+  protected key; without it, Windows falls back to DPAPI and other platforms to
+  plaintext, which is not portable across instances. Export responses are
+  marked no-store.
 - Existing digest-only keys remain valid but cannot be displayed or recovered.
   Create a new key to generate a complete configuration; no keys are automatically
   replaced or revoked.
