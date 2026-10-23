@@ -1,4 +1,5 @@
-# Start the local MySQL + Qdrant stack, migrate legacy state, then run rag-service.
+# Start MySQL, Qdrant, Redis and RocketMQ, provision both queues, migrate, then run rag-service.
+# Run rag-document-worker separately with the same database, encryption and queue settings.
 #
 #   .\scripts\start-stack.ps1                 # full start
 #   .\scripts\start-stack.ps1 -MigrateOnly    # only start dependencies + migrate
@@ -52,6 +53,8 @@ if (-not $env:RAG_REDIS_URL) { $env:RAG_REDIS_URL = "redis://127.0.0.1:6379/0" }
 if (-not $env:RAG_ROCKETMQ_ENDPOINT) { $env:RAG_ROCKETMQ_ENDPOINT = "127.0.0.1:8081" }
 if (-not $env:RAG_ROCKETMQ_TOPIC) { $env:RAG_ROCKETMQ_TOPIC = "praxis_state_cache_refresh" }
 if (-not $env:RAG_ROCKETMQ_GROUP) { $env:RAG_ROCKETMQ_GROUP = "praxis_state_cache_refresh_workers" }
+if (-not $env:RAG_DOCUMENT_TOPIC) { $env:RAG_DOCUMENT_TOPIC = "praxis_document_ingest" }
+if (-not $env:RAG_DOCUMENT_GROUP) { $env:RAG_DOCUMENT_GROUP = "praxis_document_ingest_workers" }
 
 $python = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $python)) {
@@ -82,14 +85,21 @@ if (-not $healthy) {
     throw "MySQL did not become healthy. Run: docker compose logs mysql"
 }
 
-Write-Host "Waiting for RocketMQ and provisioning cache retry resources..."
+Write-Host "Waiting for RocketMQ and provisioning cache retry and document ingest resources..."
 $mqReady = $false
 for ($attempt = 0; $attempt -lt 45; $attempt++) {
-    & docker exec praxis-rag-rocketmq sh mqadmin updatetopic -n rocketmq-namesrv:9876 -c DefaultCluster -t $env:RAG_ROCKETMQ_TOPIC *> $null
-    if ($LASTEXITCODE -eq 0) {
-        & docker exec praxis-rag-rocketmq sh mqadmin updateSubGroup -n rocketmq-namesrv:9876 -c DefaultCluster -g $env:RAG_ROCKETMQ_GROUP -r 16 *> $null
-        if ($LASTEXITCODE -eq 0) { $mqReady = $true; break }
+    $mqReady = $true
+    foreach ($topic in @($env:RAG_ROCKETMQ_TOPIC, $env:RAG_DOCUMENT_TOPIC)) {
+        & docker exec praxis-rag-rocketmq sh mqadmin updatetopic -n rocketmq-namesrv:9876 -c DefaultCluster -t $topic *> $null
+        if ($LASTEXITCODE -ne 0) { $mqReady = $false; break }
     }
+    if ($mqReady) {
+        foreach ($group in @($env:RAG_ROCKETMQ_GROUP, $env:RAG_DOCUMENT_GROUP)) {
+            & docker exec praxis-rag-rocketmq sh mqadmin updateSubGroup -n rocketmq-namesrv:9876 -c DefaultCluster -g $group -r 16 *> $null
+            if ($LASTEXITCODE -ne 0) { $mqReady = $false; break }
+        }
+    }
+    if ($mqReady) { break }
     Start-Sleep -Seconds 2
 }
 if (-not $mqReady) { throw "RocketMQ provisioning failed. Check docker-compose logs rocketmq." }

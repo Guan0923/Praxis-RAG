@@ -326,6 +326,25 @@ class McpHttpEndpoint:
         return create_registry(executor, self.catalogs.for_namespace(namespace), partial(self.mutate_document, namespace))
 
     async def mutate_document(self, namespace, operation, request):
+        if operation in ("add_document", "get_document_status"):
+            try:
+                with anyio.CancelScope(shield=True):
+                    if operation == "get_document_status":
+                        return await anyio.to_thread.run_sync(
+                            self.runtime.get_document_status, namespace, request.artifact_id)
+                    return await anyio.to_thread.run_sync(partial(
+                        self.runtime.add_document, namespace, request.name, request.content,
+                        **({"idempotency_key": request.idempotency_key} if request.idempotency_key else {}),
+                    ))
+            except UploadConflict as exc:
+                raise KnowledgeValidationError(
+                    "Document conflicts with an existing filename, queued upload or idempotency key."
+                ) from exc
+            except KnowledgeError:
+                raise
+            except Exception as exc:
+                logger.warning("MCP document submission/status failed (%s)", type(exc).__name__)
+                raise KnowledgeError("Document operation unavailable") from exc
         async with self.mutation_lock(namespace):
             # Finish the storage change and notification together even if the caller disconnects.
             with anyio.CancelScope(shield=True):

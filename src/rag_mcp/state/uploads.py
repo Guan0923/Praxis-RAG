@@ -213,7 +213,7 @@ class UploadJournal:
             ).values(**values))
 
     def begin(self, namespace, name, document_id, collection, idempotency_key=None,
-              fingerprint=None):
+              fingerprint=None, on_begin=None):
         """Persist INTENT and lease atomically; committed idempotency keys replay."""
         operation_id, owner = uuid4().hex, uuid4().hex
         try:
@@ -252,6 +252,8 @@ class UploadJournal:
                            error=None, cleanup_pending=False, workspace=None, workspace_node=None,
                            created_at=now, updated_at=now)
                 conn.execute(insert(operations).values(**row))
+                if on_begin is not None:
+                    on_begin(conn, self._decode(row))
         except IntegrityError as exc:
             raise UploadConflict("Concurrent upload conflicts with this intent") from exc
         self._flush_cache(namespace, operation_id, leases=True)

@@ -38,6 +38,24 @@ def test_invalid_config_is_rejected(tmp_path, monkeypatch, content):
         load_service_config()
 
 
+def test_document_worker_settings_can_be_loaded_from_config(tmp_path, monkeypatch):
+    path = tmp_path / "config.toml"
+    path.write_text('''[environment]
+RAG_DOCUMENT_TOPIC = "documents"
+RAG_DOCUMENT_GROUP = "document_workers"
+RAG_DOCUMENT_MAX_ATTEMPTS = "5"
+RAG_DOCUMENT_LEASE_SECONDS = "180"
+RAG_DOCUMENT_RETRY_SECONDS = "20"
+''', encoding="utf-8")
+    monkeypatch.setattr(os, "environ", {"RAG_CONFIG_FILE": str(path)})
+    load_service_config()
+    from rag_mcp.state.document_tasks import DocumentTaskSettings
+
+    settings = DocumentTaskSettings.from_env()
+    assert (settings.max_attempts, settings.lease_seconds, settings.retry_seconds) == (5, 180, 20)
+    assert os.environ["RAG_DOCUMENT_TOPIC"] == "documents"
+
+
 def test_real_service_reads_config_and_environment_override(tmp_path):
     path = tmp_path / "config.toml"
     data = tmp_path / "data"

@@ -153,6 +153,7 @@ class KnowledgeDocumentStore:
         chunking: ChunkingConfig | None = None, tokenizer_model: str = "BAAI/bge-m3", *,
         deduplicate_across_names: bool = True, embedding_model: str | None = None,
         idempotency_key: str | None = None, overwrite: bool | None = None,
+        task: dict | None = None,
     ) -> dict[str, object]:
         """Write-ahead journal, immutable staging, then one atomic publication."""
         name = self.sanitize_name(raw_name)
@@ -172,7 +173,9 @@ class KnowledgeDocumentStore:
         ).encode()).hexdigest()
         collection = getattr(getattr(ingester, "_config", None), "collection", "test")
         op = journal.begin(self.namespace, name, document_id, collection,
-                           idempotency_key=idempotency_key, fingerprint=fingerprint)
+                           idempotency_key=idempotency_key, fingerprint=fingerprint,
+                           on_begin=(lambda conn, operation: self.state.document_tasks.bind(
+                               conn, task, operation)) if task else None)
         if op["status"] == "COMMITTED":
             # Validate bytes on replay without repeating any external side effect.
             digest, size = hashlib.sha256(), 0
@@ -212,7 +215,7 @@ class KnowledgeDocumentStore:
                 raise KnowledgeValidationError(f"Document already exists: {name}; use update_document")
             previous = journal.step(op, "deduplicate", lambda: self.find_duplicate(
                 sha256, configuration, only_name=None if deduplicate_across_names else name))
-            if previous:
+            if previous and task is None:
                 result = {**previous, "skipped": True, "requested_name": name,
                           "operation_id": op["id"], "request_sha256": sha256}
                 # A no-op is a terminal replayable result, not a new document version.
@@ -228,6 +231,8 @@ class KnowledgeDocumentStore:
 
             def publish(indexed):
                 nonlocal metadata
+                if task is not None:
+                    self.state.document_tasks.progress(task, "publishing")
                 metadata = self._metadata(name, size, sha256, indexed)
                 metadata.update(sha256=sha256, chunking=configuration, operation_id=op["id"])
                 journal.intent(op, "publish", {"version": op["id"]})
@@ -241,11 +246,14 @@ class KnowledgeDocumentStore:
                                                          str(indexed.document_id), conn=conn)
                         self.state.blobs.put_tree(self.namespace, indexed.artifacts_bucket,
                                                  str(indexed.document_id), indexed.artifacts_dir, conn=conn)
+                    if task is not None:
+                        self.state.document_tasks.succeed(conn, task)
                     journal.commit(op, metadata, conn)
 
             if isinstance(ingester, DenseDocumentIngester):
                 ingester.ingest_and_publish(temporary, source_name=name, chunking=chunking,
-                    publish=publish, journal=journal, operation=op, workspace=workspace)
+                    publish=publish, journal=journal, operation=op, workspace=workspace,
+                    progress=(lambda stage: self.state.document_tasks.progress(task, stage)) if task else None)
             else:
                 transactional = getattr(ingester, "ingest_and_publish", None)
                 if transactional is not None:
@@ -418,10 +426,16 @@ class DenseDocumentIngester:
 
     def ingest_and_publish(self, path: Path, *, source_name: str, chunking: ChunkingConfig | None = None,
                            publish: Callable[[IndexedDocument], None] | None = None,
-                           journal=None, operation=None, workspace=None) -> IndexedDocument:
+                           journal=None, operation=None, workspace=None, progress=None) -> IndexedDocument:
         parsed_assets = None
-        trace = (lambda name, action: journal.step(operation, name, action)) if journal else (
-            lambda _name, action: action())
+
+        def trace(name, action):
+            if progress is not None:
+                stage = {"embedding": "embedding", "sparse": "embedding",
+                         "chunking_tokenizer": "chunking", "stage_mysql": "staging",
+                         "stage_qdrant": "indexing"}.get(name, "parsing")
+                progress(stage)
+            return journal.step(operation, name, action) if journal else action()
         parser_options = {"workspace": workspace / "parsed", "trace": trace} if workspace else {}
         try:
             if path.suffix.casefold() == ".pdf":
@@ -807,6 +821,41 @@ class RagServiceRuntime:
                                    **({"operation_id": exc.operation_id} if hasattr(exc, "operation_id") else {})})
             documents = tenant.documents.list_documents()
         return {"imported": imported, "skipped": skipped, "failed": failed, "documents": documents}
+
+    def add_document(self, namespace: str, name: str, content: bytes, *,
+                     idempotency_key: str | None = None) -> dict:
+        try:
+            return self.state.document_dispatcher.submit(namespace, name, content, idempotency_key)
+        except (KnowledgeValidationError, UploadConflict):
+            raise
+        except ValueError as exc:
+            raise KnowledgeValidationError(str(exc)) from exc
+        except Exception as exc:
+            raise KnowledgeError(
+                "Document submission was not confirmed; retry with the same idempotency_key"
+            ) from exc
+
+    def get_document_status(self, namespace: str, artifact_id: str) -> dict:
+        try:
+            return self.state.document_tasks.status(namespace, artifact_id)
+        except (ValueError, LookupError) as exc:
+            raise KnowledgeValidationError(str(exc)) from exc
+
+    def process_document_task(self, task: dict) -> dict:
+        namespace = task["namespace"]
+        if self.state.knowledge_bases.version(namespace) != task["configuration_version"]:
+            raise KnowledgeValidationError("Knowledge-base configuration changed; upload again")
+        settings = self.knowledge_base(namespace)
+        tenant = self._tenant(namespace)
+        configuration = ChunkingConfig(settings["strategy"], settings["chunk_size"], settings["chunk_overlap"])
+        with tenant.lock:
+            self.state.document_tasks.progress(task, "parsing")
+            return tenant.documents.store_and_index(
+                task["name"], io.BytesIO(task["content"]), tenant.ingester, configuration,
+                settings["tokenizer"], deduplicate_across_names=False,
+                embedding_model=settings["embedding_model"], overwrite=False,
+                idempotency_key=f"document-task:{task['artifact_id']}:{task['attempts']}", task=task,
+            )
 
     @_runtime_operation
     def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool,

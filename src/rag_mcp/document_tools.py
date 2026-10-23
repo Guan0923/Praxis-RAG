@@ -9,7 +9,12 @@ from pathlib import Path, PureWindowsPath
 
 from mcp import types
 
-from .service_knowledge import MAX_FILE_BYTES, SUPPORTED_EXTENSIONS, KnowledgeDocumentStore, KnowledgeValidationError
+from .service_knowledge import (
+    MAX_FILE_BYTES,
+    SUPPORTED_EXTENSIONS,
+    KnowledgeDocumentStore,
+    KnowledgeValidationError,
+)
 
 
 @dataclass(frozen=True)
@@ -66,12 +71,27 @@ class DocumentWriteRequest(DocumentRequest):
     idempotency_key: str | None = None
 
 
+@dataclass(frozen=True)
+class DocumentStatusRequest:
+    artifact_id: str
+
+    @classmethod
+    def from_arguments(cls, arguments):
+        from .state.document_tasks import validate_artifact_id
+        if set(arguments) != {"artifact_id"}:
+            raise KnowledgeValidationError("Provide only artifact_id")
+        try:
+            return cls(validate_artifact_id(arguments["artifact_id"]))
+        except ValueError as exc:
+            raise KnowledgeValidationError(str(exc)) from exc
+
+
 def document_tool_entries(mutate):
     from .server import RegisteredTool
 
     entries = []
     descriptions = {
-        "add_document": "Add a new file to the connected knowledge base and index it. Rejects existing filenames. Uses recursive chunking. Duplicate content under another name is allowed.",
+        "add_document": "Upload one new file for asynchronous indexing. Returns only artifact_id after durable storage and queue acceptance, NOT after indexing. Poll get_document_status until succeeded before searching. Rejects existing or queued filenames. Reuse idempotency_key after uncertain submissions. Duplicate content under another name is allowed.",
         "update_document": "Replace the complete content of an existing knowledge file and rebuild its index. Requires the exact existing filename and preserves its chunking settings. This overwrites content; use only when the user requests an update.",
         "delete_document": "Delete an existing knowledge file and its search index by exact filename. Use only when the user requests deletion. This cannot be undone through MCP.",
     }
@@ -103,4 +123,19 @@ def document_tool_entries(mutate):
             annotations=types.ToolAnnotations(read_only_hint=False, destructive_hint=name != "add_document",
                                               idempotent_hint=False, open_world_hint=False),
         ), validate, execute))
+
+    async def status(request):
+        return await mutate("get_document_status", request)
+
+    entries.append(RegisteredTool(types.Tool(
+        name="get_document_status",
+        description="Query an uploaded file by artifact_id in the connected knowledge base. Returns status (queued, processing, succeeded, failed), current stage and a safe error. Only succeeded means indexed and searchable.",
+        input_schema={
+            "type": "object", "properties": {
+                "artifact_id": {"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36},
+            }, "required": ["artifact_id"], "additionalProperties": False,
+        },
+        annotations=types.ToolAnnotations(read_only_hint=True, destructive_hint=False,
+                                          idempotent_hint=True, open_world_hint=False),
+    ), DocumentStatusRequest.from_arguments, status))
     return entries

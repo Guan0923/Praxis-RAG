@@ -17,6 +17,7 @@ from rag_mcp.state.store import StateStores
 from rag_mcp.state.uploads import UploadConflict
 
 AUTH = {"Authorization": "Bearer entrypoint-test-token", "X-RAG-Namespace": "manuals"}
+ARTIFACT_ID = "d1feec53-1036-4af0-8035-86ef6990fa6a"
 
 
 class LegacyRuntime:
@@ -30,6 +31,10 @@ class LegacyRuntime:
     def upload(self, namespace, items):
         self.calls.append((namespace, [(name, stream.read()) for name, stream in items]))
         return {"imported": [{"name": "a.txt"}], "skipped": [], "failed": [], "documents": []}
+
+    def add_document(self, namespace, name, content, *, idempotency_key=None):
+        self.calls.append((namespace, name, content, idempotency_key))
+        return {"artifact_id": ARTIFACT_ID}
 
     def write_document(self, namespace, name, content, *, overwrite):
         self.calls.append((namespace, name, content, overwrite))
@@ -52,11 +57,11 @@ class KeyedRuntime(LegacyRuntime):
 
 
 @pytest.fixture
-def make_service():
+def make_service(tmp_path):
     states = []
 
     def make(runtime_type=KeyedRuntime):
-        state = StateStores(StateSettings(url="sqlite+pysqlite:///:memory:"))
+        state = StateStores(StateSettings(url=f"sqlite+pysqlite:///{tmp_path / f'state-{len(states)}.sqlite3'}"))
         states.append(state)
         runtime = runtime_type(state)
         app = create_service_app(runtime, settings=RagHttpSettings(
@@ -118,9 +123,21 @@ def test_http_advertises_optional_bounded_header(make_service):
     assert (schema["minLength"], schema["maxLength"]) == (1, 128)
 
 
-@pytest.mark.parametrize("operation,overwrite", [("add_document", False), ("update_document", True)])
 @pytest.mark.parametrize("key", [None, "x", "x" * 128])
-def test_mcp_forwards_optional_key_and_preserves_operation_id(make_service, operation, overwrite, key):
+def test_mcp_add_forwards_optional_key_and_returns_only_artifact_id(make_service, key):
+    runtime, _client, endpoint = make_service()
+    arguments = {"name": "a.txt", "content": "hello"}
+    if key is not None:
+        arguments["idempotency_key"] = key
+    result = anyio.run(endpoint.registry("manuals").invoke_async, "add_document", arguments)
+    assert not result.is_error
+    assert runtime.calls == [("manuals", "a.txt", b"hello", key)]
+    assert json.loads(result.content[0].text) == {"artifact_id": ARTIFACT_ID}
+
+
+@pytest.mark.parametrize("key", [None, "x", "x" * 128])
+def test_mcp_update_forwards_optional_key_and_preserves_operation_id(make_service, key):
+    operation, overwrite = "update_document", True
     runtime, _client, endpoint = make_service()
     arguments = {"name": "a.txt", "content": "hello"}
     if key is not None:
@@ -132,13 +149,17 @@ def test_mcp_forwards_optional_key_and_preserves_operation_id(make_service, oper
 
 
 @pytest.mark.parametrize("operation", ["add_document", "update_document"])
-def test_mcp_omits_absent_or_null_key_for_legacy_runtime(make_service, operation):
+def test_mcp_omits_absent_or_null_key(make_service, operation):
     runtime, _client, endpoint = make_service(LegacyRuntime)
     for arguments in [{"name": "a.txt", "content": "hello"},
                       {"name": "a.txt", "content_base64": "aGVsbG8=", "idempotency_key": None}]:
         result = anyio.run(endpoint.registry("manuals").invoke_async, operation, arguments)
         assert not result.is_error
-        assert "operation_id" not in json.loads(result.content[0].text)
+        payload = json.loads(result.content[0].text)
+        if operation == "add_document":
+            assert payload == {"artifact_id": ARTIFACT_ID}
+        else:
+            assert "operation_id" not in payload
     assert len(runtime.calls) == 2
 
 
@@ -168,6 +189,9 @@ def test_mcp_schema_and_delete_boundary(make_service):
 
 
 class ConflictingRuntime(LegacyRuntime):
+    def add_document(self, namespace, name, content, *, idempotency_key=None):
+        raise UploadConflict("private-runtime-detail")
+
     def upload(self, namespace, items, *, idempotency_key=None):
         raise UploadConflict("private-runtime-detail")
 
@@ -189,7 +213,9 @@ def test_mcp_conflict_is_bounded_client_error(make_service, operation):
     result = anyio.run(endpoint.registry("manuals").invoke_async, operation,
                        {"name": "a.txt", "content": "hello", "idempotency_key": "retry"})
     assert result.is_error
-    assert result.content[0].text == "Upload conflicts with another operation or idempotency key."
+    expected = ("Document conflicts with an existing filename, queued upload or idempotency key."
+                if operation == "add_document" else "Upload conflicts with another operation or idempotency key.")
+    assert result.content[0].text == expected
 
 
 @pytest.mark.parametrize("fail_start", [False, True])

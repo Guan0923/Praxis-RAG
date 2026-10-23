@@ -51,6 +51,7 @@ Issues = "https://github.com/Guan0923/xinghe_rag/issues"
 rag-mcp-debug = "rag_mcp.debug:main"
 rag-mcp-ingest = "rag_mcp.ingest:main"
 rag-service = "rag_mcp.http_service:main"
+rag-document-worker = "rag_mcp.document_worker:main"
 rag-service-migrate = "rag_mcp.migrate:main"
 rag-state-migrate = "rag_mcp.state.migrate:main"
 

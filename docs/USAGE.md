@@ -34,15 +34,15 @@ uv tool install --editable ".[api,pdf]"
 uv tool install "praxis-rag[api,pdf] @ git+https://github.com/Guan0923/xinghe_rag.git"
 ```
 
-安装后，`rag-service`、`rag-mcp-debug`、`rag-mcp-ingest` 和 `rag-service-migrate` 都是独立命令。
+安装后，`rag-service`、`rag-document-worker`、`rag-mcp-debug`、`rag-mcp-ingest` 和 `rag-service-migrate` 都是独立命令。异步 MCP 文档队列还需要安装现有可选依赖 `[cache]`（包含 RocketMQ SDK），例如 `uv sync --extra api --extra cache`；独立工具安装时在 extras 中加入 `cache`。
 
 以上本地安装命令在仓库根目录运行，需要先安装 uv。项目产品名为 Praxis-RAG，Python 分发包名为 `praxis-rag`；远程仓库地址以当前 Git 配置为准。内部 Python 模块仍为 `rag_mcp`，集合名和命令保留原值。服务配置与新数据使用下文的 `~/.praxis-rag/` 目录，已有知识库不自动迁移。下文开发和测试命令也默认从仓库根目录运行，前端命令另有说明。
 
 ## 启动
 
-### 1. 启动 Qdrant 和 MySQL（本地 Docker）
+### 1. 启动 MySQL、Qdrant、Redis 和 RocketMQ（本地 Docker）
 
-仓库自带 `docker-compose.yml`，会同时启动 MySQL 8 和 Qdrant：
+仓库自带 `docker-compose.yml`，会同时启动 MySQL 8、Qdrant、Redis 和 RocketMQ：
 
 ```powershell
 Copy-Item .env.example .env
@@ -81,7 +81,7 @@ $env:RAG_STATE_ENCRYPTION_KEY = "base64:<32-byte-key>"
 
 ### 3. 启动 RAG Service 和独立前端
 
-本地使用 Compose 时，直接执行 `.\scripts\start-stack.ps1`（不带 `-MigrateOnly`）会加载 `.env`、启动依赖、迁移旧状态并运行服务。手动配置环境变量时也可以直接执行：
+本地使用 Compose 时，直接执行 `.\scripts\start-stack.ps1`（不带 `-MigrateOnly`）会加载 `.env`、启动依赖、显式创建缓存刷新与文档入库的两组 RocketMQ topic/group、迁移旧状态并运行服务。脚本不会启动文档消费者；MCP 异步新增还需下面的独立 worker。手动配置环境变量时也可以直接执行：
 
 ```powershell
 rag-service
@@ -136,6 +136,39 @@ OCR 不再按默认置信度阈值丢弃已识别文字；低置信度内容保�
 
 每份 PDF 的原生 `document.json`、按阅读顺序保存的 `manifest.json`、正文 `document.md`、OCR 记录 `ocr.json` 和图片保存在共享数据库 `blobs` 表的 `pdf-assets` 桶中，键为 `<document_id>/...`。正文、图片、表格与公式保持 Docling 的遍历顺序；图注、表题、脚注保留原文关联，不按长度丢弃，也不猜配未关联注解。生成描述仅用于检索，不充当原文注解。命令行 PDF 导入和 MCP 正文读取使用同一份解析结果。
 
+### 4. 启动独立文档 worker（MCP 异步新增必需）
+
+在另一个终端或进程管理器中启动消费者；先为该进程配置与 API 相同的 MySQL（或 `RAG_STATE_URL`）、Qdrant、`RAG_STATE_ENCRYPTION_KEY` 和队列连接环境。需要处理 PDF/Word 时，也要准备对应解析依赖和模型。不要假设另一个终端会继承启动脚本加载的 `.env`。
+
+```powershell
+rag-document-worker
+```
+
+每个 worker 默认同一时间只执行一个消费任务；通过启动多个独立 `rag-document-worker` 进程扩容，它们使用相同文档 topic/group。API 自带轻量 outbox relay，但不内嵌文档消费者。仅需在 API 之外补发 outbox、无需加载模型时可独立运行：
+
+```powershell
+rag-document-worker --dispatch-only
+```
+
+`--dispatch-only` 只运行 relay，不解析或索引文档，不能替代消费者。API/relay/worker 应共享以下配置；缓存队列环境变量保留原义，不要把文档队列配置写入缓存 topic/group：
+
+| 环境变量 | 默认值 / 作用 |
+| --- | --- |
+| `RAG_ROCKETMQ_ENDPOINT` | Compose 为 `127.0.0.1:8081`；缓存和文档共用连接 |
+| `RAG_ROCKETMQ_NAMESPACE` | 可选 RocketMQ namespace，与知识库 namespace 不同 |
+| `RAG_ROCKETMQ_ACCESS_KEY` / `RAG_ROCKETMQ_SECRET_KEY` | 可选凭据，仅从环境提供 |
+| `RAG_ROCKETMQ_TLS` | `false`；共享 TLS 开关 |
+| `RAG_ROCKETMQ_TOPIC` / `RAG_ROCKETMQ_GROUP` | 原缓存刷新队列，保持不变 |
+| `RAG_DOCUMENT_TOPIC` | `praxis_document_ingest` |
+| `RAG_DOCUMENT_GROUP` | `praxis_document_ingest_workers` |
+| `RAG_DOCUMENT_MAX_ATTEMPTS` | `3`；文档任务最大尝试次数 |
+| `RAG_DOCUMENT_LEASE_SECONDS` | `120`；文档任务租约秒数 |
+| `RAG_DOCUMENT_RETRY_SECONDS` | `10`；文档任务重试退避基数，乘以已尝试次数 |
+
+升级时新增 `document_tasks` 和 `document_task_outbox` 两张表。默认自动建表；若关闭 `RAG_STATE_AUTO_SCHEMA`，先由部署账号调用共享 schema 的 `metadata.create_all(engine)` 创建缺失表，再启动服务。排队任务记录知识库配置版本，消费前或发布时配置已经改变会拒绝发布，需要按新配置重新提交。
+
+本地 Broker 的 `autoCreateTopicEnable` 和 `autoCreateSubscriptionGroup` 都为 `false`。启动脚本沿用 `mqadmin updatetopic` 和 `mqadmin updateSubGroup`，显式创建缓存与文档两组资源，全部成功才继续启动服务。生产部署或手动启动时也必须预先创建两组 topic/group，并确保连接凭据具有相应权限。
+
 ### 知识库模型配置
 
 创建知识库时填写 Embedding 的 URL、Key 并从下拉列表选择模型；Reranker 可选，每个知识库独立保存配置。侧边栏“知识库”可以查看和修改配置，Key 默认隐藏，点击眼睛后按需读取。
@@ -163,7 +196,7 @@ $env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
 
 Console 使用 React、TypeScript 和 Ant Design，提供浅色与深色主题。主题和 Namespace 保存在当前浏览器；Service Token 仅保存在当前会话，MCP 配置示例不会显示真实 Token。
 
-正常运行仍只需启动 `rag-service`，通过 `/console` 打开页面，不需要 Node.js 或额外前端进程。仓库中的 `src/rag_mcp/web/` 是随 Python 包交付的构建文件，修改界面请编辑 `frontend/src/`，不要手动修改构建文件。
+Console 正常运行只需启动 `rag-service`，通过 `/console` 打开页面，不需要 Node.js 或额外前端进程；MCP 异步新增另需独立 `rag-document-worker`。仓库中的 `src/rag_mcp/web/` 是随 Python 包交付的构建文件，修改界面请编辑 `frontend/src/`，不要手动修改构建文件。
 
 ```powershell
 conda activate dev
@@ -287,27 +320,59 @@ Authorization: Bearer <RAG_SERVICE_TOKEN>
 
 客户端可使用 MCP `2025-11-25` 或 `2026-07-28` 的 Streamable HTTP 传输。旧版先初始化，新版可发现服务或直接调用；具体流程见后面的“双版本”章节。取消调用只结束等待，不会强制终止已经进入模型或 Qdrant 的同步计算。
 
-MCP 提供 `search`、`add_document`、`update_document`、`delete_document` 四个工具。若 Host 使用 `rag` 作为 server 名，搜索工具展示名通常是 `mcp_rag_search`。
+MCP 提供 `search`、文件管理、`get_document_status` 等工具。若 Host 使用 `rag` 作为 server 名，搜索工具展示名通常是 `mcp_rag_search`。
 
 ### MCP 文件管理
 
-三个文件工具只操作连接时 `X-RAG-Namespace` 指定的知识库，使用普通 Service Token，不需要管理 Token。请仅向可信客户端提供具有写入权限的连接；工具提示不能替代权限控制。管理员可通过工具管理接口分别禁用这些工具。
+文件管理和状态工具只操作连接时 `X-RAG-Namespace` 指定的知识库，使用普通 Service Token，不需要管理 Token。请仅向可信客户端提供具有写入权限的连接；工具提示不能替代权限控制。管理员可通过工具管理接口分别禁用这些工具。
 
 | 工具 | 参数 | 行为 |
 |---|---|---|
-| `add_document` | `name` 和 `content` 或 `content_base64` | 添加并建立索引；同名文件报错，不覆盖 |
-| `update_document` | `name` 和 `content` 或 `content_base64` | 完整替换已存在文件并重建索引，保留切分设置；不存在时报错 |
-| `delete_document` | `name` | 删除文件和索引；不存在时报错 |
+| `add_document` | `name` 和 `content` 或 `content_base64`；可选 `idempotency_key` | 异步新增，不覆盖同名文档；成功仅返回 `artifact_id`，不代表索引完成 |
+| `get_document_status` | `artifact_id` | 查询该新增任务的 `artifact_id`、`status`、`stage`、`error` |
+| `update_document` | `name` 和 `content` 或 `content_base64` | 仍为同步：完整替换已存在文件并重建索引，保留切分设置；不存在时报错 |
+| `delete_document` | `name` | 仍为同步：删除文件和索引；不存在时报错 |
 
 `name` 必须是含扩展名的准确文件名，不能传路径。支持 TXT、Markdown（`.md`）、PDF、DOCX、DOC，单文件最大 10 MiB。TXT/Markdown 可使用 UTF-8 文本 `content`；PDF/DOCX/DOC 必须由客户端读取文件后传标准 Base64 到 `content_base64`。两种内容参数只能传一种，不支持服务器路径或 URL。
 
 ```json
-{"name": "manual.txt", "content": "E03 表示温度传感器故障。"}
+{"name": "manual.txt", "content": "E03 表示温度传感器故障。", "idempotency_key": "manual-import-20261023-001"}
 ```
 
-新增使用默认递归切分。同内容不同文件名会分别保存，确保更新始终针对指定文件。同名、同内容、同切分设置的更新返回 `unchanged`。成功返回 `status`、`document` 和可读取的 `uri`；工具参数错误或操作失败返回 MCP `isError=true`。整个请求另有大小上限，超过后返回 HTTP 413；既有文档解析安全上限仍然适用。文件变更会发送资源更新通知。删除无法通过 MCP 撤销，更新前需要保留旧版本时应先读取或备份。
+#### 异步新增与状态轮询
 
-工具输入：
+`add_document` 先将不可变原始字节、任务及 outbox 持久化到 MySQL，再等待 RocketMQ 发送确认；成功的工具结果**只有**以下对象，不含 `status`、文档或 URI：
+
+```json
+{"artifact_id": "123e4567-e89b-42d3-a456-426614174000"}
+```
+
+此 UUID 表示已接收（accepted），不是已经解析、索引或可检索（indexed）。独立 worker 才负责解析、切分、索引与发布；尚未启动消费者时任务可以保持 `queued`。客户端在同一 namespace 调用 `get_document_status`，按需间隔轮询，直到终态：
+
+```json
+{"artifact_id": "123e4567-e89b-42d3-a456-426614174000"}
+```
+
+状态结果包含以下字段（`stage` 为当前阶段，以下阶段文字仅为示意，不是固定枚举；`error` 为失败信息）：
+
+```json
+{
+  "artifact_id": "123e4567-e89b-42d3-a456-426614174000",
+  "status": "processing",
+  "stage": "<当前处理阶段>",
+  "error": null
+}
+```
+
+`status` 为 `queued`、`processing`、`succeeded` 或 `failed`；仅 `succeeded` 表示完成索引发布，此时刷新文档列表/资源列表再读取正文或检索。`failed` 时查看 `stage`、`error` 排查，不要把收到 UUID 当成索引成功。状态展示使用 Redis 缓存，未命中、未配置或不可用时回源 MySQL；缓存可能短暂滞后，MySQL 才是任务、租约和发布权威。
+
+队列故障、发送确认超时或客户端断线时，调用失败不一定意味着未提交：MySQL 中可能已有字节、任务和待补发 outbox，API 自带 relay 或 `--dispatch-only` 可继续补发。不要换 key 盲目重复新增；从首次调用起提供 `idempotency_key`，对同一次提交使用相同 key 和完全相同的参数/内容重试，以找回同一任务。新内容使用新 key。
+
+这里的上传 `artifact_id` 用于 `get_document_status`，不是搜索快照的 `artifact_id`，不能直接用于 `rag://artifacts` 或 `/v1/artifacts` 读取。上传原始字节持久保留在 MySQL，**无上传 TTL**，不随 Redis 状态缓存或搜索结果引用过期自动清理；部署时为持续增长的数据安排容量、备份和保留策略。worker 在独立进程提交后，API **不会自动推送 MCP 资源变更通知**；客户端必须轮询状态并主动刷新 `resources/list` 或文档列表，不能依赖订阅确认入库。
+
+新增使用提交时对应版本的知识库切分配置（新知识库默认递归切分）。同内容不同文件名会分别保存，确保更新始终针对指定文件。同名、同内容、同切分设置的同步更新返回 `unchanged`；同步更新/删除的成功结果仍使用原有 `status`、`document`、`uri` 协议，不受异步新增影响。HTTP 上传也仍为同步请求，完成索引后返回原有上传结果。工具参数错误或调用失败返回 MCP `isError=true`；异步执行失败通过状态查询报告。整个请求另有大小上限，超过后返回 HTTP 413；既有文档解析安全上限仍然适用。删除无法通过 MCP 撤销，更新前需要保留旧版本时应先读取或备份。
+
+搜索工具输入：
 
 ```json
 {
@@ -406,7 +471,7 @@ HTTP 模型检索需要在控制台设置可用的模型 API，并准备 Qdrant�
 
 请求均携带 `X-RAG-Namespace` 和配置要求的 Service Token。旧会话不能跨 namespace 使用；订阅固定建立时的 namespace。工具调用取消只停止等待和发送结果，不强停后台模型线程。
 
-HTTP MCP 注册搜索和三个文件管理工具；本地搜索调试入口仍只提供搜索。新增工具要在项目中登记定义、参数校验和执行函数；配置接口不能上传代码，也不能注册外部 HTTP 转发。
+HTTP MCP 注册搜索、文件管理及 `get_document_status` 等工具；本地搜索调试入口仍只提供搜索。新增工具要在项目中登记定义、参数校验和执行函数；配置接口不能上传代码，也不能注册外部 HTTP 转发。
 
 ## 工具与提示词管理
 
@@ -445,9 +510,9 @@ HTTP MCP 注册搜索和三个文件管理工具；本地搜索调试入口仍�
 
 新版 `subscriptions/listen` 可选择工具列表、提示词列表、资源列表及指定文档更新。旧版仍使用列表变化通知与 `resources/subscribe`、`resources/unsubscribe`。通知只表示“发生变化”，客户端需要重新列出或读取内容。
 
-启停工具或修改描述、增删改提示词、上传替换删除文档都会在对应操作成功后通知。失败项和没有变化的重复操作不通知；同名相同内容上传跳过重复索引。通知不会跨 namespace。
+启停工具或修改描述、增删改提示词，以及 API 进程内完成的同步上传/替换/删除，会在对应操作成功后通知。失败项和没有变化的重复操作不通知；同名相同内容同步上传跳过重复索引。通知不会跨 namespace。MCP `add_document` 返回 UUID 时尚未发布文档；独立 worker 的提交不会自动触发 API 的 MCP 资源推送，客户端须轮询 `get_document_status` 并刷新列表。
 
-本轮仅支持**单进程、单 worker**。不提供跨进程通知、历史事件重放或断线补发。订阅断线后客户端重新订阅并读取最新状态。服务退出时释放会话与订阅，不部署 OAuth、账户系统或云服务。
+订阅通知仍仅在 API 进程内投递，不提供跨进程通知、历史事件重放或断线补发；这不限制独立文档 worker 进程的横向扩容。订阅断线后客户端重新订阅并读取最新状态。服务退出时释放会话与订阅，不部署 OAuth、账户系统或云服务。
 
 ## 当前限制
 
@@ -458,14 +523,14 @@ HTTP MCP 注册搜索和三个文件管理工具；本地搜索调试入口仍�
 - 重排仅支持 `none`（不重排）与 `cross_encoder`（调用配置的 Reranker API）。
 - Console 会同时展示 Cross Encoder 最终分数和重排前的 `retrieval_score`；请求失败时会清空旧结果并保留错误面板。
 - 推理服务离线、认证失败或返回格式不兼容时明确报错；可选择“不重排”验证不依赖 Reranker 的召回流程。
-- 上传目前是同步请求，大文件索引期间网页会等待。
+- HTTP/Console 上传及 MCP 更新、删除仍为同步请求，大文件索引期间网页会等待；仅 MCP `add_document` 为异步，需独立 worker 和状态轮询。
 - Console 用于本地开发调试，不提供账户系统或细粒度多用户权限。
 
 历史阶段和变更记录见 [PROGRESS.md](../PROGRESS.md)。
 
 ## 第一批 Redis 缓存
 
-Compose 包含 Redis 和 RocketMQ。安装可选队列 SDK：`pip install -e ".[cache]"`，使用启动脚本会创建 topic/group 并加载本地缓存环境变量。直接启动 rag-service 时自行设置 RAG_REDIS_URL 和 RAG_ROCKETMQ_ENDPOINT；不配置 Redis 默认保持原有 MySQL 读取。命中缓存不查 MySQL；执行鉴权/租约和上传发布校验不使用缓存。详见 [状态缓存与可靠刷新](state-cache.md)。
+Compose 包含 Redis 和 RocketMQ。安装可选队列 SDK：`pip install -e ".[cache]"`，使用启动脚本会创建缓存刷新和文档入库的两组 topic/group，并加载本地环境变量（不启动文档消费者）。直接启动 rag-service 时自行设置 RAG_REDIS_URL 和 RAG_ROCKETMQ_ENDPOINT；不配置 Redis 默认保持原有 MySQL 读取。命中缓存不查 MySQL；执行鉴权/租约和上传发布校验不使用缓存。详见 [状态缓存与可靠刷新](state-cache.md)。
 
 ## 第二批状态缓存（严格模式）
 

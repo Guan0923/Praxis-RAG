@@ -66,6 +66,17 @@ class TestIngester:
         pass
 
 
+class MemoryDocumentTransport:
+    def __init__(self):
+        self.queued = []
+
+    def send(self, artifact_id):
+        self.queued.append(artifact_id)
+
+    def close(self):
+        pass
+
+
 class ProtocolRuntime(RagServiceRuntime):
     """Real document storage/reading; no model or Qdrant required for wire tests."""
 
@@ -74,6 +85,7 @@ class ProtocolRuntime(RagServiceRuntime):
         self._connections = {"embedding": ModelConnection("http://unused.invalid/v1", self.config.embedding_model, vector_size=self.config.vector_size)}
         self.data_root = root
         self.state = StateStores.create(root)
+        self.state.document_dispatcher.transport = MemoryDocumentTransport()
         self._tenants = {}
         self._tenant_lock = threading.RLock()
         self._inference_lock = threading.RLock()
@@ -205,7 +217,7 @@ def test_both_protocol_lifecycles(tmp_path, mode):
                     assert client.server_info.version == "0.4.0"
                     assert client.server_capabilities.tools.list_changed
                 assert [tool.name for tool in (await client.list_tools()).tools] == [
-                    "search", "get_search_result", "add_document", "update_document", "delete_document"
+                    "search", "get_search_result", "add_document", "update_document", "delete_document", "get_document_status"
                 ]
                 for query in ("first", "second"):
                     result = await client.call_tool("search", {"query": query})

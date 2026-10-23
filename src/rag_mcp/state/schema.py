@@ -238,6 +238,41 @@ artifact_snapshots = Table(
     **_MYSQL_TABLE,
 )
 
+document_tasks = Table(
+    "document_tasks", metadata,
+    Column("artifact_id", _ci_string(36), primary_key=True),
+    Column("namespace", _ci_string(64), nullable=False),
+    Column("name", _ci_string(200), nullable=False),
+    Column("name_key", _ci_string(64), nullable=False),
+    Column("content", _long_blob(), nullable=False),
+    Column("sha256", _ci_string(64), nullable=False),
+    Column("idempotency_key", _ci_string(128)),
+    Column("configuration_version", BigInteger, nullable=False),
+    Column("status", _ci_string(24), nullable=False),
+    Column("stage", _ci_string(64), nullable=False),
+    Column("attempts", Integer, nullable=False),
+    Column("owner", _ci_string(32)),
+    Column("lease_until", Double, nullable=False),
+    Column("operation_id", _ci_string(32)),
+    Column("error", Text),
+    Column("created_at", Double, nullable=False),
+    Column("updated_at", Double, nullable=False),
+    UniqueConstraint("namespace", "idempotency_key", name="uq_document_task_idempotency"),
+    Index("ix_document_tasks_name", "namespace", "name_key", "status"),
+    Index("ix_document_tasks_recovery", "status", "lease_until"),
+    **_MYSQL_TABLE,
+)
+
+document_task_outbox = Table(
+    "document_task_outbox", metadata,
+    Column("artifact_id", _ci_string(36), primary_key=True),
+    Column("pending", Boolean, nullable=False),
+    Column("generation", BigInteger, nullable=False),
+    Column("retry_at", Double, nullable=False),
+    Index("ix_document_task_dispatch", "pending", "retry_at"),
+    **_MYSQL_TABLE,
+)
+
 SOURCE_BUCKET = "source"
 PDF_ASSET_BUCKET = "pdf-assets"
 WORD_ASSET_BUCKET = "word-assets"

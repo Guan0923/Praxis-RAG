@@ -332,7 +332,10 @@ def create_service_app(
         start_recovery = getattr(resolved_runtime, "start_upload_recovery", None)
         stop_recovery = getattr(resolved_runtime, "stop_upload_recovery", None)
         cache_sync = getattr(state, "cache_sync", None)
+        document_dispatcher = getattr(state, "document_dispatcher", None)
         try:
+            if document_dispatcher is not None:
+                document_dispatcher.start()
             if cache_sync is not None:
                 await anyio.to_thread.run_sync(cache_sync.start)
             if callable(start_recovery):
@@ -345,6 +348,8 @@ def create_service_app(
                     if callable(stop_recovery):
                         await anyio.to_thread.run_sync(stop_recovery)
                 finally:
+                    if document_dispatcher is not None:
+                        await anyio.to_thread.run_sync(document_dispatcher.stop)
                     if cache_sync is not None:
                         await anyio.to_thread.run_sync(cache_sync.stop)
 

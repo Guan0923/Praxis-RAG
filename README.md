@@ -21,6 +21,8 @@ Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可
 
 文档详情页支持文本阅读，以及 PDF 翻页、缩放和原文件下载。不同工作区分别管理文档，切换工作区后可继续浏览和检索对应资料。
 
+MCP `add_document` 为异步新增：不可变上传字节、任务与 outbox 先保存在 MySQL，RocketMQ 确认发送后仅返回 `{"artifact_id": "<UUID>"}`，表示已接收而非已索引。客户端通过 `get_document_status(artifact_id)` 轮询 `queued` / `processing` / `succeeded` / `failed` 及 `stage`、`error`；成功后主动刷新文档/资源列表。HTTP/Console 上传和 MCP `update_document`、`delete_document` 仍为同步，行为不变。部署及重试说明见 [使用与部署](docs/USAGE.md#异步新增与状态轮询)。
+
 ### PDF 内容解析
 
 PDF 通过独立的本地 Docling 解析进程处理，支持电子版与扫描版文档：
@@ -67,6 +69,8 @@ Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保�
 
 语义检索和重排分别连接模型 API，可使用不同提供方，也可连接自行部署的本地推理服务。HTTP 服务本身不加载这两类模型的权重；PDF 解析仍需要单独准备本地环境和模型。
 
+MCP 异步新增需现有 `[cache]` 可选依赖中的 RocketMQ SDK，以及独立 `rag-document-worker` 消费进程（默认一次执行一个任务，可启动多个独立进程扩容）。API 只运行轻量 outbox relay，不运行文档消费者；`rag-document-worker --dispatch-only` 可单独补发 outbox，不加载模型。worker 必须共享 API 的 MySQL、Qdrant、状态加密及 RocketMQ 连接设置；缓存与文档使用不同 topic/group，启动脚本会显式创建两组资源。
+
 **数据是否离开本机取决于你的模型配置。** 使用远程模型 API 时，查询和相关文档内容会发送给对应服务，测试连接也会发出真实模型请求，可能产生费用。
 
 ### Redis 状态缓存
@@ -79,11 +83,11 @@ Redis 缓存覆盖知识库公开配置、MCP 工具/提示词、文档与知识
 
 ## 使用流程
 
-1. 安装 Praxis-RAG。仓库自带 `docker-compose.yml`，执行 `.\scripts\start-stack.ps1` 可启动 MySQL、Qdrant、导入旧状态并运行服务；详细配置见 [共享状态存储](docs/state-storage.md)。
+1. 安装 Praxis-RAG（异步 MCP 新增需 `[cache]`）。仓库自带 `docker-compose.yml`，执行 `.\scripts\start-stack.ps1` 可启动 MySQL、Qdrant、Redis、RocketMQ，创建两组 topic/group、导入旧状态并运行服务；详细配置见 [使用与部署](docs/USAGE.md)。
 2. 启动 `rag-service`，打开 `http://127.0.0.1:8011/console`。
 3. 在“连接配置”中填写并测试模型 API，选择工作区。
 4. 上传文档，在“检索调试”中检查返回内容与来源。
-5. 将同一工作区接入 MCP 客户端或业务系统。
+5. 将同一工作区接入 MCP 客户端或业务系统；使用异步 `add_document` 时另启动 `rag-document-worker`，轮询状态确认索引完成。
 
 服务启动时自动读取 `~/.praxis-rag/config.toml`，首次运行会创建默认配置。生产环境请配置 `RAG_MYSQL_HOST`（以及 `RAG_MYSQL_USER`、`RAG_MYSQL_DATABASE`、`RAG_MYSQL_PASSWORD`）或显式 `RAG_STATE_URL`，并设置 `RAG_STATE_ENCRYPTION_KEY` 以便多实例解密密钥。已有 SQLite/本地文件数据使用 `rag-state-migrate` 显式迁移，不会自动迁移；详见 [共享状态存储](docs/state-storage.md)。
 
@@ -96,7 +100,9 @@ Redis 缓存覆盖知识库公开配置、MCP 工具/提示词、文档与知识
 - Word 保留内容控件、嵌套表格、空列、合并范围和原生公式；图片按原字节返回。未知公式结构、原生图表和 OLE 等无法可靠读取的内容明确拒绝入库；图表关联有歧义时按规则跳过并显示原因。配置与限制见 [Word 解析说明](docs/USAGE.md#word-解析和图片检索)。
 - 工作区用于划分知识库，不是用户级权限系统。目前没有账户体系或细粒度多用户授权。
 - 默认仅监听本机。远程部署需要配置访问令牌、允许访问的域名与来源，并在服务前设置 HTTPS 和访问控制。
-- 订阅通知不提供历史重放或断线补发，重新连接后需要读取最新状态。
+- 队列故障或确认超时时，MySQL 可能已持久化任务，结果不确定；首次提交即携带 `idempotency_key`，重试同一提交时保留相同 key 和内容，避免创建重复任务。状态查询使用 Redis 缓存，未命中或不可用时回源 MySQL；MySQL 是权威。
+- 上传原始字节在 MySQL 中无 TTL，不随 Redis 缓存或搜索结果过期清理；需安排容量、备份和保留策略。
+- 订阅通知不提供跨进程推送、历史重放或断线补发。独立 worker 提交不会自动触发 API MCP 资源推送；客户端须轮询任务状态并主动刷新列表，重新连接后读取最新状态。
 
 ## 项目文档
 
