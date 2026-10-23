@@ -1,5 +1,5 @@
-# Stop the local MySQL + Qdrant stack. Data volumes are preserved.
-# Add -RemoveVolumes to delete MySQL/Qdrant data as well.
+# Stop the local MySQL/Qdrant/Redis/RocketMQ stack. Data volumes are preserved.
+# Add -RemoveVolumes to delete all stack data as well.
 
 param([switch]$RemoveVolumes)
 

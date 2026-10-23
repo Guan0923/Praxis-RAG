@@ -12,10 +12,10 @@ from functools import partial
 from pathlib import Path
 from typing import Protocol
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import anyio
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.server.subscriptions import PromptsListChanged, ToolsListChanged
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from starlette.datastructures import MutableHeaders
 from starlette.routing import Route
 
 from . import __version__
@@ -45,6 +46,8 @@ from .api_keys import ApiKeyError, ApiKeyStore
 from .knowledge_bases import public_settings
 from .state.store import StateStores
 from .state.uploads import UploadConflict
+from .state.result_snapshots import SnapshotUnavailable
+from .server import MAX_ARTIFACT_LENGTH, MAX_RESULT_PAGE, validate_uuid
 
 _NAMESPACE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _WEB_ROOT = Path(__file__).with_name("web")
@@ -67,8 +70,30 @@ _LOCAL_MCP_ORIGINS = (
 )
 
 
+class _SnapshotNoStoreMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        protected = scope["type"] == "http" and (
+            path in {"/mcp", "/v1/search"} or path.startswith(("/v1/search-results/", "/v1/artifacts/"))
+        )
+
+        async def no_store(message):
+            if protected and message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Cache-Control"] = "no-store"
+            await send(message)
+
+        await self.app(scope, receive, no_store)
+
+
 class ServiceRuntime(Protocol):
     def status(self) -> dict[str, object]: ...
+    def upload_operations(self, namespace: str) -> list[dict]: ...
+    def upload_operation(self, namespace: str, operation_id: str) -> dict | None: ...
+    def published_versions(self, namespace: str) -> dict[str, str]: ...
+    def upload_leases(self, namespace: str) -> list[dict]: ...
     def list_documents(self, namespace: str) -> list[dict[str, object]]: ...
     def upload(self, namespace: str, items: list[tuple[str, object]], *, idempotency_key: str | None = None) -> dict[str, object]: ...
     def check_documents(self, namespace: str, items: list[dict[str, str]]) -> dict[str, object]: ...
@@ -81,6 +106,9 @@ class ServiceRuntime(Protocol):
     def delete(self, namespace: str, name: str) -> dict[str, object]: ...
     def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool, idempotency_key: str | None = None) -> dict[str, object]: ...
     def search(self, namespace: str, arguments: dict[str, object]) -> dict[str, object]: ...
+    def get_search_result(self, namespace: str, result_id: str, *, page: int = 1, page_size: int = 10) -> dict: ...
+    def get_artifact(self, namespace: str, artifact_id: str, *, offset: int = 0, length: int = 65536) -> dict: ...
+    def download_artifact(self, namespace: str, artifact_id: str) -> tuple[bytes, str, str]: ...
     def read_document(self, namespace: str, name: str) -> tuple[str, str]: ...
     def read_document_file(self, namespace: str, name: str) -> bytes: ...
 
@@ -303,27 +331,43 @@ def create_service_app(
     async def lifespan(_app: FastAPI):
         start_recovery = getattr(resolved_runtime, "start_upload_recovery", None)
         stop_recovery = getattr(resolved_runtime, "stop_upload_recovery", None)
+        cache_sync = getattr(state, "cache_sync", None)
         try:
+            if cache_sync is not None:
+                await anyio.to_thread.run_sync(cache_sync.start)
             if callable(start_recovery):
                 await anyio.to_thread.run_sync(start_recovery)
             async with mcp_endpoint.run():
                 yield
         finally:
-            if callable(stop_recovery):
-                with anyio.CancelScope(shield=True):
-                    await anyio.to_thread.run_sync(stop_recovery)
+            with anyio.CancelScope(shield=True):
+                try:
+                    if callable(stop_recovery):
+                        await anyio.to_thread.run_sync(stop_recovery)
+                finally:
+                    if cache_sync is not None:
+                        await anyio.to_thread.run_sync(cache_sync.stop)
 
     app = FastAPI(title="Praxis-RAG", version=__version__, lifespan=lifespan)
     app.state.runtime = resolved_runtime
     app.state.mcp_endpoint = mcp_endpoint
     app.router.routes.append(Route("/mcp", endpoint=mcp_endpoint, methods=["GET", "POST", "DELETE"]))
 
+    app.add_middleware(_SnapshotNoStoreMiddleware)
+
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, error):
+        if request.url.path.startswith(("/v1/search-results/", "/v1/artifacts/")):
+            return JSONResponse({"detail": [{key: item[key] for key in ("type", "loc", "msg")}
+                                            for item in error.errors()]}, status_code=400)
         if request.url.path.startswith("/v1/admin/knowledge-bases"):
             return JSONResponse({"detail": [{key: item[key] for key in ("type", "loc", "msg")}
                                             for item in error.errors()]}, status_code=422)
         return await request_validation_exception_handler(request, error)
+
+    @app.exception_handler(SnapshotUnavailable)
+    async def snapshot_unavailable(_request, error):
+        return JSONResponse({"detail": str(error)}, status_code=410, headers={"Cache-Control": "no-store"})
 
     @app.exception_handler(UploadConflict)
     async def upload_conflict(_request, _error):
@@ -450,6 +494,31 @@ def create_service_app(
         def console() -> FileResponse:
             return FileResponse(_WEB_ROOT / "index.html")
 
+    @app.get("/v1/uploads")
+    def upload_status_list(namespace: str = Depends(tenant)) -> Response:
+        return JSONResponse({"operations": resolved_runtime.upload_operations(namespace), "limit": 100,
+                             "display_only": True}, headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/uploads/{operation_id}")
+    def upload_status_detail(operation_id: str, namespace: str = Depends(tenant)) -> Response:
+        if not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+            raise HTTPException(status_code=404, detail="Upload operation does not exist")
+        result = resolved_runtime.upload_operation(namespace, operation_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Upload operation does not exist")
+        return JSONResponse({"operation": result, "display_only": True},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/admin/published-versions", dependencies=[Depends(local_admin)])
+    def published_version_status(namespace: str = Depends(tenant)) -> Response:
+        return JSONResponse({"versions": resolved_runtime.published_versions(namespace), "display_only": True},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/admin/upload-leases", dependencies=[Depends(local_admin)])
+    def upload_lease_status(namespace: str = Depends(tenant)) -> Response:
+        return JSONResponse({"leases": resolved_runtime.upload_leases(namespace), "display_only": True},
+                            headers={"Cache-Control": "no-store"})
+
     @app.get("/v1/documents")
     def list_documents(namespace: str = Depends(tenant)) -> dict[str, object]:
         return {
@@ -484,10 +553,16 @@ def create_service_app(
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    def public_knowledge_base(namespace: str) -> dict:
+        reader = getattr(resolved_runtime, "public_knowledge_base", None)
+        if reader is not None:
+            return reader(namespace)
+        return public_settings(resolved_runtime.knowledge_base(namespace))
+
     @app.get("/v1/admin/knowledge-bases/{namespace}", dependencies=[Depends(local_admin)])
     def knowledge_base_details(namespace: str):
         try:
-            return JSONResponse(public_settings(resolved_runtime.knowledge_base(namespace)),
+            return JSONResponse(public_knowledge_base(namespace),
                                 headers={"Cache-Control": "no-store"})
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -513,7 +588,7 @@ def create_service_app(
     @app.get("/v1/knowledge-base")
     def knowledge_base(namespace: str = Depends(tenant)):
         try:
-            return {**public_settings(resolved_runtime.knowledge_base(namespace)), "strategies": strategy_catalog()["strategies"]}
+            return {**public_knowledge_base(namespace), "strategies": strategy_catalog()["strategies"]}
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -562,7 +637,8 @@ def create_service_app(
         try:
             async with mcp_endpoint.mutation_lock(namespace):
                 with anyio.CancelScope(shield=True):
-                    before = await anyio.to_thread.run_sync(resolved_runtime.list_documents, namespace)
+                    reader = getattr(resolved_runtime, "authoritative_documents", resolved_runtime.list_documents)
+                    before = await anyio.to_thread.run_sync(reader, namespace)
                     upload = partial(resolved_runtime.upload, namespace, items)
                     if idempotency_key is not None:
                         upload = partial(upload, idempotency_key=idempotency_key)
@@ -579,7 +655,8 @@ def create_service_app(
         try:
             async with mcp_endpoint.mutation_lock(namespace):
                 with anyio.CancelScope(shield=True):
-                    before = await anyio.to_thread.run_sync(resolved_runtime.list_documents, namespace)
+                    reader = getattr(resolved_runtime, "authoritative_documents", resolved_runtime.list_documents)
+                    before = await anyio.to_thread.run_sync(reader, namespace)
                     result = await anyio.to_thread.run_sync(resolved_runtime.delete, namespace, name)
                     await mcp_endpoint.documents_changed(namespace, before, result["documents"])
                     return result
@@ -587,6 +664,61 @@ def create_service_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except KnowledgeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    def snapshot_uuid(value):
+        try:
+            return validate_uuid(value)
+        except SearchValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/v1/search-results/{result_id}")
+    def get_search_result(
+        result_id: str,
+        page: int = Query(default=1, ge=1, le=MAX_RESULT_PAGE),
+        page_size: int = Query(default=10, ge=1, le=100),
+        namespace: str = Depends(tenant),
+    ):
+        result_id = snapshot_uuid(result_id)
+        try:
+            payload = resolved_runtime.get_search_result(namespace, result_id, page=page, page_size=page_size)
+        except SnapshotUnavailable:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+    @app.get("/v1/artifacts/{artifact_id}")
+    def download_artifact(artifact_id: str, namespace: str = Depends(tenant)):
+        content, mime_type, name = resolved_runtime.download_artifact(namespace, snapshot_uuid(artifact_id))
+        # Both filename parameters are leaf names; never copy runtime paths or header controls.
+        name = str(name or "artifact").replace("\\", "/").rsplit("/", 1)[-1]
+        name = "".join(char for char in name if ord(char) >= 32 and ord(char) != 127).strip()
+        if name in {"", ".", ".."}:
+            name = "artifact"
+        fallback = re.sub(r"[^A-Za-z0-9._ -]", "_", name)
+        if not isinstance(mime_type, str) or not re.fullmatch(r"[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+", mime_type):
+            mime_type = "application/octet-stream"
+        return Response(content, media_type=mime_type, headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(name, safe="")}',
+        })
+
+    @app.get("/v1/artifacts/{artifact_id}/content")
+    def get_artifact(
+        artifact_id: str,
+        offset: int = Query(default=0, ge=0),
+        length: int = Query(default=65536, ge=1, le=MAX_ARTIFACT_LENGTH),
+        namespace: str = Depends(tenant),
+    ):
+        artifact_id = snapshot_uuid(artifact_id)
+        try:
+            payload = resolved_runtime.get_artifact(namespace, artifact_id, offset=offset, length=length)
+        except SnapshotUnavailable:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @app.post("/v1/search")
     def search(body: SearchBody, namespace: str = Depends(tenant)) -> dict[str, object]:

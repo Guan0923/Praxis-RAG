@@ -45,7 +45,18 @@ export type AssetTable = {
   num_rows?: number; num_cols?: number; nested_tables?: Record<string, AssetTable>;
   caption?: string; footnotes?: string[];
 };
+export type ArtifactReference = {
+  artifact_id: string;
+  document_id: string;
+  version: string | null;
+  kind: string;
+  name: string;
+  mime_type: string;
+  expires_at: number;
+  resource_uri: string;
+};
 export type SearchAsset = { mime_type?: string; data?: string; caption?: string;
+  artifact_id?: string; resource_uri?: string; expires_at?: number;
   location?: WordLocation; page?: number } & ({ type: "image" } | ({ type: "table" } & AssetTable));
 export type Health = {
   backend?: string;
@@ -62,10 +73,18 @@ export type Hit = {
   text?: string;
   score: number;
   asset?: SearchAsset;
+  artifacts?: ArtifactReference[];
   metadata?: { retrieval_score?: number; location?: WordLocation;
     captions?: { text: string }[]; footnotes?: { text: string }[] };
 };
 export type SearchResult = {
+  result_id?: string;
+  created_at?: number;
+  expires_at?: number;
+  snapshot_available?: boolean;
+  snapshot_error?: string;
+  artifact_warning?: string;
+  artifacts?: ArtifactReference[];
   retrieval: Retrieval;
   rerank: Rerank;
   evidence_status: string;

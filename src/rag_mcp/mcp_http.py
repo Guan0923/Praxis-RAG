@@ -8,6 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from functools import partial
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 import anyio
 from fastapi import HTTPException
@@ -31,7 +32,7 @@ from starlette.responses import JSONResponse
 from .catalog import CatalogStore
 from .document_readers import DocumentReadError
 from .resources import document_uri, parse_uri, resource_page
-from .server import create_registry, create_server
+from .server import create_registry, create_server, validate_artifact_range, validate_uuid
 from .service_knowledge import MAX_FILE_BYTES, KnowledgeError, KnowledgeValidationError
 from .state.uploads import UploadConflict
 
@@ -48,10 +49,47 @@ def _paginate(items, params):
     return items[start : start + 50], str(start + 50) if start + 50 < len(items) else None
 
 
+def _artifact_uri(namespace, artifact_id):
+    return f"rag://artifacts/{quote(namespace, safe='')}/{artifact_id}"
+
+
+def _parse_artifact_uri(namespace, uri):
+    if any(ord(char) <= 32 or ord(char) == 127 for char in uri) or "#" in uri:
+        raise ValueError("Invalid artifact URI")
+    parsed = urlsplit(uri)
+    parts = parsed.path.split("/")
+    if parsed.scheme != "rag" or parsed.netloc != "artifacts" or parsed.fragment or len(parts) != 3:
+        raise ValueError("Invalid artifact URI")
+    uri_namespace, raw_id = (unquote(part, errors="strict") for part in parts[1:])
+    artifact_id = validate_uuid(raw_id)
+    if uri_namespace != namespace or f"rag://artifacts{parsed.path}" != _artifact_uri(namespace, artifact_id):
+        raise ValueError("Artifact URI is outside this namespace or non-canonical")
+    query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+    if (set(query) - {"offset", "length"}
+            or any(len(values) != 1 for values in query.values())
+            or ("?" in uri and not parsed.query)
+            or "&".join(f"{key}={values[0]}" for key, values in query.items()) != parsed.query):
+        raise ValueError("Invalid artifact chunk parameters")
+    values = []
+    for key, default in (("offset", "0"), ("length", "65536")):
+        raw = query.get(key, [default])[0]
+        if not raw or not raw.isascii() or not raw.isdecimal() or len(raw) > 20:
+            raise ValueError("Invalid artifact chunk parameters")
+        value = int(raw)
+        if raw != str(value):
+            raise ValueError("Artifact chunk parameters must be canonical integers")
+        values.append(value)
+    offset, length = values
+    validate_artifact_range(offset, length)
+    return artifact_id, offset, length
+
+
 class NamespaceEndpoint:
     def __init__(self, namespace, runtime, catalog, security, document_mutator):
         self.namespace = namespace
         self.runtime = runtime
+        if not callable(getattr(runtime, "get_search_result", None)):
+            self.get_search_result = None
         self.catalog = catalog
         self.bus = InMemorySubscriptionBus()
         self.listen = ListenHandler(self.bus)
@@ -83,6 +121,9 @@ class NamespaceEndpoint:
 
     def search(self, request):
         return self.runtime.search(self.namespace, asdict(request))
+
+    def get_search_result(self, result_id, *, page=1, page_size=10):
+        return self.runtime.get_search_result(self.namespace, result_id, page=page, page_size=page_size)
 
     async def run(self, *, task_status=anyio.TASK_STATUS_IGNORED):
         # The manager's task group must enter and exit in the same owner task.
@@ -126,11 +167,31 @@ class NamespaceEndpoint:
                     uri_template=f"rag://knowledge/{self.namespace}/{{name}}{{?page,version}}",
                     name="Document paragraph pages",
                     mime_type="application/json",
-                )
+                ),
+                types.ResourceTemplate(
+                    uri_template="rag://artifacts/{namespace}/{artifact_id}{?offset,length}",
+                    name="Artifact byte chunks",
+                    description="Read an expiring artifact UUID as a bounded JSON chunk envelope; follow next_uri.",
+                    mime_type="application/json",
+                ),
             ]
         )
 
     async def read_resource(self, ctx, params):
+        if urlsplit(str(params.uri)).netloc == "artifacts":
+            artifact_id, offset, length = _parse_artifact_uri(self.namespace, str(params.uri))
+            payload = dict(await asyncio.to_thread(
+                self.runtime.get_artifact, self.namespace, artifact_id, offset=offset, length=length,
+            ))
+            next_offset = payload.get("next_offset")
+            payload["next_uri"] = (
+                _artifact_uri(self.namespace, artifact_id)
+                + "?" + urlencode({"offset": next_offset, "length": length})
+                if next_offset is not None else None
+            )
+            return types.ReadResourceResult(contents=[types.TextResourceContents(
+                uri=params.uri, mime_type="application/json", text=json.dumps(payload, ensure_ascii=False),
+            )])
         name, page, expected = parse_uri(self.namespace, params.uri)
         text, version = await asyncio.to_thread(self.runtime.read_document, self.namespace, name)
         payload = resource_page(self.namespace, name, text, version, page, expected)
@@ -256,14 +317,21 @@ class McpHttpEndpoint:
             def search(inner, request):
                 return self.runtime.search(namespace, asdict(request))
 
-        return create_registry(Executor(), self.catalogs.for_namespace(namespace), partial(self.mutate_document, namespace))
+            def get_search_result(inner, result_id, *, page=1, page_size=10):
+                return self.runtime.get_search_result(namespace, result_id, page=page, page_size=page_size)
+
+        executor = Executor()
+        if not callable(getattr(self.runtime, "get_search_result", None)):
+            executor.get_search_result = None
+        return create_registry(executor, self.catalogs.for_namespace(namespace), partial(self.mutate_document, namespace))
 
     async def mutate_document(self, namespace, operation, request):
         async with self.mutation_lock(namespace):
             # Finish the storage change and notification together even if the caller disconnects.
             with anyio.CancelScope(shield=True):
                 try:
-                    before = await anyio.to_thread.run_sync(self.runtime.list_documents, namespace)
+                    before = await anyio.to_thread.run_sync(
+                        getattr(self.runtime, "authoritative_documents", self.runtime.list_documents), namespace)
                     if operation == "delete_document":
                         if request.name not in {item["name"] for item in before}:
                             raise KnowledgeValidationError(f"Document does not exist: {request.name}")

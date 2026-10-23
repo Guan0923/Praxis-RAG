@@ -69,6 +69,14 @@ Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保�
 
 **数据是否离开本机取决于你的模型配置。** 使用远程模型 API 时，查询和相关文档内容会发送给对应服务，测试连接也会发出真实模型请求，可能产生费用。
 
+### Redis 状态缓存
+
+Redis 缓存覆盖知识库公开配置、MCP 工具/提示词、文档与知识库列表统计，以及 API Key 管理状态、文档版本/租约/事务进度的展示查询。命中直接返回，不额外查 MySQL；严格模式下真实鉴权、检索版本与租约执行权仍由 MySQL 校验。写入同事务记录修订和 outbox，提交后刷新 Redis，失败经 RocketMQ 重试；Redis 不可用回源。部署与一致性边界见 [状态缓存](docs/state-cache.md)。
+
+### UUID 结果与产物引用
+
+搜索保留完整结果，并返回一小时有效的 result_id 和版本固定的 artifact_id。后续可通过 MCP get_search_result / Resource 或 REST 按 ID 读取，不重复调用检索、重排或解析。结果快照和产物保存在 MySQL，Redis 加速；删除文档仅置 del_flag，影响新的访问，旧 UUID 在有效期内继续可读（仍需当前 namespace 权限）。接口与容量限制见 [UUID 引用](docs/result-references.md)。
+
 ## 使用流程
 
 1. 安装 Praxis-RAG。仓库自带 `docker-compose.yml`，执行 `.\scripts\start-stack.ps1` 可启动 MySQL、Qdrant、导入旧状态并运行服务；详细配置见 [共享状态存储](docs/state-storage.md)。

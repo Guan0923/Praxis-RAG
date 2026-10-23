@@ -21,7 +21,8 @@ class ApiKeyStore:
         self.repository = self._owned.api_keys
 
     def list(self):
-        return self.repository.list()
+        """Return display-only cached metadata, never authentication authority."""
+        return self.state.views.api_keys()
 
     def create(self, name, namespaces):
         try:

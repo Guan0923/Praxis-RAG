@@ -22,9 +22,14 @@ dependencies = [
     "sqlalchemy>=2,<3",
     "pymysql>=1.1,<2",
     "cryptography>=42,<47",
+    "redis>=5,<7",
 ]
 
 [project.optional-dependencies]
+cache = [
+    "rocketmq-python-client==5.1.2",
+]
+
 api = [
     "transformers>=4.57,<5",
 ]

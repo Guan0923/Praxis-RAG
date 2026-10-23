@@ -159,10 +159,10 @@ def test_real_word_ingestion_search_and_mcp():
                 assert not response["results"]
                 assert client.delete("/v1/documents/captioned.docx").status_code == 200
                 assert runtime.state.documents.get("manuals", "captioned.docx") is None
-                assert runtime.state.blobs.list_keys("manuals", "word-assets", document_id=replaced_id) == []
+                assert runtime.state.blobs.get("manuals", "source", "captioned.docx") == stream.getvalue()
             report["checks"] = {"doc_conversion": True, "real_vision": True, "original_image_bytes": True,
                 "table_structure": True, "http_and_mcp": True, "failed_replace_preserved_old": True,
-                "replacement_removed_old_assets": True, "delete_removed_assets": True}
+                "replacement_removed_old_assets": True, "soft_delete_hides_live_document": True}
     finally:
         (root / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         runtime._client.close()

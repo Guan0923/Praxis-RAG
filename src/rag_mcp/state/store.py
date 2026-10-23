@@ -18,8 +18,13 @@ from .repositories import (
     StateError,
 )
 from .schema import metadata
+from .schema_migrations import migrate_soft_delete
 from .settings import StateSettings
 from .uploads import UploadJournal
+from .cache_sync import CacheSynchronizer
+from .read_views import CachedReadViews
+from .artifacts import ArtifactRegistry
+from .result_snapshots import ResultSnapshots
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +38,20 @@ class StateStores:
         if create_schema:
             try:
                 metadata.create_all(self.engine)
+                migrate_soft_delete(self.engine)
             except Exception as exc:  # noqa: BLE001 - surfaced as a configuration error
                 raise StateError(f"状态数据库初始化失败：{type(exc).__name__}") from exc
+        self.cache_sync = CacheSynchronizer(self)
         self.blobs = BlobStore(self.engine)
-        self.api_keys = ApiKeyRepository(self.engine, settings.encryption_key)
-        self.knowledge_bases = KnowledgeBaseRepository(self.engine)
-        self.documents = DocumentRepository(self.engine)
-        self.catalogs = CatalogRepository(self.engine)
+        self.api_keys = ApiKeyRepository(self.engine, settings.encryption_key, self.cache_sync)
+        self.knowledge_bases = KnowledgeBaseRepository(self.engine, self.cache_sync)
+        self.documents = DocumentRepository(self.engine, self.cache_sync)
+        self.catalogs = CatalogRepository(self.engine, self.cache_sync)
         self.uploads = UploadJournal(self)
+        self.views = CachedReadViews(self)
+        self.results = ResultSnapshots(self)
+        self.artifacts = ArtifactRegistry(self, ttl_seconds=self.results.settings.ttl_seconds,
+                                          max_bytes=self.results.settings.max_artifact_bytes)
         _warn_if_unencrypted(settings)
 
     @classmethod
@@ -55,6 +66,7 @@ class StateStores:
         return cls(resolved, create_schema=create_schema and resolved.auto_schema)
 
     def close(self) -> None:
+        self.cache_sync.close()
         self.uploads.close()
         self.engine.dispose()
 

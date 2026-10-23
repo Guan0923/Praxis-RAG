@@ -233,3 +233,11 @@ integration set `RAG_TEST_MYSQL_URL` to a disposable schema named
 `praxis_txn_test_*`, optionally `RAG_TEST_QDRANT_URL`, and run
 `tests/test_mysql_upload_transactions.py`. This suite deletes its schema's rows
 and its own `txn_test_*` Qdrant collection; never point it at production state.
+
+## Redis 状态读模型
+
+第一批缓存公开知识库配置、MCP catalog、文档列表及知识库列表/统计。第二批缓存 API Key 管理状态、发布指针、租约和事务/步骤/回滚的展示投影；实际鉴权、检索版本、租约执行权和日志恢复仍直接读取 MySQL。cache_revisions/cache_outbox 与状态修改在 MySQL 同事务提交；RocketMQ 处理失败刷新，Redis 故障回源。完整配置、启动和故障语义见 [状态缓存](state-cache.md)。
+
+## UUID 结果与逻辑删除
+
+搜索快照与产物分别持久化在 search_result_snapshots、artifact_snapshots，默认保留 1 小时。Redis 快照丢失时回源 MySQL，不重新检索。文档删除通过 del_flag 隐藏，不物理删除持久化源文件和 Qdrant 数据；原 UUID 仍可访问至到期。正常自动 schema 会为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [UUID 引用与迁移](result-references.md)。

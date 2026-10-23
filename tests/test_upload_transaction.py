@@ -28,7 +28,7 @@ def stack(tmp_path):
     state = StateStores.create(tmp_path / "state")
     client = QdrantClient(":memory:")
     vectors = QdrantStore(collection="uploads", namespace="alpha", client=client,
-                          active_versions=lambda: state.uploads.active_versions("alpha"))
+                          active_versions=lambda: state.documents.visible_versions("alpha"))
     embedder = SimpleNamespace(embed_documents=lambda texts: [VECTOR for _ in texts])
     ingester = DenseDocumentIngester(RagConfig(backend="qdrant", collection="uploads"),
                                      embedder, Bm25SparseEncoder(), vectors)
@@ -194,7 +194,7 @@ def test_pdf_artifacts_are_journaled_and_recoverable_before_tokenization(stack, 
     assert workspaces and all(not root.exists() for root in workspaces)
 
 
-def test_delete_removes_retained_version_blobs_without_touching_other_documents(stack):
+def test_soft_delete_retains_version_blobs_without_touching_other_documents(stack):
     state, vectors, ingester, documents = stack
     first = upload(stack)
     second = upload(stack, b"replacement")
@@ -202,7 +202,7 @@ def test_delete_removes_retained_version_blobs_without_touching_other_documents(
     documents.delete("file.txt", ingester)
     assert documents.list_documents()[0]["name"] == "other.txt"
     for record in (first, second):
-        assert state.uploads.get_object(record["operation_id"], "source", "file.txt") is None
+        assert state.uploads.get_object(record["operation_id"], "source", "file.txt") is not None
     assert documents.read_source("other.txt") == b"unrelated"
     assert state.uploads.head("alpha", other["document_id"]) == other["operation_id"]
     assert [hit.payload["text"] for hit in vectors.dense_search(VECTOR, limit=10, filters={})] == ["unrelated"]

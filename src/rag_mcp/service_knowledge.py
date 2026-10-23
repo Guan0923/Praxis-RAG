@@ -32,6 +32,9 @@ from .state.store import StateStores
 from .workspace import cleanup_workspace
 from .state.uploads import UploadConflict
 from .state.upload_coordinator import UploadCoordinator
+from .state.result_snapshots import SnapshotUnavailable
+from .state.artifacts import ArtifactUnavailable
+from .state.search_references import SearchReferences
 from .word_reader import WORD_PARSER_VERSION
 from .model_api import HTTPEmbedder, HTTPReranker, ModelAPIError, ModelConnection, ModelHTTPClient
 from .model_settings import draft_connection
@@ -182,6 +185,9 @@ class KnowledgeDocumentStore:
                 digest.update(data)
             if digest.hexdigest() != op["result"].get("request_sha256", op["result"].get("sha256")):
                 raise UploadConflict("Idempotency key has different file bytes")
+            self.state.cache_sync.flush_pending(keys=(("documents", self.namespace), ("kb_list", ""),
+                ("heads", self.namespace), ("leases", self.namespace), ("upload_list", self.namespace),
+                ("upload_status", op["id"])))
             return {**op["result"], "operation_id": op["id"], "replayed": True}
         workspace = Path(tempfile.gettempdir()).resolve() / ("rag-txn-" + op["id"])
         temporary = workspace / name
@@ -211,6 +217,9 @@ class KnowledgeDocumentStore:
                           "operation_id": op["id"], "request_sha256": sha256}
                 # A no-op is a terminal replayable result, not a new document version.
                 journal.commit_noop(op, result)
+                self.state.cache_sync.flush_pending(keys=(("documents", self.namespace), ("kb_list", ""),
+                ("heads", self.namespace), ("leases", self.namespace), ("upload_list", self.namespace),
+                ("upload_status", op["id"])))
                 try:
                     coordinator.cleanup_workspace(op)
                 except OSError:
@@ -255,6 +264,9 @@ class KnowledgeDocumentStore:
                         cleanup_workspace(indexed.artifacts_dir)
             if metadata is None:
                 raise KnowledgeError("知识文件索引未发布")
+            self.state.cache_sync.flush_pending(keys=(("documents", self.namespace), ("kb_list", ""),
+                ("heads", self.namespace), ("leases", self.namespace), ("upload_list", self.namespace),
+                ("upload_status", op["id"])))
             try:
                 coordinator.cleanup_workspace(op)
             except OSError:
@@ -265,6 +277,9 @@ class KnowledgeDocumentStore:
             # An ambiguous commit acknowledgement must never roll back a committed head.
             current = journal.get(op["id"])
             if current["status"] == "COMMITTED":
+                self.state.cache_sync.flush_pending(keys=(("documents", self.namespace), ("kb_list", ""),
+                ("heads", self.namespace), ("leases", self.namespace), ("upload_list", self.namespace),
+                ("upload_status", op["id"])))
                 try:
                     coordinator.cleanup_workspace(current)
                 except OSError:
@@ -290,20 +305,25 @@ class KnowledgeDocumentStore:
         journal = self.state.uploads
         try:
             with journal.lock(self.namespace, document_id) as token:
-                ingester.delete(document_id)
+                # Logical deletion never touches retained source/index bytes.
+                # New lookups and Qdrant visibility consult del_flag in MySQL.
                 with self.state.engine.begin() as conn:
-                    journal.remove_head(self.namespace, document_id, conn, token)
-                    journal.purge_document_objects(self.namespace, document_id, conn, token)
-                    self.state.documents.delete(self.namespace, safe_name, conn=conn)
-                    for bucket in (SOURCE_BUCKET, PDF_ASSET_BUCKET, WORD_ASSET_BUCKET):
-                        self.state.blobs.delete_document(self.namespace, bucket, document_id, conn=conn)
+                    journal.assert_lock(token, conn)
+                    journal._cache_changed(conn, self.namespace, heads=True)
+                    if not self.state.documents.delete(self.namespace, safe_name, conn=conn):
+                        raise KnowledgeValidationError(f"知识文件不存在：{safe_name}")
         except UploadConflict as exc:
             raise KnowledgeValidationError("文档正在更新，请稍后再删除") from exc
+        self.state.cache_sync.flush_pending(keys=(("documents", self.namespace), ("kb_list", ""),
+                ("heads", self.namespace), ("leases", self.namespace), ("upload_list", self.namespace),
+                ))
         return record
 
     def read_source(self, name: str, record=None) -> bytes:
         record = record or self.state.documents.get(self.namespace, name)
-        version = record.get("operation_id") if record else None
+        if record is None:
+            raise KnowledgeValidationError("Document does not exist")
+        version = record.get("operation_id")
         content = (self.state.uploads.get_object(version, SOURCE_BUCKET, name) if version else
                    self.state.blobs.get(self.namespace, SOURCE_BUCKET, name))
         if content is None:
@@ -565,7 +585,10 @@ class RagServiceRuntime:
                            client=self._client)
 
     def recover_uploads(self):
-        return UploadCoordinator(self.state).recover(self._recovery_store)
+        recovered = UploadCoordinator(self.state).recover(self._recovery_store)
+        self.state.artifacts.purge_expired(limit=100)
+        self.state.results.purge_expired(limit=100)
+        return recovered
 
     def start_upload_recovery(self):
         if not hasattr(self, "_recovery_stop"):
@@ -615,15 +638,7 @@ class RagServiceRuntime:
 
     @_runtime_operation
     def list_knowledge_bases(self) -> list[dict]:
-        registered = {
-            item["namespace"]: public_settings(item) for item in self.state.knowledge_bases.list()
-        }
-        namespaces = set(registered)
-        documents = self.state.documents.namespaces()
-        namespaces.update(name for name, count in documents.items() if count)
-        return [{**registered.get(namespace, {"namespace": namespace}),
-                 "configured": namespace in registered, "document_count": documents.get(namespace, 0)}
-                for namespace in sorted(namespaces)]
+        return self.state.views.knowledge_bases()
 
     @_runtime_operation
     def create_knowledge_base(self, namespace: str, chunking: ChunkingConfig,
@@ -665,6 +680,13 @@ class RagServiceRuntime:
         return settings
 
     @_runtime_operation
+    def public_knowledge_base(self, namespace: str) -> dict:
+        settings = self.state.views.knowledge_base(namespace)
+        if settings is None:
+            raise KnowledgeValidationError("该知识库没有配置记录，请先创建知识库")
+        return settings
+
+    @_runtime_operation
     @_namespace_mutation
     def update_knowledge_base(self, namespace: str, values: dict, *, reembed: bool = False) -> dict:
         from .storage.qdrant_store import QdrantStore
@@ -694,10 +716,10 @@ class RagServiceRuntime:
         staging = f"knowledge_{uuid4().hex}" if reembed else None
         try:
             if staging:
-                records = self.list_documents(namespace)
+                records = self.state.documents.list(namespace)
                 source = QdrantStore(collection=current["collection"], vector_size=current["vector_size"],
                                      namespace=namespace, client=self._client,
-                                     active_versions=lambda: self.state.uploads.active_versions(namespace))
+                                     active_versions=lambda: self.state.documents.visible_versions(namespace))
                 source.reembed_into(staging, HTTPEmbedder(embedding),
                                     {item["document_id"]: item["chunk_count"] for item in records})
                 updated.update(collection=staging, reembedded_at=datetime.now(UTC).isoformat())
@@ -720,9 +742,26 @@ class RagServiceRuntime:
 
     @_runtime_operation
     def list_documents(self, namespace: str) -> list[dict[str, object]]:
+        return self.state.views.documents(namespace)
+
+    @_runtime_operation
+    def authoritative_documents(self, namespace: str) -> list[dict[str, object]]:
+        """Read current records for mutation validation and change notifications."""
         tenant = self._tenant(namespace)
         with tenant.lock:
             return tenant.documents.list_documents()
+
+    def upload_operations(self, namespace: str) -> list[dict]:
+        return self.state.views.upload_operations(namespace)
+
+    def upload_operation(self, namespace: str, operation_id: str) -> dict | None:
+        return self.state.views.upload_operation(namespace, operation_id)
+
+    def published_versions(self, namespace: str) -> dict[str, str]:
+        return self.state.views.published_versions(namespace)
+
+    def upload_leases(self, namespace: str) -> list[dict]:
+        return self.state.views.leases(namespace)
 
     def chunking_metadata(self, namespace: str, chunking: ChunkingConfig) -> dict[str, object]:
         settings = self.knowledge_base(namespace)
@@ -814,7 +853,39 @@ class RagServiceRuntime:
         tenant = self._tenant(namespace)
         request = SearchRequest.from_arguments(dict(arguments))
         with tenant.lock, self._inference_lock:
-            return tenant.orchestrator.search(request)
+            context = None
+            config = getattr(getattr(tenant, "ingester", None), "_config", None)
+            if config is not None:
+                context = {key: getattr(config, key) for key in (
+                    "collection", "embedding_model", "reranker_model", "vector_size", "chunk_tokenizer_model")}
+                context["configuration_version"] = getattr(tenant, "kb_version", None)
+            payload = tenant.orchestrator.search(request)
+            if context is not None:
+                payload = {**payload, "snapshot_context": context}
+            # Immutable hit versions are copied into expiring artifacts; do not
+            # take a writer lease or block reads of the current committed index.
+            try:
+                return SearchReferences(self.state).capture(namespace, payload)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Search reference capture unavailable: %s", type(exc).__name__)
+                return {**payload, "snapshot_available": False,
+                        "snapshot_error": "Search result references are unavailable"}
+
+    def get_search_result(self, namespace: str, result_id: str, *, page=1, page_size=10) -> dict:
+        return self.state.results.get(namespace, result_id, page=page, page_size=page_size)
+
+    def get_artifact(self, namespace: str, artifact_id: str, *, offset=0, length=65536) -> dict:
+        try:
+            return self.state.artifacts.chunk(namespace, artifact_id, offset=offset, length=length)
+        except ArtifactUnavailable as exc:
+            raise SnapshotUnavailable(str(exc)) from exc
+
+    def download_artifact(self, namespace: str, artifact_id: str):
+        try:
+            artifact = self.state.artifacts.read(namespace, artifact_id)
+        except ArtifactUnavailable as exc:
+            raise SnapshotUnavailable(str(exc)) from exc
+        return artifact["content"], artifact["mime_type"], artifact["name"]
 
     @_runtime_operation
     def read_document_file(self, namespace: str, name: str) -> bytes:
@@ -870,7 +941,7 @@ class RagServiceRuntime:
                 vector_size=config.vector_size,
                 namespace=namespace,
                 client=self._client,
-                active_versions=lambda: self.state.uploads.active_versions(namespace),
+                active_versions=lambda: self.state.documents.visible_versions(namespace),
             )
             orchestrator = RagOrchestrator(
                 retrievers={

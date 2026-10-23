@@ -81,6 +81,7 @@ documents = Table(
     Column("indexed_at", String(40), nullable=False),
     Column("diagnostics", _long_text(), nullable=False),
     Column("skipped_object_count", Integer, nullable=False, default=0),
+    Column("del_flag", Boolean, nullable=False, default=False, server_default="0"),
     UniqueConstraint("namespace", "document_id", name="uq_documents_namespace_id"),
     Index("ix_documents_namespace_sha256", "namespace", "sha256"),
     **_MYSQL_TABLE,
@@ -179,6 +180,61 @@ upload_objects = Table(
     Column("content", _long_blob(), nullable=False),
     Column("metadata", _long_text()),
     Column("created_at", Double, nullable=False),
+    **_MYSQL_TABLE,
+)
+
+cache_revisions = Table(
+    "cache_revisions", metadata,
+    Column("kind", _ci_string(32), primary_key=True),
+    Column("scope", _ci_string(64), primary_key=True),
+    Column("revision", BigInteger, nullable=False),
+    **_MYSQL_TABLE,
+)
+
+cache_outbox = Table(
+    "cache_outbox", metadata,
+    Column("id", _ci_string(32), primary_key=True),
+    Column("kind", _ci_string(32), nullable=False),
+    Column("scope", _ci_string(64), nullable=False),
+    Column("revision", BigInteger, nullable=False),
+    Column("status", _ci_string(24), nullable=False),
+    Column("attempts", Integer, nullable=False, default=0),
+    Column("retry_at", Double, nullable=False),
+    Column("created_at", Double, nullable=False),
+    Column("completed_at", Double),
+    Column("last_error", _ci_string(128)),
+    Index("ix_cache_outbox_pending", "status", "retry_at"),
+    **_MYSQL_TABLE,
+)
+
+search_result_snapshots = Table(
+    "search_result_snapshots", metadata,
+    Column("id", _ci_string(36), primary_key=True),
+    Column("namespace", _ci_string(64), nullable=False),
+    Column("content", _long_text(), nullable=False),
+    Column("created_at", Double, nullable=False),
+    Column("expires_at", Double, nullable=False),
+    Index("ix_search_result_expiry", "expires_at"),
+    Index("ix_search_result_namespace", "namespace"),
+    **_MYSQL_TABLE,
+)
+
+artifact_snapshots = Table(
+    "artifact_snapshots", metadata,
+    Column("id", _ci_string(36), primary_key=True),
+    Column("namespace", _ci_string(64), nullable=False),
+    Column("identity", _ci_string(64), nullable=False),
+    Column("document_id", _ci_string(64), nullable=False),
+    Column("version", _ci_string(64)),
+    Column("kind", _ci_string(32), nullable=False),
+    Column("name", _ci_string(512), nullable=False),
+    Column("mime_type", String(128), nullable=False),
+    Column("content", _long_blob(), nullable=False),
+    Column("created_at", Double, nullable=False),
+    Column("expires_at", Double, nullable=False),
+    UniqueConstraint("namespace", "identity", name="uq_artifact_identity"),
+    Index("ix_artifact_expiry", "expires_at"),
+    Index("ix_artifact_namespace", "namespace"),
     **_MYSQL_TABLE,
 )
 

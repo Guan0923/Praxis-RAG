@@ -48,13 +48,21 @@ Get-Content ".env" | ForEach-Object {
     }
 }
 
+if (-not $env:RAG_REDIS_URL) { $env:RAG_REDIS_URL = "redis://127.0.0.1:6379/0" }
+if (-not $env:RAG_ROCKETMQ_ENDPOINT) { $env:RAG_ROCKETMQ_ENDPOINT = "127.0.0.1:8081" }
+if (-not $env:RAG_ROCKETMQ_TOPIC) { $env:RAG_ROCKETMQ_TOPIC = "praxis_state_cache_refresh" }
+if (-not $env:RAG_ROCKETMQ_GROUP) { $env:RAG_ROCKETMQ_GROUP = "praxis_state_cache_refresh_workers" }
+
 $python = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $python)) {
     $python = "python"
 }
 $env:PYTHONPATH = (Join-Path $root "src") + [IO.Path]::PathSeparator + $env:PYTHONPATH
 
-Write-Host "Starting MySQL and Qdrant..."
+& $python -c "import redis; import rocketmq"
+if ($LASTEXITCODE -ne 0) { throw "Cache dependencies missing. Install: pip install -e '.[cache]'" }
+
+Write-Host "Starting MySQL, Qdrant, Redis and RocketMQ..."
 Invoke-Compose @("up", "-d")
 if ($LASTEXITCODE -ne 0) {
     throw "docker compose up failed. Is Docker Desktop running and this shell allowed to access it?"
@@ -73,6 +81,18 @@ for ($attempt = 0; $attempt -lt 90; $attempt++) {
 if (-not $healthy) {
     throw "MySQL did not become healthy. Run: docker compose logs mysql"
 }
+
+Write-Host "Waiting for RocketMQ and provisioning cache retry resources..."
+$mqReady = $false
+for ($attempt = 0; $attempt -lt 45; $attempt++) {
+    & docker exec praxis-rag-rocketmq sh mqadmin updatetopic -n rocketmq-namesrv:9876 -c DefaultCluster -t $env:RAG_ROCKETMQ_TOPIC *> $null
+    if ($LASTEXITCODE -eq 0) {
+        & docker exec praxis-rag-rocketmq sh mqadmin updateSubGroup -n rocketmq-namesrv:9876 -c DefaultCluster -g $env:RAG_ROCKETMQ_GROUP -r 16 *> $null
+        if ($LASTEXITCODE -eq 0) { $mqReady = $true; break }
+    }
+    Start-Sleep -Seconds 2
+}
+if (-not $mqReady) { throw "RocketMQ provisioning failed. Check docker-compose logs rocketmq." }
 
 if (-not $SkipMigrate) {
     if (Test-Path $LegacyRoot) {

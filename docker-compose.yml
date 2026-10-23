@@ -33,6 +33,58 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  redis:
+    image: redis:7.4-alpine
+    container_name: praxis-rag-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${RAG_REDIS_PORT:-6379}:6379"
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rocketmq-namesrv:
+    image: apache/rocketmq:5.3.3
+    container_name: praxis-rag-rocketmq-namesrv
+    restart: unless-stopped
+    command: ["sh", "mqnamesrv"]
+    environment:
+      JAVA_OPT_EXT: "-Xms128m -Xmx128m -Xmn64m"
+
+  rocketmq-storage-init:
+    image: apache/rocketmq:5.3.3
+    user: "0:0"
+    entrypoint: ["sh", "-c", "chown -R 3000:3000 /home/rocketmq/store"]
+    volumes:
+      - rocketmq_data:/home/rocketmq/store
+
+  rocketmq:
+    image: apache/rocketmq:5.3.3
+    container_name: praxis-rag-rocketmq
+    restart: unless-stopped
+    depends_on:
+      rocketmq-namesrv:
+        condition: service_started
+      rocketmq-storage-init:
+        condition: service_completed_successfully
+    environment:
+      NAMESRV_ADDR: rocketmq-namesrv:9876
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
+    command: ["sh", "mqbroker", "--enable-proxy", "-c", "/home/rocketmq/rocketmq-5.3.3/conf/praxis-broker.conf"]
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ./deploy/rocketmq-broker.conf:/home/rocketmq/rocketmq-5.3.3/conf/praxis-broker.conf:ro
+      - rocketmq_data:/home/rocketmq/store
+
+
 volumes:
   mysql_data:
   qdrant_data:
+  redis_data:
+  rocketmq_data:

@@ -39,7 +39,7 @@ def real_stack():
     client = QdrantClient(url=os.getenv("RAG_TEST_QDRANT_URL", "http://127.0.0.1:6333"))
     collection = "txn_test_" + uuid4().hex
     vectors = QdrantStore(collection=collection, namespace="alpha", client=client,
-                          active_versions=lambda: state.uploads.active_versions("alpha"))
+                          active_versions=lambda: state.documents.visible_versions("alpha"))
     ingester = DenseDocumentIngester(RagConfig(backend="qdrant", collection=collection),
         SimpleNamespace(embed_documents=lambda texts: [VECTOR for _ in texts]), Bm25SparseEncoder(), vectors)
     documents = KnowledgeDocumentStore(state, "alpha")

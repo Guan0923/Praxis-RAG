@@ -462,3 +462,15 @@ HTTP MCP 注册搜索和三个文件管理工具；本地搜索调试入口仍�
 - Console 用于本地开发调试，不提供账户系统或细粒度多用户权限。
 
 历史阶段和变更记录见 [PROGRESS.md](../PROGRESS.md)。
+
+## 第一批 Redis 缓存
+
+Compose 包含 Redis 和 RocketMQ。安装可选队列 SDK：`pip install -e ".[cache]"`，使用启动脚本会创建 topic/group 并加载本地缓存环境变量。直接启动 rag-service 时自行设置 RAG_REDIS_URL 和 RAG_ROCKETMQ_ENDPOINT；不配置 Redis 默认保持原有 MySQL 读取。命中缓存不查 MySQL；执行鉴权/租约和上传发布校验不使用缓存。详见 [状态缓存与可靠刷新](state-cache.md)。
+
+## 第二批状态缓存（严格模式）
+
+API Key 管理列表、发布版本展示、租约执行者展示和事务/步骤/回滚进度已接入 Redis。新增 `/v1/uploads`、`/v1/uploads/{operation_id}` 查询当前 namespace 的状态；本机管理员可查询 `/v1/admin/published-versions` 和 `/v1/admin/upload-leases`。缓存快照只用于查询展示；实际鉴权、版本选择、租约认领、提交和回滚仍查 MySQL。无需新增环境变量，沿用第一批 outbox、修订号和 RocketMQ 重试。详见 [第二批状态接口及安全边界](state-cache.md#第二批状态查询接口)。
+
+## 按 UUID 复用搜索与产物
+
+search 响应保留原 results，并新增 result_id、expires_at 和 artifacts。MCP get_search_result 或 GET /v1/search-results/{result_id} 可在 1 小时内读取原快照；rag://artifacts 资源或 /v1/artifacts/{artifact_id} 获取源文件、图片、JSON、Markdown 等。不重新执行模型或检索。文档删除为 del_flag 软删除，不影响已签发 UUID；鉴权仍检查当前 Key 权限。详见 [UUID 结果与产物引用](result-references.md)。

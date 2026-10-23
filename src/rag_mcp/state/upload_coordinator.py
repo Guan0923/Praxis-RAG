@@ -93,12 +93,19 @@ class UploadCoordinator:
 
     def _clear_workspace(self, op):
         with self.journal.engine.begin() as conn:
-            conn.execute(update(upload_operations).where(
-                upload_operations.c.id == op["id"],
-                upload_operations.c.status == "COMMITTED",
-                upload_operations.c.workspace == op["workspace"],
-                upload_operations.c.workspace_node == op["workspace_node"],
-            ).values(workspace=None, workspace_node=None))
+            self.journal._guard(conn, op["namespace"])
+            predicate = (upload_operations.c.id == op["id"],
+                         upload_operations.c.status == "COMMITTED",
+                         upload_operations.c.workspace == op["workspace"],
+                         upload_operations.c.workspace_node == op["workspace_node"])
+            current = conn.execute(select(upload_operations.c.id).where(
+                *predicate).with_for_update()).first()
+            if current is None:
+                return
+            self.journal._cache_changed(conn, op["namespace"], op["id"])
+            conn.execute(update(upload_operations).where(*predicate).values(
+                workspace=None, workspace_node=None))
+        self.journal._flush_cache(op["namespace"], op["id"])
 
     @staticmethod
     def _has_qdrant_intent(op):
@@ -165,11 +172,19 @@ class UploadCoordinator:
             # commit may retain an old_version that is still the head; don't
             # enable vector cleanup for it. Its registration remains retryable.
             with self.journal.engine.begin() as conn:
-                conn.execute(update(upload_operations).where(
-                    upload_operations.c.id == current["id"],
-                    upload_operations.c.status == "COMMITTED",
-                ).values(cleanup_pending=(current["cleanup_pending"]
-                                          or current["old_version"] is None)))
+                self.journal._guard(conn, current["namespace"])
+                pending = current["cleanup_pending"] or current["old_version"] is None
+                predicate = (upload_operations.c.id == current["id"],
+                             upload_operations.c.status == "COMMITTED",
+                             upload_operations.c.cleanup_pending != pending)
+                changed = conn.execute(select(upload_operations.c.id).where(
+                    *predicate).with_for_update()).first()
+                if changed is not None:
+                    self.journal._cache_changed(conn, current["namespace"], current["id"])
+                    conn.execute(update(upload_operations).where(*predicate).values(
+                        cleanup_pending=pending))
+            if changed is not None:
+                self.journal._flush_cache(current["namespace"], current["id"])
             logger.warning("Upload %s cleanup failed (%s); retry pending",
                            current["id"], type(exc).__name__)
             return self.journal.get(current["id"])

@@ -34,6 +34,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 
+from . import cache_events
 from .schema import (
     document_heads as heads,
     document_leases as leases,
@@ -97,6 +98,7 @@ class UploadJournal:
     def __init__(self, state, *, lease_seconds=None, auto_heartbeat=True,
                  cleanup_delay_seconds=None):
         self.engine = state.engine
+        self.cache_sync = getattr(state, "cache_sync", None)
         self.lease_seconds = float(
             lease_seconds if lease_seconds is not None
             else os.environ.get("RAG_UPLOAD_LEASE_SECONDS", "120")
@@ -111,6 +113,28 @@ class UploadJournal:
         self.auto_heartbeat = auto_heartbeat
         self._heartbeats = {}
         self._mutex = threading.Lock()
+
+    @staticmethod
+    def _cache_keys(namespace, operation_id=None, *, heads=False, leases=False):
+        keys = []
+        if operation_id is not None:
+            keys.extend((("upload_status", operation_id), ("upload_list", namespace)))
+        if heads:
+            keys.append(("heads", namespace))
+        if leases:
+            keys.append(("leases", namespace))
+        return tuple(sorted(set(keys)))
+
+    def _cache_changed(self, conn, namespace, operation_id=None, *, heads=False, leases=False):
+        """Touch sorted display keys under the namespace guard; no cache transport I/O."""
+        return cache_events.touch(conn, *self._cache_keys(
+            namespace, operation_id, heads=heads, leases=leases))
+
+    def _flush_cache(self, namespace, operation_id=None, *, heads=False, leases=False):
+        """Refresh display views only after the owning SQL transaction has committed."""
+        if self.cache_sync is not None:
+            self.cache_sync.flush_pending(keys=self._cache_keys(
+                namespace, operation_id, heads=heads, leases=leases))
 
     def _now(self, conn):
         if conn.dialect.name == "mysql":
@@ -179,6 +203,7 @@ class UploadJournal:
                         or row["resource"] in resources)
             if overlaps and row["expires_at"] > now and row["owner"] != owner:
                 raise UploadConflict("Upload resource is leased")
+        self._cache_changed(conn, namespace, operation_id, leases=True)
         for resource in resources:
             values = dict(namespace=namespace, resource=resource, owner=owner,
                           operation_id=operation_id, expires_at=now + self.lease_seconds)
@@ -229,6 +254,7 @@ class UploadJournal:
                 conn.execute(insert(operations).values(**row))
         except IntegrityError as exc:
             raise UploadConflict("Concurrent upload conflicts with this intent") from exc
+        self._flush_cache(namespace, operation_id, leases=True)
         op = self._decode(row)
         self._start(op)
         return op
@@ -264,10 +290,12 @@ class UploadJournal:
                 self._stop(op)
                 return
             self._owned(conn, op)
+            self._cache_changed(conn, op["namespace"], leases=True)
             conn.execute(update(leases).where(
                 leases.c.namespace == op["namespace"], leases.c.owner == op["owner"],
                 leases.c.operation_id == op["id"]
             ).values(expires_at=self._now(conn) + self.lease_seconds))
+        self._flush_cache(op["namespace"], leases=True)
 
     def _start(self, op):
         if self.auto_heartbeat:
@@ -322,8 +350,10 @@ class UploadJournal:
             if row["workspace"] is not None and (
                     row["workspace"] != path or row["workspace_node"] != node):
                 raise UploadConflict("Workspace is immutable")
+            self._cache_changed(conn, op["namespace"], op["id"])
             conn.execute(update(operations).where(operations.c.id == op["id"]).values(
                 workspace=path, workspace_node=node, updated_at=self._now(conn)))
+        self._flush_cache(op["namespace"], op["id"])
         op["workspace"] = path
         op["workspace_node"] = node
         return path
@@ -332,17 +362,21 @@ class UploadJournal:
         """Commit a step intent before an externally coordinated publication."""
         with self.engine.begin() as conn:
             self._owned(conn, op, statuses=("INTENT", "RUNNING"))
+            self._cache_changed(conn, op["namespace"], op["id"])
             conn.execute(insert(steps).values(
                 operation_id=op["id"], name=name, status="RUNNING",
                 details=_json(details or {}), started_at=self._now(conn)))
             conn.execute(update(operations).where(operations.c.id == op["id"]).values(
                 status="RUNNING", updated_at=self._now(conn)))
 
+        self._flush_cache(op["namespace"], op["id"])
+
     def run_step(self, op, name, action, details=None):
         """Durably record RUNNING before action(); DONE only after fencing."""
         try:
             with self.engine.begin() as conn:
                 self._owned(conn, op, statuses=("INTENT", "RUNNING"))
+                self._cache_changed(conn, op["namespace"], op["id"])
                 conn.execute(insert(steps).values(
                     operation_id=op["id"], name=name, status="RUNNING",
                     details=_json(details or {}), started_at=self._now(conn)))
@@ -350,15 +384,18 @@ class UploadJournal:
                     status="RUNNING", updated_at=self._now(conn)))
         except IntegrityError as exc:
             raise UploadConflict("Step name already exists; recover instead of replaying actions") from exc
+        self._flush_cache(op["namespace"], op["id"])
         try:
             with self.heartbeat(op):
                 logger.info("upload_step operation_id=%s step=%s status=RUNNING", op["id"], name)
                 result = action()
             with self.engine.begin() as conn:
                 self._owned(conn, op, statuses=("RUNNING",))
+                self._cache_changed(conn, op["namespace"], op["id"])
                 conn.execute(update(steps).where(
                     steps.c.operation_id == op["id"], steps.c.name == name
                 ).values(status="DONE", finished_at=self._now(conn)))
+            self._flush_cache(op["namespace"], op["id"])
             logger.info("upload_step operation_id=%s step=%s status=DONE", op["id"], name)
             return result
         except Exception as exc:
@@ -374,6 +411,7 @@ class UploadJournal:
         """Mark failed but retain the live lease until this worker rolls back/expires."""
         with self.engine.begin() as conn:
             self._owned(conn, op, statuses=("INTENT", "RUNNING", "FAILED"))
+            self._cache_changed(conn, op["namespace"], op["id"])
             error_type = type(error).__name__ if error is not None else None
             now = self._now(conn)
             conn.execute(update(operations).where(operations.c.id == op["id"]).values(
@@ -382,6 +420,8 @@ class UploadJournal:
                 conn.execute(update(steps).where(
                     steps.c.operation_id == op["id"], steps.c.name == step
                 ).values(status="FAILED", error=error_type, finished_at=now))
+
+        self._flush_cache(op["namespace"], op["id"])
 
     def claim_recovery(self, operation_id):
         """Return a fresh owner for expired work, or None for live/terminal work."""
@@ -403,6 +443,7 @@ class UploadJournal:
             row.update(owner=owner, status="ROLLING_BACK", updated_at=now)
             conn.execute(update(operations).where(operations.c.id == operation_id).values(
                 owner=owner, status="ROLLING_BACK", updated_at=now))
+        self._flush_cache(row["namespace"], operation_id, leases=True)
         op = self._decode(row)
         self._stop(snapshot)
         self._start(op)
@@ -422,6 +463,7 @@ class UploadJournal:
                 heads.c.namespace == row["namespace"], heads.c.document_id == row["document_id"]
             )) == row["id"]:
                 raise UploadConflict("Cannot roll back the active version")
+            self._cache_changed(conn, op["namespace"], op["id"])
             now = self._now(conn)
             self._insert_ignore(conn, steps, dict(
                 operation_id=op["id"], name="rollback", status="RUNNING",
@@ -431,11 +473,13 @@ class UploadJournal:
             ).values(status="RUNNING", error=None, finished_at=None))
             conn.execute(update(operations).where(operations.c.id == op["id"]).values(
                 status="ROLLING_BACK", updated_at=now))
+        self._flush_cache(op["namespace"], op["id"])
         try:
             with self.heartbeat(op):
                 cleanup(self._decode(row))
             with self.engine.begin() as conn:
                 self._owned(conn, op, statuses=("ROLLING_BACK", "ROLLBACK_FAILED"))
+                self._cache_changed(conn, op["namespace"], op["id"], leases=True)
                 conn.execute(delete(objects).where(objects.c.operation_id == op["id"]))
                 conn.execute(update(steps).where(
                     steps.c.operation_id == op["id"], steps.c.name == "rollback"
@@ -443,16 +487,19 @@ class UploadJournal:
                 conn.execute(update(operations).where(operations.c.id == op["id"]).values(
                     status="ROLLED_BACK", updated_at=self._now(conn)))
                 self._release(conn, op)
+            self._flush_cache(op["namespace"], op["id"], leases=True)
         except Exception as exc:
             try:
                 with self.engine.begin() as conn:
                     self._owned(conn, op, statuses=("ROLLING_BACK", "ROLLBACK_FAILED"))
+                    self._cache_changed(conn, op["namespace"], op["id"])
                     conn.execute(update(steps).where(
                         steps.c.operation_id == op["id"], steps.c.name == "rollback"
                     ).values(status="FAILED", error=type(exc).__name__, finished_at=self._now(conn)))
                     conn.execute(update(operations).where(operations.c.id == op["id"]).values(
                         status="ROLLBACK_FAILED", error=type(exc).__name__,
                         updated_at=self._now(conn)))
+                self._flush_cache(op["namespace"], op["id"])
             except LeaseLost:
                 pass
             raise
@@ -464,11 +511,13 @@ class UploadJournal:
         """Finish a deduplicated request without changing the document head."""
         with self.engine.begin() as conn:
             self._owned(conn, op, statuses=("INTENT", "RUNNING"))
+            self._cache_changed(conn, op["namespace"], op["id"], leases=True)
             conn.execute(delete(objects).where(objects.c.operation_id == op["id"]))
             conn.execute(update(operations).where(operations.c.id == op["id"]).values(
                 status="COMMITTED", result=_json(result), error=None,
                 cleanup_pending=False, updated_at=self._now(conn)))
             self._release(conn, op)
+        self._flush_cache(op["namespace"], op["id"], leases=True)
         self._stop(op)
 
     def commit(self, op, result, conn):
@@ -477,6 +526,7 @@ class UploadJournal:
             raise ValueError("commit requires the caller's transaction")
         encoded = _json(result)
         row = self._owned(conn, op, statuses=("INTENT", "RUNNING"))
+        self._cache_changed(conn, row["namespace"], row["id"], heads=True, leases=True)
         now = self._now(conn)
         needs_cleanup = row["old_version"] is not None or conn.execute(select(steps.c.name).where(
             steps.c.operation_id == op["id"], steps.c.name == "stage_qdrant"
@@ -518,11 +568,13 @@ class UploadJournal:
             cleanup_old(current)
             with self.engine.begin() as conn:
                 self.assert_lock(token, conn)
+                self._cache_changed(conn, current["namespace"], current["id"])
                 conn.execute(delete(objects).where(
                     objects.c.operation_id == current["old_version"]))
                 conn.execute(update(operations).where(
                     operations.c.id == current["id"], operations.c.status == "COMMITTED"
                 ).values(cleanup_pending=False, updated_at=self._now(conn)))
+            self._flush_cache(current["namespace"], current["id"])
         return self.get(op["id"])
 
     def active_versions(self, namespace):
@@ -541,11 +593,19 @@ class UploadJournal:
                 or token["resource"] not in (_NAMESPACE, _resource(document_id))):
             raise LeaseLost("Lock does not cover this document")
         self.assert_lock(token, conn)
+        if conn.scalar(select(heads.c.version).where(
+                heads.c.namespace == namespace, heads.c.document_id == document_id)) is None:
+            return
+        self._cache_changed(conn, namespace, heads=True)
         conn.execute(delete(heads).where(
             heads.c.namespace == namespace, heads.c.document_id == document_id))
 
-    def purge_document_objects(self, namespace, document_id, conn, token):
-        """Remove retained version bytes after a coordinated document deletion."""
+    def purge_document_objects(self, namespace, document_id, conn, token) -> tuple[str, ...]:
+        """Purge bytes and return changed operation IDs for display flush after commit.
+
+        The caller owns the transaction and must flush these upload_status keys
+        plus upload_list after commit; no cache transport is accessed here.
+        """
         if (token["namespace"] != namespace
                 or token["resource"] not in (_NAMESPACE, _resource(document_id))):
             raise LeaseLost("Lock does not cover this document")
@@ -553,10 +613,16 @@ class UploadJournal:
         ids = select(operations.c.id).where(
             operations.c.namespace == namespace, operations.c.document_id == document_id)
         conn.execute(delete(objects).where(objects.c.operation_id.in_(ids)))
-        conn.execute(update(operations).where(
+        changed_ids = list(conn.scalars(select(operations.c.id).where(
             operations.c.namespace == namespace, operations.c.document_id == document_id,
-            operations.c.status == "COMMITTED"
-        ).values(cleanup_pending=False))
+            operations.c.status == "COMMITTED", operations.c.cleanup_pending.is_(True))))
+        if changed_ids:
+            cache_events.touch(conn, ("upload_list", namespace), *(
+                ("upload_status", operation_id) for operation_id in changed_ids))
+            conn.execute(update(operations).where(
+                operations.c.id.in_(changed_ids)
+            ).values(cleanup_pending=False))
+        return tuple(changed_ids)
 
     def old_version(self, op):
         return self.get(op["id"])["old_version"]
@@ -593,6 +659,7 @@ class UploadJournal:
         with self.engine.begin() as conn:
             self._guard(conn, namespace)
             self._acquire(conn, namespace, [token["resource"]], token["owner"])
+        self._flush_cache(namespace, leases=True)
         return token
 
     def assert_lock(self, token, conn=None):
@@ -609,18 +676,25 @@ class UploadJournal:
     def renew_lock(self, token):
         with self.engine.begin() as conn:
             self.assert_lock(token, conn)
+            self._cache_changed(conn, token["namespace"], leases=True)
             conn.execute(update(leases).where(
                 leases.c.namespace == token["namespace"], leases.c.resource == token["resource"],
                 leases.c.owner == token["owner"]
             ).values(expires_at=self._now(conn) + self.lease_seconds))
 
+        self._flush_cache(token["namespace"], leases=True)
+
     def release_lock(self, token):
         with self.engine.begin() as conn:
             self._guard(conn, token["namespace"])
-            conn.execute(delete(leases).where(
-                leases.c.namespace == token["namespace"], leases.c.resource == token["resource"],
-                leases.c.owner == token["owner"]
-            ))
+            predicate = (leases.c.namespace == token["namespace"],
+                         leases.c.resource == token["resource"],
+                         leases.c.owner == token["owner"])
+            if conn.execute(select(leases.c.resource).where(*predicate)).first() is None:
+                return
+            self._cache_changed(conn, token["namespace"], leases=True)
+            conn.execute(delete(leases).where(*predicate))
+        self._flush_cache(token["namespace"], leases=True)
 
     @contextmanager
     def lock(self, namespace, document_id=None):

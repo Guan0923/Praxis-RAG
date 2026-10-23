@@ -1,3 +1,81 @@
+# UUID results/artifacts and logical deletion — 2026-10-23
+
+- Confirmed one-hour expiry, full backward-compatible search responses, and
+  del_flag soft deletion that hides new access but preserves existing UUIDs.
+- Results are immutable SQL snapshots with optional Redis acceleration/fallback;
+  artifact bytes have their own durable version-bound snapshots. No UUID read
+  calls Embedding, retrieval, reranking or parsing.
+- Available Python regression: 618 passed, 31 skipped; three optional browser
+  modules excluded. Existing four MCP deprecation warnings remain.
+- Real MySQL/Redis/Qdrant UUID, cache and transaction suites: 16 passed using
+  disposable praxis_uuid_test_*, praxis_cache_test_*, praxis_txn_test_* schemas
+  and test-owned prefixes/collections; includes additive legacy-column upgrade.
+- Focused core: 110 passed across UUID protocols, durable results and soft delete.
+  Real TCP MCP tested in legacy, auto and 2026-07-28 modes.
+- Tested exact bytes after update/delete/old-version GC, cross-namespace denial,
+  revoked keys, paged byte reads, strict expiry, Redis loss/disabled, SQL/cache
+  failures, artifact budgets, duplicate UUID rejection and concurrent registration.
+- Ruff F/E9 and editor diagnostics passed. Frontend full typecheck remains
+  blocked by the pre-existing missing platform TypeScript tsc.exe; only additive
+  response types changed and no new frontend interaction is claimed.
+- No production data migration or deletion was performed during validation.
+
+# UUID results/artifacts validation — 2026-10-22
+
+- Confirmed policy: Redis-only search result snapshots, 3600-second default TTL,
+  full search response preserved. Missing/expired/evicted results never re-run
+  inference. Issued version-bound artifacts remain readable after source deletion
+  until their expiry; each request still checks current namespace authorization.
+- Default Python regression: 529 passed, 30 skipped, four existing MCP warnings;
+  three optional browser modules excluded.
+- Focused UUID protocol/result/artifact suite: 95 passed.
+- Real MySQL/Redis/Qdrant isolated UUID suite: 3 passed. Covers concurrent stable
+  artifact registration, real Redis TTL/NX/eviction and full upload→search→replace
+  →delete→old-reference read without invoking search again. Disposable schemas,
+  prefixes and Qdrant collections were cleaned; no production data modified.
+- Ruff F/E9 and diff checks passed; editor diagnostics clean on UUID storage,
+  runtime and MCP/REST modules.
+- Redis outage/oversized snapshot returns original search results with explicit
+  snapshot_available=false; lookup of an unavailable result returns an error.
+
+# Second-batch state-cache validation — 2026-10-22
+
+- Confirmed strict mode: API-key authentication, Qdrant version selection, lease
+  claims/renewal/fencing, commit and rollback remain authoritative SQL reads.
+- Redis caches API-key administration, published-head display, lease/holder
+  display, latest operation list and redacted step/rollback progress.
+- Default Python regression: 434 passed, 27 skipped, four existing MCP warnings;
+  three optional browser modules excluded.
+- Live MySQL/Redis/RocketMQ/Qdrant plus Redis Lua backend suite: 45 passed using
+  isolated praxis_cache_test_* schemas, Redis prefixes and test collections.
+  Includes real upload commit/aborted publication/delete refreshing state views,
+  stale enabled display not authorizing a disabled key, and expired ownership
+  failing fencing despite a live cached snapshot.
+- Focused second-batch cache tests prove zero SQL on status cache hits, no raw
+  secret/owner/workspace/step input leakage, namespace isolation, rollback events,
+  affected-operation refresh after deletion, and no cache events on authority reads.
+- Ruff F/E9 passed; editor reports no errors on changed integration files.
+- No production document or API-key data was modified by the live test suite.
+
+# First-batch state-cache validation — 2026-10-22
+
+- Cached public knowledge-base configuration, MCP catalog, document lists and
+  knowledge-base list/statistics; actual authorization/upload fencing remains
+  authoritative. Cache-hit tests assert zero SQL and no tenant/model startup.
+- Default Python regression: 399 passed, 24 skipped, four existing MCP warnings
+  (three browser modules excluded because their optional environment is absent).
+- Isolated MySQL/Redis/RocketMQ and actual Redis Lua: 42 passed, including the
+  live MySQL rollback assertion. The live suite uses disposable
+  praxis_cache_test_* schemas, unique Redis prefixes and a test consumer group.
+- Live coverage includes synchronous refresh, Redis outage fallback, MQ delivery
+  after failed cache writes, unacknowledged message redelivery, BIGINT ordering,
+  persistent deletion watermark and TTL expiry.
+- Versioned delayed-fill/duplicate/out-of-order events, transactional outbox
+  rollback and simultaneous Redis/MQ outage are covered by unit/integration tests.
+- Docker startup/provisioning script validated with -MigrateOnly -SkipMigrate;
+  production documents/credentials were not migrated or modified by these tests.
+- Ruff F/E9 passed; no editor diagnostics on new cache code and integration paths.
+
 # Durable upload validation — 2026-10-21
 
 - HTTP/MCP uploads now share write-ahead operation/step logs, renewable MySQL

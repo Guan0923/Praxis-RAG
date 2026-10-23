@@ -99,10 +99,12 @@ class NamespaceCatalog:
         self.namespace = namespace
         self.lock = RLock()
 
-    def snapshot(self) -> CatalogData:
+    def snapshot(self, *, authoritative: bool = False) -> CatalogData:
+        """Read the public catalog, or bypass cache for execution-time permission checks."""
         with self.lock:
             try:
-                raw = self.state.catalogs.load(self.namespace)
+                raw = (self.state.catalogs.load(self.namespace) if authoritative
+                       else self.state.views.catalog(self.namespace))
             except StateError as exc:
                 raise KnowledgeError("MCP configuration cannot be read") from exc
             if raw is None:

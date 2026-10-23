@@ -10,6 +10,7 @@ import sys
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
+from uuid import UUID
 
 from mcp import types
 from mcp.server import Server
@@ -21,6 +22,52 @@ from .contracts import RagOperationError, SearchRequest, SearchValidationError
 from .catalog import NamespaceCatalog
 from .orchestrator import build_default_orchestrator
 from .service_knowledge import KnowledgeError
+from .state.result_snapshots import SnapshotUnavailable
+
+MAX_ARTIFACT_LENGTH = 1024 * 1024
+MAX_RESULT_PAGE = 2**31 - 1
+
+
+def validate_uuid(value: Any) -> str:
+    """Accept only canonical lowercase dashed UUID strings."""
+    if not isinstance(value, str) or len(value) != 36:
+        raise SearchValidationError("Expected a dashed UUID string")
+    try:
+        canonical = str(UUID(value))
+    except ValueError as exc:
+        raise SearchValidationError("Expected a dashed UUID string") from exc
+    if canonical != value:
+        raise SearchValidationError("Expected a dashed UUID string")
+    return canonical
+
+
+def validate_search_result(arguments: dict[str, Any]) -> dict[str, Any]:
+    if set(arguments) - {"result_id", "page", "page_size"}:
+        raise SearchValidationError("Unknown search-result arguments")
+    result_id = validate_uuid(arguments.get("result_id"))
+    page = arguments.get("page", 1)
+    page_size = arguments.get("page_size", 10)
+    if type(page) is not int or not 1 <= page <= MAX_RESULT_PAGE:
+        raise SearchValidationError(f"page must be an integer between 1 and {MAX_RESULT_PAGE}")
+    if type(page_size) is not int or not 1 <= page_size <= 100:
+        raise SearchValidationError("page_size must be an integer between 1 and 100")
+    return {"result_id": result_id, "page": page, "page_size": page_size}
+
+
+def _read_search_result(get_result, request):
+    try:
+        return get_result(**request)
+    except SnapshotUnavailable:
+        raise
+    except ValueError as exc:
+        raise SearchValidationError(str(exc)) from exc
+
+
+def validate_artifact_range(offset: int, length: int) -> None:
+    if type(offset) is not int or offset < 0:
+        raise SearchValidationError("offset must be a non-negative integer")
+    if type(length) is not int or not 1 <= length <= MAX_ARTIFACT_LENGTH:
+        raise SearchValidationError("length must be between 1 and 1048576 bytes")
 
 
 class SearchExecutor(Protocol):
@@ -132,16 +179,25 @@ class ToolRegistry:
             if item["enabled"]
         ]
 
+    def enabled_for_execution(self, name: str) -> bool:
+        if name not in self.entries:
+            return False
+        if self.catalog is None:
+            return True
+        # Listing/templates may be eventually consistent; actual execution never
+        # authorizes a disabled tool from a stale cache.
+        return bool(self.catalog.snapshot(authoritative=True).tools.get(name, {}).get("enabled", True))
+
     def invoke(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:
         try:
-            if name not in {item.name for item in self.definitions()}:
+            if not self.enabled_for_execution(name):
                 raise SearchValidationError(f"Unknown or disabled RAG tool: {name}")
             entry = self.entries[name]
             request = entry.validate(arguments)
             _trace("tool execution started")
             payload = entry.execute(request)
             _trace("tool execution completed")
-        except (RagConfigError, RagOperationError, SearchValidationError, KnowledgeError, KeyError) as exc:
+        except (RagConfigError, RagOperationError, SearchValidationError, KnowledgeError, SnapshotUnavailable, KeyError) as exc:
             _trace(f"tool failed: {type(exc).__name__}")
             return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], is_error=True)
         return self.render(payload)
@@ -151,12 +207,11 @@ class ToolRegistry:
         if entry is None or not inspect.iscoroutinefunction(entry.execute):
             return await asyncio.to_thread(self.invoke, name, arguments)
         try:
-            definitions = await asyncio.to_thread(self.definitions)
-            if name not in {item.name for item in definitions}:
+            if not await asyncio.to_thread(self.enabled_for_execution, name):
                 raise SearchValidationError(f"Unknown or disabled RAG tool: {name}")
             request = await asyncio.to_thread(entry.validate, arguments)
             payload = await entry.execute(request)
-        except (RagConfigError, RagOperationError, SearchValidationError, KnowledgeError, KeyError) as exc:
+        except (RagConfigError, RagOperationError, SearchValidationError, KnowledgeError, SnapshotUnavailable, KeyError) as exc:
             return types.CallToolResult(content=[types.TextContent(type="text", text=str(exc))], is_error=True)
         return self.render(payload)
 
@@ -176,6 +231,29 @@ class ToolRegistry:
 
 def create_registry(executor: SearchExecutor, catalog: NamespaceCatalog | None = None, document_mutator=None) -> ToolRegistry:
     entries = [RegisteredTool(search_tool_definition(), SearchRequest.from_arguments, executor.search)]
+    get_result = getattr(executor, "get_search_result", None)
+    if callable(get_result):
+        entries.append(RegisteredTool(
+            types.Tool(
+                name="get_search_result",
+                description="Read a saved search result by UUID without running retrieval again. Results expire.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "result_id": {"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36},
+                        "page": {"type": "integer", "minimum": 1, "maximum": MAX_RESULT_PAGE, "default": 1},
+                        "page_size": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
+                    },
+                    "required": ["result_id"],
+                    "additionalProperties": False,
+                },
+                annotations=types.ToolAnnotations(
+                    read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
+                ),
+            ),
+            validate_search_result,
+            lambda request: _read_search_result(get_result, request),
+        ))
     if document_mutator is not None:
         from .document_tools import document_tool_entries
 

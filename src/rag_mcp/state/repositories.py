@@ -12,6 +12,7 @@ from sqlalchemy import Engine, and_, delete, insert, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from . import crypto
+from .cache_events import touch, knowledge_keys, document_keys
 from .schema import api_keys, documents, document_heads, knowledge_bases, mcp_catalogs
 
 
@@ -41,9 +42,10 @@ def _object(value: str | None, default: Any = None) -> Any:
 
 
 class ApiKeyRepository:
-    def __init__(self, engine: Engine, encryption_key: str | None = None) -> None:
+    def __init__(self, engine: Engine, encryption_key: str | None = None, cache_sync=None) -> None:
         self.engine = engine
         self.encryption_key = encryption_key
+        self.cache_sync = cache_sync
 
     @staticmethod
     def _public(row) -> dict[str, object]:
@@ -81,31 +83,39 @@ class ApiKeyRepository:
         }
         try:
             with self.engine.begin() as conn:
+                touch(conn, ("api_keys", ""))
                 conn.execute(insert(api_keys).values(**values))
         except IntegrityError as exc:
             raise StateConflict("API Key 已存在") from exc
         except SQLAlchemyError as exc:
             raise StateError("API Key 无法保存") from exc
+        if self.cache_sync:
+            self.cache_sync.flush_pending(keys=(("api_keys", ""),))
         return {**self._public(_Row(values)), "key": secret}
 
     def update(self, key_id: str, name: str, namespaces: list[str], enabled: bool) -> dict[str, object] | None:
         try:
             with self.engine.begin() as conn:
+                touch(conn, ("api_keys", ""))
                 changed = conn.execute(
                     update(api_keys)
                     .where(api_keys.c.id == key_id)
                     .values(name=name, namespaces=_json(namespaces), enabled=enabled, updated_at=_now())
                 ).rowcount
-                if not changed:
-                    return None
-                row = conn.execute(select(api_keys).where(api_keys.c.id == key_id)).one()
+                row = conn.execute(select(api_keys).where(api_keys.c.id == key_id)).one() if changed else None
         except SQLAlchemyError as exc:
             raise StateError("API Key 无法更新") from exc
-        return self._public(row)
+        if self.cache_sync:
+            self.cache_sync.flush_pending(keys=(("api_keys", ""),))
+        return self._public(row) if row is not None else None
 
     def delete(self, key_id: str) -> bool:
         with self.engine.begin() as conn:
-            return bool(conn.execute(delete(api_keys).where(api_keys.c.id == key_id)).rowcount)
+            touch(conn, ("api_keys", ""))
+            changed = bool(conn.execute(delete(api_keys).where(api_keys.c.id == key_id)).rowcount)
+        if self.cache_sync:
+            self.cache_sync.flush_pending(keys=(("api_keys", ""),))
+        return changed
 
     def namespaces_for_key(self, secret: str) -> list[str]:
         digest = hashlib.sha256(secret.encode()).hexdigest()
@@ -156,16 +166,20 @@ class ApiKeyRepository:
             else None,
         }
         with self.engine.begin() as conn:
+            touch(conn, ("api_keys", ""))
             existing = conn.execute(select(api_keys.c.id).where(api_keys.c.id == key_id)).first()
             if existing:
                 conn.execute(update(api_keys).where(api_keys.c.id == key_id).values(**values))
             else:
                 conn.execute(insert(api_keys).values(**values))
+        if self.cache_sync:
+            self.cache_sync.flush_pending(keys=(("api_keys", ""),))
 
 
 class KnowledgeBaseRepository:
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, cache_sync=None) -> None:
         self.engine = engine
+        self.cache_sync = cache_sync
 
     def list(self) -> list[dict]:
         with self.engine.connect() as conn:
@@ -185,6 +199,7 @@ class KnowledgeBaseRepository:
         timestamp = _now()
         try:
             with self.engine.begin() as conn:
+                touch(conn, *knowledge_keys(settings["namespace"]))
                 conn.execute(insert(knowledge_bases).values(
                     namespace=settings["namespace"],
                     collection=settings["collection"],
@@ -193,6 +208,8 @@ class KnowledgeBaseRepository:
                     created_at=timestamp,
                     updated_at=timestamp,
                 ))
+            if self.cache_sync:
+                self.cache_sync.flush_pending(keys=knowledge_keys(settings["namespace"]))
         except IntegrityError as exc:
             raise StateConflict("该知识库已存在") from exc
         except SQLAlchemyError as exc:
@@ -200,6 +217,7 @@ class KnowledgeBaseRepository:
 
     def update(self, settings: dict) -> None:
         with self.engine.begin() as conn:
+            touch(conn, *knowledge_keys(settings["namespace"]))
             changed = conn.execute(
                 update(knowledge_bases)
                 .where(knowledge_bases.c.namespace == settings["namespace"])
@@ -210,8 +228,10 @@ class KnowledgeBaseRepository:
                     updated_at=_now(),
                 )
             ).rowcount
-        if not changed:
-            raise LookupError("知识库不存在")
+            if not changed:
+                raise LookupError("知识库不存在")
+        if self.cache_sync:
+            self.cache_sync.flush_pending(keys=knowledge_keys(settings["namespace"]))
 
     def snapshot(self, namespace: str):
         with self.engine.connect() as conn:
@@ -228,9 +248,12 @@ class KnowledgeBaseRepository:
 
     def delete(self, namespace: str) -> bool:
         with self.engine.begin() as conn:
-            return bool(
-                conn.execute(delete(knowledge_bases).where(knowledge_bases.c.namespace == namespace)).rowcount
-            )
+            touch(conn, *knowledge_keys(namespace))
+            changed = bool(conn.execute(delete(knowledge_bases).where(
+                knowledge_bases.c.namespace == namespace)).rowcount)
+        if self.cache_sync:
+            self.cache_sync.flush_pending(keys=knowledge_keys(namespace))
+        return changed
 
 
 def _document_record(row) -> dict[str, object]:
@@ -255,12 +278,13 @@ def _document_select():
     return select(documents, document_heads.c.version.label("active_version")).select_from(
         documents.outerjoin(document_heads, and_(
             documents.c.namespace == document_heads.c.namespace,
-            documents.c.document_id == document_heads.c.document_id)))
+            documents.c.document_id == document_heads.c.document_id))).where(documents.c.del_flag.is_(False))
 
 
 class DocumentRepository:
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, cache_sync=None) -> None:
         self.engine = engine
+        self.cache_sync = cache_sync
 
     def list(self, namespace: str) -> list[dict[str, object]]:
         with self.engine.connect() as conn:
@@ -306,7 +330,7 @@ class DocumentRepository:
 
         with self.engine.connect() as conn:
             rows = conn.execute(
-                select(documents.c.namespace, func.count()).group_by(documents.c.namespace)
+                select(documents.c.namespace, func.count()).where(documents.c.del_flag.is_(False)).group_by(documents.c.namespace)
             ).all()
         return {str(namespace): int(count) for namespace, count in rows}
 
@@ -324,9 +348,11 @@ class DocumentRepository:
             "indexed_at": record.get("indexed_at", _now()),
             "diagnostics": _json(record.get("diagnostics", [])),
             "skipped_object_count": int(record.get("skipped_object_count", 0)),
+            "del_flag": False,
         }
 
         def write(connection) -> None:
+            touch(connection, *document_keys(namespace))
             changed = connection.execute(
                 update(documents)
                 .where(and_(documents.c.namespace == namespace, documents.c.name == record["name"]))
@@ -349,23 +375,51 @@ class DocumentRepository:
             return
         with self.engine.begin() as own:
             write(own)
+        if self.cache_sync:
+            self.cache_sync.flush_pending(keys=document_keys(namespace))
 
     def delete(self, namespace: str, name: str, *, conn=None) -> bool:
-        statement = delete(documents).where(
-            and_(documents.c.namespace == namespace, documents.c.name == name)
-        )
+        statement = update(documents).where(
+            documents.c.namespace == namespace, documents.c.name == name,
+            documents.c.del_flag.is_(False)
+        ).values(del_flag=True)
         if conn is not None:
+            touch(conn, *document_keys(namespace))
             return bool(conn.execute(statement).rowcount)
         with self.engine.begin() as own:
-            return bool(own.execute(statement).rowcount)
+            touch(own, *document_keys(namespace))
+            changed = bool(own.execute(statement).rowcount)
+        if self.cache_sync:
+            self.cache_sync.flush_pending(keys=document_keys(namespace))
+        return changed
+
+    def visible_versions(self, namespace: str) -> dict[str, str]:
+        """Authority for new searches: preserve heads, exclude soft-deleted IDs.
+
+        Empty versions are tombstones understood by QdrantStore: both legacy
+        and versioned records of that document are excluded without deleting it.
+        """
+        with self.engine.connect() as conn:
+            query = select(documents.c.document_id, documents.c.del_flag, document_heads.c.version).select_from(
+                documents.outerjoin(document_heads, and_(
+                    documents.c.namespace == document_heads.c.namespace,
+                    documents.c.document_id == document_heads.c.document_id))).where(documents.c.namespace == namespace)
+            result = {}
+            for document_id, deleted, version in conn.execute(query):
+                if deleted:
+                    result[document_id] = ""
+                elif version is not None:
+                    result[document_id] = version
+            return result
 
     def import_record(self, namespace: str, record: dict[str, object]) -> None:
         self.upsert(namespace, record)
 
 
 class CatalogRepository:
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, cache_sync=None) -> None:
         self.engine = engine
+        self.cache_sync = cache_sync
 
     def load(self, namespace: str) -> str | None:
         with self.engine.connect() as conn:
@@ -383,6 +437,8 @@ class CatalogRepository:
 
         try:
             with self.engine.begin() as conn:
+                # Serialize first creation as well as later updates across nodes.
+                touch(conn, ("catalog", namespace))
                 row = conn.execute(
                     select(mcp_catalogs.c.data)
                     .where(mcp_catalogs.c.namespace == namespace)
@@ -390,8 +446,8 @@ class CatalogRepository:
                 ).first()
                 new_data, result, changed = transform(str(row[0]) if row else None)
                 if not changed:
-                    return result
-                if row is None:
+                    pass
+                elif row is None:
                     conn.execute(insert(mcp_catalogs).values(
                         namespace=namespace, data=new_data, version=1, updated_at=_now()
                     ))
@@ -401,7 +457,9 @@ class CatalogRepository:
                         .where(mcp_catalogs.c.namespace == namespace)
                         .values(data=new_data, version=mcp_catalogs.c.version + 1, updated_at=_now())
                     )
-                return result
+            if self.cache_sync:
+                self.cache_sync.flush_pending(keys=(("catalog", namespace),))
+            return result
         except StateError:
             raise
         except SQLAlchemyError as exc:
