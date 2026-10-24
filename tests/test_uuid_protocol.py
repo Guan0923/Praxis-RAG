@@ -15,6 +15,7 @@ from mcp import types
 from mcp.shared.exceptions import MCPError
 
 from rag_mcp.http_service import RagHttpSettings, create_service_app
+from rag_mcp.service_knowledge import KnowledgeError
 from rag_mcp.mcp_http import NamespaceEndpoint
 from rag_mcp.server import create_registry
 from rag_mcp.state.result_snapshots import SnapshotUnavailable
@@ -30,6 +31,7 @@ class Runtime:
     def __init__(self, root):
         self.state = StateStores.create(root)
         self.search = Mock(side_effect=AssertionError("Snapshot reads must not run retrieval"))
+        self.submit_search = Mock(return_value={"result_id": RESULT_ID})
         self.get_search_result = Mock(side_effect=self._result)
         self.get_artifact = Mock(side_effect=self._artifact)
         self.download_artifact = Mock(side_effect=self._download)
@@ -83,6 +85,111 @@ def test_search_only_registry_retains_legacy_tool_count():
     result = registry.invoke("search", {"query": "hello"})
     assert not result.is_error
     assert json.loads(result.content[0].text)["results"] == [{"text": "full", "metadata": {"key": "value"}}]
+
+
+@pytest.mark.parametrize("wait", [0, 5, 30])
+def test_local_search_rejects_queue_wait_argument(wait):
+    search = Mock()
+    registry = create_registry(SimpleNamespace(search=search))
+    assert "wait_seconds" not in registry.definitions()[0].input_schema["properties"]
+    assert registry.invoke("search", {"query": "hello", "wait_seconds": wait}).is_error
+    search.assert_not_called()
+
+
+@pytest.mark.parametrize("wait", [-1, 30.1, True, False, "5", None, float("nan"), float("inf"), -float("inf")])
+def test_service_search_rejects_invalid_wait_before_submission(service, wait):
+    runtime, app, _ = service
+    result = anyio.run(app.state.mcp_endpoint.registry("alpha").invoke_async, "search",
+                       {"query": "hello", "wait_seconds": wait})
+    assert result.is_error and "wait_seconds" in result.content[0].text
+    runtime.submit_search.assert_not_called()
+    runtime.get_search_result.assert_not_called()
+    runtime.search.assert_not_called()
+
+
+@pytest.mark.parametrize("wait", [0, 0.0])
+def test_service_search_zero_wait_only_returns_id_without_polling(service, wait):
+    runtime, app, _ = service
+    registry = app.state.mcp_endpoint.registry("alpha")
+    schema = registry.definitions()[0].input_schema["properties"]["wait_seconds"]
+    assert (schema["minimum"], schema["maximum"], schema["default"]) == (0, 30, 10)
+    result = anyio.run(registry.invoke_async, "search", {"query": "hello", "wait_seconds": wait})
+    assert not result.is_error
+    assert json.loads(result.content[0].text) == {"result_id": RESULT_ID}
+    namespace, arguments = runtime.submit_search.call_args.args
+    assert namespace == "alpha" and arguments["query"] == "hello"
+    assert "wait_seconds" not in arguments
+    runtime.submit_search.assert_called_once()
+    runtime.get_search_result.assert_not_called()
+    runtime.search.assert_not_called()
+
+
+@pytest.mark.parametrize("arguments", [{"query": "hello"}, {"query": "hello", "wait_seconds": 30}])
+def test_service_search_waits_for_snapshot_without_repeated_submission(service, arguments):
+    runtime, app, _ = service
+    snapshot = runtime._result("alpha", RESULT_ID)
+    runtime.get_search_result.side_effect = [
+        {"result_id": RESULT_ID, "status": "queued", "stage": stage}
+        for stage in ("queued", "processing", "retry_wait")
+    ] + [snapshot]
+    result = anyio.run(app.state.mcp_endpoint.registry("alpha").invoke_async, "search", arguments)
+    assert not result.is_error and json.loads(result.content[0].text) == snapshot
+    runtime.submit_search.assert_called_once()
+    assert runtime.get_search_result.call_count == 4
+    assert all(call.args == ("alpha", RESULT_ID) for call in runtime.get_search_result.call_args_list)
+    runtime.search.assert_not_called()
+
+
+def test_service_search_wait_expiry_only_returns_id_then_poll_completes(service):
+    runtime, app, _ = service
+    snapshot = runtime._result("alpha", RESULT_ID)
+    runtime.get_search_result.side_effect = None
+    runtime.get_search_result.return_value = {"result_id": RESULT_ID, "status": "queued", "stage": "processing"}
+    registry = app.state.mcp_endpoint.registry("alpha")
+    result = anyio.run(registry.invoke_async, "search", {"query": "hello", "wait_seconds": 0.02})
+    assert not result.is_error and json.loads(result.content[0].text) == {"result_id": RESULT_ID}
+    assert runtime.get_search_result.called
+    runtime.get_search_result.return_value = snapshot
+    polled = anyio.run(registry.invoke_async, "get_search_result", {"result_id": RESULT_ID})
+    assert not polled.is_error and json.loads(polled.content[0].text) == snapshot
+    runtime.submit_search.assert_called_once()
+    runtime.search.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["queued", "processing", "retry_wait"])
+def test_service_result_poll_exposes_pending_stage_without_inference(service, stage):
+    runtime, app, _ = service
+    pending = {"result_id": RESULT_ID, "status": "queued", "stage": stage}
+    runtime.get_search_result.side_effect = None
+    runtime.get_search_result.return_value = pending
+    result = anyio.run(app.state.mcp_endpoint.registry("alpha").invoke_async,
+                       "get_search_result", {"result_id": RESULT_ID})
+    assert not result.is_error and json.loads(result.content[0].text) == pending
+    runtime.submit_search.assert_not_called()
+    runtime.search.assert_not_called()
+
+
+@pytest.mark.parametrize("error", ["Search failed", "Search task deadline exceeded"])
+@pytest.mark.parametrize("tool", ["search", "get_search_result"])
+def test_service_search_failure_and_deadline_are_tool_errors(service, error, tool):
+    runtime, app, _ = service
+    runtime.get_search_result.side_effect = SnapshotUnavailable(error)
+    arguments = {"query": "hello"} if tool == "search" else {"result_id": RESULT_ID}
+    result = anyio.run(app.state.mcp_endpoint.registry("alpha").invoke_async, tool, arguments)
+    assert result.is_error and error in result.content[0].text
+    assert runtime.submit_search.call_count == (tool == "search")
+    runtime.search.assert_not_called()
+
+
+def test_service_submission_failure_never_falls_back_to_local_search(service):
+    runtime, app, _ = service
+    runtime.submit_search.side_effect = KnowledgeError("Queue acceptance unavailable")
+    result = anyio.run(app.state.mcp_endpoint.registry("alpha").invoke_async,
+                       "search", {"query": "hello"})
+    assert result.is_error
+    runtime.submit_search.assert_called_once()
+    runtime.get_search_result.assert_not_called()
+    runtime.search.assert_not_called()
 
 
 def test_registry_binds_snapshot_reader_without_search():

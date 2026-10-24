@@ -10,6 +10,7 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import anyio
 import httpx2 as httpx
@@ -28,7 +29,59 @@ from rag_mcp.model_api import ModelConnection
 from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.resources import document_uri
 from rag_mcp.service_knowledge import IndexedDocument, KnowledgeDocumentStore, RagServiceRuntime
+from rag_mcp.search_worker import SearchWorker
+from rag_mcp.state.settings import StateSettings
 from rag_mcp.state.store import StateStores
+
+
+class MemorySearchTransport:
+    def __init__(self):
+        self.queued = []
+        self.lock = threading.Lock()
+
+    def send(self, result_id):
+        with self.lock:
+            self.queued.append(result_id)
+
+    def close(self):
+        pass
+
+
+class TestSearchConsumer:
+    """Consume the test transport independently of request admission."""
+
+    __test__ = False
+
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.transport = MemorySearchTransport()
+        runtime.state.search_dispatcher.transport = self.transport
+        self.stop_requested = threading.Event()
+        self.cursor = 0
+        self.threads = []
+
+    def start(self):
+        for _ in range(2):
+            thread = threading.Thread(target=self._run, daemon=True)
+            self.threads.append(thread)
+            thread.start()
+
+    def _run(self):
+        worker = SearchWorker(self.runtime, executor=self.runtime.search)
+        while not self.stop_requested.wait(0.01):
+            with self.transport.lock:
+                if self.cursor >= len(self.transport.queued):
+                    continue
+                result_id = self.transport.queued[self.cursor]
+                self.cursor += 1
+            worker.process(result_id)
+
+    def stop(self):
+        self.stop_requested.set()
+        for thread in self.threads:
+            thread.join(12)
+            if thread.is_alive():
+                raise RuntimeError("Test search consumer failed to stop")
 
 AUTH = {"Authorization": "Bearer test-token", "X-RAG-Namespace": "manuals"}
 ADMIN = {"X-RAG-Namespace": "manuals"}
@@ -45,11 +98,10 @@ class TestIngester:
             from rag_mcp.chunking import _stable_id
             from rag_mcp.pdf_content import PDF_PARSER_VERSION
             from rag_mcp.word_reader import WORD_PARSER_VERSION
-            import tempfile
-
             document_id = _stable_id("doc", source_name.casefold())
             is_word = path.suffix != ".pdf"
-            artifacts_dir = Path(tempfile.mkdtemp(prefix="test-assets-"))
+            artifacts_dir = Path(".test-tmp") / "queued-search-protocol-agent" / f"test-assets-{uuid4().hex}"
+            artifacts_dir.mkdir(parents=True)
             artifacts_bucket = "word-assets" if is_word else "pdf-assets"
             (artifacts_dir / "manifest.json").write_text(
                 json.dumps({"version": WORD_PARSER_VERSION if is_word else PDF_PARSER_VERSION}), encoding="utf-8"
@@ -84,8 +136,11 @@ class ProtocolRuntime(RagServiceRuntime):
         self.config = RagConfig()
         self._connections = {"embedding": ModelConnection("http://unused.invalid/v1", self.config.embedding_model, vector_size=self.config.vector_size)}
         self.data_root = root
-        self.state = StateStores.create(root)
+        self.state = StateStores.create(root, settings=StateSettings(
+            url="sqlite+pysqlite:///" + str(root / "state.sqlite3")))
         self.state.document_dispatcher.transport = MemoryDocumentTransport()
+        self.search_consumer = TestSearchConsumer(self)
+        self.search_calls = []
         self._tenants = {}
         self._tenant_lock = threading.RLock()
         self._inference_lock = threading.RLock()
@@ -117,6 +172,9 @@ class ProtocolRuntime(RagServiceRuntime):
         return {"status": "ok"}
 
     def search(self, namespace, arguments):
+        self.search_calls.append((namespace, arguments))
+        if arguments["query"] == "fail":
+            raise ValueError("Controlled search failure")
         if arguments["query"] == "slow":
             self.started.set()
             self.release.wait(10)
@@ -163,6 +221,9 @@ def running_service(root: Path, *, runtime=None):
     app.state.test_server = server
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
+    consumer = getattr(runtime, "search_consumer", None)
+    if consumer is not None:
+        consumer.start()
     deadline = time.monotonic() + 5
     while not server.started and thread.is_alive() and time.monotonic() < deadline:
         time.sleep(0.01)
@@ -176,6 +237,10 @@ def running_service(root: Path, *, runtime=None):
         server.should_exit = True
         thread.join(6)
         sock.close()
+        if consumer is not None:
+            consumer.stop()
+        if isinstance(runtime, ProtocolRuntime):
+            runtime.state.close()
         if thread.is_alive():
             raise RuntimeError("Test service failed to stop")
 
@@ -219,6 +284,8 @@ def test_both_protocol_lifecycles(tmp_path, mode):
                 assert [tool.name for tool in (await client.list_tools()).tools] == [
                     "search", "get_search_result", "add_document", "update_document", "delete_document", "get_document_status"
                 ]
+                search_tool = next(tool for tool in (await client.list_tools()).tools if tool.name == "search")
+                assert search_tool.input_schema["properties"]["wait_seconds"]["default"] == 10
                 for query in ("first", "second"):
                     result = await client.call_tool("search", {"query": query})
                     assert json.loads(result.content[0].text)["query"] == query
@@ -339,21 +406,148 @@ def test_cancellation_keeps_other_calls_usable(tmp_path, mode):
                     scopes[0].cancel()
                     with anyio.fail_after(2):
                         await finished.wait()
-                    result = await client.call_tool("search", {"query": "still usable"})
+                    result = await client.call_tool("search", {"query": "still usable", "wait_seconds": 0})
                     assert not result.is_error
+                    assert set(json.loads(result.content[0].text)) == {"result_id"}
                     runtime.release.set()
                     assert await anyio.to_thread.run_sync(runtime.finished.wait, 2)
                     assert not (await client.call_tool("search", {"query": "after worker"})).is_error
+                    slow_id = runtime.search_consumer.transport.queued[0]
+                    with anyio.fail_after(2):
+                        while True:
+                            saved = await client.call_tool("get_search_result", {"result_id": slow_id})
+                            assert not saved.is_error
+                            payload = json.loads(saved.content[0].text)
+                            if payload.get("status") != "queued":
+                                break
+                            await anyio.sleep(0.02)
+                    assert payload["query"] == "slow"
+                    assert [args["query"] for _, args in runtime.search_calls].count("slow") == 1
                     assert successes == []
-                    for chunks in runtime.wire_responses:
-                        for line in b"".join(chunks).decode().splitlines():
-                            if not line.startswith("data: "):
-                                continue
-                            result = json.loads(line[6:]).get("result", {})
-                            for content in result.get("content", []):
-                                if content.get("type") == "text" and content["text"].startswith("{"):
-                                    assert json.loads(content["text"]).get("query") != "slow"
 
+        anyio.run(scenario)
+
+
+@pytest.mark.parametrize("mode", ["legacy", "2026-07-28"])
+def test_queued_search_polling_is_tenant_bound_and_never_repeats_work(tmp_path, mode):
+    from uuid import UUID
+
+    with running_service(tmp_path) as (url, _, runtime):
+        async def scenario():
+            async with mcp_client(url, mode) as client:
+                result = await client.call_tool("search", {"query": "slow", "wait_seconds": 0})
+                assert not result.is_error
+                admitted = json.loads(result.content[0].text)
+                assert set(admitted) == {"result_id"}
+                result_id = admitted["result_id"]
+                assert str(UUID(result_id)) == result_id
+                assert await anyio.to_thread.run_sync(runtime.started.wait, 2)
+                pending = await client.call_tool("get_search_result", admitted)
+                assert not pending.is_error
+                assert json.loads(pending.content[0].text) == {
+                    "result_id": result_id, "status": "queued", "stage": "processing",
+                }
+                other_headers = {**AUTH, "X-RAG-Namespace": "other"}
+                async with mcp_client(url, mode, headers=other_headers) as other:
+                    assert (await other.call_tool("get_search_result", admitted)).is_error
+                    runtime.release.set()
+                    with anyio.fail_after(2):
+                        while True:
+                            completed = await client.call_tool("get_search_result", admitted)
+                            assert not completed.is_error
+                            snapshot = json.loads(completed.content[0].text)
+                            if snapshot.get("status") != "queued":
+                                break
+                            await anyio.sleep(0.02)
+                    assert snapshot["result_id"] == result_id and snapshot["query"] == "slow"
+                    assert (await other.call_tool("get_search_result", admitted)).is_error
+                replay = await client.call_tool("get_search_result", admitted)
+                assert json.loads(replay.content[0].text) == snapshot
+                assert len(runtime.search_calls) == 1
+                assert runtime.search_calls[0][0] == "manuals"
+                assert runtime.search_consumer.transport.queued == [result_id]
+        anyio.run(scenario)
+
+
+@pytest.mark.parametrize("mode", ["legacy", "2026-07-28"])
+def test_wait_validation_over_mcp_does_not_admit_tasks(tmp_path, mode):
+    with running_service(tmp_path) as (url, _, runtime):
+        async def scenario():
+            async with mcp_client(url, mode) as client:
+                for wait in (-1, 30.1, True, False, "5", None):
+                    result = await client.call_tool("search", {"query": "hello", "wait_seconds": wait})
+                    assert result.is_error
+                assert (await client.call_tool("search", {
+                    "query": "hello", "wait_seconds": 0, "namespace": "other",
+                })).is_error
+                assert runtime.search_calls == []
+                assert runtime.search_consumer.transport.queued == []
+        anyio.run(scenario)
+
+
+@pytest.mark.parametrize("mode", ["legacy", "2026-07-28"])
+def test_failed_search_is_an_mcp_tool_error_without_resubmission(tmp_path, mode):
+    with running_service(tmp_path) as (url, _, runtime):
+        async def scenario():
+            async with mcp_client(url, mode) as client:
+                failed = await client.call_tool("search", {"query": "fail"})
+                assert failed.is_error
+                assert len(runtime.search_calls) == 1
+                result_id = runtime.search_consumer.transport.queued[0]
+                assert (await client.call_tool("get_search_result", {"result_id": result_id})).is_error
+                assert len(runtime.search_calls) == 1
+                assert runtime.search_consumer.transport.queued == [result_id]
+        anyio.run(scenario)
+
+
+def test_search_deadline_is_an_mcp_tool_error_without_inference(tmp_path):
+    from sqlalchemy import update
+    from rag_mcp.state.schema import search_tasks
+
+    with running_service(tmp_path) as (url, _, runtime):
+        runtime.search_consumer.stop()
+
+        async def scenario():
+            async with mcp_client(url) as client:
+                result = await client.call_tool("search", {"query": "never run", "wait_seconds": 0})
+                assert not result.is_error
+                admitted = json.loads(result.content[0].text)
+                assert set(admitted) == {"result_id"}
+                pending = await client.call_tool("get_search_result", admitted)
+                assert not pending.is_error
+                assert json.loads(pending.content[0].text) == {
+                    **admitted, "status": "queued", "stage": "queued",
+                }
+                with runtime.state.engine.begin() as conn:
+                    conn.execute(update(search_tasks).where(
+                        search_tasks.c.result_id == admitted["result_id"]).values(deadline=0))
+                assert (await client.call_tool("get_search_result", admitted)).is_error
+                assert runtime.search_calls == []
+        anyio.run(scenario)
+
+
+def test_wait_timeout_leaves_background_search_running(tmp_path):
+    with running_service(tmp_path) as (url, _, runtime):
+        async def scenario():
+            async with mcp_client(url) as client:
+                result = await client.call_tool("search", {"query": "slow", "wait_seconds": 0.05})
+                assert not result.is_error
+                admitted = json.loads(result.content[0].text)
+                assert set(admitted) == {"result_id"}
+                assert await anyio.to_thread.run_sync(runtime.started.wait, 2)
+                assert not runtime.finished.is_set()
+                runtime.release.set()
+                with anyio.fail_after(2):
+                    while True:
+                        polled = await client.call_tool("get_search_result", admitted)
+                        assert not polled.is_error
+                        saved = json.loads(polled.content[0].text)
+                        if saved.get("status") != "queued":
+                            break
+                        await anyio.sleep(0.02)
+                assert saved["query"] == "slow" and saved["result_id"] == admitted["result_id"]
+                assert len(runtime.search_calls) == 1
+                assert runtime.search_consumer.transport.queued == [admitted["result_id"]]
         anyio.run(scenario)
 
 

@@ -5,7 +5,6 @@ import io
 import json
 import os
 import threading
-from dataclasses import replace
 from uuid import UUID
 
 import anyio
@@ -13,14 +12,21 @@ import httpx2 as httpx
 import pytest
 from docx import Document
 from mcp.server.subscriptions import ResourcesListChanged, ResourceUpdated
+from model_api_test_support import configure_api_runtime
+from test_document_readers import _write_text_pdf
+from test_mcp_http import (
+    ADMIN,
+    AUTH,
+    MemoryDocumentTransport,
+    TestSearchConsumer,
+    mcp_client,
+    running_service,
+)
 
 from rag_mcp.config import RagConfig
 from rag_mcp.document_worker import DocumentWorker
 from rag_mcp.resources import document_uri
 from rag_mcp.service_knowledge import RagServiceRuntime
-from model_api_test_support import configure_api_runtime
-from test_document_readers import _write_text_pdf
-from test_mcp_http import ADMIN, AUTH, MemoryDocumentTransport, mcp_client, running_service
 
 
 def payload(result):
@@ -29,12 +35,17 @@ def payload(result):
 
 
 async def add_and_index(client, runtime, arguments):
+    await anyio.to_thread.run_sync(runtime.state.document_dispatcher.stop)
     admitted = payload(await client.call_tool("add_document", arguments))
     assert set(admitted) == {"artifact_id"}
     artifact_id = admitted["artifact_id"]
     assert str(UUID(artifact_id)) == artifact_id
     queued = payload(await client.call_tool("get_document_status", {"artifact_id": artifact_id}))
-    assert queued == {"artifact_id": artifact_id, "status": "queued", "stage": "queued", "error": None}
+    assert queued == {"artifact_id": artifact_id, "status": "queued", "stage": "dispatch_wait", "error": None}
+    assert artifact_id not in runtime.state.document_dispatcher.transport.queued
+    assert await anyio.to_thread.run_sync(runtime.state.document_dispatcher.run_once) == 1
+    assert artifact_id in runtime.state.document_dispatcher.transport.queued
+    assert payload(await client.call_tool("get_document_status", {"artifact_id": artifact_id}))["stage"] == "queued"
     assert await anyio.to_thread.run_sync(DocumentWorker(runtime).process, artifact_id)
     status = payload(await client.call_tool("get_document_status", {"artifact_id": artifact_id}))
     assert status["status"] == "succeeded" and status["error"] is None
@@ -109,11 +120,12 @@ def test_content_validation_base64_and_failed_indexing(tmp_path):
                 assert "A real Word document" in json.loads((await client.read_resource(result["uri"])).contents[0].text)["text"]
                 assert (await client.call_tool("update_document", {"name": "word.docx", "content_base64": "eA=="})).is_error
                 assert "A real Word document" in runtime.read_document("manuals", "word.docx")[0]
-                runtime.state.document_tasks.settings = replace(runtime.state.document_tasks.settings, max_attempts=1)
                 failed = payload(await client.call_tool("add_document", {"name": "fail.txt", "content": "fail"}))
                 assert set(failed) == {"artifact_id"}
                 assert "fail.txt" not in {item["name"] for item in runtime.list_documents("manuals")}
-                assert await anyio.to_thread.run_sync(DocumentWorker(runtime).process, failed["artifact_id"])
+                assert not await anyio.to_thread.run_sync(DocumentWorker(runtime).process, failed["artifact_id"])
+                assert runtime.get_document_status("manuals", failed["artifact_id"])["stage"] == "retry_wait"
+                assert await anyio.to_thread.run_sync(runtime.state.document_tasks.dead_letter, failed["artifact_id"])
                 status = payload(await client.call_tool("get_document_status", failed))
                 assert status["status"] == "failed" and status["error"]
                 assert "fail.txt" not in {item["name"] for item in runtime.list_documents("manuals")}
@@ -179,6 +191,8 @@ def test_mutation_notifications_and_admin_disable(tmp_path):
 
 def test_concurrent_adds_do_not_overwrite(tmp_path):
     with running_service(tmp_path) as (url, _, runtime):
+        runtime.state.document_dispatcher.stop()
+
         async def scenario():
             results = []
             async def add(content):
@@ -191,6 +205,9 @@ def test_concurrent_adds_do_not_overwrite(tmp_path):
             admitted = payload(next(result for result in results if not result.is_error))
             assert set(admitted) == {"artifact_id"}
             assert runtime.list_documents("manuals") == []
+            assert runtime.state.document_dispatcher.transport.queued == []
+            assert runtime.get_document_status("manuals", admitted["artifact_id"])["stage"] == "dispatch_wait"
+            assert await anyio.to_thread.run_sync(runtime.state.document_dispatcher.run_once) == 1
             assert runtime.state.document_dispatcher.transport.queued == [admitted["artifact_id"]]
             assert runtime.get_document_status("manuals", admitted["artifact_id"])["status"] == "queued"
             assert await anyio.to_thread.run_sync(DocumentWorker(runtime).process, admitted["artifact_id"])
@@ -209,6 +226,7 @@ def test_real_mcp_add_update_delete_and_search(tmp_path):
     try:
         configure_api_runtime(runtime)
         runtime.state.document_dispatcher.transport = MemoryDocumentTransport()
+        runtime.search_consumer = TestSearchConsumer(runtime)
         with running_service(tmp_path / "sources", runtime=runtime) as (url, _, _):
             async def scenario():
                 async with mcp_client(url, timeout=120) as client:
@@ -216,7 +234,16 @@ def test_real_mcp_add_update_delete_and_search(tmp_path):
                     replacement = "ZXNEW942: Replace the controller and calibrate the display."
                     await add_and_index(client, runtime, {"name": "manual.txt", "content": original})
                     async def search(query, mode="hybrid"):
-                        return payload(await client.call_tool("search", {"query": query, "retrieval": mode, "rerank": "none"}))
+                        result = payload(await client.call_tool("search", {
+                            "query": query, "retrieval": mode, "rerank": "none", "wait_seconds": 0,
+                        }))
+                        with anyio.fail_after(120):
+                            while set(result) == {"result_id"} or result.get("status") == "queued":
+                                await anyio.sleep(0.1)
+                                result = payload(await client.call_tool("get_search_result", {
+                                    "result_id": result["result_id"],
+                                }))
+                        return result
                     assert any("ZXOLD731" in row["text"] for row in (await search("ZXOLD731 sensor cable"))["results"])
                     payload(await client.call_tool("update_document", {"name": "manual.txt", "content": replacement}))
                     assert not (await search("ZXOLD731", "bm25"))["results"]

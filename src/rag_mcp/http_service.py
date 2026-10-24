@@ -106,6 +106,7 @@ class ServiceRuntime(Protocol):
     def delete(self, namespace: str, name: str) -> dict[str, object]: ...
     def write_document(self, namespace: str, name: str, content: bytes, *, overwrite: bool, idempotency_key: str | None = None) -> dict[str, object]: ...
     def search(self, namespace: str, arguments: dict[str, object]) -> dict[str, object]: ...
+    def submit_search(self, namespace: str, arguments: dict[str, object]) -> dict[str, object]: ...
     def get_search_result(self, namespace: str, result_id: str, *, page: int = 1, page_size: int = 10) -> dict: ...
     def get_artifact(self, namespace: str, artifact_id: str, *, offset: int = 0, length: int = 65536) -> dict: ...
     def download_artifact(self, namespace: str, artifact_id: str) -> tuple[bytes, str, str]: ...
@@ -333,7 +334,10 @@ def create_service_app(
         stop_recovery = getattr(resolved_runtime, "stop_upload_recovery", None)
         cache_sync = getattr(state, "cache_sync", None)
         document_dispatcher = getattr(state, "document_dispatcher", None)
+        search_dispatcher = getattr(state, "search_dispatcher", None)
         try:
+            if search_dispatcher is not None:
+                search_dispatcher.start()
             if document_dispatcher is not None:
                 document_dispatcher.start()
             if cache_sync is not None:
@@ -348,6 +352,8 @@ def create_service_app(
                     if callable(stop_recovery):
                         await anyio.to_thread.run_sync(stop_recovery)
                 finally:
+                    if search_dispatcher is not None:
+                        await anyio.to_thread.run_sync(search_dispatcher.stop)
                     if document_dispatcher is not None:
                         await anyio.to_thread.run_sync(document_dispatcher.stop)
                     if cache_sync is not None:
@@ -587,6 +593,8 @@ def create_service_app(
             return JSONResponse(result, headers={"Cache-Control": "no-store"})
         except KnowledgeValidationError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KnowledgeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except RagOperationError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 

@@ -1,5 +1,8 @@
-# Start MySQL, Qdrant, Redis and RocketMQ, provision both queues, migrate, then run rag-service.
-# Run rag-document-worker separately with the same database, encryption and queue settings.
+# Start dependencies, provision normal queues and readable DLQs, migrate, then run rag-service.
+# Normal DLQ receive/ACK verified with SDK 5.1.2 / Apache Broker 5.3.3; revalidate other deployments.
+# Run rag-document-worker and rag-search-worker separately with the same database,
+# Redis, Qdrant, encryption and RocketMQ settings. Without a search consumer,
+# MCP searches remain queued until their task deadline; --dispatch-only is not a consumer.
 #
 #   .\scripts\start-stack.ps1                 # full start
 #   .\scripts\start-stack.ps1 -MigrateOnly    # only start dependencies + migrate
@@ -55,6 +58,40 @@ if (-not $env:RAG_ROCKETMQ_TOPIC) { $env:RAG_ROCKETMQ_TOPIC = "praxis_state_cach
 if (-not $env:RAG_ROCKETMQ_GROUP) { $env:RAG_ROCKETMQ_GROUP = "praxis_state_cache_refresh_workers" }
 if (-not $env:RAG_DOCUMENT_TOPIC) { $env:RAG_DOCUMENT_TOPIC = "praxis_document_ingest" }
 if (-not $env:RAG_DOCUMENT_GROUP) { $env:RAG_DOCUMENT_GROUP = "praxis_document_ingest_workers" }
+if (-not $env:RAG_SEARCH_TOPIC) { $env:RAG_SEARCH_TOPIC = "praxis_search" }
+if (-not $env:RAG_SEARCH_GROUP) { $env:RAG_SEARCH_GROUP = "praxis_search_workers" }
+if (-not $env:RAG_DOCUMENT_DLQ_GROUP) { $env:RAG_DOCUMENT_DLQ_GROUP = "praxis_document_dead_letters" }
+if (-not $env:RAG_SEARCH_DLQ_GROUP) { $env:RAG_SEARCH_DLQ_GROUP = "praxis_search_dead_letters" }
+
+function Get-BrokerMaxRetries {
+    param([string]$Name)
+    $value = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($value)) { return 16 }
+    $parsed = 0
+    if (-not [int]::TryParse($value, [ref]$parsed) -or $parsed -lt 0) {
+        throw "$Name must be a nonnegative integer for Broker provisioning."
+    }
+    return $parsed
+}
+
+# These overrides configure Broker resources only; Python workers do not parse them.
+$documentMaxRetries = Get-BrokerMaxRetries "RAG_DOCUMENT_BROKER_MAX_RETRIES"
+$searchMaxRetries = Get-BrokerMaxRetries "RAG_SEARCH_BROKER_MAX_RETRIES"
+$normalGroups = @($env:RAG_ROCKETMQ_GROUP, $env:RAG_DOCUMENT_GROUP, $env:RAG_SEARCH_GROUP)
+$dlqGroups = @($env:RAG_DOCUMENT_DLQ_GROUP, $env:RAG_SEARCH_DLQ_GROUP)
+if ($dlqGroups[0] -eq $dlqGroups[1] -or @($dlqGroups | Where-Object { $_ -in $normalGroups }).Count) {
+    throw "DLQ handler groups must be distinct from each other and all normal consumer groups."
+}
+# Use the actual source group name, including any explicit physical namespace prefix.
+# Resource namespace metadata alone is not verified to map to namespaced Broker resources.
+$dlqTopics = @("%DLQ%$($env:RAG_DOCUMENT_GROUP)", "%DLQ%$($env:RAG_SEARCH_GROUP)")
+$consumerGroups = @(
+    @{ Name = $env:RAG_ROCKETMQ_GROUP; MaxRetries = 16 },
+    @{ Name = $env:RAG_DOCUMENT_GROUP; MaxRetries = $documentMaxRetries },
+    @{ Name = $env:RAG_SEARCH_GROUP; MaxRetries = $searchMaxRetries },
+    @{ Name = $env:RAG_DOCUMENT_DLQ_GROUP; MaxRetries = 16 },
+    @{ Name = $env:RAG_SEARCH_DLQ_GROUP; MaxRetries = 16 }
+)
 
 $python = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $python)) {
@@ -85,17 +122,24 @@ if (-not $healthy) {
     throw "MySQL did not become healthy. Run: docker compose logs mysql"
 }
 
-Write-Host "Waiting for RocketMQ and provisioning cache retry and document ingest resources..."
+Write-Host "Waiting for RocketMQ and provisioning normal queues, readable DLQ topics and independent handler groups..."
 $mqReady = $false
 for ($attempt = 0; $attempt -lt 45; $attempt++) {
     $mqReady = $true
-    foreach ($topic in @($env:RAG_ROCKETMQ_TOPIC, $env:RAG_DOCUMENT_TOPIC)) {
+    foreach ($topic in @($env:RAG_ROCKETMQ_TOPIC, $env:RAG_DOCUMENT_TOPIC, $env:RAG_SEARCH_TOPIC)) {
         & docker exec praxis-rag-rocketmq sh mqadmin updatetopic -n rocketmq-namesrv:9876 -c DefaultCluster -t $topic *> $null
         if ($LASTEXITCODE -ne 0) { $mqReady = $false; break }
     }
     if ($mqReady) {
-        foreach ($group in @($env:RAG_ROCKETMQ_GROUP, $env:RAG_DOCUMENT_GROUP)) {
-            & docker exec praxis-rag-rocketmq sh mqadmin updateSubGroup -n rocketmq-namesrv:9876 -c DefaultCluster -g $group -r 16 *> $null
+        foreach ($topic in $dlqTopics) {
+            # Broker-created DLQs can be write-only; retain writes and explicitly enable reads.
+            & docker exec praxis-rag-rocketmq sh mqadmin updatetopic -n rocketmq-namesrv:9876 -c DefaultCluster -t $topic -p 6 -r 1 -w 1 *> $null
+            if ($LASTEXITCODE -ne 0) { $mqReady = $false; break }
+        }
+    }
+    if ($mqReady) {
+        foreach ($group in $consumerGroups) {
+            & docker exec praxis-rag-rocketmq sh mqadmin updateSubGroup -n rocketmq-namesrv:9876 -c DefaultCluster -g $group.Name -r $group.MaxRetries *> $null
             if ($LASTEXITCODE -ne 0) { $mqReady = $false; break }
         }
     }
@@ -103,6 +147,9 @@ for ($attempt = 0; $attempt -lt 45; $attempt++) {
     Start-Sleep -Seconds 2
 }
 if (-not $mqReady) { throw "RocketMQ provisioning failed. Check docker-compose logs rocketmq." }
+Write-Host "Consumers are not started: run rag-search-worker for MCP search and rag-document-worker for MCP add_document separately."
+Write-Host "DLQ resources are provisioned; planned rag-dead-letter-worker --kind document|search needs reader permissions. Revalidate SDK/Broker versions other than tested 5.1.2/5.3.3."
+Write-Host "Without a search consumer, MCP searches remain queued until their task deadline; --dispatch-only is not a consumer."
 
 if (-not $SkipMigrate) {
     if (Test-Path $LegacyRoot) {

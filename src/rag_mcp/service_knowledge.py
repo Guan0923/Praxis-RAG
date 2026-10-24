@@ -11,13 +11,15 @@ import tempfile
 import json
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import wraps
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 from typing import Protocol
 from uuid import uuid4
+
+from sqlalchemy.exc import SQLAlchemyError
 
 from .chunking import _stable_id, chunk_document
 from .chunk_strategies import ChunkingConfig, LEGACY_CONFIG
@@ -701,11 +703,37 @@ class RagServiceRuntime:
         return settings
 
     @_runtime_operation
-    @_namespace_mutation
     def update_knowledge_base(self, namespace: str, values: dict, *, reembed: bool = False) -> dict:
+        published = None
+        publication_error = None
+        try:
+            with self.state.uploads.lock(namespace) as token:
+                try:
+                    published = self._publish_knowledge_base(namespace, values, reembed=reembed, token=token)
+                except Exception as exc:
+                    publication_error = exc
+                    raise
+        except Exception:
+            if published is None:
+                if publication_error is not None:
+                    raise publication_error
+                raise
+            logging.getLogger(__name__).warning("Published knowledge base %s; lease cleanup pending", namespace)
+        self._tenants.pop(namespace, None)
+        try:
+            from .state.cache_events import knowledge_keys
+            self.state.cache_sync.flush_pending(keys=knowledge_keys(namespace))
+        except Exception:  # noqa: BLE001 - committed outbox retries cache refresh independently
+            logging.getLogger(__name__).warning("Published knowledge base %s; cache refresh pending", namespace)
+        return public_settings(published)
+
+    def _publish_knowledge_base(self, namespace, values, *, reembed, token):
+        from .state.repositories import PublicationRejected
         from .storage.qdrant_store import QdrantStore
 
-        current = self.knowledge_base(namespace)
+        current, expected_version = self.state.knowledge_bases.snapshot(namespace)
+        if current is None:
+            raise KnowledgeValidationError("该知识库没有配置记录，请先创建知识库")
         old_embedding = model_connection(current, "embedding")
         old_reranker = model_connection(current, "reranker")
         embedding = replace(draft_connection(old_embedding, values.get("embedding", {})),
@@ -737,18 +765,37 @@ class RagServiceRuntime:
                 source.reembed_into(staging, HTTPEmbedder(embedding),
                                     {item["document_id"]: item["chunk_count"] for item in records})
                 updated.update(collection=staging, reembedded_at=datetime.now(UTC).isoformat())
-            # A single database commit publishes the complete index and its credentials.
-            self.state.knowledge_bases.update(updated)
         except Exception:
-            if staging:
-                try:
-                    if self._client.collection_exists(staging):
-                        self._client.delete_collection(staging)
-                except Exception:
-                    logging.getLogger(__name__).exception("Failed to remove unpublished index %s", staging)
+            self._discard_unpublished_index(staging)
             raise
-        self._tenants.pop(namespace, None)
-        return public_settings(updated)
+        try:
+            self.state.knowledge_bases.publish(
+                updated, expected_version=expected_version, journal=self.state.uploads, token=token)
+        except PublicationRejected as exc:
+            self._discard_unpublished_index(staging)
+            raise KnowledgeValidationError("知识库发布已回滚，请刷新配置后重试") from exc
+        except Exception as exc:
+            try:
+                confirmed = self.state.knowledge_bases.confirm_publication(
+                    namespace, updated, expected_version=expected_version, journal=self.state.uploads)
+            except Exception:  # noqa: BLE001 - uncertainty forbids destructive cleanup
+                confirmed = False
+            if not confirmed:
+                self._tenants.pop(namespace, None)
+                raise KnowledgeError(
+                    "Knowledge-base publication outcome is unconfirmed; the new index was retained. "
+                    "Check the current configuration before retrying."
+                ) from exc
+        return updated
+
+    def _discard_unpublished_index(self, collection):
+        if collection is None:
+            return
+        try:
+            if self._client.collection_exists(collection):
+                self._client.delete_collection(collection)
+        except Exception:  # noqa: BLE001 - cleanup cannot replace the original construction/publication error
+            logging.getLogger(__name__).warning("Unpublished index cleanup pending: %s", collection)
 
     def _knowledge_chunking(self, namespace: str) -> ChunkingConfig:
         settings = self.knowledge_base(namespace)
@@ -832,7 +879,7 @@ class RagServiceRuntime:
             raise KnowledgeValidationError(str(exc)) from exc
         except Exception as exc:
             raise KnowledgeError(
-                "Document submission was not confirmed; retry with the same idempotency_key"
+                "Document storage was not confirmed; retry with the same idempotency_key"
             ) from exc
 
     def get_document_status(self, namespace: str, artifact_id: str) -> dict:
@@ -854,7 +901,7 @@ class RagServiceRuntime:
                 task["name"], io.BytesIO(task["content"]), tenant.ingester, configuration,
                 settings["tokenizer"], deduplicate_across_names=False,
                 embedding_model=settings["embedding_model"], overwrite=False,
-                idempotency_key=f"document-task:{task['artifact_id']}:{task['attempts']}", task=task,
+                idempotency_key=f"document-task:{task['artifact_id']}:{task['execution_id']}", task=task,
             )
 
     @_runtime_operation
@@ -898,7 +945,7 @@ class RagServiceRuntime:
         return {"deleted": deleted, "documents": documents}
 
     @_runtime_operation
-    def search(self, namespace: str, arguments: Mapping[str, object]) -> dict[str, object]:
+    def search(self, namespace: str, arguments: Mapping[str, object], *, save_snapshot=True) -> dict[str, object]:
         tenant = self._tenant(namespace)
         request = SearchRequest.from_arguments(dict(arguments))
         with tenant.lock, self._inference_lock:
@@ -914,13 +961,29 @@ class RagServiceRuntime:
             # Immutable hit versions are copied into expiring artifacts; do not
             # take a writer lease or block reads of the current committed index.
             try:
-                return SearchReferences(self.state).capture(namespace, payload)
+                return SearchReferences(self.state).capture(namespace, payload, save_snapshot=save_snapshot)
             except Exception as exc:
                 logging.getLogger(__name__).warning("Search reference capture unavailable: %s", type(exc).__name__)
                 return {**payload, "snapshot_available": False,
                         "snapshot_error": "Search result references are unavailable"}
 
+    def submit_search(self, namespace: str, arguments: dict) -> dict:
+        validated = SearchRequest.from_arguments(arguments)
+        try:
+            return self.state.search_dispatcher.submit(namespace, asdict(validated))
+        except (KnowledgeError, SnapshotUnavailable):
+            raise
+        except Exception as exc:
+            raise KnowledgeError("Search submission unavailable; queue acceptance was not confirmed") from exc
+
     def get_search_result(self, namespace: str, result_id: str, *, page=1, page_size=10) -> dict:
+        try:
+            queued = self.state.search_tasks.get(namespace, result_id, page=page, page_size=page_size)
+        except SQLAlchemyError:
+            # Only committed result snapshots may be replayed when the task database is unavailable.
+            return self.state.results.get(namespace, result_id, page=page, page_size=page_size)
+        if queued is not None:
+            return queued
         return self.state.results.get(namespace, result_id, page=page, page_size=page_size)
 
     def get_artifact(self, namespace: str, artifact_id: str, *, offset=0, length=65536) -> dict:

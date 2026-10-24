@@ -6,11 +6,10 @@ import argparse
 import logging
 import signal
 import threading
-from contextlib import contextmanager
 
 from .service_knowledge import KnowledgeValidationError
 from .state.upload_coordinator import UploadCoordinator
-from .state.uploads import LeaseLost
+from .state.uploads import UploadConflict
 
 logger = logging.getLogger(__name__)
 
@@ -21,37 +20,13 @@ class DocumentWorker:
         self.tasks = runtime.state.document_tasks
         self._mutex = threading.Lock()
 
-    @contextmanager
-    def _heartbeat(self, task):
-        stop = threading.Event()
-        errors = []
-
-        def renew():
-            while not stop.wait(self.tasks.settings.lease_seconds / 3):
-                try:
-                    self.tasks.heartbeat(task)
-                except Exception as exc:  # noqa: BLE001 - ownership must fail closed on any renewal error
-                    errors.append(exc)
-                    return
-
-        thread = threading.Thread(target=renew, name="document-task-lease", daemon=True)
-        thread.start()
-        try:
-            yield
-            if errors:
-                raise LeaseLost("Document heartbeat failed") from errors[0]
-        finally:
-            stop.set()
-            thread.join()
-
     def process(self, artifact_id):
         with self._mutex:
             task = self.tasks.claim(artifact_id)
             if task is None:
                 return self.tasks.terminal(artifact_id)
             try:
-                with self._heartbeat(task):
-                    self.runtime.process_document_task(task)
+                self.runtime.process_document_task(task)
             except Exception as exc:  # noqa: BLE001 - persist safe outcomes for all parser/backend failures
                 if self.tasks.terminal(artifact_id):
                     return True  # Publication committed even if its acknowledgement was lost.
@@ -60,7 +35,7 @@ class DocumentWorker:
                              if isinstance(exc, KnowledgeValidationError)
                              else f"Document processing failed ({type(exc).__name__})")
                     self.tasks.fail(task, retry=not isinstance(exc, KnowledgeValidationError), error=error)
-                except LeaseLost:
+                except UploadConflict:
                     pass
                 logger.warning("Document processing deferred artifact_id=%s error_type=%s",
                                artifact_id, type(exc).__name__)
@@ -70,7 +45,6 @@ class DocumentWorker:
 
     def recover(self):
         UploadCoordinator(self.runtime.state).recover(self.runtime._recovery_store)
-        self.tasks.redrive_expired()
 
 
 def main(argv=None):

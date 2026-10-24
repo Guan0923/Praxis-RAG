@@ -18,7 +18,7 @@ from .repositories import (
     StateError,
 )
 from .schema import metadata
-from .schema_migrations import migrate_soft_delete
+from .schema_migrations import migrate_document_outbox, migrate_soft_delete
 from .settings import StateSettings
 from .uploads import UploadJournal
 from .cache_sync import CacheSynchronizer
@@ -40,6 +40,7 @@ class StateStores:
             try:
                 metadata.create_all(self.engine)
                 migrate_soft_delete(self.engine)
+                migrate_document_outbox(self.engine)
             except Exception as exc:  # noqa: BLE001 - surfaced as a configuration error
                 raise StateError(f"状态数据库初始化失败：{type(exc).__name__}") from exc
         self.cache_sync = CacheSynchronizer(self)
@@ -56,6 +57,10 @@ class StateStores:
         self.results = ResultSnapshots(self)
         self.artifacts = ArtifactRegistry(self, ttl_seconds=self.results.settings.ttl_seconds,
                                           max_bytes=self.results.settings.max_artifact_bytes)
+        from .search_tasks import SearchTasks
+        from .search_queue import SearchTaskDispatcher
+        self.search_tasks = SearchTasks(self)
+        self.search_dispatcher = SearchTaskDispatcher(self)
         _warn_if_unencrypted(settings)
 
     @classmethod
@@ -70,6 +75,7 @@ class StateStores:
         return cls(resolved, create_schema=create_schema and resolved.auto_schema)
 
     def close(self) -> None:
+        self.search_dispatcher.close()
         self.document_dispatcher.close()
         self.cache_sync.close()
         self.uploads.close()

@@ -101,7 +101,7 @@ class ResultSnapshots:
         except (KeyError, TypeError, ValueError, UnicodeError, RecursionError):
             return None
 
-    def save(self, namespace, payload, *, result_id=None, created_at=None):
+    def save(self, namespace, payload, *, result_id=None, created_at=None, conn=None):
         """Persist a detached public response before publishing its cache or UUID."""
         if not isinstance(namespace, str) or not 1 <= len(namespace) <= 64:
             raise ValueError("Invalid result namespace")
@@ -124,17 +124,31 @@ class ResultSnapshots:
         encoded = content.encode("utf-8")
         if len(encoded) > self.settings.max_result_bytes:
             raise SnapshotUnavailable("Search result exceeds snapshot size limit")
+        statement = insert(search_result_snapshots).values(
+            id=result_id, namespace=namespace, content=content, created_at=created, expires_at=expires)
         try:
-            with self.state.engine.begin() as conn:
-                conn.execute(insert(search_result_snapshots).values(
-                    id=result_id, namespace=namespace, content=content,
-                    created_at=created, expires_at=expires))
+            if conn is not None:
+                conn.execute(statement)
+            else:
+                with self.state.engine.begin() as connection:
+                    connection.execute(statement)
         except IntegrityError:
             raise SnapshotUnavailable("Search result ID already exists") from None
         except SQLAlchemyError:
             raise SnapshotUnavailable("Search result storage is temporarily unavailable") from None
-        self._cache(namespace, result_id, encoded, expires)
+        if conn is None:
+            self._cache(namespace, result_id, encoded, expires)
         return json.loads(content)["payload"]
+
+    def cache_saved(self, namespace, result_id):
+        """Publish only committed bytes; called after a task/result transaction commits."""
+        with self.state.engine.connect() as conn:
+            row = conn.execute(select(search_result_snapshots).where(
+                search_result_snapshots.c.id == result_id,
+                search_result_snapshots.c.namespace == namespace,
+            )).mappings().first()
+        if row is not None:
+            self._cache(namespace, result_id, row["content"].encode("utf-8"), row["expires_at"])
 
     def get(self, namespace, result_id, *, page=1, page_size=10):
         """Read a frozen execution, never the live index or an inference model."""

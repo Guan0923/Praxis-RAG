@@ -91,7 +91,7 @@ def document_tool_entries(mutate):
 
     entries = []
     descriptions = {
-        "add_document": "Upload one new file for asynchronous indexing. Returns only artifact_id after durable storage and queue acceptance, NOT after indexing. Poll get_document_status until succeeded before searching. Rejects existing or queued filenames. Reuse idempotency_key after uncertain submissions. Duplicate content under another name is allowed.",
+        "add_document": "Upload one new file for asynchronous indexing. Returns only artifact_id immediately after durable MySQL storage, NOT after queue delivery or indexing. Delivery retries in the background, including during broker outages. Poll get_document_status until succeeded before searching. Rejects existing or queued filenames. Reuse idempotency_key after uncertain submissions. Duplicate content under another name is allowed.",
         "update_document": "Replace the complete content of an existing knowledge file and rebuild its index. Requires the exact existing filename and preserves its chunking settings. This overwrites content; use only when the user requests an update.",
         "delete_document": "Delete an existing knowledge file and its search index by exact filename. Use only when the user requests deletion. This cannot be undone through MCP.",
     }

@@ -4,7 +4,7 @@
 
 - 搜索结果快照持久化到 MySQL，Redis 负责加速；默认有效期 **3600 秒（1 小时）**。
 - Redis 淘汰、丢数据、未启用或故障时，从 MySQL 读取同一份快照，不重新搜索、Embedding 或重排；MySQL 中已过期或不存在则明确失败。
-- 原搜索响应保留完整结果、图片和表格，新增 result_id、expires_at、artifact 引用，兼容原客户端。
+- 完成的搜索响应保留完整结果、图片和表格，新增 result_id、expires_at、artifact 引用。服务端 MCP `search` 使用任务队列；等待未完成时仅返回 result_id，客户端须用现有 `get_search_result` 轮询。REST `/v1/search` 与本地同步调试保持同步。
 - 已签发的源文件、图片、表格、解析产物引用绑定具体版本。原文档更新、删除后，旧引用继续有效至到期。
 - 删除文档只设置 `documents.del_flag=true`：新的列表、按名称读取、去重、覆盖存在检查和搜索过滤掉该记录；不撤销旧 UUID，不物理删除当前源文件、产物或 Qdrant 向量。重新上传该名称成功发布后清除 del_flag。
 - UUID 不是访问凭证；每次请求仍执行现有 API Key/namespace 鉴权。权限撤销会阻止后续读取。
@@ -12,15 +12,19 @@
 ## 保存与取回
 
 ```text
-search → 原有检索/重排 → 复制被返回的产物 → MySQL 保存结果快照 → Redis 加速
-                                   ↓
-           返回原有 results + result_id + expires_at + artifacts
-                                   ↓
-     get_search_result(result_id) / Resource(artifact_id) / REST
-                      直接读取，不调用搜索或模型
+服务端 MCP search → MySQL 任务/参数/outbox → RocketMQ（仅 result_id）
+                                             ↓
+                            rag-search-worker → 原有检索/重排
+                                             ↓
+                  复制返回产物 → MySQL 结果快照 → Redis 加速
+                                             ↓
+等待内完成：完整结果 + result_id；否则：仅 result_id → get_search_result 轮询
+
+REST /v1/search / 本地调试 → 同步检索/重排（不经搜索任务队列）
+完成快照 / artifact → 按 ID 直接读取，不调用搜索或模型
 ```
 
-每次搜索生成独立 UUIDv4 result_id，不按查询文本匹配。MySQL `search_result_snapshots` 保存独立 UUID、namespace、完整响应及绝对过期时间。Redis key 包含 namespace 哈希及 ID，TTL 与状态缓存独立；UUID 全局唯一，不允许用同一个 UUID 覆盖其他快照。快照保留原结果顺序、分数、证据、debug 元数据及产物引用。分页只切片原快照，不再查询 Qdrant。
+每次搜索生成独立 UUIDv4 result_id，不按查询文本匹配。服务端 MCP 的 result_id 在提交时生成，任务与最终快照使用同一 UUID；搜索参数只进入 MySQL，不进入 Redis 或 MQ。与 `add_document` 不同，`search` 只需 MySQL 任务及 outbox 持久化接收即可返回 UUID，不等待 Broker 确认；API relay 异步投递，MQ 启动或故障不阻塞 `wait_seconds` 的完成等待窗口，队列不可用时任务保持排队直至截止时间。MySQL `search_result_snapshots` 保存独立 UUID、namespace、完整响应及绝对过期时间。Redis key 包含 namespace 哈希及 ID，TTL 与状态缓存独立；UUID 全局唯一，不允许用同一个 UUID 覆盖其他快照。快照保留原结果顺序、分数、证据、debug 元数据及产物引用。分页只切片原快照，不再查询 Qdrant。
 
 相同 namespace、文档版本、产物类型、名称和字节内容复用稳定 UUIDv5 artifact_id。新的引用可单调延长它的有效期，不缩短已有引用；旧响应里的 expires_at 是该次签发时的保留期限。
 
@@ -91,8 +95,9 @@ MySQL 保存失败或快照过大时，仍返回原搜索结果，并设置 snap
 
 不修改 MCP 标准，只扩展本项目工具与资源：
 
-- search：保留原结果渲染，额外返回 UUID 和产物引用。
-- get_search_result：参数 result_id，以及可选 page/page_size。取回结果沿用原来的 ImageContent 渲染，不重新检索。
+- 服务端 `search`：新增 `wait_seconds`，必须为有限数值（支持小数），0..30，默认 10；不是任务 deadline。在等待内完成返回原完整 payload、同一任务 UUID `result_id` 和产物引用；否则**仅**返回 `{"result_id":"<UUID>"}`。REST `/v1/search` 和本地同步调试不变。
+- 扩展现有 `get_search_result`（不重复注册新工具）：参数 result_id，以及可选 page/page_size。任务未完成返回 `{"result_id":"<UUID>","status":"queued","stage":"queued"}`；执行中或等待重试仍为 `status="queued"`，stage 分别为 `processing` / `retry_wait`。任务状态直接读取 SQL，不依赖 Redis 状态缓存。
+- 成功后 `get_search_result` 返回完整持久化快照（可分页），沿用原来的 ImageContent 渲染，不重新检索。执行最终失败、任务 deadline 到达或结果过期返回 MCP `isError=true`，不能当作成功的空结果。
 - Resource 模板：`rag://artifacts/{namespace}/{artifact_id}{?offset,length}`。
 - read_resource 返回 JSON 分块 envelope，next_uri 指向下一段；按 next_uri 读取并 base64 解码、拼接可恢复文件。
 - 原 rag://knowledge 文档资源和工具启停管理不变。
@@ -101,16 +106,26 @@ MySQL 保存失败或快照过大时，仍返回原搜索结果，并设置 snap
 ## 配置与限制
 
 ```text
+RAG_SEARCH_TOPIC=praxis_search
+RAG_SEARCH_GROUP=praxis_search_workers
+RAG_SEARCH_TIMEOUT_SECONDS=120
+# Provisioning only; Broker owns consumer retries (not runtime Python settings).
+RAG_SEARCH_BROKER_MAX_RETRIES=16
+RAG_SEARCH_DLQ_GROUP=praxis_search_dead_letters
 RAG_RESULT_TTL_SECONDS=3600
 RAG_RESULT_MAX_BYTES=16777216
 RAG_ARTIFACT_MAX_BYTES=67108864
 RAG_RESULT_MAX_ARTIFACTS=100
 ```
 
-- 结果 Redis 快照默认最大 16 MiB；保持原图片兼容响应，过大时仅不保存快照。
+- 服务端 MCP 搜索必须运行独立 `rag-search-worker` 消费者；已有部署若未启动，搜索会排队直至 deadline。`rag-search-worker --dispatch-only` 只补发 outbox，不执行检索。每个消费进程默认顺序执行，文档与搜索使用独立 topic/group；worker 与 API 共享 MySQL、Redis、MQ、Qdrant 和状态加密设置。
+- 任务默认总超时 120 秒，包含排队等待，与 `wait_seconds`（默认 10 秒）和完成快照的 3600 秒 TTL 独立。生产检索在子进程执行；MQ 可见性续期失败有界重试，不承诺立即取消正在执行的检索或下游调用。
+- MySQL 保存查询参数、业务状态和首次投递 outbox；消费重试、invisible 与 DLQ 由 Broker 管理。临时故障不 ACK，交由 Broker 重投；确定性失败先提交 SQL 终态再 ACK。终态 first-terminal-wins；即使续期失败，已提交终态仍尝试 ACK，重复消息不得覆盖终态或重新执行已完成搜索。
+- 计划提供独立 `rag-dead-letter-worker --kind search`（也支持 `--kind document`），只读任务并提交失败终态，不加载模型或执行推理。正常 Broker 死信 topic 为 `%DLQ%<源消费组>`，处理组使用独立 `RAG_SEARCH_DLQ_GROUP`；不能把处理组名当死信 topic。传输层已验证 Python SDK 5.1.2 / Apache Broker 5.3.3 的正常 DLQ 接收及 ACK；其他版本上线前需重新验证，并预建可读 topic、处理组及权限，详见 [Broker 消费与死信处理](USAGE.md#broker-消费与死信处理)。
+- 结果快照默认最大 16 MiB；保持原图片兼容响应。同步 REST 搜索快照过大时仍可返回原结果并标记不可持久化；MCP 排队任务不能以未持久化的结果冒充已完成快照。
 - 每次搜索默认至多签发 100 个产物，累计字节预算 64 MiB；同一搜索的重复产物不重复计费。
 - 单个 artifact 默认也受 64 MiB 上限约束，MySQL max_allowed_packet 必须满足实际产物大小；默认 Compose 为 64 MiB，接近上限的大对象可能因协议开销失败并提示引用不可用。
-- Redis 使用已有连接配置和前缀，但不可变结果快照不采用状态修订水位/outbox，也不通过 RocketMQ 重跑查询。缓存丢失直接回源 MySQL；不延长绝对过期时间。
+- Redis 使用已有连接配置和前缀；不可变结果快照缓存不采用状态修订水位/outbox，缓存丢失直接回源 MySQL，不延长绝对过期时间，不通过 MQ 重跑已完成结果。服务端 MCP 搜索执行任务另有 MySQL outbox 和 RocketMQ 队列，不应与结果缓存混淆。
 - 此版本不增加前端快照历史/下载入口；现有搜索 UI 继续使用完整结果。
 
 ## 验证

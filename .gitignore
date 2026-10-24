@@ -27,6 +27,7 @@ models/
 model-cache/
 qdrant_storage/
 
-# Frontend dependencies; compiled console assets are shipped with the Python package.
+# Frontend dependencies and generated build output.
 frontend/node_modules/
 frontend/*.tsbuildinfo
+/src/rag_mcp/web/

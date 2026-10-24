@@ -3,39 +3,44 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import os
+import random
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 
 from . import cache_events
 from .schema import document_task_outbox as outbox
 from .schema import document_tasks as tasks
-from .schema import documents, knowledge_bases, upload_operations
-from .uploads import LeaseLost, UploadConflict
+from .schema import documents, knowledge_bases
+from .uploads import UploadConflict
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class DocumentTaskSettings:
-    max_attempts: int = 3
-    lease_seconds: float = 120
-    retry_seconds: float = 10
+class DocumentDispatchSettings:
+    lease_seconds: float = 30
+    retry_seconds: float = 2
+    max_retry_seconds: float = 300
+    alert_seconds: float = 300
 
     def __post_init__(self):
-        if type(self.max_attempts) is not int or self.max_attempts < 1:
-            raise ValueError("RAG_DOCUMENT_MAX_ATTEMPTS must be a positive integer")
-        for name in ("lease_seconds", "retry_seconds"):
+        for name in ("lease_seconds", "retry_seconds", "max_retry_seconds", "alert_seconds"):
             value = getattr(self, name)
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"Document task {name} must be finite and positive")
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"Document dispatch {name} must be finite and positive")
+        if self.max_retry_seconds < self.retry_seconds:
+            raise ValueError("Document dispatch max retry must not be below retry base")
 
     @classmethod
     def from_env(cls):
-        return cls(int(os.getenv("RAG_DOCUMENT_MAX_ATTEMPTS", "3")),
-                   float(os.getenv("RAG_DOCUMENT_LEASE_SECONDS", "120")),
-                   float(os.getenv("RAG_DOCUMENT_RETRY_SECONDS", "10")))
+        return cls(*(float(os.getenv(f"RAG_DOCUMENT_DISPATCH_{key}", default)) for key, default in (
+            ("LEASE_SECONDS", "30"), ("RETRY_SECONDS", "2"),
+            ("MAX_RETRY_SECONDS", "300"), ("ALERT_SECONDS", "300"))))
 
 
 def validate_artifact_id(value):
@@ -48,10 +53,11 @@ def validate_artifact_id(value):
 
 
 class DocumentTasks:
-    def __init__(self, state, settings=None):
+    def __init__(self, state):
         self.state = state
         self.engine = state.engine
-        self.settings = settings or DocumentTaskSettings.from_env()
+        self.dispatch_settings = DocumentDispatchSettings.from_env()
+        self._dispatch_pause_until = 0
         state.cache_sync.register("document_status", self._load_status)
 
     def _changed(self, conn, artifact_id):
@@ -123,41 +129,136 @@ class DocumentTasks:
             conn.execute(insert(tasks).values(
                 artifact_id=artifact_id, namespace=namespace, name=name, name_key=name_key,
                 content=content, sha256=digest, idempotency_key=idempotency_key,
-                configuration_version=version, status="queued", stage="queued", attempts=0,
+                configuration_version=version, status="queued", stage="dispatch_wait", attempts=0,
                 owner=None, lease_until=0, operation_id=None, error=None,
                 created_at=now, updated_at=now))
             conn.execute(insert(outbox).values(artifact_id=artifact_id, pending=True, generation=1, retry_at=0))
-        self.flush(artifact_id)
         return artifact_id
 
-    def dispatch(self, artifact_id, transport):
-        """Confirm send before clearing the outbox; a lost confirmation may duplicate."""
-        if transport is None:
-            raise RuntimeError("Configure RAG_ROCKETMQ_ENDPOINT for asynchronous add_document")
+    def _delivery_claim(self, artifact_id):
         with self.engine.connect() as conn:
-            delivery = conn.execute(select(outbox).where(
-                outbox.c.artifact_id == artifact_id)).mappings().first()
-        if delivery is None or not delivery["pending"]:
-            return
-        transport.send(artifact_id)
+            namespace = conn.scalar(select(tasks.c.namespace).where(tasks.c.artifact_id == artifact_id))
+        if namespace is None:
+            return None
         with self.engine.begin() as conn:
-            conn.execute(update(outbox).where(
-                outbox.c.artifact_id == artifact_id, outbox.c.generation == delivery["generation"]
-            ).values(pending=False))
+            self.state.uploads._guard(conn, namespace)
+            now = self.state.uploads._now(conn)
+            row = conn.execute(select(outbox).where(outbox.c.artifact_id == artifact_id)
+                               .with_for_update()).mappings().first()
+            if (row is None or not row["pending"] or row["retry_at"] > now
+                    or row["lease_until"] > now):
+                return None
+            owner = uuid4().hex
+            changed = conn.execute(update(outbox).where(
+                outbox.c.artifact_id == artifact_id, outbox.c.pending.is_(True),
+                outbox.c.generation == row["generation"], outbox.c.lease_until <= now,
+                outbox.c.retry_at <= now,
+            ).values(owner=owner, lease_until=now + self.dispatch_settings.lease_seconds,
+                     attempts=outbox.c.attempts + 1))
+            if changed.rowcount != 1:
+                return None
+            return {**dict(row), "namespace": namespace, "owner": owner,
+                    "attempts": row["attempts"] + 1}
+
+    def _delivery_result(self, delivery, error=None):
+        artifact_id = delivery["artifact_id"]
+        with self.engine.begin() as conn:
+            self.state.uploads._guard(conn, delivery["namespace"])
+            task = self._row(conn, artifact_id)
+            now = self.state.uploads._now(conn)
+            predicate = (outbox.c.artifact_id == artifact_id,
+                         outbox.c.generation == delivery["generation"],
+                         outbox.c.owner == delivery["owner"], outbox.c.pending.is_(True),
+                         outbox.c.lease_until > now)
+            values = {"owner": None, "lease_until": 0, "pending": error is not None, "last_error": error}
+            if error is not None:
+                ceiling = min(self.dispatch_settings.max_retry_seconds,
+                              self.dispatch_settings.retry_seconds * 2 ** min(delivery["attempts"] - 1, 20))
+                values["retry_at"] = now + random.uniform(ceiling / 2, ceiling)
+            changed = conn.execute(update(outbox).where(*predicate).values(**values))
+            if changed.rowcount == 1 and task["status"] == "queued" and task["stage"] in ("dispatch_wait", "dispatch_retry", "queued"):
+                self._changed(conn, artifact_id)
+                conn.execute(update(tasks).where(tasks.c.artifact_id == artifact_id).values(
+                    stage="dispatch_retry" if error else "queued", updated_at=now))
+        self.flush(artifact_id)
+
+    @staticmethod
+    def _broker_unavailable(exc):
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return True
+        try:
+            import grpc
+            from rocketmq.v5.exception.client_exception import (
+                InternalErrorException,
+                ProxyTimeoutException,
+            )
+        except ImportError:
+            return False
+        if isinstance(exc, (InternalErrorException, ProxyTimeoutException)):
+            return True
+        return isinstance(exc, grpc.RpcError) and exc.code() in (
+            grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED,
+            grpc.StatusCode.RESOURCE_EXHAUSTED,
+        )
+
+    def dispatch(self, artifact_id, transport):
+        """Claim briefly, send outside SQL, then fence this generation's confirmation."""
+        if transport is None:
+            return False
+        delivery = self._delivery_claim(artifact_id)
+        if delivery is None:
+            return False
+        try:
+            transport.send(artifact_id)
+        except Exception as exc:  # noqa: BLE001 - retain delivery and only persist a safe error category
+            # Never retain SDK exception text, which may contain credentials.
+            category = type(exc).__name__
+            self._delivery_result(delivery, category)
+            logger.warning("Document delivery deferred artifact_id=%s attempts=%s error_type=%s",
+                           artifact_id, delivery["attempts"], category)
+            if self._broker_unavailable(exc):
+                with self.engine.connect() as conn:
+                    ceiling = min(self.dispatch_settings.max_retry_seconds,
+                                  self.dispatch_settings.retry_seconds * 2 ** min(delivery["attempts"] - 1, 20))
+                    self._dispatch_pause_until = self.state.uploads._now(conn) + random.uniform(ceiling / 2, ceiling)
+                return "unavailable"
+            return False
+        self._delivery_result(delivery)
+        return True
 
     def dispatch_pending(self, transport, limit=20):
+        if transport is None:
+            return 0
         with self.engine.connect() as conn:
             now = self.state.uploads._now(conn)
+            if now < self._dispatch_pause_until:
+                return 0
             ids = list(conn.scalars(select(outbox.c.artifact_id).where(
-                outbox.c.pending.is_(True), outbox.c.retry_at <= now
+                outbox.c.pending.is_(True), outbox.c.retry_at <= now, outbox.c.lease_until <= now,
             ).order_by(outbox.c.retry_at, outbox.c.artifact_id).limit(limit)))
+        sent = 0
         for artifact_id in ids:
             try:
-                self.dispatch(artifact_id, transport)
-            except Exception:  # noqa: BLE001 - any failure leaves the durable outbox intact
-                # Stop on broker failure; do not serialize a timeout per queued upload.
+                result = self.dispatch(artifact_id, transport)
+                if result == "unavailable":
+                    break
+                sent += result is True
+            except Exception as exc:  # noqa: BLE001 - SQL/confirmation failure is recovered by delivery lease
+                logger.warning("Document relay deferred artifact_id=%s error_type=%s",
+                               artifact_id, type(exc).__name__)
                 break
-        return len(ids)
+        return sent
+
+    def delivery_health(self):
+        with self.engine.connect() as conn:
+            now = self.state.uploads._now(conn)
+            row = conn.execute(select(func.count(), func.min(tasks.c.created_at)).select_from(
+                tasks.join(outbox, tasks.c.artifact_id == outbox.c.artifact_id)).where(
+                    outbox.c.pending.is_(True), tasks.c.status == "queued")).first()
+        age = max(0, now - row[1]) if row[1] is not None else 0
+        if row[0] and age >= self.dispatch_settings.alert_seconds:
+            logger.warning("Document delivery backlog pending=%s oldest_seconds=%.0f", row[0], age)
+        return {"pending": row[0], "oldest_seconds": age}
 
     def _row(self, conn, artifact_id):
         columns = [column for column in tasks.c if column.name != "content"]
@@ -165,28 +266,25 @@ class DocumentTasks:
                            .with_for_update()).mappings().first()
         return dict(row) if row else None
 
-    def _owned(self, conn, task):
+    def _active(self, conn, task):
         self.state.uploads._guard(conn, task["namespace"])
         row = self._row(conn, task["artifact_id"])
-        if (row is None or row["owner"] != task["owner"] or row["status"] != "processing"
-                or row["lease_until"] <= self.state.uploads._now(conn)):
-            raise LeaseLost("Document task ownership expired")
+        if row is None or row["status"] not in ("queued", "processing"):
+            raise UploadConflict("Document upload already has a final result")
         return row
 
-    def _finish(self, conn, row, status, error=None):
+    def _finish(self, conn, row, status, error=None, *, stage=None):
         self._changed(conn, row["artifact_id"])
-        conn.execute(update(tasks).where(tasks.c.artifact_id == row["artifact_id"]).values(
-            status=status, stage="completed" if status == "succeeded" else "failed", error=error,
-            owner=None, lease_until=0, updated_at=self.state.uploads._now(conn)))
-        conn.execute(update(outbox).where(outbox.c.artifact_id == row["artifact_id"]).values(pending=False))
+        changed = conn.execute(update(tasks).where(
+            tasks.c.artifact_id == row["artifact_id"], tasks.c.status.in_(("queued", "processing")),
+        ).values(status=status, stage=stage or ("completed" if status == "succeeded" else "failed"),
+                 error=error, owner=None, lease_until=0, updated_at=self.state.uploads._now(conn)))
+        if changed.rowcount != 1:
+            raise UploadConflict("Document upload already has a final result")
 
     def claim(self, artifact_id):
+        """Load a broker delivery; processing status is not an execution lease."""
         validate_artifact_id(artifact_id)
-        task = self._claim(artifact_id)
-        self.flush(artifact_id)
-        return task
-
-    def _claim(self, artifact_id):
         with self.engine.connect() as conn:
             namespace = conn.scalar(select(tasks.c.namespace).where(tasks.c.artifact_id == artifact_id))
         if namespace is None:
@@ -194,52 +292,32 @@ class DocumentTasks:
         with self.engine.begin() as conn:
             self.state.uploads._guard(conn, namespace)
             row = self._row(conn, artifact_id)
-            now = self.state.uploads._now(conn)
-            if row["status"] in ("succeeded", "failed") or row["lease_until"] > now:
-                return None
-            if row["operation_id"]:
-                operation = conn.execute(select(upload_operations.c.status).where(
-                    upload_operations.c.id == row["operation_id"])).scalar()
-                if operation == "COMMITTED":
-                    self._finish(conn, row, "succeeded")
-                    return None
-                if operation not in (None, "ROLLED_BACK"):
-                    return None  # Execution recovery must compensate before a fresh attempt.
-            if row["attempts"] >= self.settings.max_attempts:
-                self._finish(conn, row, "failed", "Document processing retry limit reached")
+            if row["status"] not in ("queued", "processing"):
                 return None
             self._changed(conn, artifact_id)
-            row.update(status="processing", stage="receiving", owner=uuid4().hex,
-                       attempts=row["attempts"] + 1, operation_id=None,
-                       lease_until=now + self.settings.lease_seconds, error=None, updated_at=now)
             conn.execute(update(tasks).where(tasks.c.artifact_id == artifact_id).values(
-                **{key: row[key] for key in ("status", "stage", "owner", "attempts", "operation_id",
-                                            "lease_until", "error", "updated_at")}))
+                status="processing", stage="receiving", updated_at=self.state.uploads._now(conn)))
+            row.update(status="processing", stage="receiving", execution_id=uuid4().hex)
             row["content"] = conn.scalar(select(tasks.c.content).where(tasks.c.artifact_id == artifact_id))
+        self.flush(artifact_id)
         return row
 
-    def heartbeat(self, task):
-        with self.engine.begin() as conn:
-            self._owned(conn, task)
-            conn.execute(update(tasks).where(tasks.c.artifact_id == task["artifact_id"]).values(
-                lease_until=self.state.uploads._now(conn) + self.settings.lease_seconds))
-
     def bind(self, conn, task, operation):
-        self._owned(conn, task)
+        self._active(conn, task)
         conn.execute(update(tasks).where(tasks.c.artifact_id == task["artifact_id"]).values(
             operation_id=operation["id"]))
         task["operation_id"] = operation["id"]
 
     def progress(self, task, stage):
         with self.engine.begin() as conn:
-            self._owned(conn, task)
+            self._active(conn, task)
             self._changed(conn, task["artifact_id"])
             conn.execute(update(tasks).where(tasks.c.artifact_id == task["artifact_id"]).values(
                 stage=stage, updated_at=self.state.uploads._now(conn)))
         self.flush(task["artifact_id"])
 
     def succeed(self, conn, task):
-        row = self._owned(conn, task)
+        row = self._active(conn, task)
         version = conn.scalar(select(knowledge_bases.c.version).where(
             knowledge_bases.c.namespace == task["namespace"]).with_for_update())
         if version != task["configuration_version"]:
@@ -248,17 +326,14 @@ class DocumentTasks:
 
     def fail(self, task, *, retry, error):
         with self.engine.begin() as conn:
-            row = self._owned(conn, task)
-            if not retry or row["attempts"] >= self.settings.max_attempts:
+            row = self._active(conn, task)
+            if not retry:
                 self._finish(conn, row, "failed", error)
             else:
                 self._changed(conn, task["artifact_id"])
-                retry_at = self.state.uploads._now(conn) + self.settings.retry_seconds * row["attempts"]
                 conn.execute(update(tasks).where(tasks.c.artifact_id == task["artifact_id"]).values(
-                    status="queued", stage="retry_wait", error=None, owner=None, lease_until=retry_at,
+                    status="queued", stage="retry_wait", error=None,
                     updated_at=self.state.uploads._now(conn)))
-                conn.execute(update(outbox).where(outbox.c.artifact_id == task["artifact_id"]).values(
-                    pending=True, generation=outbox.c.generation + 1, retry_at=retry_at))
         self.flush(task["artifact_id"])
 
     def terminal(self, artifact_id):
@@ -266,17 +341,19 @@ class DocumentTasks:
             status = conn.scalar(select(tasks.c.status).where(tasks.c.artifact_id == artifact_id))
         return status is None or status in ("succeeded", "failed")
 
-    def redrive_expired(self, limit=20):
-        """Republish expired work even after broker retry/DLQ retention is exhausted."""
+    def dead_letter(self, artifact_id):
+        """Broker retry exhaustion is terminal; never overwrite a committed result."""
+        validate_artifact_id(artifact_id)
+        with self.engine.connect() as conn:
+            namespace = conn.scalar(select(tasks.c.namespace).where(tasks.c.artifact_id == artifact_id))
+        if namespace is None:
+            logger.warning("Unknown document dead letter artifact_id=%s", artifact_id)
+            return True
         with self.engine.begin() as conn:
-            now = self.state.uploads._now(conn)
-            ids = list(conn.scalars(select(tasks.c.artifact_id).where(
-                tasks.c.status.in_(("queued", "processing")), tasks.c.lease_until <= now,
-                tasks.c.updated_at <= now - self.settings.lease_seconds
-            ).order_by(tasks.c.updated_at).limit(limit).with_for_update(skip_locked=True)))
-            for artifact_id in ids:
-                conn.execute(update(outbox).where(
-                    outbox.c.artifact_id == artifact_id, outbox.c.pending.is_(False)
-                ).values(pending=True, generation=outbox.c.generation + 1, retry_at=now))
-                conn.execute(update(tasks).where(tasks.c.artifact_id == artifact_id).values(updated_at=now))
-        return len(ids)
+            self.state.uploads._guard(conn, namespace)
+            row = self._row(conn, artifact_id)
+            if row["status"] in ("queued", "processing"):
+                self._finish(conn, row, "failed", "Message retry limit reached", stage="dead_letter")
+        self.flush(artifact_id)
+        logger.warning("Document dead letter finalized artifact_id=%s", artifact_id)
+        return True

@@ -122,6 +122,9 @@ class NamespaceEndpoint:
     def search(self, request):
         return self.runtime.search(self.namespace, asdict(request))
 
+    async def search_queued(self, request):
+        return await McpHttpEndpoint.search_queued(self, self.namespace, request)
+
     def get_search_result(self, result_id, *, page=1, page_size=10):
         return self.runtime.get_search_result(self.namespace, result_id, page=page, page_size=page_size)
 
@@ -317,6 +320,9 @@ class McpHttpEndpoint:
             def search(inner, request):
                 return self.runtime.search(namespace, asdict(request))
 
+            async def search_queued(inner, request):
+                return await self.search_queued(namespace, request)
+
             def get_search_result(inner, result_id, *, page=1, page_size=10):
                 return self.runtime.get_search_result(namespace, result_id, page=page, page_size=page_size)
 
@@ -324,6 +330,22 @@ class McpHttpEndpoint:
         if not callable(getattr(self.runtime, "get_search_result", None)):
             executor.get_search_result = None
         return create_registry(executor, self.catalogs.for_namespace(namespace), partial(self.mutate_document, namespace))
+
+    async def search_queued(self, namespace, request):
+        # Submission is durable even if the client disconnects during admission.
+        with anyio.CancelScope(shield=True):
+            submitted = await anyio.to_thread.run_sync(
+                self.runtime.submit_search, namespace, asdict(request.search))
+        result_id = submitted["result_id"]
+        if request.wait_seconds > 0:
+            with anyio.move_on_after(request.wait_seconds):
+                while True:
+                    payload = await anyio.to_thread.run_sync(
+                        self.runtime.get_search_result, namespace, result_id, abandon_on_cancel=True)
+                    if payload.get("status") != "queued":
+                        return payload
+                    await anyio.sleep(0.1)
+        return {"result_id": result_id}
 
     async def mutate_document(self, namespace, operation, request):
         if operation in ("add_document", "get_document_status"):

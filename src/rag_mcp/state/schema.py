@@ -269,6 +269,10 @@ document_task_outbox = Table(
     Column("pending", Boolean, nullable=False),
     Column("generation", BigInteger, nullable=False),
     Column("retry_at", Double, nullable=False),
+    Column("owner", _ci_string(32)),
+    Column("lease_until", Double, nullable=False, server_default="0"),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("last_error", Text),
     Index("ix_document_task_dispatch", "pending", "retry_at"),
     **_MYSQL_TABLE,
 )
@@ -276,3 +280,33 @@ document_task_outbox = Table(
 SOURCE_BUCKET = "source"
 PDF_ASSET_BUCKET = "pdf-assets"
 WORD_ASSET_BUCKET = "word-assets"
+
+search_tasks = Table(
+    "search_tasks", metadata,
+    Column("result_id", _ci_string(36), primary_key=True),
+    Column("namespace", _ci_string(64), nullable=False),
+    Column("arguments", _long_text(), nullable=False),
+    Column("status", _ci_string(24), nullable=False),
+    Column("stage", _ci_string(24), nullable=False),
+    Column("attempts", Integer, nullable=False),
+    Column("owner", _ci_string(32)),
+    Column("lease_until", Double, nullable=False),
+    Column("retry_at", Double, nullable=False),
+    Column("deadline", Double, nullable=False),
+    Column("created_at", Double, nullable=False),
+    Column("updated_at", Double, nullable=False),
+    Index("ix_search_tasks_deadline", "status", "deadline"),
+    Index("ix_search_tasks_recovery", "status", "lease_until", "updated_at"),
+    Index("ix_search_tasks_namespace", "namespace"),
+    **_MYSQL_TABLE,
+)
+
+search_task_outbox = Table(
+    "search_task_outbox", metadata,
+    Column("result_id", _ci_string(36), primary_key=True),
+    Column("pending", Boolean, nullable=False),
+    Column("generation", BigInteger, nullable=False),
+    Column("retry_at", Double, nullable=False),
+    Index("ix_search_task_dispatch", "pending", "retry_at"),
+    **_MYSQL_TABLE,
+)

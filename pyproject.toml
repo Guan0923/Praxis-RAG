@@ -52,6 +52,8 @@ rag-mcp-debug = "rag_mcp.debug:main"
 rag-mcp-ingest = "rag_mcp.ingest:main"
 rag-service = "rag_mcp.http_service:main"
 rag-document-worker = "rag_mcp.document_worker:main"
+rag-search-worker = "rag_mcp.search_worker:main"
+rag-dead-letter-worker = "rag_mcp.dead_letter_worker:main"
 rag-service-migrate = "rag_mcp.migrate:main"
 rag-state-migrate = "rag_mcp.state.migrate:main"
 

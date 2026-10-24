@@ -9,7 +9,9 @@
 
 ```text
 浏览器 ----------> http://127.0.0.1:8011/console
-MCP HTTP Client -> http://127.0.0.1:8011/mcp -> rag-service -> Qdrant :6333
+MCP HTTP Client -> http://127.0.0.1:8011/mcp -> rag-service
+MCP search: MySQL task/outbox -> RocketMQ -> rag-search-worker -> Qdrant :6333
+REST /v1/search / Console: rag-service -> Qdrant :6333（同步）
 ```
 
 RAG 只返回证据，不生成最终回答。是否调用、是否改写查询、是否多跳检索以及如何组织答案，仍由 Agent 决定。
@@ -28,13 +30,16 @@ uv sync --extra api
 uv tool install --editable ".[api,pdf]"
 ```
 
-从独立 Git 仓库直接安装：
+首次从 Git 获取源码时，先克隆到本地；构建产物不再提交到 Git，不能通过直接安装 Git URL 获得完整 Console：
 
 ```powershell
-uv tool install "praxis-rag[api,pdf] @ git+https://github.com/Guan0923/xinghe_rag.git"
+git clone https://github.com/Guan0923/xinghe_rag.git
+Set-Location .\xinghe_rag
 ```
 
-安装后，`rag-service`、`rag-document-worker`、`rag-mcp-debug`、`rag-mcp-ingest` 和 `rag-service-migrate` 都是独立命令。异步 MCP 文档队列还需要安装现有可选依赖 `[cache]`（包含 RocketMQ SDK），例如 `uv sync --extra api --extra cache`；独立工具安装时在 extras 中加入 `cache`。
+上述源码安装方式如需 Console，必须先按[前端开发与打包](#前端开发与打包)构建前端，再安装当前目录。仅使用 API/MCP 时不需要前端构建。
+
+安装后，`rag-service`、`rag-document-worker`、`rag-search-worker`、`rag-mcp-debug`、`rag-mcp-ingest` 和 `rag-service-migrate` 都是独立命令。异步 MCP 文档和搜索队列还需要安装现有可选依赖 `[cache]`（包含 RocketMQ SDK），例如 `uv sync --extra api --extra cache`；独立工具安装时在 extras 中加入 `cache`。
 
 以上本地安装命令在仓库根目录运行，需要先安装 uv。项目产品名为 Praxis-RAG，Python 分发包名为 `praxis-rag`；远程仓库地址以当前 Git 配置为准。内部 Python 模块仍为 `rag_mcp`，集合名和命令保留原值。服务配置与新数据使用下文的 `~/.praxis-rag/` 目录，已有知识库不自动迁移。下文开发和测试命令也默认从仓库根目录运行，前端命令另有说明。
 
@@ -81,7 +86,7 @@ $env:RAG_STATE_ENCRYPTION_KEY = "base64:<32-byte-key>"
 
 ### 3. 启动 RAG Service 和独立前端
 
-本地使用 Compose 时，直接执行 `.\scripts\start-stack.ps1`（不带 `-MigrateOnly`）会加载 `.env`、启动依赖、显式创建缓存刷新与文档入库的两组 RocketMQ topic/group、迁移旧状态并运行服务。脚本不会启动文档消费者；MCP 异步新增还需下面的独立 worker。手动配置环境变量时也可以直接执行：
+本地使用 Compose 时，直接执行 `.\scripts\start-stack.ps1`（不带 `-MigrateOnly`）会加载 `.env`、启动依赖、显式创建缓存刷新、文档入库与搜索的三组 RocketMQ topic/group、迁移旧状态并运行服务。脚本还显式创建可读的正常 Broker DLQ topic 和独立处理组，但不启动任何消费者，也不证明 SDK/Proxy DLQ 订阅可用；MCP 异步新增和搜索还需下面各自独立的 worker。手动配置环境变量时也可以直接执行：
 
 ```powershell
 rag-service
@@ -154,20 +159,79 @@ rag-document-worker --dispatch-only
 
 | 环境变量 | 默认值 / 作用 |
 | --- | --- |
-| `RAG_ROCKETMQ_ENDPOINT` | Compose 为 `127.0.0.1:8081`；缓存和文档共用连接 |
+| `RAG_ROCKETMQ_ENDPOINT` | Compose 为 `127.0.0.1:8081`；缓存、文档和搜索共用连接 |
 | `RAG_ROCKETMQ_NAMESPACE` | 可选 RocketMQ namespace，与知识库 namespace 不同 |
 | `RAG_ROCKETMQ_ACCESS_KEY` / `RAG_ROCKETMQ_SECRET_KEY` | 可选凭据，仅从环境提供 |
 | `RAG_ROCKETMQ_TLS` | `false`；共享 TLS 开关 |
 | `RAG_ROCKETMQ_TOPIC` / `RAG_ROCKETMQ_GROUP` | 原缓存刷新队列，保持不变 |
 | `RAG_DOCUMENT_TOPIC` | `praxis_document_ingest` |
 | `RAG_DOCUMENT_GROUP` | `praxis_document_ingest_workers` |
-| `RAG_DOCUMENT_MAX_ATTEMPTS` | `3`；文档任务最大尝试次数 |
-| `RAG_DOCUMENT_LEASE_SECONDS` | `120`；文档任务租约秒数 |
-| `RAG_DOCUMENT_RETRY_SECONDS` | `10`；文档任务重试退避基数，乘以已尝试次数 |
+| `RAG_DOCUMENT_BROKER_MAX_RETRIES` | `16`；仅供部署脚本 `updateSubGroup -r` 使用，非 Python 运行时设置 |
+| `RAG_DOCUMENT_DLQ_GROUP` | `praxis_document_dead_letters`；独立死信处理消费组，不是死信 topic |
+| `RAG_DOCUMENT_DISPATCH_LEASE_SECONDS` | `30`；可选，outbox 投递认领租约秒数 |
+| `RAG_DOCUMENT_DISPATCH_RETRY_SECONDS` | `2`；可选，投递指数退避基数秒数，带随机抖动 |
+| `RAG_DOCUMENT_DISPATCH_MAX_RETRY_SECONDS` | `300`；可选，投递退避上限秒数，不是最大重试次数 |
+| `RAG_DOCUMENT_DISPATCH_ALERT_SECONDS` | `300`；可选，持续投递故障告警间隔秒数 |
 
-升级时新增 `document_tasks` 和 `document_task_outbox` 两张表。默认自动建表；若关闭 `RAG_STATE_AUTO_SCHEMA`，先由部署账号调用共享 schema 的 `metadata.create_all(engine)` 创建缺失表，再启动服务。排队任务记录知识库配置版本，消费前或发布时配置已经改变会拒绝发布，需要按新配置重新提交。
+升级时需要 `document_tasks` 和 `document_task_outbox` 两张表；已有 outbox 增加 `owner`、`lease_until`、`attempts`、`last_error` 字段。默认自动建表并运行该 outbox 的增量迁移；若关闭 `RAG_STATE_AUTO_SCHEMA`，先由有 DDL 权限的部署账号调用共享 schema 的 `metadata.create_all(engine)` 创建缺失表，并显式调用状态存储后端的 `migrate_document_outbox()` 迁移已有 outbox，再启动 API/relay/worker。仅调用 `create_all` 不会补齐已有表字段。排队任务记录知识库配置版本，消费前或发布时配置已经改变会拒绝发布，需要按新配置重新提交。
 
-本地 Broker 的 `autoCreateTopicEnable` 和 `autoCreateSubscriptionGroup` 都为 `false`。启动脚本沿用 `mqadmin updatetopic` 和 `mqadmin updateSubGroup`，显式创建缓存与文档两组资源，全部成功才继续启动服务。生产部署或手动启动时也必须预先创建两组 topic/group，并确保连接凭据具有相应权限。
+缺少 MQ 配置不会阻止 `add_document` 将上传接收到 MySQL，但不会开始解析/索引。请在处理前配置并启动 relay 和文档消费者。relay 使用短 SQL 事务认领 owner/租约及投递 generation，在事务外连接和发送 MQ；仅匹配认领者及 generation 的确认才能更新 outbox，避免过期投递覆盖新的投递状态。投递尝试次数、下次重试时间 `retry_at` 和脱敏后的 `last_error` 持久化到 SQL。单条发送失败不阻塞其他任务；连接故障使用带抖动的指数退避和警告日志，不忙循环。首次投递失败不会消耗 Broker 消费重试次数、使文档任务终止或清理待投递上传，文档任务无限期保留等待恢复。恢复只重领过期的首次投递 outbox，不抢占有效 producer 租约；已确认投递的消息不由 SQL 重新调度消费。`RAG_DOCUMENT_DISPATCH_*` 是 producer 首发协调，不是任务执行所有权或 Broker 重试设置。
+
+本地 Broker 的 `autoCreateTopicEnable` 和 `autoCreateSubscriptionGroup` 都为 `false`。启动脚本沿用 `mqadmin updatetopic` 和 `mqadmin updateSubGroup` 循环，保留缓存、文档和搜索三组正常 topic/group。生产部署或手动启动也需预建资源并配置权限；死信读取还需下述独立处理组及可读 DLQ topic，不能依赖自动创建。
+
+### 5. 启动独立搜索 worker（服务端 MCP search 必需）
+
+**已有安装升级后也必须启动搜索消费者，否则 MCP 搜索会保持排队，直至任务截止时间后报错。** 服务端 MCP 搜索不再由 API 进程执行；REST `/v1/search`、Console 和本地同步调试路径保持同步，不需要搜索消费者。
+
+先在另一个终端或进程管理器中配置与 API 相同的 MySQL（或 `RAG_STATE_URL`）、Redis、RocketMQ、Qdrant 和 `RAG_STATE_ENCRYPTION_KEY`。不要假设新终端会继承启动脚本加载的环境；也不要为 worker 使用独立数据库或不同模型配置。
+
+```powershell
+rag-search-worker
+```
+
+每个进程默认顺序执行搜索，可启动多个独立进程扩容，使用同一搜索 topic/group。文档和搜索使用独立 topic/group，分别运行消费者，不互相抢占消息。只需补发搜索 outbox 时运行：
+
+```powershell
+rag-search-worker --dispatch-only
+```
+
+`--dispatch-only` 只运行 relay，不执行检索，不能替代消费者。API 也运行轻量搜索 outbox relay。提交时先将参数、任务和 outbox 持久化到 MySQL，由 relay 发送仅携带 `result_id` 的 RocketMQ 消息；搜索参数不存入 Redis 或 MQ，任务状态以 SQL 为权威，不使用 Redis 状态缓存。
+
+| 环境变量 | 默认值 / 作用 |
+| --- | --- |
+| `RAG_SEARCH_TOPIC` | `praxis_search`；与缓存、文档 topic 独立 |
+| `RAG_SEARCH_GROUP` | `praxis_search_workers`；独立搜索消费组 |
+| `RAG_SEARCH_TIMEOUT_SECONDS` | `120`；任务总超时，包含排队等待 |
+| `RAG_SEARCH_BROKER_MAX_RETRIES` | `16`；仅供部署脚本 `updateSubGroup -r` 使用，非 Python 运行时设置 |
+| `RAG_SEARCH_DLQ_GROUP` | `praxis_search_dead_letters`；独立死信处理消费组 |
+| `RAG_RESULT_TTL_SECONDS` | `3600`；完成结果快照的有效期，与任务超时不同 |
+
+任务超时不是调用端的 `wait_seconds`（默认 10 秒）：后者只决定本次调用等待多久，不延长任务截止时间。生产检索在子进程中执行；MQ 可见性续期失败不承诺立即取消该进程或已发出的下游调用。升级时需创建搜索任务/outbox 表；默认自动建表，关闭 `RAG_STATE_AUTO_SCHEMA` 时先部署共享 schema 的新增表，再启动 API 和 worker。完成结果写入 MySQL，Redis 仅缓存快照；Redis 未启用或故障时仍可回源 SQL 读取，不重新检索。
+
+### Broker 消费与死信处理
+
+MySQL 保存文件/查询参数、业务状态和首次投递 outbox；**Broker 管理消费重试、消息不可见期（invisible）及 DLQ**。SQL 任务不承担消费租约、heartbeat、最大尝试次数或消费重投调度。旧版文档/搜索消费租约、尝试次数及重试间隔配置仅为兼容旧配置解析而保留在 allowlist，已弃用且运行时忽略，不能据此调整 Broker 行为；不再使用 `DocumentTaskSettings`。数据库中的旧消费租约等字段保留但不参与执行控制，无破坏性删列迁移。不要用 outbox 首次投递的 owner/租约/退避代替 Broker 消费控制，也不要把已确认投递的 outbox 重置来实现消费重试。
+
+- 临时故障：不 ACK，由 Broker 负责重试；业务展示可记录等待重试，但不是 SQL 定时器驱动的重投。
+- 确定性故障：先提交 SQL 失败终态，再 ACK；成功也先持久化业务终态/结果，再 ACK。
+- 终态更新遵循 **first-terminal-wins**，重复消息或迟到的执行不能覆盖已有终态；读取到已提交终态后可直接尝试 ACK。
+- MQ visibility 续期失败只作有界重试，不承诺立即取消已开始的工作。即使续期失败，只要 SQL 终态已提交仍尝试 ACK；ACK 失败或重复投递仍可能发生。
+- UploadJournal 的每文档/名称业务租约及其自身 SQL heartbeat、fenced 版本提交检查、补偿与恢复机制保留；移除的是 SQL **任务** heartbeat，不是所有文档 SQL heartbeat。这些控制保障业务版本一致性，**不是 Broker retry 或消费执行所有权**；Broker 是唯一消费重试调度者。
+
+正常源消费组默认最大重试为 **16**，与既有 `mqadmin updateSubGroup -r 16` 一致。可用 `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_SEARCH_BROKER_MAX_RETRIES` 在资源部署时覆盖；Python API/worker 不解析这两个变量。缓存 topic/group 及其设置保持不变。
+
+计划提供独立、无模型/推理的死信处理 CLI（需对应实现后部署；传输层已验证 Python SDK 5.1.2 / Apache Broker 5.3.3 正常 DLQ 读取和 ACK）：
+
+```powershell
+rag-dead-letter-worker --kind document
+rag-dead-letter-worker --kind search
+```
+
+它读取 SQL 业务状态，将尚未终结的任务标记失败，提交后 ACK；已有终态不覆盖，不重新解析、检索或重跑模型。两个处理组分别配置为 `RAG_DOCUMENT_DLQ_GROUP=praxis_document_dead_letters`、`RAG_SEARCH_DLQ_GROUP=praxis_search_dead_letters`，不能与正常源消费组共用。
+
+**正常 Broker DLQ topic 是 `%DLQ%<源消费组>`**：默认分别为 `%DLQ%praxis_document_ingest_workers` 和 `%DLQ%praxis_search_workers`，不是自定义失败 topic，也不是 `%DLQ%<死信处理组>`。需显式建立独立处理组，确保 DLQ topic 可读（RocketMQ topic permission 至少包含读位 `4`；正常读写为 `6`），并为连接身份授予这些 topic 的读取、处理组订阅和 ACK 权限。Broker 自动创建关闭时不能省略资源部署。启动脚本用 `updatetopic -p 6 -r 1 -w 1` 显式保留 Broker 写入并开启读取，再创建独立处理组；这不替代生产 ACL。传输层已用独立临时资源验证 Python SDK 5.1.2 / Apache Broker 5.3.3：正常消息未 ACK，经 Broker 重试耗尽后进入 `%DLQ%<源消费组>`，独立处理组收到原消息并成功 ACK。此结论不自动覆盖其他 SDK/Proxy/Broker 版本；更换部署组合须重新验证，不能仅凭资源已创建便宣称订阅可用。
+
+DLQ 名称必须从 **Broker 实际源消费组名** 推导。若源组显式为 `ns%group`，对应 topic 是 `%DLQ%ns%group`，不是 `ns%%DLQ%group`。不要假设 `RAG_ROCKETMQ_NAMESPACE` 的 SDK metadata 会自动映射为物理资源前缀；传输层还验证了显式物理源组 `probe_ns%<group>` 对应 `%DLQ%probe_ns%<group>` 的直接接收及 ACK；适配器在接收请求中保留物理 topic，并在 ACK 前恢复 Broker 响应中可能被去掉的物理前缀。此验证不代表 metadata-only namespace 隔离成立；其他部署仍需验证 SDK/Proxy 映射。
 
 ### 知识库模型配置
 
@@ -196,20 +260,26 @@ $env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
 
 Console 使用 React、TypeScript 和 Ant Design，提供浅色与深色主题。主题和 Namespace 保存在当前浏览器；Service Token 仅保存在当前会话，MCP 配置示例不会显示真实 Token。
 
-Console 正常运行只需启动 `rag-service`，通过 `/console` 打开页面，不需要 Node.js 或额外前端进程；MCP 异步新增另需独立 `rag-document-worker`。仓库中的 `src/rag_mcp/web/` 是随 Python 包交付的构建文件，修改界面请编辑 `frontend/src/`，不要手动修改构建文件。
+Console 正常运行只需启动 `rag-service`，通过 `/console` 打开页面，不需要 Node.js 或额外前端进程；服务端 MCP 搜索另需 `rag-search-worker`，MCP 异步新增另需 `rag-document-worker`。`src/rag_mcp/web/` 是自动生成并随 Python 包交付的构建目录，已由 `.gitignore` 忽略，不再提交到 Git。修改界面请编辑 `frontend/src/`，不要手动修改构建文件。
+
+首次克隆源码、修改前端后，或安装/打包 Python 包前，在仓库根目录执行（需要 Node.js 22.12+）：
 
 ```powershell
-conda activate dev
-cd frontend
-npm ci
-npm run build
+Push-Location .\frontend
+try {
+    npm ci
+    npm run build
+} finally {
+    Pop-Location
+}
 ```
 
-构建会替换 `src/rag_mcp/web/` 中的旧文件；发布或打包 Python 包前，必须一起包含新的构建结果。仅开发时需要 Node.js 22.12+。
+构建会先清空 `src/rag_mcp/web/` 再写入当前版本，避免多份哈希文件积累。构建成功后再运行上文的本地安装命令，或打包 Python 分发包；现有 package-data 配置会将生成的页面、JS、CSS 和 PDF.js 资源包含在包中。只做 `git pull` 不会更新本机构建目录，更新源码后需重新构建。未构建的全新源码目录不提供 `/console`，但仍可使用 API/MCP。运行已包含构建资源的安装包不需要 Node.js。
 
 需要热更新时，可以单独运行开发服务器：
 
 ```powershell
+Set-Location .\frontend
 $env:RAG_DEV_API = "http://127.0.0.1:8011"
 npm run dev
 ```
@@ -318,9 +388,33 @@ MCP 客户端使用以下连接信息：
 Authorization: Bearer <RAG_SERVICE_TOKEN>
 ```
 
-客户端可使用 MCP `2025-11-25` 或 `2026-07-28` 的 Streamable HTTP 传输。旧版先初始化，新版可发现服务或直接调用；具体流程见后面的“双版本”章节。取消调用只结束等待，不会强制终止已经进入模型或 Qdrant 的同步计算。
+客户端可使用 MCP `2025-11-25` 或 `2026-07-28` 的 Streamable HTTP 传输。旧版先初始化，新版可发现服务或直接调用；具体流程见后面的“双版本”章节。取消调用只结束等待，不撤销已提交的搜索任务；任务截止时间仍有效，MQ 可见性续期失败不保证立即取消生产检索或下游调用。其他已进入模型或 Qdrant 的同步计算不因取消调用而强制终止。
 
-MCP 提供 `search`、文件管理、`get_document_status` 等工具。若 Host 使用 `rag` 作为 server 名，搜索工具展示名通常是 `mcp_rag_search`。
+MCP 提供 `search`、`get_search_result`、文件管理、`get_document_status` 等工具。若 Host 使用 `rag` 作为 server 名，搜索工具展示名通常是 `mcp_rag_search`。
+
+### MCP 搜索与结果轮询
+
+以下队列语义仅适用于服务端 MCP `search`，REST `/v1/search`、Console 和本地同步调试行为不变。`search` 保留原检索参数，并接受 `wait_seconds`：必须是有限数值（可为小数），范围 0..30，默认 10；字符串、布尔值、NaN、无穷及越界值不是合法等待秒数。
+
+搜索提交到 MySQL 任务/outbox，由 RocketMQ 搜索消费者执行。`search` 在 MySQL 任务及 outbox 持久化接收后即可返回 UUID，**不等待 Broker 发送确认**；API relay 异步投递，不会因等待 MQ 启动或确认而阻塞 `wait_seconds` 的完成等待窗口。队列故障期间任务保持排队，恢复后可继续投递；到达任务截止时间则报错。每次提交生成独立任务 UUID，始终作为 `result_id` 使用。若在 `wait_seconds` 内完成，返回原完整搜索 payload，加上同一 `result_id` 及快照引用；否则返回对象**只有** ID，没有 `status`、空结果或占位快照：
+
+```json
+{"result_id": "6cec23f3-0452-4289-a1b5-b18c018d0634"}
+```
+
+继续调用**现有**工具 `get_search_result`，不新增第二个查询工具；参数为 `result_id`、可选 `page`（从 1 开始）和 `page_size`（1..100）。未完成时返回：
+
+```json
+{
+  "result_id": "6cec23f3-0452-4289-a1b5-b18c018d0634",
+  "status": "queued",
+  "stage": "processing"
+}
+```
+
+待执行、执行中和等待重试的 `status` 均为 `queued`，以 `stage="queued" | "processing" | "retry_wait"` 区分。成功后返回已保存的完整结果快照（指定分页时仅切片原结果），沿用原有图片渲染，不重新执行检索/模型。执行最终失败、任务截止时间到达或结果快照过期均为明确 MCP 错误（`isError=true`），不是成功的空结果；跨 namespace 或无权限也不能读取。
+
+`wait_seconds=0` 可不等待完成便取回 ID；等待结束不等于任务失败，也不延长默认 120 秒的任务总超时（包含排队等待）。没有搜索消费者的已有部署会一直排队至截止时间，必须单独运行 `rag-search-worker`，仅运行 `--dispatch-only` 不够。完成快照默认保留 3600 秒，MySQL 持久保存，Redis 故障回源 SQL；这与任务截止时间是两个独立期限。
 
 ### MCP 文件管理
 
@@ -341,19 +435,19 @@ MCP 提供 `search`、文件管理、`get_document_status` 等工具。若 Host 
 
 #### 异步新增与状态轮询
 
-`add_document` 先将不可变原始字节、任务及 outbox 持久化到 MySQL，再等待 RocketMQ 发送确认；成功的工具结果**只有**以下对象，不含 `status`、文档或 URI：
+`add_document` 在一个 MySQL 事务（T1）中持久化不可变原始字节、任务及 outbox，提交成功后立即返回，不连接或发送 RocketMQ，也不等待 Redis 刷新。后台 relay 独立负责投递；成功的工具结果**只有**以下对象，不含 `status`、文档或 URI：
 
 ```json
 {"artifact_id": "123e4567-e89b-42d3-a456-426614174000"}
 ```
 
-此 UUID 表示已接收（accepted），不是已经解析、索引或可检索（indexed）。独立 worker 才负责解析、切分、索引与发布；尚未启动消费者时任务可以保持 `queued`。客户端在同一 namespace 调用 `get_document_status`，按需间隔轮询，直到终态：
+此 UUID 仅表示 MySQL 已持久接收（accepted），不是 Broker 已确认投递，也不是已经解析、索引或可检索（indexed）。未配置 MQ、队列故障或尚未启动消费者时仍可接收，任务保持 `queued`；处理前必须配置 relay、队列和独立文档消费者。独立 worker 才负责解析、切分、索引与发布。客户端在同一 namespace 调用 `get_document_status`，按需间隔轮询，直到终态：
 
 ```json
 {"artifact_id": "123e4567-e89b-42d3-a456-426614174000"}
 ```
 
-状态结果包含以下字段（`stage` 为当前阶段，以下阶段文字仅为示意，不是固定枚举；`error` 为失败信息）：
+状态结果包含以下字段（`stage` 为当前阶段，示例中的处理阶段文字仅为占位；排队阶段见下文；`error` 为失败信息）：
 
 ```json
 {
@@ -364,9 +458,11 @@ MCP 提供 `search`、文件管理、`get_document_status` 等工具。若 Host 
 }
 ```
 
-`status` 为 `queued`、`processing`、`succeeded` 或 `failed`；仅 `succeeded` 表示完成索引发布，此时刷新文档列表/资源列表再读取正文或检索。`failed` 时查看 `stage`、`error` 排查，不要把收到 UUID 当成索引成功。状态展示使用 Redis 缓存，未命中、未配置或不可用时回源 MySQL；缓存可能短暂滞后，MySQL 才是任务、租约和发布权威。
+`status` 为 `queued`、`processing`、`succeeded` 或 `failed`；仅 `succeeded` 表示完成索引发布，此时刷新文档列表/资源列表再读取正文或检索。`failed` 时查看 `stage`、`error` 排查，不要把收到 UUID 当成索引成功。状态展示使用 Redis 缓存，未命中、未配置或不可用时回源 MySQL；缓存可能短暂滞后，MySQL 才是业务任务、上传事务租约和版本发布权威；消息不可见期及消费重试由 Broker 管理。
 
-队列故障、发送确认超时或客户端断线时，调用失败不一定意味着未提交：MySQL 中可能已有字节、任务和待补发 outbox，API 自带 relay 或 `--dispatch-only` 可继续补发。不要换 key 盲目重复新增；从首次调用起提供 `idempotency_key`，对同一次提交使用相同 key 和完全相同的参数/内容重试，以找回同一任务。新内容使用新 key。
+排队时 `status` 始终为 `queued`：`stage="dispatch_wait"` 表示等待首次投递，`dispatch_retry` 表示投递失败后等待后台重试，`queued` 表示已投递、等待消费。投递故障按持久化的 `attempts`、`retry_at`、脱敏 `last_error` 进行带抖动的指数退避，并输出节流告警；不会仅因投递失败变为 `failed` 或过期删除，单条故障也不阻塞其他任务。relay 重启后继续首次投递，仅恢复过期 outbox 投递认领；已确认发送后由 Broker 负责重投。
+
+队列故障或发送确认超时发生在后台，不会令已提交的新增请求失败。客户端断线、响应丢失或数据库提交结果不明确时，调用失败仍不一定意味着未接收：MySQL 中可能已有字节、任务和待补发 outbox。不要换 key 盲目重复新增；从首次调用起提供 `idempotency_key`，对同一次提交使用相同 key 和完全相同的参数/内容重试，以找回同一 `artifact_id`。已收到 UUID 时只需查询状态，不必为投递故障重新提交；新内容使用新 key。
 
 这里的上传 `artifact_id` 用于 `get_document_status`，不是搜索快照的 `artifact_id`，不能直接用于 `rag://artifacts` 或 `/v1/artifacts` 读取。上传原始字节持久保留在 MySQL，**无上传 TTL**，不随 Redis 状态缓存或搜索结果引用过期自动清理；部署时为持续增长的数据安排容量、备份和保留策略。worker 在独立进程提交后，API **不会自动推送 MCP 资源变更通知**；客户端必须轮询状态并主动刷新 `resources/list` 或文档列表，不能依赖订阅确认入库。
 
@@ -523,14 +619,14 @@ HTTP MCP 注册搜索、文件管理及 `get_document_status` 等工具；本地
 - 重排仅支持 `none`（不重排）与 `cross_encoder`（调用配置的 Reranker API）。
 - Console 会同时展示 Cross Encoder 最终分数和重排前的 `retrieval_score`；请求失败时会清空旧结果并保留错误面板。
 - 推理服务离线、认证失败或返回格式不兼容时明确报错；可选择“不重排”验证不依赖 Reranker 的召回流程。
-- HTTP/Console 上传及 MCP 更新、删除仍为同步请求，大文件索引期间网页会等待；仅 MCP `add_document` 为异步，需独立 worker 和状态轮询。
+- HTTP/Console 上传及 MCP 更新、删除仍为同步请求，大文件索引期间网页会等待；MCP `add_document` 和服务端 MCP `search` 使用各自独立 worker 与状态/结果轮询，REST 搜索及本地同步调试不变。
 - Console 用于本地开发调试，不提供账户系统或细粒度多用户权限。
 
 历史阶段和变更记录见 [PROGRESS.md](../PROGRESS.md)。
 
 ## 第一批 Redis 缓存
 
-Compose 包含 Redis 和 RocketMQ。安装可选队列 SDK：`pip install -e ".[cache]"`，使用启动脚本会创建缓存刷新和文档入库的两组 topic/group，并加载本地环境变量（不启动文档消费者）。直接启动 rag-service 时自行设置 RAG_REDIS_URL 和 RAG_ROCKETMQ_ENDPOINT；不配置 Redis 默认保持原有 MySQL 读取。命中缓存不查 MySQL；执行鉴权/租约和上传发布校验不使用缓存。详见 [状态缓存与可靠刷新](state-cache.md)。
+Compose 包含 Redis 和 RocketMQ。安装可选队列 SDK：`pip install -e ".[cache]"`，使用启动脚本会创建缓存刷新、文档入库和搜索的三组正常 topic/group，以及可读正常 Broker DLQ topic 和独立处理组，并加载本地环境变量（不启动任何消费者）。直接启动 rag-service 时自行设置 RAG_REDIS_URL 和 RAG_ROCKETMQ_ENDPOINT；不配置 Redis 默认保持原有 MySQL 读取。命中缓存不查 MySQL；执行鉴权、上传事务租约和版本发布校验不使用缓存。详见 [状态缓存与可靠刷新](state-cache.md)。
 
 ## 第二批状态缓存（严格模式）
 
@@ -538,4 +634,4 @@ API Key 管理列表、发布版本展示、租约执行者展示和事务/步�
 
 ## 按 UUID 复用搜索与产物
 
-search 响应保留原 results，并新增 result_id、expires_at 和 artifacts。MCP get_search_result 或 GET /v1/search-results/{result_id} 可在 1 小时内读取原快照；rag://artifacts 资源或 /v1/artifacts/{artifact_id} 获取源文件、图片、JSON、Markdown 等。不重新执行模型或检索。文档删除为 del_flag 软删除，不影响已签发 UUID；鉴权仍检查当前 Key 权限。详见 [UUID 结果与产物引用](result-references.md)。
+搜索完成响应保留原 results，并新增 result_id、expires_at 和 artifacts；服务端 MCP `search` 等待未完成时仅返回 result_id，通过现有 `get_search_result` 轮询。MCP get_search_result 或 GET /v1/search-results/{result_id} 可在完成快照默认 1 小时的有效期内读取；REST 结果接口不提供 MCP 排队状态。rag://artifacts 资源或 /v1/artifacts/{artifact_id} 获取源文件、图片、JSON、Markdown 等。不重新执行模型或检索。文档删除为 del_flag 软删除，不影响已签发 UUID；鉴权仍检查当前 Key 权限。详见 [UUID 结果与产物引用](result-references.md)。

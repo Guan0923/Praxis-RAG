@@ -20,7 +20,7 @@ class SearchReferences:
     def __init__(self, state):
         self.state = state
 
-    def capture(self, namespace, payload):
+    def capture(self, namespace, payload, *, save_snapshot=True):
         snapshots = self.state.results
         created = time.time()
         expires = created + snapshots.settings.ttl_seconds
@@ -128,6 +128,8 @@ class SearchReferences:
                                      "max_bytes": snapshots.settings.max_artifact_bytes}
         if artifact_errors:
             result["artifact_warning"] = "Some artifact references could not be stored"
+        if not save_snapshot:
+            return result
         try:
             return snapshots.save(namespace, result, result_id=str(uuid4()), created_at=created)
         except SnapshotUnavailable:

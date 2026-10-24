@@ -43,17 +43,37 @@ def test_document_worker_settings_can_be_loaded_from_config(tmp_path, monkeypatc
     path.write_text('''[environment]
 RAG_DOCUMENT_TOPIC = "documents"
 RAG_DOCUMENT_GROUP = "document_workers"
-RAG_DOCUMENT_MAX_ATTEMPTS = "5"
-RAG_DOCUMENT_LEASE_SECONDS = "180"
-RAG_DOCUMENT_RETRY_SECONDS = "20"
+RAG_DOCUMENT_DLQ_GROUP = "document_workers_dlq"
+RAG_DOCUMENT_DISPATCH_LEASE_SECONDS = "40"
+RAG_DOCUMENT_DISPATCH_RETRY_SECONDS = "3"
+RAG_DOCUMENT_DISPATCH_MAX_RETRY_SECONDS = "180"
+RAG_DOCUMENT_DISPATCH_ALERT_SECONDS = "90"
 ''', encoding="utf-8")
     monkeypatch.setattr(os, "environ", {"RAG_CONFIG_FILE": str(path)})
     load_service_config()
-    from rag_mcp.state.document_tasks import DocumentTaskSettings
-
-    settings = DocumentTaskSettings.from_env()
-    assert (settings.max_attempts, settings.lease_seconds, settings.retry_seconds) == (5, 180, 20)
     assert os.environ["RAG_DOCUMENT_TOPIC"] == "documents"
+    assert os.environ["RAG_DOCUMENT_GROUP"] == "document_workers"
+    assert os.environ["RAG_DOCUMENT_DLQ_GROUP"] == "document_workers_dlq"
+    from rag_mcp.state.document_tasks import DocumentDispatchSettings
+
+    dispatch = DocumentDispatchSettings.from_env()
+    assert (dispatch.lease_seconds, dispatch.retry_seconds, dispatch.max_retry_seconds, dispatch.alert_seconds) == (40, 3, 180, 90)
+
+
+def test_search_worker_settings_can_be_loaded_from_config(tmp_path, monkeypatch):
+    path = tmp_path / "config.toml"
+    path.write_text('''[environment]
+RAG_SEARCH_TOPIC = "searches"
+RAG_SEARCH_GROUP = "search_workers"
+RAG_SEARCH_DLQ_GROUP = "search_workers_dlq"
+RAG_SEARCH_TIMEOUT_SECONDS = "90"
+''', encoding="utf-8")
+    monkeypatch.setattr(os, "environ", {"RAG_CONFIG_FILE": str(path)})
+    load_service_config()
+    assert os.environ["RAG_SEARCH_TOPIC"] == "searches"
+    assert os.environ["RAG_SEARCH_GROUP"] == "search_workers"
+    assert os.environ["RAG_SEARCH_DLQ_GROUP"] == "search_workers_dlq"
+    assert os.environ["RAG_SEARCH_TIMEOUT_SECONDS"] == "90"
 
 
 def test_real_service_reads_config_and_environment_override(tmp_path):

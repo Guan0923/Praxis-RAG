@@ -24,6 +24,10 @@ class StateConflict(StateError):
     """Raised when a unique key already exists."""
 
 
+class PublicationRejected(StateError):
+    """Publication did not reach COMMIT and its transaction was rolled back."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -232,6 +236,40 @@ class KnowledgeBaseRepository:
                 raise LookupError("知识库不存在")
         if self.cache_sync:
             self.cache_sync.flush_pending(keys=knowledge_keys(settings["namespace"]))
+
+    def publish(self, settings: dict, *, expected_version: int, journal, token) -> None:
+        """Fence the switch in SQL; errors during COMMIT deliberately remain uncertain."""
+        with self.engine.connect() as conn:
+            transaction = conn.begin()
+            try:
+                if token["namespace"] != settings["namespace"] or token["resource"] != "namespace:exclusive":
+                    raise StateConflict("Knowledge-base publication requires its namespace lease")
+                journal.assert_lock(token, conn)
+                touch(conn, *knowledge_keys(settings["namespace"]))
+                current = conn.execute(select(knowledge_bases.c.version).where(
+                    knowledge_bases.c.namespace == settings["namespace"]).with_for_update()).scalar()
+                if current != expected_version:
+                    raise StateConflict("Knowledge-base configuration changed; retry with refreshed settings")
+                changed = conn.execute(update(knowledge_bases).where(
+                    knowledge_bases.c.namespace == settings["namespace"],
+                    knowledge_bases.c.version == expected_version,
+                ).values(settings=_json(settings), collection=settings["collection"],
+                         version=knowledge_bases.c.version + 1, updated_at=_now())).rowcount
+                if changed != 1:
+                    raise StateConflict("Knowledge-base configuration changed; retry with refreshed settings")
+                journal.assert_lock(token, conn)
+            except Exception as exc:
+                transaction.rollback()
+                raise PublicationRejected("Knowledge-base publication was rolled back") from exc
+            transaction.commit()
+
+    def confirm_publication(self, namespace: str, settings: dict, *, expected_version: int, journal) -> bool:
+        """Use a locking current read, never a stale snapshot, to confirm an uncertain COMMIT."""
+        with self.engine.begin() as conn:
+            journal._guard(conn, namespace)
+            row = conn.execute(select(knowledge_bases.c.settings, knowledge_bases.c.version).where(
+                knowledge_bases.c.namespace == namespace).with_for_update()).first()
+            return bool(row and row.version == expected_version + 1 and _object(row.settings) == settings)
 
     def snapshot(self, namespace: str):
         with self.engine.connect() as conn:

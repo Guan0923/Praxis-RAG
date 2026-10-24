@@ -142,7 +142,7 @@ finally:
         runtime.close()
 
 
-def test_mysql_concurrent_claim_has_one_owner(tmp_path, monkeypatch):
+def test_mysql_duplicate_claims_allowed_but_publication_is_first_terminal_wins(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
 
     url = os.environ["RAG_TEST_DOCUMENT_MYSQL_URL"]
@@ -163,8 +163,34 @@ def test_mysql_concurrent_claim_has_one_owner(tmp_path, monkeypatch):
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(claim, instance.document_tasks) for instance in (state, other)]
-            owners = [future.result(timeout=10) for future in futures]
-        assert sum(item is not None for item in owners) == 1
+            claims = [future.result(timeout=10) for future in futures]
+        assert all(item is not None for item in claims)
+        assert claims[0]["execution_id"] != claims[1]["execution_id"]
+        from sqlalchemy import select
+
+        from rag_mcp.state.schema import document_tasks
+        from rag_mcp.state.uploads import UploadConflict
+
+        with state.engine.connect() as conn:
+            row = conn.execute(select(document_tasks).where(
+                document_tasks.c.artifact_id == artifact_id)).mappings().one()
+        assert row["owner"] is None and row["lease_until"] == 0 and row["attempts"] == 0
+        barrier = threading.Barrier(2)
+
+        def publish(instance, task):
+            barrier.wait()
+            try:
+                with instance.engine.begin() as conn:
+                    instance.document_tasks.succeed(conn, task)
+            except UploadConflict:
+                return False
+            return True
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(publish, instance, task)
+                       for instance, task in zip((state, other), claims)]
+            assert sum(future.result(timeout=10) for future in futures) == 1
+        assert state.document_tasks.status(namespace, artifact_id)["status"] == "succeeded"
     finally:
         other.close()
         state.close()

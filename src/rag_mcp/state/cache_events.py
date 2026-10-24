@@ -13,7 +13,7 @@ from .schema import cache_outbox, cache_revisions
 
 KINDS = frozenset({
     "kb_public", "kb_list", "documents", "catalog", "api_keys", "heads",
-    "leases", "upload_status", "upload_list", "document_status",
+    "leases", "upload_status", "upload_list", "document_status", "search_status",
 })
 
 

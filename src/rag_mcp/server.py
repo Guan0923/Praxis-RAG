@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
 import sys
 from collections.abc import Awaitable, Callable, Mapping
@@ -108,9 +109,28 @@ SEARCH_TOOL_SCHEMA: dict[str, object] = {
 }
 
 
-def search_tool_definition() -> types.Tool:
-    """Describe the stable action space exposed to MCP clients."""
+@dataclass(frozen=True)
+class QueuedSearchRequest:
+    search: SearchRequest
+    wait_seconds: float = 10
 
+    @classmethod
+    def from_arguments(cls, arguments):
+        values = dict(arguments)
+        wait = values.pop("wait_seconds", 10)
+        if type(wait) not in (int, float) or not math.isfinite(wait) or not 0 <= wait <= 30:
+            raise SearchValidationError("wait_seconds must be a finite number between 0 and 30")
+        return cls(SearchRequest.from_arguments(values), float(wait))
+
+
+def search_tool_definition(*, queued: bool = False) -> types.Tool:
+    """Describe the stable action space exposed to MCP clients."""
+    schema = SEARCH_TOOL_SCHEMA
+    if queued:
+        schema = {**schema, "properties": {**schema["properties"], "wait_seconds": {
+            "type": "number", "minimum": 0, "maximum": 30, "default": 10,
+            "description": "Maximum seconds to wait for this call (not the task deadline). Use 0 to enqueue without waiting.",
+        }}}
     return types.Tool(
         name="search",
         description=(
@@ -119,8 +139,11 @@ def search_tool_definition() -> types.Tool:
             "for exact codes/names and embedding for semantic paraphrases. Cite returned source and chunk_id. "
             "If evidence_status is no_evidence, rewrite the query once when useful, otherwise say the knowledge "
             "base is insufficient. Do not use this tool for greetings or unrelated general tasks."
+            + (" Searches are queued. Set wait_seconds (0..30, default 10). If only result_id is returned, "
+               "poll get_search_result with that UUID; status queued means still waiting or processing. "
+               "Do not submit the same search again merely because the wait ended." if queued else "")
         ),
-        input_schema=SEARCH_TOOL_SCHEMA,
+        input_schema=schema,
         annotations=types.ToolAnnotations(
             read_only_hint=True,
             destructive_hint=False,
@@ -230,13 +253,18 @@ class ToolRegistry:
 
 
 def create_registry(executor: SearchExecutor, catalog: NamespaceCatalog | None = None, document_mutator=None) -> ToolRegistry:
-    entries = [RegisteredTool(search_tool_definition(), SearchRequest.from_arguments, executor.search)]
+    queued_search = getattr(executor, "search_queued", None)
+    entries = [RegisteredTool(
+        search_tool_definition(queued=callable(queued_search)),
+        QueuedSearchRequest.from_arguments if callable(queued_search) else SearchRequest.from_arguments,
+        queued_search if callable(queued_search) else executor.search,
+    )]
     get_result = getattr(executor, "get_search_result", None)
     if callable(get_result):
         entries.append(RegisteredTool(
             types.Tool(
                 name="get_search_result",
-                description="Read a saved search result by UUID without running retrieval again. Results expire.",
+                description="Read a search by result_id UUID without running retrieval again. Pending queued searches return status queued and their stage; completed searches return frozen results. Failed, timed-out or expired searches return errors.",
                 input_schema={
                     "type": "object",
                     "properties": {
