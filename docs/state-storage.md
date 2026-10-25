@@ -1,8 +1,10 @@
 # Shared state storage
 
-Praxis-RAG keeps the retrieval index in Qdrant and every other durable object in
+Praxis-RAG keeps the retrieval index in Qdrant and permanent published data in
 one shared relational database. The production target is MySQL 8.0+; a SQLite
-file is still accepted for local development and the test suite.
+file is still accepted for local development and the test suite. Redis is required
+for transient MCP upload/search task state, document reassembly and search result
+snapshots. RocketMQ carries complete requests, not pointers to SQL task rows.
 
 ## What is stored where
 
@@ -15,10 +17,14 @@ file is still accepted for local development and the test suite.
 | Knowledge-base settings and provider keys | `knowledge_bases` |
 | MCP tool/prompt settings | `mcp_catalogs` |
 | Service API keys | `api_keys` |
-| Accepted MCP document upload bytes | `blobs` (immutable upload; no upload TTL) |
-| MCP document tasks and initial dispatch | `document_tasks`, `document_task_outbox` |
-| MCP search parameters, business state and initial dispatch | `search_tasks`, `search_task_outbox` |
+| MCP document/query requests | RocketMQ schema 2 envelopes; complete query or document request chunks (512 KiB decoded maximum per chunk, 10 MiB maximum per file) |
+| Transient MCP task states and document reassembly | Redis (required; no SQL fallback) |
+| Search result snapshots | Redis; `RAG_RESULT_TTL_SECONDS=3600` by default; no SQL fallback |
+| Issued version-bound artifact snapshots | MySQL `artifact_snapshots` (bytes and expiry) |
+| Upload publication/recovery operations and business leases | MySQL UploadJournal tables (see below) |
+| Persistent read-model refresh revisions and outbox | MySQL `cache_revisions`, `cache_outbox`; separate cache MQ topic |
 | Consumer retries, message invisibility and dead letters | RocketMQ Broker (not SQL task scheduling) |
+| Legacy MCP tasks, dispatch and search results | `document_tasks`, `document_task_outbox`, `search_tasks`, `search_task_outbox`, `search_result_snapshots`; retained, inactive, not migrated |
 
 `RAG_SERVICE_DATA_ROOT` remains the default location only for the local
 `state.sqlite3` fallback; it is no longer the authoritative document store.
@@ -45,15 +51,14 @@ RAG_MYSQL_SSL_CA          # optional CA bundle path
 Optional tuning: `RAG_STATE_POOL_SIZE`, `RAG_STATE_MAX_OVERFLOW`,
 `RAG_STATE_POOL_RECYCLE`, `RAG_STATE_POOL_TIMEOUT`, `RAG_STATE_ECHO`, and
 `RAG_STATE_AUTO_SCHEMA` (default on, creates missing tables with
-`CREATE TABLE IF NOT EXISTS`). Auto schema also runs the additive document
-outbox migration, adding `owner`, `lease_until`, `attempts`, and `last_error`
-to existing `document_task_outbox` tables. Other existing columns are not
-implicitly migrated. Disable auto schema when the runtime account cannot run
-DDL: before starting API/relay/workers, use a deployment account to create
-missing tables with `metadata.create_all(engine)` and explicitly run the state
-storage backend's `migrate_document_outbox()` method. `create_all` alone does not
-add columns to an existing table. Apply other schema changes with a migration
-tool before rolling out a new version.
+`CREATE TABLE IF NOT EXISTS`). Historical document outbox migrations added
+`owner`, `lease_until`, `attempts`, and `last_error`; those tables are now legacy,
+not an acceptance or delivery prerequisite. Keep existing tables and rows; do not
+drop them as part of this rollout. Disable auto schema when the runtime account
+cannot run DDL: use a deployment account to create missing active tables with
+`metadata.create_all(engine)` and apply required additive migrations before
+starting API/workers. `create_all` alone does not add columns to an existing
+table. No transient task/result data migration is performed.
 
 The MySQL runtime account needs `SELECT`, `INSERT`, `UPDATE`, `DELETE` on the
 schema; the account running schema setup also needs `CREATE` and `ALTER` for
@@ -85,10 +90,12 @@ migration CLI.
 | `documents` | `(namespace, name)` | per-document manifest |
 | `blobs` | `(namespace, bucket, key)` | source bytes and parse artifacts (`LONGBLOB`) |
 | `mcp_catalogs` | `namespace` | MCP tool/prompt settings |
-| `document_tasks` | `artifact_id` | accepted asynchronous MCP document business state; first terminal result wins |
-| `document_task_outbox` | `artifact_id` | initial delivery generation, producer `owner`, `lease_until`, `attempts`, `retry_at`, sanitized `last_error` |
-| `search_tasks` | `result_id` | search parameters, deadline and business state; first terminal result wins |
-| `search_task_outbox` | `result_id` | initial search-message delivery only |
+| `artifact_snapshots` | `artifact_id` | durable version-bound artifact bytes, metadata and expiry |
+| `document_tasks` | `artifact_id` | **legacy, inactive** asynchronous document task state |
+| `document_task_outbox` | `artifact_id` | **legacy, inactive** initial delivery generation, owner, lease, attempts and retry metadata |
+| `search_tasks` | `result_id` | **legacy, inactive** search parameters, deadline and task state |
+| `search_task_outbox` | `result_id` | **legacy, inactive** initial search-message delivery |
+| `search_result_snapshots` | `result_id` | **legacy, inactive** SQL search snapshots; not a Redis fallback |
 
 Identifier columns (`namespace`, document `name`, `digest`, blob `key`) use a
 binary collation in MySQL so `Alpha` and `alpha` do not collapse into one row.
@@ -120,78 +127,89 @@ use `-RemoveVolumes` only when you intend to delete it.
 ## Durable upload transactions
 
 HTTP multipart uploads and MCP `update_document` run the write-ahead journal
-synchronously. MCP `add_document` first commits immutable raw bytes, a task and
-an outbox row in one SQL transaction (T1), then immediately returns only
-`artifact_id`. That request neither connects/sends to MQ nor flushes Redis.
-The document worker later uses the same upload journal to parse, index and
-publish. One file is one business transaction; a multi-file HTTP submission
-retains independent success/failure results per file.
+synchronously. MCP `add_document` sends the complete document request through
+RocketMQ and returns only `artifact_id` after **all chunks are broker-confirmed**
+and Redis acceptance state is recorded. Transient task/reassembly state uses the
+existing `RAG_RESULT_TTL_SECONDS` (default 3600 seconds).
+The worker reassembles the request in Redis, then uses the same MySQL upload
+journal to parse, index and publish. One file remains one business transaction;
+a multi-file HTTP submission retains independent success/failure results per file.
 
-### Asynchronous document dispatch
+### Asynchronous request delivery
 
-Acceptance means durable SQL storage, not broker confirmation or indexing.
-Missing MQ configuration still permits acceptance, but processing requires a
-configured background relay, queue and separate `rag-document-worker` consumer.
-Initial dispatch failures remain pending indefinitely; they do not consume
-Broker delivery retries or expire the accepted upload bytes.
+Both MCP upload and queued search require reachable Redis and RocketMQ plus the
+RocketMQ SDK. A schema 2 envelope contains the complete query or document request;
+document payloads use chunks of at most **512 KiB decoded bytes**, preserving the
+**10 MiB file limit**. API success waits for every message's broker confirmation,
+even with search `wait_seconds=0`. Acceptance is not indexing completion.
 
-The relay claims an outbox owner, lease and generation in a short transaction,
-sends outside the SQL transaction, and conditionally records delivery only for the
-matching owner/generation. It persists initial dispatch `attempts`, `retry_at`
-and a sanitized `last_error`, using exponential backoff with jitter. A single-item
-failure does not block other tasks. Outages back off and emit throttled warnings.
-Expired initial-send claims can be recovered without stealing a valid producer
-lease. `RAG_DOCUMENT_DISPATCH_*` controls this first-send coordination only;
-a confirmed delivery is not re-created by SQL consumer retry/redrive scheduling.
-A crash around send confirmation can still cause duplicate delivery.
+Missing configuration, failed Redis prerequisites or MQ sends are surfaced as
+errors. There is no SQL task/outbox acceptance during an outage and no background
+SQL relay to finish a partial submission. A timeout after some sends can be
+ambiguous; retry the same submission with the same idempotency key and content.
+Redis task/reassembly loss or TTL expiry makes the ID unavailable and may require
+resubmission. Transient data has no SQL fallback; published document data is not
+lost with Redis. Logs contain only task/operation IDs and safe error categories,
+never query text, file/message content or secrets.
 
 ### Broker-owned consumption and terminal state
 
-MySQL stores files/query parameters, business state and initial outbox delivery.
-The Broker owns consumer retries, invisibility and DLQ routing; SQL tasks do not
-own execution leases, heartbeats, retry counts or consumer redrive schedules.
-Legacy consumer configuration is accepted only for backward-compatible config
-parsing and is deprecated and ignored at runtime; `DocumentTaskSettings` is no
-longer used. Existing consumer-lease schema fields remain inert for compatibility:
-no destructive column-drop migration is required. This does not remove the
-UploadJournal business document leases or compensation described below.
-Temporary failures leave the message unacknowledged for Broker retry. A
-deterministic failure is committed as final SQL business state before ACK.
-Success follows the same commit-before-ACK ordering. Terminal transitions are
-conditional: **first terminal result wins**; later duplicate deliveries cannot
-overwrite it and can be ACKed after checking authoritative SQL state.
+Document, search and persistent read-model cache refresh use separate topics and
+groups. Document and search run in separate worker processes. The Broker owns
+consumer retries, invisibility and DLQ routing; Redis holds transient task state,
+reassembly and search snapshots, not SQL task rows or outboxes.
 
-MQ visibility renewal failures receive bounded retries. Loss of renewal does not
-promise immediate cancellation of in-flight work or downstream model/Qdrant calls.
-Even after a renewal failure, the worker still attempts ACK if terminal SQL state
-has committed; otherwise Broker redelivery remains possible.
+Incomplete document chunks are **never ACKed**: Broker replay preserves the
+original payload so Redis expiry/loss cannot silently discard previously received
+chunks. Any chunk that completes reassembly can execute the request; once a
+terminal state is recorded, remaining duplicate chunks can be ACKed.
+Temporary failures leave the message unacknowledged for Broker retry.
+Deterministic failures write final failure state in Redis before ACK. Success
+stores the result and terminal state before ACK. Terminal transitions are
+conditional: **first terminal result wins**; duplicate deliveries cannot overwrite
+an existing Redis terminal result. Redis loss/expiry is not durable deduplication
+for search. UploadJournal independently prevents duplicate document publication.
+
+For documents, commit durable publication in MySQL **before** writing Redis
+`succeeded`. These are separate operations, not an atomic Redis+MySQL transaction.
+If Redis recording fails after publication, leave the message unacknowledged;
+on retry reconcile the durable UploadJournal outcome and repair transient state
+rather than publish again. Journal operations, business leases, SQL heartbeats,
+fenced version commits, compensation and recovery remain in MySQL.
+
+MQ visibility renewal failures receive bounded retries, without promising immediate
+cancellation of in-flight model/Qdrant calls. After a terminal Redis state has been
+recorded, workers still attempt ACK even if renewal failed; ACK failure may cause
+redelivery. Nonterminal work is not ACKed as successful.
 
 The planned independent `rag-dead-letter-worker --kind document|search` consumes
-normal Broker dead letters, finalizes nonterminal business state and ACKs only
-after commit; it does not load models, infer, parse or rerun tasks. Its separate
-handler groups default to `RAG_DOCUMENT_DLQ_GROUP=praxis_document_dead_letters`
-and `RAG_SEARCH_DLQ_GROUP=praxis_search_dead_letters`. The actual normal DLQ topic
-is `%DLQ%<source consumer group>`, not a topic named after the handler group.
-Transport verification confirmed Broker-generated normal DLQ receive and ACK
-under an independent handler group with Python SDK 5.1.2 / Apache Broker 5.3.3.
-Explicit physical source groups such as `ns%group` were also verified with
-`%DLQ%ns%group`; the transport preserves the physical receive/ACK topic name.
-SDK namespace metadata alone does not prove physical isolation. Revalidate other
-SDK/Proxy/Broker combinations and namespace mapping before rollout.
+normal Broker dead letters, records nonterminal task failure in Redis and then
+ACKs; it does not load models, infer, parse or rerun tasks. Its separate handler
+groups default to `RAG_DOCUMENT_DLQ_GROUP=praxis_document_dead_letters` and
+`RAG_SEARCH_DLQ_GROUP=praxis_search_dead_letters`. The actual normal DLQ topic is
+`%DLQ%<source consumer group>`, not the handler group name. Historical transport
+verification covered Python SDK 5.1.2 / Apache Broker 5.3.3 and explicit physical
+source groups (`ns%group` → `%DLQ%ns%group`); it is not schema 2 application
+validation. SDK namespace metadata alone does not prove physical isolation.
+Revalidate other SDK/Proxy/Broker combinations and namespace mapping before rollout.
 See [deployment and permissions](USAGE.md#broker-消费与死信处理).
 
-UploadJournal's per-document/name business leases and their own SQL heartbeat
-are retained for fenced version commits, compensation and recovery. Only SQL
-**task** heartbeats are removed, not all document-related SQL heartbeats.
-These business controls are separate from message invisibility; the Broker is
-the sole consumption-retry scheduler. Producer outbox schema leases remain
-initial-send coordination only, not consumer execution ownership.
+`get_document_status` reads Redis; only `succeeded` confirms durable publication.
+Missing/expired transient state is unavailable, not a successful empty response
+or a reason to read legacy SQL tasks. See [polling](USAGE.md#异步新增与状态轮询).
 
-`get_document_status` keeps `status="queued"` while dispatch is pending or
-awaiting consumption. Stages distinguish `dispatch_wait` (initial dispatch),
-`dispatch_retry` (retry pending) and `queued` (sent, awaiting consumption).
-Only `succeeded` confirms publication. Status caching can lag; SQL remains the
-authority. See [deployment settings and polling](USAGE.md#异步新增与状态轮询).
+### Upgrade boundary
+
+Stop old producers/API submissions and drain old workers and their pending
+outboxes/messages **before** upgrading. Deploy API and document/search workers
+together: schema 2 full-request envelopes are incompatible with legacy UUID-only
+messages. Do not mix versions or leave old messages for new workers. Old jobs and
+SQL result snapshots are not migrated; legacy tables and rows are retained, not
+dropped, but are outside the active path. Document worker `--dispatch-only` is
+removed; dispatcher compatibility `start`/`run_once` entry points are no-ops,
+not SQL relays. No filesystem MQ spool is used. None of these is an
+upgrade/recovery strategy. The separate persistent read-model `cache_outbox`
+is unaffected.
 
 ### Persisted state
 
@@ -240,10 +258,12 @@ derives a per-file key from the submission key and file index. Keys are
 namespace-scoped.
 
 For asynchronous adds, provide the key on the first request. After a disconnect
-or ambiguous commit, retry with the same key and identical parameters/content.
-Once an `artifact_id` is known, poll it rather than submitting again for a
-background MQ outage: the durable outbox remains pending and retries. Use a new
-key for new content, not merely because dispatch is delayed.
+or ambiguous broker confirmation, retry with the same key and identical
+parameters/content. Once an `artifact_id` is known, poll it while its Redis state
+exists. Redis loss/TTL expiry can require resubmission; there is no durable SQL
+outbox to replay. Transient ID reuse is not guaranteed after Redis loss, but the
+durable UploadJournal still reconciles an already committed publication. Use a
+new key for genuinely new content, not merely a delayed confirmation.
 
 Failed/rolled-back upload-journal keys are retained for audit and cannot be
 reused as a new request; retry the business action with a new key after recovery.
@@ -329,7 +349,8 @@ retry. HTTP response delivery itself is outside the publication transaction.
 
 ## Multi-instance notes
 
-- Share the same MySQL database, Qdrant endpoint and encryption key.
+- Share the same MySQL database, Qdrant endpoint, encryption key, Redis endpoint/
+  prefix and RocketMQ document/search/cache topic/group configuration.
 - Document/name leases coordinate uploads and conflict with document deletion.
   Knowledge-base edits/reembedding take an exclusive namespace lease.
 - API keys are read on every request. Knowledge-base snapshots include their
@@ -357,4 +378,4 @@ and its own `txn_test_*` Qdrant collection; never point it at production state.
 
 ## UUID 结果与逻辑删除
 
-搜索快照与产物分别持久化在 search_result_snapshots、artifact_snapshots，默认保留 1 小时。Redis 快照丢失时回源 MySQL，不重新检索。文档删除通过 del_flag 隐藏，不物理删除持久化源文件和 Qdrant 数据；原 UUID 仍可访问至到期。正常自动 schema 会为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [UUID 引用与迁移](result-references.md)。
+搜索快照只保存于 Redis，沿用 `RAG_RESULT_TTL_SECONDS=3600`；丢失或到期即不可用，无 SQL 回源，可能需重新提交查询。`search_result_snapshots` 为保留的历史表，不再参与活跃路径或迁移。产物仍持久化于 MySQL `artifact_snapshots`，已签发 artifact 的版本固定及到期前保留保证不变；不要将该保证扩展到搜索结果 UUID。文档删除通过 del_flag 隐藏，不物理删除持久化源文件和 Qdrant 数据。正常自动 schema 为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [UUID 引用与迁移](result-references.md)。

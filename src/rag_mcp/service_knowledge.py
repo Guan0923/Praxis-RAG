@@ -19,7 +19,6 @@ from threading import RLock
 from typing import Protocol
 from uuid import uuid4
 
-from sqlalchemy.exc import SQLAlchemyError
 
 from .chunking import _stable_id, chunk_document
 from .chunk_strategies import ChunkingConfig, LEGACY_CONFIG
@@ -237,6 +236,8 @@ class KnowledgeDocumentStore:
                     self.state.document_tasks.progress(task, "publishing")
                 metadata = self._metadata(name, size, sha256, indexed)
                 metadata.update(sha256=sha256, chunking=configuration, operation_id=op["id"])
+                if task is not None:
+                    metadata["task_configuration_version"] = task["configuration_version"]
                 journal.intent(op, "publish", {"version": op["id"]})
                 with self.state.engine.begin() as conn:
                     journal.assert_owner(op, conn)
@@ -249,8 +250,10 @@ class KnowledgeDocumentStore:
                         self.state.blobs.put_tree(self.namespace, indexed.artifacts_bucket,
                                                  str(indexed.document_id), indexed.artifacts_dir, conn=conn)
                     if task is not None:
-                        self.state.document_tasks.succeed(conn, task)
+                        self.state.document_tasks.validate_publication(conn, task)
                     journal.commit(op, metadata, conn)
+                if task is not None:
+                    self.state.document_tasks.succeed(None, task)
 
             if isinstance(ingester, DenseDocumentIngester):
                 ingester.ingest_and_publish(temporary, source_name=name, chunking=chunking,
@@ -298,8 +301,9 @@ class KnowledgeDocumentStore:
             try:
                 journal.fail(op, exc)
                 coordinator.compensate(op, factory(op))
-            except Exception:
-                logging.getLogger(__name__).exception("Upload recovery pending: %s", op["id"])
+            except Exception as recovery_error:
+                logging.getLogger(__name__).warning("Upload recovery pending operation_id=%s category=%s",
+                                                    op["id"], type(recovery_error).__name__)
             raise
         finally:
             journal._stop(op)
@@ -879,14 +883,18 @@ class RagServiceRuntime:
             raise KnowledgeValidationError(str(exc)) from exc
         except Exception as exc:
             raise KnowledgeError(
-                "Document storage was not confirmed; retry with the same idempotency_key"
+                "Document delivery was not confirmed; retry with the same idempotency_key"
             ) from exc
 
     def get_document_status(self, namespace: str, artifact_id: str) -> dict:
+        from .state.transient import TransientUnavailable
+
         try:
             return self.state.document_tasks.status(namespace, artifact_id)
         except (ValueError, LookupError) as exc:
             raise KnowledgeValidationError(str(exc)) from exc
+        except TransientUnavailable as exc:
+            raise KnowledgeError("Document status is temporarily unavailable; retry later") from exc
 
     def process_document_task(self, task: dict) -> dict:
         namespace = task["namespace"]
@@ -962,7 +970,7 @@ class RagServiceRuntime:
             # take a writer lease or block reads of the current committed index.
             try:
                 return SearchReferences(self.state).capture(namespace, payload, save_snapshot=save_snapshot)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - optional references must not discard retrieval; log safe category only
                 logging.getLogger(__name__).warning("Search reference capture unavailable: %s", type(exc).__name__)
                 return {**payload, "snapshot_available": False,
                         "snapshot_error": "Search result references are unavailable"}
@@ -977,11 +985,7 @@ class RagServiceRuntime:
             raise KnowledgeError("Search submission unavailable; queue acceptance was not confirmed") from exc
 
     def get_search_result(self, namespace: str, result_id: str, *, page=1, page_size=10) -> dict:
-        try:
-            queued = self.state.search_tasks.get(namespace, result_id, page=page, page_size=page_size)
-        except SQLAlchemyError:
-            # Only committed result snapshots may be replayed when the task database is unavailable.
-            return self.state.results.get(namespace, result_id, page=page, page_size=page_size)
+        queued = self.state.search_tasks.get(namespace, result_id, page=page, page_size=page_size)
         if queued is not None:
             return queued
         return self.state.results.get(namespace, result_id, page=page, page_size=page_size)

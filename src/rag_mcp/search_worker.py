@@ -154,30 +154,31 @@ class SearchWorker:
 
         return self._monitor(poll, deadline)
 
-    def process(self, result_id):
+    def process(self, envelope):
         with self._mutex:
-            task = self.tasks.claim(result_id)
+            task = self.tasks.claim(envelope)
             if task is None:
-                return self.tasks.terminal(result_id)
-            # Includes IPC/runtime startup; publication rechecks the SQL deadline.
+                return self.tasks.terminal(envelope)
+            result_id = envelope["result_id"]
+            # Includes IPC/runtime startup; atomic publication rechecks the deadline.
             deadline = time.monotonic() + task["remaining_seconds"]
             try:
                 execute = self._spawn if self.executor is None else self._injected
                 payload = execute(task, deadline)
                 self.tasks.complete(task, payload)
-            except Exception as exc:  # noqa: BLE001 - all retrieval failures must leave a durable outcome
+            except Exception as exc:  # noqa: BLE001 - failed deliveries must remain retryable
                 # Completion could commit while its acknowledgement is lost.
-                if self.tasks.terminal(result_id):
+                if self.tasks.terminal(envelope):
                     return True
                 self.tasks.fail(task, retry=getattr(exc, "retry", True),
                                 error="Search execution failed")
                 logger.warning("Search deferred result_id=%s error_type=%s",
                                result_id, type(exc).__name__)
-            return self.tasks.terminal(result_id)
+            return self.tasks.terminal(envelope)
 
     def close(self):
-        # Normal CLI shutdown drains the current delivery until its persisted
-        # deadline. This hook also cleans up a child after unexpected caller exit.
+        # Normal CLI shutdown drains the current delivery until its deadline.
+        # This hook also cleans up a child after unexpected caller exit.
         if self._child is not None:
             self._stop_child(self._child)
             self._child = None
@@ -191,7 +192,7 @@ def main(argv=None):
     from .state.store import StateStores
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dispatch-only", action="store_true", help="Relay SQL outbox without inference")
+    parser.add_argument("--dispatch-only", action="store_true", help="Compatibility no-op; submissions publish directly")
     args = parser.parse_args(argv)
     load_service_config()
     settings = search_queue_settings()
@@ -208,12 +209,7 @@ def main(argv=None):
     worker = None
     try:
         if args.dispatch_only:
-            while not stop.is_set():
-                try:
-                    state.search_dispatcher.run_once()
-                except Exception as exc:  # noqa: BLE001 - durable relay retries on the next pass
-                    logger.warning("Search dispatch unavailable (%s)", type(exc).__name__)
-                stop.wait(1)
+            logger.info("Search dispatcher compatibility mode; no pending SQL relay")
         else:
             # The coordinator owns no Qdrant/model instance. Each execution child
             # constructs its own runtime, including when using local Qdrant paths.

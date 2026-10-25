@@ -1,4 +1,4 @@
-"""Consume broker dead letters into terminal SQL state without inference or re-enqueueing."""
+"""Record broker retry exhaustion in Redis without inference or re-enqueueing."""
 
 from __future__ import annotations
 
@@ -45,18 +45,21 @@ def dead_letter_queue_settings(kind):
 
 
 class DeadLetterWorker:
-    """ACK eligibility is returned only by the committed authoritative transaction."""
+    """ACK only after a Redis terminal outcome is saved or already exists."""
 
     def __init__(self, state, kind):
         if kind not in {"document", "search"}:
             raise ValueError("Dead-letter kind must be document or search")
         self.tasks = getattr(state, f"{kind}_tasks")
+        self.message_key = "artifact_id" if kind == "document" else "result_id"
 
-    def process(self, task_id):
-        validate_artifact_id(task_id)
-        complete = self.tasks.dead_letter(task_id)
+    def process(self, payload):
+        if not isinstance(payload, dict):
+            raise TypeError("Expected a versioned dead-letter message")
+        task_id = validate_artifact_id(payload.get(self.message_key))
+        complete = self.tasks.dead_letter(payload)
         if complete is True:
-            logger.info("Dead-letter transaction committed or task already absent/terminal")
+            logger.info("Dead-letter outcome saved or task already absent/terminal task_id=%s", task_id)
         return complete is True
 
 
@@ -82,12 +85,16 @@ def main(argv=None):
     transport = None
     try:
         worker = DeadLetterWorker(state, args.kind)
-        transport = RocketMQDocumentQueue(settings)
-        transport.message_key = "artifact_id" if args.kind == "document" else "result_id"
+        if args.kind == "search":
+            from .state.search_queue import RocketMQSearchQueue
+
+            transport = RocketMQSearchQueue(settings)
+        else:
+            transport = RocketMQDocumentQueue(settings)
         while not stop.is_set():
             try:
                 transport.consume_once(worker.process)
-            except Exception as exc:  # noqa: BLE001 - keep failed SQL transactions and ACKs retryable
+            except Exception as exc:  # noqa: BLE001 - Redis failures must leave messages retryable
                 logger.warning("Dead-letter consumer unavailable category=%s",
                                transport._failure_category(exc))
                 stop.wait(2)

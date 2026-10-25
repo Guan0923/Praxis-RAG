@@ -6,18 +6,19 @@ from types import SimpleNamespace
 
 import pytest
 from qdrant_client import QdrantClient
+from redis_stub import MemoryRedis
 from sqlalchemy import create_engine, inspect, select, text
 
 from rag_mcp.chunk_strategies import ChunkingConfig
 from rag_mcp.config import RagConfig
 from rag_mcp.service_knowledge import DenseDocumentIngester, KnowledgeDocumentStore
+from rag_mcp.sparse import Bm25SparseEncoder
 from rag_mcp.state.cache import CacheSettings, RedisStateCache
 from rag_mcp.state.schema import documents
 from rag_mcp.state.schema_migrations import migrate_soft_delete
 from rag_mcp.state.search_references import SearchReferences
 from rag_mcp.state.store import StateStores
 from rag_mcp.storage.qdrant_store import QdrantStore
-from rag_mcp.sparse import Bm25SparseEncoder
 
 VECTOR = [1.0] + [0.0] * 1023
 CONFIG = ChunkingConfig("character", 100, 10)
@@ -28,7 +29,8 @@ def stack(tmp_path, monkeypatch):
     monkeypatch.delenv("RAG_REDIS_URL", raising=False)
     monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
     state = StateStores.create(tmp_path / "state")
-    state.cache_sync.backend = RedisStateCache(CacheSettings(enabled=False))
+    state.cache_sync.backend = RedisStateCache(
+        CacheSettings(prefix="soft-delete-test", enabled=True), client=MemoryRedis())
     client = QdrantClient(":memory:")
     store = QdrantStore(collection="soft_delete", namespace="ns", client=client,
                         active_versions=lambda: state.documents.visible_versions("ns"))

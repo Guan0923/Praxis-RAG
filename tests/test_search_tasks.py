@@ -1,19 +1,33 @@
-"""Reliable queued retrieval, deadlines, result identity and Redis publication."""
+"""Full-request admission and Redis-only queued retrieval contracts."""
 
+import copy
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, update
+from redis_stub import MemoryRedis
 
-from rag_mcp.contracts import SearchRequest
-from rag_mcp.service_knowledge import RagServiceRuntime
-from rag_mcp.state.result_snapshots import SnapshotUnavailable
-from rag_mcp.state.schema import search_result_snapshots
-from rag_mcp.state.settings import StateSettings
-from rag_mcp.state.store import StateStores
+from rag_mcp.service_knowledge import KnowledgeError, RagServiceRuntime
+from rag_mcp.state.cache import RedisStateCache, StateCacheSettings
+from rag_mcp.state.result_snapshots import (
+    ResultSnapshots,
+    SnapshotSettings,
+    SnapshotUnavailable,
+)
+from rag_mcp.state.search_queue import (
+    RocketMQSearchQueue,
+    SearchTaskDispatcher,
+    search_queue_settings,
+)
+from rag_mcp.state.search_tasks import (
+    SearchTasks,
+    SearchTaskSettings,
+    validate_search_envelope,
+)
 
 
 class Queue:
@@ -21,570 +35,399 @@ class Queue:
         self.sent = []
         self.broken = False
 
-    def send(self, result_id):
+    def send(self, envelope):
         if self.broken:
             raise ConnectionError("private broker details")
-        self.sent.append(result_id)
+        self.sent.append(copy.deepcopy(envelope))
 
     def close(self):
         pass
 
 
 @pytest.fixture
-def service(tmp_path, monkeypatch):
+def service(monkeypatch):
     monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
-    monkeypatch.delenv("RAG_REDIS_URL", raising=False)
-    state = StateStores(StateSettings(url=f"sqlite+pysqlite:///{tmp_path / 'searches.sqlite3'}"))
-    state.knowledge_bases.create({"namespace": "manuals", "collection": "test"})
+    client = MemoryRedis()
+    engine = Mock()
+    engine.begin.side_effect = AssertionError("Search must not access SQL")
+    engine.connect.side_effect = AssertionError("Search must not access SQL")
+    state = SimpleNamespace(engine=engine, cache_sync=SimpleNamespace(
+        backend=RedisStateCache(StateCacheSettings(prefix="search-test"), client=client)))
+    state.results = ResultSnapshots(state)
+    state.search_tasks = SearchTasks(state)
     queue = Queue()
-    state.search_dispatcher.transport = queue
+    state.search_dispatcher = SearchTaskDispatcher(state, queue)
     yield state, queue
-    state.close()
+    engine.begin.assert_not_called()
+    engine.connect.assert_not_called()
 
 
 def submit(service):
-    state, _queue = service
-    return state.search_dispatcher.submit("manuals", {"query": "manual"})["result_id"]
+    state, queue = service
+    result_id = state.search_dispatcher.submit("manuals", {"query": "private manual"})["result_id"]
+    assert queue.sent[-1]["result_id"] == result_id
+    return queue.sent[-1]
 
 
-def complete(state, result_id, text="evidence"):
-    task = state.search_tasks.claim(result_id)
+def complete(state, envelope, text="evidence"):
+    task = state.search_tasks.claim(envelope)
     assert task is not None
-    state.search_tasks.complete(task, {"query": "manual", "results": [{"text": text, "metadata": {}}]})
+    state.search_tasks.complete(task, {"results": [{"text": text}]})
     return task
 
 
-def test_admission_is_durable_uuid_only_and_poll_never_executes_search(service):
+def test_admission_sends_full_envelope_and_redis_retains_no_invocation(service):
     state, queue = service
-    result_id = submit(service)
-    assert queue.sent == []
-    state.search_dispatcher.run_once()
-    assert queue.sent == [result_id]
-    pending = state.search_tasks.get("manuals", result_id)
-    assert pending["result_id"] == result_id and pending["status"] == "queued"
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(search_result_snapshots.c.id)) is None
-    complete(state, result_id)
-    result = state.search_tasks.get("manuals", result_id)
-    assert result["result_id"] == result_id
-    assert result["results"][0]["text"] == "evidence"
-    assert state.search_tasks.get("manuals", result_id) == result
+    envelope = submit(service)
+    assert envelope["schema"] == 2 and envelope["arguments"] == {"query": "private manual"}
+    record = state.search_tasks.transient.get("search-result", envelope["result_id"])
+    assert "private manual" not in json.dumps(record) and "arguments" not in record
+    assert state.search_tasks.get("manuals", envelope["result_id"])["status"] == "queued"
+    assert state.search_dispatcher.run_once() == 0
+    state.search_dispatcher.start()
+    state.search_dispatcher.stop()
+    assert len(queue.sent) == 1
+    complete(state, envelope)
+    result = state.search_tasks.get("manuals", envelope["result_id"])
+    assert result["result_id"] == envelope["result_id"] and result["results"] == [{"text": "evidence"}]
 
 
-def test_broker_failure_preserves_outbox_for_relay(service):
+def test_broker_failure_never_reports_success_or_leaves_active_job(service):
     state, queue = service
     queue.broken = True
-    result_id = state.search_dispatcher.submit("manuals", {"query": "manual"})["result_id"]
-    state.search_dispatcher.run_once()
+    with pytest.raises(RuntimeError, match="acceptance") as error:
+        state.search_dispatcher.submit("manuals", {"query": "private"})
+    assert "private" not in str(error.value)
+    client = state.cache_sync.backend._connection()
+    assert all(json.loads(value)["status"] == "failed" for value in client.values.values())
     assert queue.sent == []
-    assert state.search_tasks.get("manuals", result_id)["status"] == "queued"
-    queue.broken = False
-    state.search_dispatcher.run_once()
-    assert queue.sent == [result_id]
-    assert state.search_tasks.get("manuals", queue.sent[0])["status"] == "queued"
 
 
-def test_duplicate_concurrent_consumers_can_claim(service):
-    state, _queue = service
-    result_id = submit(service)
-    other = StateStores(state.settings)
-    barrier = threading.Barrier(2)
-
-    def claim(tasks):
-        barrier.wait()
-        return tasks.claim(result_id)
-
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(claim, instance.search_tasks) for instance in (state, other)]
-            claimed = [future.result(timeout=5) for future in futures]
-        assert all(task is not None for task in claimed)
-        assert all(task["status"] == "processing" for task in claimed)
-        assert claimed[0]["arguments"] == claimed[1]["arguments"]
-    finally:
-        other.close()
-
-
-def test_result_is_tenant_scoped_and_snapshot_expiry_is_an_error(service):
-    state, _queue = service
-    result_id = submit(service)
-    assert state.search_tasks.get("other", result_id) is None
-    assert state.search_tasks.get("manuals", str(uuid4())) is None
-    complete(state, result_id)
-    assert state.search_tasks.get("other", result_id) is None
-    with state.engine.begin() as conn:
-        conn.execute(update(search_result_snapshots).where(
-            search_result_snapshots.c.id == result_id).values(expires_at=0))
-    with pytest.raises(SnapshotUnavailable):
-        state.search_tasks.get("manuals", result_id)
-
-
-def test_failed_job_returns_safe_error_instead_of_queued(service):
-    state, _queue = service
-    result_id = submit(service)
-    task = state.search_tasks.claim(result_id)
-    state.search_tasks.fail(task, retry=False, error="Search processing failed")
-    with pytest.raises(SnapshotUnavailable, match="failed"):
-        state.search_tasks.get("manuals", result_id)
-    assert state.search_tasks.terminal(result_id)
-
-
-def test_atomic_snapshot_failure_does_not_mark_task_successful(service, monkeypatch):
-    state, _queue = service
-    result_id = submit(service)
-    task = state.search_tasks.claim(result_id)
-    original = state.results.save
-
-    def abort(*args, **kwargs):
-        original(*args, **kwargs)
-        raise RuntimeError("abort before commit")
-
-    monkeypatch.setattr(state.results, "save", abort)
-    with pytest.raises(RuntimeError, match="abort"):
-        state.search_tasks.complete(task, {"results": []})
-    assert state.search_tasks.get("manuals", result_id)["status"] == "queued"
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(search_result_snapshots.c.id)) is None
-
-
-def test_completed_results_use_redis_and_redis_outage_falls_back_to_sql(service, monkeypatch):
-    import time
-
-    from rag_mcp.state.cache import RedisStateCache, StateCacheSettings
-
-    class Redis:
-        def __init__(self):
-            self.values = {}
-            self.deadlines = {}
-
-        def set(self, key, value, ex=None, nx=False):
-            self.values[key] = value
-            self.deadlines[key] = time.time() + (ex or 60)
-
-        def get(self, key):
-            return self.values.get(key) if self.deadlines.get(key, 0) > time.time() else None
-
-        def close(self):
-            pass
-
-    state, _queue = service
-    state.cache_sync.backend.close()
-    backend = RedisStateCache(StateCacheSettings(), client=Redis())
-    state.cache_sync.backend = backend
-    result_id = submit(service)
-    complete(state, result_id)
-    key = state.results._key("manuals", result_id)
-    raw = backend._connection().get(key)
-    assert json.loads(raw)["payload"]["result_id"] == result_id
-    assert state.search_tasks.get("manuals", result_id)["results"][0]["text"] == "evidence"
-
-    def fail(*_args, **_kwargs):
-        raise ConnectionError("down")
-
-    monkeypatch.setattr(backend._connection(), "get", fail)
-    assert state.search_tasks.get("manuals", result_id)["results"][0]["text"] == "evidence"
-
-
-def test_query_validation_precedes_submission(service):
+def test_missing_broker_rejects_before_creating_state(service):
     state, queue = service
+    state.search_dispatcher.transport = None
+    with pytest.raises(RuntimeError, match="broker"):
+        state.search_dispatcher.submit("manuals", {"query": "manual"})
+    assert state.cache_sync.backend._connection().values == {}
+    assert queue.sent == []
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_redis_unavailable_rejects_submission_before_broker_send(service, disabled):
+    state, queue = service
+    if disabled:
+        state.cache_sync.backend = RedisStateCache(StateCacheSettings(enabled=False))
+    else:
+        state.cache_sync.backend._connection().broken = True
     runtime = object.__new__(RagServiceRuntime)
     runtime.state = state
-    with pytest.raises(ValueError):
-        runtime.submit_search("manuals", {"query": "manual", "wait_seconds": 2})
+    with pytest.raises(KnowledgeError, match="not confirmed"):
+        runtime.submit_search("manuals", {"query": "manual"})
     assert queue.sent == []
-    assert SearchRequest.from_arguments({"query": "manual"}).query == "manual"
 
 
-def test_task_deadline_includes_queue_time_and_blocks_late_success(service):
-    from rag_mcp.state.schema import search_tasks
-
-    state, _queue = service
-    result_id = submit(service)
-    with state.engine.begin() as conn:
-        conn.execute(update(search_tasks).where(search_tasks.c.result_id == result_id).values(deadline=0))
-    with pytest.raises(SnapshotUnavailable, match="deadline|timed out"):
-        state.search_tasks.get("manuals", result_id)
-    assert state.search_tasks.claim(result_id) is None
-    assert state.search_tasks.terminal(result_id)
-    result_id = submit(service)
-    task = state.search_tasks.claim(result_id)
-    with state.engine.begin() as conn:
-        conn.execute(update(search_tasks).where(search_tasks.c.result_id == result_id).values(deadline=0))
-    assert state.search_tasks.complete(task, {"results": []}) is None
-    assert state.search_tasks.terminal(result_id)
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(search_result_snapshots.c.id).where(
-            search_result_snapshots.c.id == result_id)) is None
-
-
-def test_old_computation_can_publish_after_duplicate_claim_and_retry(service):
-    from rag_mcp.state.schema import search_tasks
-
-    state, _queue = service
-    result_id = submit(service)
-    old = state.search_tasks.claim(result_id)
-    with state.engine.begin() as conn:
-        conn.execute(update(search_tasks).where(search_tasks.c.result_id == result_id).values(
-            owner="legacy", lease_until=10**12, attempts=1000, retry_at=10**12))
-    fresh = state.search_tasks.claim(result_id)
-    assert fresh is not None
-    state.search_tasks.fail(fresh, retry=True)
-    assert state.search_tasks.get("manuals", result_id)["stage"] == "retry_wait"
-    assert state.search_tasks.complete(old, {"results": [{"text": "first"}]}) is not None
-    assert state.search_tasks.complete(fresh, {"results": [{"text": "second"}]}) is None
-    assert state.search_tasks.get("manuals", result_id)["results"][0]["text"] == "first"
-
-
-@pytest.mark.parametrize("dispatch_first", [True, False])
-def test_retries_never_reopen_or_change_initial_outbox(service, dispatch_first):
-    from rag_mcp.state.schema import search_task_outbox, search_tasks
-
+def test_redis_failure_after_send_is_not_successful_acceptance(service):
     state, queue = service
-    result_id = submit(service)
-    if dispatch_first:
-        state.search_dispatcher.run_once()
-    with state.engine.connect() as conn:
-        initial = dict(conn.execute(select(search_task_outbox)).mappings().one())
-    for _ in range(5):
-        task = state.search_tasks.claim(result_id)
-        state.search_tasks.fail(task, retry=True, error="token=private-provider-credential")
-        assert state.search_tasks.get("manuals", result_id) == {
-            "result_id": result_id, "status": "queued", "stage": "retry_wait"}
-    with state.engine.connect() as conn:
-        assert dict(conn.execute(select(search_task_outbox)).mappings().one()) == initial
-        row = conn.execute(select(search_tasks)).mappings().one()
-        assert json.loads(row["arguments"]) == {"query": "manual"}
-        assert "private-provider-credential" not in str(row)
-        assert row["attempts"] == 0
-    state.search_dispatcher.run_once()
-    state.search_dispatcher.run_once()
-    assert queue.sent == [result_id]
-    assert not state.search_tasks.terminal(result_id)
+    send = queue.send
+
+    def break_after_send(envelope):
+        send(envelope)
+        state.cache_sync.backend._connection().broken = True
+
+    queue.send = break_after_send
+    with pytest.raises(RuntimeError, match="not confirmed"):
+        state.search_dispatcher.submit("manuals", {"query": "manual"})
+    assert len(queue.sent) == 1
 
 
-def test_expiry_sweep_is_bounded_and_clears_private_arguments(service):
-    from rag_mcp.state.schema import search_task_outbox, search_tasks
-
+def test_wrong_namespace_missing_and_expired_jobs_never_execute(service):
     state, _queue = service
-    ids = [submit(service) for _ in range(3)]
-    with state.engine.begin() as conn:
-        conn.execute(update(search_tasks).where(search_tasks.c.result_id.in_(ids)).values(deadline=0))
-    assert state.search_tasks.expire(limit=2) == 2
-    assert state.search_tasks.expire(limit=2) == 1
-    with state.engine.connect() as conn:
-        rows = conn.execute(select(search_tasks).where(search_tasks.c.result_id.in_(ids))).mappings().all()
-        assert all(row["status"] == "timed_out" and not json.loads(row["arguments"]) for row in rows)
-        assert all(conn.scalars(select(search_task_outbox.c.pending).where(search_task_outbox.c.result_id.in_(ids))))
+    envelope = submit(service)
+    assert state.search_tasks.get("other", envelope["result_id"]) is None
+    assert state.search_tasks.get("manuals", str(uuid4())) is None
+    assert state.search_tasks.claim({**envelope, "namespace": "other"}) is None
+    state.search_tasks.clock = lambda: envelope["deadline"]
+    assert state.search_tasks.claim(envelope) is None
+    assert state.search_tasks.terminal(envelope)
+    with pytest.raises(SnapshotUnavailable, match="timed out"):
+        state.search_tasks.get("manuals", envelope["result_id"])
 
 
-def test_outbox_send_confirmation_cannot_clear_newer_generation(service):
-    from rag_mcp.state.schema import search_task_outbox
-
+def test_retry_and_dead_letter_are_transient_and_safe(service):
     state, _queue = service
-    result_id = submit(service)
-
-    class RacingQueue:
-        def send(self, incoming):
-            with state.engine.begin() as conn:
-                conn.execute(update(search_task_outbox).where(
-                    search_task_outbox.c.result_id == incoming).values(
-                        generation=search_task_outbox.c.generation + 1))
-
-    state.search_tasks.dispatch(result_id, RacingQueue())
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(search_task_outbox.c.pending).where(
-            search_task_outbox.c.result_id == result_id))
+    envelope = submit(service)
+    task = state.search_tasks.claim(envelope)
+    state.search_tasks.fail(task, error="private credential")
+    assert state.search_tasks.get("manuals", envelope["result_id"])["stage"] == "retry_wait"
+    assert not state.search_tasks.terminal(envelope)
+    assert state.search_tasks.dead_letter(envelope["result_id"])
+    with pytest.raises(SnapshotUnavailable, match="failed"):
+        state.search_tasks.get("manuals", envelope["result_id"])
+    assert "private credential" not in str(state.cache_sync.backend._connection().values)
 
 
-def test_separate_state_instance_reads_same_job_after_restart(service):
+def test_duplicate_completion_is_atomic_and_first_terminal_wins(service):
     state, _queue = service
-    result_id = submit(service)
-    restarted = StateStores(state.settings)
-    try:
-        assert restarted.search_tasks.get("manuals", result_id)["status"] == "queued"
-        complete(restarted, result_id)
-        assert state.search_tasks.get("manuals", result_id)["result_id"] == result_id
-    finally:
-        restarted.close()
-
-
-@pytest.mark.parametrize("competitor", ["complete", "fail", "dead_letter"])
-def test_concurrent_terminal_outcomes_are_atomic_and_first_wins(service, competitor, monkeypatch):
-    from rag_mcp.state.schema import search_tasks
-
-    state, _queue = service
-    result_id = submit(service)
-    first = state.search_tasks.claim(result_id)
-    second = state.search_tasks.claim(result_id)
-    other = StateStores(state.settings)
+    envelope = submit(service)
+    first = state.search_tasks.claim(envelope)
+    second = state.search_tasks.claim(envelope)
     barrier = threading.Barrier(2)
-    saves = []
-    original = state.results.save
 
-    def save(*args, **kwargs):
-        saves.append(kwargs["result_id"])
-        return original(*args, **kwargs)
+    def finish(task, text):
+        barrier.wait(timeout=5)
+        return state.search_tasks.complete(task, {"results": [{"text": text}]})
 
-    monkeypatch.setattr(state.results, "save", save)
-    monkeypatch.setattr(other.results, "save", save)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(finish, task, text) for task, text in ((first, "first"), (second, "second"))]
+        [future.result(timeout=5) for future in futures]
+    saved = state.search_tasks.get("manuals", envelope["result_id"])
+    state.search_tasks.fail(second, retry=False)
+    state.search_tasks.complete(second, {"results": [{"text": "late"}]})
+    assert state.search_tasks.get("manuals", envelope["result_id"]) == saved
+    assert state.search_tasks.claim(envelope) is None
 
-    def publish():
-        barrier.wait()
-        return state.search_tasks.complete(first, {"results": [{"text": "first"}]})
 
-    def compete():
-        barrier.wait()
-        if competitor == "complete":
-            return other.search_tasks.complete(second, {"results": [{"text": "second"}]})
-        if competitor == "fail":
-            return other.search_tasks.fail(second, retry=False)
-        return other.search_tasks.dead_letter(result_id)
+def test_deadline_rechecked_during_atomic_publication(service, monkeypatch):
+    state, _queue = service
+    envelope = submit(service)
+    task = state.search_tasks.claim(envelope)
+    prepare = state.results.prepare
+
+    def cross_deadline(*args, **kwargs):
+        value = prepare(*args, **kwargs)
+        state.search_tasks.clock = lambda: envelope["deadline"]
+        return value
+
+    monkeypatch.setattr(state.results, "prepare", cross_deadline)
+    assert state.search_tasks.complete(task, {"results": []}) is None
+    row = state.search_tasks.transient.get("search-result", envelope["result_id"])
+    assert row["status"] == "timed_out" and "payload" not in row
+
+
+def test_result_loss_or_redis_failure_never_falls_back_to_sql(service):
+    state, _queue = service
+    envelope = submit(service)
+    complete(state, envelope)
+    runtime = object.__new__(RagServiceRuntime)
+    runtime.state = state
+    state.cache_sync.backend._connection().broken = True
+    with pytest.raises(SnapshotUnavailable):
+        runtime.get_search_result("manuals", envelope["result_id"])
+    state.cache_sync.backend._connection().broken = False
+    state.search_tasks.transient.delete("search-result", envelope["result_id"])
+    with pytest.raises(SnapshotUnavailable):
+        runtime.get_search_result("manuals", envelope["result_id"])
+
+
+@pytest.mark.parametrize("change", [
+    {"schema": 1}, {"schema": True}, {"result_id": "not-uuid"}, {"namespace": ""},
+    {"namespace": "x" * 65}, {"arguments": []}, {"arguments": {"query": "x" * (1024 * 1024)}},
+    {"created_at": float("nan")}, {"deadline": float("inf")}, {"expires_at": 0},
+])
+def test_envelope_validation_is_bounded(service, change):
+    envelope = submit(service)
+    with pytest.raises(ValueError, match="envelope"):
+        validate_search_envelope({**envelope, **change})
+
+
+def test_transport_overrides_use_full_payload_helpers(service, monkeypatch):
+    envelope = submit(service)
+    queue = RocketMQSearchQueue(search_queue_settings())
+    send = Mock()
+    consume = Mock()
+    monkeypatch.setattr(queue, "_send_payload", send)
+    monkeypatch.setattr(queue, "_consume_payload_once", consume)
+    queue.send(envelope)
+    send.assert_called_once_with(envelope, envelope["result_id"])
+    callback = Mock()
+    queue.consume_once(callback)
+    consume.assert_called_once_with(callback, validate_search_envelope)
+    with pytest.raises(ValueError):
+        queue.send({"result_id": envelope["result_id"]})
+    with pytest.raises(ValueError):
+        queue.send(envelope["result_id"])
+
+
+@pytest.mark.parametrize("value", [0, -1, True, float("nan"), float("inf")])
+def test_invalid_timeout(value):
+    with pytest.raises(ValueError):
+        SearchTaskSettings(timeout_seconds=value)
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_real_transport_callback_contract_acks_only_after_result_bytes(service, terminal):
+    state, _queue = service
+    envelope = submit(service)
+    message = SimpleNamespace(body=json.dumps(envelope).encode(), topic="broker-topic")
+    acknowledgements = []
+
+    def ack(received):
+        assert received is message
+        if terminal:
+            assert state.results.get("manuals", envelope["result_id"])["results"] == [{"text": "ready"}]
+        acknowledgements.append(received)
+
+    consumer = SimpleNamespace(receive=lambda *_args: [message], ack=ack,
+                               startup=lambda: None, shutdown=lambda: None)
+    transport = RocketMQSearchQueue(search_queue_settings(), consumer_factory=lambda: consumer)
+
+    def process(received):
+        assert received == envelope
+        task = state.search_tasks.claim(received)
+        if terminal:
+            state.search_tasks.complete(task, {"results": [{"text": "ready"}]})
+        else:
+            state.search_tasks.fail(task, retry=True)
+        return state.search_tasks.terminal(received)
 
     try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(publish), pool.submit(compete)]
-            outcomes = [future.result(timeout=10) for future in futures]
-        with state.engine.connect() as conn:
-            row = conn.execute(select(search_tasks)).mappings().one()
-            snapshot = conn.execute(select(search_result_snapshots)).mappings().first()
-        if row["status"] == "succeeded":
-            assert snapshot is not None
-            assert saves == [result_id]
-            winner = state.search_tasks.get("manuals", result_id)
-            assert winner["results"][0]["text"] in ("first", "second")
-        else:
-            assert row["status"] == "failed"
-            assert snapshot is None
-            assert saves == []
-        if competitor == "complete":
-            assert sum(outcome is not None for outcome in outcomes) == 1
-        assert json.loads(row["arguments"]) == {}
-        assert state.search_tasks.complete(first, {"results": []}) is None
-        state.search_tasks.fail(second, retry=True)
-        with state.engine.connect() as conn:
-            assert dict(conn.execute(select(search_tasks)).mappings().one()) == dict(row)
+        transport.consume_once(process)
+        assert len(acknowledgements) == int(terminal)
+        assert message.topic == transport.settings.topic
     finally:
-        other.close()
+        transport.close()
 
 
-def test_deadline_during_snapshot_serialization_rolls_back_snapshot(service, monkeypatch):
-    import time
+def test_transport_rejects_legacy_uuid_and_oversized_messages_without_execute(service):
+    envelope = submit(service)
+    messages = [SimpleNamespace(body=json.dumps(payload).encode(), topic="topic") for payload in (
+        {"result_id": envelope["result_id"]}, envelope["result_id"],
+        {**envelope, "arguments": {"query": "x" * (1024 * 1024)}})]
+    consumer = SimpleNamespace(receive=lambda *_args: messages, ack=Mock(),
+                               startup=lambda: None, shutdown=lambda: None)
+    callback = Mock()
+    transport = RocketMQSearchQueue(search_queue_settings(), consumer_factory=lambda: consumer)
+    try:
+        transport.consume_once(callback)
+        callback.assert_not_called()
+        consumer.ack.assert_not_called()
+    finally:
+        transport.close()
 
-    from rag_mcp.state.schema import search_tasks
-    from rag_mcp.state.search_tasks import SearchTaskSettings
 
+def test_safe_admission_and_terminal_logging_excludes_query(service, caplog):
+    caplog.set_level("INFO")
     state, _queue = service
-    state.search_tasks.settings = SearchTaskSettings(timeout_seconds=0.2)
-    result_id = submit(service)
-    task = state.search_tasks.claim(result_id)
-    original = state.results.save
-
-    def delayed_save(*args, **kwargs):
-        result = original(*args, **kwargs)
-        time.sleep(0.3)
-        return result
-
-    monkeypatch.setattr(state.results, "save", delayed_save)
-    assert state.search_tasks.complete(task, {"results": []}) is None
-    with state.engine.connect() as conn:
-        row = conn.execute(select(search_tasks)).mappings().one()
-        assert row["status"] == "timed_out"
-        assert json.loads(row["arguments"]) == {}
-        assert conn.scalar(select(search_result_snapshots.c.id)) is None
+    envelope = submit(service)
+    complete(state, envelope)
+    assert envelope["result_id"] in caplog.text
+    assert "admission confirmed" in caplog.text and "succeeded" in caplog.text
+    assert "private manual" not in caplog.text and "evidence" not in caplog.text
 
 
-@pytest.mark.parametrize("existing", ["queued", "processing", "succeeded", "failed", "timed_out", "unknown"])
-def test_dead_letter_is_idempotent_and_respects_first_terminal(service, existing):
-    from rag_mcp.state.schema import search_task_outbox, search_tasks
-
+def test_ttl_caps_execution_deadline_and_expiry_never_recreates_evicted_work(service):
     state, _queue = service
-    result_id = str(uuid4()) if existing == "unknown" else submit(service)
-    if existing == "processing":
-        state.search_tasks.claim(result_id)
-    elif existing == "succeeded":
-        complete(state, result_id)
-    elif existing == "failed":
-        state.search_tasks.fail(state.search_tasks.claim(result_id), retry=False)
-    elif existing == "timed_out":
-        with state.engine.begin() as conn:
-            conn.execute(update(search_tasks).where(search_tasks.c.result_id == result_id).values(deadline=0))
-    assert state.search_tasks.dead_letter(result_id) is True
-    assert state.search_tasks.dead_letter(result_id) is True
-    assert state.search_tasks.terminal(result_id)
-    with state.engine.connect() as conn:
-        row = conn.execute(select(search_tasks)).mappings().first()
-        if existing == "unknown":
-            assert row is None
-            return
-        expected = existing if existing in ("succeeded", "failed", "timed_out") else "failed"
-        assert row["status"] == expected
-        expected_stage = {"succeeded": "completed", "failed": "failed", "timed_out": "failed"}
-        assert row["stage"] == expected_stage.get(existing, "dead_letter")
-        assert json.loads(row["arguments"]) == {}
-        assert conn.scalar(select(search_task_outbox.c.pending))
-        assert bool(conn.scalar(select(search_result_snapshots.c.id))) == (existing == "succeeded")
+    state.results.settings = SnapshotSettings(ttl_seconds=2)
+    state.search_tasks.settings = SearchTaskSettings(timeout_seconds=100)
+    envelope = submit(service)
+    assert envelope["deadline"] == envelope["expires_at"]
+    state.search_tasks.transient.delete("search-result", envelope["result_id"])
+    assert state.search_tasks.claim(envelope) is None
+    assert state.search_tasks.terminal(envelope)
+    assert state.search_tasks.transient.get("search-result", envelope["result_id"]) is None
 
-
-def test_dead_letter_database_failure_propagates_without_ack(service, monkeypatch):
-    state, _queue = service
-    result_id = submit(service)
-
-    def unavailable(*_args):
-        raise ConnectionError("SQL unavailable")
-
-    monkeypatch.setattr(state.search_tasks, "_row", unavailable)
-    with pytest.raises(ConnectionError, match="SQL unavailable"):
-        state.search_tasks.dead_letter(result_id)
-
-
-@pytest.mark.parametrize("retry", [True, False])
-def test_failure_obeys_sql_deadline_not_provider_error_text(service, retry):
-    from rag_mcp.state.schema import search_tasks
-
-    state, _queue = service
-    result_id = submit(service)
-    task = state.search_tasks.claim(result_id)
-    state.search_tasks.fail(task, retry=retry, error="Search execution timed out")
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(search_tasks.c.status)) == ("queued" if retry else "failed")
-    result_id = submit(service)
-    task = state.search_tasks.claim(result_id)
-    with state.engine.begin() as conn:
-        conn.execute(update(search_tasks).where(search_tasks.c.result_id == result_id).values(deadline=0))
-    state.search_tasks.fail(task, retry=retry, error="provider error containing private token")
-    with state.engine.connect() as conn:
-        row = conn.execute(select(search_tasks).where(search_tasks.c.result_id == result_id)).mappings().one()
-        assert row["status"] == "timed_out"
-        assert json.loads(row["arguments"]) == {}
-        assert "private token" not in str(row)
-
-
-def test_dispatcher_only_expires_business_deadlines_never_redrives_processing(service):
-    from rag_mcp.state.schema import search_tasks
-
-    state, queue = service
-    result_id = submit(service)
-    state.search_dispatcher.run_once()
-    state.search_tasks.claim(result_id)
-    with state.engine.begin() as conn:
-        conn.execute(update(search_tasks).where(search_tasks.c.result_id == result_id).values(
-            lease_until=0, retry_at=0, updated_at=0))
-    assert state.search_dispatcher.run_once() == 0
-    assert queue.sent == [result_id]
-    assert state.search_tasks.get("manuals", result_id)["stage"] == "processing"
-    with state.engine.begin() as conn:
-        conn.execute(update(search_tasks).where(search_tasks.c.result_id == result_id).values(deadline=0))
-    state.search_dispatcher.run_once()
-    assert queue.sent == [result_id]
-    assert state.search_tasks.terminal(result_id)
-
-
-def test_retry_during_initial_delivery_does_not_reopen_outbox(service):
-    from rag_mcp.state.schema import search_task_outbox
-
-    state, _queue = service
-    result_id = submit(service)
-
-    class ImmediateConsumer:
-        def send(self, incoming):
-            state.search_tasks.fail(state.search_tasks.claim(incoming), retry=True)
-
-    state.search_tasks.dispatch(result_id, ImmediateConsumer())
-    with state.engine.connect() as conn:
-        row = conn.execute(select(search_task_outbox)).mappings().one()
-        assert row["pending"] is False
-        assert row["generation"] == 1
-
-
-def test_search_settings_only_configure_business_timeout(monkeypatch):
-    from rag_mcp.state.search_tasks import SearchTaskSettings
-
-    for key in ("RAG_SEARCH_MAX_ATTEMPTS", "RAG_SEARCH_LEASE_SECONDS", "RAG_SEARCH_RETRY_SECONDS"):
-        monkeypatch.setenv(key, "obsolete-invalid-config")
+def test_timeout_environment_and_result_ttl_are_independent(monkeypatch):
     monkeypatch.setenv("RAG_SEARCH_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("RAG_RESULT_TTL_SECONDS", "75")
     assert SearchTaskSettings.from_env() == SearchTaskSettings(timeout_seconds=30)
+    assert SnapshotSettings.from_env().ttl_seconds == 75
     assert set(SearchTaskSettings.__dataclass_fields__) == {"timeout_seconds"}
-    for value in (0, -1, float("inf"), float("nan"), True):
-        with pytest.raises(ValueError):
-            SearchTaskSettings(timeout_seconds=value)
+
+@pytest.mark.parametrize("field,value", [("arguments", {"query": "injected"}), ("created_at", 1)])
+def test_conflicting_envelope_never_mutates_admitted_request(service, field, value):
+    state, _queue = service
+    envelope = submit(service)
+    store = state.search_tasks.transient
+    before = store.get("search-result", envelope["result_id"])
+    assert state.search_tasks.claim({**envelope, field: value}) is None
+    assert store.get("search-result", envelope["result_id"]) == before
+    assert state.search_tasks.claim(envelope)["arguments"] == envelope["arguments"]
 
 
-@pytest.mark.parametrize("env_key,source", [
-    ("RAG_SEARCH_TOPIC", "cache"), ("RAG_SEARCH_TOPIC", "document"),
-    ("RAG_SEARCH_GROUP", "cache"), ("RAG_SEARCH_GROUP", "document"),
-])
-def test_search_queue_is_separate_from_other_queues(monkeypatch, env_key, source):
-    from rag_mcp.state.cache_queue import RocketMQSettings
-    from rag_mcp.state.document_queue import document_queue_settings
-    from rag_mcp.state.search_queue import search_queue_settings
-
-    cache = RocketMQSettings.from_env()
-    document = document_queue_settings()
-    settings = cache if source == "cache" else document
-    monkeypatch.setenv(env_key, settings.topic if env_key.endswith("TOPIC") else settings.group)
-    with pytest.raises(ValueError, match="separate"):
-        search_queue_settings()
-
-
-@pytest.mark.parametrize("outcome", ["processing", "succeeded", "failed", "timed_out", "dead_letter"])
-def test_only_producer_confirmation_archives_initial_outbox(service, outcome):
-    from rag_mcp.state.schema import search_task_outbox, search_tasks
+def test_uuid_collision_cannot_replace_another_tenant(service, monkeypatch):
+    import rag_mcp.state.search_tasks as module
 
     state, queue = service
-    result_id = submit(service)
-    task = state.search_tasks.claim(result_id)
-    if outcome == "succeeded":
-        state.search_tasks.complete(task, {"results": []})
-    elif outcome == "failed":
-        state.search_tasks.fail(task, retry=False)
-    elif outcome == "timed_out":
-        with state.engine.begin() as conn:
-            conn.execute(update(search_tasks).where(search_tasks.c.result_id == result_id).values(deadline=0))
-        state.search_tasks.expire()
-    elif outcome == "dead_letter":
-        state.search_tasks.dead_letter(result_id)
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(search_task_outbox.c.pending)) is True
-    state.search_dispatcher.run_once()
-    assert queue.sent == [result_id]
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(search_task_outbox.c.pending)) is False
+    envelope = submit(service)
+    before = state.search_tasks.transient.get("search-result", envelope["result_id"])
+    monkeypatch.setattr(module, "uuid4", lambda: envelope["result_id"])
+    with pytest.raises(RuntimeError, match="admission"):
+        state.search_dispatcher.submit("other", {"query": "injected"})
+    assert len(queue.sent) == 1
+    assert state.search_tasks.transient.get("search-result", envelope["result_id"]) == before
 
 
-def test_completed_callback_before_send_confirmation_is_still_archived(service):
-    from rag_mcp.state.schema import search_task_outbox
+def test_unicode_wire_expansion_is_bounded_before_admission(service):
+    state, queue = service
+    # Raw UTF-8 fits 1 MiB; MQ JSON ASCII escaping would exceed the envelope bound.
+    with pytest.raises(ValueError, match="envelope"):
+        state.search_dispatcher.submit("manuals", {"query": "中" * 200_000})
+    assert queue.sent == []
+    assert state.cache_sync.backend._connection().values == {}
+
+
+def test_uncertain_broker_send_cannot_execute_failed_attempt_on_redelivery(service):
+    from rag_mcp.search_worker import SearchWorker
+
+    state, queue = service
+    send = queue.send
+
+    def lose_receipt(envelope):
+        send(envelope)
+        raise TimeoutError("private receipt lost")
+
+    queue.send = lose_receipt
+    with pytest.raises(RuntimeError, match="not confirmed"):
+        state.search_dispatcher.submit("manuals", {"query": "manual"})
+    original = queue.sent[0]
+    worker = SearchWorker(SimpleNamespace(state=state), executor=lambda *_args: pytest.fail("failed admission"))
+    assert worker.process(original)
+    queue.send = send
+    retried_id = state.search_dispatcher.submit("manuals", {"query": "manual"})["result_id"]
+    # Search has no client idempotency key: each new submission is a new invocation.
+    assert retried_id != original["result_id"]
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_redelivery_missing_or_expired_state_is_acknowledged_without_execution(service, missing):
+    from rag_mcp.search_worker import SearchWorker
 
     state, _queue = service
-    result_id = submit(service)
-
-    class ImmediateConsumer:
-        def send(self, incoming):
-            complete(state, incoming)
-            with state.engine.connect() as conn:
-                assert conn.scalar(select(search_task_outbox.c.pending)) is True
-
-    state.search_tasks.dispatch(result_id, ImmediateConsumer())
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(search_task_outbox.c.pending)) is False
+    envelope = submit(service)
+    if missing:
+        state.search_tasks.transient.delete("search-result", envelope["result_id"])
+    else:
+        state.search_tasks.clock = lambda: envelope["expires_at"]
+    worker = SearchWorker(SimpleNamespace(state=state), executor=lambda *_args: pytest.fail("expired work"))
+    assert worker.process(envelope)
+    row = state.search_tasks.transient.get("search-result", envelope["result_id"])
+    assert row is None if missing else row["status"] == "timed_out"
 
 
-def test_confirmation_loss_can_resend_completed_job_without_recomputing(service):
-    from rag_mcp.state.schema import search_task_outbox
+def test_transport_redis_read_failure_never_acknowledges(service):
+    from rag_mcp.search_worker import SearchWorker
 
-    state, queue = service
-    result_id = submit(service)
+    state, _queue = service
+    envelope = submit(service)
+    state.cache_sync.backend._connection().broken = True
+    message = SimpleNamespace(body=json.dumps(envelope).encode(), topic="topic")
+    consumer = SimpleNamespace(receive=lambda *_args: [message], ack=Mock(),
+                               startup=lambda: None, shutdown=lambda: None)
+    worker = SearchWorker(SimpleNamespace(state=state), executor=lambda *_args: pytest.fail("Redis unavailable"))
+    transport = RocketMQSearchQueue(search_queue_settings(), consumer_factory=lambda: consumer)
+    try:
+        with pytest.raises(RuntimeError, match="Redis"):
+            transport.consume_once(worker.process)
+        consumer.ack.assert_not_called()
+    finally:
+        transport.close()
 
-    class ConfirmationLost:
-        def send(self, incoming):
-            complete(state, incoming)
-            raise ConnectionError("send acknowledgement lost")
-
-    with pytest.raises(ConnectionError):
-        state.search_tasks.dispatch(result_id, ConfirmationLost())
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(search_task_outbox.c.pending)) is True
-    assert state.search_tasks.claim(result_id) is None
-    state.search_tasks.dispatch_pending(queue)
-    assert queue.sent == [result_id]
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(search_task_outbox.c.pending)) is False
+@pytest.mark.parametrize("change", [{"namespace": "other"}, {"arguments": {"query": "injected"}}])
+def test_conflicting_dead_letter_envelope_cannot_fail_admitted_job(service, change):
+    state, _queue = service
+    envelope = submit(service)
+    before = state.search_tasks.transient.get("search-result", envelope["result_id"])
+    assert state.search_tasks.dead_letter({**envelope, **change})
+    assert state.search_tasks.transient.get("search-result", envelope["result_id"]) == before
+    complete(state, envelope)
+    assert state.search_tasks.dead_letter(envelope)
+    assert state.search_tasks.get("manuals", envelope["result_id"])["results"] == [{"text": "evidence"}]

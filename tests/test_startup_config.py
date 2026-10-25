@@ -1,11 +1,11 @@
 """Persistent startup configuration and a real isolated service launch."""
 
 import os
-from pathlib import Path
 import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -44,20 +44,36 @@ def test_document_worker_settings_can_be_loaded_from_config(tmp_path, monkeypatc
 RAG_DOCUMENT_TOPIC = "documents"
 RAG_DOCUMENT_GROUP = "document_workers"
 RAG_DOCUMENT_DLQ_GROUP = "document_workers_dlq"
-RAG_DOCUMENT_DISPATCH_LEASE_SECONDS = "40"
-RAG_DOCUMENT_DISPATCH_RETRY_SECONDS = "3"
-RAG_DOCUMENT_DISPATCH_MAX_RETRY_SECONDS = "180"
-RAG_DOCUMENT_DISPATCH_ALERT_SECONDS = "90"
+RAG_DOCUMENT_BROKER_MAX_RETRIES = "24"
+RAG_RESULT_TTL_SECONDS = "7200"
 ''', encoding="utf-8")
     monkeypatch.setattr(os, "environ", {"RAG_CONFIG_FILE": str(path)})
     load_service_config()
     assert os.environ["RAG_DOCUMENT_TOPIC"] == "documents"
     assert os.environ["RAG_DOCUMENT_GROUP"] == "document_workers"
     assert os.environ["RAG_DOCUMENT_DLQ_GROUP"] == "document_workers_dlq"
-    from rag_mcp.state.document_tasks import DocumentDispatchSettings
+    from rag_mcp.state.document_queue import document_queue_settings
+    from rag_mcp.state.result_snapshots import SnapshotSettings
 
-    dispatch = DocumentDispatchSettings.from_env()
-    assert (dispatch.lease_seconds, dispatch.retry_seconds, dispatch.max_retry_seconds, dispatch.alert_seconds) == (40, 3, 180, 90)
+    queue = document_queue_settings()
+    assert (queue.topic, queue.group) == ("documents", "document_workers")
+    assert os.environ["RAG_DOCUMENT_BROKER_MAX_RETRIES"] == "24"
+    assert SnapshotSettings.from_env().ttl_seconds == 7200
+
+
+def test_legacy_document_task_settings_are_accepted_but_ignored(tmp_path, monkeypatch):
+    legacy = {
+        "RAG_DOCUMENT_MAX_ATTEMPTS": "5", "RAG_DOCUMENT_LEASE_SECONDS": "40",
+        "RAG_DOCUMENT_RETRY_SECONDS": "3", "RAG_DOCUMENT_DISPATCH_LEASE_SECONDS": "40",
+        "RAG_DOCUMENT_DISPATCH_RETRY_SECONDS": "3", "RAG_DOCUMENT_DISPATCH_MAX_RETRY_SECONDS": "180",
+        "RAG_DOCUMENT_DISPATCH_ALERT_SECONDS": "90",
+    }
+    path = tmp_path / "config.toml"
+    path.write_text('[environment]\n' + '\n'.join(f'{key} = "{value}"' for key, value in legacy.items()),
+                    encoding="utf-8")
+    monkeypatch.setattr(os, "environ", {"RAG_CONFIG_FILE": str(path)})
+    load_service_config()
+    assert not legacy.keys() & os.environ.keys()
 
 
 def test_search_worker_settings_can_be_loaded_from_config(tmp_path, monkeypatch):

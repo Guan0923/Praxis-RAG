@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+
 from rag_mcp.config import RagConfig, RagConfigError
 from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.migrate import discover_legacy_sources, namespace_for_legacy_user
@@ -271,3 +272,25 @@ def test_legacy_migration_preview_discovers_sources_without_moving_them(tmp_path
     assert found == [(user_id, [source])]
     assert namespace_for_legacy_user(user_id).startswith("user-")
     assert source.exists()
+
+
+@pytest.mark.parametrize("failure", ["redis_disabled", "redis_error"])
+def test_http_search_result_loss_fails_closed_without_sql_replay(tmp_path, failure):
+    from test_mcp_http import ProtocolRuntime
+
+    from rag_mcp.state.cache import RedisStateCache, StateCacheSettings
+
+    runtime = ProtocolRuntime(tmp_path)
+    saved = runtime.state.results.save(NAMESPACE, {"query": "retained", "results": [{"text": "frozen"}]})
+    if failure == "redis_disabled":
+        runtime.state.cache_sync.backend = RedisStateCache(StateCacheSettings(enabled=False))
+    else:
+        runtime.state.cache_sync.backend._connection().broken = True
+    try:
+        settings = RagHttpSettings(data_root=tmp_path, token="test-token")
+        client = TestClient(create_service_app(runtime, settings=settings))
+        response = client.get("/v1/search-results/" + saved["result_id"], headers=AUTH)
+        assert response.status_code == 410
+        assert runtime.search_calls == []
+    finally:
+        runtime.state.close()

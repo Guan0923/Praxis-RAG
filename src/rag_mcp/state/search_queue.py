@@ -1,14 +1,14 @@
-"""Dedicated UUID-only search transport and independent durable outbox relay."""
+"""Dedicated full-request search transport with synchronous broker admission."""
 
 from __future__ import annotations
 
 import logging
 import os
-import threading
 from dataclasses import replace
 
 from .cache_queue import RocketMQSettings
 from .document_queue import RocketMQDocumentQueue, document_queue_settings
+from .search_tasks import validate_search_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -30,57 +30,53 @@ def search_queue_settings():
 
 class RocketMQSearchQueue(RocketMQDocumentQueue):
     message_key = "result_id"
+    validate_payload = staticmethod(validate_search_envelope)
+
+    def send(self, payload):
+        payload = validate_search_envelope(payload)
+        return self._send_payload(payload, payload["result_id"])
+
+    def consume_once(self, callback):
+        return self._consume_payload_once(callback, validate_search_envelope)
 
 
 class SearchTaskDispatcher:
-    """Admission does not connect to the broker or execute retrieval in the API."""
-
     def __init__(self, state, transport=None):
         self.tasks = state.search_tasks
         settings = search_queue_settings()
         self.transport = transport if transport is not None else (
             RocketMQSearchQueue(settings) if settings.endpoint else None)
-        self._stop = threading.Event()
-        self._wake = threading.Event()
-        self._thread = None
-        self._lifecycle_lock = threading.Lock()
 
     def submit(self, namespace, arguments_dict):
-        result_id = self.tasks.submit(namespace, arguments_dict)
-        self._wake.set()
-        return {"result_id": result_id}
+        if self.transport is None:
+            raise RuntimeError("Search broker unavailable")
+        envelope = self.tasks.submit(namespace, arguments_dict)
+        try:
+            self.transport.send(envelope)
+            # A broker send alone is not acceptance if its poll state is unavailable.
+            if self.tasks._read(namespace, envelope["result_id"]) is None:
+                raise RuntimeError("Search admission unavailable")
+        except Exception as exc:  # noqa: BLE001 - unconfirmed admission must never return success
+            logger.warning("Search admission unconfirmed result_id=%s category=%s",
+                           envelope["result_id"], type(exc).__name__)
+            try:
+                self.tasks.fail(envelope, retry=False)
+            except Exception as cleanup_error:  # noqa: BLE001 - Redis may also be unavailable
+                logger.warning("Search admission cleanup unavailable result_id=%s category=%s",
+                               envelope["result_id"], type(cleanup_error).__name__)
+            raise RuntimeError("Search queue acceptance was not confirmed") from None
+        logger.info("Search admission confirmed result_id=%s", envelope["result_id"])
+        return {"result_id": envelope["result_id"]}
 
     def run_once(self):
-        self.tasks.expire()
-        return self.tasks.dispatch_pending(self.transport)
+        return 0
 
     def start(self):
-        with self._lifecycle_lock:
-            if self.transport is None or self._thread is not None:
-                return
-            self._stop.clear()
-
-            def relay():
-                while not self._stop.is_set():
-                    self._wake.clear()
-                    try:
-                        self.run_once()
-                    except Exception as exc:  # noqa: BLE001 - retry durable outbox after SQL/broker failures
-                        logger.warning("Search outbox unavailable (%s)", type(exc).__name__)
-                    self._wake.wait(1)
-
-            self._thread = threading.Thread(target=relay, name="search-outbox", daemon=True)
-            self._thread.start()
+        return None
 
     def stop(self):
-        with self._lifecycle_lock:
-            self._stop.set()
-            self._wake.set()
-            if self._thread is not None:
-                self._thread.join()
-                self._thread = None
+        return None
 
     def close(self):
-        self.stop()
         if self.transport is not None:
             self.transport.close()

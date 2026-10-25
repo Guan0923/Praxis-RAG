@@ -1,6 +1,5 @@
 """Bounded MCP waits and immutable snapshot publication without retrieval repeats."""
 
-import json
 import threading
 import time
 from types import SimpleNamespace
@@ -8,15 +7,12 @@ from uuid import uuid4
 
 import anyio
 import pytest
-from sqlalchemy import select
+from test_search_tasks import service as service  # noqa: PLC0414 - pytest fixture registration
 
 from rag_mcp.contracts import SearchValidationError
 from rag_mcp.mcp_http import McpHttpEndpoint
 from rag_mcp.server import QueuedSearchRequest, create_registry, search_tool_definition
 from rag_mcp.state.result_snapshots import SnapshotUnavailable
-from rag_mcp.state.schema import search_result_snapshots
-from rag_mcp.state.settings import StateSettings
-from rag_mcp.state.store import StateStores
 
 
 @pytest.mark.parametrize("wait", [-1, 31, True, "5", None, float("nan"), float("inf")])
@@ -159,27 +155,16 @@ def test_failed_job_is_mcp_error_not_queued():
     assert "deadline" in result.content[0].text
 
 
-def test_snapshot_transaction_never_caches_rolled_back_result(tmp_path, monkeypatch):
-    state = StateStores(StateSettings(url=f"sqlite+pysqlite:///{tmp_path / 'snapshots.sqlite3'}"))
-    cached = []
-    monkeypatch.setattr(state.results, "_cache", lambda *args: cached.append(args))
-    result_id = str(uuid4())
-    try:
-        with pytest.raises(RuntimeError, match="abort"), state.engine.begin() as conn:
-            state.results.save("manuals", {"results": [{"text": "uncommitted"}]},
-                               result_id=result_id, conn=conn)
-            assert cached == []
-            raise RuntimeError("abort")
-        with state.engine.connect() as conn:
-            assert conn.scalar(select(search_result_snapshots.c.id)) is None
-        state.results.cache_saved("manuals", result_id)
-        assert cached == []
-        with state.engine.begin() as conn:
-            state.results.save("manuals", {"results": [{"text": "committed"}]},
-                               result_id=result_id, conn=conn)
-            assert cached == []
-        state.results.cache_saved("manuals", result_id)
-        assert len(cached) == 1
-        assert json.loads(cached[0][2])["payload"]["result_id"] == result_id
-    finally:
-        state.close()
+def test_completion_publishes_bytes_and_status_before_returning_ack(service):
+    from test_search_tasks import submit
+
+    from rag_mcp.search_worker import SearchWorker
+
+    state, _queue = service
+    envelope = submit(service)
+    worker = SearchWorker(SimpleNamespace(state=state), executor=lambda *_args: {"results": [{"text": "ready"}]})
+    assert worker.process(envelope) is True
+    row = state.search_tasks.transient.get("search-result", envelope["result_id"])
+    assert row["status"] == "succeeded"
+    assert row["payload"]["results"] == [{"text": "ready"}]
+    assert row["payload"]["result_id"] == envelope["result_id"]

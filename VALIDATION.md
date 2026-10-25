@@ -1,10 +1,40 @@
-# UUID results/artifacts and logical deletion — 2026-10-23
+# Historical UUID results/artifacts and logical deletion — 2026-10-23
 
-- Confirmed one-hour expiry, full backward-compatible search responses, and
-  del_flag soft deletion that hides new access but preserves existing UUIDs.
-- Results are immutable SQL snapshots with optional Redis acceleration/fallback;
-  artifact bytes have their own durable version-bound snapshots. No UUID read
-  calls Embedding, retrieval, reranking or parsing.
+The dated results below describe their tested revisions, not verification of the
+current architecture migration. The approved active design uses schema 2 complete
+RocketMQ requests (document chunks: at most 512 KiB decoded; files: at most 10 MiB),
+all-message broker confirmation before API success, and required Redis transient
+task/reassembly/result storage. Search snapshots use `RAG_RESULT_TTL_SECONDS=3600`
+with no SQL fallback. Task CAS and atomic result/success writes are Redis-local,
+not an atomic Redis+MySQL transaction. MySQL retains published documents/blobs,
+KB/API keys/catalog, artifact snapshots and UploadJournal operations/leases;
+document success follows durable publication, reconciled via journal on retry.
+Old task/outbox/result tables are retained but inactive, with no job/result
+migration. Drain old workers before deploying API/workers together: schema 2 is
+incompatible with UUID-only messages. See [deployment](docs/USAGE.md) and
+[storage boundaries](docs/state-storage.md).
+
+Current migration validation — 2026-10-25:
+
+- Non-browser suite: **841 passed, 37 skipped, 1 deselected** in 141.35 seconds.
+- Three browser files (`test_browser_model_options.py`,
+  `test_browser_navigation.py`, `test_browser_word.py`) excluded because collection
+  requires missing Playwright; it was not installed for these unrelated tests.
+- Deselected `tests/test_model_api_settings.py::test_failed_reembedding_preserves_old_configuration_and_index[publish]`:
+  the same failure was separately reproduced from pristine HEAD in an isolated
+  extracted checkout. Known pre-existing failure; not fixed by this migration.
+- Changed/added Python files have zero **new** Ruff findings versus HEAD;
+  existing baseline findings remain. `git diff --check` passed.
+- No live RocketMQ/Redis validation or runtime deployment verification is claimed.
+
+- At this revision, confirmed one-hour expiry, full backward-compatible search
+  responses, and del_flag soft deletion hiding new access while preserving UUIDs.
+  Current durable retention guarantees apply to MySQL artifacts; Redis search
+  result IDs can become unavailable after data loss/TTL expiry.
+- This historical revision used immutable SQL result snapshots with optional
+  Redis acceleration/fallback; that design is superseded, not the active contract.
+  Artifact bytes had their own durable version-bound snapshots. No UUID read
+  called Embedding, retrieval, reranking or parsing.
 - Available Python regression: 618 passed, 31 skipped; three optional browser
   modules excluded. Existing four MCP deprecation warnings remain.
 - Real MySQL/Redis/Qdrant UUID, cache and transaction suites: 16 passed using
@@ -20,9 +50,12 @@
   response types changed and no new frontend interaction is claimed.
 - No production data migration or deletion was performed during validation.
 
-# UUID results/artifacts validation — 2026-10-22
+# Historical UUID results/artifacts validation — 2026-10-22
 
-- Confirmed policy: Redis-only search result snapshots, 3600-second default TTL,
+These are historical checks of the then-current snapshot implementation, not
+schema 2 queued-request, chunk replay/ACK or migration acceptance verification.
+
+- Policy confirmed at that revision: Redis-only search result snapshots, 3600-second default TTL,
   full search response preserved. Missing/expired/evicted results never re-run
   inference. Issued version-bound artifacts remain readable after source deletion
   until their expiry; each request still checks current namespace authorization.
@@ -35,10 +68,16 @@
   prefixes and Qdrant collections were cleaned; no production data modified.
 - Ruff F/E9 and diff checks passed; editor diagnostics clean on UUID storage,
   runtime and MCP/REST modules.
-- Redis outage/oversized snapshot returns original search results with explicit
-  snapshot_available=false; lookup of an unavailable result returns an error.
+- At that revision, Redis outage/oversized snapshot returned synchronous search
+  results with explicit snapshot_available=false; unavailable-result lookup errored.
+  This is not queued MCP acceptance during an outage: queued operations require
+  Redis/MQ and all broker confirmations, with no durable SQL fallback.
 
-# Second-batch state-cache validation — 2026-10-22
+# Historical second-batch state-cache validation — 2026-10-22
+
+These checks concern MySQL-backed display read models, not the new Redis-only
+MCP task/reassembly/result stores. Raw-input exclusion for these display views
+does not forbid temporary raw document chunks in Redis reassembly.
 
 - Confirmed strict mode: API-key authentication, Qdrant version selection, lease
   claims/renewal/fencing, commit and rollback remain authoritative SQL reads.
@@ -57,7 +96,11 @@
 - Ruff F/E9 passed; editor reports no errors on changed integration files.
 - No production document or API-key data was modified by the live test suite.
 
-# First-batch state-cache validation — 2026-10-22
+# Historical first-batch state-cache validation — 2026-10-22
+
+Redis-outage fallback and SQL outbox statements in this section apply only to
+persistent MySQL read-model refresh. They do not provide SQL acceptance or result
+fallback for queued MCP uploads/search in the current architecture.
 
 - Cached public knowledge-base configuration, MCP catalog, document lists and
   knowledge-base list/statistics; actual authorization/upload fencing remains
@@ -76,10 +119,13 @@
   production documents/credentials were not migrated or modified by these tests.
 - Ruff F/E9 passed; no editor diagnostics on new cache code and integration paths.
 
-# Durable upload validation — 2026-10-21
+# Historical durable upload validation — 2026-10-21
 
-- HTTP/MCP uploads now share write-ahead operation/step logs, renewable MySQL
-  leases, immutable version staging, atomic head publication and recovery.
+- HTTP/MCP uploads at this revision shared write-ahead operation/step logs,
+  renewable MySQL leases, immutable version staging, atomic head publication and
+  recovery. These MySQL publication/recovery guarantees remain; they do not mean
+  the new queued MCP request or Redis success state is atomically committed with
+  MySQL, nor verify the new broker-confirmed submission/chunk protocol.
 - Python regression (excluding three unavailable browser modules): 329 passed,
   18 skipped, four existing MCP deprecation warnings. After the final version-byte
   deletion check, focused transaction/protocol regression: 143 passed, 2 skipped.

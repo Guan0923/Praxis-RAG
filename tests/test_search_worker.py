@@ -1,18 +1,18 @@
-"""Owned search subprocess termination and independent-task resource bounds."""
+"""Owned spawned retrieval, bounded deadlines and publish-before-ACK behavior."""
 
 import multiprocessing
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from test_search_tasks import service as service  # noqa: PLC0414 - pytest fixture registration
+from test_search_tasks import submit
 
 from rag_mcp.config import RagConfig
 from rag_mcp.search_worker import SearchWorker
-from rag_mcp.state.schema import search_result_snapshots, search_tasks
 from rag_mcp.state.search_tasks import SearchTaskSettings
-from rag_mcp.state.settings import StateSettings
-from rag_mcp.state.store import StateStores
 
 
 def sleeping_search(connection, _config, _settings, _root, _namespace, _arguments):
@@ -20,183 +20,145 @@ def sleeping_search(connection, _config, _settings, _root, _namespace, _argument
 
 
 def large_search(connection, _config, _settings, _root, _namespace, _arguments):
-    # Same child-to-parent envelope as the production target.
     connection.send((True, {"results": [{"text": "x" * (2 * 1024 * 1024)}]}))
     connection.close()
 
 
 @pytest.fixture
-def worker_state(tmp_path, monkeypatch):
-    monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
-    monkeypatch.delenv("RAG_REDIS_URL", raising=False)
-    state = StateStores(StateSettings(url=f"sqlite+pysqlite:///{tmp_path / 'worker.sqlite3'}"))
-    state.knowledge_bases.create({"namespace": "manuals", "collection": "test"})
-    runtime = SimpleNamespace(state=state, config=RagConfig(backend="qdrant"), data_root=tmp_path)
-    yield runtime
-    state.close()
+def worker_state(service, tmp_path):
+    state, _queue = service
+    state.settings = None
+    return SimpleNamespace(state=state, config=RagConfig(backend="qdrant"), data_root=tmp_path)
 
 
-def test_task_deadline_terminates_only_owned_inference_process(worker_state, monkeypatch):
+def test_task_deadline_terminates_only_owned_inference_process(service, worker_state, monkeypatch):
     import rag_mcp.search_worker as module
 
-    runtime = worker_state
-    state = runtime.state
+    state = worker_state.state
     state.search_tasks.settings = SearchTaskSettings(timeout_seconds=1)
-    task_id = state.search_tasks.submit("manuals", {"query": "slow"})
-    # submit's durable API may return the UUID or its response mapping.
-    result_id = task_id["result_id"] if isinstance(task_id, dict) else task_id
+    envelope = submit(service)
     monkeypatch.setattr(module, "_execute_search", sleeping_search)
-
-    def forbidden(_task):
-        pytest.fail("Spawned search must not renew a SQL execution lease")
-
-    monkeypatch.setattr(state.search_tasks, "heartbeat", forbidden, raising=False)
     before = {process.pid for process in multiprocessing.active_children()}
-    worker = SearchWorker(runtime)
+    worker = SearchWorker(worker_state)
     try:
         started = time.monotonic()
-        worker.process(result_id)
+        assert worker.process(envelope)
         assert time.monotonic() - started < 8
         assert {process.pid for process in multiprocessing.active_children()} <= before
-        with state.engine.connect() as conn:
-            status = conn.scalar(select(search_tasks.c.status).where(search_tasks.c.result_id == result_id))
-            assert status == "timed_out"
-            assert conn.scalar(select(search_result_snapshots.c.id)) is None
+        row = state.search_tasks.transient.get("search-result", envelope["result_id"])
+        assert row["status"] == "timed_out" and "payload" not in row
     finally:
         worker.close()
 
 
-def test_injected_executor_never_heartbeats_and_ignores_legacy_leases(worker_state, monkeypatch):
-    from sqlalchemy import update
-
-    runtime = worker_state
-    state = runtime.state
-    result_id = state.search_tasks.submit("manuals", {"query": "manual"})
-    with state.engine.begin() as conn:
-        conn.execute(update(search_tasks).where(search_tasks.c.result_id == result_id).values(
-            owner="old-worker", lease_until=10**12, attempts=1000, retry_at=10**12))
-
-    def forbidden(_task):
-        pytest.fail("Search worker must not renew a SQL execution lease")
-
-    monkeypatch.setattr(state.search_tasks, "heartbeat", forbidden, raising=False)
-    calls = []
-
-    def execute(namespace, arguments):
-        calls.append((namespace, arguments))
-        return {"results": [{"text": "answer"}]}
-
-    worker = SearchWorker(runtime, executor=execute)
-    try:
-        assert worker.process(result_id)
-        assert worker.process(result_id)
-        assert calls == [("manuals", {"query": "manual"})]
-        assert state.search_tasks.get("manuals", result_id)["results"][0]["text"] == "answer"
-    finally:
-        worker.close()
-
-
-def test_large_child_response_is_drained_before_join(worker_state, monkeypatch):
+def test_large_child_response_is_drained_before_join(service, worker_state, monkeypatch):
     import rag_mcp.search_worker as module
 
-    runtime = worker_state
-    state = runtime.state
-    task_id = state.search_tasks.submit("manuals", {"query": "large"})
-    result_id = task_id["result_id"] if isinstance(task_id, dict) else task_id
+    envelope = submit(service)
     monkeypatch.setattr(module, "_execute_search", large_search)
-    worker = SearchWorker(runtime)
+    worker = SearchWorker(worker_state)
     try:
-        assert worker.process(result_id)
-        result = state.search_tasks.get("manuals", result_id)
+        assert worker.process(envelope)
+        result = worker_state.state.search_tasks.get("manuals", envelope["result_id"])
         assert len(result["results"][0]["text"]) == 2 * 1024 * 1024
     finally:
         worker.close()
 
 
 @pytest.mark.parametrize("permanent", [False, True])
-def test_execution_failure_is_safe_and_only_broker_retries(worker_state, permanent):
-    from sqlalchemy import update
+def test_failure_is_safe_and_only_broker_retries(service, worker_state, permanent, caplog):
+    envelope = submit(service)
 
-    from rag_mcp.state.schema import search_task_outbox
-
-    state = worker_state.state
-    result_id = state.search_tasks.submit("manuals", {"query": "manual"})
-    with state.engine.begin() as conn:
-        conn.execute(update(search_task_outbox).values(pending=False))
-
-    def execute(_namespace, _arguments):
-        error = ValueError if permanent else ConnectionError
-        raise error("private-provider-credential")
+    def execute(*_args):
+        raise (ValueError if permanent else ConnectionError)("private-provider-credential")
 
     worker = SearchWorker(worker_state, executor=execute)
-    try:
-        assert worker.process(result_id) is permanent
-        with state.engine.connect() as conn:
-            row = conn.execute(select(search_tasks)).mappings().one()
-            assert row["status"] == ("failed" if permanent else "queued")
-            assert row["stage"] == ("failed" if permanent else "retry_wait")
-            assert "private-provider-credential" not in str(row)
-            assert not conn.scalar(select(search_task_outbox.c.pending))
-            assert conn.scalar(select(search_result_snapshots.c.id)) is None
-    finally:
-        worker.close()
+    assert worker.process(envelope) is permanent
+    row = worker_state.state.search_tasks.transient.get("search-result", envelope["result_id"])
+    assert row["status"] == ("failed" if permanent else "queued")
+    assert row["stage"] == ("failed" if permanent else "retry_wait")
+    assert "private-provider-credential" not in str(row) + caplog.text
+
+
+def test_results_exist_before_ack_and_duplicate_delivery_does_not_reexecute(service, worker_state):
+    envelope = submit(service)
+    calls = []
+
+    def execute(namespace, arguments):
+        calls.append((namespace, arguments))
+        return {"results": [{"text": "answer"}]}
+
+    worker = SearchWorker(worker_state, executor=execute)
+    assert worker.process(envelope) is True
+    assert worker_state.state.results.get("manuals", envelope["result_id"])["results"] == [{"text": "answer"}]
+    assert worker.process(envelope) is True
+    assert len(calls) == 1
+
+
+def test_wrong_namespace_and_expired_delivery_never_invoke_executor(service, worker_state):
+    envelope = submit(service)
+    worker = SearchWorker(worker_state, executor=lambda *_args: pytest.fail("must not execute"))
+    assert worker.process({**envelope, "namespace": "other"})
+    worker_state.state.search_tasks.clock = lambda: envelope["expires_at"]
+    assert worker.process(envelope)
+    with pytest.raises(ValueError, match="envelope"):
+        worker.process(envelope["result_id"])
 
 
 @pytest.mark.parametrize("loser_fails", [False, True])
-def test_duplicate_workers_compute_but_first_terminal_wins(worker_state, loser_fails):
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
+def test_duplicate_workers_first_terminal_wins(service, worker_state, loser_fails):
+    envelope = submit(service)
+    barrier = Barrier(2)
+    published = Event()
 
-    runtime = worker_state
-    result_id = runtime.state.search_tasks.submit("manuals", {"query": "duplicate"})
-    barrier = threading.Barrier(2)
-    winner_committed = threading.Event()
-
-    def winner(_namespace, _arguments):
+    def winner(*_args):
         barrier.wait(timeout=5)
         return {"results": [{"text": "winner"}]}
 
-    def loser(_namespace, _arguments):
+    def loser(*_args):
         barrier.wait(timeout=5)
-        assert winner_committed.wait(5)
+        assert published.wait(5)
         if loser_fails:
-            raise ConnectionError("private credential")
+            raise ConnectionError("private")
         return {"results": [{"text": "loser"}]}
 
-    first = SearchWorker(runtime, executor=winner)
-    second = SearchWorker(runtime, executor=loser)
+    first = SearchWorker(worker_state, executor=winner)
+    second = SearchWorker(worker_state, executor=loser)
 
     def process_first():
         try:
-            return first.process(result_id)
+            return first.process(envelope)
         finally:
-            winner_committed.set()
+            published.set()
 
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(process_first), pool.submit(second.process, result_id)]
-            assert all(future.result(timeout=10) for future in futures)
-        result = runtime.state.search_tasks.get("manuals", result_id)
-        assert result["results"][0]["text"] == "winner"
-    finally:
-        first.close()
-        second.close()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(process_first), pool.submit(second.process, envelope)]
+        assert all(future.result(timeout=10) for future in futures)
+    assert worker_state.state.results.get("manuals", envelope["result_id"])["results"] == [{"text": "winner"}]
 
 
-def test_worker_sql_failure_propagates_instead_of_acknowledging(worker_state, monkeypatch):
-    state = worker_state.state
-    result_id = state.search_tasks.submit("manuals", {"query": "manual"})
+def test_redis_publication_failure_does_not_ack(service, worker_state):
+    envelope = submit(service)
 
-    def unavailable(*_args, **_kwargs):
-        raise ConnectionError("SQL unavailable")
+    def execute(*_args):
+        worker_state.state.cache_sync.backend._connection().broken = True
+        return {"results": []}
 
-    monkeypatch.setattr(state.search_tasks, "complete", unavailable)
-    monkeypatch.setattr(state.search_tasks, "fail", unavailable)
-    worker = SearchWorker(worker_state, executor=lambda *_args: {"results": []})
-    try:
-        with pytest.raises(ConnectionError, match="SQL unavailable"):
-            worker.process(result_id)
-        with state.engine.connect() as conn:
-            assert conn.scalar(select(search_result_snapshots.c.id)) is None
-    finally:
-        worker.close()
+    worker = SearchWorker(worker_state, executor=execute)
+    with pytest.raises(RuntimeError, match="Redis"):
+        worker.process(envelope)
+
+
+def test_lost_completion_response_does_not_overwrite_saved_result(service, worker_state, monkeypatch):
+    envelope = submit(service)
+    tasks = worker_state.state.search_tasks
+    complete = tasks.complete
+
+    def lose_response(*args):
+        complete(*args)
+        raise ConnectionError("private lost response")
+
+    monkeypatch.setattr(tasks, "complete", lose_response)
+    worker = SearchWorker(worker_state, executor=lambda *_args: {"results": [{"text": "saved"}]})
+    assert worker.process(envelope)
+    assert tasks.get("manuals", envelope["result_id"])["results"] == [{"text": "saved"}]

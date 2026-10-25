@@ -186,8 +186,8 @@ def test_real_redis_snapshot_ttl_nx_namespace_and_exact_key_loss(live_state):
     payload = {"results": [{"rank": index + 1, "text": f"retained {index}", "score": index / 10}
                            for index in range(5)], "debug": {"retrieval": "embedding"}}
     saved = snapshots.save(namespace, payload, result_id=result_id)
-    key = snapshots._key(namespace, result_id)
-    assert key.startswith(state.cache_sync.backend.settings.prefix + ":search-result:")
+    key = snapshots.transient._key("search-result", result_id)
+    assert key.startswith(state.cache_sync.backend.settings.prefix + ":transient:")
     encoded = client.get(key)
     assert json.loads(encoded)["namespace"] == namespace
     assert 0 < client.pttl(key) <= 30_000
@@ -202,7 +202,7 @@ def test_real_redis_snapshot_ttl_nx_namespace_and_exact_key_loss(live_state):
 
     other = snapshots.save(namespace + "-other", {"results": [{"text": "other tenant"}]})
     other_id = other["result_id"]
-    other_key = snapshots._key(namespace + "-other", other_id)
+    other_key = snapshots.transient._key("search-result", other_id)
     assert other_key != key
     assert snapshots.get(namespace + "-other", other_id)["results"] == other["results"]
     expired = ResultSnapshots(state, settings=snapshots.settings, clock=lambda: saved["expires_at"])
@@ -210,15 +210,17 @@ def test_real_redis_snapshot_ttl_nx_namespace_and_exact_key_loss(live_state):
         expired.get(namespace, result_id)
     assert client.exists(key) == 1  # Logical expiry is checked even before Redis eviction.
 
-    assert client.delete(key) == 1  # Simulate eviction without touching another snapshot.
-    assert snapshots.get(namespace, result_id)["results"] == saved["results"]
+    assert client.delete(key) == 1  # Eviction is final; SQL never restores result snapshots.
+    with pytest.raises(SnapshotUnavailable):
+        snapshots.get(namespace, result_id)
     assert client.exists(other_key) == 1
     assert client.pexpire(other_key, 1)
     deadline = time.monotonic() + 3
     while client.exists(other_key) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert client.exists(other_key) == 0
-    assert snapshots.get(namespace + "-other", other_id)["results"] == other["results"]
+    with pytest.raises(SnapshotUnavailable):
+        snapshots.get(namespace + "-other", other_id)
 
 
 def test_live_upload_search_replay_artifacts_survive_replace_delete_and_redis_loss(
@@ -338,9 +340,10 @@ def test_live_upload_search_replay_artifacts_survive_replace_delete_and_redis_lo
         runtime.get_search_result(index.namespace + "-other", saved["result_id"])
 
     client = state.cache_sync.backend._connection()
-    key = state.results._key(index.namespace, saved["result_id"])
+    key = state.results.transient._key("search-result", saved["result_id"])
     assert client.delete(key) == 1
-    assert runtime.get_search_result(index.namespace, saved["result_id"])["results"] == saved["results"]
+    with pytest.raises(SnapshotUnavailable):
+        runtime.get_search_result(index.namespace, saved["result_id"])
     assert runtime.download_artifact(index.namespace, source_id)[0] == original
     assert runtime.download_artifact(index.namespace, references["image"]["artifact_id"])[0] == image
     assert json.loads(runtime.download_artifact(index.namespace, references["table"]["artifact_id"])[0]) == table

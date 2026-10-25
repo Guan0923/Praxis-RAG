@@ -1,4 +1,4 @@
-"""Opt-in MCP -> MySQL outbox -> RocketMQ -> real spawned search worker acceptance."""
+"""Opt-in MCP -> full-request RocketMQ -> Redis spawned-worker acceptance."""
 
 import json
 import os
@@ -37,7 +37,7 @@ def test_real_mcp_queued_bm25_search_and_production_worker(tmp_path, monkeypatch
         "RAG_ROCKETMQ_ENDPOINT": os.getenv("RAG_TEST_ROCKETMQ_ENDPOINT", "127.0.0.1:8081"),
         "RAG_SEARCH_TOPIC": topic, "RAG_SEARCH_GROUP": group,
         "RAG_REDIS_URL": os.getenv("RAG_TEST_REDIS_URL", "redis://127.0.0.1:6379/0"),
-        "RAG_REDIS_PREFIX": redis_prefix,
+        "RAG_REDIS_PREFIX": redis_prefix, "RAG_REDIS_ENABLED": "1",
     }.items():
         monkeypatch.setenv(key, value)
     state = StateStores(StateSettings(url=url))
@@ -89,7 +89,8 @@ def test_real_mcp_queued_bm25_search_and_production_worker(tmp_path, monkeypatch
                         pytest.fail(output.read_text(encoding="utf-8")[-4000:])
                     assert result["result_id"] == result_id
                     assert any("ZXQUEUED731" in hit["text"] for hit in result["results"])
-                    raw = state.cache_sync.backend._connection().get(state.results._key("manuals", result_id))
+                    raw = state.cache_sync.backend._connection().get(
+                        state.results.transient._key("search-result", result_id))
                     assert json.loads(raw)["payload"]["result_id"] == result_id
                     repeated = await client.call_tool("get_search_result", {"result_id": result_id})
                     assert json.loads(repeated.content[0].text)["results"] == result["results"]

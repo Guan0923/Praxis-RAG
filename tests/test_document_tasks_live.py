@@ -64,6 +64,7 @@ def test_real_mcp_admission_and_separate_process_consumer(tmp_path, monkeypatch)
     monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
     monkeypatch.setenv("RAG_REDIS_URL", os.getenv("RAG_TEST_REDIS_URL", "redis://127.0.0.1:6379/0"))
     monkeypatch.setenv("RAG_REDIS_PREFIX", "rag:document-test:" + uuid4().hex)
+    monkeypatch.setenv("RAG_REDIS_ENABLED", "1")
     state = StateStores(StateSettings(url=url))
     collection = "document_test_" + uuid4().hex
     state.knowledge_bases.create({
@@ -139,58 +140,59 @@ finally:
             keys = list(conn.execute(select(cache_revisions.c.kind, cache_revisions.c.scope)))
         for kind, scope in keys:
             backend._connection().delete(*backend._keys(kind, scope))
+        for key in backend._connection().scan_iter(match=backend.settings.prefix + ":*"):
+            backend._connection().delete(key)
         runtime.close()
 
 
-def test_mysql_duplicate_claims_allowed_but_publication_is_first_terminal_wins(tmp_path, monkeypatch):
+def test_redis_duplicate_claims_share_execution_state_across_mysql_instances(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
 
     url = os.environ["RAG_TEST_DOCUMENT_MYSQL_URL"]
     assert make_url(url).database.startswith("praxis_document_test_")
     monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
-    monkeypatch.delenv("RAG_REDIS_URL", raising=False)
+    monkeypatch.setenv("RAG_REDIS_URL", os.getenv("RAG_TEST_REDIS_URL", "redis://127.0.0.1:6379/0"))
+    monkeypatch.setenv("RAG_REDIS_ENABLED", "1")
+    prefix = "rag:document-test:" + uuid4().hex
+    monkeypatch.setenv("RAG_REDIS_PREFIX", prefix)
     state = StateStores(StateSettings(url=url))
     other = StateStores(StateSettings(url=url))
     try:
         namespace = "claim_" + uuid4().hex
         state.knowledge_bases.create({"namespace": namespace, "collection": "test"})
-        artifact_id = state.document_tasks.submit(namespace, "claim.txt", b"claim")
+        task = state.document_tasks.submit(namespace, "claim.txt", b"claim")
+        artifact_id = task["artifact_id"]
+        transient = state.document_tasks.transient
+        token = transient.lock("document-execution", artifact_id, 30)
+        assert token is not None
+        assert other.document_tasks.transient.lock("document-execution", artifact_id, 30) is None
+        assert not other.document_tasks.transient.unlock("document-execution", artifact_id, "wrong-owner")
+        assert transient.unlock("document-execution", artifact_id, token)
         barrier = threading.Barrier(2)
 
         def claim(tasks):
             barrier.wait()
-            return tasks.claim(artifact_id)
+            return tasks.claim(task)
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(claim, instance.document_tasks) for instance in (state, other)]
             claims = [future.result(timeout=10) for future in futures]
         assert all(item is not None for item in claims)
         assert claims[0]["execution_id"] != claims[1]["execution_id"]
-        from sqlalchemy import select
-
-        from rag_mcp.state.schema import document_tasks
+        row = state.document_tasks.transient.get("document", artifact_id)
+        assert row == other.document_tasks.transient.get("document", artifact_id)
+        winner = next(item for item in claims if item["execution_id"] == row["execution_id"])
+        loser = next(item for item in claims if item["execution_id"] != row["execution_id"])
         from rag_mcp.state.uploads import UploadConflict
-
-        with state.engine.connect() as conn:
-            row = conn.execute(select(document_tasks).where(
-                document_tasks.c.artifact_id == artifact_id)).mappings().one()
-        assert row["owner"] is None and row["lease_until"] == 0 and row["attempts"] == 0
-        barrier = threading.Barrier(2)
-
-        def publish(instance, task):
-            barrier.wait()
-            try:
-                with instance.engine.begin() as conn:
-                    instance.document_tasks.succeed(conn, task)
-            except UploadConflict:
-                return False
-            return True
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(publish, instance, task)
-                       for instance, task in zip((state, other), claims)]
-            assert sum(future.result(timeout=10) for future in futures) == 1
-        assert state.document_tasks.status(namespace, artifact_id)["status"] == "succeeded"
+        with pytest.raises(UploadConflict):
+            state.document_tasks.progress(loser, "indexing")
+        other.document_tasks.progress(winner, "indexing")
+        assert state.document_tasks.status(namespace, artifact_id)["stage"] == "indexing"
+        # Persisted document publication is tested by the separate-process worker above.
+        assert state.documents.list(namespace) == []
     finally:
+        backend = state.cache_sync.backend
+        for key in backend._connection().scan_iter(match=prefix + ":*"):
+            backend._connection().delete(key)
         other.close()
         state.close()

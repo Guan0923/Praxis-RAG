@@ -11,29 +11,33 @@ from uuid import UUID
 import pytest
 from sqlalchemy import create_engine, event, func, inspect, select, text
 from sqlalchemy.exc import OperationalError
+from test_soft_delete_references import VECTOR, snapshot, upload
+from test_soft_delete_references import stack as stack_fixture
 
 from rag_mcp.orchestrator import RagOrchestrator
 from rag_mcp.retrievers.dense import DenseRetriever
 from rag_mcp.service_knowledge import RagServiceRuntime
 from rag_mcp.state.cache import CacheSettings, RedisStateCache
 from rag_mcp.state.result_snapshots import SnapshotUnavailable
-from rag_mcp.state.schema import artifact_snapshots, search_result_snapshots
+from rag_mcp.state.schema import artifact_snapshots
 from rag_mcp.state.schema_migrations import migrate_soft_delete
 from rag_mcp.state.search_references import SearchReferences
 from rag_mcp.state.settings import StateSettings
 from rag_mcp.state.store import StateStores
-from test_soft_delete_references import VECTOR, snapshot, stack as stack_fixture, upload
 
 # Re-export the real fixture without shadowing an imported fixture symbol.
 stack = stack_fixture
+from redis_stub import MemoryRedis
 from test_state_cache import FakeRedis
 
 
-class FaultRedis(FakeRedis):
+class FaultRedis(MemoryRedis, FakeRedis):
     """Use the existing revision fake for both state views and UUID cache keys."""
 
     def __init__(self):
         super().__init__()
+        self.now = self.clock()
+        self.last_script = None
         self.down = False
 
     def get(self, key):
@@ -41,14 +45,10 @@ class FaultRedis(FakeRedis):
             raise OSError("cache unavailable")
         return super().get(key)
 
-    def set(self, key, value, *, ex, nx):
+    def _check(self, key):
         if self.down:
             raise OSError("cache unavailable")
-        if nx and self.get(key) is not None:
-            return False
-        self.values[key] = bytes(value)
-        self.expires[key] = self.now + ex
-        return True
+        super()._check(key)
 
 
 @pytest.fixture(autouse=True)
@@ -64,13 +64,18 @@ def local_state_only(tmp_path, monkeypatch):
         monkeypatch.setenv(name, value)
 
 
+@pytest.fixture(autouse=True)
+def redis_results(request):
+    if "stack" not in request.fixturenames:
+        return
+    stack = request.getfixturevalue("stack")
+    stack[0].cache_sync.backend = RedisStateCache(
+        CacheSettings(prefix="uuid-failure", enabled=True), client=FaultRedis())
+
+
 @pytest.fixture()
-def cached_stack(stack):
-    state = stack[0]
-    redis = FaultRedis()
-    state.cache_sync.backend = RedisStateCache(
-        CacheSettings(prefix="uuid-failure", enabled=True), client=redis)
-    return stack, redis
+def cached_stack(stack, redis_results):
+    return stack, stack[0].cache_sync.backend._connection()
 
 
 def runtime_for(stack):
@@ -130,7 +135,6 @@ def test_redis_down_capture_and_deleted_replay_never_reinfer_or_resolve_tenant(c
     state, _, ingester, source = stack
     upload(stack)
     runtime, model, search = runtime_for(stack)
-    redis.down = True
     saved = execute(runtime)
     assert saved["snapshot_available"] is True
     assert UUID(saved["result_id"]).version == 4
@@ -139,8 +143,10 @@ def test_redis_down_capture_and_deleted_replay_never_reinfer_or_resolve_tenant(c
     source.delete("file.txt", ingester)
     runtime._tenant = Mock(side_effect=AssertionError("Replay must not resolve a tenant"))
 
-    # Redis remains down: replay and bytes are independent of live documents.
-    assert runtime.get_search_result("ns", saved["result_id"])["results"] == saved["results"]
+    redis.down = True
+    with pytest.raises(SnapshotUnavailable, match="expired or unavailable"):
+        runtime.get_search_result("ns", saved["result_id"])
+    # Artifact bytes remain durable SQL records, unlike result snapshots.
     assert runtime.download_artifact("ns", artifact["artifact_id"])[0] == b"original immutable evidence"
     redis.down = False
     assert runtime.get_search_result("ns", saved["result_id"])["results"] == saved["results"]
@@ -150,13 +156,14 @@ def test_redis_down_capture_and_deleted_replay_never_reinfer_or_resolve_tenant(c
         redis.down = True
         with pytest.raises(SnapshotUnavailable, match="expired or unavailable"):
             runtime.get_search_result("ns", saved["result_id"])
+    redis.down = False
     assert runtime.get_search_result("ns", saved["result_id"])["results"] == saved["results"]
     assert model.embed_query.call_count == search.call_count == 1
     model.embed_query.assert_called_once_with("original evidence")
     runtime._tenant.assert_not_called()
 
 
-def test_snapshot_insert_failure_returns_original_payload_without_unreadable_uuid(cached_stack):
+def test_redis_snapshot_failure_returns_original_payload_without_unreadable_uuid(cached_stack):
     stack, redis = cached_stack
     state = stack[0]
     upload(stack)
@@ -171,19 +178,14 @@ def test_snapshot_insert_failure_returns_original_payload_without_unreadable_uui
         return payload
 
     capture.side_effect = record
-    fault = fail_insert("search_result_snapshots")
-    event.listen(state.engine, "before_cursor_execute", fault)
-    try:
-        response = execute(runtime)
-    finally:
-        event.remove(state.engine, "before_cursor_execute", fault)
+    redis.down = True
+    response = execute(runtime)
+    redis.down = False
     assert_original_hits(originals[0], response)
     assert response["snapshot_available"] is False
     assert response["snapshot_error"]
     assert not {"result_id", "created_at", "expires_at"} & response.keys()
-    assert not any(":search-result:" in key for key in redis.values)
-    with state.engine.connect() as conn:
-        assert conn.scalar(select(func.count()).select_from(search_result_snapshots)) == 0
+    assert not any(":transient:" in key for key in redis.values)
     assert state.artifacts.read("ns", response["artifacts"][0]["artifact_id"])["content"] == b"original immutable evidence"
     assert model.embed_query.call_count == search.call_count == 1
 
@@ -206,10 +208,12 @@ def test_artifact_insert_failure_warns_but_keeps_real_search_and_durable_snapsho
     assert saved["debug"]["returned_count"] == 1
     redis.down = True
     runtime._tenant = Mock(side_effect=AssertionError("Replay must not resolve a tenant"))
+    with pytest.raises(SnapshotUnavailable):
+        runtime.get_search_result("ns", saved["result_id"])
+    redis.down = False
     assert runtime.get_search_result("ns", saved["result_id"])["results"] == saved["results"]
     with state.engine.connect() as conn:
         assert conn.scalar(select(func.count()).select_from(artifact_snapshots)) == 0
-        assert conn.scalar(select(func.count()).select_from(search_result_snapshots)) == 1
     assert model.embed_query.call_count == search.call_count == 1
     runtime._tenant.assert_not_called()
 
@@ -245,7 +249,7 @@ def test_capture_limits_charge_unique_bytes_and_never_remove_hits(stack, monkeyp
         assert conn.scalar(select(func.count()).select_from(artifact_snapshots)) == 2
 
 
-def test_pages_keep_deterministic_frozen_metadata_across_cache_and_sql(cached_stack):
+def test_pages_keep_deterministic_frozen_metadata_without_sql_fallback(cached_stack, monkeypatch):
     stack, redis = cached_stack
     state = stack[0]
     record = upload(stack)
@@ -258,9 +262,14 @@ def test_pages_keep_deterministic_frozen_metadata_across_cache_and_sql(cached_st
         assert {k: v for k, v in page.items() if k not in {
             "results", "page", "page_size", "total_results", "next_page"}} == {
                 k: v for k, v in saved.items() if k != "results"}
-    redis.down = True
-    for number, expected in enumerate(pages, 1):
-        assert state.results.get("ns", saved["result_id"], page=number, page_size=2) == expected
+    with monkeypatch.context() as patch:
+        patch.setattr(state.engine, "connect", sql_unavailable)
+        for number, expected in enumerate(pages, 1):
+            assert state.results.get("ns", saved["result_id"], page=number, page_size=2) == expected
+        redis.down = True
+        with pytest.raises(SnapshotUnavailable):
+            state.results.get("ns", saved["result_id"])
+    redis.down = False
     with pytest.raises(ValueError, match="page does not exist"):
         state.results.get("ns", saved["result_id"], page=3, page_size=2)
 
@@ -284,10 +293,12 @@ def test_capture_input_response_and_replay_are_deeply_detached(cached_stack):
     replay["artifacts"][0]["name"] = "changed replay"
     assert state.results.get("ns", saved["result_id"])["results"] == frozen["results"]
     redis.down = True
-    sql_replay = state.results.get("ns", saved["result_id"])
-    assert sql_replay["results"] == frozen["results"]
-    assert sql_replay["artifacts"] == frozen["artifacts"]
-    assert sql_replay["debug"] == frozen["debug"]
+    with pytest.raises(SnapshotUnavailable):
+        state.results.get("ns", saved["result_id"])
+    redis.down = False
+    redis.delete(state.results.transient._key("search-result", saved["result_id"]))
+    with pytest.raises(SnapshotUnavailable):
+        state.results.get("ns", saved["result_id"])
 
 
 def test_stale_display_cache_never_controls_live_get_or_new_queries_and_flush_repairs(cached_stack, monkeypatch):

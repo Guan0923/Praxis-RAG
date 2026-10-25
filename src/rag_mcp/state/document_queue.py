@@ -1,4 +1,4 @@
-"""Dedicated RocketMQ document transport and lightweight durable outbox relay."""
+"""Bounded document payload transport with confirmed synchronous admission."""
 
 from __future__ import annotations
 
@@ -6,11 +6,10 @@ import json
 import logging
 import os
 import threading
-import time
 from dataclasses import replace
 
 from .cache_queue import RocketMQCacheQueue, RocketMQSettings
-from .document_tasks import validate_artifact_id
+from .document_tasks import document_envelopes, validate_document_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -87,18 +86,26 @@ class RocketMQDocumentQueue(RocketMQCacheQueue):
         if error is not None:
             raise error
 
-    def send(self, artifact_id):
-        validate_artifact_id(artifact_id)
+    validate_payload = staticmethod(validate_document_envelope)
+
+    def send(self, task):
+        for payload in document_envelopes(task):
+            self._send_payload(payload, task["artifact_id"])
+
+    def _send_payload(self, payload, key):
         from rocketmq import Message
 
         message = Message()
         message.topic = self.settings.topic
-        message.keys = artifact_id
-        message.body = json.dumps({self.message_key: artifact_id}, separators=(",", ":")).encode()
+        message.keys = key
+        message.body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
         with self._producer_lock:
             self._start_producer().send(message)
 
     def consume_once(self, callback):
+        return self._consume_payload_once(callback, self.validate_payload)
+
+    def _consume_payload_once(self, callback, validator):
         with self._consumer_lock:
             consumer = self._start_consumer()
         for message in consumer.receive(1, self.invisible_seconds):
@@ -107,7 +114,7 @@ class RocketMQDocumentQueue(RocketMQCacheQueue):
             message.topic = self.settings.topic
             try:
                 payload = json.loads(message.body)
-                artifact_id = validate_artifact_id(payload.get(self.message_key) if isinstance(payload, dict) else None)
+                payload = validator(payload)
             except (ValueError, TypeError):
                 logger.warning("Ignoring malformed document message; broker retry/DLQ applies")
                 continue
@@ -130,7 +137,7 @@ class RocketMQDocumentQueue(RocketMQCacheQueue):
             renewer = threading.Thread(target=renew, name="document-message-lease", daemon=True)
             renewer.start()
             try:
-                complete = callback(artifact_id)
+                complete = callback(payload)
             finally:
                 stop.set()
                 renewer.join()
@@ -143,58 +150,37 @@ class RocketMQDocumentQueue(RocketMQCacheQueue):
 
 
 class DocumentTaskDispatcher:
-    """No inference in the API process; failures leave the SQL outbox pending."""
+    """Return an upload ID only after Redis and every MQ message are confirmed."""
 
     def __init__(self, state, transport=None):
         self.tasks = state.document_tasks
         settings = document_queue_settings()
         self.transport = transport or (RocketMQDocumentQueue(settings) if settings.endpoint else None)
-        self._stop = threading.Event()
-        self._wake = threading.Event()
-        self._thread = None
-        self._lifecycle_lock = threading.Lock()
-        self._health_at = 0
 
     def submit(self, namespace, name, content, idempotency_key=None):
-        artifact_id = self.tasks.submit(namespace, name, content, idempotency_key)
-        self._wake.set()
-        return {"artifact_id": artifact_id}
+        if self.transport is None:
+            raise RuntimeError("RocketMQ is required for document uploads")
+        task = self.tasks.submit(namespace, name, content, idempotency_key)
+        if not task.get("accepted"):
+            try:
+                self.transport.send(task)
+                self.tasks.accepted(task)
+            except Exception as exc:
+                logger.warning("Document admission unconfirmed artifact_id=%s category=%s",
+                               task["artifact_id"], type(exc).__name__)
+                raise
+        logger.info("Document admission confirmed artifact_id=%s", task["artifact_id"])
+        return {"artifact_id": task["artifact_id"]}
 
     def run_once(self):
-        if time.monotonic() >= self._health_at:
-            self.tasks.delivery_health()
-            self._health_at = time.monotonic() + min(60, self.tasks.dispatch_settings.alert_seconds)
-            if self.transport is None:
-                logger.warning("Document relay has no RocketMQ endpoint; accepted uploads remain pending")
-        return self.tasks.dispatch_pending(self.transport)
+        return 0
 
     def start(self):
-        with self._lifecycle_lock:
-            if self._thread is not None:
-                return
-            self._stop.clear()
-
-            def run():
-                while not self._stop.is_set():
-                    self._wake.clear()
-                    try:
-                        self.run_once()
-                    except Exception as exc:  # noqa: BLE001 - SQL outbox remains authoritative for retries
-                        logger.warning("Document dispatch pending (%s)", type(exc).__name__)
-                    self._wake.wait(2)
-
-            self._thread = threading.Thread(target=run, name="document-outbox", daemon=True)
-            self._thread.start()
+        """Compatibility hook; there is no SQL task relay."""
 
     def stop(self):
-        with self._lifecycle_lock:
-            self._stop.set()
-            self._wake.set()
-            if self._thread is not None:
-                self._thread.join()
-                self._thread = None
+        """Compatibility hook; there is no background dispatcher."""
 
     def close(self):
-        self.stop()
         if self.transport is not None:
             self.transport.close()

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import tomllib
+from pathlib import Path
 
 from .config import RagConfigError
 
@@ -46,10 +46,8 @@ RAG_REDIS_TIMEOUT_SECONDS RAG_ROCKETMQ_ENDPOINT RAG_ROCKETMQ_TOPIC
 RAG_ROCKETMQ_GROUP RAG_ROCKETMQ_NAMESPACE RAG_ROCKETMQ_TLS
 RAG_STATE_ECHO RAG_STATE_AUTO_SCHEMA RAG_UPLOAD_LEASE_SECONDS
 RAG_UPLOAD_CLEANUP_DELAY_SECONDS
-RAG_DOCUMENT_TOPIC RAG_DOCUMENT_GROUP RAG_DOCUMENT_DLQ_GROUP RAG_DOCUMENT_MAX_ATTEMPTS
-RAG_DOCUMENT_LEASE_SECONDS RAG_DOCUMENT_RETRY_SECONDS
-RAG_DOCUMENT_DISPATCH_LEASE_SECONDS RAG_DOCUMENT_DISPATCH_RETRY_SECONDS
-RAG_DOCUMENT_DISPATCH_MAX_RETRY_SECONDS RAG_DOCUMENT_DISPATCH_ALERT_SECONDS
+RAG_DOCUMENT_TOPIC RAG_DOCUMENT_GROUP RAG_DOCUMENT_DLQ_GROUP
+RAG_DOCUMENT_BROKER_MAX_RETRIES
 RAG_SEARCH_TOPIC RAG_SEARCH_GROUP RAG_SEARCH_DLQ_GROUP RAG_SEARCH_TIMEOUT_SECONDS
 RAG_SEARCH_MAX_ATTEMPTS RAG_SEARCH_LEASE_SECONDS RAG_SEARCH_RETRY_SECONDS
 RAG_EMBEDDING_MODEL RAG_EMBEDDING_DEVICE RAG_CHUNK_TOKENIZER_MODEL
@@ -58,6 +56,14 @@ RAG_RERANKER_DEVICE RAG_RERANKER_BATCH_SIZE RAG_RERANKER_MAX_CANDIDATES
 RAG_RERANKER_MAX_LENGTH RAG_RERANKER_MAX_TEXT_CHARS RAG_PRELOAD_RERANKER
 RAG_PDF_PARSER_PYTHON RAG_PDF_MODELS_PATH RAG_PDF_PARSE_TIMEOUT
 RAG_WORD_CONVERTER_PATH RAG_WORD_CONVERT_TIMEOUT'''.split())
+
+
+# Accept old files without restoring removed task leases or the SQL relay.
+_IGNORED_DOCUMENT_KEYS = frozenset((
+    "RAG_DOCUMENT_MAX_ATTEMPTS", "RAG_DOCUMENT_LEASE_SECONDS", "RAG_DOCUMENT_RETRY_SECONDS",
+    "RAG_DOCUMENT_DISPATCH_LEASE_SECONDS", "RAG_DOCUMENT_DISPATCH_RETRY_SECONDS",
+    "RAG_DOCUMENT_DISPATCH_MAX_RETRY_SECONDS", "RAG_DOCUMENT_DISPATCH_ALERT_SECONDS",
+))
 
 
 def load_service_config() -> Path:
@@ -83,12 +89,14 @@ def load_service_config() -> Path:
     if set(document) != {"environment"} or not isinstance(values, dict):
         raise RagConfigError(f"{path}: expected one [environment] section")
     for key, value in values.items():
-        if key not in _KEYS or not isinstance(value, str):
+        if key not in _KEYS | _IGNORED_DOCUMENT_KEYS or not isinstance(value, str):
             raise RagConfigError(f"{path}: unknown setting or non-string value: {key}")
 
     # A caller selecting a different database must not inherit the other selector.
     database_override = "QDRANT_URL" in os.environ or "QDRANT_PATH" in os.environ
     for key, value in values.items():
+        if key in _IGNORED_DOCUMENT_KEYS:
+            continue
         if database_override and key in {"QDRANT_URL", "QDRANT_PATH"}:
             continue
         os.environ.setdefault(key, value)

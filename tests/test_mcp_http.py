@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import io
+import json
 import socket
 import threading
 import time
@@ -19,17 +19,30 @@ import uvicorn
 from mcp.client import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.subscriptions import SubscriptionLost
-from mcp.server.subscriptions import PromptsListChanged, ResourcesListChanged, ResourceUpdated, ToolsListChanged
+from mcp.server.subscriptions import (
+    PromptsListChanged,
+    ResourcesListChanged,
+    ResourceUpdated,
+    ToolsListChanged,
+)
 from mcp.shared.exceptions import MCPError
-from rag_mcp.document_readers import read_document_text
-from rag_mcp.config import RagConfig
+from redis_stub import MemoryRedis
+
 from rag_mcp.chunk_strategies import ChunkingConfig
+from rag_mcp.config import RagConfig
+from rag_mcp.document_readers import read_document_text
+from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.knowledge_bases import KnowledgeBaseStore
 from rag_mcp.model_api import ModelConnection
-from rag_mcp.http_service import RagHttpSettings, create_service_app
 from rag_mcp.resources import document_uri
-from rag_mcp.service_knowledge import IndexedDocument, KnowledgeDocumentStore, RagServiceRuntime
 from rag_mcp.search_worker import SearchWorker
+from rag_mcp.service_knowledge import (
+    IndexedDocument,
+    KnowledgeDocumentStore,
+    RagServiceRuntime,
+)
+from rag_mcp.state.cache import RedisStateCache, StateCacheSettings
+from rag_mcp.state.document_tasks import document_envelopes
 from rag_mcp.state.settings import StateSettings
 from rag_mcp.state.store import StateStores
 
@@ -39,9 +52,9 @@ class MemorySearchTransport:
         self.queued = []
         self.lock = threading.Lock()
 
-    def send(self, result_id):
+    def send(self, payload):
         with self.lock:
-            self.queued.append(result_id)
+            self.queued.append(json.loads(json.dumps(payload)))
 
     def close(self):
         pass
@@ -72,9 +85,9 @@ class TestSearchConsumer:
             with self.transport.lock:
                 if self.cursor >= len(self.transport.queued):
                     continue
-                result_id = self.transport.queued[self.cursor]
+                payload = self.transport.queued[self.cursor]
                 self.cursor += 1
-            worker.process(result_id)
+            worker.process(payload)
 
     def stop(self):
         self.stop_requested.set()
@@ -90,6 +103,9 @@ ADMIN = {"X-RAG-Namespace": "manuals"}
 class TestIngester:
     __test__ = False
 
+    def __init__(self, root):
+        self.root = root
+
     def ingest(self, path, *, source_name, chunking=None):
         text = read_document_text(path)
         artifacts_dir = None
@@ -100,7 +116,7 @@ class TestIngester:
             from rag_mcp.word_reader import WORD_PARSER_VERSION
             document_id = _stable_id("doc", source_name.casefold())
             is_word = path.suffix != ".pdf"
-            artifacts_dir = Path(".test-tmp") / "queued-search-protocol-agent" / f"test-assets-{uuid4().hex}"
+            artifacts_dir = self.root / f"test-assets-{uuid4().hex}"
             artifacts_dir.mkdir(parents=True)
             artifacts_bucket = "word-assets" if is_word else "pdf-assets"
             (artifacts_dir / "manifest.json").write_text(
@@ -122,8 +138,8 @@ class MemoryDocumentTransport:
     def __init__(self):
         self.queued = []
 
-    def send(self, artifact_id):
-        self.queued.append(artifact_id)
+    def send(self, task):
+        self.queued.extend(document_envelopes(task))
 
     def close(self):
         pass
@@ -138,6 +154,8 @@ class ProtocolRuntime(RagServiceRuntime):
         self.data_root = root
         self.state = StateStores.create(root, settings=StateSettings(
             url="sqlite+pysqlite:///" + str(root / "state.sqlite3")))
+        self.state.cache_sync.backend = RedisStateCache(
+            StateCacheSettings(prefix="protocol-test", enabled=True), client=MemoryRedis())
         self.state.document_dispatcher.transport = MemoryDocumentTransport()
         self.search_consumer = TestSearchConsumer(self)
         self.search_calls = []
@@ -163,7 +181,7 @@ class ProtocolRuntime(RagServiceRuntime):
                 self._tenants[namespace] = SimpleNamespace(
                     state=self.state,
                     documents=KnowledgeDocumentStore(self.state, namespace),
-                    ingester=TestIngester(),
+                    ingester=TestIngester(self.data_root),
                     lock=threading.RLock(),
                 )
             return self._tenants[namespace]
@@ -412,7 +430,7 @@ def test_cancellation_keeps_other_calls_usable(tmp_path, mode):
                     runtime.release.set()
                     assert await anyio.to_thread.run_sync(runtime.finished.wait, 2)
                     assert not (await client.call_tool("search", {"query": "after worker"})).is_error
-                    slow_id = runtime.search_consumer.transport.queued[0]
+                    slow_id = runtime.search_consumer.transport.queued[0]["result_id"]
                     with anyio.fail_after(2):
                         while True:
                             saved = await client.call_tool("get_search_result", {"result_id": slow_id})
@@ -465,7 +483,11 @@ def test_queued_search_polling_is_tenant_bound_and_never_repeats_work(tmp_path, 
                 assert json.loads(replay.content[0].text) == snapshot
                 assert len(runtime.search_calls) == 1
                 assert runtime.search_calls[0][0] == "manuals"
-                assert runtime.search_consumer.transport.queued == [result_id]
+                envelopes = runtime.search_consumer.transport.queued
+                assert [item["result_id"] for item in envelopes] == [result_id]
+                assert envelopes[0]["schema"] == 2 and envelopes[0]["namespace"] == "manuals"
+                assert envelopes[0]["arguments"]["query"] == "slow"
+                assert envelopes[0]["created_at"] < envelopes[0]["deadline"] <= envelopes[0]["expires_at"]
         anyio.run(scenario)
 
 
@@ -493,17 +515,14 @@ def test_failed_search_is_an_mcp_tool_error_without_resubmission(tmp_path, mode)
                 failed = await client.call_tool("search", {"query": "fail"})
                 assert failed.is_error
                 assert len(runtime.search_calls) == 1
-                result_id = runtime.search_consumer.transport.queued[0]
+                result_id = runtime.search_consumer.transport.queued[0]["result_id"]
                 assert (await client.call_tool("get_search_result", {"result_id": result_id})).is_error
                 assert len(runtime.search_calls) == 1
-                assert runtime.search_consumer.transport.queued == [result_id]
+                assert [item["result_id"] for item in runtime.search_consumer.transport.queued] == [result_id]
         anyio.run(scenario)
 
 
 def test_search_deadline_is_an_mcp_tool_error_without_inference(tmp_path):
-    from sqlalchemy import update
-    from rag_mcp.state.schema import search_tasks
-
     with running_service(tmp_path) as (url, _, runtime):
         runtime.search_consumer.stop()
 
@@ -518,9 +537,8 @@ def test_search_deadline_is_an_mcp_tool_error_without_inference(tmp_path):
                 assert json.loads(pending.content[0].text) == {
                     **admitted, "status": "queued", "stage": "queued",
                 }
-                with runtime.state.engine.begin() as conn:
-                    conn.execute(update(search_tasks).where(
-                        search_tasks.c.result_id == admitted["result_id"]).values(deadline=0))
+                runtime.state.search_tasks.transient.update(
+                    "search-result", admitted["result_id"], lambda row: {**row, "deadline": 0})
                 assert (await client.call_tool("get_search_result", admitted)).is_error
                 assert runtime.search_calls == []
         anyio.run(scenario)
@@ -547,7 +565,7 @@ def test_wait_timeout_leaves_background_search_running(tmp_path):
                         await anyio.sleep(0.02)
                 assert saved["query"] == "slow" and saved["result_id"] == admitted["result_id"]
                 assert len(runtime.search_calls) == 1
-                assert runtime.search_consumer.transport.queued == [admitted["result_id"]]
+                assert [item["result_id"] for item in runtime.search_consumer.transport.queued] == [admitted["result_id"]]
         anyio.run(scenario)
 
 
@@ -892,4 +910,49 @@ def test_partial_upload_notifications_and_resource_listing_pages(tmp_path):
                     async with client.listen(resource_subscriptions=[uri + "?page=1"]):
                         pass
 
+        anyio.run(scenario)
+
+
+@pytest.mark.parametrize("kind", ["document", "search"])
+@pytest.mark.parametrize("failure", ["broker_missing", "broker_error", "redis_disabled", "redis_error"])
+def test_mcp_queue_admission_fails_closed_without_result_ids(tmp_path, kind, failure):
+    with running_service(tmp_path) as (url, _, runtime):
+        dispatcher = getattr(runtime.state, kind + "_dispatcher")
+        transport = dispatcher.transport
+        if failure == "broker_missing":
+            dispatcher.transport = None
+        elif failure == "broker_error":
+            def reject(_payload):
+                raise ConnectionError("controlled broker failure")
+            transport.send = reject
+        elif failure == "redis_disabled":
+            runtime.state.cache_sync.backend = RedisStateCache(StateCacheSettings(enabled=False))
+        else:
+            runtime.state.cache_sync.backend._connection().broken = True
+
+        async def scenario():
+            async with mcp_client(url) as client:
+                arguments = ({"name": "unaccepted.txt", "content": "not published"}
+                             if kind == "document" else {"query": "not accepted", "wait_seconds": 0})
+                result = await client.call_tool("add_document" if kind == "document" else "search", arguments)
+                assert result.is_error
+                assert runtime.search_calls == []
+                assert transport.queued == []
+                assert runtime.state.documents.list("manuals") == []
+        anyio.run(scenario)
+
+
+def test_mcp_redis_eviction_cannot_restore_snapshot_or_reexecute_search(tmp_path):
+    with running_service(tmp_path) as (url, _, runtime):
+        async def scenario():
+            async with mcp_client(url) as client:
+                completed = await client.call_tool("search", {"query": "frozen"})
+                assert not completed.is_error
+                saved = json.loads(completed.content[0].text)
+                assert saved["snapshot_available"] is True
+                key = runtime.state.results.transient._key("search-result", saved["result_id"])
+                assert runtime.state.cache_sync.backend._connection().delete(key) == 1
+                unavailable = await client.call_tool("get_search_result", {"result_id": saved["result_id"]})
+                assert unavailable.is_error
+                assert len(runtime.search_calls) == 1
         anyio.run(scenario)

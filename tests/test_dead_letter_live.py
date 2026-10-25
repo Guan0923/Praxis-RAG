@@ -1,7 +1,7 @@
 """Opt-in SDK 5.1.2/Broker 5.3.3 DLQ regression on freshly provisioned resources.
 
 Run with RAG_TEST_DLQ_LIVE=1; defaults to the local disposable Docker broker.
-No service configuration/.env is read. SQL uses an isolated pytest SQLite file.
+No service configuration/.env is read. SQL uses an isolated pytest SQLite file; transient state uses injected Redis.
 """
 
 import json
@@ -12,20 +12,21 @@ import time
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, update
-from sqlalchemy.exc import SQLAlchemyError
+from redis_stub import MemoryRedis
 
 from rag_mcp.dead_letter_worker import DeadLetterWorker, dead_letter_queue_settings
+from rag_mcp.state.cache import RedisStateCache, StateCacheSettings
 from rag_mcp.state.cache_queue import RocketMQSettings
 from rag_mcp.state.document_queue import RocketMQDocumentQueue
-from rag_mcp.state.schema import document_tasks, search_tasks
+from rag_mcp.state.search_queue import RocketMQSearchQueue
 from rag_mcp.state.settings import StateSettings
 from rag_mcp.state.store import StateStores
+from rag_mcp.state.transient import TransientUnavailable
 
 
 @pytest.mark.parametrize("kind,physical_namespace", [("document", ""), ("search", "probe_ns%")])
 @pytest.mark.skipif(os.getenv("RAG_TEST_DLQ_LIVE") != "1", reason="Requires opt-in disposable Docker RocketMQ")
-def test_broker_exhaustion_sql_failure_redelivery_and_terminal_ack(tmp_path, monkeypatch, kind, physical_namespace):
+def test_broker_exhaustion_redis_failure_redelivery_and_terminal_ack(tmp_path, monkeypatch, kind, physical_namespace):
     pytest.importorskip("rocketmq")
     marker = "praxis_dlq_test_" + uuid4().hex
     topic = marker + "_topic"
@@ -55,24 +56,29 @@ def test_broker_exhaustion_sql_failure_redelivery_and_terminal_ack(tmp_path, mon
         admin("updateTopic", "-c", cluster, "-t", dlq, "-p", "6", "-r", "1", "-w", "1")
         monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
         monkeypatch.setenv("RAG_REDIS_ENABLED", "0")
+        monkeypatch.setenv("RAG_SEARCH_TIMEOUT_SECONDS", "300")
         state = StateStores(StateSettings(url=f"sqlite+pysqlite:///{tmp_path / 'dlq.sqlite3'}"))
+        redis = MemoryRedis()
+        state.cache_sync.backend = RedisStateCache(
+            StateCacheSettings(prefix=marker, enabled=True), client=redis)
         namespace = "business_namespace"
         state.knowledge_bases.create({"namespace": namespace, "collection": "test"})
         tasks = getattr(state, f"{kind}_tasks")
-        table = document_tasks if kind == "document" else search_tasks
-        column = table.c.artifact_id if kind == "document" else table.c.result_id
         key = "artifact_id" if kind == "document" else "result_id"
         if kind == "document":
-            pending = tasks.submit(namespace, "pending.txt", b"pending")
-            succeeded = tasks.submit(namespace, "succeeded.txt", b"published")
+            pending_task = tasks.submit(namespace, "pending.txt", b"pending")
+            succeeded_task = tasks.submit(namespace, "succeeded.txt", b"published")
+            transient_kind = "document"
+            queue_type = RocketMQDocumentQueue
         else:
-            pending = tasks.submit(namespace, {"query": "pending"})
-            succeeded = tasks.submit(namespace, {"query": "published"})
-        with state.engine.begin() as conn:
-            conn.execute(update(table).where(column == succeeded).values(status="succeeded", stage="published"))
-            if kind == "search":
-                conn.execute(update(table).values(deadline=32503680000))
-        source = RocketMQDocumentQueue(RocketMQSettings(endpoint=endpoint, topic=topic, group=source_group))
+            pending_task = tasks.submit(namespace, {"query": "pending"})
+            succeeded_task = tasks.submit(namespace, {"query": "published"})
+            transient_kind = "search-result"
+            queue_type = RocketMQSearchQueue
+        pending, succeeded = pending_task[key], succeeded_task[key]
+        tasks.transient.update(transient_kind, succeeded,
+            lambda row: {**row, "status": "succeeded", "stage": "completed"})
+        source = queue_type(RocketMQSettings(endpoint=endpoint, topic=topic, group=source_group))
         source.message_key = key
         source.invisible_seconds = 10
         clients.append(source)
@@ -83,7 +89,7 @@ def test_broker_exhaustion_sql_failure_redelivery_and_terminal_ack(tmp_path, mon
         monkeypatch.setenv(f"RAG_{kind.upper()}_TOPIC", topic)
         monkeypatch.setenv(f"RAG_{kind.upper()}_GROUP", source_group)
         monkeypatch.setenv(f"RAG_{kind.upper()}_DLQ_GROUP", handler_group)
-        handler = RocketMQDocumentQueue(dead_letter_queue_settings(kind))
+        handler = queue_type(dead_letter_queue_settings(kind))
         handler.message_key = key
         handler.invisible_seconds = 10
         clients.append(handler)
@@ -98,38 +104,40 @@ def test_broker_exhaustion_sql_failure_redelivery_and_terminal_ack(tmp_path, mon
 
         def ack(message):
             task_id = json.loads(message.body)[key]
-            with state.engine.connect() as conn:
-                row = conn.execute(select(table).where(column == task_id)).mappings().one()
+            row = tasks.transient.get(transient_kind, task_id)
             assert row["status"] == ("failed" if task_id == pending else "succeeded")
-            assert row["stage"] == ("dead_letter" if task_id == pending else "published")
+            if task_id == succeeded:
+                assert row["stage"] == "completed"
             real_ack(message)
             acknowledged.append(task_id)
 
         monkeypatch.setattr(handler_consumer, "ack", ack)
         real_dead_letter = tasks.dead_letter
-        failed_sql = []
+        failed_redis = []
 
-        def fail_sql_once(task_id):
-            if task_id == pending and not failed_sql:
-                failed_sql.append(task_id)
-                raise SQLAlchemyError("simulated SQL transaction failure")
-            return real_dead_letter(task_id)
+        def fail_redis_once(payload):
+            assert isinstance(payload, dict)
+            assert queue_type.validate_payload(payload) == payload
+            task_id = payload[key]
+            if task_id == pending and not failed_redis:
+                failed_redis.append(task_id)
+                raise TransientUnavailable("simulated Redis transaction failure")
+            return real_dead_letter(payload)
 
-        monkeypatch.setattr(tasks, "dead_letter", fail_sql_once)
-        source.send(pending)
-        source.send(succeeded)
+        monkeypatch.setattr(tasks, "dead_letter", fail_redis_once)
+        source.send(pending_task)
+        source.send(succeeded_task)
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline and len(acknowledged) < 2:
-            source.consume_once(lambda task_id: source_deliveries.append(task_id) or False)
+            source.consume_once(lambda payload: source_deliveries.append(payload[key]) or False)
             try:
                 handler.consume_once(worker.process)
-            except SQLAlchemyError:
+            except TransientUnavailable:
                 assert pending not in acknowledged
-                with state.engine.connect() as conn:
-                    assert conn.scalar(select(table.c.status).where(column == pending)) == "queued"
+                assert tasks.transient.get(transient_kind, pending)["status"] == "queued"
         assert set(source_deliveries) == {pending, succeeded}
         assert not source_acks
-        assert failed_sql == [pending]
+        assert failed_redis == [pending]
         assert set(acknowledged) == {pending, succeeded}
         # A successful broker ACK must prevent another handler delivery.
         handler.consume_once(lambda _: pytest.fail("ACKed DLQ message redelivered"))

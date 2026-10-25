@@ -1,8 +1,13 @@
-# Redis 状态缓存（第一批 + 第二批严格模式）
+# Redis 短期任务状态与持久读模型缓存
 
 ## 范围
 
-MySQL 继续持久化，Qdrant 继续检索。第一批缓存四种读模型（MCP 工具和提示词共用一份 catalog）：
+Redis 有两种不同职责，不能混用其故障语义：
+
+- **短期权威状态**：MCP 异步上传/排队搜索的任务状态、上传分块重组及搜索结果快照只在 Redis 中保存。Redis 是必需依赖，不存在 SQL 回源。任务/重组及搜索快照沿用 `RAG_RESULT_TTL_SECONDS=3600`，与下面展示缓存的 60 秒 TTL 不同。
+- **持久数据展示缓存**：MySQL 继续保存已发布文档/源文件/解析产物、KB/API Key/catalog、artifact 快照和 UploadJournal 操作/租约；Qdrant 继续检索。下面第一、二批读模型仍可在 Redis 故障时回源 MySQL，cache outbox 保持原义。
+
+第一批缓存四种读模型（MCP 工具和提示词共用一份 catalog）：
 
 | 缓存 kind | scope | 内容 |
 | --- | --- | --- |
@@ -25,11 +30,23 @@ MySQL 继续持久化，Qdrant 继续检索。第一批缓存四种读模型（M
 
 租约 owner 原始所有权 token 不放 Redis；holder_id 是 token 的短哈希，仅用于区分执行者。操作详情不缓存 idempotency_key、workspace、fingerprint、result 原文、步骤输入 details、文件内容或密钥。upload_status 的返回值再次验证 namespace，UUID 不授予访问权。API Key 列表仍仅允许本机管理员。
 
-不缓存原始文件、图片、解析产物、查询/重排结果、明文/加密模型密钥。事务/步骤的**展示投影**可缓存，MySQL 原始日志始终是恢复依据；本次不是迁移日志或租约权威到 Redis。文档列表中的 operation_id 也仅为展示元数据。
+上述**展示读模型**不缓存原始文件、图片、解析产物、查询/重排结果或模型密钥。异步上传重组及搜索结果使用独立 Redis 短期存储（见下节），不套用此限制或 MySQL 回源策略；文档重组会在 Redis 暂存解码后的原始文件分块字节，这不是禁止存放原始字节的规则，也不是永久源文件存储。事务/步骤的展示投影可缓存，MySQL 原始 UploadJournal 始终是恢复依据；不迁移发布/恢复日志或业务租约权威到 Redis。文档列表中的 operation_id 也仅为展示元数据。
 
 公开配置和列表命中 Redis 时直接返回，不额外查 MySQL 版本，也不构建 tenant 或调用模型。上传、去重、覆盖/删除检查、reembedding、鉴权、版本发布与恢复仍使用 MySQL 权威读取。工具列表允许缓存，但真正执行工具时直接校验 MySQL 的 enabled 状态，避免停用被旧缓存绕过。
 
-## 读写与可靠同步
+## MCP 短期任务、重组与搜索快照
+
+API 直接向 RocketMQ 投递 schema 2 完整请求：搜索消息包含查询及参数；文档请求分块传输，每块解码后最多 **512 KiB**，单文件仍最多 **10 MiB**。Redis 保存任务状态和分块重组数据。只有所有消息都获 Broker 确认且 Redis 接收状态写入成功后，API 才返回成功；`wait_seconds=0` 也不能跳过确认。成功响应表示已投递，不表示完成检索或文档发布。
+
+MQ/Redis 未配置、SDK 缺失、连接失败或发送确认失败必须明确报错；故障期间没有 SQL 持久接收和 outbox 补发保证。部分发送后的超时可能不确定，上传重试应保留原 idempotency_key、内容和参数。Redis 丢失、淘汰或 TTL 到期可使任务/重组或搜索结果引用不可用，可能需要重新提交；不读旧 SQL 任务/结果表，也不自动重新搜索来伪造原快照。
+
+文档与搜索由独立 worker、独立 topic/group 消费；缓存刷新使用第三组独立 topic/group。消费者续期 MQ visibility；文档分块未收齐不 ACK，Broker 重投使 Redis 过期/丢失后仍可重组原请求。任一收齐分块的消息可触发执行，已记录终态后其余重复分块才 ACK。临时故障不 ACK，确定性故障先写 Redis 失败终态再 ACK，成功也先写结果/终态再 ACK。Redis 任务状态通过 CAS 条件更新，结果与成功终态原子写入 Redis；重复消息遵循 first-terminal-wins，不能覆盖仍存在的终态。这种 Redis 内部原子性不包含 MySQL 发布。Redis 丢失后不承诺搜索持久去重。
+
+文档 `succeeded` 只能在 MySQL UploadJournal 已持久发布之后写入。两次写入**不是 Redis+MySQL 原子事务**；若发布后 Redis 写入失败，重投通过 MySQL journal 对账并修复状态，而不是重复发布。业务租约、fencing、补偿和恢复仍由 MySQL 执行。日志仅记录任务/操作 ID 与安全错误类别，不记录查询、文件/消息正文或凭据。
+
+升级前停旧入口并排空旧 worker/outbox/消息；API 和 worker 一起部署。schema 2 与旧 UUID-only 消息不兼容，旧任务和结果不迁移，原 SQL 表保留但不在活跃路径。文档 worker 已移除 `--dispatch-only`，dispatcher 兼容入口为空操作，不 relay SQL，也无文件系统 MQ spool；下面的 `cache_outbox` 不受此迁移影响。结果与 MySQL artifact 保留边界见 [UUID 引用](result-references.md)。
+
+## 持久读模型的读写与可靠同步
 
 ```text
 读取：Redis 命中 → 返回；未命中 → MySQL 一致快照 → 带修订号回填
@@ -87,7 +104,7 @@ RAG_ROCKETMQ_NAMESPACE=
 RAG_ROCKETMQ_TLS=false
 ```
 
-不设置 Redis URL 默认禁用缓存，不影响原有部署。多实例共享相同 Redis、前缀、MySQL、topic/group。不同 MySQL 数据库必须使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；MQ 凭据仅从环境变量 RAG_ROCKETMQ_ACCESS_KEY / RAG_ROCKETMQ_SECRET_KEY 读取。
+`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存，搜索快照用 `RAG_RESULT_TTL_SECONDS=3600`。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis，但**不能使用 MCP 异步上传、排队搜索或可复用搜索结果快照**，不可将禁用缓存当作这些路径的降级方式。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；持久数据展示读取可回源 MySQL。多实例共享相同 Redis、前缀、MySQL 和各自 topic/group。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；MQ 凭据仅从环境变量 RAG_ROCKETMQ_ACCESS_KEY / RAG_ROCKETMQ_SECRET_KEY 读取。
 
 ## Docker 与启动
 
@@ -105,15 +122,15 @@ docker exec praxis-rag-rocketmq sh mqadmin updatetopic -n rocketmq-namesrv:9876 
 docker exec praxis-rag-rocketmq sh mqadmin updateSubGroup -n rocketmq-namesrv:9876 -c DefaultCluster -g praxis_state_cache_refresh_workers -r 16
 ```
 
-Redis/RocketMQ 启动失败不应回滚已提交的业务操作。部署缺少 SDK 时运行日志提示配置错误，outbox 保持待处理。应在启动前安装 cache extra 并确认连接。
+对持久读模型刷新，Redis/RocketMQ 失败不回滚已提交的 MySQL 业务操作，`cache_outbox` 保留待处理事件。对 MCP 上传/排队搜索，Redis/MQ 是提交前置依赖；缺 SDK/配置或连接失败直接报错，不通过 SQL task outbox 持久接收。启动前安装 cache extra，确认 Redis、MQ 连接、topic/group 和权限。
 
 ## 运维与限制
 
 新增表 cache_revisions 和 cache_outbox；正常自动 schema 会建缺失表，不改既有业务列。禁用自动 schema 的部署需先使用有 DDL 权限的账号建表。
 
-Redis 水位不独立淘汰；内存用量随缓存 kind/scope 增长。不要删除水位却保留 payload，或在旧 worker 仍回填时 FLUSHDB。全量清空/换库应先停所有实例并重启，或在所有实例使用新 RAG_REDIS_PREFIX 后回源重建。Redis 持续不可用时 outbox 会积压；DONE 事件当前保留用于排查，生产需根据审计要求定期归档清理 DONE 行（不要清理未完成事件或修订水位）。
+展示缓存水位不独立淘汰；内存用量随缓存 kind/scope 增长。不要删除水位却保留 payload，或在旧 worker 仍回填时 FLUSHDB。清空/换库前先停入口并排空 worker，再停所有实例；新前缀可从 MySQL 重建**展示缓存**，不能恢复短期任务、未重组上传或搜索快照，须告知客户端已有 ID 可能不可用并需重新提交。Redis 持续不可用时 `cache_outbox` 会积压；DONE 事件按审计要求归档清理（不要清理未完成事件或修订水位）。
 
-本批不实现跨实例 MCP 订阅通知总线；配置缓存同步不等于通知可重放。UUID 检索结果/产物读取属于独立第三批，见 [UUID 引用](result-references.md)，不复用状态 outbox。
+本批不实现跨实例 MCP 订阅通知总线；配置缓存同步不等于通知可重放。UUID 搜索结果使用独立 Redis TTL 存储，产物快照仍在 MySQL；两者都不复用展示缓存 outbox。见 [UUID 引用](result-references.md)。
 
 ## 验证
 

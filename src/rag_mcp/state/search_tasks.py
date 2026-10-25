@@ -1,28 +1,23 @@
-"""SQL-authoritative search outcomes and an initial-delivery transactional outbox.
-
-Private invocation arguments never enter broker messages or public status caches.
-"""
+"""Full-request MQ envelopes with transient Redis outcomes, never a SQL outbox."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import os
-from contextlib import contextmanager
+import time
 from dataclasses import dataclass
 from uuid import uuid4
 
-from sqlalchemy import case, insert, select, text, update
-
 from .result_snapshots import SnapshotUnavailable, canonical_uuid
-from .schema import search_task_outbox as outbox
-from .schema import search_tasks as tasks
-
-logger = logging.getLogger(__name__)
 
 _ACTIVE = ("queued", "processing")
 _UNAVAILABLE = "Search result expired or unavailable"
+MAX_SEARCH_ARGUMENT_BYTES = 1024 * 1024
+MAX_SEARCH_ENVELOPE_BYTES = MAX_SEARCH_ARGUMENT_BYTES + 4096
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -46,235 +41,165 @@ def validate_result_id(value):
         raise ValueError("result_id must be a canonical UUID") from None
 
 
+def validate_search_envelope(payload):
+    try:
+        if (not isinstance(payload, dict) or type(payload.get("schema")) is not int
+                or payload["schema"] != 2
+                or set(payload) != {"schema", "result_id", "namespace", "arguments",
+                                    "created_at", "expires_at", "deadline"}):
+            raise ValueError
+        validate_result_id(payload["result_id"])
+        if not isinstance(payload["namespace"], str) or not 1 <= len(payload["namespace"]) <= 64:
+            raise ValueError
+        if not isinstance(payload["arguments"], dict):
+            raise ValueError  # noqa: TRY004 - malformed transport data is a validation failure
+        times = [payload[key] for key in ("created_at", "expires_at", "deadline")]
+        if any(type(value) not in (int, float) or not math.isfinite(value) for value in times):
+            raise ValueError
+        if not times[0] < times[2] <= times[1]:
+            raise ValueError
+        arguments = json.dumps(payload["arguments"], ensure_ascii=False, allow_nan=False,
+                               separators=(",", ":"))
+        # Match the transport's ASCII escaping: Unicode can expand sixfold on wire.
+        encoded = json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        if (len(arguments.encode()) > MAX_SEARCH_ARGUMENT_BYTES
+                or len(encoded.encode()) > MAX_SEARCH_ENVELOPE_BYTES):
+            raise ValueError
+        return json.loads(encoded)
+    except (ValueError, TypeError, KeyError, RecursionError, OverflowError):
+        raise ValueError("Invalid search message envelope") from None
+
+
+def _request_digest(envelope):
+    request = {key: envelope[key] for key in ("namespace", "arguments", "created_at", "expires_at", "deadline")}
+    content = json.dumps(request, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
 class SearchTasks:
-    def __init__(self, state, settings=None):
+    def __init__(self, state, settings=None, clock=time.time):
         self.state = state
-        self.engine = state.engine
         self.settings = settings or SearchTaskSettings.from_env()
+        self.clock = clock
 
-    @staticmethod
-    def _clock(conn):
-        if conn.dialect.name == "mysql":
-            return text("UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6))")
-        return text("((julianday('now') - 2440587.5) * 86400.0)")
-
-    def _now(self, conn):
-        return float(conn.scalar(select(self._clock(conn))))
-
-    def _row(self, conn, result_id, *, arguments=False):
-        columns = [c for c in tasks.c if arguments or c.name != "arguments"]
-        row = conn.execute(select(*columns).where(tasks.c.result_id == result_id)
-                           .with_for_update()).mappings().first()
-        return dict(row) if row else None
-
-    @contextmanager
-    def _transaction(self):
-        with self.engine.begin() as conn:
-            # SQLite ignores FOR UPDATE. Acquire its writer before any read so
-            # competing completions cannot both attempt the unique snapshot insert.
-            if conn.dialect.name == "sqlite":
-                conn.exec_driver_sql("BEGIN IMMEDIATE")
-            yield conn
-
-    def _finish(self, conn, row, status, now, *, stage="failed"):
-        expired = tasks.c.deadline <= self._clock(conn)
-        changed = conn.execute(update(tasks).where(
-            tasks.c.result_id == row["result_id"], tasks.c.status.in_(_ACTIVE),
-        ).values(
-            status=case((expired, "timed_out"), else_=status),
-            stage=case((expired, "failed"), else_=stage), arguments="{}", updated_at=now))
-        return changed.rowcount == 1
+    @property
+    def transient(self):
+        from .transient import TransientStore
+        return TransientStore(self.state)
 
     def submit(self, namespace, arguments_dict):
-        if not isinstance(namespace, str) or not 1 <= len(namespace) <= 64:
-            raise ValueError("Invalid search namespace")
-        if not isinstance(arguments_dict, dict):
-            raise TypeError("Search arguments must be a dictionary")
-        arguments = json.dumps(arguments_dict, ensure_ascii=False, allow_nan=False,
-                               separators=(",", ":"))
-        if len(arguments.encode("utf-8")) > 1024 * 1024:
-            raise ValueError("Search arguments exceed the size limit")
-        result_id = str(uuid4())
-        with self.engine.begin() as conn:
-            now = self._now(conn)
-            conn.execute(insert(tasks).values(
-                result_id=result_id, namespace=namespace, arguments=arguments,
-                status="queued", stage="queued", attempts=0, owner=None, lease_until=0,
-                retry_at=now, deadline=now + self.settings.timeout_seconds,
-                created_at=now, updated_at=now))
-            conn.execute(insert(outbox).values(
-                result_id=result_id, pending=True, generation=1, retry_at=now))
-        return result_id
+        now = self.clock()
+        expires = now + self.state.results.settings.ttl_seconds
+        envelope = validate_search_envelope({
+            "schema": 2, "result_id": str(uuid4()), "namespace": namespace,
+            "arguments": arguments_dict, "created_at": now, "expires_at": expires,
+            "deadline": min(now + self.settings.timeout_seconds, expires)})
+        record = {key: value for key, value in envelope.items() if key not in ("arguments", "schema")}
+        record.update(status="queued", stage="queued", updated_at=now,
+                      request_digest=_request_digest(envelope))
+        if not self.transient.put("search-result", envelope["result_id"], record,
+                                  ttl_seconds=self.state.results.settings.ttl_seconds, nx=True):
+            raise RuntimeError("Search admission unavailable")
+        return envelope
+
+    def _read(self, namespace, result_id):
+        row = self.transient.get("search-result", result_id)
+        return row if row is not None and row.get("namespace") == namespace else None
+
+    def _update(self, envelope, callback):
+        def change(row):
+            if (row is None or row.get("namespace") != envelope["namespace"]
+                    or row.get("status") not in _ACTIVE):
+                return None
+            if "arguments" in envelope and row.get("request_digest") != _request_digest(envelope):
+                return None
+            if row["expires_at"] <= self.clock() or row["deadline"] <= self.clock():
+                return {**row, "status": "timed_out", "stage": "failed", "updated_at": self.clock()}
+            return callback(row)
+        updated = self.transient.update("search-result", envelope["result_id"], change,
+                                        ttl_seconds=self.state.results.settings.ttl_seconds)
+        if updated is not None:
+            logger.info("Search state result_id=%s status=%s stage=%s",
+                        envelope["result_id"], updated["status"], updated["stage"])
+        return updated
 
     def get(self, namespace, result_id, page=1, page_size=10):
         try:
             validate_result_id(result_id)
         except ValueError:
             raise SnapshotUnavailable(_UNAVAILABLE) from None
-        with self._transaction() as conn:
-            # Namespace is part of the lookup: foreign jobs are indistinguishable
-            # from unknown IDs, including when callers fall back to old snapshots.
-            row = conn.execute(select(tasks.c.result_id, tasks.c.status, tasks.c.stage,
-                                      tasks.c.deadline).where(
-                tasks.c.result_id == result_id, tasks.c.namespace == namespace)
-                .with_for_update()).mappings().first()
+        try:
+            row = self._read(namespace, result_id)
             if row is None:
                 return None
-            status = row["status"]
-            if status in _ACTIVE and row["deadline"] <= self._now(conn):
-                self._finish(conn, row, "timed_out", self._now(conn))
-                status = "timed_out"
-        if status == "succeeded":
+            if row.get("status") in _ACTIVE:
+                row = self._update({"namespace": namespace, "result_id": result_id}, lambda row: None) or row
+        except RuntimeError:
+            raise SnapshotUnavailable(_UNAVAILABLE) from None
+        if row["status"] == "succeeded":
             return self.state.results.get(namespace, result_id, page=page, page_size=page_size)
-        if status not in _ACTIVE:
+        if row["expires_at"] <= self.clock():
+            raise SnapshotUnavailable(_UNAVAILABLE)
+        if row["status"] not in _ACTIVE:
             message = ("Search timed out before completion; submit a new search"
-                       if status == "timed_out" else "Search failed; submit a new search")
+                       if row["status"] == "timed_out" else "Search failed; submit a new search")
             raise SnapshotUnavailable(message)
         return {"result_id": result_id, "status": "queued", "stage": row["stage"]}
 
-    def claim(self, result_id):
-        """Load active work, without exclusive ownership or SQL retry admission."""
-        validate_result_id(result_id)
-        with self._transaction() as conn:
-            row = self._row(conn, result_id, arguments=True)
-            if row is None or row["status"] not in _ACTIVE:
-                return None
-            now = self._now(conn)
-            if row["deadline"] <= now:
-                self._finish(conn, row, "timed_out", now)
-                return None
-            row.update(status="processing", stage="processing", updated_at=now)
-            changed = conn.execute(update(tasks).where(
-                tasks.c.result_id == result_id, tasks.c.status.in_(_ACTIVE),
-                tasks.c.deadline > self._clock(conn)).values(
-                    status="processing", stage="processing", updated_at=now))
-            if changed.rowcount != 1:
-                self._finish(conn, row, "timed_out", self._now(conn))
-                return None
-            row["arguments"] = json.loads(row["arguments"])
-            row["remaining_seconds"] = row["deadline"] - now
-        return row
+    def claim(self, envelope):
+        envelope = validate_search_envelope(envelope)
+        row = self._update(envelope, lambda row: {**row, "status": "processing",
+                                                 "stage": "processing", "updated_at": self.clock()})
+        if (row is None or row.get("namespace") != envelope["namespace"]
+                or row.get("status") not in _ACTIVE or row["expires_at"] <= self.clock()):
+            return None
+        # The broker request must match the admitted metadata, not merely its UUID.
+        if any(row[key] != envelope[key] for key in ("created_at", "expires_at", "deadline")):
+            return None
+        return {**row, "arguments": envelope["arguments"],
+                "remaining_seconds": max(0, row["deadline"] - self.clock())}
 
     def complete(self, task, payload):
-        """Publish once; duplicates and other terminal winners are harmless no-ops."""
-        with self._transaction() as conn:
-            row = self._row(conn, task["result_id"])
-            if row is None or row["status"] not in _ACTIVE:
-                return None
-            now = self._now(conn)
-            if row["deadline"] <= now:
-                self._finish(conn, row, "timed_out", now)
-                return None
-            # Retain the task lock while saving. A savepoint lets deadline expiry
-            # discard the inserted snapshot while committing the timeout outcome.
-            with conn.begin_nested() as snapshot:
-                public = self.state.results.save(
-                    row["namespace"], payload, result_id=row["result_id"], conn=conn)
-                clock = self._clock(conn)
-                changed = conn.execute(update(tasks).where(
-                    tasks.c.result_id == row["result_id"], tasks.c.status.in_(_ACTIVE),
-                    tasks.c.deadline > clock).values(
-                        status="succeeded", stage="completed", arguments="{}", updated_at=clock))
-                if changed.rowcount != 1:
-                    snapshot.rollback()
-                    public = None
-            if public is None:
-                self._finish(conn, row, "timed_out", self._now(conn))
-                return None
-        try:
-            self.state.results.cache_saved(row["namespace"], row["result_id"])
-        except Exception as exc:  # noqa: BLE001 - cache failures cannot undo a committed snapshot
-            logger.warning("Search snapshot cache unavailable (%s)", type(exc).__name__)
-        return public
+        prepared = self.state.results.prepare(task["namespace"], payload, result_id=task["result_id"])
+        # Status and bytes share one WATCH/MULTI update. ACK can never precede bytes.
+        row = self._update(task, lambda row: prepared)
+        if row and row.get("namespace") == task["namespace"] and row.get("status") == "succeeded":
+            return row["payload"]
+        return None
 
     def fail(self, task, retry=True, error=None):
-        # Provider error text may contain credentials/queries and is never stored.
-        with self._transaction() as conn:
-            row = self._row(conn, task["result_id"])
-            if row is None or row["status"] not in _ACTIVE:
-                return
-            now = self._now(conn)
-            if row["deadline"] <= now:
-                self._finish(conn, row, "timed_out", now)
-            elif not retry:
-                self._finish(conn, row, "failed", now)
-            else:
-                changed = conn.execute(update(tasks).where(
-                    tasks.c.result_id == row["result_id"], tasks.c.status.in_(_ACTIVE),
-                    tasks.c.deadline > self._clock(conn)).values(
-                        status="queued", stage="retry_wait", updated_at=now))
-                if changed.rowcount != 1:
-                    self._finish(conn, row, "timed_out", self._now(conn))
+        # Provider text is intentionally neither stored nor logged.
+        return self._update(task, lambda row: {**row, "status": "queued" if retry else "failed",
+                                              "stage": "retry_wait" if retry else "failed",
+                                              "updated_at": self.clock()})
 
-    def dead_letter(self, result_id):
-        """Persist broker exhaustion before ACK; SQL errors deliberately propagate."""
-        validate_result_id(result_id)
-        with self._transaction() as conn:
-            row = self._row(conn, result_id)
+    def terminal(self, envelope):
+        if isinstance(envelope, dict):
+            namespace, result_id = envelope["namespace"], validate_result_id(envelope["result_id"])
+        else:
+            result_id = validate_result_id(envelope)
+            row = self.transient.get("search-result", result_id)
+            namespace = row["namespace"] if row else None
+        row = self._read(namespace, result_id)
+        if row is None:
+            return True
+        row = self._update({"namespace": namespace, "result_id": result_id}, lambda row: None) or row
+        return row.get("status") not in _ACTIVE
+
+    def dead_letter(self, envelope):
+        if isinstance(envelope, dict):
+            envelope = validate_search_envelope(envelope)
+        else:
+            result_id = validate_result_id(envelope)
+            row = self.transient.get("search-result", result_id)
             if row is None:
-                logger.info("Search dead letter references unknown result_id=%s", result_id)
                 return True
-            if row["status"] in _ACTIVE:
-                now = self._now(conn)
-                if row["deadline"] <= now:
-                    self._finish(conn, row, "timed_out", now)
-                else:
-                    self._finish(conn, row, "failed", now, stage="dead_letter")
+            envelope = {"result_id": result_id, "namespace": row["namespace"]}
+        self.fail(envelope, retry=False)
         return True
 
-    def terminal(self, result_id):
-        validate_result_id(result_id)
-        with self._transaction() as conn:
-            row = self._row(conn, result_id)
-            if row is None or row["status"] not in _ACTIVE:
-                return True
-            now = self._now(conn)
-            if row["deadline"] <= now:
-                self._finish(conn, row, "timed_out", now)
-                return True
-        return False
-
     def expire(self, limit=20):
-        with self._transaction() as conn:
-            now = self._now(conn)
-            rows = conn.execute(select(tasks.c.result_id).where(
-                tasks.c.status.in_(_ACTIVE), tasks.c.deadline <= now)
-                .order_by(tasks.c.deadline).limit(limit)
-                .with_for_update(skip_locked=True)).mappings().all()
-            for row in rows:
-                self._finish(conn, row, "timed_out", now)
-        return len(rows)
-
-    def dispatch(self, result_id, transport):
-        if transport is None:
-            return
-        with self.engine.connect() as conn:
-            now = self._now(conn)
-            delivery = conn.execute(select(outbox.c.generation).where(
-                outbox.c.result_id == result_id, outbox.c.pending.is_(True),
-                outbox.c.retry_at <= now)).mappings().first()
-        if delivery is None:
-            return
-        transport.send(result_id)
-        with self.engine.begin() as conn:
-            conn.execute(update(outbox).where(
-                outbox.c.result_id == result_id, outbox.c.generation == delivery["generation"]
-            ).values(pending=False))
+        return 0
 
     def dispatch_pending(self, transport, limit=20):
-        if transport is None:
-            return 0
-        with self.engine.connect() as conn:
-            now = self._now(conn)
-            ids = list(conn.scalars(select(outbox.c.result_id).where(
-                outbox.c.pending.is_(True), outbox.c.retry_at <= now)
-                .order_by(outbox.c.retry_at, outbox.c.result_id).limit(limit)))
-        sent = 0
-        for result_id in ids:
-            try:
-                self.dispatch(result_id, transport)
-                sent += 1
-            except Exception as exc:  # noqa: BLE001 - unconfirmed deliveries remain durable
-                logger.warning("Search publication deferred (%s)", type(exc).__name__)
-                break
-        return sent
+        return 0

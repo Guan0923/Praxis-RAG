@@ -1,5 +1,6 @@
 """Dedicated document protocol, broker confirmation and ACK boundaries."""
 
+import hashlib
 import json
 from types import SimpleNamespace
 from uuid import uuid4
@@ -8,6 +9,17 @@ import pytest
 
 from rag_mcp.state.cache_queue import RocketMQSettings
 from rag_mcp.state.document_queue import RocketMQDocumentQueue, document_queue_settings
+from rag_mcp.state.document_tasks import CHUNK_BYTES, document_envelopes
+
+
+def task(content=b"source"):
+    return {"artifact_id": str(uuid4()), "namespace": "manuals", "name": "manual.txt",
+            "size": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+            "configuration_version": 1, "content": content}
+
+
+def valid_message():
+    return SimpleNamespace(body=json.dumps(next(document_envelopes(task()))).encode())
 
 
 class Producer:
@@ -48,12 +60,12 @@ def test_document_protocol_uses_canonical_uuid_and_dedicated_topic():
     producer = Producer()
     queue = RocketMQDocumentQueue(RocketMQSettings(topic="documents"), producer_factory=lambda: producer)
     try:
-        artifact_id = str(uuid4())
-        queue.send(artifact_id)
+        incoming = task()
+        queue.send(incoming)
         message = producer.messages[0]
         assert message.topic == "documents"
-        assert json.loads(message.body) == {"artifact_id": artifact_id}
-        with pytest.raises(ValueError):
+        assert json.loads(message.body) == next(document_envelopes(incoming))
+        with pytest.raises((ValueError, TypeError)):
             queue.send(uuid4().hex)
     finally:
         queue.close()
@@ -61,14 +73,15 @@ def test_document_protocol_uses_canonical_uuid_and_dedicated_topic():
 
 
 def test_consumer_ack_only_for_terminal_tasks():
-    artifact_id = str(uuid4())
-    message = SimpleNamespace(body=json.dumps({"artifact_id": artifact_id}).encode())
+    incoming = task()
+    artifact_id = incoming["artifact_id"]
+    message = SimpleNamespace(body=json.dumps(next(document_envelopes(incoming))).encode())
     consumer = Consumer([message])
     queue = RocketMQDocumentQueue(RocketMQSettings(), consumer_factory=lambda: consumer)
     try:
-        queue.consume_once(lambda incoming: incoming != artifact_id)
+        queue.consume_once(lambda incoming: incoming["artifact_id"] != artifact_id)
         assert consumer.acks == []
-        queue.consume_once(lambda incoming: incoming == artifact_id)
+        queue.consume_once(lambda incoming: incoming["artifact_id"] == artifact_id)
         assert consumer.acks == [message]
     finally:
         queue.close()
@@ -80,7 +93,7 @@ def test_callback_failure_and_poison_messages_are_not_acknowledged():
     try:
         queue.consume_once(lambda _: pytest.fail("Poison message reached worker"))
         assert consumer.acks == []
-        consumer.messages = [SimpleNamespace(body=json.dumps({"artifact_id": str(uuid4())}).encode())]
+        consumer.messages = [valid_message()]
 
         def fail(_):
             raise OSError("database unavailable")
@@ -95,7 +108,7 @@ def test_callback_failure_and_poison_messages_are_not_acknowledged():
 def test_long_task_renews_visibility_before_ack():
     import threading
 
-    message = SimpleNamespace(body=json.dumps({"artifact_id": str(uuid4())}).encode())
+    message = valid_message()
     consumer = Consumer([message])
     renewed = threading.Event()
     original = consumer.change_invisible_duration
@@ -121,7 +134,7 @@ def test_long_task_renews_visibility_before_ack():
 def test_visibility_renewal_failure_still_acks_committed_terminal(caplog):
     import threading
 
-    message = SimpleNamespace(body=json.dumps({"artifact_id": str(uuid4())}).encode())
+    message = valid_message()
     consumer = Consumer([message])
     failed = threading.Event()
 
@@ -159,7 +172,7 @@ def test_cache_and_document_topics_and_groups_must_be_separate(monkeypatch):
 def test_renewals_have_bounded_retries_without_vetoing_callback(terminal, caplog):
     import threading
 
-    message = SimpleNamespace(body=json.dumps({"artifact_id": str(uuid4())}).encode())
+    message = valid_message()
     consumer = Consumer([message])
     exhausted = threading.Event()
     calls = []
@@ -188,7 +201,7 @@ def test_renewals_have_bounded_retries_without_vetoing_callback(terminal, caplog
 
 
 def test_failed_ack_propagates_after_terminal_commit(caplog):
-    message = SimpleNamespace(body=json.dumps({"artifact_id": str(uuid4())}).encode())
+    message = valid_message()
     consumer = Consumer([message])
     committed = []
 
@@ -213,7 +226,7 @@ def test_failed_ack_propagates_after_terminal_commit(caplog):
 
 
 def test_ack_and_renew_use_physical_subscription_topic():
-    message = SimpleNamespace(topic="%DLQ%source", body=json.dumps({"artifact_id": str(uuid4())}).encode())
+    message = valid_message()
     consumer = Consumer([message])
     queue = RocketMQDocumentQueue(
         RocketMQSettings(topic="%DLQ%mq_namespace%source", namespace="mq_namespace"),
@@ -257,5 +270,48 @@ def test_sdk_receive_request_keeps_physical_topic_name(monkeypatch):
         consumer = queue._start_consumer()
         captured.append(consumer._receive_req(queue.settings.topic))
         assert captured[0].message_queue.topic.name == "%DLQ%ns%source"
+    finally:
+        queue.close()
+
+
+def test_ten_mib_payload_is_bounded_and_all_confirmations_are_required():
+    pytest.importorskip("rocketmq")
+    producer = Producer()
+    queue = RocketMQDocumentQueue(RocketMQSettings(topic="documents"), producer_factory=lambda: producer)
+    incoming = task(b"x" * (10 * 1024 * 1024))
+    try:
+        queue.send(incoming)
+        assert len(producer.messages) == 20
+        assert all(len(item.body) < 710_000 for item in producer.messages)
+        assert [json.loads(item.body)["chunk_index"] for item in producer.messages] == list(range(20))
+    finally:
+        queue.close()
+
+
+def test_partial_send_failure_is_not_hidden():
+    pytest.importorskip("rocketmq")
+    producer = Producer()
+    original = producer.send
+    def send(item):
+        if producer.messages:
+            raise TimeoutError("confirmation lost")
+        original(item)
+    producer.send = send
+    queue = RocketMQDocumentQueue(RocketMQSettings(topic="documents"), producer_factory=lambda: producer)
+    try:
+        with pytest.raises(TimeoutError):
+            queue.send(task(b"x" * (CHUNK_BYTES + 1)))
+        assert len(producer.messages) == 1
+    finally:
+        queue.close()
+
+
+
+def test_legacy_canonical_uuid_only_payload_is_rejected():
+    consumer = Consumer([SimpleNamespace(body=json.dumps({"artifact_id": str(uuid4())}).encode())])
+    queue = RocketMQDocumentQueue(RocketMQSettings(), consumer_factory=lambda: consumer)
+    try:
+        queue.consume_once(lambda _: pytest.fail("Legacy SQL job reached worker"))
+        assert consumer.acks == []
     finally:
         queue.close()

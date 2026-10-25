@@ -2,7 +2,7 @@
 # Normal DLQ receive/ACK verified with SDK 5.1.2 / Apache Broker 5.3.3; revalidate other deployments.
 # Run rag-document-worker and rag-search-worker separately with the same database,
 # Redis, Qdrant, encryption and RocketMQ settings. Without a search consumer,
-# MCP searches remain queued until their task deadline; --dispatch-only is not a consumer.
+# MCP searches need a consumer before their task deadline; SQL outbox relays are no longer used.
 #
 #   .\scripts\start-stack.ps1                 # full start
 #   .\scripts\start-stack.ps1 -MigrateOnly    # only start dependencies + migrate
@@ -149,7 +149,7 @@ for ($attempt = 0; $attempt -lt 45; $attempt++) {
 if (-not $mqReady) { throw "RocketMQ provisioning failed. Check docker-compose logs rocketmq." }
 Write-Host "Consumers are not started: run rag-search-worker for MCP search and rag-document-worker for MCP add_document separately."
 Write-Host "DLQ resources are provisioned; planned rag-dead-letter-worker --kind document|search needs reader permissions. Revalidate SDK/Broker versions other than tested 5.1.2/5.3.3."
-Write-Host "Without a search consumer, MCP searches remain queued until their task deadline; --dispatch-only is not a consumer."
+Write-Host "Redis and RocketMQ are required for queued requests. Deploy API and workers together; drain legacy UUID-only messages before upgrading."
 
 if (-not $SkipMigrate) {
     if (Test-Path $LegacyRoot) {

@@ -35,18 +35,23 @@ def payload(result):
 
 
 async def add_and_index(client, runtime, arguments):
-    await anyio.to_thread.run_sync(runtime.state.document_dispatcher.stop)
+    cursor = len(runtime.state.document_dispatcher.transport.queued)
     admitted = payload(await client.call_tool("add_document", arguments))
     assert set(admitted) == {"artifact_id"}
     artifact_id = admitted["artifact_id"]
     assert str(UUID(artifact_id)) == artifact_id
     queued = payload(await client.call_tool("get_document_status", {"artifact_id": artifact_id}))
-    assert queued == {"artifact_id": artifact_id, "status": "queued", "stage": "dispatch_wait", "error": None}
-    assert artifact_id not in runtime.state.document_dispatcher.transport.queued
-    assert await anyio.to_thread.run_sync(runtime.state.document_dispatcher.run_once) == 1
-    assert artifact_id in runtime.state.document_dispatcher.transport.queued
-    assert payload(await client.call_tool("get_document_status", {"artifact_id": artifact_id}))["stage"] == "queued"
-    assert await anyio.to_thread.run_sync(DocumentWorker(runtime).process, artifact_id)
+    assert queued == {"artifact_id": artifact_id, "status": "queued", "stage": "queued", "error": None}
+    envelopes = runtime.state.document_dispatcher.transport.queued[cursor:]
+    assert envelopes and all(item["artifact_id"] == artifact_id and item["schema"] == 2 for item in envelopes)
+    expected = (arguments["content"].encode() if "content" in arguments
+                else base64.b64decode(arguments["content_base64"]))
+    assert b"".join(base64.b64decode(item["data"]) for item in envelopes) == expected
+    assert all(len(base64.b64decode(item["data"])) <= 512 * 1024 for item in envelopes)
+    worker = DocumentWorker(runtime)
+    for index, envelope in enumerate(envelopes):
+        complete = await anyio.to_thread.run_sync(worker.process, envelope)
+        assert complete is (index == len(envelopes) - 1)
     status = payload(await client.call_tool("get_document_status", {"artifact_id": artifact_id}))
     assert status["status"] == "succeeded" and status["error"] is None
     document = next(item for item in runtime.list_documents("manuals") if item["name"] == arguments["name"])
@@ -123,9 +128,11 @@ def test_content_validation_base64_and_failed_indexing(tmp_path):
                 failed = payload(await client.call_tool("add_document", {"name": "fail.txt", "content": "fail"}))
                 assert set(failed) == {"artifact_id"}
                 assert "fail.txt" not in {item["name"] for item in runtime.list_documents("manuals")}
-                assert not await anyio.to_thread.run_sync(DocumentWorker(runtime).process, failed["artifact_id"])
+                envelope = runtime.state.document_dispatcher.transport.queued[-1]
+                assert envelope["artifact_id"] == failed["artifact_id"]
+                assert not await anyio.to_thread.run_sync(DocumentWorker(runtime).process, envelope)
                 assert runtime.get_document_status("manuals", failed["artifact_id"])["stage"] == "retry_wait"
-                assert await anyio.to_thread.run_sync(runtime.state.document_tasks.dead_letter, failed["artifact_id"])
+                assert await anyio.to_thread.run_sync(runtime.state.document_tasks.dead_letter, envelope)
                 status = payload(await client.call_tool("get_document_status", failed))
                 assert status["status"] == "failed" and status["error"]
                 assert "fail.txt" not in {item["name"] for item in runtime.list_documents("manuals")}
@@ -205,12 +212,10 @@ def test_concurrent_adds_do_not_overwrite(tmp_path):
             admitted = payload(next(result for result in results if not result.is_error))
             assert set(admitted) == {"artifact_id"}
             assert runtime.list_documents("manuals") == []
-            assert runtime.state.document_dispatcher.transport.queued == []
-            assert runtime.get_document_status("manuals", admitted["artifact_id"])["stage"] == "dispatch_wait"
-            assert await anyio.to_thread.run_sync(runtime.state.document_dispatcher.run_once) == 1
-            assert runtime.state.document_dispatcher.transport.queued == [admitted["artifact_id"]]
-            assert runtime.get_document_status("manuals", admitted["artifact_id"])["status"] == "queued"
-            assert await anyio.to_thread.run_sync(DocumentWorker(runtime).process, admitted["artifact_id"])
+            envelopes = runtime.state.document_dispatcher.transport.queued
+            assert len(envelopes) == 1 and envelopes[0]["artifact_id"] == admitted["artifact_id"]
+            assert runtime.get_document_status("manuals", admitted["artifact_id"])["stage"] == "queued"
+            assert await anyio.to_thread.run_sync(DocumentWorker(runtime).process, envelopes[0])
             assert len(runtime.list_documents("manuals")) == 1
         anyio.run(scenario)
 

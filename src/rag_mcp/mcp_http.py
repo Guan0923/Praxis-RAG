@@ -332,7 +332,7 @@ class McpHttpEndpoint:
         return create_registry(executor, self.catalogs.for_namespace(namespace), partial(self.mutate_document, namespace))
 
     async def search_queued(self, namespace, request):
-        # Submission is durable even if the client disconnects during admission.
+        # Finish broker-confirmed admission even if the client disconnects.
         with anyio.CancelScope(shield=True):
             submitted = await anyio.to_thread.run_sync(
                 self.runtime.submit_search, namespace, asdict(request.search))

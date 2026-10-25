@@ -1,136 +1,58 @@
-"""DLQ acknowledgement follows committed SQL state, never inference or re-enqueue."""
+"""DLQ handling records Redis outcomes without inference or SQL task access."""
 
-import json
 import subprocess
 import sys
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select, update
 
 from rag_mcp.dead_letter_worker import DeadLetterWorker, dead_letter_queue_settings
-from rag_mcp.state.document_queue import RocketMQDocumentQueue
-from rag_mcp.state.schema import document_tasks, search_tasks
-from rag_mcp.state.settings import StateSettings
 from rag_mcp.state.store import StateStores
+from rag_mcp.state.transient import TransientUnavailable
 
 
-class Consumer:
-    def __init__(self, bodies):
-        self.messages = [SimpleNamespace(body=body) for body in bodies]
-        self.acks = []
-        self.closed = False
+@pytest.mark.parametrize("kind", ["document", "search"])
+@pytest.mark.parametrize("complete", [True, False, None])
+def test_ack_eligibility_follows_task_outcome(kind, complete, caplog):
+    calls = []
 
-    def startup(self):
-        pass
+    def dead_letter(task_id):
+        calls.append(task_id)
+        return complete
 
-    def receive(self, *_):
-        return self.messages
-
-    def ack(self, message):
-        self.acks.append(message)
-
-    def shutdown(self):
-        self.closed = True
-
-
-@pytest.fixture
-def state(monkeypatch):
-    monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
-    monkeypatch.setenv("RAG_REDIS_ENABLED", "0")
-    result = StateStores(StateSettings(url="sqlite+pysqlite:///:memory:"))
-    result.knowledge_bases.create({"namespace": "business_namespace", "collection": "test"})
-    yield result
-    result.close()
-
-
-def submit(state, kind):
-    if kind == "document":
-        return state.document_tasks.submit("business_namespace", "manual.txt", b"content")
-    return state.search_tasks.submit("business_namespace", {"query": "manual"})
-
-
-def deliver(state, kind, task_id):
+    tasks = SimpleNamespace(dead_letter=dead_letter)
+    state = SimpleNamespace(document_tasks=tasks, search_tasks=tasks)
     key = "artifact_id" if kind == "document" else "result_id"
-    consumer = Consumer([json.dumps({key: task_id}).encode()])
-    queue = RocketMQDocumentQueue(dead_letter_queue_settings(kind), consumer_factory=lambda: consumer)
-    queue.message_key = key
-    return consumer, queue, DeadLetterWorker(state, kind)
+    task_id = str(uuid4())
+    payload = {"schema": 2, key: task_id}
+    with caplog.at_level("INFO"):
+        result = DeadLetterWorker(state, kind).process(payload)
+    assert result is (complete is True)
+    assert calls == [payload]
+    if complete is True:
+        assert task_id in caplog.text
 
 
 @pytest.mark.parametrize("kind", ["document", "search"])
-@pytest.mark.parametrize("status", ["queued", "processing", "succeeded"])
-def test_dead_letters_fail_pending_preserve_succeeded_before_ack(state, kind, status):
-    task_id = submit(state, kind)
-    table = document_tasks if kind == "document" else search_tasks
-    column = table.c.artifact_id if kind == "document" else table.c.result_id
-    with state.engine.begin() as conn:
-        conn.execute(update(table).where(column == task_id).values(status=status, stage="test"))
-    consumer, queue, worker = deliver(state, kind, task_id)
-    original = consumer.ack
-
-    def ack(message):
-        with state.engine.connect() as conn:
-            row = conn.execute(select(table).where(column == task_id)).mappings().one()
-        assert row["status"] == ("succeeded" if status == "succeeded" else "failed")
-        assert row["stage"] == ("test" if status == "succeeded" else "dead_letter")
-        original(message)
-
-    consumer.ack = ack
-    try:
-        queue.consume_once(worker.process)
-        queue.consume_once(worker.process)
-        assert len(consumer.acks) == 2
-    finally:
-        queue.close()
-    assert consumer.closed
-
-
-@pytest.mark.parametrize("kind", ["document", "search"])
-def test_database_exception_does_not_ack(state, kind, monkeypatch):
-    task_id = submit(state, kind)
-    consumer, queue, worker = deliver(state, kind, task_id)
-
+def test_redis_failure_propagates_without_ack_eligibility(kind):
     def fail(_):
-        raise OSError("sensitive database credentials")
+        raise TransientUnavailable("Redis task write unavailable")
 
-    monkeypatch.setattr(worker.tasks, "dead_letter", fail)
-    try:
-        with pytest.raises(OSError):
-            queue.consume_once(worker.process)
-        assert consumer.acks == []
-    finally:
-        queue.close()
-
-
-@pytest.mark.parametrize("kind", ["document", "search"])
-def test_unknown_canonical_ids_ack_after_authoritative_lookup(state, kind, caplog):
-    consumer, queue, worker = deliver(state, kind, str(uuid4()))
-    try:
-        with caplog.at_level("INFO"):
-            queue.consume_once(worker.process)
-        assert len(consumer.acks) == 1
-        assert "unknown" in caplog.text.lower()
-    finally:
-        queue.close()
-
-
-@pytest.mark.parametrize("kind", ["document", "search"])
-def test_poison_payload_never_reaches_sql_or_acks(kind, caplog):
+    tasks = SimpleNamespace(dead_letter=fail)
+    state = SimpleNamespace(document_tasks=tasks, search_tasks=tasks)
     key = "artifact_id" if kind == "document" else "result_id"
-    consumer = Consumer([b"not json", b"[]", b"null", b"\xff", b"{}",
-                         json.dumps({key: "arbitrary-id-with-private-secret"}).encode(),
-                         json.dumps({key: uuid4().hex}).encode()])
-    queue = RocketMQDocumentQueue(dead_letter_queue_settings(kind), consumer_factory=lambda: consumer)
-    queue.message_key = key
-    try:
-        queue.consume_once(lambda _: pytest.fail("poison reached callback"))
-        assert consumer.acks == []
-        assert "malformed" in caplog.text
-        assert "private-secret" not in caplog.text
-    finally:
-        queue.close()
+    with pytest.raises(TransientUnavailable):
+        DeadLetterWorker(state, kind).process({"schema": 2, key: str(uuid4())})
+
+
+@pytest.mark.parametrize("kind", ["document", "search"])
+@pytest.mark.parametrize("payload", [None, [], "legacy-id", {}, {"artifact_id": "bad", "result_id": "bad"}])
+def test_invalid_payload_never_reaches_task_store(kind, payload):
+    tasks = SimpleNamespace(dead_letter=lambda _: pytest.fail("Invalid message reached task store"))
+    state = SimpleNamespace(document_tasks=tasks, search_tasks=tasks)
+    with pytest.raises((ValueError, TypeError)):
+        DeadLetterWorker(state, kind).process(payload)
 
 
 def test_dlq_settings_preserve_credentials_and_use_physical_not_business_namespace(monkeypatch):
@@ -186,25 +108,24 @@ def test_main_loads_shared_config_and_closes_every_client(monkeypatch, kind):
             assert settings.topic.startswith("%DLQ%")
 
         def consume_once(self, callback):
-            assert self.message_key == ("artifact_id" if kind == "document" else "result_id")
-            assert callback(str(uuid4())) is True
+            key = "artifact_id" if kind == "document" else "result_id"
+            assert callback({"schema": 2, key: str(uuid4())}) is True
             stop.set()
 
         def close(self):
             events.append("transport_close")
 
+    from rag_mcp.state import search_queue
+
     monkeypatch.setattr(module, "RocketMQDocumentQueue", Transport)
+    monkeypatch.setattr(search_queue, "RocketMQSearchQueue", Transport)
     assert module.main(["--kind", kind]) == 0
     assert events == ["config", "transport_close", "state_close"]
 
 
 @pytest.mark.parametrize("kind", ["document", "search"])
-def test_uncommitted_handler_result_never_acks(kind):
+def test_nonterminal_handler_result_never_eligible_for_ack(kind):
     tasks = SimpleNamespace(dead_letter=lambda _: False)
     state = SimpleNamespace(document_tasks=tasks, search_tasks=tasks)
-    consumer, queue, worker = deliver(state, kind, str(uuid4()))
-    try:
-        queue.consume_once(worker.process)
-        assert consumer.acks == []
-    finally:
-        queue.close()
+    key = "artifact_id" if kind == "document" else "result_id"
+    assert DeadLetterWorker(state, kind).process({"schema": 2, key: str(uuid4())}) is False
