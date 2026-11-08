@@ -187,3 +187,20 @@ REST /v1/admin/tools -> 6 tools
 ```
 
 当前已知限制（Go 侧）：上传/删除/异步文档状态尚未接线（需要 task-9 上传事务与 G7）；PDF 文本预览需要外部解析器清单（读取原文件可用）；同步搜索结果快照尚未保存（task-13 完成 SearchReferences 后接入）。
+
+### 2026-11-08 第四轮：上传事务、文档 ingest 与只读状态接口
+
+新增提交：
+
+- `feat(go): durable upload journal and coordinator`：UploadJournal + UploadCoordinator（操作/步骤/对象/head/租约/幂等/恢复/补偿/工作区安全，149 pass / 2 MySQL skip）。
+- `feat(go): ingest adapter, Word chunk builder and chunking exports`：`internal/ingest`（md/txt/doc/docx/pdf 统一 Prepare 适配器、Word chunk builder、资产 staging、稳定 chunk id 与文档元数据）。
+- `feat(go): upload status, published-version and lease read endpoints`：`/v1/uploads`、`/v1/uploads/{operation_id}`、`/v1/admin/published-versions`、`/v1/admin/upload-leases`（只读展示模型；前两者租户认证，后两者本机管理 + 租户双重校验）。
+
+进行中：
+
+- task-12（go-retrieval）：runtime 知识库 create/update/reembed/delete。
+- task-13（go-mcp）：`internal/redisstate` + `internal/searchrefs`（结果快照与引用捕获）。
+- task-14（go-state）：DocumentJobs/SearchTasks + outbox dispatcher（G7 状态机）。
+- task-15（go-document）：Dockerfile/构建脚本/Makefile/冒烟工作流。
+
+下一步：用 upload journal + ingest 适配器实现 `runtime.Upload/Delete/WriteDocument/DeleteDocument`（含 Qdrant 发布、blob/Artifact 持久化、文档变更通知），随后接线管理端知识库路由与 Redis 快照。
