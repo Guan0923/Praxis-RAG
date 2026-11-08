@@ -199,6 +199,21 @@ func TestDocumentsEndpoints(t *testing.T) {
 	if invalidCheck.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("invalid check status = %d", invalidCheck.Code)
 	}
+
+	unsupported := performRequest(handler, testRequest{
+		method: "POST", target: "/v1/documents/check", headers: tenantAuth(),
+		body: `{"files":[{"name":"bad.exe","sha256":"` + sha + `"}]}`,
+	})
+	if unsupported.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported check status = %d body = %s", unsupported.Code, unsupported.Body.String())
+	}
+	wantMessage := "暂不支持该文件类型：bad.exe；请选择 .doc、.docx、.md、.pdf、.txt。"
+	if body := decodeBody(t, unsupported); body["detail"] != wantMessage {
+		t.Fatalf("unsupported detail = %v, want %q", body["detail"], wantMessage)
+	}
+	if len(runtime.checkFiles) != 1 {
+		t.Fatalf("handler forwarded an unsupported name to the runtime: %+v", runtime.checkFiles)
+	}
 }
 
 func TestKnowledgeBaseEndpoint(t *testing.T) {

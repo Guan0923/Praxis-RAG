@@ -34,6 +34,16 @@ type Service struct {
 	stores   *state.Stores
 	dataRoot string
 	search   *SearchEngine
+	// views is the cached read-view source for display lists. It is nil when
+	// the store exposes no views, in which case the authoritative repository is
+	// used directly.
+	views documentReadViews
+}
+
+// documentReadViews is the read-through cached document list used by
+// /v1/documents (Python state.views.documents).
+type documentReadViews interface {
+	Documents(ctx context.Context, namespace string) ([]map[string]any, error)
 }
 
 // New validates the runtime configuration and prepares the data root. A backend
@@ -59,7 +69,11 @@ func New(cfg config.RagConfig, stores *state.Stores, dataRoot string) (*Service,
 	if err != nil {
 		return nil, err
 	}
-	return &Service{config: cfg, stores: stores, dataRoot: root, search: search}, nil
+	service := &Service{config: cfg, stores: stores, dataRoot: root, search: search}
+	if stores.Views != nil {
+		service.views = stores.Views
+	}
+	return service, nil
 }
 
 // DataRoot returns the resolved data root.
@@ -125,7 +139,23 @@ func (s *Service) SubmitSearch(ctx context.Context, namespace string, request co
 
 // ListDocuments returns the namespace's document records. The shape matches
 // Python's KnowledgeDocumentStore.list_documents (dicts with JSON field names).
+// ListDocuments returns the display document list through the cached read view
+// (Python state.views.documents), so repeated reads share the same snapshot and
+// event ordering as the other view endpoints. The view already overlays the
+// knowledge-base collection/embedding_model; when views are unavailable or fail
+// the authoritative repository is used as a fallback.
 func (s *Service) ListDocuments(ctx context.Context, namespace string) ([]map[string]any, error) {
+	if s.views != nil {
+		documents, err := s.views.Documents(ctx, namespace)
+		if err == nil {
+			return documents, nil
+		}
+	}
+	return s.authoritativeDocuments(ctx, namespace)
+}
+
+// authoritativeDocuments reads current records directly from the repository.
+func (s *Service) authoritativeDocuments(ctx context.Context, namespace string) ([]map[string]any, error) {
 	records, err := s.stores.Documents.List(ctx, namespace)
 	if err != nil {
 		return nil, &apierrors.KnowledgeError{Message: "Document records cannot be read."}
@@ -324,6 +354,28 @@ func (s *Service) readSource(ctx context.Context, namespace, name string) ([]byt
 // CheckDocuments reports existing documents that already match the supplied
 // content hashes. Duplicate detection compares the stored chunking metadata
 // with the namespace's committed configuration like Python's find_duplicate.
+// SupportedUploadExtensions is the accepted upload suffix set in Python's sorted
+// order (used verbatim in the unsupported-type message).
+var SupportedUploadExtensions = []string{".doc", ".docx", ".md", ".pdf", ".txt"}
+
+// UnsupportedFileTypeMessage mirrors service_knowledge.validate_uploads:
+// "暂不支持该文件类型：<name>；请选择 .doc、.docx、.md、.pdf、.txt。".
+func UnsupportedFileTypeMessage(name string) string {
+	return "暂不支持该文件类型：" + name + "；请选择 " + strings.Join(SupportedUploadExtensions, "、") + "。"
+}
+
+// SupportedUploadExtension reports whether name has an accepted suffix
+// (case-insensitive, mirroring Path(...).suffix.casefold()).
+func SupportedUploadExtension(name string) bool {
+	extension := strings.ToLower(filepath.Ext(name))
+	for _, supported := range SupportedUploadExtensions {
+		if extension == supported {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Service) CheckDocuments(ctx context.Context, namespace string, files []CheckFile) (map[string]any, error) {
 	settings, err := s.stores.KnowledgeBases.Get(ctx, namespace)
 	if err != nil {
@@ -338,6 +390,11 @@ func (s *Service) CheckDocuments(ctx context.Context, namespace string, files []
 		safeName, nameErr := SanitizeName(file.Name)
 		if nameErr != nil || safeName != file.Name {
 			return nil, &apierrors.KnowledgeValidationError{Message: "Invalid document name: " + file.Name}
+		}
+		// Python validate_uploads checks the casefolded suffix after sanitizing
+		// and raises the shared unsupported-type message (HTTP 400).
+		if !SupportedUploadExtension(safeName) {
+			return nil, &apierrors.KnowledgeValidationError{Message: UnsupportedFileTypeMessage(safeName)}
 		}
 		candidates, listErr := s.stores.Documents.Candidates(ctx, namespace, file.SHA256, &file.Name)
 		if listErr != nil {

@@ -340,6 +340,15 @@ func TestConsoleStaticAssets(t *testing.T) {
 	if asset.Code != http.StatusOK || asset.Body.String() != "console-asset" {
 		t.Fatalf("asset status = %d body = %q", asset.Code, asset.Body.String())
 	}
+	// Python StaticFiles never renders directory listings (and never falls back
+	// to webRoot/index.html for a directory request): both the assets root and
+	// subdirectories are 404.
+	for _, target := range []string{"/console/assets/", "/console/assets/assets/", "/console/assets/missing.js"} {
+		response := performRequest(server.Handler(), testRequest{method: "GET", target: target})
+		if response.Code != http.StatusNotFound || strings.Contains(response.Body.String(), "index.html") {
+			t.Fatalf("%s status = %d body = %q", target, response.Code, response.Body.String())
+		}
+	}
 }
 
 func TestConsoleIsAbsentWithoutBuild(t *testing.T) {

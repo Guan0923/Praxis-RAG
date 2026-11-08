@@ -172,6 +172,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		recorder.Header().Set("Cache-Control", "no-store")
 	}
 
+	// Python's StaticFiles never serves directory listings: reject directory
+	// paths (including the assets root) instead of letting http.FileServer render
+	// HTML listings or fall back to webRoot/index.html.
+	if s.webRoot != "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		strings.HasPrefix(r.URL.Path, "/console/assets") && !consoleAssetFile(s.webRoot, r.URL.Path) {
+		writeDetail(recorder, http.StatusNotFound, "Not Found")
+		return
+	}
+
 	result, pathMatched, allowed := s.router.match(r.Method, r.URL.Path)
 	if result.route == nil {
 		if !pathMatched {
@@ -278,6 +287,26 @@ func isSnapshotPath(path string) bool {
 	return strings.HasPrefix(path, "/v1/search-results/") || strings.HasPrefix(path, "/v1/artifacts/")
 }
 
+// consoleAssetFile reports whether the request maps to a regular file under the
+// Console web root (not a directory, not outside the root).
+func consoleAssetFile(webRoot, requestPath string) bool {
+	relative := strings.TrimPrefix(requestPath, "/console/assets")
+	relative = strings.TrimPrefix(relative, "/")
+	if relative == "" || strings.Contains(relative, "..") {
+		return false
+	}
+	root, err := filepath.Abs(webRoot)
+	if err != nil {
+		return false
+	}
+	target, err := filepath.Abs(filepath.Join(root, filepath.FromSlash(relative)))
+	if err != nil || target != root && !strings.HasPrefix(target, root+string(os.PathSeparator)) {
+		return false
+	}
+	info, err := os.Stat(target)
+	return err == nil && !info.IsDir()
+}
+
 // resolveWebRoot locates the built Console. An explicit setting wins; otherwise
 // the repository layout and the executable directory are probed.
 func resolveWebRoot(configured string) string {
@@ -296,6 +325,7 @@ func resolveWebRoot(configured string) string {
 		executableDir := filepath.Dir(executable)
 		candidates = append(candidates,
 			filepath.Join(executableDir, "web"),
+			filepath.Join(executableDir, "..", "web"),
 			filepath.Join(executableDir, "..", "src", "rag_mcp", "web"),
 		)
 	}

@@ -2,11 +2,13 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/document"
@@ -199,4 +201,80 @@ func TestReadDocumentPlainTextValidation(t *testing.T) {
 	insertReadableDocument(t, stores, "alpha", "big.txt", "doc-big", "", nil)
 	_, _, err = service.ReadDocument(ctx, "alpha", "big.txt")
 	assertKnowledgeValidation(t, err, "文档提取文本过大：big.txt")
+}
+
+type stubDocumentViews struct {
+	documents []map[string]any
+	err       error
+	calls     int
+}
+
+func (s *stubDocumentViews) Documents(context.Context, string) ([]map[string]any, error) {
+	s.calls++
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.documents, nil
+}
+
+func TestListDocumentsUsesCachedReadViewsAndFallback(t *testing.T) {
+	stores := newTestStores(t)
+	service, err := New(config.RagConfig{Backend: config.BackendQdrant}, stores, t.TempDir())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = service.Close(context.Background()) }()
+	ctx := context.Background()
+
+	// The cached view is used when it succeeds (no repository read needed).
+	cached := &stubDocumentViews{documents: []map[string]any{{"name": "cached.md"}}}
+	service.views = cached
+	documents, err := service.ListDocuments(ctx, "alpha")
+	if err != nil || len(documents) != 1 || documents[0]["name"] != "cached.md" || cached.calls != 1 {
+		t.Fatalf("cached ListDocuments() = %+v, %v, calls=%d", documents, err, cached.calls)
+	}
+
+	// A failing view falls back to the authoritative repository.
+	insertReadableDocument(t, stores, "alpha", "real.md", "doc-real", "", map[string]any{})
+	failing := &stubDocumentViews{err: context.DeadlineExceeded}
+	service.views = failing
+	documents, err = service.ListDocuments(ctx, "alpha")
+	if err != nil || len(documents) != 1 || documents[0]["name"] != "real.md" || failing.calls != 1 {
+		t.Fatalf("fallback ListDocuments() = %+v, %v, calls=%d", documents, err, failing.calls)
+	}
+
+	// No views configured (store without cache support) also falls back.
+	service.views = nil
+	documents, err = service.ListDocuments(ctx, "alpha")
+	if err != nil || len(documents) != 1 || documents[0]["name"] != "real.md" {
+		t.Fatalf("authoritative ListDocuments() = %+v, %v", documents, err)
+	}
+}
+
+func TestCheckDocumentsRejectsUnsupportedExtension(t *testing.T) {
+	service, stores := newKBService(t, "http://127.0.0.1:1")
+	ctx := context.Background()
+	if err := stores.KnowledgeBases.Create(ctx, testKnowledgeBaseSettings(t, "alpha", "http://127.0.0.1:1", "knowledge_test")); err != nil {
+		t.Fatalf("KnowledgeBases.Create() error = %v", err)
+	}
+	_, err := service.CheckDocuments(ctx, "alpha", []CheckFile{{Name: "bad.exe", SHA256: strings.Repeat("a", 64)}})
+	var validation *apierrors.KnowledgeValidationError
+	if !errors.As(err, &validation) {
+		t.Fatalf("CheckDocuments() error = %v", err)
+	}
+	want := "暂不支持该文件类型：bad.exe；请选择 .doc、.docx、.md、.pdf、.txt。"
+	if validation.Message != want {
+		t.Fatalf("message = %q, want %q", validation.Message, want)
+	}
+	if SupportedUploadExtension("bad.exe") || !SupportedUploadExtension("a.MD") {
+		t.Fatalf("supported-extension helper is wrong")
+	}
+	// A supported suffix reaches the duplicate probe instead of validation.
+	payload, err := service.CheckDocuments(ctx, "alpha", []CheckFile{{Name: "ok.md", SHA256: strings.Repeat("b", 64)}})
+	if err != nil {
+		t.Fatalf("supported CheckDocuments() error = %v", err)
+	}
+	if files, ok := payload["files"].([]map[string]any); !ok || len(files) != 1 {
+		t.Fatalf("payload = %+v", payload)
+	}
 }

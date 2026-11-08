@@ -306,8 +306,7 @@ func (s *Server) handleCheckDocuments(w http.ResponseWriter, r *http.Request) {
 		if !supportedExtension(suffix) {
 			// Python raises KnowledgeValidationError, which the check route
 			// renders as a 400 detail string.
-			writeDetail(w, http.StatusBadRequest,
-				"暂不支持该文件类型："+item.Name+"；请选择 "+strings.Join(SupportedExtensions, "、")+"。")
+			writeDetail(w, http.StatusBadRequest, unsupportedFileTypeMessage(item.Name))
 			return
 		}
 	}
@@ -364,6 +363,16 @@ func isSHA256(value string) bool {
 }
 
 var _ = json.Marshal
+
+// unsupportedFileTypeMessage mirrors runtime.UnsupportedFileTypeMessage /
+// service_knowledge.validate_uploads. The runtime validates the same rule for
+// direct callers; this handler avoids duplicating the exact literal in two
+// places by building it here.
+func unsupportedFileTypeMessage(name string) string {
+	extensions := append([]string(nil), SupportedExtensions...)
+	sort.Strings(extensions)
+	return "暂不支持该文件类型：" + name + "；请选择 " + strings.Join(extensions, "、") + "。"
+}
 
 // supportedExtension reports whether suffix is one of the accepted upload types.
 func supportedExtension(suffix string) bool {
