@@ -16,9 +16,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Guan0923/xinghe_rag/internal/apikeys"
+	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
+	"github.com/Guan0923/xinghe_rag/internal/state"
 	"github.com/Guan0923/xinghe_rag/internal/version"
 )
 
@@ -41,16 +44,24 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	stateSettings, err := config.StateSettingsFromEnv(serviceSettings.DataRoot)
+	stateSettings, err := state.SettingsFromEnv(serviceSettings.DataRoot)
 	if err != nil {
 		return err
 	}
-	service, err := runtime.New(ragConfig, stateSettings, serviceSettings.DataRoot)
+	stores, err := state.New(stateSettings, stateSettings.AutoSchema)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = stores.Close() }()
+	service, err := runtime.New(ragConfig, stores, serviceSettings.DataRoot)
 	if err != nil {
 		return err
 	}
 	logger := newLogger()
-	api := httpapi.New(serviceSettings, service, nil, logger)
+	api := httpapi.New(serviceSettings, service, nil, logger,
+		httpapi.WithAPIKeyStore(apikeys.New(stores.APIKeys)),
+		httpapi.WithCatalogStore(catalog.StateStore{Repository: stores.Catalogs}),
+	)
 
 	address := net.JoinHostPort(serviceSettings.Host, strconv.Itoa(serviceSettings.Port))
 	httpServer := &http.Server{

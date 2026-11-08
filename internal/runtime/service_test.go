@@ -8,11 +8,35 @@ import (
 	"testing"
 
 	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
+func newTestStores(t *testing.T) *state.Stores {
+	t.Helper()
+	root := t.TempDir()
+	settings := config.StateSettings{
+		URL:        "sqlite+pysqlite:///" + filepath.ToSlash(filepath.Join(root, "state.sqlite3")),
+		SQLitePath: filepath.Join(root, "state.sqlite3"),
+		AutoSchema: true,
+	}
+	stores, err := state.New(settings, true)
+	if err != nil {
+		t.Fatalf("state.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = stores.Close() })
+	return stores
+}
+
 func TestNewRequiresQdrantBackend(t *testing.T) {
-	_, err := New(config.RagConfig{Backend: config.BackendMock}, testStateSettings(t), t.TempDir())
+	_, err := New(config.RagConfig{Backend: config.BackendMock}, newTestStores(t), t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "RAG_BACKEND=qdrant") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewRequiresStateStore(t *testing.T) {
+	_, err := New(config.RagConfig{Backend: config.BackendQdrant}, nil, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "shared state store") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -22,7 +46,7 @@ func TestNewCreatesDataRootAndReportsStatus(t *testing.T) {
 	service, err := New(config.RagConfig{
 		Backend:    config.BackendQdrant,
 		Collection: "mini_agent_knowledge_pdf_assets_v1",
-	}, testStateSettings(t), dataRoot)
+	}, newTestStores(t), dataRoot)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -38,18 +62,8 @@ func TestNewCreatesDataRootAndReportsStatus(t *testing.T) {
 	if status["backend"] != "qdrant" || status["collection"] != "mini_agent_knowledge_pdf_assets_v1" {
 		t.Fatalf("status = %v", status)
 	}
-	state, ok := status["state"].(map[string]any)
-	if !ok || state["backend"] != "sqlite" {
+	statePayload, ok := status["state"].(map[string]any)
+	if !ok || statePayload["backend"] != "sqlite" {
 		t.Fatalf("state = %v", status["state"])
-	}
-}
-
-func testStateSettings(t *testing.T) config.StateSettings {
-	t.Helper()
-	root := t.TempDir()
-	return config.StateSettings{
-		URL:        "sqlite+pysqlite:///" + filepath.ToSlash(filepath.Join(root, "state.sqlite3")),
-		SQLitePath: filepath.Join(root, "state.sqlite3"),
-		AutoSchema: true,
 	}
 }

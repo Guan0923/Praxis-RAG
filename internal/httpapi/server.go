@@ -48,6 +48,7 @@ type Server struct {
 	settings config.ServiceSettings
 	status   StatusProvider
 	keys     KeyLookup
+	keyStore APIKeyStore
 	logger   *slog.Logger
 	router   *router
 	webRoot  string
@@ -97,6 +98,11 @@ func (s *Server) registerRoutes() {
 	s.router.add("DELETE", "/v1/admin/prompts/{name}", authAdmin, s.handleDeletePrompt)
 	s.router.add("GET", "/v1/admin/tools", authAdmin, s.handleListTools)
 	s.router.add("PATCH", "/v1/admin/tools/{name}", authAdmin, s.handlePatchTool)
+	s.router.add("GET", "/v1/admin/api-keys", authAdmin, s.handleListAPIKeys)
+	s.router.add("POST", "/v1/admin/api-keys", authAdmin, s.handleCreateAPIKey)
+	s.router.add("PUT", "/v1/admin/api-keys/{key_id}", authAdmin, s.handleUpdateAPIKey)
+	s.router.add("DELETE", "/v1/admin/api-keys/{key_id}", authAdmin, s.handleDeleteAPIKey)
+	s.router.add("GET", "/v1/admin/api-keys/{key_id}/mcp-config", authAdmin, s.handleAPIKeyMCPConfig)
 
 	if s.webRoot != "" {
 		s.router.add("GET", "/", authNone, s.handleConsoleIndex)

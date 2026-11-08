@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"crypto/subtle"
 	"net"
 	"net/http"
@@ -16,7 +17,7 @@ var namespacePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 
 // KeyLookup resolves the namespaces authorized for one API key secret.
 type KeyLookup interface {
-	NamespacesForKey(secret string) ([]string, error)
+	NamespacesForKey(ctx context.Context, secret string) ([]string, error)
 }
 
 // namespaceFromHeader validates and returns the X-RAG-Namespace header value.
@@ -48,7 +49,7 @@ func (s *Server) tenantFromHeaders(w http.ResponseWriter, r *http.Request) (stri
 			writeDetail(w, http.StatusUnauthorized, "RAG service authentication failed.")
 			return "", false
 		}
-		namespaces, err := s.keys.NamespacesForKey(secret)
+		namespaces, err := s.keys.NamespacesForKey(r.Context(), secret)
 		if err != nil {
 			writeDetail(w, http.StatusUnauthorized, err.Error())
 			return "", false

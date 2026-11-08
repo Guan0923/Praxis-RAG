@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,8 +14,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Guan0923/xinghe_rag/internal/apikeys"
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
 type fakeNotifier struct{ namespaces []string }
@@ -33,7 +36,7 @@ func (f fakeStatus) Status(context.Context) map[string]any { return f.payload }
 
 type fakeKeys map[string][]string
 
-func (f fakeKeys) NamespacesForKey(secret string) ([]string, error) {
+func (f fakeKeys) NamespacesForKey(_ context.Context, secret string) ([]string, error) {
 	namespaces, ok := f[secret]
 	if !ok {
 		return nil, errors.New("无效的 API Key")
@@ -630,3 +633,153 @@ func TestAdminToolSettings(t *testing.T) {
 }
 
 func strPtr(value string) *string { return &value }
+
+func newStateBackedServer(t *testing.T) *Server {
+	t.Helper()
+	root := t.TempDir()
+	settings := config.StateSettings{
+		URL:           "sqlite+pysqlite:///" + filepath.ToSlash(filepath.Join(root, "state.sqlite3")),
+		SQLitePath:    filepath.Join(root, "state.sqlite3"),
+		AutoSchema:    true,
+		EncryptionKey: "base64:" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")),
+	}
+	stores, err := state.New(settings, true)
+	if err != nil {
+		t.Fatalf("state.New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = stores.Close() })
+	return New(testSettings(""), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithAPIKeyStore(apikeys.New(stores.APIKeys)),
+	)
+}
+
+func TestAPIKeyLifecycleAgainstSQLiteState(t *testing.T) {
+	handler := newStateBackedServer(t).Handler()
+
+	created := performRequest(handler, testRequest{
+		method:  "POST",
+		target:  "/v1/admin/api-keys",
+		remote:  "127.0.0.1:5000",
+		headers: map[string]string{"Content-Type": "application/json"},
+		body:    `{"name":"app","namespaces":["alpha","beta"]}`,
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body = %s", created.Code, created.Body.String())
+	}
+	createdBody := decodeBody(t, created)
+	key, _ := createdBody["key"].(string)
+	if !strings.HasPrefix(key, "prk_") {
+		t.Fatalf("key = %v", createdBody["key"])
+	}
+	keyID, _ := createdBody["id"].(string)
+	if keyID == "" {
+		t.Fatalf("created = %v", createdBody)
+	}
+
+	listed := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/admin/api-keys", remote: "127.0.0.1:5000",
+	})
+	if listed.Code != http.StatusOK {
+		t.Fatalf("list status = %d body = %s", listed.Code, listed.Body.String())
+	}
+	if strings.Contains(listed.Body.String(), key) {
+		t.Fatalf("list response leaked the plaintext key")
+	}
+	if got := listed.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+
+	tenantHeaders := map[string]string{"Authorization": "Bearer " + key, "X-RAG-Namespace": "alpha"}
+	allowed := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/chunking/strategies", headers: tenantHeaders,
+	})
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("tenant status = %d body = %s", allowed.Code, allowed.Body.String())
+	}
+	forbidden := performRequest(handler, testRequest{
+		method:  "GET",
+		target:  "/v1/chunking/strategies",
+		headers: map[string]string{"Authorization": "Bearer " + key, "X-RAG-Namespace": "other"},
+	})
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("forbidden status = %d", forbidden.Code)
+	}
+
+	updatePath := "/v1/admin/api-keys/" + keyID
+	updated := performRequest(handler, testRequest{
+		method: "PUT", target: updatePath, remote: "127.0.0.1:5000",
+		body: `{"name":"app","namespaces":["alpha"],"enabled":false}`,
+	})
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update status = %d body = %s", updated.Code, updated.Body.String())
+	}
+	disabled := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/chunking/strategies", headers: tenantHeaders,
+	})
+	if disabled.Code != http.StatusUnauthorized {
+		t.Fatalf("disabled status = %d", disabled.Code)
+	}
+
+	performRequest(handler, testRequest{
+		method: "PUT", target: updatePath, remote: "127.0.0.1:5000",
+		body: `{"name":"app","namespaces":["alpha"],"enabled":true}`,
+	})
+	configPath := updatePath + "/mcp-config"
+	mcpConfig := performRequest(handler, testRequest{
+		method:  "GET",
+		target:  configPath,
+		remote:  "127.0.0.1:5000",
+		headers: map[string]string{"X-RAG-Namespace": "alpha"},
+	})
+	if mcpConfig.Code != http.StatusOK {
+		t.Fatalf("mcp-config status = %d body = %s", mcpConfig.Code, mcpConfig.Body.String())
+	}
+	if got := mcpConfig.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("mcp-config Cache-Control = %q", got)
+	}
+	configBody := decodeBody(t, mcpConfig)
+	headers, _ := configBody["headers"].(map[string]any)
+	if headers["Authorization"] != "Bearer "+key || headers["X-RAG-Namespace"] != "alpha" {
+		t.Fatalf("headers = %v", headers)
+	}
+	if configBody["url"] != "http://127.0.0.1:8011/mcp" {
+		t.Fatalf("url = %v", configBody["url"])
+	}
+
+	deleted := performRequest(handler, testRequest{
+		method: "DELETE", target: updatePath, remote: "127.0.0.1:5000",
+	})
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d", deleted.Code)
+	}
+	gone := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/chunking/strategies", headers: tenantHeaders,
+	})
+	if gone.Code != http.StatusUnauthorized {
+		t.Fatalf("deleted key status = %d", gone.Code)
+	}
+	missing := performRequest(handler, testRequest{
+		method: "DELETE", target: updatePath, remote: "127.0.0.1:5000",
+	})
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing delete status = %d", missing.Code)
+	}
+}
+
+func TestAPIKeyValidation(t *testing.T) {
+	handler := newStateBackedServer(t).Handler()
+	for _, body := range []string{
+		`{"name":"","namespaces":["alpha"]}`,
+		`{"name":"app","namespaces":[]}`,
+		`{"name":"app","namespaces":["bad namespace"]}`,
+		`{"name":"app"}`,
+		`{"name":"app","namespaces":["alpha"],"unknown":true}`,
+	} {
+		response := performRequest(handler, testRequest{
+			method: "POST", target: "/v1/admin/api-keys", remote: "127.0.0.1:5000", body: body,
+		})
+		if response.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("body %s status = %d", body, response.Code)
+		}
+	}
+}
