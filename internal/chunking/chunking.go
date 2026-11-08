@@ -1,6 +1,16 @@
 // Package chunking holds the chunking configuration contract and strategy
-// catalog. Token-budgeted splitting is ported in a later phase because it
-// depends on the tokenizer decision documented in docs/GO_MIGRATION.md.
+// catalog, and ports the text splitter from rag_mcp.chunk_strategies plus the
+// document chunker from rag_mcp.chunking.
+//
+// Token parity gap: Python counted tokens with a transformers AutoTokenizer
+// (BAAI/bge-m3, SentencePiece). The Go port replaces it with an injectable
+// TokenCounter; DefaultCounter is a deterministic approximation, so token
+// counts and token-budget chunk boundaries differ from Python even though
+// sentence/paragraph/structure boundaries and the overlap rules are ports of
+// the original algorithms. To reach exact parity a BGE-M3 tokenizer must be
+// ported to Go (or run as an external process) and injected through
+// ChunkOptions.Counter / NewTokenBudget. This is tracked in
+// docs/GO_MIGRATION.md ("Tokenizer 依赖").
 package chunking
 
 import "fmt"
