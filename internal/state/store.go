@@ -50,11 +50,21 @@ func isUniqueViolation(err error) bool {
 // Stores is one shared database handle plus every repository in a service
 // process. It mirrors rag_mcp.state.store.StateStores.
 //
-// TODO(G2/G7): attach the deferred components here, in the Python constructor
-// order: CacheSynchronizer (cache_sync), BlobStore (blobs), UploadJournal
-// (uploads), DocumentJobs + DocumentJobDispatcher, CachedReadViews (views),
-// ResultSnapshots (results), ArtifactRegistry (artifacts), SearchTasks +
-// SearchTaskDispatcher. Close must then release them before the engine.
+// TODO(G2/G7) still deferred from the state-layer port:
+//   - UploadJournal + UploadCoordinator (uploads.py, upload_coordinator.py):
+//     upload_operations/upload_steps/upload_objects/document_heads/
+//     document_leases rows, idempotency keys, workspace registration, lease
+//     heartbeat/expiry, cleanup_pending, recovery claims, and the transactional
+//     commit/rollback protocol. The schema and the upload read views above are
+//     already in place, but nothing writes those tables yet.
+//   - DocumentJobs + DocumentJobDispatcher (document_jobs.py,
+//     document_queue.py) and SearchTasks + SearchTaskDispatcher
+//     (search_tasks.py, search_queue.py).
+//   - KnowledgeBaseRepository.publish/confirm_publication (needs the lease
+//     journal) and the schema migrate CLI (migrate.py).
+//   - Concrete Redis (StateCache/TransientStore) and RocketMQ (EventPublisher)
+//     clients for CacheSync; configured endpoints are logged and reads fall back
+//     to the authoritative database.
 type Stores struct {
 	Settings StateSettings
 	DB       *sql.DB
@@ -63,6 +73,12 @@ type Stores struct {
 	KnowledgeBases *KnowledgeBaseRepository
 	Documents      *DocumentRepository
 	Catalogs       *CatalogRepository
+
+	CacheSync *CacheSynchronizer
+	Blobs     *BlobStore
+	Views     *CachedReadViews
+	Results   *ResultSnapshots
+	Artifacts *ArtifactRegistry
 
 	dialect    Dialect
 	closeOnce  sync.Once
@@ -131,16 +147,47 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 		DB:       database,
 		dialect:  dialect,
 	}
-	stores.APIKeys = newAPIKeyRepository(database, dialect, settings.EncryptionKey)
-	stores.KnowledgeBases = newKnowledgeBaseRepository(database, dialect)
-	stores.Documents = newDocumentRepository(database, dialect)
-	stores.Catalogs = newCatalogRepository(database, dialect)
 	if createSchema {
 		if err := stores.ensureSchema(context.Background()); err != nil {
 			_ = database.Close()
 			return nil, newStateError("状态数据库初始化失败：" + err.Error())
 		}
 	}
+	// Cache sync is assembled after the schema (like the Python constructor) and
+	// before the repositories, because every repository flushes its own keys.
+	cacheSync, err := NewDefaultCacheSynchronizer(stores)
+	if err != nil {
+		_ = database.Close()
+		return nil, err
+	}
+	stores.CacheSync = cacheSync
+	stores.APIKeys = newAPIKeyRepository(database, dialect, settings.EncryptionKey, cacheSync)
+	stores.KnowledgeBases = newKnowledgeBaseRepository(database, dialect, cacheSync)
+	stores.Documents = newDocumentRepository(database, dialect, cacheSync)
+	stores.Catalogs = newCatalogRepository(database, dialect, cacheSync)
+	stores.Blobs = newBlobStore(database, dialect)
+	stores.Views = NewCachedReadViews(stores)
+
+	snapshotSettings, err := SnapshotSettingsFromEnv()
+	if err != nil {
+		_ = cacheSync.Close()
+		_ = database.Close()
+		return nil, err
+	}
+	stores.Results = NewResultSnapshots(stores, snapshotSettings, nil)
+	// When the async phase injects the Redis backend it can also provide the
+	// expiring TransientStore that owns search-result snapshots.
+	if provider, ok := cacheSync.Backend.(TransientProvider); ok {
+		stores.Results.Transient = provider.TransientStore()
+	}
+	maxArtifactBytes := int64(snapshotSettings.MaxArtifactBytes)
+	artifacts, err := NewArtifactRegistry(stores, float64(snapshotSettings.TTLSeconds), nil, &maxArtifactBytes)
+	if err != nil {
+		_ = cacheSync.Close()
+		_ = database.Close()
+		return nil, err
+	}
+	stores.Artifacts = artifacts
 	warnIfUnencrypted(settings)
 	return stores, nil
 }
@@ -158,10 +205,20 @@ func (s *Stores) Ping(ctx context.Context) error {
 	return s.DB.QueryRowContext(ctx, "SELECT 1").Scan(&one)
 }
 
-// Close releases the database handle. It is safe to call more than once.
+// Close releases the cache clients and the database handle. It is safe to call
+// more than once.
 func (s *Stores) Close() error {
 	s.closeOnce.Do(func() {
-		s.closeError = s.DB.Close()
+		var firstErr error
+		if s.CacheSync != nil {
+			if err := s.CacheSync.Close(); err != nil {
+				firstErr = err
+			}
+		}
+		if err := s.DB.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		s.closeError = firstErr
 	})
 	return s.closeError
 }

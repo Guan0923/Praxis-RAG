@@ -47,10 +47,19 @@ type APIKeyRepository struct {
 	db            *sql.DB
 	dialect       Dialect
 	encryptionKey string
+	cacheSync     *CacheSynchronizer
 }
 
-func newAPIKeyRepository(db *sql.DB, dialect Dialect, encryptionKey string) *APIKeyRepository {
-	return &APIKeyRepository{db: db, dialect: dialect, encryptionKey: encryptionKey}
+func newAPIKeyRepository(db *sql.DB, dialect Dialect, encryptionKey string, cacheSync *CacheSynchronizer) *APIKeyRepository {
+	return &APIKeyRepository{db: db, dialect: dialect, encryptionKey: encryptionKey, cacheSync: cacheSync}
+}
+
+// flushPending refreshes the committed api_keys display cache; failures stay in
+// the durable outbox for the relay worker.
+func (r *APIKeyRepository) flushPending(ctx context.Context) {
+	if r.cacheSync != nil {
+		_ = r.cacheSync.FlushPending(ctx, apiKeyKeys())
+	}
 }
 
 const apiKeySelectColumns = "id, name, prefix, namespaces, enabled, created_at, protected_key"
@@ -148,7 +157,7 @@ func (r *APIKeyRepository) Create(ctx context.Context, name string, namespaces [
 	if err := database.Commit(); err != nil {
 		return CreatedAPIKey{}, newStateError("API Key 无法保存")
 	}
-	// CacheSynchronizer.flush_pending is deferred to the cache-sync round.
+	r.flushPending(ctx)
 	return CreatedAPIKey{APIKey: values, Key: secret}, nil
 }
 
@@ -188,6 +197,7 @@ func (r *APIKeyRepository) Update(ctx context.Context, keyID, name string, names
 	if err := database.Commit(); err != nil {
 		return nil, newStateError("API Key 无法更新")
 	}
+	r.flushPending(ctx)
 	return updated, nil
 }
 
@@ -212,6 +222,7 @@ func (r *APIKeyRepository) Delete(ctx context.Context, keyID string) (bool, erro
 	if err := database.Commit(); err != nil {
 		return false, err
 	}
+	r.flushPending(ctx)
 	return changed > 0, nil
 }
 
@@ -311,7 +322,11 @@ func (r *APIKeyRepository) ImportRow(ctx context.Context, row APIKeyImport) erro
 	default:
 		return err
 	}
-	return database.Commit()
+	if err := database.Commit(); err != nil {
+		return err
+	}
+	r.flushPending(ctx)
+	return nil
 }
 
 // KnowledgeBaseSnapshot is the settings/version pair returned by
@@ -324,12 +339,20 @@ type KnowledgeBaseSnapshot struct {
 // KnowledgeBaseRepository is the SQL implementation of
 // KnowledgeBaseRepository.
 type KnowledgeBaseRepository struct {
-	db      *sql.DB
-	dialect Dialect
+	db        *sql.DB
+	dialect   Dialect
+	cacheSync *CacheSynchronizer
 }
 
-func newKnowledgeBaseRepository(db *sql.DB, dialect Dialect) *KnowledgeBaseRepository {
-	return &KnowledgeBaseRepository{db: db, dialect: dialect}
+func newKnowledgeBaseRepository(db *sql.DB, dialect Dialect, cacheSync *CacheSynchronizer) *KnowledgeBaseRepository {
+	return &KnowledgeBaseRepository{db: db, dialect: dialect, cacheSync: cacheSync}
+}
+
+// flushPending refreshes the committed knowledge-base display caches.
+func (r *KnowledgeBaseRepository) flushPending(ctx context.Context, namespace string) {
+	if r.cacheSync != nil {
+		_ = r.cacheSync.FlushPending(ctx, knowledgeKeys(namespace))
+	}
 }
 
 // List returns every knowledge-base settings object ordered by namespace.
@@ -404,6 +427,7 @@ func (r *KnowledgeBaseRepository) Create(ctx context.Context, settings map[strin
 	if err := database.Commit(); err != nil {
 		return newStateError("知识库配置无法保存")
 	}
+	r.flushPending(ctx, namespace)
 	return nil
 }
 
@@ -446,7 +470,11 @@ func (r *KnowledgeBaseRepository) Update(ctx context.Context, settings map[strin
 	if changed == 0 {
 		return newLookupError("知识库不存在")
 	}
-	return database.Commit()
+	if err := database.Commit(); err != nil {
+		return err
+	}
+	r.flushPending(ctx, namespace)
+	return nil
 }
 
 // Delete removes one knowledge base and reports whether a row changed.
@@ -471,6 +499,7 @@ func (r *KnowledgeBaseRepository) Delete(ctx context.Context, namespace string) 
 	if err := database.Commit(); err != nil {
 		return false, err
 	}
+	r.flushPending(ctx, namespace)
 	return changed > 0, nil
 }
 
@@ -528,12 +557,22 @@ type DocumentRecord struct {
 
 // DocumentRepository is the SQL implementation of DocumentRepository.
 type DocumentRepository struct {
-	db      *sql.DB
-	dialect Dialect
+	db        *sql.DB
+	dialect   Dialect
+	cacheSync *CacheSynchronizer
 }
 
-func newDocumentRepository(db *sql.DB, dialect Dialect) *DocumentRepository {
-	return &DocumentRepository{db: db, dialect: dialect}
+func newDocumentRepository(db *sql.DB, dialect Dialect, cacheSync *CacheSynchronizer) *DocumentRepository {
+	return &DocumentRepository{db: db, dialect: dialect, cacheSync: cacheSync}
+}
+
+// flushPending refreshes the committed document display caches. Transactional
+// helpers (UpsertTx/DeleteTx) never flush: the owner of the transaction decides
+// when it commits.
+func (r *DocumentRepository) flushPending(ctx context.Context, namespace string) {
+	if r.cacheSync != nil {
+		_ = r.cacheSync.FlushPending(ctx, documentKeys(namespace))
+	}
 }
 
 const (
@@ -690,7 +729,11 @@ func (r *DocumentRepository) Upsert(ctx context.Context, namespace string, recor
 	if err := r.UpsertTx(ctx, database, namespace, record); err != nil {
 		return err
 	}
-	return database.Commit()
+	if err := database.Commit(); err != nil {
+		return err
+	}
+	r.flushPending(ctx, namespace)
+	return nil
 }
 
 // UpsertTx writes one document inside the caller's transaction, like the
@@ -769,6 +812,7 @@ func (r *DocumentRepository) Delete(ctx context.Context, namespace, name string)
 	if err := database.Commit(); err != nil {
 		return false, err
 	}
+	r.flushPending(ctx, namespace)
 	return changed, nil
 }
 
@@ -828,12 +872,20 @@ type CatalogTransform func(current *string) (data string, result any, changed bo
 
 // CatalogRepository is the SQL implementation of CatalogRepository.
 type CatalogRepository struct {
-	db      *sql.DB
-	dialect Dialect
+	db        *sql.DB
+	dialect   Dialect
+	cacheSync *CacheSynchronizer
 }
 
-func newCatalogRepository(db *sql.DB, dialect Dialect) *CatalogRepository {
-	return &CatalogRepository{db: db, dialect: dialect}
+func newCatalogRepository(db *sql.DB, dialect Dialect, cacheSync *CacheSynchronizer) *CatalogRepository {
+	return &CatalogRepository{db: db, dialect: dialect, cacheSync: cacheSync}
+}
+
+// flushPending refreshes the committed catalog display cache.
+func (r *CatalogRepository) flushPending(ctx context.Context, namespace string) {
+	if r.cacheSync != nil {
+		_ = r.cacheSync.FlushPending(ctx, catalogKeys(namespace))
+	}
 }
 
 // Load returns the stored catalog JSON; found is false for a missing namespace.
@@ -898,5 +950,6 @@ func (r *CatalogRepository) Mutate(ctx context.Context, namespace string, transf
 	if err := database.Commit(); err != nil {
 		return nil, newStateError("MCP 配置无法保存")
 	}
+	r.flushPending(ctx, namespace)
 	return result, nil
 }

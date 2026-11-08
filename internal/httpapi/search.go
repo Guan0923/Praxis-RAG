@@ -26,11 +26,18 @@ type ArtifactRuntime interface {
 	DownloadArtifact(ctx context.Context, namespace, artifactID string) (content []byte, mimeType string, name string, err error)
 }
 
+// KnowledgeBaseRuntime exposes the public knowledge-base settings.
+type KnowledgeBaseRuntime interface {
+	PublicKnowledgeBase(ctx context.Context, namespace string) (map[string]any, error)
+}
+
 // Runtime is the HTTP-facing service runtime. It grows as endpoints are ported.
 type Runtime interface {
 	SearchRuntime
 	ResultRuntime
 	ArtifactRuntime
+	DocumentRuntime
+	KnowledgeBaseRuntime
 }
 
 // WithRuntime wires the service runtime.

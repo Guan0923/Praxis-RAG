@@ -45,18 +45,19 @@ func WithChangeNotifier(notifier ChangeNotifier) Option {
 
 // Server hosts the REST API, MCP endpoint, and Console static assets.
 type Server struct {
-	settings config.ServiceSettings
-	status   StatusProvider
-	keys     KeyLookup
-	keyStore APIKeyStore
-	runtime  Runtime
-	logger   *slog.Logger
-	router   *router
-	webRoot  string
-	catalog  catalog.Store
-	tools    ToolRegistry
-	notifier ChangeNotifier
-	handler  http.Handler
+	settings   config.ServiceSettings
+	status     StatusProvider
+	keys       KeyLookup
+	keyStore   APIKeyStore
+	runtime    Runtime
+	mcpHandler http.Handler
+	logger     *slog.Logger
+	router     *router
+	webRoot    string
+	catalog    catalog.Store
+	tools      ToolRegistry
+	notifier   ChangeNotifier
+	handler    http.Handler
 }
 
 // New builds the HTTP server. A nil StatusProvider falls back to a static
@@ -108,6 +109,15 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/search-results/{result_id}", authTenant, s.handleGetSearchResult)
 	s.router.add("GET", "/v1/artifacts/{artifact_id}", authTenant, s.handleDownloadArtifact)
 	s.router.add("GET", "/v1/artifacts/{artifact_id}/content", authTenant, s.handleGetArtifactContent)
+	s.router.add("GET", "/v1/documents", authTenant, s.handleListDocuments)
+	s.router.add("POST", "/v1/documents", authTenant, s.handleUploadDocuments)
+	s.router.add("POST", "/v1/documents/check", authTenant, s.handleCheckDocuments)
+	s.router.add("GET", "/v1/documents/{name}/content", authTenant, s.handleDocumentContent)
+	s.router.add("DELETE", "/v1/documents/{name}", authTenant, s.handleDeleteDocument)
+	s.router.add("GET", "/v1/knowledge-base", authTenant, s.handleKnowledgeBase)
+	s.router.add("POST", "/mcp", authMCP, s.handleMCP)
+	s.router.add("GET", "/mcp", authMCP, s.handleMCP)
+	s.router.add("DELETE", "/mcp", authMCP, s.handleMCP)
 
 	if s.webRoot != "" {
 		s.router.add("GET", "/", authNone, s.handleConsoleIndex)
@@ -164,6 +174,20 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !s.requireLocalAdmin(recorder, r) {
 			return
 		}
+	case authMCP:
+		// MCP requires credentials even on loopback; the protocol endpoint
+		// answers 401 with a Bearer challenge instead of the local-admin
+		// fallback used by the REST tenant routes.
+		if r.Header.Get("Authorization") == "" {
+			recorder.Header().Set("WWW-Authenticate", "Bearer")
+			writeDetail(recorder, http.StatusUnauthorized, "MCP 请求必须提供 Authorization: Bearer <API_KEY>")
+			return
+		}
+		namespace, ok := s.tenantFromHeaders(recorder, r)
+		if !ok {
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, namespace))
 	}
 	if len(result.params) > 0 {
 		r = r.WithContext(context.WithValue(r.Context(), pathParamsContext{}, result.params))

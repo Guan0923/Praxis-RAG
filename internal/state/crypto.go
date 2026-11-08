@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
-	"runtime"
 	"strings"
 )
 
@@ -137,33 +136,15 @@ func decodeEncryptionKey(keyText string) ([]byte, error) {
 
 // legacyProtect mirrors crypto._legacy_protect. The Go port does not implement
 // Windows DPAPI yet (deferred); it refuses to write a format the Python service
-// on the same host could not read, and reports a configuration error instead.
-//
-// TODO(migration): implement CryptProtectData/CryptUnprotectData through
-// golang.org/x/sys/windows so Windows hosts without RAG_STATE_ENCRYPTION_KEY
-// keep the Python behavior for local SQLite state.
+// legacyProtect mirrors crypto._legacy_protect: dpapi: on Windows (current-user
+// CryptProtectData) and private-file: elsewhere. The platform split lives in
+// crypto_legacy_windows.go / crypto_legacy_other.go.
 func legacyProtect(value string) (string, error) {
-	if runtime.GOOS == "windows" {
-		return "", &CryptoError{Message: "Go 状态层暂不支持无密钥的 Windows DPAPI 保护，请设置 " + EncryptionKeyEnv}
-	}
-	return "private-file:" + value, nil
+	return legacyProtectPlatform(value)
 }
 
-// legacyUnprotect mirrors crypto._legacy_unprotect. dpapi: values still require
-// the Python fallback or a future Go DPAPI implementation (deferred).
+// legacyUnprotect mirrors crypto._legacy_unprotect: only the platform that
+// wrote a legacy value can read it back.
 func legacyUnprotect(value string) (string, error) {
-	switch {
-	case strings.HasPrefix(value, "dpapi:"):
-		if runtime.GOOS != "windows" {
-			return "", &CryptoError{Message: "apikey 需要由保存它的系统账号读取"}
-		}
-		return "", &CryptoError{Message: "Go 状态层暂不支持读取 Windows DPAPI 旧凭据，请设置 " + EncryptionKeyEnv + " 或使用 Python 迁移工具"}
-	case strings.HasPrefix(value, "private-file:"):
-		if runtime.GOOS == "windows" {
-			return "", &CryptoError{Message: "apikey 需要由保存它的系统账号读取"}
-		}
-		return strings.TrimPrefix(value, "private-file:"), nil
-	default:
-		return "", &CryptoError{Message: "apikey 需要由保存它的系统账号读取"}
-	}
+	return legacyUnprotectPlatform(value)
 }

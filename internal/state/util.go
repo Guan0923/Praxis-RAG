@@ -2,11 +2,13 @@ package state
 
 import (
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -98,6 +100,12 @@ func sha256Hex(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// sha256Sum reproduces hashlib.sha256(content).hexdigest() for bytes.
+func sha256Sum(content []byte) string {
+	sum := sha256.Sum256(content)
+	return hex.EncodeToString(sum[:])
+}
+
 // tokenURLSafe reproduces secrets.token_urlsafe(size): base64url of size random
 // bytes without padding.
 func tokenURLSafe(size int) (string, error) {
@@ -147,4 +155,110 @@ func requireSetting(settings map[string]any, name string) (string, error) {
 		return "", fmt.Errorf("knowledge base settings %q must be a string", name)
 	}
 	return value, nil
+}
+
+// uuidNamespaceURL is RFC 4122 UUID.NAMESPACE_URL, used by uuid5 identities.
+var uuidNamespaceURL = [16]byte{
+	0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1,
+	0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+}
+
+// uuid5 reproduces uuid.uuid5(uuid.NAMESPACE_URL, name).
+func uuid5(namespace [16]byte, name string) string {
+	hasher := sha1.New()
+	_, _ = hasher.Write(namespace[:])
+	_, _ = hasher.Write([]byte(name))
+	var value [16]byte
+	copy(value[:], hasher.Sum(nil)[:16])
+	value[6] = (value[6] & 0x0f) | 0x50
+	value[8] = (value[8] & 0x3f) | 0x80
+	return formatUUID(value)
+}
+
+// uuid4String reproduces str(uuid.uuid4()): lowercase dashed UUIDv4.
+func uuid4String() (string, error) {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		return "", fmt.Errorf("无法生成安全随机数: %w", err)
+	}
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	var fixed [16]byte
+	copy(fixed[:], value)
+	return formatUUID(fixed), nil
+}
+
+func formatUUID(value [16]byte) string {
+	const hexDigits = "0123456789abcdef"
+	buffer := make([]byte, 36)
+	position := 0
+	for index, char := range value {
+		if index == 4 || index == 6 || index == 8 || index == 10 {
+			buffer[position] = '-'
+			position++
+		}
+		buffer[position] = hexDigits[char>>4]
+		buffer[position+1] = hexDigits[char&0x0f]
+		position += 2
+	}
+	return string(buffer)
+}
+
+// canonicalUUID reports whether value is the canonical lowercase dashed form,
+// mirroring `str(uuid.UUID(value)) == value` (result_snapshots.canonical_uuid
+// and ArtifactRegistry.read).
+func canonicalUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		switch index {
+		case 8, 13, 18, 23:
+			if value[index] != '-' {
+				return false
+			}
+		default:
+			char := value[index]
+			if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// quotePython reproduces urllib.parse.quote(value, safe=""): every byte outside
+// A-Z a-z 0-9 - . _ ~ becomes an uppercase %XX escape.
+func quotePython(value string) string {
+	const hexDigits = "0123456789ABCDEF"
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '-' || char == '.' || char == '_' || char == '~' {
+			builder.WriteByte(char)
+			continue
+		}
+		builder.WriteByte('%')
+		builder.WriteByte(hexDigits[char>>4])
+		builder.WriteByte(hexDigits[char&0x0f])
+	}
+	return builder.String()
+}
+
+// errorTypeName reproduces type(exc).__name__ for sanitized last_error columns.
+func errorTypeName(err error) string {
+	if err == nil {
+		return ""
+	}
+	name := reflect.TypeOf(err).String()
+	if index := strings.LastIndex(name, "."); index >= 0 {
+		name = name[index+1:]
+	}
+	name = strings.TrimPrefix(name, "*")
+	if name == "" {
+		return "Error"
+	}
+	return name
 }

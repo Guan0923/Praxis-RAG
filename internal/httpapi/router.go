@@ -13,6 +13,7 @@ const (
 	authNone authPolicy = iota
 	authTenant
 	authAdmin
+	authMCP
 )
 
 // route is one method+path registration. Patterns use "{name}" for a single

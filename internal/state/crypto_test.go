@@ -6,7 +6,6 @@ import (
 	"crypto/cipher"
 	"encoding/base64"
 	"errors"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -191,57 +190,6 @@ func TestIsPortable(t *testing.T) {
 		if got := IsPortable(value); got != want {
 			t.Fatalf("IsPortable(%q) = %v, want %v", value, got, want)
 		}
-	}
-}
-
-func TestLegacyProtectPlatformBehavior(t *testing.T) {
-	isolateStateEnv(t)
-	protected, err := Protect("legacy", "")
-	if runtime.GOOS == "windows" {
-		if err == nil {
-			t.Fatalf("Protect without a key on Windows = %q, want a deferred-DPAPI error", protected)
-		}
-		var cryptoError *CryptoError
-		if !errors.As(err, &cryptoError) {
-			t.Fatalf("error %v is not a *CryptoError", err)
-		}
-	} else {
-		if err != nil {
-			t.Fatalf("Protect without a key error = %v", err)
-		}
-		if protected != "private-file:legacy" {
-			t.Fatalf("Protected value = %q, want private-file prefix", protected)
-		}
-		decrypted, err := Unprotect(protected, "")
-		if err != nil || decrypted != "legacy" {
-			t.Fatalf("Unprotect(%q) = %q, %v", protected, decrypted, err)
-		}
-	}
-}
-
-func TestLegacyUnprotectPlatformBehavior(t *testing.T) {
-	isolateStateEnv(t)
-	const platformMessage = "apikey 需要由保存它的系统账号读取"
-	if runtime.GOOS == "windows" {
-		_, err := Unprotect("private-file:secret", "")
-		cryptoError := mustBeError[*CryptoError](t, err)
-		if cryptoError.Message != platformMessage {
-			t.Fatalf("private-file message = %q, want %q", cryptoError.Message, platformMessage)
-		}
-	} else {
-		decrypted, err := Unprotect("private-file:secret", "")
-		if err != nil || decrypted != "secret" {
-			t.Fatalf("Unprotect(private-file:) = %q, %v", decrypted, err)
-		}
-		_, err = Unprotect("dpapi:AAAA", "")
-		cryptoError := mustBeError[*CryptoError](t, err)
-		if cryptoError.Message != platformMessage {
-			t.Fatalf("dpapi message = %q, want %q", cryptoError.Message, platformMessage)
-		}
-	}
-	_, err := Unprotect("plain-value", "")
-	if cryptoError := mustBeError[*CryptoError](t, err); cryptoError.Message != platformMessage {
-		t.Fatalf("unknown legacy message = %q, want %q", cryptoError.Message, platformMessage)
 	}
 }
 

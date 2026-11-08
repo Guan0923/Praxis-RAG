@@ -243,3 +243,33 @@ func TestArtifactEndpoints(t *testing.T) {
 		t.Fatalf("bad range status = %d", badRange.Code)
 	}
 }
+
+// Document and knowledge-base methods keep fakeServiceRuntime assignable to the
+// full httpapi.Runtime interface; the search-focused tests do not exercise them.
+func (f *fakeServiceRuntime) ListDocuments(context.Context, string) ([]map[string]any, error) {
+	return nil, nil
+}
+
+func (f *fakeServiceRuntime) Upload(context.Context, string, []UploadFile, string) (map[string]any, error) {
+	return map[string]any{}, nil
+}
+
+func (f *fakeServiceRuntime) Delete(context.Context, string, string) (map[string]any, error) {
+	return map[string]any{}, nil
+}
+
+func (f *fakeServiceRuntime) CheckDocuments(context.Context, string, []CheckFile) (map[string]any, error) {
+	return map[string]any{}, nil
+}
+
+func (f *fakeServiceRuntime) ReadDocument(context.Context, string, string) (string, string, error) {
+	return "", "", nil
+}
+
+func (f *fakeServiceRuntime) ReadDocumentFile(context.Context, string, string) ([]byte, error) {
+	return nil, nil
+}
+
+func (f *fakeServiceRuntime) PublicKnowledgeBase(context.Context, string) (map[string]any, error) {
+	return map[string]any{}, nil
+}
