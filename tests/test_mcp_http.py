@@ -42,7 +42,7 @@ from rag_mcp.service_knowledge import (
     RagServiceRuntime,
 )
 from rag_mcp.state.cache import RedisStateCache, StateCacheSettings
-from rag_mcp.state.document_tasks import document_envelopes
+from rag_mcp.state.document_jobs import document_job_envelope
 from rag_mcp.state.settings import StateSettings
 from rag_mcp.state.store import StateStores
 
@@ -135,11 +135,13 @@ class TestIngester:
 
 
 class MemoryDocumentTransport:
+    """Records the identifier-only notification the relay would publish."""
+
     def __init__(self):
         self.queued = []
 
-    def send(self, task):
-        self.queued.extend(document_envelopes(task))
+    def send(self, payload):
+        self.queued.append(json.loads(json.dumps(payload)))
 
     def close(self):
         pass
@@ -913,11 +915,74 @@ def test_partial_upload_notifications_and_resource_listing_pages(tmp_path):
         anyio.run(scenario)
 
 
-@pytest.mark.parametrize("kind", ["document", "search"])
-@pytest.mark.parametrize("failure", ["broker_missing", "broker_error", "redis_disabled", "redis_error"])
-def test_mcp_queue_admission_fails_closed_without_result_ids(tmp_path, kind, failure):
+def _document_outbox(runtime):
+    from sqlalchemy import select
+
+    from rag_mcp.state.schema import document_job_outbox
+
+    with runtime.state.engine.connect() as conn:
+        return [dict(row) for row in conn.execute(select(document_job_outbox)).mappings()]
+
+
+@pytest.mark.parametrize("failure", ["broker_missing", "broker_error"])
+def test_mcp_document_admission_survives_a_broker_outage(tmp_path, failure):
+    """A committed upload is never reported as a failed submission."""
+
     with running_service(tmp_path) as (url, _, runtime):
-        dispatcher = getattr(runtime.state, kind + "_dispatcher")
+        dispatcher = runtime.state.document_dispatcher
+        transport = dispatcher.transport
+        if failure == "broker_missing":
+            dispatcher.transport = None
+        else:
+            def reject(_payload):
+                raise ConnectionError("controlled broker failure")
+            transport.send = reject
+
+        async def scenario():
+            async with mcp_client(url) as client:
+                result = await client.call_tool(
+                    "add_document", {"name": "accepted.txt", "content": "not published"})
+                assert not result.is_error, result.content
+                artifact_id = json.loads(result.content[0].text)["artifact_id"]
+                status = await client.call_tool("get_document_status", {"artifact_id": artifact_id})
+                assert json.loads(status.content[0].text)["status"] == "queued"
+                assert transport.queued == []
+                assert runtime.state.documents.list("manuals") == []
+                job = runtime.state.document_jobs.get(artifact_id)
+                assert job["content"] == b"not published"
+                rows = _document_outbox(runtime)
+                assert len(rows) == 1 and rows[0]["status"] == "PENDING"
+        anyio.run(scenario)
+
+
+@pytest.mark.parametrize("failure", ["redis_disabled", "redis_error"])
+def test_mcp_document_admission_does_not_depend_on_redis(tmp_path, failure):
+    """The document path has no Redis dependency, so status and delivery stay up."""
+
+    with running_service(tmp_path) as (url, _, runtime):
+        transport = runtime.state.document_dispatcher.transport
+        if failure == "redis_disabled":
+            runtime.state.cache_sync.backend = RedisStateCache(StateCacheSettings(enabled=False))
+        else:
+            runtime.state.cache_sync.backend._connection().broken = True
+
+        async def scenario():
+            async with mcp_client(url) as client:
+                result = await client.call_tool(
+                    "add_document", {"name": "accepted.txt", "content": "committed"})
+                assert not result.is_error, result.content
+                artifact_id = json.loads(result.content[0].text)["artifact_id"]
+                assert transport.queued[-1]["artifact_id"] == artifact_id
+                status = await client.call_tool("get_document_status", {"artifact_id": artifact_id})
+                assert json.loads(status.content[0].text)["status"] == "queued"
+                assert runtime.state.documents.list("manuals") == []
+        anyio.run(scenario)
+
+
+@pytest.mark.parametrize("failure", ["broker_missing", "broker_error", "redis_disabled", "redis_error"])
+def test_mcp_search_admission_fails_closed_without_result_ids(tmp_path, failure):
+    with running_service(tmp_path) as (url, _, runtime):
+        dispatcher = runtime.state.search_dispatcher
         transport = dispatcher.transport
         if failure == "broker_missing":
             dispatcher.transport = None
@@ -932,9 +997,7 @@ def test_mcp_queue_admission_fails_closed_without_result_ids(tmp_path, kind, fai
 
         async def scenario():
             async with mcp_client(url) as client:
-                arguments = ({"name": "unaccepted.txt", "content": "not published"}
-                             if kind == "document" else {"query": "not accepted", "wait_seconds": 0})
-                result = await client.call_tool("add_document" if kind == "document" else "search", arguments)
+                result = await client.call_tool("search", {"query": "not accepted", "wait_seconds": 0})
                 assert result.is_error
                 assert runtime.search_calls == []
                 assert transport.queued == []

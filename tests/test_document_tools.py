@@ -42,16 +42,18 @@ async def add_and_index(client, runtime, arguments):
     assert str(UUID(artifact_id)) == artifact_id
     queued = payload(await client.call_tool("get_document_status", {"artifact_id": artifact_id}))
     assert queued == {"artifact_id": artifact_id, "status": "queued", "stage": "queued", "error": None}
-    envelopes = runtime.state.document_dispatcher.transport.queued[cursor:]
-    assert envelopes and all(item["artifact_id"] == artifact_id and item["schema"] == 2 for item in envelopes)
+    notifications = runtime.state.document_dispatcher.transport.queued[cursor:]
+    # Exactly one identifier-only notification: the bytes never cross the broker.
+    assert len(notifications) == 1
+    notification = notifications[0]
+    assert notification["schema"] == 3 and notification["artifact_id"] == artifact_id
+    assert "content" not in notification and "data" not in notification
     expected = (arguments["content"].encode() if "content" in arguments
                 else base64.b64decode(arguments["content_base64"]))
-    assert b"".join(base64.b64decode(item["data"]) for item in envelopes) == expected
-    assert all(len(base64.b64decode(item["data"])) <= 512 * 1024 for item in envelopes)
+    # The complete request is durable in MySQL before the notification exists.
+    assert runtime.state.document_jobs.get(artifact_id, "manuals")["content"] == expected
     worker = DocumentWorker(runtime)
-    for index, envelope in enumerate(envelopes):
-        complete = await anyio.to_thread.run_sync(worker.process, envelope)
-        assert complete is (index == len(envelopes) - 1)
+    assert await anyio.to_thread.run_sync(worker.process, notification) is True
     status = payload(await client.call_tool("get_document_status", {"artifact_id": artifact_id}))
     assert status["status"] == "succeeded" and status["error"] is None
     document = next(item for item in runtime.list_documents("manuals") if item["name"] == arguments["name"])
@@ -132,7 +134,7 @@ def test_content_validation_base64_and_failed_indexing(tmp_path):
                 assert envelope["artifact_id"] == failed["artifact_id"]
                 assert not await anyio.to_thread.run_sync(DocumentWorker(runtime).process, envelope)
                 assert runtime.get_document_status("manuals", failed["artifact_id"])["stage"] == "retry_wait"
-                assert await anyio.to_thread.run_sync(runtime.state.document_tasks.dead_letter, envelope)
+                assert await anyio.to_thread.run_sync(runtime.state.document_jobs.dead_letter, envelope)
                 status = payload(await client.call_tool("get_document_status", failed))
                 assert status["status"] == "failed" and status["error"]
                 assert "fail.txt" not in {item["name"] for item in runtime.list_documents("manuals")}

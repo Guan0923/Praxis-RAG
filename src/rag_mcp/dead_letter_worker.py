@@ -1,4 +1,8 @@
-"""Record broker retry exhaustion in Redis without inference or re-enqueueing."""
+"""Record broker retry exhaustion as a durable MySQL terminal state.
+
+No inference and no re-enqueue: a dead-lettered document job becomes ``failed``
+in the jobs table, which clients observe through ``get_document_status``.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ from pathlib import Path
 
 from .state.cache_queue import RocketMQSettings
 from .state.document_queue import RocketMQDocumentQueue, document_queue_settings
-from .state.document_tasks import validate_artifact_id
+from .state.document_jobs import validate_artifact_id, validate_document_envelope
 
 logger = logging.getLogger(__name__)
 
@@ -45,19 +49,27 @@ def dead_letter_queue_settings(kind):
 
 
 class DeadLetterWorker:
-    """ACK only after a Redis terminal outcome is saved or already exists."""
+    """ACK only after the durable terminal outcome is saved or already exists."""
 
     def __init__(self, state, kind):
         if kind not in {"document", "search"}:
             raise ValueError("Dead-letter kind must be document or search")
-        self.tasks = getattr(state, f"{kind}_tasks")
+        self.kind = kind
+        self.tasks = state.document_jobs if kind == "document" else state.search_tasks
         self.message_key = "artifact_id" if kind == "document" else "result_id"
 
     def process(self, payload):
         if not isinstance(payload, dict):
             raise TypeError("Expected a versioned dead-letter message")
-        task_id = validate_artifact_id(payload.get(self.message_key))
-        complete = self.tasks.dead_letter(payload)
+        if self.kind == "document":
+            # Normalise both the native schema-3 notification and the raw
+            # Debezium change event before touching the durable job.
+            envelope = validate_document_envelope(payload)
+            task_id = envelope["artifact_id"]
+            complete = self.tasks.dead_letter(envelope)
+        else:
+            task_id = validate_artifact_id(payload.get(self.message_key))
+            complete = self.tasks.dead_letter(payload)
         if complete is True:
             logger.info("Dead-letter outcome saved or task already absent/terminal task_id=%s", task_id)
         return complete is True
@@ -94,7 +106,7 @@ def main(argv=None):
         while not stop.is_set():
             try:
                 transport.consume_once(worker.process)
-            except Exception as exc:  # noqa: BLE001 - Redis failures must leave messages retryable
+            except Exception as exc:  # noqa: BLE001 - storage failures must leave messages retryable
                 logger.warning("Dead-letter consumer unavailable category=%s",
                                transport._failure_category(exc))
                 stop.wait(2)

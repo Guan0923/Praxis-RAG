@@ -25,7 +25,6 @@ from .cache_sync import CacheSynchronizer
 from .read_views import CachedReadViews
 from .artifacts import ArtifactRegistry
 from .result_snapshots import ResultSnapshots
-from .document_tasks import DocumentTasks
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +49,11 @@ class StateStores:
         self.documents = DocumentRepository(self.engine, self.cache_sync)
         self.catalogs = CatalogRepository(self.engine, self.cache_sync)
         self.uploads = UploadJournal(self)
-        self.document_tasks = DocumentTasks(self)
-        from .document_queue import DocumentTaskDispatcher
-        self.document_dispatcher = DocumentTaskDispatcher(self)
+        from .document_jobs import DocumentJobs
+
+        self.document_jobs = DocumentJobs(self)
+        from .document_queue import DocumentJobDispatcher
+        self.document_dispatcher = DocumentJobDispatcher(self)
         self.views = CachedReadViews(self)
         self.results = ResultSnapshots(self)
         self.artifacts = ArtifactRegistry(self, ttl_seconds=self.results.settings.ttl_seconds,

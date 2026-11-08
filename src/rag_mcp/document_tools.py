@@ -77,7 +77,7 @@ class DocumentStatusRequest:
 
     @classmethod
     def from_arguments(cls, arguments):
-        from .state.document_tasks import validate_artifact_id
+        from .state.document_jobs import validate_artifact_id
         if set(arguments) != {"artifact_id"}:
             raise KnowledgeValidationError("Provide only artifact_id")
         try:
@@ -91,7 +91,7 @@ def document_tool_entries(mutate):
 
     entries = []
     descriptions = {
-        "add_document": "Upload one new file for asynchronous indexing. Returns artifact_id only after RocketMQ confirms the complete chunked request, NOT after indexing. Redis and RocketMQ are required; unavailable dependencies fail submission. Task status is retained in Redis for the configured result TTL. Poll get_document_status until succeeded before searching. Rejects existing or queued filenames. Reuse idempotency_key after uncertain submissions. Duplicate content under another name is allowed.",
+        "add_document": "Upload one new file for asynchronous indexing. Returns artifact_id once the request is durably committed to the service database, NOT after indexing. The message broker is not on the submission path: a committed upload is always delivered later. Poll get_document_status until succeeded before searching. Rejects existing or queued filenames. Reuse idempotency_key after uncertain submissions. Duplicate content under another name is allowed.",
         "update_document": "Replace the complete content of an existing knowledge file and rebuild its index. Requires the exact existing filename and preserves its chunking settings. This overwrites content; use only when the user requests an update.",
         "delete_document": "Delete an existing knowledge file and its search index by exact filename. Use only when the user requests deletion. This cannot be undone through MCP.",
     }

@@ -238,6 +238,10 @@ artifact_snapshots = Table(
     **_MYSQL_TABLE,
 )
 
+# Retired tables: retained so existing databases keep their history, but they
+# are no longer read or written. The active path is document_jobs +
+# document_job_outbox (MySQL is the source of truth, RocketMQ carries a
+# notification only).
 document_tasks = Table(
     "document_tasks", metadata,
     Column("artifact_id", _ci_string(36), primary_key=True),
@@ -280,6 +284,54 @@ document_task_outbox = Table(
 SOURCE_BUCKET = "source"
 PDF_ASSET_BUCKET = "pdf-assets"
 WORD_ASSET_BUCKET = "word-assets"
+
+document_jobs = Table(
+    "document_jobs", metadata,
+    Column("artifact_id", _ci_string(36), primary_key=True),
+    Column("namespace", _ci_string(64), nullable=False),
+    Column("name", _ci_string(200), nullable=False),
+    Column("name_key", _ci_string(64), nullable=False),
+    # Cleared once the bytes are durably published to the source bucket, so a
+    # finished job never keeps a second copy of the uploaded file.
+    Column("content", _long_blob(), nullable=True),
+    Column("size", BigInteger, nullable=False),
+    Column("sha256", _ci_string(64), nullable=False),
+    Column("configuration_version", BigInteger, nullable=False),
+    Column("idempotency_key", _ci_string(128)),
+    Column("status", _ci_string(24), nullable=False),
+    Column("stage", _ci_string(64), nullable=False),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("owner", _ci_string(32)),
+    Column("execution_id", _ci_string(32)),
+    Column("lease_until", Double, nullable=False, server_default="0"),
+    Column("operation_id", _ci_string(32)),
+    Column("retry_at", Double, nullable=False, server_default="0"),
+    Column("error", Text),
+    Column("created_at", Double, nullable=False),
+    Column("updated_at", Double, nullable=False),
+    UniqueConstraint("namespace", "idempotency_key", name="uq_document_job_idempotency"),
+    Index("ix_document_job_name", "namespace", "name_key", "status"),
+    Index("ix_document_job_recovery", "status", "lease_until"),
+    **_MYSQL_TABLE,
+)
+
+document_job_outbox = Table(
+    "document_job_outbox", metadata,
+    Column("id", _ci_string(32), primary_key=True),
+    Column("artifact_id", _ci_string(36), nullable=False),
+    Column("namespace", _ci_string(64), nullable=False),
+    Column("name", _ci_string(200), nullable=False),
+    Column("status", _ci_string(16), nullable=False),
+    Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("retry_at", Double, nullable=False, server_default="0"),
+    Column("created_at", Double, nullable=False),
+    Column("published_at", Double),
+    Column("last_error", _ci_string(128)),
+    Index("ix_document_job_outbox_pending", "status", "retry_at"),
+    Index("ix_document_job_outbox_artifact", "artifact_id"),
+    Index("ix_document_job_outbox_age", "created_at"),
+    **_MYSQL_TABLE,
+)
 
 search_tasks = Table(
     "search_tasks", metadata,

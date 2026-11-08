@@ -20,15 +20,24 @@
                                              ↓
 等待内完成：完整结果 + result_id；否则：仅 result_id → get_search_result 轮询
 
+异步文档新增（MCP add_document）→ MySQL 单事务（document_jobs 完整任务含文件字节
+                                  + document_job_outbox 通知）→ 提交即返回 artifact_id
+                                             ↓
+                  relay / Debezium → RocketMQ schema 3 纯通知（仅标识）
+                                             ↓
+                  rag-document-worker → 从 MySQL 读回任务并解析/索引
+                                             ↓
+             get_document_status 直接读 MySQL（无 Redis TTL）；succeeded 表示已发布
+
 REST /v1/search / 本地调试 → 同步检索/重排（不经搜索任务队列）
 结果按 ID 读取 Redis；artifact 按 ID 读取 MySQL；不调用搜索或模型
 ```
 
-每次搜索生成独立 UUIDv4 result_id，不按查询文本匹配。MCP 的任务与最终快照使用同一 UUID。搜索消息携带完整查询/参数，上传消息携带完整文档请求的分块（每块解码后最多 512 KiB，单文件仍最多 10 MiB）。**两条路径都必须在所有消息获 Broker 确认、Redis 接收状态就绪后才返回成功**；`wait_seconds=0` 不跳过发送确认。MQ/Redis 前置条件失败或发送失败明确报错，故障期间没有 SQL 持久接收/补发保证。部分发送后的超时可不确定，上传应使用同一 idempotency_key、内容及参数重试。
+每次搜索生成独立 UUIDv4 result_id，不按查询文本匹配。MCP 的任务与最终快照使用同一 UUID。**两条路径的受理语义不同**：搜索消息仍携带完整查询与参数直投 RocketMQ，必须在 Broker 确认、Redis 快照就绪后才返回成功；异步文档新增只提交一个 MySQL 事务（完整任务含文件原字节 + 发件箱通知），提交成功即返回 `artifact_id`，MQ 只传 schema 3 纯通知，Redis 不参与受理、状态或投递。文档投递失败不影响受理，由发件箱 relay/Debezium 重试；"发送确认超时可能不确定"只适用于搜索。
 
-Redis 保存短期任务/上传重组以及 namespace、完整搜索响应和绝对过期时间。key 包含 namespace 哈希及 ID，结果 TTL 与展示缓存独立；UUID 不允许覆盖其他快照。快照保留原结果顺序、分数、证据、debug 元数据及产物引用，分页只切片原快照，不再查 Qdrant。读取不延长绝对过期时间。
+Redis 保存排队搜索的 namespace、短期任务状态、完整搜索响应和绝对过期时间。key 包含 namespace 哈希及 ID，结果 TTL 与展示缓存独立；UUID 不允许覆盖其他快照。快照保留原结果顺序、分数、证据、debug 元数据及产物引用，分页只切片原快照，不再查 Qdrant。读取不延长绝对过期时间。文档任务状态、租约和文件字节保存在 MySQL，不使用该 Redis 快照，也没有 TTL。
 
-升级必须先停旧入口并排空旧 worker/outbox/消息，再同时部署 API 与 worker；schema 2 完整请求 envelope 与 UUID-only 消息不兼容，不能混跑。`document_tasks`、`search_tasks`、对应 outbox 及 `search_result_snapshots` 保留为历史表，不在活跃路径；旧任务和结果不迁移。文档 worker 已移除 `--dispatch-only`，dispatcher 兼容入口不 relay SQL，也无文件系统 MQ spool。日志仅记录 ID 和安全错误类别，不记录查询、文件/消息正文或秘密。
+升级必须先停旧入口并排空旧 worker 及在途消息，再同时部署 API 与 worker；文档消息已从 schema 2 完整请求改为 schema 3 纯通知，不能混跑；搜索仍为 schema 2，与更早的 UUID-only 消息不兼容。`document_tasks`、`document_task_outbox`、`search_tasks`、`search_task_outbox`、`search_result_snapshots` 保留为历史表，不在活跃路径；旧任务和结果不迁移。日志仅记录 ID 和安全错误类别，不记录查询、文件/消息正文或秘密。
 
 相同 namespace、文档版本、产物类型、名称和字节内容复用稳定 UUIDv5 artifact_id。新的引用可单调延长它的有效期，不缩短已有引用；旧响应里的 expires_at 是该次签发时的保留期限。
 
@@ -122,12 +131,12 @@ RAG_ARTIFACT_MAX_BYTES=67108864
 RAG_RESULT_MAX_ARTIFACTS=100
 ```
 
-- MCP 搜索必须运行独立 `rag-search-worker`；没有消费者会排队直至 deadline。旧 `--dispatch-only` 不再补发 SQL，不能替代消费者。每个消费进程默认顺序执行，文档、搜索、缓存刷新使用独立 topic/group；worker 与 API 共享 MySQL、必需的 Redis/MQ、Qdrant 和状态加密设置。
+- MCP 搜索必须运行独立 `rag-search-worker`；没有消费者会排队直至 deadline。每个消费进程默认顺序执行，文档、搜索、缓存刷新使用独立 topic/group；worker 与 API 共享 MySQL、必需的 Redis/MQ、Qdrant 和状态加密设置。文档异步新增另需 `rag-document-worker`（不依赖 Redis），投递模式由 `RAG_OUTBOX_BRIDGE` 选择。
 - 任务默认总超时 120 秒，包含排队等待，与 `wait_seconds`（默认 10 秒）和完成快照的 3600 秒 TTL 独立。生产检索在子进程执行；MQ 可见性续期失败有界重试，不承诺立即取消正在执行的检索或下游调用。
-- MQ 携带查询参数，Redis 保存短期任务/结果；任务状态采用 CAS，结果快照与成功终态在 Redis 内原子保存（不含 MySQL 事务）；消费重试、invisible 与 DLQ 由 Broker 管理。临时故障不 ACK；确定性失败先写 Redis 失败终态再 ACK，成功先存结果/终态再 ACK。终态 first-terminal-wins；续期失败后已记录终态仍尝试 ACK，重复消息不覆盖仍存在的终态；Redis 丢失后不保证搜索持久去重。
-- 文档分块未收齐不 ACK，重投保证 Redis 丢失后仍可重组原请求；任一收齐分块的消息执行，终态记录后剩余重复消息再 ACK。短期文档状态/重组沿用 `RAG_RESULT_TTL_SECONDS`（默认 3600 秒）。
-- 文档成功状态在 MySQL 持久发布后写入 Redis；若后者失败，重投通过 UploadJournal 对账而不重复发布。MySQL 仍保存业务操作/租约、fencing、补偿与恢复，不存在 Redis+MySQL 原子事务。
-- 计划提供独立 `rag-dead-letter-worker --kind search`（也支持 `--kind document`），在 Redis 记录失败终态后 ACK，不加载模型或执行推理。正常 Broker 死信 topic 为 `%DLQ%<源消费组>`，处理组使用独立 `RAG_SEARCH_DLQ_GROUP`；不能把处理组名当死信 topic。传输层已验证 Python SDK 5.1.2 / Apache Broker 5.3.3 的正常 DLQ 接收及 ACK；其他版本上线前需重新验证，并预建可读 topic、处理组及权限，详见 [Broker 消费与死信处理](USAGE.md#broker-消费与死信处理)。
+- MQ 携带完整查询参数，Redis 保存短期搜索任务/结果；任务状态采用 CAS，结果快照与成功终态在 Redis 内原子保存（不含 MySQL 事务）；消费重试、invisible 与 DLQ 由 Broker 管理。临时故障不 ACK；确定性失败先写 Redis 失败终态再 ACK，成功先存结果/终态再 ACK。终态 first-terminal-wins；续期失败后已记录终态仍尝试 ACK，重复消息不覆盖仍存在的终态；Redis 丢失后不保证搜索持久去重。
+- 文档消息只含 schema 3 通知标识；worker 按 `artifact_id` 从 MySQL 读回任务与文件字节，用 SQL 租约 claim 并心跳续租，只有 MySQL 记录终态才 ACK，瞬时失败不 ACK 由 Broker 重投。没有 Redis 任务状态或重组 TTL，也没有 Redis+MySQL 原子事务：文档 `succeeded` 就是 MySQL 持久发布结果。
+- 文档重投通过 UploadJournal 对账，不重复发布；MySQL 仍保存业务操作/租约、fencing、补偿与恢复。
+- 独立 `rag-dead-letter-worker --kind search`（也支持 `--kind document`）把尚未终结的任务标记失败：搜索写 Redis、文档写 MySQL，成功写入后才 ACK，不加载模型或执行推理。正常 Broker 死信 topic 为 `%DLQ%<源消费组>`，处理组使用独立 `RAG_SEARCH_DLQ_GROUP`；不能把处理组名当死信 topic。传输层已验证 Python SDK 5.1.2 / Apache Broker 5.3.3 的正常 DLQ 接收及 ACK；其他版本上线前需重新验证，并预建可读 topic、处理组及权限，详见 [Broker 消费与死信处理](USAGE.md#broker-消费与死信处理)。
 - 结果快照默认最大 16 MiB；保持原图片兼容响应。同步 REST 搜索快照过大时仍可返回原结果并标记快照不可用；MCP 排队任务不能以未写入 Redis 的结果冒充已完成快照。
 - 每次搜索默认至多签发 100 个产物，累计字节预算 64 MiB；同一搜索的重复产物不重复计费。
 - 单个 artifact 默认也受 64 MiB 上限约束，MySQL max_allowed_packet 必须满足实际产物大小；默认 Compose 为 64 MiB，接近上限的大对象可能因协议开销失败并提示引用不可用。

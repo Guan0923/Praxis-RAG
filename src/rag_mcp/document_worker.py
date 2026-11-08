@@ -1,4 +1,10 @@
-"""Bounded document consumer; scale with independent worker processes."""
+"""Durable document consumer: load the job from MySQL, index, then ACK.
+
+The broker message carries an identifier only. Everything the worker needs --
+bytes, checksum, configuration version -- is read back from the durable job
+row, so a redelivered or Debezium-replayed notification can never disagree with
+the committed request.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +14,11 @@ import signal
 import threading
 
 from .service_knowledge import KnowledgeValidationError
+from .state.document_jobs import (
+    TERMINAL_STATUSES,
+    heartbeat_seconds,
+    validate_document_envelope,
+)
 from .state.upload_coordinator import UploadCoordinator
 from .state.uploads import UploadConflict
 
@@ -17,53 +28,80 @@ logger = logging.getLogger(__name__)
 class DocumentWorker:
     def __init__(self, runtime):
         self.runtime = runtime
-        self.tasks = runtime.state.document_tasks
+        self.jobs = runtime.state.document_jobs
         self._mutex = threading.Lock()
 
-    def process(self, envelope):
-        from .state.document_tasks import validate_document_envelope
+    def _start_heartbeat(self, task):
+        """Keep the SQL lease alive across long parses and model calls."""
 
+        stop = threading.Event()
+
+        def beat():
+            while not stop.wait(heartbeat_seconds()):
+                try:
+                    self.jobs.heartbeat(task)
+                except Exception as exc:  # noqa: BLE001 - the lease expiry path recovers
+                    logger.warning("Document lease heartbeat failed artifact_id=%s error_type=%s",
+                                   task["artifact_id"], type(exc).__name__)
+                    return
+
+        thread = threading.Thread(target=beat, name="document-job-heartbeat", daemon=True)
+        thread.start()
+        return stop, thread
+
+    def process(self, envelope):
         envelope = validate_document_envelope(envelope)
         artifact_id = envelope["artifact_id"]
         with self._mutex:
-            if self.tasks.reconcile(envelope) or self.tasks.terminal(envelope):
+            job = self.jobs.get(artifact_id, envelope["namespace"])
+            if job is None:
+                # Deliberately acknowledged: an unknown or purged job cannot be
+                # made processable by retrying the delivery.
+                logger.info("Document job unknown; acknowledging artifact_id=%s", artifact_id)
                 return True
-            task = self.tasks.assemble(envelope)
+            if job["status"] in TERMINAL_STATUSES:
+                return True
+            if self.jobs.reconcile(job):
+                return True
+            task = self.jobs.claim(envelope)
             if task is None:
-                # Never ACK partial payloads: Redis TTL/loss must not lose the file.
-                return False
-            token = self.tasks.transient.lock("document_execution", artifact_id, 300)
-            if token is None:
-                return False
+                # Another live worker holds the lease; leave the delivery for retry.
+                return self.jobs.terminal(envelope)
+            stop, heartbeat = self._start_heartbeat(task)
             try:
-                if self.tasks.reconcile(task):
+                if self.jobs.reconcile(task):
                     return True
-                if self.tasks.execution_busy(task):
+                if self.jobs.execution_busy(task):
                     return False
-                task = self.tasks.claim(task)
-                if task is None:
-                    return self.tasks.terminal(artifact_id)
                 try:
                     self.runtime.process_document_task(task)
-                    if not self.tasks.reconcile(task):
+                    if not self.jobs.reconcile(task):
                         return False
                 except Exception as exc:  # noqa: BLE001 - classify all parser/backend failures safely
-                    if self.tasks.reconcile(task):
+                    if self.jobs.reconcile(task):
                         return True
                     try:
                         error = ("Invalid document or changed knowledge-base configuration"
                                  if isinstance(exc, KnowledgeValidationError)
                                  else f"Document processing failed ({type(exc).__name__})")
-                        self.tasks.fail(task, retry=not isinstance(exc, KnowledgeValidationError), error=error)
+                        self.jobs.fail(task, retry=not isinstance(exc, KnowledgeValidationError),
+                                       error=error)
                     except UploadConflict:
                         pass
                     logger.warning("Document processing deferred artifact_id=%s error_type=%s",
                                    artifact_id, type(exc).__name__)
-                return self.tasks.terminal(artifact_id)
+                return self.jobs.terminal(artifact_id)
             finally:
-                self.tasks.transient.unlock("document_execution", artifact_id, token)
+                stop.set()
+                heartbeat.join(timeout=heartbeat_seconds())
 
     def recover(self):
+        try:
+            self.jobs.sweep()
+            self.jobs.gc_outbox()
+            self.jobs.gc_terminal()
+        except Exception as exc:  # noqa: BLE001 - maintenance never blocks consumption
+            logger.warning("Document job maintenance failed (%s)", type(exc).__name__)
         UploadCoordinator(self.runtime.state).recover(self.runtime._recovery_store)
 
 

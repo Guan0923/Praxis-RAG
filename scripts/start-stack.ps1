@@ -2,7 +2,12 @@
 # Normal DLQ receive/ACK verified with SDK 5.1.2 / Apache Broker 5.3.3; revalidate other deployments.
 # Run rag-document-worker and rag-search-worker separately with the same database,
 # Redis, Qdrant, encryption and RocketMQ settings. Without a search consumer,
-# MCP searches need a consumer before their task deadline; SQL outbox relays are no longer used.
+# MCP searches need a consumer before their task deadline.
+#
+# RAG_OUTBOX_BRIDGE selects how a committed document job reaches RocketMQ:
+#   relay    (default) in-process outbox publisher inside rag-service
+#   debezium           the optional Debezium Server profile tails the MySQL binlog
+# Both deliver the same identifier-only notification; never enable both.
 #
 #   .\scripts\start-stack.ps1                 # full start
 #   .\scripts\start-stack.ps1 -MigrateOnly    # only start dependencies + migrate
@@ -56,6 +61,18 @@ if (-not $env:RAG_REDIS_URL) { $env:RAG_REDIS_URL = "redis://127.0.0.1:6379/0" }
 if (-not $env:RAG_ROCKETMQ_ENDPOINT) { $env:RAG_ROCKETMQ_ENDPOINT = "127.0.0.1:8081" }
 if (-not $env:RAG_ROCKETMQ_TOPIC) { $env:RAG_ROCKETMQ_TOPIC = "praxis_state_cache_refresh" }
 if (-not $env:RAG_ROCKETMQ_GROUP) { $env:RAG_ROCKETMQ_GROUP = "praxis_state_cache_refresh_workers" }
+if (-not $env:RAG_OUTBOX_BRIDGE) { $env:RAG_OUTBOX_BRIDGE = "relay" }
+if ($env:RAG_OUTBOX_BRIDGE -notin @("relay", "debezium")) {
+    throw "RAG_OUTBOX_BRIDGE must be relay or debezium."
+}
+if (-not $env:RAG_MYSQL_DATABASE) { $env:RAG_MYSQL_DATABASE = "praxis_rag" }
+# Debezium derives the RocketMQ topic from <topic.prefix>.<database>.<table>.
+if ($env:RAG_OUTBOX_BRIDGE -eq "debezium") {
+    if (-not $env:DEBEZIUM_TOPIC_PREFIX) { $env:DEBEZIUM_TOPIC_PREFIX = "praxis" }
+    if (-not $env:RAG_DOCUMENT_TOPIC) {
+        $env:RAG_DOCUMENT_TOPIC = "$($env:DEBEZIUM_TOPIC_PREFIX).$($env:RAG_MYSQL_DATABASE).document_job_outbox"
+    }
+}
 if (-not $env:RAG_DOCUMENT_TOPIC) { $env:RAG_DOCUMENT_TOPIC = "praxis_document_ingest" }
 if (-not $env:RAG_DOCUMENT_GROUP) { $env:RAG_DOCUMENT_GROUP = "praxis_document_ingest_workers" }
 if (-not $env:RAG_SEARCH_TOPIC) { $env:RAG_SEARCH_TOPIC = "praxis_search" }
@@ -102,8 +119,15 @@ $env:PYTHONPATH = (Join-Path $root "src") + [IO.Path]::PathSeparator + $env:PYTH
 & $python -c "import redis; import rocketmq"
 if ($LASTEXITCODE -ne 0) { throw "Cache dependencies missing. Install: pip install -e '.[cache]'" }
 
+$composeProfiles = @()
+if ($env:RAG_OUTBOX_BRIDGE -eq "debezium") {
+    $composeProfiles = @("--profile", "debezium")
+    if (-not $env:RAG_ROCKETMQ_BROKER_IP) { $env:RAG_ROCKETMQ_BROKER_IP = "rocketmq" }
+    Write-Host "Debezium bridge enabled: tailing MySQL binlog for $($env:RAG_DOCUMENT_TOPIC)"
+}
+
 Write-Host "Starting MySQL, Qdrant, Redis and RocketMQ..."
-Invoke-Compose @("up", "-d")
+Invoke-Compose (@($composeProfiles) + @("up", "-d"))
 if ($LASTEXITCODE -ne 0) {
     throw "docker compose up failed. Is Docker Desktop running and this shell allowed to access it?"
 }
@@ -149,7 +173,7 @@ for ($attempt = 0; $attempt -lt 45; $attempt++) {
 if (-not $mqReady) { throw "RocketMQ provisioning failed. Check docker-compose logs rocketmq." }
 Write-Host "Consumers are not started: run rag-search-worker for MCP search and rag-document-worker for MCP add_document separately."
 Write-Host "DLQ resources are provisioned; planned rag-dead-letter-worker --kind document|search needs reader permissions. Revalidate SDK/Broker versions other than tested 5.1.2/5.3.3."
-Write-Host "Redis and RocketMQ are required for queued requests. Deploy API and workers together; drain legacy UUID-only messages before upgrading."
+Write-Host "Document uploads are accepted by a MySQL commit; MQ only carries the notification. Deploy API and workers together; drain schema-2 chunked messages before upgrading."
 
 if (-not $SkipMigrate) {
     if (Test-Path $LegacyRoot) {

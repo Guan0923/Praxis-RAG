@@ -15,8 +15,17 @@ services:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_bin
       - --max-allowed-packet=64M
+      # Required by the Debezium bridge: row-based binlog with full before/after
+      # images. Harmless when running with RAG_OUTBOX_BRIDGE=relay.
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --server-id=1
+      - --binlog-expire-logs-seconds=604800
     volumes:
       - mysql_data:/var/lib/mysql
+      # Creates the least-privilege CDC user used by Debezium on first init.
+      - ./deploy/mysql/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
       interval: 5s
@@ -75,7 +84,13 @@ services:
     environment:
       NAMESRV_ADDR: rocketmq-namesrv:9876
       JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
-    command: ["sh", "mqbroker", "--enable-proxy", "-c", "/home/rocketmq/rocketmq-5.3.3/conf/praxis-broker.conf"]
+    command:
+      - sh
+      - -c
+      - >-
+        sed "s/^brokerIP1=.*/brokerIP1=${RAG_ROCKETMQ_BROKER_IP:-127.0.0.1}/"
+        /home/rocketmq/rocketmq-5.3.3/conf/praxis-broker.conf > /tmp/praxis-broker.conf
+        && exec sh mqbroker --enable-proxy -c /tmp/praxis-broker.conf
     ports:
       - "127.0.0.1:8081:8081"
     volumes:
@@ -83,8 +98,38 @@ services:
       - rocketmq_data:/home/rocketmq/store
 
 
+
+  # Optional CDC bridge: tails the MySQL binlog of the transactional outbox
+  # table and publishes one notification per committed upload. Enable with
+  #   docker compose --profile debezium up -d
+  # and run rag-service/rag-document-worker with RAG_OUTBOX_BRIDGE=debezium.
+  # See deploy/debezium/README.md. Not started by default.
+  debezium:
+    image: ${DEBEZIUM_IMAGE:-quay.io/debezium/server:3.7.1.Final}
+    container_name: praxis-rag-debezium
+    restart: unless-stopped
+    profiles: ["debezium"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rocketmq:
+        condition: service_started
+    environment:
+      RAG_MYSQL_HOST: mysql
+      RAG_MYSQL_PORT: "3306"
+      RAG_MYSQL_USER: ${RAG_MYSQL_DEBEZIUM_USER:-debezium}
+      RAG_MYSQL_PASSWORD: ${RAG_MYSQL_DEBEZIUM_PASSWORD:?set RAG_MYSQL_DEBEZIUM_PASSWORD in .env}
+      RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
+      RAG_ROCKETMQ_NAMESRV: ${RAG_ROCKETMQ_NAMESRV:-rocketmq-namesrv:9876}
+      DEBEZIUM_SERVER_ID: ${DEBEZIUM_SERVER_ID:-184054}
+      QUARKUS_LOG_LEVEL: ${DEBEZIUM_LOG_LEVEL:-INFO}
+    volumes:
+      - ./deploy/debezium/application.properties:/debezium/conf/application.properties:ro
+      - debezium_data:/debezium/data
+
 volumes:
   mysql_data:
   qdrant_data:
   redis_data:
   rocketmq_data:
+  debezium_data:

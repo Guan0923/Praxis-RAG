@@ -175,7 +175,7 @@ class KnowledgeDocumentStore:
         collection = getattr(getattr(ingester, "_config", None), "collection", "test")
         op = journal.begin(self.namespace, name, document_id, collection,
                            idempotency_key=idempotency_key, fingerprint=fingerprint,
-                           on_begin=(lambda conn, operation: self.state.document_tasks.bind(
+                           on_begin=(lambda conn, operation: self.state.document_jobs.bind(
                                conn, task, operation)) if task else None)
         if op["status"] == "COMMITTED":
             # Validate bytes on replay without repeating any external side effect.
@@ -233,7 +233,7 @@ class KnowledgeDocumentStore:
             def publish(indexed):
                 nonlocal metadata
                 if task is not None:
-                    self.state.document_tasks.progress(task, "publishing")
+                    self.state.document_jobs.progress(task, "publishing")
                 metadata = self._metadata(name, size, sha256, indexed)
                 metadata.update(sha256=sha256, chunking=configuration, operation_id=op["id"])
                 if task is not None:
@@ -250,15 +250,15 @@ class KnowledgeDocumentStore:
                         self.state.blobs.put_tree(self.namespace, indexed.artifacts_bucket,
                                                  str(indexed.document_id), indexed.artifacts_dir, conn=conn)
                     if task is not None:
-                        self.state.document_tasks.validate_publication(conn, task)
+                        self.state.document_jobs.validate_publication(conn, task)
                     journal.commit(op, metadata, conn)
                 if task is not None:
-                    self.state.document_tasks.succeed(None, task)
+                    self.state.document_jobs.succeed(None, task)
 
             if isinstance(ingester, DenseDocumentIngester):
                 ingester.ingest_and_publish(temporary, source_name=name, chunking=chunking,
                     publish=publish, journal=journal, operation=op, workspace=workspace,
-                    progress=(lambda stage: self.state.document_tasks.progress(task, stage)) if task else None)
+                    progress=(lambda stage: self.state.document_jobs.progress(task, stage)) if task else None)
             else:
                 transactional = getattr(ingester, "ingest_and_publish", None)
                 if transactional is not None:
@@ -875,6 +875,12 @@ class RagServiceRuntime:
 
     def add_document(self, namespace: str, name: str, content: bytes, *,
                      idempotency_key: str | None = None) -> dict:
+        """Accept an upload by committing it to MySQL.
+
+        Success means the durable job and its outbox notification are committed.
+        It says nothing about broker delivery or indexing; clients poll
+        ``get_document_status`` for those.
+        """
         try:
             return self.state.document_dispatcher.submit(namespace, name, content, idempotency_key)
         except (KnowledgeValidationError, UploadConflict):
@@ -883,18 +889,14 @@ class RagServiceRuntime:
             raise KnowledgeValidationError(str(exc)) from exc
         except Exception as exc:
             raise KnowledgeError(
-                "Document delivery was not confirmed; retry with the same idempotency_key"
+                "Document submission failed; retry with the same idempotency_key"
             ) from exc
 
     def get_document_status(self, namespace: str, artifact_id: str) -> dict:
-        from .state.transient import TransientUnavailable
-
         try:
-            return self.state.document_tasks.status(namespace, artifact_id)
+            return self.state.document_jobs.status(namespace, artifact_id)
         except (ValueError, LookupError) as exc:
             raise KnowledgeValidationError(str(exc)) from exc
-        except TransientUnavailable as exc:
-            raise KnowledgeError("Document status is temporarily unavailable; retry later") from exc
 
     def process_document_task(self, task: dict) -> dict:
         namespace = task["namespace"]
@@ -904,7 +906,7 @@ class RagServiceRuntime:
         tenant = self._tenant(namespace)
         configuration = ChunkingConfig(settings["strategy"], settings["chunk_size"], settings["chunk_overlap"])
         with tenant.lock:
-            self.state.document_tasks.progress(task, "parsing")
+            self.state.document_jobs.progress(task, "parsing")
             return tenant.documents.store_and_index(
                 task["name"], io.BytesIO(task["content"]), tenant.ingester, configuration,
                 settings["tokenizer"], deduplicate_across_names=False,

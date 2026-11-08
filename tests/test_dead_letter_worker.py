@@ -1,4 +1,8 @@
-"""DLQ handling records Redis outcomes without inference or SQL task access."""
+"""DLQ handling records durable terminal outcomes without inference or re-enqueue.
+
+Document dead letters are normalised from the native schema-3 notification (or a
+raw Debezium change event) and finalised in the ``document_jobs`` table.
+"""
 
 import subprocess
 import sys
@@ -12,47 +16,79 @@ from rag_mcp.state.store import StateStores
 from rag_mcp.state.transient import TransientUnavailable
 
 
+def payload(kind, task_id=None):
+    task_id = task_id or str(uuid4())
+    if kind == "document":
+        return {"schema": 3, "artifact_id": task_id, "namespace": "manuals",
+                "name": "manual.txt", "created_at": 0.0}
+    return {"schema": 3, "result_id": task_id}
+
+
 @pytest.mark.parametrize("kind", ["document", "search"])
 @pytest.mark.parametrize("complete", [True, False, None])
 def test_ack_eligibility_follows_task_outcome(kind, complete, caplog):
     calls = []
 
-    def dead_letter(task_id):
-        calls.append(task_id)
+    def dead_letter(message):
+        calls.append(message)
         return complete
 
     tasks = SimpleNamespace(dead_letter=dead_letter)
-    state = SimpleNamespace(document_tasks=tasks, search_tasks=tasks)
+    state = SimpleNamespace(document_jobs=tasks, search_tasks=tasks)
     key = "artifact_id" if kind == "document" else "result_id"
-    task_id = str(uuid4())
-    payload = {"schema": 2, key: task_id}
+    incoming = payload(kind)
+    task_id = incoming[key]
     with caplog.at_level("INFO"):
-        result = DeadLetterWorker(state, kind).process(payload)
+        result = DeadLetterWorker(state, kind).process(incoming)
     assert result is (complete is True)
-    assert calls == [payload]
+    assert calls == [incoming]
     if complete is True:
         assert task_id in caplog.text
 
 
 @pytest.mark.parametrize("kind", ["document", "search"])
-def test_redis_failure_propagates_without_ack_eligibility(kind):
+def test_storage_failure_propagates_without_ack_eligibility(kind):
     def fail(_):
-        raise TransientUnavailable("Redis task write unavailable")
+        raise TransientUnavailable("State write unavailable")
 
     tasks = SimpleNamespace(dead_letter=fail)
-    state = SimpleNamespace(document_tasks=tasks, search_tasks=tasks)
-    key = "artifact_id" if kind == "document" else "result_id"
+    state = SimpleNamespace(document_jobs=tasks, search_tasks=tasks)
     with pytest.raises(TransientUnavailable):
-        DeadLetterWorker(state, kind).process({"schema": 2, key: str(uuid4())})
+        DeadLetterWorker(state, kind).process(payload(kind))
 
 
 @pytest.mark.parametrize("kind", ["document", "search"])
-@pytest.mark.parametrize("payload", [None, [], "legacy-id", {}, {"artifact_id": "bad", "result_id": "bad"}])
-def test_invalid_payload_never_reaches_task_store(kind, payload):
+@pytest.mark.parametrize("incoming", [
+    None, [], "legacy-id", {}, {"artifact_id": "bad", "result_id": "bad"},
+])
+def test_invalid_payload_never_reaches_task_store(kind, incoming):
     tasks = SimpleNamespace(dead_letter=lambda _: pytest.fail("Invalid message reached task store"))
-    state = SimpleNamespace(document_tasks=tasks, search_tasks=tasks)
+    state = SimpleNamespace(document_jobs=tasks, search_tasks=tasks)
     with pytest.raises((ValueError, TypeError)):
-        DeadLetterWorker(state, kind).process(payload)
+        DeadLetterWorker(state, kind).process(incoming)
+
+
+def test_document_dead_letter_rejects_legacy_schema_two():
+    """The document kind requires the schema-3 notification, not the old protocol."""
+
+    tasks = SimpleNamespace(dead_letter=lambda _: pytest.fail("Legacy message reached task store"))
+    state = SimpleNamespace(document_jobs=tasks)
+    legacy = {"schema": 2, "artifact_id": str(uuid4())}
+    with pytest.raises(ValueError):
+        DeadLetterWorker(state, "document").process(legacy)
+
+
+def test_document_dead_letter_accepts_a_debezium_change_event():
+    received = []
+    tasks = SimpleNamespace(dead_letter=lambda message: received.append(message) or True)
+    state = SimpleNamespace(document_jobs=tasks)
+    artifact_id = str(uuid4())
+    change = {"before": None, "op": "c", "after": {
+        "artifact_id": artifact_id, "namespace": "manuals", "name": "manual.txt",
+        "created_at": 0.0}}
+    assert DeadLetterWorker(state, "document").process(change) is True
+    assert received == [{"schema": 3, "artifact_id": artifact_id, "namespace": "manuals",
+                         "name": "manual.txt", "created_at": 0.0}]
 
 
 def test_dlq_settings_preserve_credentials_and_use_physical_not_business_namespace(monkeypatch):
@@ -96,7 +132,7 @@ def test_main_loads_shared_config_and_closes_every_client(monkeypatch, kind):
     stop.is_set = lambda: stop.stopped
     stop.set = lambda: setattr(stop, "stopped", True)
     tasks = SimpleNamespace(dead_letter=lambda _: True)
-    state = SimpleNamespace(document_tasks=tasks, search_tasks=tasks, close=lambda: events.append("state_close"))
+    state = SimpleNamespace(document_jobs=tasks, search_tasks=tasks, close=lambda: events.append("state_close"))
     monkeypatch.setattr(startup, "load_service_config", lambda: events.append("config"))
     monkeypatch.setattr(StateStores, "create", lambda _: state)
     monkeypatch.setattr(module.threading, "Event", lambda: stop)
@@ -108,8 +144,7 @@ def test_main_loads_shared_config_and_closes_every_client(monkeypatch, kind):
             assert settings.topic.startswith("%DLQ%")
 
         def consume_once(self, callback):
-            key = "artifact_id" if kind == "document" else "result_id"
-            assert callback({"schema": 2, key: str(uuid4())}) is True
+            assert callback(payload(kind)) is True
             stop.set()
 
         def close(self):
@@ -126,6 +161,5 @@ def test_main_loads_shared_config_and_closes_every_client(monkeypatch, kind):
 @pytest.mark.parametrize("kind", ["document", "search"])
 def test_nonterminal_handler_result_never_eligible_for_ack(kind):
     tasks = SimpleNamespace(dead_letter=lambda _: False)
-    state = SimpleNamespace(document_tasks=tasks, search_tasks=tasks)
-    key = "artifact_id" if kind == "document" else "result_id"
-    assert DeadLetterWorker(state, kind).process({"schema": 2, key: str(uuid4())}) is False
+    state = SimpleNamespace(document_jobs=tasks, search_tasks=tasks)
+    assert DeadLetterWorker(state, kind).process(payload(kind)) is False

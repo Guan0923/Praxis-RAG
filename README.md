@@ -21,7 +21,7 @@ Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可
 
 文档详情页支持文本阅读，以及 PDF 翻页、缩放和原文件下载。不同工作区分别管理文档，切换工作区后可继续浏览和检索对应资料。
 
-MCP `add_document` 为异步新增：请求按解码后每块最多 **512 KiB** 分成携带完整请求元数据与文件内容的 RocketMQ 消息，保留单文件 **10 MiB** 上限。Redis 必须可用，用于短期任务状态和分块重组（沿用 `RAG_RESULT_TTL_SECONDS`，默认 3600 秒）；**所有消息均获 Broker 确认且 Redis 接收状态写入成功后**才仅返回 `{"artifact_id": "<UUID>"}`，表示已投递而非已索引。MQ/Redis 缺失或故障会明确报错，不会通过 SQL 持久接收后等待补发。客户端通过 `get_document_status(artifact_id)` 轮询 `queued` / `processing` / `succeeded` / `failed` 及 `stage`、`error`；成功后主动刷新文档/资源列表。HTTP/Console 上传和 MCP `update_document`、`delete_document` 仍为同步。部署及重试说明见 [使用与部署](docs/USAGE.md#异步新增与状态轮询)。
+MCP `add_document` 为异步新增：API 在一个 MySQL 事务里写入完整任务（含文件原字节，单文件仍 **10 MiB** 上限）和一条发件箱通知，**提交成功即受理**，只返回 `{"artifact_id": "<UUID>"}`。受理路径不需要 Redis，也不与 RocketMQ 对话：默认由 API 进程内的 relay 轮询发件箱把纯通知投递到 MQ，或配置 `RAG_OUTBOX_BRIDGE=debezium` 后由 Debezium 读取 binlog 投递；投递失败不影响受理，发件箱保留并重试。客户端通过 `get_document_status(artifact_id)` 轮询 `queued` / `processing` / `succeeded` / `failed` 及 `stage`、`error`：状态直接读 MySQL，**没有 TTL，不会因 Redis 过期而失效**，只有 `succeeded` 表示已完成持久发布。HTTP/Console 上传和 MCP `update_document`、`delete_document` 仍为同步。部署及重试说明见 [使用与部署](docs/USAGE.md#异步新增与状态轮询)。
 
 ### PDF 内容解析
 
@@ -67,23 +67,25 @@ PDF 的公式与表格行会按内容边界处理，减少在切分过程中拆�
 
 ### 独立部署与模型连接
 
-Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保存检索索引；源文件、PDF/Word 解析产物、文档清单、知识库配置、MCP 配置和 API Key 保存在共享状态数据库（生产环境使用 MySQL，本地开发和测试可使用 SQLite 文件）。
+Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档入库任务（含文件原字节）与发件箱、文档清单、知识库配置、MCP 配置和 API Key 保存在共享状态数据库（生产环境使用 MySQL，本地开发和测试可使用 SQLite 文件，此时投递只能使用进程内 relay）。
+
+架构总纲（异步文档入库）：**MySQL 存真相**——文件字节、任务状态与发件箱在同一个事务里提交；**Redis 存短期搜索状态与展示缓存**，不再保存文档任务状态；**RocketMQ 只传通知**（`{"schema":3,"artifact_id","namespace","name","created_at"}`，不含文件内容）；**Debezium（可选）负责把已提交的事务投递到 MQ**。搜索路径保持原样，仍把完整查询请求直投 MQ。
 
 语义检索和重排分别连接模型 API，可使用不同提供方，也可连接自行部署的本地推理服务。HTTP 服务本身不加载这两类模型的权重；PDF 解析仍需要单独准备本地环境和模型。
 
-MCP 异步新增和搜索必须配置 Redis、RocketMQ 及现有 `[cache]` 可选依赖中的 SDK，并分别运行 `rag-document-worker` 和 `rag-search-worker`（每个进程默认顺序执行，可多进程扩容）。API 直接投递，不运行文档/搜索消费者或 SQL 任务 relay；文档 worker 已移除 `--dispatch-only`；旧 dispatcher 的兼容入口不再补发 SQL。worker 共享 API 的 MySQL、Redis、Qdrant、状态加密及 RocketMQ 设置；缓存、文档和搜索使用三组独立正常 topic/group，并预建可读正常 Broker DLQ topic 与独立处理组。
+MCP 异步新增需要 MySQL 与独立 `rag-document-worker`；投递默认由 API 进程内 relay 完成（需要 RocketMQ 及现有 `[cache]` 可选依赖中的 SDK），选择 Debezium 模式时应用内 relay 关闭，改由外部 CDC 管道投递。服务端 MCP 搜索仍必须配置 Redis、RocketMQ 并运行独立的 `rag-search-worker`（每个 worker 进程默认顺序执行，可多进程扩容）。worker 共享 API 的 MySQL、Redis、Qdrant、状态加密及 RocketMQ 设置；缓存、文档和搜索使用三组独立正常 topic/group，并预建可读正常 Broker DLQ topic 与独立处理组。文档投递的两种模式互斥，部署细节见 [deploy/debezium/README.md](deploy/debezium/README.md)。
 
-**升级必须先停止旧入口并排空旧 worker，再将 API 与 worker 一起部署。** 新的 **schema 2** 完整请求 envelope 不兼容旧 UUID-only 消息，不能混跑。旧 `document_tasks`、`search_tasks`、对应 outbox 和 `search_result_snapshots` 表保留、不删除，但退出活跃路径；旧任务和结果不迁移。`RAG_SEARCH_TIMEOUT_SECONDS=120` 包含排队等待，与 `wait_seconds` 无关。生产检索在子进程中运行；MQ 可见性续期失败有界重试，不承诺立即取消已开始的计算。完整配置见 [使用与部署](docs/USAGE.md#5-启动独立搜索-worker服务端-mcp-search-必需)。
+**升级必须先停止旧入口、排空旧 worker 与旧消息，再将 API 与 worker 一起部署。** 新的 **schema 3** 文档通知**只含标识、不含文件内容**，与旧版 schema 2 文档消息不兼容，不能混跑；搜索仍为 schema 2 完整请求 envelope，与更早的 UUID-only 消息不兼容。旧 `document_tasks`、`document_task_outbox`、`search_tasks`、`search_task_outbox`、`search_result_snapshots` 表保留、不删除，但退出活跃路径；旧任务和结果不迁移。`RAG_SEARCH_TIMEOUT_SECONDS=120` 包含排队等待，与 `wait_seconds` 无关。生产检索在子进程中运行；MQ 可见性续期失败有界重试，不承诺立即取消已开始的计算。完整配置见 [使用与部署](docs/USAGE.md#5-启动独立搜索-worker服务端-mcp-search-必需)。
 
-Broker 管理消费重试、invisible 与 DLQ。文档分块未收齐时不 ACK，依赖重投在 Redis 丢失后重组；任一收齐分块的消息执行后，已记录终态允许其余重复消息 ACK。临时故障不 ACK；确定性故障先写 Redis 失败终态再 ACK，成功先保存结果/终态再 ACK。终态 first-terminal-wins，重复消息不覆盖已有终态。文档成功状态必须在 MySQL 持久发布后写入；Redis 写入失败时由重投读取 UploadJournal 对账，不重新发布。UploadJournal 的 MySQL 操作记录、每文档业务租约、SQL heartbeat、fenced 提交及补偿保留，防止重复文档发布；Redis 与 MySQL 之间没有原子事务。正常消费组默认 Broker 最大重试 16，仅部署脚本通过 `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_SEARCH_BROKER_MAX_RETRIES` 覆盖。
+Broker 管理消费重试、invisible 与 DLQ。文档消息只含标识：worker 按 `artifact_id` 从 MySQL 读回文件字节，用 SQL 租约 claim（`RAG_DOCUMENT_JOB_LEASE_SECONDS`，默认 300 秒）并按 `RAG_DOCUMENT_JOB_HEARTBEAT_SECONDS`（默认 20 秒）续租；**只有 MySQL 已记录终态才 ACK**（`succeeded` 或 `failed`），瞬时失败不 ACK，交给 Broker 重投，同时发件箱 sweep 会为脱离通知的滞留任务补发通知。终态 first-terminal-wins，重复消息不覆盖已有终态。文档成功的判定就是 MySQL 持久发布完成，不再依赖 Redis；UploadJournal 的 MySQL 操作记录、每文档业务租约、fenced 提交及补偿保留，防止重复文档发布。正常消费组默认 Broker 最大重试 16，仅部署脚本通过 `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_SEARCH_BROKER_MAX_RETRIES` 覆盖。
 
-计划新增独立无模型/推理 CLI `rag-dead-letter-worker --kind document|search`，使用独立 `RAG_DOCUMENT_DLQ_GROUP` / `RAG_SEARCH_DLQ_GROUP` 读取 `%DLQ%<源消费组>`，写入 Redis 失败终态后 ACK。传输层已验证 Python SDK 5.1.2 / Apache Broker 5.3.3 的正常 DLQ 接收与 ACK；其他部署组合须重新验证，并预建可读 topic、处理组及权限后部署；详见 [Broker 消费与死信处理](docs/USAGE.md#broker-消费与死信处理)。
+独立、无模型/推理的 `rag-dead-letter-worker --kind document|search` 读取 `%DLQ%<源消费组>`：文档把尚未终结的任务在 MySQL 标记 `failed`，搜索在 Redis 记录失败终态，成功写入后才 ACK；已有终态不覆盖，瞬时失败不 ACK，不重新解析、检索或重跑模型。传输层已验证 Python SDK 5.1.2 / Apache Broker 5.3.3 的正常 DLQ 接收与 ACK；其他部署组合须重新验证，并预建可读 topic、处理组及权限后部署；详见 [Broker 消费与死信处理](docs/USAGE.md#broker-消费与死信处理)。
 
 **数据是否离开本机取决于你的模型配置。** 使用远程模型 API 时，查询和相关文档内容会发送给对应服务，测试连接也会发出真实模型请求，可能产生费用。
 
 ### Redis 状态缓存
 
-Redis 缓存覆盖知识库公开配置、MCP 工具/提示词、文档与知识库列表统计，以及 API Key 管理状态、文档版本/租约/事务进度的展示查询。命中直接返回，不额外查 MySQL；严格模式下真实鉴权、检索版本与上传事务租约执行权仍由 MySQL 校验。这些 MySQL 读模型写入时同事务记录修订和 cache outbox，提交后刷新 Redis，失败经独立缓存 topic 重试；Redis 不可用可回源 MySQL。此回源仅适用于持久数据的展示缓存，不适用于短期任务、分块重组或搜索结果。部署与一致性边界见 [状态缓存](docs/state-cache.md)。
+Redis 缓存覆盖知识库公开配置、MCP 工具/提示词、文档与知识库列表统计，以及 API Key 管理状态、文档版本/租约/事务进度的展示查询。命中直接返回，不额外查 MySQL；严格模式下真实鉴权、检索版本与上传事务租约执行权仍由 MySQL 校验。这些 MySQL 读模型写入时同事务记录修订和 cache outbox，提交后刷新 Redis，失败经独立缓存 topic 重试；Redis 不可用可回源 MySQL。此回源仅适用于持久数据的展示缓存，不适用于短期搜索任务或搜索结果快照。**异步文档入库的任务状态与文件字节在 MySQL，不经 Redis、也没有 Redis TTL**；Redis 故障不影响 `add_document` 受理与状态查询。部署与一致性边界见 [状态缓存](docs/state-cache.md)。
 
 ### UUID 结果与产物引用
 
@@ -93,8 +95,8 @@ Redis 缓存覆盖知识库公开配置、MCP 工具/提示词、文档与知识
 
 从 Git 获取源码后，如需 Web Console，先按[前端构建说明](docs/USAGE.md#前端开发与打包)执行 `npm ci` 和 `npm run build`，再安装或打包 Python 项目。前端构建产物不再提交到 Git；仅使用 API/MCP 无需此步骤。
 
-1. 安装 Praxis-RAG（MCP 异步新增和搜索需 `[cache]`）。仓库自带 `docker-compose.yml`，执行 `.\scripts\start-stack.ps1` 可启动 MySQL、Qdrant、Redis、RocketMQ，创建三组 topic/group、导入旧状态并运行服务；不启动消费者，详细配置见 [使用与部署](docs/USAGE.md)。
-2. 启动 `rag-service`，打开 `http://127.0.0.1:8011/console`。进程启动或 `/health` 成功不等于队列就绪：需确认 Redis/MQ 可用、topic/group 与 worker 已配置，再以实际 MCP 提交和状态轮询做冒烟检查。
+1. 安装 Praxis-RAG（服务端 MCP 搜索和默认 relay 投递需 `[cache]`）。仓库自带 `docker-compose.yml`，执行 `.\scripts\start-stack.ps1` 可启动 MySQL、Qdrant、Redis、RocketMQ，创建三组 topic/group、导入旧状态并运行服务；不启动消费者，详细配置见 [使用与部署](docs/USAGE.md)。
+2. 启动 `rag-service`，打开 `http://127.0.0.1:8011/console`。进程启动或 `/health` 成功不等于队列就绪：异步新增需确认 MySQL 可写并运行 `rag-document-worker`（默认 relay 模式还需 RocketMQ；Debezium 模式需 CDC 管道），排队搜索需确认 Redis/MQ 与 `rag-search-worker`，再以实际 MCP 提交和状态轮询做冒烟检查。
 3. 在“连接配置”中填写并测试模型 API，选择工作区。
 4. 上传文档，在“检索调试”中检查返回内容与来源。
 5. 将同一工作区接入 MCP 客户端或业务系统；服务端 MCP 搜索另启动 `rag-search-worker`，使用异步 `add_document` 时另启动 `rag-document-worker`；分别轮询结果和入库状态。
@@ -105,13 +107,13 @@ Redis 缓存覆盖知识库公开配置、MCP 工具/提示词、文档与知识
 
 ## 使用边界
 
-- HTTP/MCP 上传使用持久化事务日志、文档租约和版本发布；租约保障业务版本一致性，与 Broker 消费重试分离，失败及进程重启后可幂等补偿。MySQL 决定版本可见性，Qdrant 保存版本化索引。它是可恢复业务事务，不是跨数据库 ACID；通知仍为实例内投递。详见 [事务与恢复](docs/state-storage.md#durable-upload-transactions)。
+- MCP 异步新增的受理点是 MySQL 单事务提交（任务 + 发件箱），不是 Broker 确认；同步 HTTP/MCP 上传使用持久化事务日志、文档租约和版本发布。租约保障业务版本一致性，与 Broker 消费重试分离，失败及进程重启后可幂等补偿。MySQL 决定版本可见性，Qdrant 保存版本化索引。它是可恢复业务事务，不是跨数据库 ACID；MCP 订阅通知仍为实例内投递。详见 [事务与恢复](docs/state-storage.md#durable-upload-transactions)。
 - 每批最多上传 10 个文件，单文件最大 10 MiB。暂不支持 Excel、网页抓取和独立图片上传。
 - Word 保留内容控件、嵌套表格、空列、合并范围和原生公式；图片按原字节返回。未知公式结构、原生图表和 OLE 等无法可靠读取的内容明确拒绝入库；图表关联有歧义时按规则跳过并显示原因。配置与限制见 [Word 解析说明](docs/USAGE.md#word-解析和图片检索)。
 - 工作区用于划分知识库，不是用户级权限系统。目前没有账户体系或细粒度多用户授权。
 - 默认仅监听本机。远程部署需要配置访问令牌、允许访问的域名与来源，并在服务前设置 HTTPS 和访问控制。
-- MQ/Redis 前置条件失败会明确报错，故障期间没有 SQL 持久接收/补发保证。部分消息发送后超时可能导致结果不确定；从首次新增起携带 `idempotency_key`，重试保持同一 key、内容及参数。Redis 状态/重组数据丢失或 TTL 到期后，ID 可能不可用并需重新提交；MySQL UploadJournal 仍防止已发布文档被重复发布。
-- 已发布源文件、解析产物及 UploadJournal 记录仍在 MySQL，不随短期 Redis 状态或搜索结果 TTL 清理。未处理上传不能视作已持久入库；需安排 Redis/MQ 容量及 MySQL 备份策略。
+- 文档异步新增以 MySQL 提交为受理成功：RocketMQ 或 Redis 故障不会丢失、也不会让已提交任务失败；没有消费者或投递受阻时任务保持 `queued`，由 relay / Debezium 与 sweep 继续尝试。排队搜索仍依赖 Redis 与 RocketMQ，缺失或故障会明确报错，故障期间没有 SQL 补发。提交结果不确定（如响应丢失）时，用同一 `idempotency_key`、内容与参数重试会返回原 `artifact_id`，不会重复入队。Redis 搜索任务/快照丢失或 TTL 到期后，result_id 可能不可用并需重新提交；文档任务状态在 MySQL，不受 Redis 影响；MySQL UploadJournal 仍防止已发布文档被重复发布。
+- 文档入库任务（含文件原字节）、已发布源文件、解析产物及 UploadJournal 记录都在 MySQL，不随 Redis TTL 清理；未到 `succeeded` 的任务不能视作已持久入库。发件箱行按 `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS`（默认 7 天）清理，需安排 MySQL 备份与容量策略。
 - 日志仅记录任务/操作 ID 和安全错误类别，不记录查询、文件内容、消息正文或凭据。
 - 订阅通知不提供跨进程推送、历史重放或断线补发。独立 worker 提交不会自动触发 API MCP 资源推送；客户端须轮询任务状态并主动刷新列表，重新连接后读取最新状态。
 
