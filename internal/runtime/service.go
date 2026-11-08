@@ -414,3 +414,8 @@ func sameChunking(stored any, configuration map[string]any) bool {
 	}
 	return true
 }
+
+// SearchRaw runs retrieval without snapshot capture (search worker seam).
+func (s *Service) SearchRaw(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error) {
+	return s.search.SearchRaw(ctx, namespace, request)
+}

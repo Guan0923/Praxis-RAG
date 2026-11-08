@@ -186,3 +186,18 @@ func (e *SearchEngine) SetReferenceCapture(capture *searchrefs.Capture) {
 	defer e.mu.Unlock()
 	e.references = capture
 }
+
+// SearchRaw runs one retrieval action without capturing references or saving a
+// result snapshot. Worker binaries use it so the durable task owns the snapshot
+// (searchrefs.Capture + SearchTasks.Complete) instead of the API process.
+func (e *SearchEngine) SearchRaw(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error) {
+	tenant, err := e.tenant(ctx, namespace)
+	if err != nil {
+		return nil, searchError(err)
+	}
+	payload, err := tenant.orchestrator.Search(ctx, request)
+	if err != nil {
+		return nil, searchError(err)
+	}
+	return payload, nil
+}
