@@ -125,3 +125,25 @@ func strategyByID(id string) (Strategy, bool) {
 	}
 	return Strategy{}, false
 }
+
+// Title ports rag_mcp.chunking._title: the first non-empty line with leading
+// "#" markers removed, truncated to 200 runes, falling back to the supplied
+// value. It was previously pinned inside internal/document/pdfcontent; external
+// pipelines (Word chunking) use it to keep titles identical across formats.
+func Title(text, fallback string) string {
+	return titleOf(text, fallback)
+}
+
+// CharacterRanges ports rag_mcp.chunking._split_ranges: the legacy character
+// splitter (break on newline/CJK punctuation near the target end, trim
+// whitespace, overlap from the raw end). It replaces the pinned copy that lived
+// in internal/document/pdfcontent.
+func CharacterRanges(text string, chunkSize, overlap int) []Range {
+	return splitCharacterRanges([]rune(text), chunkSize, overlap)
+}
+
+// DocumentID ports `_stable_id("doc", source.casefold())`, the stable
+// document-scoped id shared by chunk_document and the Word/PDF asset pipelines.
+func DocumentID(source string) string {
+	return StableID("doc", pythonCaseFold(source))
+}

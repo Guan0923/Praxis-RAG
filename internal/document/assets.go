@@ -363,7 +363,7 @@ func (a Asset) Payload(source string) map[string]any {
 			"captions":              wordAnnotationPayloads(a.Captions),
 			"footnotes":             wordAnnotationPayloads(a.Footnotes),
 			"table":                 wordTablePayload(a.Table),
-			"location":              wordLocationPayload(a.Location),
+			"location":              a.Location.Payload(),
 			"labels":                cloneStrings(a.Labels),
 			"bookmarks":             cloneStrings(a.Bookmarks),
 			"record_type":           "asset",
@@ -488,20 +488,6 @@ func pdfAssetTable(table *PDFTable) *AssetTable {
 	return asset
 }
 
-func wordLocationPayload(location WordLocation) map[string]any {
-	headings := cloneStrings(location.Headings)
-	if headings == nil {
-		headings = []string{}
-	}
-	return map[string]any{
-		"part":      location.Part,
-		"paragraph": location.Paragraph,
-		"headings":  headings,
-		"scope":     location.Scope,
-		"section":   location.Section,
-	}
-}
-
 func wordAnnotationPayloads(annotations []AssetAnnotation) []map[string]any {
 	result := make([]map[string]any, 0, len(annotations))
 	for _, annotation := range annotations {
@@ -512,7 +498,7 @@ func wordAnnotationPayloads(annotations []AssetAnnotation) []map[string]any {
 		result = append(result, map[string]any{
 			"text":     annotation.Text,
 			"ref":      annotation.Ref,
-			"location": wordLocationPayload(location),
+			"location": location.Payload(),
 		})
 	}
 	return result

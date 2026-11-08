@@ -102,6 +102,26 @@ type WordDiagnostic struct {
 	AssetIDs []string     `json:"asset_ids"`
 }
 
+// Diagnostic is the storage-neutral diagnostic record exposed by the ingest
+// pipeline (an alias so external packages need one name only).
+type Diagnostic = WordDiagnostic
+
+// Payload renders the location the way the Python manifest and asset payloads
+// store it. It is shared by the asset and ingest layers.
+func (l WordLocation) Payload() map[string]any {
+	headings := cloneStrings(l.Headings)
+	if headings == nil {
+		headings = []string{}
+	}
+	return map[string]any{
+		"part":      l.Part,
+		"paragraph": l.Paragraph,
+		"headings":  headings,
+		"scope":     l.Scope,
+		"section":   l.Section,
+	}
+}
+
 // WordManifest is the ordered OOXML extraction result. Its JSON shape matches
 // word_reader.parse_docx so runtime artifacts and the external vision worker
 // stay compatible.

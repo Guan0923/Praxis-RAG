@@ -5,10 +5,8 @@
 //
 // It lives in a subpackage because internal/chunking imports internal/document
 // (for Content/Block/Span); placing this port in package document would create
-// an import cycle. Pinned helper notes: titleOf and characterRanges are small
-// copies of rag_mcp.chunking private helpers (_title, _split_ranges) because
-// internal/chunking does not export them yet; promoting them into internal
-// chunking and deleting these copies is a tracked cleanup.
+// an import cycle. The shared _title/_split_ranges equivalents are exported by
+// internal/chunking (chunking.Title / chunking.CharacterRanges).
 package pdfcontent
 
 import (
@@ -16,7 +14,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
@@ -86,7 +83,7 @@ func ContentChunks(manifest document.PDFManifest, options Options) ([]chunking.C
 		config:     config,
 		budget:     budget,
 		maximum:    maximum,
-		title:      titleOf(manifestTitleText(manifest), options.FallbackTitle),
+		title:      chunking.Title(manifestTitleText(manifest), options.FallbackTitle),
 		base: map[string]any{
 			"document_suffix":    document.SuffixPDF,
 			"chunking":           config.Metadata(options.TokenizerModel),
@@ -230,7 +227,7 @@ func (b *chunkBuilder) flush() error {
 	runes := []rune(text)
 	var ranges []chunking.Range
 	if b.config.Strategy == "character" {
-		ranges = characterRanges(runes, b.config.ChunkSize, b.config.ChunkOverlap)
+		ranges = chunking.CharacterRanges(text, b.config.ChunkSize, b.config.ChunkOverlap)
 	} else {
 		var err error
 		ranges, err = chunking.SplitContent(content, document.SuffixPDF, b.config, b.budget)
@@ -522,91 +519,4 @@ func byteRangesToRuneRanges(text string, ranges [][2]int) [][2]int {
 		byteCursor = location[1]
 	}
 	return result
-}
-
-// titleOf is a pinned copy of rag_mcp.chunking._title (see package comment).
-func titleOf(text, fallback string) string {
-	for _, line := range pythonSplitLines(text) {
-		candidate := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(line), "#"))
-		if candidate != "" {
-			return truncateRunes(candidate, 200)
-		}
-	}
-	return truncateRunes(fallback, 200)
-}
-
-// pythonSplitLines splits like Python's str.splitlines.
-func pythonSplitLines(text string) []string {
-	lines := make([]string, 0, 8)
-	var builder strings.Builder
-	for _, value := range text {
-		switch value {
-		case '\n', '\r', '\v', '\f', '\u2028', '\u2029', '\u0085':
-			lines = append(lines, builder.String())
-			builder.Reset()
-		default:
-			builder.WriteRune(value)
-		}
-	}
-	lines = append(lines, builder.String())
-	return lines
-}
-
-func truncateRunes(text string, limit int) string {
-	runes := []rune(text)
-	if len(runes) <= limit {
-		return text
-	}
-	return string(runes[:limit])
-}
-
-// characterBreaks mirrors rag_mcp.chunking._BREAK_CHARS.
-var characterBreaks = map[rune]struct{}{
-	'\n': {}, '。': {}, '！': {}, '？': {}, '!': {}, '?': {}, '；': {}, ';': {},
-}
-
-// characterRanges is a pinned copy of rag_mcp.chunking._split_ranges (see
-// package comment).
-func characterRanges(runes []rune, chunkSize, overlap int) []chunking.Range {
-	chunks := make([]chunking.Range, 0, 8)
-	start := 0
-	for start < len(runes) {
-		targetEnd := start + chunkSize
-		if targetEnd > len(runes) {
-			targetEnd = len(runes)
-		}
-		end := targetEnd
-		if targetEnd < len(runes) {
-			minimumEnd := start + chunkSize/2
-			if minimumEnd < start+1 {
-				minimumEnd = start + 1
-			}
-			for index := targetEnd - 1; index >= minimumEnd; index-- {
-				if _, ok := characterBreaks[runes[index]]; ok {
-					end = index + 1
-					break
-				}
-			}
-		}
-		left := start
-		for left < end && unicode.IsSpace(runes[left]) {
-			left++
-		}
-		right := end
-		for right > left && unicode.IsSpace(runes[right-1]) {
-			right--
-		}
-		if left < right {
-			chunks = append(chunks, chunking.Range{Start: left, End: right})
-		}
-		if end >= len(runes) {
-			break
-		}
-		nextStart := end - overlap
-		if nextStart < start+1 {
-			nextStart = start + 1
-		}
-		start = nextStart
-	}
-	return chunks
 }

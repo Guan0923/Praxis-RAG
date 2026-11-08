@@ -365,14 +365,14 @@ func TestInlineMathRanges(t *testing.T) {
 	}
 }
 
-func TestPinnedTitleAndCharacterRanges(t *testing.T) {
-	if got := titleOf("\n\n  ## 标题  \nbody", "fallback"); got != "标题" {
+func TestChunkingHelperExports(t *testing.T) {
+	if got := chunking.Title("\n\n  ## 标题  \nbody", "fallback"); got != "标题" {
 		t.Fatalf("title = %q", got)
 	}
-	if got := titleOf("\n \n", "fallback"); got != "fallback" {
+	if got := chunking.Title("\n \n", "fallback"); got != "fallback" {
 		t.Fatalf("fallback title = %q", got)
 	}
-	ranges := characterRanges([]rune("abc\ndef"), 4, 1)
+	ranges := chunking.CharacterRanges("abc\ndef", 4, 1)
 	want := []chunking.Range{{Start: 0, End: 3}, {Start: 4, End: 7}}
 	if len(ranges) != len(want) {
 		t.Fatalf("character ranges = %v", ranges)
@@ -381,5 +381,11 @@ func TestPinnedTitleAndCharacterRanges(t *testing.T) {
 		if ranges[index] != want[index] {
 			t.Fatalf("character ranges = %v, want %v", ranges, want)
 		}
+	}
+	if chunking.DocumentID("Manual.PDF") != chunking.DocumentID("manual.pdf") {
+		t.Fatalf("DocumentID() must case-fold like Python")
+	}
+	if !strings.HasPrefix(chunking.DocumentID("manual.pdf"), "doc-") {
+		t.Fatalf("DocumentID() prefix = %q", chunking.DocumentID("manual.pdf"))
 	}
 }
