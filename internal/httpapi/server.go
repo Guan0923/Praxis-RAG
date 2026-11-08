@@ -32,10 +32,22 @@ func WithCatalogStore(store catalog.Store) Option {
 }
 
 // ChangeNotifier receives catalog mutations so the MCP layer can publish
-// tools/list_changed and prompts/list_changed notifications.
+// tools/list_changed and prompts/list_changed notifications, plus document
+// mutations for resources/list_changed and resources/updated.
 type ChangeNotifier interface {
 	PromptsChanged(namespace string)
 	ToolsChanged(namespace string)
+}
+
+// DocumentChangeNotifier receives document mutations so the MCP layer can
+// publish resources/list_changed and resources/updated notifications.
+type DocumentChangeNotifier interface {
+	DocumentsChanged(namespace string, before, after []map[string]any)
+}
+
+// WithDocumentNotifier wires document-change notifications.
+func WithDocumentNotifier(notifier DocumentChangeNotifier) Option {
+	return func(s *Server) { s.docNotifier = notifier }
 }
 
 // WithChangeNotifier wires MCP change notifications.
@@ -45,19 +57,20 @@ func WithChangeNotifier(notifier ChangeNotifier) Option {
 
 // Server hosts the REST API, MCP endpoint, and Console static assets.
 type Server struct {
-	settings   config.ServiceSettings
-	status     StatusProvider
-	keys       KeyLookup
-	keyStore   APIKeyStore
-	runtime    Runtime
-	mcpHandler http.Handler
-	logger     *slog.Logger
-	router     *router
-	webRoot    string
-	catalog    catalog.Store
-	tools      ToolRegistry
-	notifier   ChangeNotifier
-	handler    http.Handler
+	settings    config.ServiceSettings
+	status      StatusProvider
+	keys        KeyLookup
+	keyStore    APIKeyStore
+	runtime     Runtime
+	mcpHandler  http.Handler
+	logger      *slog.Logger
+	router      *router
+	webRoot     string
+	catalog     catalog.Store
+	tools       ToolRegistry
+	notifier    ChangeNotifier
+	docNotifier DocumentChangeNotifier
+	handler     http.Handler
 }
 
 // New builds the HTTP server. A nil StatusProvider falls back to a static

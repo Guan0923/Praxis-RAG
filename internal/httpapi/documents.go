@@ -76,6 +76,10 @@ func (s *Server) handleUploadDocuments(w http.ResponseWriter, r *http.Request) {
 		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
 		return
 	}
+	var before []map[string]any
+	if s.docNotifier != nil {
+		before, _ = s.runtime.ListDocuments(r.Context(), namespace)
+	}
 	idempotencyKey, details := idempotencyHeader(r)
 	if details != nil {
 		writeValidation(w, http.StatusUnprocessableEntity, details)
@@ -94,6 +98,9 @@ func (s *Server) handleUploadDocuments(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeRuntimeError(w, err, false)
 		return
+	}
+	if s.docNotifier != nil {
+		s.docNotifier.DocumentsChanged(namespace, before, payloadDocuments(payload))
 	}
 	writeJSON(w, http.StatusOK, payload)
 }
@@ -176,6 +183,10 @@ func (s *Server) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
 		return
 	}
+	var before []map[string]any
+	if s.docNotifier != nil {
+		before, _ = s.runtime.ListDocuments(r.Context(), namespace)
+	}
 	payload, err := s.runtime.Delete(r.Context(), namespace, pathParam(r, "name"))
 	if err != nil {
 		var validation *apierrors.KnowledgeValidationError
@@ -186,7 +197,33 @@ func (s *Server) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 		writeRuntimeError(w, err, false)
 		return
 	}
+	if s.docNotifier != nil {
+		s.docNotifier.DocumentsChanged(namespace, before, payloadDocuments(payload))
+	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+// payloadDocuments extracts the post-write document list from a runtime
+// payload (Python returns it for MCP change notifications).
+func payloadDocuments(payload map[string]any) []map[string]any {
+	raw, ok := payload["documents"]
+	if !ok {
+		return nil
+	}
+	switch typed := raw.(type) {
+	case []map[string]any:
+		return typed
+	case []any:
+		documents := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if document, ok := item.(map[string]any); ok {
+				documents = append(documents, document)
+			}
+		}
+		return documents
+	default:
+		return nil
+	}
 }
 
 func (s *Server) handleDocumentContent(w http.ResponseWriter, r *http.Request) {

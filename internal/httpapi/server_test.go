@@ -30,6 +30,10 @@ func (f *fakeNotifier) ToolsChanged(namespace string) {
 	f.namespaces = append(f.namespaces, namespace)
 }
 
+func (f *fakeNotifier) DocumentsChanged(namespace string, _, _ []map[string]any) {
+	f.namespaces = append(f.namespaces, namespace)
+}
+
 type fakeStatus struct{ payload map[string]any }
 
 func (f fakeStatus) Status(context.Context) map[string]any { return f.payload }

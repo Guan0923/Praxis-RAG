@@ -20,9 +20,11 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
+	"github.com/Guan0923/xinghe_rag/internal/mcp"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 	"github.com/Guan0923/xinghe_rag/internal/version"
+	"github.com/Guan0923/xinghe_rag/internal/wire"
 )
 
 func main() {
@@ -58,9 +60,40 @@ func run() error {
 		return err
 	}
 	logger := newLogger()
+	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
+	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{
+		Runtime:      wire.MCPRuntime{Service: service},
+		Catalog:      catalogStore,
+		QueuedSearch: false,
+		Logger:       logger,
+	})
+	if err != nil {
+		return err
+	}
+	mcpHandler, err := mcp.NewHTTPHandler(mcp.HTTPOptions{
+		Endpoint: mcpEndpoint,
+		NamespaceFromRequest: func(r *http.Request) (string, error) {
+			namespace, ok := httpapi.NamespaceFromContext(r.Context())
+			if !ok || namespace == "" {
+				return "", mcp.ErrUnauthorized
+			}
+			return namespace, nil
+		},
+		AllowedHosts:   serviceSettings.MCPAllowedHosts,
+		AllowedOrigins: serviceSettings.MCPAllowedOrigins,
+		Logger:         logger,
+	})
+	if err != nil {
+		return err
+	}
 	api := httpapi.New(serviceSettings, service, nil, logger,
+		httpapi.WithRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithAPIKeyStore(apikeys.New(stores.APIKeys)),
-		httpapi.WithCatalogStore(catalog.StateStore{Repository: stores.Catalogs}),
+		httpapi.WithCatalogStore(catalogStore),
+		httpapi.WithToolRegistry(mcpEndpoint),
+		httpapi.WithChangeNotifier(wire.Notifier{Endpoint: mcpEndpoint}),
+		httpapi.WithDocumentNotifier(wire.Notifier{Endpoint: mcpEndpoint}),
+		httpapi.WithMCPHandler(mcpHandler),
 	)
 
 	address := net.JoinHostPort(serviceSettings.Host, strconv.Itoa(serviceSettings.Port))
