@@ -49,6 +49,7 @@ type Server struct {
 	status   StatusProvider
 	keys     KeyLookup
 	keyStore APIKeyStore
+	runtime  Runtime
 	logger   *slog.Logger
 	router   *router
 	webRoot  string
@@ -103,6 +104,10 @@ func (s *Server) registerRoutes() {
 	s.router.add("PUT", "/v1/admin/api-keys/{key_id}", authAdmin, s.handleUpdateAPIKey)
 	s.router.add("DELETE", "/v1/admin/api-keys/{key_id}", authAdmin, s.handleDeleteAPIKey)
 	s.router.add("GET", "/v1/admin/api-keys/{key_id}/mcp-config", authAdmin, s.handleAPIKeyMCPConfig)
+	s.router.add("POST", "/v1/search", authTenant, s.handleSearch)
+	s.router.add("GET", "/v1/search-results/{result_id}", authTenant, s.handleGetSearchResult)
+	s.router.add("GET", "/v1/artifacts/{artifact_id}", authTenant, s.handleDownloadArtifact)
+	s.router.add("GET", "/v1/artifacts/{artifact_id}/content", authTenant, s.handleGetArtifactContent)
 
 	if s.webRoot != "" {
 		s.router.add("GET", "/", authNone, s.handleConsoleIndex)
@@ -176,7 +181,18 @@ func (s *Server) logRequest(r *http.Request, recorder *statusRecorder, started t
 	)
 }
 
+// namespaceContextKey carries the authenticated tenant namespace.
 type namespaceContextKey struct{}
+
+// tenantNamespace returns the namespace authenticated by the route policy.
+func (s *Server) tenantNamespace(w http.ResponseWriter, r *http.Request) (string, bool) {
+	namespace, ok := NamespaceFromContext(r.Context())
+	if !ok {
+		writeDetail(w, http.StatusUnauthorized, "RAG service authentication failed.")
+		return "", false
+	}
+	return namespace, true
+}
 
 // pathParamsContext carries router path parameters to handlers.
 type pathParamsContext struct{}
