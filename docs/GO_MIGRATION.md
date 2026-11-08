@@ -276,3 +276,16 @@ REST /v1/admin/tools -> 6 tools
 **迁移差异（必须记录）**：`rag-service-migrate --apply` 当前只导入状态（blobs+documents），**不执行向量重建**（Python 版会调用 runtime.upload）；需要在迁移后用文档 worker/重新上传重新索引。`--skip-assets` 与旧版解析资产树仍未纳入发现计划（TODO）。
 
 验证：gofmt/vet clean；`go test -count=1 ./internal/migrate/...` 4/4 通过；`go build ./...` 全绿。
+
+### 2026-11-08 第十轮：异步受理、排队搜索与后台维护接线
+
+已提交 `feat(go): async admission, queued search and background maintenance`：
+
+- `async.go`：`addDocumentAsync`（DocumentDispatcher 单事务受理 + best-effort relay，返回 `{"artifact_id"}`，Python 冲突/校验错误映射）、`documentStatus`（4 键状态投影）。
+- `queued_search.go`：`submitSearchTask`（无 broker 时 fail-closed；Submit+DispatchPending 确认发布）、`submitSearch`（wait_seconds 0..30 + 100ms 轮询；完成返回快照、超时只返回 `{"result_id"}`）、`getSearchResultOrdered`（先 SearchTasks 活动视图，再快照）。
+- `maintenance.go`：`StartBackground/StopBackground`（mq publisher 注入、cache-sync/document relay、10s 维护循环：上传恢复清理、SearchTasks.Expire、DocumentJobs.Sweep/GC、结果快照与 Artifact 过期清理；无 broker 时降级不阻塞启动）。
+- Lead 已完成 5 处 `service.go` 委托与 `main.go` `StartBackground`，`Close` 先 `StopBackground`。
+
+验证：`go build ./...` 全绿；runtime 59 测试通过；二进制冒烟（真实 SQLite）：health/documents/uploads/MCP initialize 均正常，无 broker 时仅输出降级日志。
+
+并行收尾：task-20（worker 处理库，`internal/{searchworker,documentworker}` 已通过测试并有 WIRING.md）、task-21（parity 审计报告）。
