@@ -289,3 +289,11 @@ REST /v1/admin/tools -> 6 tools
 验证：`go build ./...` 全绿；runtime 59 测试通过；二进制冒烟（真实 SQLite）：health/documents/uploads/MCP initialize 均正常，无 broker 时仅输出降级日志。
 
 并行收尾：task-20（worker 处理库，`internal/{searchworker,documentworker}` 已通过测试并有 WIRING.md）、task-21（parity 审计报告）。
+
+### 2026-11-08 第十一轮：parity 审计与 P0/P1 修复启动
+
+- `docs/GO_PARITY_AUDIT.md` 已提交：前端调用的全部端点均存在；P0 = 搜索资产投影缺失、MCP 同步/排队模式、worker 可执行缺失、ReadDocument 未读 document.md；P1 = snapshot_context、documents/check 扩展名校验、KB HTTP 校验漂移、delete_document annotation、md/txt 校验、cached read views、OpenAPI。
+- 已修复并提交：`fix(go): parity fixes from audit (queued search flag, check suffix validation, delete annotation)` —— MCP `QueuedSearch` 改为按 `mq.SettingsFromEnv().Configured()` 自动选择（无 broker 时保持同步可用），`/v1/documents/check` 增加 Python 一致的扩展名 400 文案，`delete_document` destructive annotation 修正。
+- 进行中：task-22（runtime ProcessDocumentJob/RecoverDocumentUploads）、task-23（三个 worker 主程序）、task-24（P0-1 资产投影 + P0-4 document.md 预览）、task-25（snapshot_context/OpenAPI/KB 校验）。
+
+审计建议顺序：P0-4+P0-1（共享资产/版本对象读取）→ P0-2 queued 标志 + MCP 测试 → P0-3 workers + ProcessDocumentJob → P1 批次 → 内部 parity 黑盒差分 → 删除 Python。
