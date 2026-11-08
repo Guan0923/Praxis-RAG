@@ -106,6 +106,14 @@ func (e *SearchEngine) buildTenant(namespace string, settings map[string]any) (*
 	if err != nil {
 		return nil, err
 	}
+	// Asset projection is part of the retrieval result contract: hydrate
+	// Qdrant asset records and staged bytes before capture/rendering
+	// (pdf_assets.project_results). Search and SearchRaw share this orchestrator.
+	projector := newAssetProjector(store, storeAssetObjects{
+		journals:  e.stores.Uploads,
+		blobs:     e.stores.Blobs,
+		namespace: namespace,
+	})
 	orchestrator := retrieval.NewOrchestrator(
 		map[contracts.RetrievalMode]retrieval.Retriever{
 			contracts.RetrievalBM25:      retrieval.NewBm25Retriever(encoder, store),
@@ -118,7 +126,7 @@ func (e *SearchEngine) buildTenant(namespace string, settings map[string]any) (*
 		runtimeImplementation,
 		nil, // no Phase-1 mock limitations
 		nil, // warmup is a no-op for HTTP models
-		nil, // artifact projection is attached by the document/artifact layer
+		projector,
 	)
 	return &tenantResources{
 		settings:     settings,

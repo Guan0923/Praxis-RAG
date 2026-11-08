@@ -14,8 +14,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/xinghe_rag/internal/chunking"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
 	"github.com/Guan0923/xinghe_rag/internal/document"
@@ -147,9 +149,13 @@ func (s *Service) ListDocuments(ctx context.Context, namespace string) ([]map[st
 	return result, nil
 }
 
-// ReadDocument returns the rendered text and version of one document. Word
-// documents are re-extracted from the stored source; PDF text requires the
-// external parser manifest and reports an actionable error until G3 wiring.
+// ReadDocument returns the saved rendered text and version of one document.
+//
+// Versioned PDF/Word records serve the staged document.md from the upload
+// journal object store (the immutable publication artifact). Unversioned parser
+// records fall back to the per-namespace asset bucket, and plain md/txt reads
+// the source with Python's utf-8-sig + MAX_EXTRACTED_CHARACTERS rules
+// (service_knowledge.KnowledgeDocumentStore.read_text).
 func (s *Service) ReadDocument(ctx context.Context, namespace, name string) (string, string, error) {
 	safeName, err := SanitizeName(name)
 	if err != nil || safeName != name {
@@ -162,27 +168,130 @@ func (s *Service) ReadDocument(ctx context.Context, namespace, name string) (str
 	if record == nil {
 		return "", "", &apierrors.KnowledgeValidationError{Message: "Document does not exist"}
 	}
+	suffix := strings.ToLower(filepath.Ext(name))
+	version := record.IndexedAt
+	if record.OperationID != "" {
+		if bucket, ok := artifactBucketForSuffix(suffix); ok {
+			content, found, readErr := s.readVersionedArtifact(ctx, record.OperationID, record.DocumentID, bucket)
+			if readErr != nil || !found || !utf8.Valid(content) {
+				return "", "", savedContentUnavailableError()
+			}
+			return string(content), version, nil
+		}
+	}
+	if suffix == document.SuffixPDF {
+		text, readErr := s.readSavedArtifactText(ctx, namespace, name, record,
+			state.PDFAssetBucket, "pdf_parser_version", document.PDFParserVersion,
+			pdfParserChangedMessage, savedPDFContentUnavailableMessage)
+		if readErr != nil {
+			return "", "", readErr
+		}
+		return text, version, nil
+	}
+	if suffix == document.SuffixDOC || suffix == document.SuffixDOCX {
+		if parserVersionValue(record.Chunking, "word_parser_version") != "" {
+			text, readErr := s.readSavedArtifactText(ctx, namespace, name, record,
+				state.WordAssetBucket, "word_parser_version", document.WordParserVersion,
+				wordParserChangedMessage, savedWordContentUnavailableMessage)
+			if readErr != nil {
+				return "", "", readErr
+			}
+			return text, version, nil
+		}
+	}
 	content, err := s.readSource(ctx, namespace, name)
 	if err != nil {
 		return "", "", err
 	}
-	suffix := strings.ToLower(filepath.Ext(name))
-	version := record.IndexedAt
-	switch suffix {
-	case ".md", ".txt":
-		text := stripBOM(content)
-		return text, version, nil
-	case ".doc", ".docx":
-		text, readErr := readWordText(content, name)
-		if readErr != nil {
-			return "", "", &apierrors.KnowledgeValidationError{Message: readErr.Error()}
-		}
-		return text, version, nil
-	default:
-		return "", "", &apierrors.KnowledgeError{
-			Message: "PDF text preview requires the external parser; read the original file instead.",
-		}
+	text, err := decodeSourceText(content, name)
+	if err != nil {
+		return "", "", err
 	}
+	return text, version, nil
+}
+
+// artifactBucketForSuffix reports the parser-artifact bucket for suffixes whose
+// rendered document.md is stored with a versioned upload.
+func artifactBucketForSuffix(suffix string) (string, bool) {
+	switch suffix {
+	case document.SuffixPDF:
+		return state.PDFAssetBucket, true
+	case document.SuffixDOC, document.SuffixDOCX:
+		return state.WordAssetBucket, true
+	default:
+		return "", false
+	}
+}
+
+// readVersionedArtifact reads one immutable publication artifact from the
+// upload journal object store (Python state.uploads.get_object).
+func (s *Service) readVersionedArtifact(ctx context.Context, version, documentID, bucket string) ([]byte, bool, error) {
+	if s.stores.Uploads == nil || version == "" || documentID == "" {
+		return nil, false, nil
+	}
+	return s.stores.Uploads.GetObject(ctx, version, bucket, documentID+"/document.md")
+}
+
+// readSavedArtifactText reads an unversioned parser artifact from the namespace
+// asset bucket after validating the parser version, mirroring
+// pdf_assets.read_pdf_content / word_assets.read_word_content.
+func (s *Service) readSavedArtifactText(
+	ctx context.Context,
+	namespace, name string,
+	record *state.DocumentRecord,
+	bucket, parserKey, expectedParser, changedMessage, unavailableMessage string,
+) (string, error) {
+	if parserVersionValue(record.Chunking, parserKey) != expectedParser {
+		return "", &apierrors.KnowledgeValidationError{Message: changedMessage}
+	}
+	documentID := chunking.DocumentID(name)
+	content, found, err := s.stores.Blobs.Get(ctx, namespace, bucket, documentID+"/document.md")
+	if err != nil {
+		return "", &apierrors.KnowledgeError{Message: "Document content is unavailable"}
+	}
+	if !found || !utf8.Valid(content) {
+		return "", &apierrors.KnowledgeValidationError{Message: unavailableMessage}
+	}
+	return string(content), nil
+}
+
+// parserVersionValue reads a parser version from the decoded chunking metadata.
+func parserVersionValue(value any, key string) string {
+	metadata, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	version, _ := metadata[key].(string)
+	return version
+}
+
+// decodeSourceText ports content.decode("utf-8-sig") plus the extracted-size
+// guard of read_text.
+func decodeSourceText(content []byte, name string) (string, error) {
+	text := string(bytes.TrimPrefix(content, []byte{0xEF, 0xBB, 0xBF}))
+	if !utf8.ValidString(text) {
+		return "", &apierrors.KnowledgeValidationError{Message: textEncodingErrorPrefix + name}
+	}
+	if utf8.RuneCountInString(text) > document.MaxExtractedCharacters {
+		return "", &apierrors.KnowledgeValidationError{Message: textTooLargePrefix + name}
+	}
+	return text, nil
+}
+
+// Saved-content messages mirror the Python runtime strings exactly (the HTTP
+// handlers map KnowledgeValidationError to 404).
+const (
+	savedContentUnavailableMessage     = "Saved content unavailable; reimport this document"
+	savedPDFContentUnavailableMessage  = "Saved PDF content is unavailable; explicitly reimport this PDF"
+	savedWordContentUnavailableMessage = "Saved Word content unavailable; reimport this document"
+	pdfParserChangedMessage            = "PDF parser version changed; explicitly reimport this PDF"
+	wordParserChangedMessage           = "Word parser changed; reimport this document"
+	textEncodingErrorPrefix            = "文本文件必须使用 UTF-8 编码："
+	textTooLargePrefix                 = "文档提取文本过大："
+)
+
+func savedContentUnavailableError() error {
+	return &apierrors.KnowledgeValidationError{Message: savedContentUnavailableMessage}
 }
 
 // ReadDocumentFile returns the stored source bytes of one document.
@@ -210,23 +319,6 @@ func (s *Service) readSource(ctx context.Context, namespace, name string) ([]byt
 		return nil, &apierrors.KnowledgeValidationError{Message: "Document content is unavailable"}
 	}
 	return content, nil
-}
-
-func readWordText(content []byte, name string) (string, error) {
-	directory, err := os.MkdirTemp("", "praxis-word-preview-")
-	if err != nil {
-		return "", fmt.Errorf("Word preview is unavailable")
-	}
-	defer func() { _ = os.RemoveAll(directory) }()
-	path := filepath.Join(directory, name)
-	if err := os.WriteFile(path, content, 0o600); err != nil {
-		return "", fmt.Errorf("Word preview is unavailable")
-	}
-	return document.ReadText(path)
-}
-
-func stripBOM(content []byte) string {
-	return string(bytes.TrimPrefix(content, []byte{0xEF, 0xBB, 0xBF}))
 }
 
 // CheckDocuments reports existing documents that already match the supplied
