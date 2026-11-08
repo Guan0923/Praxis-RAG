@@ -51,17 +51,17 @@ func isUniqueViolation(err error) bool {
 // process. It mirrors rag_mcp.state.store.StateStores.
 //
 // TODO(G2/G7) still deferred from the state-layer port:
+//   - Concrete RocketMQ document/search notification publishers and the Redis
+//     StateCache/TransientStore clients; the narrow interfaces and durable
+//     outbox state machines are in place for the worker binaries.
+//   - Worker main packages (rag-document-worker / rag-search-worker /
+//     rag-dead-letter-worker), broker-side DLQ consumption and Debezium bridge
+//     deployment.
+//   - KnowledgeBaseRepository.publish/confirm_publication (needs the lease
+//     journal) and the schema migrate CLI (migrate.py).
 //   - UploadCoordinator is constructed by the runtime (NewUploadCoordinator) so
 //     it can inject the Qdrant-backed IndexPublisher and schedule Recover; the
 //     journal itself is attached here as Stores.Uploads.
-//   - DocumentJobs + DocumentJobDispatcher (document_jobs.py,
-//     document_queue.py) and SearchTasks + SearchTaskDispatcher
-//     (search_tasks.py, search_queue.py).
-//   - KnowledgeBaseRepository.publish/confirm_publication (needs the lease
-//     journal) and the schema migrate CLI (migrate.py).
-//   - Concrete Redis (StateCache/TransientStore) and RocketMQ (EventPublisher)
-//     clients for CacheSync; configured endpoints are logged and reads fall back
-//     to the authoritative database.
 type Stores struct {
 	Settings StateSettings
 	DB       *sql.DB
@@ -77,6 +77,11 @@ type Stores struct {
 	Results   *ResultSnapshots
 	Artifacts *ArtifactRegistry
 	Uploads   *UploadJournal
+
+	DocumentJobs       *DocumentJobs
+	DocumentDispatcher *DocumentJobDispatcher
+	SearchTasks        *SearchTasks
+	SearchDispatcher   *SearchTaskDispatcher
 
 	dialect    Dialect
 	closeOnce  sync.Once
@@ -171,6 +176,22 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 		return nil, err
 	}
 	stores.Uploads = uploads
+	documentJobs, err := NewDocumentJobs(stores)
+	if err != nil {
+		uploads.Close()
+		_ = cacheSync.Close()
+		_ = database.Close()
+		return nil, err
+	}
+	stores.DocumentJobs = documentJobs
+	documentDispatcher, err := NewDocumentJobDispatcher(stores, nil)
+	if err != nil {
+		uploads.Close()
+		_ = cacheSync.Close()
+		_ = database.Close()
+		return nil, err
+	}
+	stores.DocumentDispatcher = documentDispatcher
 	stores.Views = NewCachedReadViews(stores)
 
 	snapshotSettings, err := SnapshotSettingsFromEnv()
@@ -195,6 +216,16 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 		return nil, err
 	}
 	stores.Artifacts = artifacts
+	searchTasks, err := NewSearchTasks(stores)
+	if err != nil {
+		_ = documentDispatcher.Close()
+		uploads.Close()
+		_ = cacheSync.Close()
+		_ = database.Close()
+		return nil, err
+	}
+	stores.SearchTasks = searchTasks
+	stores.SearchDispatcher = NewSearchTaskDispatcher(stores, nil)
 	warnIfUnencrypted(settings)
 	return stores, nil
 }
@@ -217,8 +248,18 @@ func (s *Stores) Ping(ctx context.Context) error {
 func (s *Stores) Close() error {
 	s.closeOnce.Do(func() {
 		var firstErr error
+		if s.DocumentDispatcher != nil {
+			if err := s.DocumentDispatcher.Close(); err != nil {
+				firstErr = err
+			}
+		}
+		if s.SearchDispatcher != nil {
+			if err := s.SearchDispatcher.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
 		if s.CacheSync != nil {
-			if err := s.CacheSync.Close(); err != nil {
+			if err := s.CacheSync.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}

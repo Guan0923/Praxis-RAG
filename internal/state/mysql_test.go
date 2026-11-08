@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -124,6 +125,73 @@ func TestMySQLStoreRoundTrip(t *testing.T) {
 
 // cleanupMySQLRows removes the rows a MySQL test case created; the shared test
 // database is never dropped.
+// TestMySQLG7StateMachines gates the document-job and search-task state
+// machines on RAG_TEST_MYSQL_URL.
+func TestMySQLG7StateMachines(t *testing.T) {
+	stores := openMySQLTestStores(t)
+	ctx := context.Background()
+	suffix, err := randomHex(6)
+	if err != nil {
+		t.Fatalf("randomHex() error = %v", err)
+	}
+	namespace := "go-g7-" + suffix
+	if err := stores.KnowledgeBases.Create(ctx, map[string]any{
+		"namespace": namespace, "collection": namespace + "-c",
+	}); err != nil {
+		t.Fatalf("KnowledgeBases.Create() error = %v", err)
+	}
+	documentPublisher := &fakeDocumentPublisher{}
+	documentDispatcher, err := NewDocumentJobDispatcher(stores, documentPublisher)
+	if err != nil {
+		t.Fatalf("NewDocumentJobDispatcher() error = %v", err)
+	}
+	defer func() { _ = documentDispatcher.Close() }()
+	admission, err := documentDispatcher.Submit(ctx, namespace, "mysql.txt", []byte("mysql"), nil)
+	if err != nil {
+		t.Fatalf("document Submit() error = %v", err)
+	}
+	if len(documentPublisher.messages()) != 1 {
+		t.Fatalf("document notifications = %+v", documentPublisher.messages())
+	}
+	notification := documentNotification(t, stores, admission.ArtifactID)
+	task, err := stores.DocumentJobs.Claim(ctx, notification)
+	if err != nil || task == nil || task.Attempts != 1 {
+		t.Fatalf("Claim() = %+v, %v", task, err)
+	}
+	if err := stores.DocumentJobs.Fail(ctx, task, false, stringPtr("test")); err != nil {
+		t.Fatalf("Fail() error = %v", err)
+	}
+	searchPublisher := &fakeSearchPublisher{}
+	searchDispatcher := NewSearchTaskDispatcher(stores, searchPublisher)
+	envelope, err := searchDispatcher.Submit(ctx, namespace, map[string]any{"query": "mysql"})
+	if err != nil {
+		t.Fatalf("search Submit() error = %v", err)
+	}
+	if len(searchPublisher.messages()) != 1 || searchPublisher.messages()[0].ResultID != envelope.ResultID {
+		t.Fatalf("search notifications = %+v", searchPublisher.messages())
+	}
+	if _, err := stores.SearchTasks.Claim(ctx, envelope); err != nil {
+		t.Fatalf("search Claim() error = %v", err)
+	}
+	t.Cleanup(func() {
+		jc := context.Background()
+		for _, statement := range []string{
+			"DELETE FROM document_job_outbox WHERE namespace = ?",
+			"DELETE FROM document_jobs WHERE namespace = ?",
+			"DELETE FROM search_task_outbox WHERE result_id = ?",
+			"DELETE FROM search_tasks WHERE namespace = ?",
+		} {
+			arguments := []any{namespace}
+			if strings.Contains(statement, "result_id = ?") {
+				arguments = []any{envelope.ResultID}
+			}
+			if _, err := stores.DB.ExecContext(jc, statement, arguments...); err != nil {
+				t.Logf("cleanup %q error = %v", statement, err)
+			}
+		}
+	})
+}
+
 func cleanupMySQLRows(t *testing.T, stores *Stores, namespace, keyID string) {
 	t.Helper()
 	ctx := context.Background()
