@@ -362,4 +362,3 @@ Exit codes:
   2  usage or configuration error (bad arguments, RAG_BACKEND, missing knowledge base)
 `)
 }
-
