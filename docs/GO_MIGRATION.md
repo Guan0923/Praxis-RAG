@@ -204,3 +204,15 @@ REST /v1/admin/tools -> 6 tools
 - task-15（go-document）：Dockerfile/构建脚本/Makefile/冒烟工作流。
 
 下一步：用 upload journal + ingest 适配器实现 `runtime.Upload/Delete/WriteDocument/DeleteDocument`（含 Qdrant 发布、blob/Artifact 持久化、文档变更通知），随后接线管理端知识库路由与 Redis 快照。
+
+### 2026-11-08 第五轮：知识库管理、G7 状态机与上传路径启动
+
+已提交：
+
+- `feat(go): runtime knowledge-base administration`：`Service.List/Create/Update/DeleteKnowledgeBase`、key 读取、模型列表（kbconfig + 状态仓储 + Qdrant staging reembed + 版本栅栏 + Invalidate），34 runtime 测试全绿。
+- `feat(go): document jobs, search tasks and outbox dispatchers`：G7 状态机（异步入库 job + outbox 单事务、SQL 租约/心跳/首终态、relay/debezium 模式；搜索任务 envelope/租约/失败/截止时间 + dispatcher 确认发布），165 state 测试。
+- `feat(httpapi): knowledge-base administration endpoints and adapters`：`/v1/admin/knowledge-bases*`（list/create/models/details/key/patch）经 `internal/wire` 适配到 runtime；JSON 校验与 FastAPI 风格 422、错误映射 400/404/409/503；httpapi 测试全绿。
+
+进行中：task-13 (`internal/redisstate` + `internal/searchrefs`)、task-15（Dockerfile/构建脚本）、task-16（runtime 上传/删除/写入路径，unexported entrypoints，Lead 负责替换 stub 委托）。
+
+下一步：替换 `Upload/Delete/WriteDocument/DeleteDocument` stub 为 task-16 实现；接入 redisstate/searchrefs 生成 result_id 快照；构建 `rag-document-worker` / `rag-search-worker` / `rag-dead-letter-worker` 主程序（RocketMQ 客户端）；最后 G8 打包、parity 回归与 Python 后端删除。
