@@ -78,13 +78,13 @@ assets/                   可选嵌入资源目录（构建时生成，不入库
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | G0 | 迁移总纲、Go 模块骨架、配置/契约、HTTP 路由/认证/Console/健康检查 | 已完成 |
-| G1 | 共享状态层：schema、MySQL/SQLite 仓储、加密、知识库/文档/API Key 读模型 | 进行中（go-state） |
-| G2 | 上传事务：UploadJournal、租约、blob、制品注册、制品/结果快照、缓存 outbox | 待开始 |
-| G3 | 读取与切分：Markdown/TXT/DOCX 读取、PDF 解析进程编排、五类切分策略 | 进行中（go-document） |
-| G4 | 检索：Qdrant 客户端、BM25 sparse、Dense/Hybrid、Reranker、orchestrator | 进行中（go-retrieval） |
-| G5 | 运行时：知识库创建/更新/重向量化、文档 CRUD、搜索、恢复线程 | 待开始 |
-| G6 | MCP：Streamable HTTP transport、工具/提示词目录、订阅通知 | 进行中（go-mcp，官方 Go SDK） |
-| G7 | 异步：Redis 缓存/搜索任务/快照、RocketMQ outbox、文档/搜索/DLQ worker | 待开始 |
+| G1 | 共享状态层：schema、MySQL/SQLite 仓储、加密、知识库/文档/API Key 读模型 | 已完成（part 1/2）；上传事务进行中 |
+| G2 | 上传事务：UploadJournal、租约、blob、制品注册、制品/结果快照、缓存 outbox | 进行中（blob/制品/快照/缓存已落地，Journal/Coordinator 进行中） |
+| G3 | 读取与切分：Markdown/TXT/DOCX 读取、PDF 解析进程编排、五类切分策略 | 已完成基础；资产/PDF chunks/公式进行中 |
+| G4 | 检索：Qdrant 客户端、BM25 sparse、Dense/Hybrid、Reranker、orchestrator | 已完成；runtime 接入进行中 |
+| G5 | 运行时：知识库创建/更新/重向量化、文档 CRUD、搜索、恢复线程 | 进行中（search engine 先行） |
+| G6 | MCP：Streamable HTTP transport、工具/提示词目录、订阅通知 | 工具/提示词/双协议 transport 完成；resources/订阅进行中 |
+| G7 | 异步：Redis 缓存/搜索任务/快照、RocketMQ outbox、文档/搜索/DLQ worker | 待开始（状态表与缓存 outbox 已就绪） |
 | G8 | 迁移 CLI、Docker/脚本/文档切换、等价性回归、删除 Python 后端 | 待开始 |
 
 核心决策补充：
@@ -145,3 +145,19 @@ assets/                   可选嵌入资源目录（构建时生成，不入库
   （`internal/{qdrant,retrieval,modelapi,sparse}`）、task-3 文档读取与切分
   （`internal/{document,chunking}`）、task-4 MCP 服务层（`internal/mcp`）。
 - 本轮新增测试：catalog 6 项、resources 6 项；`go test ./internal/catalog/... ./internal/resources/...` 通过。
+
+### 2026-11-08 第二轮：状态层/检索/文档/MCP 并行落地
+
+已提交（按提交顺序）：
+
+- `cd3f852`+：MCP 目录、文档资源、`/v1/admin/tools` 与 `/v1/admin/prompts`。
+- `a1843c0`：状态层 part 1（schema/crypto/store/四类仓储，61 pass）。
+- `099b526`：SQLite 状态接入 `rag-service`、API Key 认证与管理接口（`/v1/admin/api-keys`、mcp-config）。
+- `7d699bb`：文档读取与切分（document 31 + chunking 40 用例）与检索栈（qdrant/retrieval/modelapi/sparse，147 用例）。
+- `feat(go): implement MCP server layer...`：官方 Go SDK MCP 层（双协议分发、6 工具、提示词、传输安全，57 用例）。
+- `feat(go): add search, search-result and artifact endpoints`：`/v1/search`、`/v1/search-results/*`、`/v1/artifacts/*`。
+- `feat(go): state part 2 ...`：blob/制品/结果快照/缓存同步/读视图/DPAPI（115 pass）+ `internal/kbconfig`（69 用例）+ `/v1/documents*`、`/v1/knowledge-base`、`/mcp` 挂载。
+
+进行中：`task-6` 文档资产/PDF chunks/公式（go-document）、`task-8` MCP resources/订阅（go-mcp）、`task-9` 上传事务（go-state）、`task-10` runtime 搜索路径（go-retrieval）。
+
+尚未开始的关键路径：`internal/runtime` 文档上传/删除/入库（等待 task-9 上传事务）、Redis 搜索快照/任务与 RocketMQ worker（G7）、管理端知识库创建/更新/重向量化、Console 构建集成与打包切换。
