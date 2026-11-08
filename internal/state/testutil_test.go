@@ -44,6 +44,8 @@ var stateEnvKeys = []string{
 	"RAG_RESULT_MAX_BYTES",
 	"RAG_ARTIFACT_MAX_BYTES",
 	"RAG_RESULT_MAX_ARTIFACTS",
+	"RAG_UPLOAD_LEASE_SECONDS",
+	"RAG_UPLOAD_CLEANUP_DELAY_SECONDS",
 }
 
 // testEncryptionKey is the same 32-byte "k" key the Python fixtures use.

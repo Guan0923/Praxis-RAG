@@ -51,12 +51,9 @@ func isUniqueViolation(err error) bool {
 // process. It mirrors rag_mcp.state.store.StateStores.
 //
 // TODO(G2/G7) still deferred from the state-layer port:
-//   - UploadJournal + UploadCoordinator (uploads.py, upload_coordinator.py):
-//     upload_operations/upload_steps/upload_objects/document_heads/
-//     document_leases rows, idempotency keys, workspace registration, lease
-//     heartbeat/expiry, cleanup_pending, recovery claims, and the transactional
-//     commit/rollback protocol. The schema and the upload read views above are
-//     already in place, but nothing writes those tables yet.
+//   - UploadCoordinator is constructed by the runtime (NewUploadCoordinator) so
+//     it can inject the Qdrant-backed IndexPublisher and schedule Recover; the
+//     journal itself is attached here as Stores.Uploads.
 //   - DocumentJobs + DocumentJobDispatcher (document_jobs.py,
 //     document_queue.py) and SearchTasks + SearchTaskDispatcher
 //     (search_tasks.py, search_queue.py).
@@ -79,6 +76,7 @@ type Stores struct {
 	Views     *CachedReadViews
 	Results   *ResultSnapshots
 	Artifacts *ArtifactRegistry
+	Uploads   *UploadJournal
 
 	dialect    Dialect
 	closeOnce  sync.Once
@@ -166,10 +164,18 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.Documents = newDocumentRepository(database, dialect, cacheSync)
 	stores.Catalogs = newCatalogRepository(database, dialect, cacheSync)
 	stores.Blobs = newBlobStore(database, dialect)
+	uploads, err := NewUploadJournal(stores)
+	if err != nil {
+		_ = cacheSync.Close()
+		_ = database.Close()
+		return nil, err
+	}
+	stores.Uploads = uploads
 	stores.Views = NewCachedReadViews(stores)
 
 	snapshotSettings, err := SnapshotSettingsFromEnv()
 	if err != nil {
+		uploads.Close()
 		_ = cacheSync.Close()
 		_ = database.Close()
 		return nil, err
@@ -183,6 +189,7 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	maxArtifactBytes := int64(snapshotSettings.MaxArtifactBytes)
 	artifacts, err := NewArtifactRegistry(stores, float64(snapshotSettings.TTLSeconds), nil, &maxArtifactBytes)
 	if err != nil {
+		uploads.Close()
 		_ = cacheSync.Close()
 		_ = database.Close()
 		return nil, err
@@ -214,6 +221,9 @@ func (s *Stores) Close() error {
 			if err := s.CacheSync.Close(); err != nil {
 				firstErr = err
 			}
+		}
+		if s.Uploads != nil {
+			s.Uploads.Close()
 		}
 		if err := s.DB.Close(); err != nil && firstErr == nil {
 			firstErr = err

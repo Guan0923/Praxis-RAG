@@ -147,3 +147,67 @@ func cleanupMySQLRows(t *testing.T, stores *Stores, namespace, keyID string) {
 		}
 	}
 }
+
+// TestMySQLUploadJournalRoundTrip gates the durable upload transaction on
+// RAG_TEST_MYSQL_URL, mirroring tests/test_mysql_upload_transactions.py.
+func TestMySQLUploadJournalRoundTrip(t *testing.T) {
+	stores := openMySQLTestStores(t)
+	ctx := context.Background()
+	journal, err := NewUploadJournal(stores, WithLeaseSeconds(30), WithAutoHeartbeat(false), WithCleanupDelaySeconds(0))
+	if err != nil {
+		t.Fatalf("NewUploadJournal() error = %v", err)
+	}
+	defer journal.Close()
+	suffix, err := randomHex(6)
+	if err != nil {
+		t.Fatalf("randomHex() error = %v", err)
+	}
+	namespace := "go-upload-" + suffix
+	idempotencyKey := "key-" + suffix
+	t.Cleanup(func() {
+		jc := context.Background()
+		for _, statement := range []string{
+			"DELETE FROM upload_objects WHERE operation_id IN (SELECT id FROM upload_operations WHERE namespace = ?)",
+			"DELETE FROM upload_steps WHERE operation_id IN (SELECT id FROM upload_operations WHERE namespace = ?)",
+			"DELETE FROM upload_operations WHERE namespace = ?",
+			"DELETE FROM document_heads WHERE namespace = ?",
+		} {
+			if _, err := stores.DB.ExecContext(jc, statement, namespace); err != nil {
+				t.Logf("cleanup %q error = %v", statement, err)
+			}
+		}
+	})
+	operation, err := journal.Begin(ctx, namespace, "file.txt", "doc", "collection", BeginOptions{
+		IdempotencyKey: &idempotencyKey,
+	})
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	if err := journal.PutObject(ctx, operation, SourceBucket, "file.txt", []byte("mysql bytes"), nil); err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+	transaction, err := stores.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	if _, err := journal.Commit(ctx, operation, map[string]any{"ok": true}, transaction); err != nil {
+		_ = transaction.Rollback()
+		t.Fatalf("Commit() error = %v", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatalf("Commit tx error = %v", err)
+	}
+	head, err := journal.Head(ctx, namespace, "doc")
+	if err != nil || head == nil || *head != operation.ID {
+		t.Fatalf("Head() = %v, %v", head, err)
+	}
+	replay, err := journal.Begin(ctx, namespace, "file.txt", "doc", "collection", BeginOptions{
+		IdempotencyKey: &idempotencyKey,
+	})
+	if err != nil || replay.ID != operation.ID || replay.Status != UploadCommitted {
+		t.Fatalf("replay = %+v, %v", replay, err)
+	}
+	if content, found, err := journal.GetObject(ctx, operation.ID, SourceBucket, "file.txt"); err != nil || !found || string(content) != "mysql bytes" {
+		t.Fatalf("GetObject() = %q, %v, %v", content, found, err)
+	}
+}
