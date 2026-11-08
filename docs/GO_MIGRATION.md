@@ -308,3 +308,14 @@ REST /v1/admin/tools -> 6 tools
 已验证：`go build ./cmd/...`、`go vet ./cmd/...` 全绿；三个二进制实跑：无 broker → 2（明确文案）、错误 backend → 2、`--kind` 非法 → 2、`--help` → 0、document worker 本地模式可启动并创建 SQLite 状态。
 
 **Worker 运行环境要点**（完整表见 CLI 输出/GO_MIGRATION 计划）：共享 `RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`RAG_REDIS_*`、`RAG_BACKEND=qdrant`、`QDRANT_URL`、`RAG_ROCKETMQ_*`；搜索 worker 另有 `RAG_SEARCH_TOPIC/GROUP/MAX_ATTEMPTS`；文档 worker 另有 `RAG_DOCUMENT_TOPIC/GROUP/BROKER_MAX_RETRIES`、`RAG_DOCUMENT_WORKER_LOCAL/POLL_SECONDS/RECOVER_SECONDS`；DLQ worker 另有 `RAG_*_DLQ_GROUP/TOPIC`。
+
+### 2026-11-08 第十三轮：P0/P1 parity 修复完成
+
+已提交：
+
+- `fix(go): P1 parity (snapshot_context, OpenAPI/docs, KB validation)`：搜索 payload 增加 Python 一致的 `snapshot_context`（collection/embedding_model/reranker_model/vector_size/chunk_tokenizer_model/configuration_version，Search 与 SearchRaw 均生效）；`/openapi.json`（OpenAPI 3.1，34 个操作，SearchBody rerank enum）+ `/docs`（自包含页面）；KB 管理 create/PATCH 校验与 Python 422 对齐（embedding 必填、模型名长度、loc 正确）。
+- `fix(go): P0 parity (search asset projection, saved document.md preview)`：`pdf_assets.project_results` 移植（image base64/table rows/captions/footnotes/location/page/bbox/metadata 增补、upload_version 可见性过滤、失败安全降级）接入 tenant orchestrator，Search/SearchRaw 均产出 asset；`ReadDocument` 对版本化 PDF/DOC/DOCX 读取已落盘 `document.md`（缺失时 Python 文案 "Saved content unavailable; reimport this document"），md/txt 严格 UTF-8 + `MAX_EXTRACTED_CHARACTERS` 校验。
+
+**全量验证**：`go build ./...` + `go test -count=1 ./...` 全部 23 个包通过（state 165、runtime 79、mq 8、workers 27、httpapi/mcp/searchrefs/检索栈等）。
+
+进行中：task-26（异步 e2e 集成测试）、task-27（P1-6 cached read views / P1-2 / P2 静态服务）、task-28（G8 文档切换）、task-29（真实 rag-mcp-ingest CLI）。
