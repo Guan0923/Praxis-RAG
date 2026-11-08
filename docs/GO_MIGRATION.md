@@ -230,3 +230,14 @@ REST /v1/admin/tools -> 6 tools
 新增依赖：`github.com/alicebob/miniredis/v2 v2.40.0`（+ `yuin/gopher-lua` 间接，测试用）。
 
 进行中：task-15（Dockerfile/构建脚本/Makefile，文件已出现）、task-16（runtime 上传/删除/写入，`documents_publish.go` 已出现）、task-17（`internal/mq` RocketMQ 传输层）。
+
+### 2026-11-08 第七轮：构建打包
+
+已提交 `build(go): Dockerfile, cross-platform build scripts, Makefile and app compose profile`：
+
+- `Dockerfile`：三段式（node 构建 Console → golang 编译全部 `cmd/*` 静态二进制 → alpine 非 root 运行，`RAG_WEB_ROOT=/app/web`、`/health` HEALTHCHECK、`deploy/config.container.toml` 非敏感默认配置）。
+- `.dockerignore`、`Makefile`、`scripts/build-go.ps1`、`scripts/build-go.sh`：构建 `dist/bin/<cmd>` 与 `dist/web`，内置冒烟（临时端口 + 临时 SQLite → `/health`、`/console`、`/`），支持 `-SkipFrontend`/`-SkipGo`/`-SmokeOnly`/`-Test`/`-FreshFrontendDeps`。
+- `docker-compose.yml`：新增可选 `app` profile（默认 `docker compose up` 仍只启动基础设施；app 需要 `RAG_SERVICE_TOKEN`）。
+- `.env.example`：补充 Go 服务/容器所需变量说明。
+
+本机验证（无 Docker）：`pwsh -File scripts/build-go.ps1 -SmokeOnly` 通过，`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200；`scripts/build-go.sh` 语法与 smoke 通过。容器镜像与 compose `app` profile 需在具备 Docker 的主机/CI 验证（受限项已记录）。
