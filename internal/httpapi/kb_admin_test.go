@@ -164,7 +164,7 @@ func TestKnowledgeBaseAdminCreate(t *testing.T) {
 
 	badStrategy := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/admin/knowledge-bases", remote: "127.0.0.1:5000",
-		body: `{"namespace":"alpha","embedding_model":"x","strategy":"unknown"}`,
+		body: `{"namespace":"alpha","embedding":{},"embedding_model":"x","strategy":"unknown"}`,
 	})
 	if badStrategy.Code != http.StatusBadRequest {
 		t.Fatalf("bad strategy status = %d body = %s", badStrategy.Code, badStrategy.Body.String())
@@ -173,7 +173,7 @@ func TestKnowledgeBaseAdminCreate(t *testing.T) {
 	runtime.createErr = &apierrors.KnowledgeValidationError{Message: "该知识库已存在，请在知识库页面修改配置"}
 	conflict := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/admin/knowledge-bases", remote: "127.0.0.1:5000",
-		body: `{"namespace":"alpha","embedding_model":"x"}`,
+		body: `{"namespace":"alpha","embedding":{},"embedding_model":"x"}`,
 	})
 	if conflict.Code != http.StatusBadRequest {
 		t.Fatalf("conflict status = %d", conflict.Code)
@@ -244,6 +244,66 @@ func TestKnowledgeBaseAdminUpdate(t *testing.T) {
 	})
 	if rejected.Code != http.StatusConflict {
 		t.Fatalf("rejected status = %d", rejected.Code)
+	}
+}
+
+func TestKnowledgeBaseAdminValidationParity(t *testing.T) {
+	runtime := &fakeKBAdminRuntime{fakeDocRuntime: newFakeDocRuntime()}
+	handler := newKBAdminServer(t, runtime)
+	longText := func(size int) string {
+		buffer := make([]byte, size)
+		for index := range buffer {
+			buffer[index] = 'x'
+		}
+		return string(buffer)
+	}
+	cases := []struct {
+		name     string
+		body     string
+		location string
+		wantType string
+		patch    bool
+	}{
+		{"missing embedding", `{"namespace":"alpha","embedding_model":"x"}`, "embedding", "missing", false},
+		{"missing embedding_model", `{"namespace":"alpha","embedding":{}}`, "embedding_model", "missing", false},
+		{"empty embedding_model", `{"namespace":"alpha","embedding":{},"embedding_model":""}`, "embedding_model", "string_too_short", false},
+		{"long embedding_model", `{"namespace":"alpha","embedding":{},"embedding_model":"` + longText(513) + `"}`, "embedding_model", "string_too_long", false},
+		{"long reranker_model", `{"namespace":"alpha","embedding":{},"embedding_model":"m","reranker_model":"` + longText(513) + `"}`, "reranker_model", "string_too_long", false},
+		{"patch empty embedding_model", `{"embedding_model":""}`, "embedding_model", "string_too_short", true},
+		{"patch long embedding_model", `{"embedding_model":"` + longText(513) + `"}`, "embedding_model", "string_too_long", true},
+		{"patch long reranker_model", `{"reranker_model":"` + longText(513) + `"}`, "reranker_model", "string_too_long", true},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			method, target := "POST", "/v1/admin/knowledge-bases"
+			if testCase.patch {
+				method, target = "PATCH", "/v1/admin/knowledge-bases/alpha"
+			}
+			response := performRequest(handler, testRequest{
+				method: method, target: target, remote: "127.0.0.1:5000", body: testCase.body,
+			})
+			if response.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+			}
+			detail, _ := decodeBody(t, response)["detail"].([]any)
+			if len(detail) == 0 {
+				t.Fatalf("missing detail: %s", response.Body.String())
+			}
+			first, _ := detail[0].(map[string]any)
+			location, _ := first["loc"].([]any)
+			if len(location) != 2 || location[0] != "body" || location[1] != testCase.location {
+				t.Fatalf("loc = %v, want body.%s", first["loc"], testCase.location)
+			}
+			if first["type"] != testCase.wantType {
+				t.Fatalf("type = %v, want %s", first["type"], testCase.wantType)
+			}
+		})
+	}
+	if runtime.createInput.Namespace != "" {
+		t.Fatalf("invalid create reached the runtime: %+v", runtime.createInput)
+	}
+	if runtime.updateNamespace != "" {
+		t.Fatalf("invalid patch reached the runtime: %q", runtime.updateNamespace)
 	}
 }
 

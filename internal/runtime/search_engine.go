@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -74,14 +75,36 @@ func (e *SearchEngine) Search(
 	if err != nil {
 		return nil, searchError(err)
 	}
+	// Python snapshots the tenant configuration *before* retrieval and merges it
+	// into the payload, so saved references/result snapshots record which
+	// collection/config version produced the evidence.
+	snapshot := snapshotContext(tenant)
 	payload, err := tenant.orchestrator.Search(ctx, request)
 	if err != nil {
 		return nil, searchError(err)
 	}
+	payload["snapshot_context"] = snapshot
 	if e.references != nil {
 		payload, _ = e.references.Capture(ctx, namespace, payload, true)
 	}
 	return payload, nil
+}
+
+// snapshotContext mirrors the Python ingester-config context:
+// collection/embedding_model/reranker_model/vector_size/chunk_tokenizer_model
+// plus the knowledge-base configuration version at search time. Missing values
+// stay nil rather than guessing, because table rows created before a field
+// existed have no value to report.
+func snapshotContext(tenant *tenantResources) map[string]any {
+	settings := tenant.settings
+	return map[string]any{
+		"collection":            tenant.collection,
+		"embedding_model":       settings["embedding_model"],
+		"reranker_model":        settings["reranker_model"],
+		"vector_size":           snapshotInteger(settings["vector_size"]),
+		"chunk_tokenizer_model": settings["tokenizer"],
+		"configuration_version": snapshotInteger(settings["version"]),
+	}
 }
 
 // PublicKnowledgeBase returns the credential-free settings projection of one
@@ -195,9 +218,35 @@ func (e *SearchEngine) SearchRaw(ctx context.Context, namespace string, request 
 	if err != nil {
 		return nil, searchError(err)
 	}
+	snapshot := snapshotContext(tenant)
 	payload, err := tenant.orchestrator.Search(ctx, request)
 	if err != nil {
 		return nil, searchError(err)
 	}
+	payload["snapshot_context"] = snapshot
 	return payload, nil
+}
+
+// snapshotInteger normalizes JSON-decoded numbers to integers (Python's ingester
+// config exposes vector_size/configuration_version as ints; encoding/json decodes
+// stored settings as float64/json.Number).
+func snapshotInteger(value any) any {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed)
+	case int64:
+		return typed
+	case float64:
+		if typed == float64(int64(typed)) {
+			return int64(typed)
+		}
+		return typed
+	case json.Number:
+		if parsed, err := typed.Int64(); err == nil {
+			return parsed
+		}
+		return typed
+	default:
+		return value
+	}
 }

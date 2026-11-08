@@ -477,3 +477,52 @@ func (f *fakeTransient) Delete(kind, identity string) (int64, error) {
 	delete(f.values, key)
 	return 1, nil
 }
+
+func TestSearchSnapshotContext(t *testing.T) {
+	qdrantURL, _ := newFakeQdrantAPI(t, testQueryPoints)
+	modelURL, _ := newFakeModelAPI(t, nil)
+	engine, _ := newSearchEngineForTest(t, qdrantURL, modelURL)
+	request := mustSearchRequest(t, map[string]any{
+		"query": "证据", "retrieval": "embedding", "rerank": "none", "candidate_k": 5, "top_k": 2,
+	})
+
+	assertSnapshot := func(label string, payload map[string]any) {
+		t.Helper()
+		context, ok := payload["snapshot_context"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s snapshot_context = %T %v", label, payload["snapshot_context"], payload["snapshot_context"])
+		}
+		want := map[string]any{
+			"collection":            "knowledge_test",
+			"embedding_model":       "embed-a",
+			"reranker_model":        "rank-a",
+			"vector_size":           int64(3),
+			"chunk_tokenizer_model": "BAAI/bge-m3",
+		}
+		for key, value := range want {
+			if context[key] != value {
+				t.Errorf("%s snapshot_context[%q] = %v, want %v", label, key, context[key], value)
+			}
+		}
+		if _, present := context["configuration_version"]; !present {
+			t.Errorf("%s snapshot_context missing configuration_version: %v", label, context)
+		}
+		for _, leaked := range []string{"embedding", "reranker", "namespace", "strategy"} {
+			if _, present := context[leaked]; present {
+				t.Errorf("%s snapshot_context leaked %q: %v", label, leaked, context)
+			}
+		}
+	}
+
+	payload, err := engine.Search(context.Background(), "alpha", request)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	assertSnapshot("Search", payload)
+
+	raw, err := engine.SearchRaw(context.Background(), "alpha", request)
+	if err != nil {
+		t.Fatalf("SearchRaw() error = %v", err)
+	}
+	assertSnapshot("SearchRaw", raw)
+}

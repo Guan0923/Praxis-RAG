@@ -62,7 +62,7 @@ type createKnowledgeBaseBody struct {
 	Namespace      string            `json:"namespace"`
 	Embedding      *providerSettings `json:"embedding"`
 	Reranker       *providerSettings `json:"reranker"`
-	EmbeddingModel string            `json:"embedding_model"`
+	EmbeddingModel *string           `json:"embedding_model"`
 	RerankerModel  string            `json:"reranker_model"`
 	Strategy       string            `json:"strategy"`
 	ChunkSize      *int              `json:"chunk_size"`
@@ -146,16 +146,39 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		writeValidation(w, http.StatusUnprocessableEntity, details)
 		return
 	}
-	if body.EmbeddingModel == "" {
+	// Python's CreateKnowledgeBaseBody requires `embedding` (ProviderSettingsBody)
+	// and `embedding_model` (min_length=1, max_length=512), validated in field
+	// declaration order before the handler runs. Match that ordering so the
+	// first 422 detail has the same loc/type/msg as FastAPI.
+	if body.Embedding == nil {
+		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
+			Type: "missing", Loc: []any{"body", "embedding"}, Msg: "Field required",
+		}})
+		return
+	}
+	if body.EmbeddingModel == nil {
+		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
+			Type: "missing", Loc: []any{"body", "embedding_model"}, Msg: "Field required",
+		}})
+		return
+	}
+	if len([]rune(*body.EmbeddingModel)) == 0 {
 		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
 			Type: "string_too_short", Loc: []any{"body", "embedding_model"},
 			Msg: "String should have at least 1 character",
 		}})
 		return
 	}
-	if len([]rune(body.EmbeddingModel)) > 512 || len([]rune(body.RerankerModel)) > 512 {
+	if len([]rune(*body.EmbeddingModel)) > 512 {
 		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
 			Type: "string_too_long", Loc: []any{"body", "embedding_model"},
+			Msg: "String should have at most 512 characters",
+		}})
+		return
+	}
+	if len([]rune(body.RerankerModel)) > 512 {
+		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
+			Type: "string_too_long", Loc: []any{"body", "reranker_model"},
 			Msg: "String should have at most 512 characters",
 		}})
 		return
@@ -169,10 +192,7 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		writeDetail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	embeddingValues := map[string]any{}
-	if body.Embedding != nil {
-		embeddingValues = body.Embedding.values()
-	}
+	embeddingValues := body.Embedding.values()
 	rerankerValues := map[string]any{}
 	if body.Reranker != nil {
 		rerankerValues = body.Reranker.values()
@@ -180,7 +200,7 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 	payload, err := s.kbAdmin.CreateKnowledgeBase(r.Context(), KnowledgeBaseCreateInput{
 		Namespace:       body.Namespace,
 		Chunking:        configuration,
-		EmbeddingModel:  body.EmbeddingModel,
+		EmbeddingModel:  *body.EmbeddingModel,
 		RerankerModel:   body.RerankerModel,
 		EmbeddingValues: embeddingValues,
 		RerankerValues:  rerankerValues,
@@ -309,9 +329,28 @@ func (s *Server) handleUpdateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		writeValidation(w, http.StatusUnprocessableEntity, details)
 		return
 	}
-	if body.EmbeddingModel != nil && len([]rune(*body.EmbeddingModel)) > 512 {
+	// Python's UpdateKnowledgeBaseBody validates embedding_model (min_length=1,
+	// max_length=512) before reranker_model (max_length=512); provider bodies have
+	// no scalar constraints, so these are the only 422 checks that run first.
+	if body.EmbeddingModel != nil {
+		if len([]rune(*body.EmbeddingModel)) == 0 {
+			writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
+				Type: "string_too_short", Loc: []any{"body", "embedding_model"},
+				Msg: "String should have at least 1 character",
+			}})
+			return
+		}
+		if len([]rune(*body.EmbeddingModel)) > 512 {
+			writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
+				Type: "string_too_long", Loc: []any{"body", "embedding_model"},
+				Msg: "String should have at most 512 characters",
+			}})
+			return
+		}
+	}
+	if body.RerankerModel != nil && len([]rune(*body.RerankerModel)) > 512 {
 		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
-			Type: "string_too_long", Loc: []any{"body", "embedding_model"},
+			Type: "string_too_long", Loc: []any{"body", "reranker_model"},
 			Msg: "String should have at most 512 characters",
 		}})
 		return

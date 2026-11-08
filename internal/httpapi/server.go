@@ -133,6 +133,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/uploads/{operation_id}", authTenant, s.handleUploadStatusDetail)
 	s.router.add("GET", "/v1/admin/published-versions", authNone, s.handlePublishedVersions)
 	s.router.add("GET", "/v1/admin/upload-leases", authNone, s.handleUploadLeases)
+	s.registerDocumentationRoutes()
 	s.registerKnowledgeBaseAdminRoutes()
 	s.router.add("POST", "/mcp", authMCP, s.handleMCP)
 	s.router.add("GET", "/mcp", authMCP, s.handleMCP)
