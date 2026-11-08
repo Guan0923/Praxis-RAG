@@ -241,3 +241,24 @@ REST /v1/admin/tools -> 6 tools
 - `.env.example`：补充 Go 服务/容器所需变量说明。
 
 本机验证（无 Docker）：`pwsh -File scripts/build-go.ps1 -SmokeOnly` 通过，`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200；`scripts/build-go.sh` 语法与 smoke 通过。容器镜像与 compose `app` profile 需在具备 Docker 的主机/CI 验证（受限项已记录）。
+
+### 2026-11-08 第八轮：上传写入路径、RocketMQ 与打包
+
+已提交：
+
+- `feat(go): RocketMQ transport layer for async workers`：`internal/mq`（settings/消息编解码/Publisher 实现两个 state 发布接口/PullConsumer + SDK 封装；Go SDK v5.1.4；无 broker 环境，实机回环未验证）。
+- `feat(go): runtime document upload, delete and write path`：`uploadDocuments/storeAndIndex`（写前日志 → 幂等重放 → 去重 → ingest → embedding/sparse → stage_qdrant → 单事务发布 → 补偿）、`writeDocumentContent`、`deleteDocumentByName`，以及 `documentIndexStore`/恢复补偿 seam；Lead 已把 `Service.Upload/Delete/WriteDocument/DeleteDocument` stub 替换为委托。**HTTP `/v1/documents*` 与 MCP 文档工具现已具备真实写入能力。**
+- `build(go): Dockerfile, cross-platform build scripts, Makefile and app compose profile`（见上节）。
+
+验证：`go build ./...` 全绿；runtime 46 测试、state 165、mq 8、httpapi/mcp/检索等全部通过。`dist/bin/rag-service.exe` + 真实构建 Console 的冒烟通过。
+
+并行进行中（下一轮收口）：
+
+| 任务 | 负责人 | 内容 |
+| --- | --- | --- |
+| task-18 | go-retrieval | runtime 异步受理 + 排队搜索 + 后台维护循环 |
+| task-19 | go-state | migrate/CLI（rag-service-migrate、rag-state-migrate、ingest/debug） |
+| task-20 | go-mcp | search/document/dead-letter worker 处理库 |
+| task-21 | go-document | Go vs Python/前端 parity 审计报告 |
+
+剩余主要工作：worker 主程序、异步文档状态（MCP add_document 接线）、queued search 等待语义、G8 文档/README 切换、黑盒 parity 回归、删除 Python 后端。
