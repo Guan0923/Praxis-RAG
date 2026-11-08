@@ -21,6 +21,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
 	"github.com/Guan0923/xinghe_rag/internal/mcp"
+	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
 	"github.com/Guan0923/xinghe_rag/internal/searchrefs"
@@ -58,6 +59,10 @@ func run() error {
 	}
 	defer func() { _ = stores.Close() }()
 	logger := newLogger()
+	mqSettings, err := mq.SettingsFromEnv()
+	if err != nil {
+		return err
+	}
 	cache, err := redisstate.NewFromEnv()
 	if err != nil {
 		return err
@@ -78,7 +83,7 @@ func run() error {
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{
 		Runtime:      wire.MCPRuntime{Service: service},
 		Catalog:      catalogStore,
-		QueuedSearch: false,
+		QueuedSearch: mqSettings.Configured(),
 		Logger:       logger,
 	})
 	if err != nil {

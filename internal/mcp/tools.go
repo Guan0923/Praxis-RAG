@@ -223,7 +223,7 @@ func (e *Endpoint) documentEntry(name, description string) toolEntry {
 		}
 	}
 
-	destructive := writing && name != addDocumentToolName
+	destructive := name != addDocumentToolName
 	openWorld := false
 	annotations := &sdk.ToolAnnotations{
 		ReadOnlyHint:    false,

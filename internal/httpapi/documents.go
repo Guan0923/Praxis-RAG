@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -300,6 +301,16 @@ func (s *Server) handleCheckDocuments(w http.ResponseWriter, r *http.Request) {
 		writeValidation(w, http.StatusUnprocessableEntity, details)
 		return
 	}
+	for _, item := range body.Files {
+		suffix := strings.ToLower(filepath.Ext(item.Name))
+		if !supportedExtension(suffix) {
+			// Python raises KnowledgeValidationError, which the check route
+			// renders as a 400 detail string.
+			writeDetail(w, http.StatusBadRequest,
+				"暂不支持该文件类型："+item.Name+"；请选择 "+strings.Join(SupportedExtensions, "、")+"。")
+			return
+		}
+	}
 	files := make([]CheckFile, 0, len(body.Files))
 	for _, item := range body.Files {
 		files = append(files, CheckFile{Name: item.Name, SHA256: item.SHA256})
@@ -353,3 +364,13 @@ func isSHA256(value string) bool {
 }
 
 var _ = json.Marshal
+
+// supportedExtension reports whether suffix is one of the accepted upload types.
+func supportedExtension(suffix string) bool {
+	for _, extension := range SupportedExtensions {
+		if extension == suffix {
+			return true
+		}
+	}
+	return false
+}
