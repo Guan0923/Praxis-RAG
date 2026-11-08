@@ -188,15 +188,15 @@ func (r *Reader) docxDocument(ctx context.Context, resolved, name, suffix string
 		}
 		source = converted
 	}
-	displayName := filepath.Base(source)
-	if err := validateDOCX(source, displayName); err != nil {
-		// Validation errors are already DocumentReadError sequivalents and
-		// propagate unchanged, like document_readers._docx_blocks.
-		return nil, "", err
-	}
-	blocks, err := parseDOCX(source)
+	pkg, err := ParseWordPackage(source)
 	if err != nil {
+		// Validation errors are already DocumentReadError equivalents and
+		// propagate unchanged, like document_readers._docx_blocks.
+		if _, ok := AsReadError(err); ok {
+			return nil, "", err
+		}
 		return nil, "", readErrf("Word 解析失败：%s；%v", name, err)
 	}
+	blocks := pkg.Manifest.DocumentBlocks()
 	return blocks, joinDOCX(blocks), nil
 }

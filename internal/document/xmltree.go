@@ -22,13 +22,15 @@ const (
 
 // xmlNode is a minimal DOM node: element name, attributes, direct text and
 // ordered children. It is enough to reproduce the lxml element access used by
-// word_reader.py (find/findall/iter/get/text) with encoding/xml, which avoids a
-// third-party XML dependency.
+// word_reader.py (find/findall/iter/get/text/iterancestors) with encoding/xml,
+// which avoids a third-party XML dependency.
 type xmlNode struct {
 	Name     xml.Name
 	Attrs    []xml.Attr
 	Children []*xmlNode
 	Text     string
+	// Parent supports iterancestors-style lookups (picture labels/bookmarks).
+	Parent *xmlNode
 }
 
 // parseXMLNode parses one XML document. External entity resolution and DTD
@@ -51,6 +53,11 @@ func parseXMLNode(data []byte) (*xmlNode, error) {
 			node := &xmlNode{Name: element.Name, Attrs: element.Attr}
 			parent := stack[len(stack)-1]
 			parent.Children = append(parent.Children, node)
+			if parent != root {
+				node.Parent = parent
+			} else {
+				node.Parent = nil
+			}
 			stack = append(stack, node)
 		case xml.EndElement:
 			if len(stack) <= 1 {
@@ -168,6 +175,17 @@ func (n *xmlNode) walkDescendants(visit func(*xmlNode) bool) {
 	for _, child := range n.Children {
 		child.walkDescendants(visit)
 	}
+}
+
+// ancestorWhere returns the nearest ancestor matching the predicate, mirroring
+// lxml iterancestors.
+func (n *xmlNode) ancestorWhere(match func(*xmlNode) bool) *xmlNode {
+	for current := n.Parent; current != nil; current = current.Parent {
+		if match(current) {
+			return current
+		}
+	}
+	return nil
 }
 
 // hasDescendant reports whether node or any descendant matches ns:local.

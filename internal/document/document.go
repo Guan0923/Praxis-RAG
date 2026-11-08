@@ -1,11 +1,26 @@
 // Package document ports supported-document text extraction from
-// rag_mcp.document_readers and the OOXML reader from rag_mcp.word_reader.
+// rag_mcp.document_readers and the OOXML reader from rag_mcp.word_reader, plus
+// the storage-decoupled asset pipelines of rag_mcp.word_assets /
+// rag_mcp.pdf_assets and the OMML formula conversion used by Word reading.
 //
 // Markdown/TXT are read in process; DOCX is parsed from the OOXML zip package
-// in process; PDF text extraction is delegated to the external Docling parser
+// in process (including full caption/note association and skipped-object
+// diagnostics); PDF text extraction is delegated to the external Docling parser
 // process through the protocol defined in pdf.go (Docling itself is never
 // reimplemented here). Legacy .doc files additionally require an external
-// LibreOffice based converter, see docconvert.go.
+// LibreOffice based converter, see docconvert.go; uncaptioned Word pictures can
+// be described by the external word_vision_worker through vision.go.
+//
+// Pipeline API (all storage decoupled; the runtime persists what these return):
+//   - ParseWordPackage -> BuildWordContent: qualified manifest, document.md text
+//     and typed Asset records (bytes, mime, document-relative identity,
+//     checksum, size, order).
+//   - ExternalPDFParser -> BuildPDFContent: the same for PDF manifests produced
+//     by the Docling worker, plus RenderContent for the document.md text.
+//   - WordManifest.DocumentBlocks / ReadDocument / ReadText: the reader view
+//     used by chunking.
+//   - The PDF chunk port lives in internal/document/pdfcontent to avoid an
+//     import cycle with internal/chunking.
 //
 // Character offsets in Span are code-point (rune) offsets, matching Python's
 // len()/index semantics for str, so chunking metadata stays comparable with

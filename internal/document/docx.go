@@ -2,7 +2,6 @@ package document
 
 import (
 	"archive/zip"
-	"fmt"
 	"io"
 	"path"
 	"strings"
@@ -46,12 +45,18 @@ func (a *docxArchive) Has(name string) bool {
 	return ok
 }
 
+// missingWordPartError marks a package part that a parsed XML part references
+// but the zip does not contain (Python's KeyError from archive.read).
+type missingWordPartError struct{ name string }
+
+func (e *missingWordPartError) Error() string { return "missing Word part: " + e.name }
+
 // readPart reads one part with a hard decompression cap so a lying zip header
 // cannot expand past the validated package budget.
 func (a *docxArchive) readPart(name string) ([]byte, error) {
 	file, ok := a.files[name]
 	if !ok {
-		return nil, fmt.Errorf("missing Word part: %s", name)
+		return nil, &missingWordPartError{name: name}
 	}
 	handle, err := file.Open()
 	if err != nil {

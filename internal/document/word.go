@@ -1,28 +1,24 @@
 package document
 
 import (
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"path"
 	"regexp"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 )
 
 // headingStyle mirrors re.fullmatch(r"heading\s*([1-9])", name, re.I).
 var headingStyle = regexp.MustCompile(`(?i)^heading\s*([1-9])$`)
 
-// captionPrefix mirrors the prefix part of word_reader.CAPTION. The Python
-// pattern ends with r"(?:\b|(?=[\s:：、.．]))"; the lookahead is handled by
-// pythonWordBoundaryAfter because Go's regexp has no lookaround and its \b is
-// ASCII-only.
-var captionPrefix = regexp.MustCompile(`(?i)^\s*(?:图|表|figure|fig\.?|table)\s*(?:\d+(?:[.\-]\d+)*|[一二三四五六七八九十]+)`)
-
-// noteLine mirrors word_reader.NOTE.
-var noteLine = regexp.MustCompile(`(?i)^\s*(?:注|说明|来源|资料来源|note|notes|source)\s*[:：.]`)
-
 var nulPlaceholder = regexp.MustCompile(`\x00[^\x00]+\x00`)
+
+// referenceInstruction mirrors the REF field scan in word_reader.read_paragraph:
+// `re.findall(r"\bREF\s+([^\s\\]+)", ...)`.
+var referenceInstruction = regexp.MustCompile(`\bREF\s+([^\s\\]+)`)
 
 // styleInfo is one entry of word/styles.xml.
 type styleInfo struct {
@@ -37,70 +33,65 @@ type cellRef struct {
 	col     int
 }
 
-// tableCell is one logical table cell (merged continuations are folded into
-// their anchor cell, matching word_reader.read_table).
-type tableCell struct {
-	row          int
-	col          int
-	rowSpan      int
-	colSpan      int
-	text         string
-	nestedTables []string
-}
-
-// wordAsset is one picture or table asset discovered while reading the package.
-type wordAsset struct {
-	id         string
-	kind       string // "table" or "picture"
-	rows       [][]string
-	cells      []tableCell
-	headerRows [][]string
-	headers    []string
-	numRows    int
-	numCols    int
-	parentCell *cellRef
-}
-
-// wordBlock is one block before the document_readers manifest projection.
-type wordBlock struct {
-	ref      string
-	kind     string
-	text     string
-	headings []string
-	assetID  string
-}
-
-// wordReader ports rag_mcp.word_reader.WordReader: ordered OOXML extraction
-// with explicit picture/table placeholders and fail-closed handling for
-// structures that cannot be converted reliably.
+// wordReader ports rag_mcp.word_reader.WordReader: ordered OOXML extraction with
+// explicit picture/table assets, caption/note association and fail-closed
+// handling for structures that cannot be converted reliably.
 //
-// Deferred parity TODOs (documented in docs/GO_MIGRATION.md phase G3):
-//   - Word formulas (m:oMath) are rejected instead of being converted to LaTeX
-//     through docxlatex; the reader refuses the document with a clear error
-//     rather than indexing a wrong formula.
-//   - word_reader's asset caption/note association (WordReader.associate) is
-//     not ported yet. Text extraction is unaffected for documents whose
-//     captions/notes are ordinary blocks; the skipped-object pruning that runs
-//     when a caption cannot be uniquely associated is not applied.
+// Formula conversion is bounded in process (see formula.go); deployments that
+// need full docxlatex coverage can inject a FormulaConverter via ParseOptions.
 type wordReader struct {
 	archive      *docxArchive
 	contentTypes contentTypes
-	blocks       []wordBlock
-	assets       []*wordAsset
-	assetIndex   map[string]int
+	blocks       []WordManifestBlock
+	assets       []*WordManifestAsset
+	images       map[string][]byte
 	headings     []string
 	paragraph    int
 	section      int
 	characters   int
 	serial       int
+	skipped      int
 	styles       map[string]styleInfo
 	relations    map[string]map[string]relation
 	visitedNotes map[string]struct{}
+	diagnostics  []WordDiagnostic
+	formula      FormulaConverter
 }
 
-// parseDOCX extracts ordered blocks from one Word package. The caller has
-// already validated the archive bounds (validateDOCX).
-func parseDOCX(filePath string) ([]Block, error) {
+// ParseOptions configures optional external integrations while parsing.
+type ParseOptions struct {
+	// FormulaConverter overrides the bounded in-process OMML converter.
+	FormulaConverter FormulaConverter
+}
+
+// ParseWordPackage extracts a Word package into a storage-decoupled manifest
+// plus image bytes keyed by manifest asset id. It validates the archive bounds
+// (entry count, encryption flag, uncompressed size) first, like
+// word_reader.parse_docx.
+func ParseWordPackage(filePath string, options ...ParseOptions) (*WordPackage, error) {
+	if err := validateDOCX(filePath, baseName(filePath)); err != nil {
+		return nil, err
+	}
+	pkg, err := parseWordPackage(filePath, options...)
+	if err != nil {
+		if _, ok := AsReadError(err); ok {
+			return nil, err
+		}
+		// word_reader.parse_docx wraps missing parts and malformed XML as
+		// "Word document is invalid or incomplete"; keep that ingestion-level
+		// message for the runtime while intentional ValueError equivalents
+		// (unsupported structures, merged-cell errors, ...) pass through.
+		var syntaxError *xml.SyntaxError
+		var missingPart *missingWordPartError
+		if errors.As(err, &syntaxError) || errors.As(err, &missingPart) {
+			return nil, fmt.Errorf("Word document is invalid or incomplete: %s: %v", baseName(filePath), err)
+		}
+		return nil, err
+	}
+	return pkg, nil
+}
+
+func parseWordPackage(filePath string, options ...ParseOptions) (*WordPackage, error) {
 	archive, err := openDOCX(filePath)
 	if err != nil {
 		return nil, err
@@ -108,10 +99,15 @@ func parseDOCX(filePath string) ([]Block, error) {
 	defer archive.Close()
 	reader := &wordReader{
 		archive:      archive,
-		assetIndex:   make(map[string]int),
+		images:       make(map[string][]byte),
 		styles:       make(map[string]styleInfo),
 		relations:    make(map[string]map[string]relation),
 		visitedNotes: make(map[string]struct{}),
+		diagnostics:  make([]WordDiagnostic, 0),
+		formula:      BoundedFormulaConverter{},
+	}
+	if len(options) > 0 && options[0].FormulaConverter != nil {
+		reader.formula = options[0].FormulaConverter
 	}
 	if archive.Has("word/styles.xml") {
 		stylesNode, err := archive.part("word/styles.xml")
@@ -138,7 +134,21 @@ func parseDOCX(filePath string) ([]Block, error) {
 	if err := reader.read(); err != nil {
 		return nil, err
 	}
-	return reader.documentBlocks(), nil
+	return &WordPackage{Manifest: reader.manifest(), Images: reader.images}, nil
+}
+
+func (r *wordReader) manifest() WordManifest {
+	blocks := make([]WordManifestBlock, len(r.blocks))
+	copy(blocks, r.blocks)
+	assets := make([]*WordManifestAsset, len(r.assets))
+	copy(assets, r.assets)
+	return WordManifest{
+		Version:            WordParserVersion,
+		Blocks:             blocks,
+		Assets:             assets,
+		Diagnostics:        r.diagnostics,
+		SkippedObjectCount: r.skipped,
+	}
 }
 
 func (r *wordReader) read() error {
@@ -187,6 +197,17 @@ func (r *wordReader) read() error {
 		if err := r.walk(partNode, target, posixBase(target)); err != nil {
 			return err
 		}
+	}
+	for index := range r.blocks {
+		r.blocks[index].Order = index
+	}
+	skipped, err := r.associate()
+	if err != nil {
+		return err
+	}
+	r.skipped = skipped
+	for index := range r.blocks {
+		r.blocks[index].Order = index
 	}
 	return nil
 }
@@ -269,9 +290,46 @@ func (r *wordReader) style(paragraph *xmlNode) []string {
 	return names
 }
 
+func (r *wordReader) location(part, scope string) WordLocation {
+	return WordLocation{
+		Part:      part,
+		Paragraph: r.paragraph,
+		Headings:  cloneStrings(r.headings),
+		Scope:     scope,
+		Section:   r.section,
+	}
+}
+
+// blockExtra carries the optional manifest fields of one emitted block.
+type blockExtra struct {
+	assetID    string
+	bookmarks  []string
+	references []string
+	inCell     bool
+}
+
+// appendBlock ports WordReader.block: bounded append with a stable serial ref.
+func (r *wordReader) appendBlock(kind, text string, location WordLocation, extra blockExtra) error {
+	r.characters += utf8.RuneCountInString(text)
+	if r.characters > MaxExtractedCharacters {
+		return fmt.Errorf("Word extracted text exceeds the size limit")
+	}
+	r.serial++
+	r.blocks = append(r.blocks, WordManifestBlock{
+		Ref:        "block-" + strconv.Itoa(r.serial),
+		Kind:       kind,
+		Text:       text,
+		Location:   location,
+		AssetID:    extra.assetID,
+		InCell:     extra.inCell,
+		Bookmarks:  cloneStrings(extra.bookmarks),
+		References: cloneStrings(extra.references),
+	})
+	return nil
+}
+
 // readParagraph ports WordReader.read_paragraph, including the NUL-marker
-// protocol used to splice textbox/note/picture blocks back into paragraph
-// order.
+// protocol used to splice textbox/note/picture blocks back into paragraph order.
 func (r *wordReader) readParagraph(node *xmlNode, part, scope string, emit bool) (string, error) {
 	r.paragraph++
 	headings := cloneStrings(r.headings)
@@ -299,23 +357,32 @@ func (r *wordReader) readParagraph(node *xmlNode, part, scope string, emit bool)
 		r.section++
 		headings = cloneStrings(r.headings)
 	}
+	location := WordLocation{
+		Part:      part,
+		Paragraph: r.paragraph,
+		Headings:  headings,
+		Scope:     scope,
+		Section:   r.section,
+	}
 	if emit {
-		events := make(map[string]wordBlock, len(r.blocks)-offset)
+		events := make(map[string]WordManifestBlock, len(r.blocks)-offset)
 		for _, block := range r.blocks[offset:] {
-			events[block.ref] = block
+			events[block.Ref] = block
 		}
 		r.blocks = r.blocks[:offset]
 		kind := KindParagraph
 		switch {
 		case headingLevel > 0:
 			kind = KindHeading
-		case captionMatch(text):
+		case parseCaption(text) != nil:
 			kind = KindCaption
 		case styleMentionsCaption(styles):
 			kind = KindCaption
 		case noteLine.MatchString(text):
 			kind = KindNote
 		}
+		bookmarks := bookmarkNames(node)
+		references := paragraphReferences(node)
 		for _, segment := range splitNULSegments(raw) {
 			if strings.HasPrefix(segment, "\x00") {
 				if event, ok := events[strings.Trim(segment, "\x00")]; ok {
@@ -324,19 +391,21 @@ func (r *wordReader) readParagraph(node *xmlNode, part, scope string, emit bool)
 				continue
 			}
 			if trimmed := strings.TrimSpace(segment); trimmed != "" {
-				if err := r.block(kind, trimmed, headings, ""); err != nil {
+				if err := r.appendBlock(kind, trimmed, location, blockExtra{
+					bookmarks: bookmarks, references: references,
+				}); err != nil {
 					return "", err
 				}
 			}
 		}
 	} else if text != "" {
 		switch {
-		case captionMatch(text):
-			if err := r.block(KindCaption, text, headings, ""); err != nil {
+		case parseCaption(text) != nil:
+			if err := r.appendBlock(KindCaption, text, location, blockExtra{inCell: true}); err != nil {
 				return "", err
 			}
 		case noteLine.MatchString(text):
-			if err := r.block(KindNote, text, headings, ""); err != nil {
+			if err := r.appendBlock(KindNote, text, location, blockExtra{inCell: true}); err != nil {
 				return "", err
 			}
 		}
@@ -348,6 +417,44 @@ func (r *wordReader) readParagraph(node *xmlNode, part, scope string, emit bool)
 		}
 	}
 	return text, nil
+}
+
+// bookmarkNames mirrors `[el.get(w:name) for el in node.iter(w:bookmarkStart)]`.
+func bookmarkNames(node *xmlNode) []string {
+	names := make([]string, 0, 2)
+	node.walkDescendants(func(candidate *xmlNode) bool {
+		if isElement(candidate, nsWord, "bookmarkStart") {
+			value, _ := candidate.wordAttr("name")
+			names = append(names, value)
+		}
+		return true
+	})
+	return names
+}
+
+// paragraphReferences mirrors the REF field xpath in word_reader.read_paragraph.
+func paragraphReferences(node *xmlNode) []string {
+	parts := make([]string, 0, 2)
+	node.walkDescendants(func(candidate *xmlNode) bool {
+		if isElement(candidate, nsWord, "instrText") {
+			parts = append(parts, candidate.Text)
+		}
+		if isElement(candidate, nsWord, "fldSimple") {
+			if value, ok := candidate.wordAttr("instr"); ok {
+				parts = append(parts, value)
+			}
+		}
+		return true
+	})
+	if len(parts) == 0 {
+		return nil
+	}
+	matches := referenceInstruction.FindAllStringSubmatch(strings.Join(parts, " "), -1)
+	references := make([]string, 0, len(matches))
+	for _, match := range matches {
+		references = append(references, match[1])
+	}
+	return references
 }
 
 // inline ports WordReader.inline.
@@ -375,13 +482,21 @@ func (r *wordReader) inline(node *xmlNode, part, scope string) (string, error) {
 		return "", fmt.Errorf("Unsupported embedded chart or diagram at %s, paragraph %d", part, r.paragraph)
 	}
 	if isElement(node, nsMath, "oMath") {
-		return "", fmt.Errorf("Unsupported Word formula at %s, paragraph %d: the Go reader does not implement docxlatex formula conversion", part, r.paragraph)
+		oMathXML, err := serializeOMML(node)
+		if err != nil {
+			return "", fmt.Errorf("Word formula conversion failed: %v", err)
+		}
+		latex, err := r.formula.ConvertOMML(oMathXML)
+		if err != nil {
+			return "", err
+		}
+		return "$" + latex + "$", nil
 	}
 	if isElement(node, nsWord, "object") {
 		return "", fmt.Errorf("Unsupported embedded OLE object at %s, paragraph %d", part, r.paragraph)
 	}
 	if isElement(node, nsDrawingML, "blip") || isElement(node, nsVML, "imagedata") {
-		reference, err := r.picture(node, part)
+		reference, err := r.picture(node, part, scope)
 		if err != nil {
 			return "", err
 		}
@@ -394,7 +509,7 @@ func (r *wordReader) inline(node *xmlNode, part, scope string) (string, error) {
 		}
 		var builder strings.Builder
 		for _, block := range r.blocks[offset:] {
-			builder.WriteString("\x00" + block.ref + "\x00")
+			builder.WriteString("\x00" + block.Ref + "\x00")
 		}
 		return builder.String(), nil
 	}
@@ -456,14 +571,14 @@ func (r *wordReader) noteReference(node *xmlNode, part, scope string) (string, e
 	var builder strings.Builder
 	builder.WriteString(" [" + noteKind + " " + noteID + "]")
 	for _, block := range r.blocks[offset:] {
-		builder.WriteString("\x00" + block.ref + "\x00")
+		builder.WriteString("\x00" + block.Ref + "\x00")
 	}
 	return builder.String(), nil
 }
 
-// picture ports WordReader.picture: validate the relationship/part/content type
-// and register a picture asset, returning the placeholder block ref.
-func (r *wordReader) picture(node *xmlNode, part string) (string, error) {
+// picture ports WordReader.picture: validate the relationship/part/content type,
+// keep the image bytes in the package image map and register a picture asset.
+func (r *wordReader) picture(node *xmlNode, part, scope string) (string, error) {
 	rid := ""
 	for _, name := range []string{"embed", "id", "link"} {
 		if value, ok := node.attrNS(nsRelationships, name); ok && value != "" {
@@ -498,12 +613,49 @@ func (r *wordReader) picture(node *xmlNode, part string) (string, error) {
 		return "", fmt.Errorf("Empty Word image: %s", target)
 	}
 	assetID := "picture-" + strconv.Itoa(len(r.assets)+1)
-	r.assetIndex[assetID] = len(r.assets)
-	r.assets = append(r.assets, &wordAsset{id: assetID, kind: "picture"})
-	if err := r.block(KindPicture, "", cloneStrings(r.headings), assetID); err != nil {
+	imageFile := "images/" + assetID + path.Ext(target)
+	location := r.location(part, scope)
+	labels := make([]string, 0, 3)
+	if container := node.ancestorWhere(func(candidate *xmlNode) bool {
+		return isElement(candidate, nsWord, "drawing") || isElement(candidate, nsWord, "pict")
+	}); container != nil {
+		container.walkDescendants(func(candidate *xmlNode) bool {
+			if !isElement(candidate, nsWordDrawing, "docPr") {
+				return true
+			}
+			for _, key := range []string{"name", "title", "descr"} {
+				value, _ := candidate.attrNS("", key)
+				labels = append(labels, value)
+			}
+			return true
+		})
+	}
+	bookmarks := []string{}
+	if paragraph := node.ancestorWhere(func(candidate *xmlNode) bool {
+		return isElement(candidate, nsWord, "p")
+	}); paragraph != nil {
+		bookmarks = bookmarkNames(paragraph)
+	}
+	mimeCopy := mime
+	imageCopy := imageFile
+	r.assets = append(r.assets, &WordManifestAsset{
+		AssetID:       assetID,
+		Kind:          "picture",
+		ImageFile:     &imageCopy,
+		MIMEType:      &mimeCopy,
+		Caption:       "",
+		CaptionSource: "none",
+		Captions:      make([]WordAnnotation, 0),
+		Footnotes:     make([]WordAnnotation, 0),
+		Location:      location,
+		Labels:        labels,
+		Bookmarks:     bookmarks,
+	})
+	r.images[assetID] = data
+	if err := r.appendBlock(KindPicture, "", location, blockExtra{assetID: assetID}); err != nil {
 		return "", err
 	}
-	return r.blocks[len(r.blocks)-1].ref, nil
+	return r.blocks[len(r.blocks)-1].Ref, nil
 }
 
 // readTable ports WordReader.read_table: gridBefore/gridSpan/gridAfter,
@@ -511,14 +663,35 @@ func (r *wordReader) picture(node *xmlNode, part string) (string, error) {
 // rejection of legacy horizontal merges and invalid grids.
 func (r *wordReader) readTable(node *xmlNode, part, scope string, parentCell *cellRef) (string, error) {
 	assetID := "table-" + strconv.Itoa(len(r.assets)+1)
-	headings := cloneStrings(r.headings)
-	asset := &wordAsset{id: assetID, kind: "table", parentCell: parentCell}
-	assetIndex := len(r.assets)
-	r.assetIndex[assetID] = assetIndex
-	r.assets = append(r.assets, asset)
-	if err := r.block("table", "", headings, assetID); err != nil {
+	location := r.location(part, scope)
+	table := &WordTableData{
+		Rows:       make([][]string, 0),
+		Cells:      make([]WordTableCellData, 0),
+		Footnotes:  make([]string, 0),
+		HeaderRows: make([][]string, 0),
+		ParentCell: nil,
+	}
+	if parentCell != nil {
+		table.ParentCell = &WordParentCell{AssetID: parentCell.assetID, Row: parentCell.row, Col: parentCell.col}
+	}
+	r.assets = append(r.assets, &WordManifestAsset{
+		AssetID:       assetID,
+		Kind:          "table",
+		ImageFile:     nil,
+		MIMEType:      nil,
+		Caption:       "",
+		CaptionSource: "none",
+		Captions:      make([]WordAnnotation, 0),
+		Footnotes:     make([]WordAnnotation, 0),
+		Table:         table,
+		Location:      location,
+		Labels:        make([]string, 0),
+		Bookmarks:     bookmarkNames(node),
+	})
+	if err := r.appendBlock("table", "", location, blockExtra{assetID: assetID}); err != nil {
 		return "", err
 	}
+	assetIndex := len(r.assets) - 1
 	columns := 0
 	if grid := node.child(nsWord, "tblGrid"); grid != nil {
 		columns = len(grid.Children)
@@ -567,22 +740,22 @@ func (r *wordReader) readTable(node *xmlNode, part, scope string, parentCell *ce
 			}
 			if continuation {
 				anchorIndex, ok := active[column]
-				if !ok || anchorIndex >= len(r.assets[assetIndex].cells) ||
-					r.assets[assetIndex].cells[anchorIndex].colSpan != span {
+				if !ok || anchorIndex >= len(r.assets[assetIndex].Table.Cells) ||
+					r.assets[assetIndex].Table.Cells[anchorIndex].ColSpan != span {
 					return "", fmt.Errorf("Broken vertical table merge: %s, row %d", assetID, rowNumber+1)
 				}
 				if len(cellText) > 0 || len(nested) > 0 {
 					return "", fmt.Errorf("Unexpected content in merged continuation: %s", assetID)
 				}
-				r.assets[assetIndex].cells[anchorIndex].rowSpan++
+				r.assets[assetIndex].Table.Cells[anchorIndex].RowSpan++
 				nextActive[column] = anchorIndex
 				values = append(values, make([]string, span)...)
 			} else {
 				value := strings.Join(cellText, "\n")
-				r.assets[assetIndex].cells = append(r.assets[assetIndex].cells, tableCell{
-					row: rowNumber, col: column, rowSpan: 1, colSpan: span, text: value, nestedTables: nested,
+				r.assets[assetIndex].Table.Cells = append(r.assets[assetIndex].Table.Cells, WordTableCellData{
+					Row: rowNumber, Col: column, RowSpan: 1, ColSpan: span, Text: value, NestedTables: nested,
 				})
-				index := len(r.assets[assetIndex].cells) - 1
+				index := len(r.assets[assetIndex].Table.Cells) - 1
 				values = append(values, value)
 				values = append(values, make([]string, span-1)...)
 				if vmerge != nil {
@@ -602,24 +775,24 @@ func (r *wordReader) readTable(node *xmlNode, part, scope string, parentCell *ce
 		if len(values) > columns {
 			columns = len(values)
 		}
-		r.assets[assetIndex].rows = append(r.assets[assetIndex].rows, values)
+		r.assets[assetIndex].Table.Rows = append(r.assets[assetIndex].Table.Rows, values)
 		if row.findPath(wordName("trPr"), wordName("tblHeader")) != nil {
-			r.assets[assetIndex].headerRows = append(r.assets[assetIndex].headerRows, cloneStrings(values))
+			r.assets[assetIndex].Table.HeaderRows = append(r.assets[assetIndex].Table.HeaderRows, cloneStrings(values))
 		}
 	}
-	table := r.assets[assetIndex]
-	if len(table.rows) == 0 || columns == 0 {
+	table = r.assets[assetIndex].Table
+	if len(table.Rows) == 0 || columns == 0 {
 		return "", fmt.Errorf("Empty Word table: %s", assetID)
 	}
-	for index := range table.rows {
-		if missing := columns - len(table.rows[index]); missing > 0 {
-			table.rows[index] = append(table.rows[index], make([]string, missing)...)
+	for index := range table.Rows {
+		if missing := columns - len(table.Rows[index]); missing > 0 {
+			table.Rows[index] = append(table.Rows[index], make([]string, missing)...)
 		}
 	}
-	table.numRows, table.numCols = len(table.rows), columns
-	table.headers = cloneStrings(table.rows[0])
-	if len(table.headerRows) == 0 {
-		table.headerRows = [][]string{cloneStrings(table.headers)}
+	table.NumRows, table.NumCols = len(table.Rows), columns
+	table.Headers = cloneStrings(table.Rows[0])
+	if len(table.HeaderRows) == 0 {
+		table.HeaderRows = [][]string{cloneStrings(table.Headers)}
 	}
 	return assetID, nil
 }
@@ -654,124 +827,6 @@ func (r *wordReader) tableCellContent(container *xmlNode, part, cellScope string
 		}
 	}
 	return nil
-}
-
-// block ports WordReader.block: bounded append with a stable serial ref.
-func (r *wordReader) block(kind, text string, headings []string, assetID string) error {
-	r.characters += utf8.RuneCountInString(text)
-	if r.characters > MaxExtractedCharacters {
-		return fmt.Errorf("Word extracted text exceeds the size limit")
-	}
-	r.serial++
-	r.blocks = append(r.blocks, wordBlock{
-		ref:      "block-" + strconv.Itoa(r.serial),
-		kind:     kind,
-		text:     text,
-		headings: cloneStrings(headings),
-		assetID:  assetID,
-	})
-	return nil
-}
-
-// documentBlocks projects the manifest blocks the way
-// document_readers._docx_blocks does: table assets expand into one row block
-// each, picture assets become "[Image: <asset_id>]" and empty text blocks are
-// dropped.
-func (r *wordReader) documentBlocks() []Block {
-	result := make([]Block, 0, len(r.blocks))
-	for _, block := range r.blocks {
-		if block.assetID != "" {
-			index, ok := r.assetIndex[block.assetID]
-			if !ok {
-				continue
-			}
-			asset := r.assets[index]
-			if asset.kind == "table" {
-				for _, row := range asset.rows {
-					result = append(result, Block{
-						Text:     tableRowText(row),
-						Kind:     KindTableRow,
-						Headings: cloneStrings(block.headings),
-						Table:    index + 1,
-					})
-				}
-				continue
-			}
-			result = append(result, Block{
-				Text:     "[Image: " + asset.id + "]",
-				Kind:     KindPicture,
-				Headings: cloneStrings(block.headings),
-			})
-			continue
-		}
-		if block.text != "" {
-			result = append(result, Block{
-				Text:     block.text,
-				Kind:     block.kind,
-				Headings: cloneStrings(block.headings),
-			})
-		}
-	}
-	return result
-}
-
-// tableRowText mirrors document_readers._docx_blocks' row rendering.
-func tableRowText(row []string) string {
-	cells := make([]string, len(row))
-	for index, cell := range row {
-		cell = strings.ReplaceAll(cell, "\n", " ")
-		cell = strings.ReplaceAll(cell, "|", `\|`)
-		cells[index] = cell
-	}
-	return strings.Join(cells, " | ")
-}
-
-// joinDOCX mirrors document_readers._join_docx.
-func joinDOCX(blocks []Block) string {
-	parts := make([]string, 0, len(blocks))
-	previousTable := 0
-	for _, block := range blocks {
-		if len(parts) > 0 {
-			if block.Table != 0 && block.Table == previousTable {
-				parts = append(parts, "\n")
-			} else {
-				parts = append(parts, "\n\n")
-			}
-		}
-		parts = append(parts, block.Text)
-		previousTable = block.Table
-	}
-	return strings.Join(parts, "")
-}
-
-// captionMatch mirrors word_reader.CAPTION.match using a Python-compatible
-// Unicode word boundary (Go's regexp \b is ASCII-only and has no lookahead).
-func captionMatch(text string) bool {
-	match := captionPrefix.FindStringIndex(text)
-	if match == nil {
-		return false
-	}
-	rest := text[match[1]:]
-	if rest == "" {
-		return true
-	}
-	runeValue, _ := utf8.DecodeRuneInString(rest)
-	return !isPythonWordRune(runeValue)
-}
-
-// isPythonWordRune reports whether rune counts as \w for Python's re module.
-func isPythonWordRune(value rune) bool {
-	return value == '_' || unicode.IsLetter(value) || unicode.IsDigit(value) ||
-		unicode.Is(unicode.Nl, value) || unicode.Is(unicode.No, value)
-}
-
-func styleMentionsCaption(styles []string) bool {
-	for _, style := range styles {
-		if strings.Contains(strings.ToLower(style), "caption") {
-			return true
-		}
-	}
-	return false
 }
 
 // splitNULSegments mirrors re.split(r"(\x00[^\x00]+\x00)", raw) with the
@@ -841,4 +896,13 @@ func cloneStrings(values []string) []string {
 	cloned := make([]string, len(values))
 	copy(cloned, values)
 	return cloned
+}
+
+// baseName is filepath.Base without importing path/filepath into the reader.
+func baseName(path string) string {
+	index := strings.LastIndexAny(path, `/\`)
+	if index < 0 {
+		return path
+	}
+	return path[index+1:]
 }

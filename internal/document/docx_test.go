@@ -264,6 +264,23 @@ func TestDOCXMalformedPackages(t *testing.T) {
 	}
 }
 
+func TestParseWordPackageStructuralErrors(t *testing.T) {
+	missing := buildDOCX(t, docxEntry{name: "[Content_Types].xml", body: contentTypesXML()})
+	_, err := ParseWordPackage(missing)
+	want := "Word document is invalid or incomplete: fixture.docx: missing Word part: word/document.xml"
+	if err == nil || err.Error() != want {
+		t.Fatalf("missing part error = %v, want %q", err, want)
+	}
+	invalid := buildDOCX(t,
+		docxEntry{name: "[Content_Types].xml", body: contentTypesXML()},
+		docxEntry{name: "word/document.xml", body: `<w:document`},
+	)
+	_, err = ParseWordPackage(invalid)
+	if err == nil || !strings.Contains(err.Error(), "Word document is invalid or incomplete: fixture.docx") {
+		t.Fatalf("malformed XML error = %v", err)
+	}
+}
+
 func TestDOCXRejectsUnsupportedStructures(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -291,9 +308,9 @@ func TestDOCXRejectsUnsupportedStructures(t *testing.T) {
 			message: "Unsupported embedded Word content",
 		},
 		{
-			name:    "formula",
-			body:    `<w:p><w:r><m:oMath><m:r><m:t>x</m:t></m:r></m:oMath></w:r></w:p>`,
-			message: "Unsupported Word formula",
+			name:    "unsupported formula structure",
+			body:    `<w:p><w:r><m:oMath><m:unknown><m:r><m:t>x</m:t></m:r></m:unknown></m:oMath></w:r></w:p>`,
+			message: "Unsupported Word formula structure",
 		},
 		{
 			name: "horizontal merge",
