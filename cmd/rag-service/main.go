@@ -88,6 +88,7 @@ func run() error {
 	}
 	api := httpapi.New(serviceSettings, service, nil, logger,
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: service}),
+		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithAPIKeyStore(apikeys.New(stores.APIKeys)),
 		httpapi.WithCatalogStore(catalogStore),
 		httpapi.WithToolRegistry(mcpEndpoint),

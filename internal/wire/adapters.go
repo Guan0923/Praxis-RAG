@@ -9,6 +9,7 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
+	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
 	"github.com/Guan0923/xinghe_rag/internal/mcp"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
 )
@@ -196,4 +197,40 @@ func (a HTTPRuntime) PublishedVersions(ctx context.Context, namespace string) (m
 // UploadLeases implements httpapi.UploadStatusRuntime.
 func (a HTTPRuntime) UploadLeases(ctx context.Context, namespace string) ([]map[string]any, error) {
 	return a.Service.UploadLeases(ctx, namespace)
+}
+
+// ListKnowledgeBases implements httpapi.KnowledgeBaseAdminRuntime.
+func (a HTTPRuntime) ListKnowledgeBases(ctx context.Context) ([]map[string]any, error) {
+	return a.Service.ListKnowledgeBases(ctx)
+}
+
+// CreateKnowledgeBase implements httpapi.KnowledgeBaseAdminRuntime.
+func (a HTTPRuntime) CreateKnowledgeBase(ctx context.Context, input httpapi.KnowledgeBaseCreateInput) (map[string]any, error) {
+	return a.Service.CreateKnowledgeBase(ctx, kbconfig.CreateInput{
+		Namespace:       input.Namespace,
+		Chunking:        input.Chunking,
+		EmbeddingModel:  input.EmbeddingModel,
+		RerankerModel:   input.RerankerModel,
+		EmbeddingValues: input.EmbeddingValues,
+		RerankerValues:  input.RerankerValues,
+		TokenizerModel:  a.Service.Config().ChunkTokenizerModel,
+	})
+}
+
+// UpdateKnowledgeBase implements httpapi.KnowledgeBaseAdminRuntime.
+func (a HTTPRuntime) UpdateKnowledgeBase(ctx context.Context, namespace string, input httpapi.KnowledgeBaseUpdateInput) (map[string]any, error) {
+	return a.Service.UpdateKnowledgeBase(ctx, namespace, kbconfig.UpdateInput{
+		Values:  input.Values,
+		Reembed: input.Reembed,
+	})
+}
+
+// KnowledgeBaseKey implements httpapi.KnowledgeBaseAdminRuntime.
+func (a HTTPRuntime) KnowledgeBaseKey(ctx context.Context, namespace, kind string) (string, error) {
+	return a.Service.KnowledgeBaseKey(ctx, namespace, kind)
+}
+
+// KnowledgeBaseModels implements httpapi.KnowledgeBaseAdminRuntime.
+func (a HTTPRuntime) KnowledgeBaseModels(ctx context.Context, kind string, values map[string]any, namespace *string) ([]string, error) {
+	return a.Service.KnowledgeBaseModels(ctx, kind, values, namespace)
 }
