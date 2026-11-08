@@ -84,6 +84,7 @@ func (e *SearchEngine) Search(
 		return nil, searchError(err)
 	}
 	payload["snapshot_context"] = snapshot
+	payload = normalizeSearchPayload(payload)
 	if e.references != nil {
 		payload, _ = e.references.Capture(ctx, namespace, payload, true)
 	}
@@ -224,7 +225,36 @@ func (e *SearchEngine) SearchRaw(ctx context.Context, namespace string, request 
 		return nil, searchError(err)
 	}
 	payload["snapshot_context"] = snapshot
-	return payload, nil
+	return normalizeSearchPayload(payload), nil
+}
+
+// normalizeSearchPayload renders the orchestrator payload as the JSON-shaped
+// contract consumed by reference capture and result snapshots.
+//
+// Python's retrieval returns a list of dicts; the Go projector returns
+// []map[string]any. internal/searchrefs.project iterates only []any (so typed
+// results would silently skip artifact registration) and
+// state.ResultSnapshots.Prepare rejects any other slice type (so snapshots would
+// degrade to snapshot_available=false). Normalizing once at the runtime boundary
+// keeps synchronous HTTP/MCP search and the async worker path on the same shape.
+func normalizeSearchPayload(payload map[string]any) map[string]any {
+	if payload == nil {
+		return nil
+	}
+	results, ok := payload["results"].([]map[string]any)
+	if !ok {
+		return payload
+	}
+	normalized := make([]any, len(results))
+	for index, item := range results {
+		normalized[index] = map[string]any(item)
+	}
+	updated := make(map[string]any, len(payload))
+	for key, value := range payload {
+		updated[key] = value
+	}
+	updated["results"] = normalized
+	return updated
 }
 
 // snapshotInteger normalizes JSON-decoded numbers to integers (Python's ingester

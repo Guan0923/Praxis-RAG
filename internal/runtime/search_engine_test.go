@@ -24,13 +24,28 @@ func mustSearchRequest(t *testing.T, arguments map[string]any) contracts.SearchR
 	return request
 }
 
+// payloadResults reads the JSON-shaped results list ([]any after the runtime
+// boundary normalization) and converts it for the existing assertions; the
+// pre-normalization []map[string]any form stays accepted for fixture payloads.
 func payloadResults(t *testing.T, payload map[string]any) []map[string]any {
 	t.Helper()
-	results, ok := payload["results"].([]map[string]any)
-	if !ok {
+	switch results := payload["results"].(type) {
+	case []map[string]any:
+		return results
+	case []any:
+		converted := make([]map[string]any, 0, len(results))
+		for _, item := range results {
+			hit, ok := item.(map[string]any)
+			if !ok {
+				t.Fatalf("results item = %T %v", item, item)
+			}
+			converted = append(converted, hit)
+		}
+		return converted
+	default:
 		t.Fatalf("results = %T %v", payload["results"], payload["results"])
+		return nil
 	}
-	return results
 }
 
 func payloadDebug(t *testing.T, payload map[string]any) map[string]any {
@@ -525,4 +540,92 @@ func TestSearchSnapshotContext(t *testing.T) {
 		t.Fatalf("SearchRaw() error = %v", err)
 	}
 	assertSnapshot("SearchRaw", raw)
+}
+
+// TestNormalizeSearchPayloadShapes pins the JSON-shaped contract at the runtime
+// boundary: orchestrator results are []map[string]any, while searchrefs and
+// state.ResultSnapshots require []any. Nil payloads and result-less payloads must
+// stay nil/absent, and already-normalized payloads must pass through untouched.
+func TestNormalizeSearchPayloadShapes(t *testing.T) {
+	if normalized := normalizeSearchPayload(nil); normalized != nil {
+		t.Fatalf("normalizeSearchPayload(nil) = %v, want nil", normalized)
+	}
+
+	absent := map[string]any{"query": "E03"}
+	normalizedAbsent := normalizeSearchPayload(absent)
+	if _, present := normalizedAbsent["results"]; present {
+		t.Fatalf("result-less payload gained a results key: %v", normalizedAbsent)
+	}
+	if normalizedAbsent["query"] != "E03" {
+		t.Fatalf("result-less payload lost its other fields: %v", normalizedAbsent)
+	}
+
+	emptyTyped := map[string]any{"query": "E03", "results": []map[string]any{}}
+	normalizedEmpty := normalizeSearchPayload(emptyTyped)
+	emptyResults, ok := normalizedEmpty["results"].([]any)
+	if !ok || emptyResults == nil || len(emptyResults) != 0 {
+		t.Fatalf("empty typed results = %#v, want non-nil []any{}", normalizedEmpty["results"])
+	}
+	if _, stillTyped := emptyTyped["results"].([]map[string]any); !stillTyped {
+		t.Fatalf("normalizeSearchPayload mutated its input: %#v", emptyTyped["results"])
+	}
+
+	typed := map[string]any{
+		"query":            "E03",
+		"snapshot_context": map[string]any{"collection": "knowledge_test"},
+		"results": []map[string]any{
+			{"rank": 1, "document_id": "doc-e03"},
+			{"rank": 2, "document_id": "doc-temp"},
+		},
+	}
+	normalized := normalizeSearchPayload(typed)
+	results, ok := normalized["results"].([]any)
+	if !ok || len(results) != 2 {
+		t.Fatalf("normalized results = %#v", normalized["results"])
+	}
+	first, ok := results[0].(map[string]any)
+	if !ok || first["document_id"] != "doc-e03" {
+		t.Fatalf("normalized first result = %#v", results[0])
+	}
+	if normalized["query"] != "E03" {
+		t.Fatalf("normalized payload lost query: %v", normalized)
+	}
+	if contextMap, ok := normalized["snapshot_context"].(map[string]any); !ok || contextMap["collection"] != "knowledge_test" {
+		t.Fatalf("normalized payload lost snapshot_context: %v", normalized["snapshot_context"])
+	}
+
+	alreadyJSON := map[string]any{"results": []any{map[string]any{"rank": 1}}}
+	normalizedAlready := normalizeSearchPayload(alreadyJSON)
+	if results, ok := normalizedAlready["results"].([]any); !ok || len(results) != 1 {
+		t.Fatalf("already-normalized results changed: %#v", normalizedAlready["results"])
+	}
+}
+
+// TestSearchResultsAreJSONShaped pins the runtime-boundary contract: both the
+// synchronous (captured) payload and the raw worker payload expose results as
+// []any, matching Python's list of dicts and the snapshot/searchrefs contract.
+func TestSearchResultsAreJSONShaped(t *testing.T) {
+	qdrantURL, _ := newFakeQdrantAPI(t, testQueryPoints)
+	modelURL, _ := newFakeModelAPI(t, nil)
+	engine, _ := newSearchEngineForTest(t, qdrantURL, modelURL)
+
+	request := mustSearchRequest(t, map[string]any{
+		"query": "证据", "retrieval": "embedding", "rerank": "none", "candidate_k": 5, "top_k": 2,
+	})
+	payload, err := engine.Search(context.Background(), "alpha", request)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	results, ok := payload["results"].([]any)
+	if !ok || len(results) != 2 {
+		t.Fatalf("Search() results = %T %v, want []any of 2", payload["results"], payload["results"])
+	}
+	raw, err := engine.SearchRaw(context.Background(), "alpha", request)
+	if err != nil {
+		t.Fatalf("SearchRaw() error = %v", err)
+	}
+	rawResults, ok := raw["results"].([]any)
+	if !ok || len(rawResults) != 2 {
+		t.Fatalf("SearchRaw() results = %T %v, want []any of 2", raw["results"], raw["results"])
+	}
 }
