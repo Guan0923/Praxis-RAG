@@ -13,8 +13,19 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 )
+
+type fakeNotifier struct{ namespaces []string }
+
+func (f *fakeNotifier) PromptsChanged(namespace string) {
+	f.namespaces = append(f.namespaces, namespace)
+}
+
+func (f *fakeNotifier) ToolsChanged(namespace string) {
+	f.namespaces = append(f.namespaces, namespace)
+}
 
 type fakeStatus struct{ payload map[string]any }
 
@@ -58,10 +69,15 @@ type testRequest struct {
 	headers map[string]string
 	remote  string
 	host    string
+	body    string
 }
 
 func performRequest(handler http.Handler, request testRequest) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(request.method, request.target, nil)
+	var body io.Reader
+	if request.body != "" {
+		body = strings.NewReader(request.body)
+	}
+	req := httptest.NewRequest(request.method, request.target, body)
 	req.Host = "127.0.0.1:8011"
 	if request.host != "" {
 		req.Host = request.host
@@ -363,3 +379,254 @@ func TestRouterMatching(t *testing.T) {
 		t.Fatalf("trailing slash did not match")
 	}
 }
+
+func newPromptAdminServer(t *testing.T) (*Server, *fakeNotifier) {
+	t.Helper()
+	notifier := &fakeNotifier{}
+	server := New(testSettings(""), fakeStatus{payload: map[string]any{"status": "ok"}}, nil,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithCatalogStore(catalog.NewMemoryStore()),
+		WithChangeNotifier(notifier),
+	)
+	return server, notifier
+}
+
+func adminHeaders(namespace string) map[string]string {
+	return map[string]string{"X-RAG-Namespace": namespace}
+}
+
+func TestAdminPromptLifecycle(t *testing.T) {
+	server, notifier := newPromptAdminServer(t)
+	handler := server.Handler()
+
+	empty := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/admin/prompts", remote: "127.0.0.1:5000", headers: adminHeaders("user-1"),
+	})
+	if empty.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", empty.Code, empty.Body.String())
+	}
+	emptyBody := decodeBody(t, empty)
+	if prompts, ok := emptyBody["prompts"].([]any); !ok || len(prompts) != 0 {
+		t.Fatalf("prompts = %v", emptyBody["prompts"])
+	}
+
+	template := `{"description":"Summary prompt","arguments":[{"name":"topic","required":true}],` +
+		`"messages":[{"role":"user","text":"Summarize {{topic}}"}]}`
+	created := performRequest(handler, testRequest{
+		method:  "PUT",
+		target:  "/v1/admin/prompts/summary",
+		remote:  "127.0.0.1:5000",
+		headers: adminHeaders("user-1"),
+		body:    template,
+	})
+	if created.Code != http.StatusOK {
+		t.Fatalf("put status = %d body = %s", created.Code, created.Body.String())
+	}
+	if body := decodeBody(t, created); body["changed"] != true || body["name"] != "summary" {
+		t.Fatalf("put body = %v", body)
+	}
+	if len(notifier.namespaces) != 1 || notifier.namespaces[0] != "user-1" {
+		t.Fatalf("notifier = %v", notifier.namespaces)
+	}
+
+	unchanged := performRequest(handler, testRequest{
+		method:  "PUT",
+		target:  "/v1/admin/prompts/summary",
+		remote:  "127.0.0.1:5000",
+		headers: adminHeaders("user-1"),
+		body:    template,
+	})
+	if body := decodeBody(t, unchanged); body["changed"] != false {
+		t.Fatalf("unchanged body = %v", body)
+	}
+	if len(notifier.namespaces) != 1 {
+		t.Fatalf("no-op put notified: %v", notifier.namespaces)
+	}
+
+	listed := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/admin/prompts", remote: "127.0.0.1:5000", headers: adminHeaders("user-1"),
+	})
+	prompts := decodeBody(t, listed)["prompts"].([]any)
+	first := prompts[0].(map[string]any)
+	if first["name"] != "summary" || first["description"] != "Summary prompt" {
+		t.Fatalf("prompt = %v", first)
+	}
+	arguments := first["arguments"].([]any)
+	if len(arguments) != 1 || arguments[0].(map[string]any)["description"] != "" {
+		t.Fatalf("arguments = %v", arguments)
+	}
+
+	invalid := performRequest(handler, testRequest{
+		method:  "PUT",
+		target:  "/v1/admin/prompts/bad",
+		remote:  "127.0.0.1:5000",
+		headers: adminHeaders("user-1"),
+		body:    `{"messages":[{"role":"user","text":"{{undeclared}}"}]}`,
+	})
+	if invalid.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid status = %d body = %s", invalid.Code, invalid.Body.String())
+	}
+	if detail, ok := decodeBody(t, invalid)["detail"].([]any); !ok || len(detail) == 0 {
+		t.Fatalf("invalid detail = %s", invalid.Body.String())
+	}
+
+	deleted := performRequest(handler, testRequest{
+		method: "DELETE", target: "/v1/admin/prompts/summary", remote: "127.0.0.1:5000", headers: adminHeaders("user-1"),
+	})
+	if deleted.Code != http.StatusOK || decodeBody(t, deleted)["deleted"] != "summary" {
+		t.Fatalf("delete = %d %s", deleted.Code, deleted.Body.String())
+	}
+	if len(notifier.namespaces) != 2 {
+		t.Fatalf("notifier = %v", notifier.namespaces)
+	}
+	secondDelete := performRequest(handler, testRequest{
+		method: "DELETE", target: "/v1/admin/prompts/summary", remote: "127.0.0.1:5000", headers: adminHeaders("user-1"),
+	})
+	if secondDelete.Code != http.StatusNotFound {
+		t.Fatalf("second delete status = %d", secondDelete.Code)
+	}
+}
+
+func TestPromptAdminRequiresNamespaceHeaderAndCatalog(t *testing.T) {
+	server, _ := newPromptAdminServer(t)
+	missingNamespace := performRequest(server.Handler(), testRequest{
+		method: "GET", target: "/v1/admin/prompts", remote: "127.0.0.1:5000",
+	})
+	if missingNamespace.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", missingNamespace.Code)
+	}
+	if detail := decodeBody(t, missingNamespace)["detail"]; detail != "Invalid RAG namespace." {
+		t.Fatalf("detail = %v", detail)
+	}
+
+	withoutCatalog := New(testSettings(""), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	response := performRequest(withoutCatalog.Handler(), testRequest{
+		method: "GET", target: "/v1/admin/prompts", remote: "127.0.0.1:5000", headers: adminHeaders("user-1"),
+	})
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d", response.Code)
+	}
+}
+
+type fakeToolRegistry struct {
+	defaults     map[string]catalog.ToolSettings
+	descriptions map[string]string
+}
+
+func (f fakeToolRegistry) Configured(string) ([]map[string]any, error) {
+	tools := make([]map[string]any, 0, len(f.defaults))
+	for name, defaults := range f.defaults {
+		enabled := true
+		if defaults.Enabled != nil {
+			enabled = *defaults.Enabled
+		}
+		description := ""
+		if defaults.Description != nil {
+			description = *defaults.Description
+		}
+		tools = append(tools, map[string]any{
+			"name": name, "enabled": enabled, "description": description,
+		})
+	}
+	return tools, nil
+}
+
+func (f fakeToolRegistry) Defaults(_ string, name string) (catalog.ToolSettings, bool) {
+	defaults, ok := f.defaults[name]
+	return defaults, ok
+}
+
+func enabledPtr(value bool) *bool { return &value }
+
+func TestAdminToolSettings(t *testing.T) {
+	registry := fakeToolRegistry{
+		defaults: map[string]catalog.ToolSettings{
+			"search":            {Enabled: enabledPtr(true), Description: strPtr("Search the knowledge base.")},
+			"get_search_result": {Enabled: enabledPtr(true), Description: strPtr("Read a search result.")},
+		},
+	}
+	notifier := &fakeNotifier{}
+	server := New(testSettings(""), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithCatalogStore(catalog.NewMemoryStore()),
+		WithToolRegistry(registry),
+		WithChangeNotifier(notifier),
+	)
+	handler := server.Handler()
+
+	listed := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/admin/tools", remote: "127.0.0.1:5000", headers: adminHeaders("user-1"),
+	})
+	if listed.Code != http.StatusOK {
+		t.Fatalf("list status = %d body = %s", listed.Code, listed.Body.String())
+	}
+	tools := decodeBody(t, listed)["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools = %v", tools)
+	}
+
+	patched := performRequest(handler, testRequest{
+		method:  "PATCH",
+		target:  "/v1/admin/tools/search",
+		remote:  "127.0.0.1:5000",
+		headers: adminHeaders("user-1"),
+		body:    `{"enabled":false,"description":"Custom"}`,
+	})
+	if patched.Code != http.StatusOK {
+		t.Fatalf("patch status = %d body = %s", patched.Code, patched.Body.String())
+	}
+	patchedBody := decodeBody(t, patched)
+	if patchedBody["changed"] != true {
+		t.Fatalf("patch body = %v", patchedBody)
+	}
+	if len(notifier.namespaces) != 1 {
+		t.Fatalf("notifier = %v", notifier.namespaces)
+	}
+
+	unchanged := performRequest(handler, testRequest{
+		method:  "PATCH",
+		target:  "/v1/admin/tools/search",
+		remote:  "127.0.0.1:5000",
+		headers: adminHeaders("user-1"),
+		body:    `{"enabled":false,"description":"Custom"}`,
+	})
+	if decodeBody(t, unchanged)["changed"] != false {
+		t.Fatalf("unchanged = %s", unchanged.Body.String())
+	}
+
+	unknown := performRequest(handler, testRequest{
+		method:  "PATCH",
+		target:  "/v1/admin/tools/missing",
+		remote:  "127.0.0.1:5000",
+		headers: adminHeaders("user-1"),
+		body:    `{"enabled":true}`,
+	})
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown status = %d", unknown.Code)
+	}
+	if detail := decodeBody(t, unknown)["detail"]; detail != "Unknown registered tool." {
+		t.Fatalf("detail = %v", detail)
+	}
+
+	for _, body := range []string{`{}`, `{"enabled":null}`, `{"enabled":"yes"}`, `{"description":123}`} {
+		invalid := performRequest(handler, testRequest{
+			method:  "PATCH",
+			target:  "/v1/admin/tools/search",
+			remote:  "127.0.0.1:5000",
+			headers: adminHeaders("user-1"),
+			body:    body,
+		})
+		if invalid.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("body %s status = %d", body, invalid.Code)
+		}
+	}
+
+	withoutRegistry := New(testSettings(""), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	response := performRequest(withoutRegistry.Handler(), testRequest{
+		method: "GET", target: "/v1/admin/tools", remote: "127.0.0.1:5000", headers: adminHeaders("user-1"),
+	})
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d", response.Code)
+	}
+}
+
+func strPtr(value string) *string { return &value }

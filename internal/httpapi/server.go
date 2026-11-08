@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 )
@@ -20,6 +21,26 @@ import (
 // StatusProvider renders the secret-free service health payload.
 type StatusProvider interface {
 	Status(ctx context.Context) map[string]any
+}
+
+// Option customizes the HTTP server.
+type Option func(*Server)
+
+// WithCatalogStore enables the MCP catalog administration endpoints.
+func WithCatalogStore(store catalog.Store) Option {
+	return func(s *Server) { s.catalog = store }
+}
+
+// ChangeNotifier receives catalog mutations so the MCP layer can publish
+// tools/list_changed and prompts/list_changed notifications.
+type ChangeNotifier interface {
+	PromptsChanged(namespace string)
+	ToolsChanged(namespace string)
+}
+
+// WithChangeNotifier wires MCP change notifications.
+func WithChangeNotifier(notifier ChangeNotifier) Option {
+	return func(s *Server) { s.notifier = notifier }
 }
 
 // Server hosts the REST API, MCP endpoint, and Console static assets.
@@ -30,12 +51,15 @@ type Server struct {
 	logger   *slog.Logger
 	router   *router
 	webRoot  string
+	catalog  catalog.Store
+	tools    ToolRegistry
+	notifier ChangeNotifier
 	handler  http.Handler
 }
 
 // New builds the HTTP server. A nil StatusProvider falls back to a static
 // healthy payload; a nil KeyLookup disables API-key authentication.
-func New(settings config.ServiceSettings, status StatusProvider, keys KeyLookup, logger *slog.Logger) *Server {
+func New(settings config.ServiceSettings, status StatusProvider, keys KeyLookup, logger *slog.Logger, options ...Option) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -49,6 +73,9 @@ func New(settings config.ServiceSettings, status StatusProvider, keys KeyLookup,
 		logger:   logger,
 		router:   newRouter(),
 		webRoot:  resolveWebRoot(settings.WebRoot),
+	}
+	for _, option := range options {
+		option(server)
 	}
 	server.registerRoutes()
 	server.handler = server.buildHandler()
@@ -65,6 +92,11 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/health", authNone, s.handleHealth)
 	s.router.add("GET", "/v1/chunking/strategies", authTenant, s.handleChunkingStrategies)
 	s.router.add("GET", "/v1/admin/knowledge-bases/defaults", authAdmin, s.handleKnowledgeBaseDefaults)
+	s.router.add("GET", "/v1/admin/prompts", authAdmin, s.handleListPrompts)
+	s.router.add("PUT", "/v1/admin/prompts/{name}", authAdmin, s.handlePutPrompt)
+	s.router.add("DELETE", "/v1/admin/prompts/{name}", authAdmin, s.handleDeletePrompt)
+	s.router.add("GET", "/v1/admin/tools", authAdmin, s.handleListTools)
+	s.router.add("PATCH", "/v1/admin/tools/{name}", authAdmin, s.handlePatchTool)
 
 	if s.webRoot != "" {
 		s.router.add("GET", "/", authNone, s.handleConsoleIndex)
@@ -122,6 +154,9 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if len(result.params) > 0 {
+		r = r.WithContext(context.WithValue(r.Context(), pathParamsContext{}, result.params))
+	}
 
 	result.route.handler(recorder, r)
 }
@@ -136,6 +171,9 @@ func (s *Server) logRequest(r *http.Request, recorder *statusRecorder, started t
 }
 
 type namespaceContextKey struct{}
+
+// pathParamsContext carries router path parameters to handlers.
+type pathParamsContext struct{}
 
 // NamespaceFromContext returns the authenticated tenant namespace.
 func NamespaceFromContext(ctx context.Context) (string, bool) {
