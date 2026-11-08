@@ -230,7 +230,7 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 | `RAG_DOCUMENT_DLQ_GROUP` | `praxis_document_dead_letters` | 文档死信处理组（不是 topic） |
 | `RAG_SEARCH_TOPIC` / `RAG_SEARCH_GROUP` | `praxis_search` / `praxis_search_workers` | 排队搜索队列 |
 | `RAG_SEARCH_DLQ_GROUP` | `praxis_search_dead_letters` | 搜索死信处理组（不是 topic） |
-| `RAG_OUTBOX_BRIDGE` | `relay` | **未实现 `debezium` 模式**；Go 服务配置 broker 时总是启用进程内 relay |
+| `RAG_OUTBOX_BRIDGE` | `relay` | `relay`：进程内发布发件箱；`debezium`：应用不发布，由 MySQL binlog CDC 投递（需 compose `debezium` profile / 外部 Debezium；两者不可同时启用） |
 | `RAG_DOCUMENT_BROKER_MAX_RETRIES` | `5` | 文档 worker 消费最大尝试次数（也可用 `RAG_DOCUMENT_MAX_ATTEMPTS`） |
 
 正常 Broker DLQ topic 是 `%DLQ%<源消费组>`：默认 `%DLQ%praxis_document_ingest_workers`、`%DLQ%praxis_search_workers`。死信 worker 用独立组（上表 `*_DLQ_GROUP`）读取这些物理 topic；需要预建 topic/组并授予读权限，Broker 自动创建在仓库 Compose 中关闭。
@@ -501,7 +501,7 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 
 `add_document` 在状态库单事务写入完整任务（含文件字节）与发件箱，提交后返回 `{"artifact_id": "<uuid>"}`，不代表已解析/可检索。`get_document_status` 返回 `status`（`queued/processing/succeeded/failed`）、`stage`、`error`；仅 `succeeded` 表示已持久发布。同名文档已存在或已有排队/执行中的新增会被拒绝；不确定提交结果时用同一 `idempotency_key` 重试，不会重复入队。
 
-投递方式：Go 服务在配置 RocketMQ 时启用进程内 relay；未配置时需以 `RAG_DOCUMENT_WORKER_LOCAL=1` 启动文档 worker 直接轮询发件箱。Go 未实现 Python 的 Debezium 模式，不要同时启用 Debezium，否则重复投递。
+投递方式：默认 `RAG_OUTBOX_BRIDGE=relay`，服务进程内发布发件箱；设为 `debezium` 时服务不发布，由外部 Debezium 读取 MySQL binlog 投递（`docker compose --profile debezium up -d`，配置见 [deploy/debezium/README.md](../deploy/debezium/README.md)）。未配置 broker 时可用 `RAG_DOCUMENT_WORKER_LOCAL=1` 让文档 worker 直接轮询发件箱。**不要把 Debezium 与 relay 同时启用**（重复投递）。
 
 ### 资源、提示词与订阅
 
@@ -648,11 +648,14 @@ Go 服务会在 ingest 阶段以子进程方式调用 `rag_mcp.pdf_worker` / `ra
 - **Qdrant**：仅支持 HTTP 模式；`QDRANT_PATH` 会在启动时被拒绝。
 - **Tokenizer**：见 §10；token 预算切分位置可能与 Python 不同。
 - **外部解析器**：PDF（Docling）、DOC（LibreOffice）、Word 视觉描述都不是 Go 内置能力；未配置时相应功能报错。Go 暂未接入 Word 视觉 worker，无图注图片没有生成描述。
-- **异步投递**：Go 只实现 relay 模式（配置 MQ 时进程内轮询发件箱）或本地 worker 模式；无 Debezium 模式；`RAG_OUTBOX_BRIDGE` 对 Go 不生效。
+- **异步投递**：支持 relay（默认，进程内发件箱发布）、debezium（MySQL binlog CDC，应用不发布）与本地 worker 模式；Debezium 模式需要 MySQL 状态库。
 - **排队搜索**：`RAG_ROCKETMQ_ENDPOINT` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 MQ。
 - **REST 上传/更新/删除**仍同步执行，大文件索引期间请求会等待；异步只用于 MCP `add_document`。
 - **管理边界**：`/v1/admin/*` 仅本机直连；没有账户体系或细粒度多用户权限；工作区不是权限隔离。
 - **数据**：旧 SQLite 状态用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。
 - 具体契约差异（cached read views、静态目录列表等剩余的 P1/P2）见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。
+
+
+
 
 

@@ -191,7 +191,7 @@ MCP search（配置 MQ 时）-> search_task_outbox -> RocketMQ -> rag-search-wor
 
 - 服务与三个 worker 是**独立进程**；`rag-service` 不内嵌消费者。
 - `rag-service` 在配置 `RAG_ROCKETMQ_ENDPOINT` 时启用 in-process outbox relay 和排队搜索；未配置时 MCP 搜索同步、文档通知依赖本地 worker 模式，否则任务保持 `queued`。
-- `RAG_OUTBOX_BRIDGE=debezium` 属于 Python 旧路径，Go 服务当前**总是**在配置 broker 时启用进程内 relay；迁移期不要同时让 Debezium 投递，否则同一条已提交事务会被投递两次（下游幂等，但会产生重复消费）。详见 [GO_MIGRATION](docs/GO_MIGRATION.md) 的“当前切换状态”。
+- **`RAG_OUTBOX_BRIDGE` 支持 `relay`（默认）与 `debezium`**：`relay` 由服务进程内发布发件箱；`debezium` 时服务**不发布**，由外部 Debezium Server 读取 MySQL binlog 投递（Go 已实现该模式并在真实 MySQL 8.0 + Debezium 3.7.1 + RocketMQ 5.3.3 上验证通过，见 [deploy/debezium/README.md](deploy/debezium/README.md)）。两种模式不能同时启用，否则会重复投递。
 
 ## 迁移状态
 
@@ -228,3 +228,4 @@ MCP search（配置 MQ 时）-> search_task_outbox -> RocketMQ -> rag-search-wor
 | [历史开发记录](PROGRESS.md) | 项目早期开发阶段记录，不作为当前功能清单。 |
 
 产品名为 **Praxis-RAG**，Go module 为 `github.com/Guan0923/xinghe_rag`，Python 安装包名为 `praxis-rag`、内部模块仍为 `rag_mcp`。REST 路径、MCP 工具名、环境变量与数据位置尽量保持与 Python 实现一致；差异以 [Go Parity 审计](docs/GO_PARITY_AUDIT.md) 为准。
+

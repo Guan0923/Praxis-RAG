@@ -279,3 +279,38 @@ func TestMySQLUploadJournalRoundTrip(t *testing.T) {
 		t.Fatalf("GetObject() = %q, %v, %v", content, found, err)
 	}
 }
+
+// TestMySQLDocumentTaskLookupSQL executes the document-task correlation queries
+// on MySQL. It exists because these LIKE ... ESCAPE queries used a backslash
+// literal that MySQL rejects (error 1064) while SQLite accepts it; the live
+// Debezium run surfaced the incompatibility, unit SQLite tests could not.
+func TestMySQLDocumentTaskLookupSQL(t *testing.T) {
+	stores := openMySQLTestStores(t)
+	ctx := context.Background()
+	suffix, err := randomHex(6)
+	if err != nil {
+		t.Fatalf("randomHex() error = %v", err)
+	}
+	task := &DocumentJobTask{DocumentJob: DocumentJob{
+		ArtifactID:           "00000000-0000-4000-8000-000000000000",
+		Namespace:            "go-task-lookup-" + suffix,
+		Name:                 "lookup.md",
+		SHA256:               "sha",
+		Size:                 3,
+		ConfigurationVersion: 1,
+	}}
+	operation, err := stores.DocumentJobs.CommittedOperation(ctx, task)
+	if err != nil {
+		t.Fatalf("CommittedOperation() SQL error = %v", err)
+	}
+	if operation != nil {
+		t.Fatalf("CommittedOperation() = %+v, want nil", operation)
+	}
+	busy, err := stores.DocumentJobs.ExecutionBusy(ctx, task)
+	if err != nil {
+		t.Fatalf("ExecutionBusy() SQL error = %v", err)
+	}
+	if busy {
+		t.Fatal("ExecutionBusy() = true, want false")
+	}
+}

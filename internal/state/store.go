@@ -348,9 +348,10 @@ func openMySQL(settings StateSettings) (*sql.DB, error) {
 	config.Addr = net.JoinHostPort(host, strconv.Itoa(port))
 	config.DBName = settings.Database
 	// The Python URL always requests charset=utf8mb4; timestamps are stored as
-	// strings/doubles, so no time parsing is needed.
+	// strings/doubles, so no time parsing is needed. The driver applies utf8mb4
+	// by default; passing "charset" through Params makes the driver run
+	// `SET charset=...`, which MySQL rejects with error 1193.
 	config.ParseTime = false
-	config.Params = map[string]string{"charset": "utf8mb4"}
 	if strings.TrimSpace(settings.SSLCA) != "" {
 		tlsConfig, err := mysqlTLSConfig(settings)
 		if err != nil {

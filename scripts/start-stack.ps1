@@ -210,11 +210,27 @@ if (-not $SkipMigrate) {
     }
 }
 
-if ($MigrateOnly) {
+if ($env:RAG_OUTBOX_BRIDGE -eq "debezium") {
+    Write-Host "Waiting for Debezium to start streaming the document_job_outbox binlog..."
+    $streaming = $false
+    for ($attempt = 0; $attempt -lt 90; $attempt++) {
+        $logs = docker logs praxis-rag-debezium --since 5m 2>&1
+        if ($logs -match "Starting streaming") { $streaming = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if ($streaming) {
+        Write-Host "Debezium is streaming MySQL binlog -> topic $($env:RAG_DOCUMENT_TOPIC)."
+        Write-Host "The Go service will NOT start its in-process relay (RAG_OUTBOX_BRIDGE=debezium)."
+    }
+    else {
+        Write-Warning "Debezium did not report 'Starting streaming' yet; check docker logs praxis-rag-debezium before relying on async uploads."
+    }
+}
+if () {
     Write-Host "Dependencies started and migration finished."
     exit 0
 }
-
 Write-Host "Starting rag-service on http://$($env:RAG_SERVICE_HOST):$($env:RAG_SERVICE_PORT)/console"
 & $ragService
+
 

@@ -359,3 +359,15 @@ REST /v1/admin/tools -> 6 tools
 - Console 构建输出从 `src/rag_mcp/web` 迁移到 `build/web`（vite/构建脚本/Dockerfile/.gitignore/`resolveWebRoot` 同步更新），不再保留 Python 包目录。
 - 文档同步：README/USAGE/DEPLOYMENT/本文件更新为“Python 后端已删除”，`docs/GO_PARITY_AUDIT.md` 标注为历史审计快照；旧设计文档（api-keys/knowledge-base-settings/result-references/state-cache/state-storage）加注为历史设计参考（Go 实现见 `internal/` 对应包）。
 - 验证：`go build ./...`、`go test -count=1 ./...` 全绿；`scripts/build-go.ps1` 全量构建 + 冒烟通过（含迁移后的 `build/web` 路径）。
+
+### 2026-11-08 第十五轮：实现并实机验证 `RAG_OUTBOX_BRIDGE=debezium`
+
+- **实现状态**：`internal/state` 的 bridge 模式移植早已存在（`documents` 使用 `DocumentBridgeModeFromEnv`，debezium 时 `DocumentDispatcher.Relay=nil`，应用不发布），本次补齐运行时可观测性、回归测试、验证脚本与文档，并在真实栈上跑通。
+- **实机环境**：MySQL 8.0.46 + Qdrant + Redis + RocketMQ 5.3.3（gRPC proxy 127.0.0.1:18081）+ Debezium Server 3.7.1.Final；`rag-service` 与 `rag-document-worker` 连接同一栈。
+- **验证链路**：MCP `add_document` → MySQL `document_job_outbox` 提交（保持 PENDING）→ Debezium 读取 binlog → topic `praxis_document_ingest` → worker 消费 → `ProcessDocumentJob` → Qdrant + documents → `get_document_status=succeeded`；REST `/v1/search` 命中该文档。
+- **证据**：`scripts/verify-debezium-e2e.py` 输出 14 PASS / 0 FAIL；发件箱行在投递前后始终 `published_at IS NULL`，服务日志输出 `in-process relay disabled`——证明仅 Debezium 投递。
+- **顺带修复两个 MySQL 兼容缺陷**（SQLite 测试无法暴露，gated MySQL 测试与实机暴露）：
+  1. `internal/state/store.go`：`Config.Params["charset"]` 被驱动执行为 `SET charset=...` → MySQL 1193；改为依赖驱动默认 utf8mb4。
+  2. `internal/state/document_jobs.go`：`LIKE ... ESCAPE '\\'` 在 MySQL 是语法错误；改用 `ESCAPE '!'` 与对应 `escapeLike`，新增 `TestEscapeLikeUsesPortableEscapeCharacter` 与 gated `TestMySQLDocumentTaskLookupSQL`。
+- **MySQL 验证**：本地容器上 `TestMySQLStoreRoundTrip`、`TestMySQLG7StateMachines`、`TestMySQLUploadJournalRoundTrip`、`TestMySQLDocumentTaskLookupSQL` 全部通过。
+- **文档/工具**：README、USAGE、DEPLOYMENT、`deploy/debezium/README.md` 标注为已实现并验证；`scripts/start-stack.ps1` 在 debezium 模式等待 "Starting streaming"；新增可配置的 `scripts/verify-debezium-e2e.py`。

@@ -683,7 +683,7 @@ func (d *DocumentJobs) CommittedOperation(ctx context.Context, task *DocumentJob
 	var operationID string
 	err := d.stores.DB.QueryRowContext(ctx,
 		"SELECT id FROM upload_operations WHERE namespace = ? AND status = ? "+
-			"AND idempotency_key LIKE ? ESCAPE '\\' ORDER BY created_at LIMIT 1",
+			"AND idempotency_key LIKE ? ESCAPE '!' ORDER BY created_at LIMIT 1",
 		task.Namespace, UploadCommitted, escapeLike(prefix)+"%").
 		Scan(&operationID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -708,7 +708,7 @@ func (d *DocumentJobs) CommittedOperation(ctx context.Context, task *DocumentJob
 }
 
 func escapeLike(value string) string {
-	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	replacer := strings.NewReplacer(`!`, `!!`, `%`, `!%`, `_`, `!_`)
 	return replacer.Replace(value)
 }
 
@@ -733,7 +733,7 @@ func (d *DocumentJobs) ExecutionBusy(ctx context.Context, task *DocumentJobTask)
 	var operationID string
 	err := d.stores.DB.QueryRowContext(ctx,
 		"SELECT id FROM upload_operations WHERE namespace = ? AND status IN (?, ?) "+
-			"AND idempotency_key LIKE ? ESCAPE '\\' LIMIT 1",
+			"AND idempotency_key LIKE ? ESCAPE '!' LIMIT 1",
 		task.Namespace, UploadIntent, UploadRunning, escapeLike(prefix)+"%").Scan(&operationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil

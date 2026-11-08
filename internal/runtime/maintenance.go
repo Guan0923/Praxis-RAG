@@ -120,6 +120,9 @@ func (s *Service) StartBackground(ctx context.Context, options ...BackgroundOpti
 		if publisher != nil {
 			s.stores.DocumentDispatcher.Start()
 		}
+		if s.stores.DocumentDispatcher.Mode == "debezium" {
+			log.Printf("Document outbox bridge mode=debezium; in-process relay disabled (external CDC publishes outbox notifications)")
+		}
 	}
 	if s.stores.CacheSync != nil && s.stores.CacheSync.Enabled() {
 		s.stores.CacheSync.Start()

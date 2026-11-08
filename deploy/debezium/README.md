@@ -2,10 +2,11 @@
 
 这个目录让 MySQL 里已经提交的事务**必然**产生一条 RocketMQ 通知，中间不依赖应用进程是否存活。
 
-> **本机实测记录（2026-11-08，Windows + Docker Desktop）**：下表所有配置都已在真实
-> MySQL 8.0.46 + RocketMQ 5.3.3 + Debezium Server 3.7.1.Final 上跑通，端到端链路为
-> `MySQL 事务提交 → binlog → Debezium → topic praxis_document_ingest → 宿主消费 → worker → succeeded`。
-> 排查过程中踩到的坑都写在下面的"实测踩坑"一节。
+> **实测记录（2026-11-08，Windows + Docker Desktop）**：下表配置已在真实
+> MySQL 8.0.46 + RocketMQ 5.3.3 + Debezium Server 3.7.1.Final 上跑通；**Go 后端**
+> （`rag-service` + `rag-document-worker`，`RAG_OUTBOX_BRIDGE=debezium`）也已在该栈完成
+> 端到端验证：MCP `add_document` → MySQL 提交 → binlog → Debezium → topic →
+> worker → `succeeded`，且发件箱行保持 PENDING（应用未发布）。排查坑见下文。
 
 ## 为什么需要它
 
@@ -34,14 +35,32 @@ RAG_MYSQL_DEBEZIUM_USER=debezium
 RAG_MYSQL_DEBEZIUM_PASSWORD=change-me
 ```
 
-2. 一条命令启动并自检（**必须在普通 PowerShell 窗口**运行，agent 沙箱打不开 Docker 的 named pipe）：
+2. 一条命令启动并自检（需要 Docker；本仓库已在 Windows + Docker Desktop 实测）：
 
 ```powershell
-.\scripts\start-debezium-stack.ps1
+.\scripts\start-stack.ps1
 ```
 
-脚本会依次：起依赖 → 等 MySQL healthy → 建 CDC 账号 → 建表 → 预建 topic/group → 起 Debezium → 等 streaming → 打印状态。
-失败会明确抛错，不会假装就绪。
+脚本会依次：起依赖（含 `debezium` profile）→ 等 MySQL healthy → 预建 topic/group →
+执行 `rag-state-migrate --apply` → 等待 Debezium "Starting streaming" → 启动 `dist/bin/rag-service.exe`。
+只想准备依赖与数据库时加 `-MigrateOnly`。
+
+### Go 后端使用
+
+```powershell
+# 构建（一次即可）
+pwsh -File scripts/build-go.ps1 -SkipFrontend
+
+# 终端 1：API（RAG_OUTBOX_BRIDGE=debezium 时不会启动进程内 relay）
+dist\bin\rag-service.exe
+
+# 终端 2：文档 worker（消费 Debezium 投递的 schema-3/Debezium 事件）
+dist\bin\rag-document-worker.exe
+```
+
+两者的 `RAG_*` / `RAG_MYSQL_*` / `RAG_ROCKETMQ_ENDPOINT` 环境必须一致；状态库必须是
+MySQL。端到端验证脚本：`python scripts/verify-debezium-e2e.py`（需要本目录的 compose
+栈与 `dist/bin` 已就绪，脚本使用临时 fake 模型 API，不会写入真实知识库配置）。
 
 3. 用 `RAG_OUTBOX_BRIDGE=debezium` 启动 `rag-service` 和 `rag-document-worker`。
 

@@ -363,9 +363,9 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 | --- | --- | --- |
 | relay（Go 默认且唯一内建） | `RAG_ROCKETMQ_ENDPOINT` 设置 | `rag-service` 进程内轮询 `document_job_outbox` 投递纯通知；搜索请求也由进程内 relay 投递 |
 | 本地单进程 | 不设置 MQ + `RAG_DOCUMENT_WORKER_LOCAL=1` | 文档 worker 直接轮询 outbox；搜索只能是同步（MCP `search` 无 `wait_seconds`） |
-| Debezium | `RAG_OUTBOX_BRIDGE=debezium` + 外部 Debezium | Go **未实现**；不要让 Go relay 与 Debezium 同时投递，否则重复通知 |
+| Debezium | `RAG_OUTBOX_BRIDGE=debezium` + 外部 Debezium | 已实现并验证；应用不发布，由 CDC 投递。不要与 relay 同时启用 |
 
-Go 没有 Debezium CDC 模式：不要启用该 profile；若确需 binlog 桥接，需要另行实现 Go 版本的 bridge，并避免与进程内 relay 双投递。
+Debezium 模式（`RAG_OUTBOX_BRIDGE=debezium`）要求状态库为 MySQL：启动 compose `debezium` profile（或外部 Debezium Server），应用侧保持该环境变量；应用不会启动进程内 relay，避免双投递。已验证组合：MySQL 8.0 + Debezium Server 3.7.1.Final + RocketMQ 5.3.3 + gRPC proxy 5.1.x。
 
 ## 9. 安全与网络
 
@@ -384,5 +384,7 @@ Go 没有 Debezium CDC 模式：不要启用该 profile；若确需 binlog 桥�
 - 三个 worker 的启动/退出码行为（无 broker、错误 backend、非法 `--kind`、`--help`）。
 
 本环境**未验证**：Docker 镜像构建与 Compose profile、systemd 单元、真实 MySQL/Redis/RocketMQ/Qdrant、Go RocketMQ SDK 与 Broker 5.3.3/Proxy 的兼容性、Docling/LibreOffice/视觉模型实链路、多实例并发与故障切换。上线前请在预发环境按本指南逐项演练，并参考 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 的剩余 P1/P2 与 [GO_MIGRATION](GO_MIGRATION.md) 的进行中项。
+
+
 
 
