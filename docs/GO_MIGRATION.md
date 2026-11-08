@@ -82,9 +82,9 @@ assets/                   可选嵌入资源目录（构建时生成，不入库
 | G2 | 上传事务：UploadJournal、租约、blob、制品注册、制品/结果快照、缓存 outbox | 进行中（blob/制品/快照/缓存已落地，Journal/Coordinator 进行中） |
 | G3 | 读取与切分：Markdown/TXT/DOCX 读取、PDF 解析进程编排、五类切分策略 | 已完成基础；资产/PDF chunks/公式进行中 |
 | G4 | 检索：Qdrant 客户端、BM25 sparse、Dense/Hybrid、Reranker、orchestrator | 已完成；runtime 接入进行中 |
-| G5 | 运行时：知识库创建/更新/重向量化、文档 CRUD、搜索、恢复线程 | 进行中（search engine 先行） |
-| G6 | MCP：Streamable HTTP transport、工具/提示词目录、订阅通知 | 工具/提示词/双协议 transport 完成；resources/订阅进行中 |
-| G7 | 异步：Redis 缓存/搜索任务/快照、RocketMQ outbox、文档/搜索/DLQ worker | 待开始（状态表与缓存 outbox 已就绪） |
+| G5 | 运行时：知识库创建/更新/重向量化、文档 CRUD、搜索、恢复线程 | 进行中（Service 已接线：搜索/文档读路径/工件；上传与 KB 管理进行中） |
+| G6 | MCP：Streamable HTTP transport、工具/提示词目录、订阅通知 | 已完成（工具/提示词/resources/订阅/双协议） |
+| G7 | 异步：Redis 缓存/搜索任务/快照、RocketMQ outbox、文档/搜索/DLQ worker | 进行中（redisstate/searchrefs 先行；MQ worker 待开始） |
 | G8 | 迁移 CLI、Docker/脚本/文档切换、等价性回归、删除 Python 后端 | 待开始 |
 
 核心决策补充：
@@ -161,3 +161,29 @@ assets/                   可选嵌入资源目录（构建时生成，不入库
 进行中：`task-6` 文档资产/PDF chunks/公式（go-document）、`task-8` MCP resources/订阅（go-mcp）、`task-9` 上传事务（go-state）、`task-10` runtime 搜索路径（go-retrieval）。
 
 尚未开始的关键路径：`internal/runtime` 文档上传/删除/入库（等待 task-9 上传事务）、Redis 搜索快照/任务与 RocketMQ worker（G7）、管理端知识库创建/更新/重向量化、Console 构建集成与打包切换。
+
+### 2026-11-08 第三轮：运行时与 MCP 全链路接线
+
+新增提交：
+
+- MCP resources/templates/read、artifact URI、subscriptions 与 `Endpoint.DocumentsChanged`（103 用例）。
+- `internal/runtime` 搜索路径：`SearchEngine`（租户缓存 + Qdrant orchestrator + 公开 KB + 结果快照读取，20 用例）。
+- `internal/runtime.Service`：搜索/公开 KB/结果页/文档列表/文档读取（md/txt/docx）/工件分块与下载/去重检查；上传、删除、异步入库暂时返回明确的不支持错误（等待上传事务与 G7）。
+- `internal/wire`：HTTP/MCP 适配器（两个传输层对 `ListDocuments`/`ReadDocument` 的返回类型不同，运行时保持传输无关）+ `Notifier`（含文档变更通知）。
+- `cmd/rag-service`：挂载 `/mcp`（legacy stateful / modern stateless 双协议，API Key + namespace 认证）、Catalog Store、ToolRegistry、ChangeNotifier、DocumentChangeNotifier；`/v1/admin/tools` 直接由 MCP Endpoint 提供。
+
+端到端冒烟（真实 SQLite 状态 + 真实 Go 二进制，`127.0.0.1:18015`）：
+
+```text
+health=ok backend=qdrant state=sqlite
+REST documents=0 supported=.doc,.docx,.md,.pdf,.txt
+REST knowledge-base (missing)=404
+REST admin prompts PUT changed=true
+MCP initialize=200 (Mcp-Session-Id) -> initialized=202 -> tools/list 6 tools
+MCP prompts/list has summary; prompts/get renders "Summarize E03"
+MCP tools/call search -> isError=true, "该知识库没有配置记录，请先创建知识库"
+MCP unauthenticated GET -> 401 + WWW-Authenticate: Bearer
+REST /v1/admin/tools -> 6 tools
+```
+
+当前已知限制（Go 侧）：上传/删除/异步文档状态尚未接线（需要 task-9 上传事务与 G7）；PDF 文本预览需要外部解析器清单（读取原文件可用）；同步搜索结果快照尚未保存（task-13 完成 SearchReferences 后接入）。
