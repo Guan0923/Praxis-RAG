@@ -21,7 +21,9 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
 	"github.com/Guan0923/xinghe_rag/internal/mcp"
+	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
+	"github.com/Guan0923/xinghe_rag/internal/searchrefs"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 	"github.com/Guan0923/xinghe_rag/internal/version"
 	"github.com/Guan0923/xinghe_rag/internal/wire"
@@ -55,11 +57,20 @@ func run() error {
 		return err
 	}
 	defer func() { _ = stores.Close() }()
+	logger := newLogger()
+	cache, err := redisstate.NewFromEnv()
+	if err != nil {
+		return err
+	}
+	if err := redisstate.Attach(stores, cache); err != nil {
+		return err
+	}
+	stores.CacheSync.Start()
 	service, err := runtime.New(ragConfig, stores, serviceSettings.DataRoot)
 	if err != nil {
 		return err
 	}
-	logger := newLogger()
+	service.SearchEngine().SetReferenceCapture(searchrefs.New(stores, logger))
 	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{
 		Runtime:      wire.MCPRuntime{Service: service},

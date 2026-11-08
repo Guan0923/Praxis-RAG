@@ -13,6 +13,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
 	"github.com/Guan0923/xinghe_rag/internal/modelapi"
 	"github.com/Guan0923/xinghe_rag/internal/qdrant"
+	"github.com/Guan0923/xinghe_rag/internal/searchrefs"
 	"github.com/Guan0923/xinghe_rag/internal/sparse"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -32,9 +33,10 @@ type SearchEngine struct {
 	encoder    *sparse.Encoder
 	httpClient *http.Client
 
-	mu      sync.Mutex
-	tenants map[string]*tenantResources
-	closed  bool
+	mu         sync.Mutex
+	tenants    map[string]*tenantResources
+	closed     bool
+	references *searchrefs.Capture
 }
 
 // NewSearchEngine builds the search engine. It validates the local-file
@@ -75,6 +77,9 @@ func (e *SearchEngine) Search(
 	payload, err := tenant.orchestrator.Search(ctx, request)
 	if err != nil {
 		return nil, searchError(err)
+	}
+	if e.references != nil {
+		payload, _ = e.references.Capture(ctx, namespace, payload, true)
 	}
 	return payload, nil
 }
@@ -171,4 +176,13 @@ func searchError(err error) error {
 		return contracts.NewRagOperationError(modelError.Message)
 	}
 	return err
+}
+
+// SetReferenceCapture attaches the search-reference/result-snapshot capture
+// stage (internal/searchrefs). Capture absorbs its own failures, so retrieval
+// results are never lost.
+func (e *SearchEngine) SetReferenceCapture(capture *searchrefs.Capture) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.references = capture
 }
