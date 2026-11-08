@@ -38,6 +38,7 @@ type Runtime interface {
 	ArtifactRuntime
 	DocumentRuntime
 	KnowledgeBaseRuntime
+	UploadStatusRuntime
 }
 
 // WithRuntime wires the service runtime.

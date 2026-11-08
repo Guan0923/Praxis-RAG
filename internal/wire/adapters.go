@@ -177,3 +177,23 @@ func toRecords(items []map[string]any) []mcp.DocumentRecord {
 	}
 	return records
 }
+
+// UploadOperations implements httpapi.UploadStatusRuntime.
+func (a HTTPRuntime) UploadOperations(ctx context.Context, namespace string) ([]map[string]any, error) {
+	return a.Service.UploadOperations(ctx, namespace)
+}
+
+// UploadOperation implements httpapi.UploadStatusRuntime.
+func (a HTTPRuntime) UploadOperation(ctx context.Context, namespace, operationID string) (map[string]any, bool, error) {
+	return a.Service.UploadOperation(ctx, namespace, operationID)
+}
+
+// PublishedVersions implements httpapi.UploadStatusRuntime.
+func (a HTTPRuntime) PublishedVersions(ctx context.Context, namespace string) (map[string]string, error) {
+	return a.Service.PublishedVersions(ctx, namespace)
+}
+
+// UploadLeases implements httpapi.UploadStatusRuntime.
+func (a HTTPRuntime) UploadLeases(ctx context.Context, namespace string) ([]map[string]any, error) {
+	return a.Service.UploadLeases(ctx, namespace)
+}

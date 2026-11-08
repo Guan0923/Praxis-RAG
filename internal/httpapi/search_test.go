@@ -273,3 +273,21 @@ func (f *fakeServiceRuntime) ReadDocumentFile(context.Context, string, string) (
 func (f *fakeServiceRuntime) PublicKnowledgeBase(context.Context, string) (map[string]any, error) {
 	return map[string]any{}, nil
 }
+
+// Upload status read-model methods keep fakeServiceRuntime assignable to the
+// full httpapi.Runtime interface.
+func (f *fakeServiceRuntime) UploadOperations(context.Context, string) ([]map[string]any, error) {
+	return nil, nil
+}
+
+func (f *fakeServiceRuntime) UploadOperation(context.Context, string, string) (map[string]any, bool, error) {
+	return nil, false, nil
+}
+
+func (f *fakeServiceRuntime) PublishedVersions(context.Context, string) (map[string]string, error) {
+	return nil, nil
+}
+
+func (f *fakeServiceRuntime) UploadLeases(context.Context, string) ([]map[string]any, error) {
+	return nil, nil
+}
