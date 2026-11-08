@@ -33,3 +33,14 @@ frontend/*.tsbuildinfo
 /src/rag_mcp/web/
 # pytest temp root when the system temp dir is unavailable (sandboxed shells)
 pytest-of-*/
+
+# Go build output and local test scratch space.
+/bin/
+/rag-service
+/rag-service.exe
+/rag-document-worker
+/rag-document-worker.exe
+/rag-search-worker
+/rag-search-worker.exe
+/rag-dead-letter-worker
+/rag-dead-letter-worker.exe
