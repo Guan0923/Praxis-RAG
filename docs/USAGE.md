@@ -163,7 +163,7 @@ rag-document-worker
 
 | 环境变量 | 默认值 / 作用 |
 | --- | --- |
-| `RAG_ROCKETMQ_ENDPOINT` | Compose 为 `127.0.0.1:8081`；缓存、文档和搜索共用连接 |
+| `RAG_ROCKETMQ_ENDPOINT` | Compose 为 `127.0.0.1:8081`；缓存、文档和搜索共用连接。宿主 8081 被占用时改 `RAG_ROCKETMQ_PROXY_PORT`（如 18081）并同步修改此值 |
 | `RAG_ROCKETMQ_NAMESPACE` | 可选 RocketMQ namespace，与知识库 namespace 不同 |
 | `RAG_ROCKETMQ_ACCESS_KEY` / `RAG_ROCKETMQ_SECRET_KEY` | 可选凭据，仅从环境提供 |
 | `RAG_ROCKETMQ_TLS` | `false`；共享 TLS 开关 |

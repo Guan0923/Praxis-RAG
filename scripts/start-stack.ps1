@@ -26,6 +26,23 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# Docker Desktop 把 CLI 放在自己的目录里，很多终端会话不会继承这一项 PATH，
+# 于是出现 "术语 'docker' 不会被识别"。这里显式解析路径再继续。
+function Resolve-DockerCli {
+    if (Get-Command docker -ErrorAction SilentlyContinue) { return }
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA) | Where-Object { $_ }
+    foreach ($base in $roots) {
+        $bin = Join-Path $base "Docker\Docker\resources\bin"
+        if (Test-Path (Join-Path $bin "docker.exe")) {
+            $env:PATH = $bin + [IO.Path]::PathSeparator + $env:PATH
+            Write-Host "   已把 Docker CLI 目录加入 PATH: $bin" -ForegroundColor DarkGray
+            return
+        }
+    }
+    throw "找不到 docker 命令。请启动 Docker Desktop，或把 '%ProgramFiles%\Docker\Docker\resources\bin' 加入 PATH 后重开终端。"
+}
+Resolve-DockerCli
+
 function Invoke-Compose {
     param([string[]]$Arguments)
     if (Get-Command docker-compose -ErrorAction SilentlyContinue) {

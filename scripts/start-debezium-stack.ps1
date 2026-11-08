@@ -17,6 +17,23 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# Docker Desktop 把 CLI 放在自己的目录里，很多终端会话不会继承这一项 PATH，
+# 于是出现 "术语 'docker' 不会被识别"。这里显式解析路径再继续。
+function Resolve-DockerCli {
+    if (Get-Command docker -ErrorAction SilentlyContinue) { return }
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA) | Where-Object { $_ }
+    foreach ($base in $roots) {
+        $bin = Join-Path $base "Docker\Docker\resources\bin"
+        if (Test-Path (Join-Path $bin "docker.exe")) {
+            $env:PATH = $bin + [IO.Path]::PathSeparator + $env:PATH
+            Write-Host "   已把 Docker CLI 目录加入 PATH: $bin" -ForegroundColor DarkGray
+            return
+        }
+    }
+    throw "找不到 docker 命令。请启动 Docker Desktop，或把 '%ProgramFiles%\Docker\Docker\resources\bin' 加入 PATH 后重开终端。"
+}
+Resolve-DockerCli
+
 function Invoke-Compose {
     param([string[]]$Arguments)
     if (Get-Command docker-compose -ErrorAction SilentlyContinue) { & docker-compose @Arguments }
@@ -56,7 +73,12 @@ if (-not $env:RAG_SEARCH_GROUP) { $env:RAG_SEARCH_GROUP = "praxis_search_workers
 if (-not $env:RAG_ROCKETMQ_TOPIC) { $env:RAG_ROCKETMQ_TOPIC = "praxis_state_cache_refresh" }
 if (-not $env:RAG_SEARCH_TOPIC) { $env:RAG_SEARCH_TOPIC = "praxis_search" }
 
-$documentTopic = "$($env:DEBEZIUM_TOPIC_PREFIX).$db.document_job_outbox"
+# RocketMQ topic names only allow ^[%a-zA-Z0-9_-]+$: the connector default
+# destination <prefix>.<db>.<table> contains dots and is rejected, so the
+# Debezium SMT routes every record to this single legal topic name.
+if (-not $env:RAG_DOCUMENT_TOPIC) { $env:RAG_DOCUMENT_TOPIC = "praxis_document_ingest" }
+if (-not $env:DEBEZIUM_TOPIC_PREFIX) { $env:DEBEZIUM_TOPIC_PREFIX = $env:RAG_DOCUMENT_TOPIC }
+$documentTopic = $env:RAG_DOCUMENT_TOPIC
 $env:RAG_DOCUMENT_TOPIC = $documentTopic
 $env:RAG_OUTBOX_BRIDGE = "debezium"
 $cdcUser = if ($env:RAG_MYSQL_DEBEZIUM_USER) { $env:RAG_MYSQL_DEBEZIUM_USER } else { "debezium" }
@@ -120,14 +142,25 @@ Write-Host "== step 5/5: starting Debezium ==" -ForegroundColor Cyan
 Invoke-Compose(@("--profile", "debezium", "up", "-d", "debezium"))
 
 $streaming = $false
-for ($i = 0; $i -lt 90; $i++) {
+$failure = $null
+for ($i = 0; $i -lt 60; $i++) {
+    $state = (docker inspect --format "{{.State.Status}}" praxis-rag-debezium 2>$null)
     $log = (docker logs praxis-rag-debezium --tail 400 2>&1 | Out-String)
     if ($log -match "Starting streaming|streaming phase|Snapshot completed") { $streaming = $true; break }
-    if ($log -match "Could not|Failed to") { break }
+    if ($log -match "SRCFG00014|Failed to load mandatory config|Failed to start application|Failed to start quarkus") {
+        $failure = "Debezium 配置加载失败（sink/source 属性未生效）"
+        break
+    }
+    if ($state -eq "restarting" -and $log -match "\\bERROR\\b") { $failure = "Debezium 反复重启"; break }
     Start-Sleep -Seconds 3
 }
 if ($streaming) { Write-Host "   Debezium is streaming the binlog" -ForegroundColor Green }
-else { Write-Host "   Debezium streaming not confirmed yet; see logs below" -ForegroundColor Yellow }
+else {
+    Write-Host "   Debezium 未进入 streaming：" -ForegroundColor Red
+    if ($failure) { Write-Host "   $failure" -ForegroundColor Red }
+    docker logs praxis-rag-debezium --tail 30 2>&1 | Write-Host
+    throw "Debezium 启动失败，栈未就绪"
+}
 
 Write-Host ""
 Write-Host "== containers ==" -ForegroundColor Cyan

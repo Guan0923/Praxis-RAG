@@ -90,14 +90,19 @@ services:
       - >-
         sed "s/^brokerIP1=.*/brokerIP1=${RAG_ROCKETMQ_BROKER_IP:-127.0.0.1}/"
         /home/rocketmq/rocketmq-5.3.3/conf/praxis-broker.conf > /tmp/praxis-broker.conf
+        && sed "s/__GRPC_PORT__/${RAG_ROCKETMQ_PROXY_PORT:-8081}/"
+        /tmp/rmq-proxy.template.json > /home/rocketmq/rocketmq-5.3.3/conf/rmq-proxy.json
         && exec sh mqbroker --enable-proxy -c /tmp/praxis-broker.conf
     ports:
-      - "127.0.0.1:8081:8081"
+      # The gRPC proxy advertises its *internal* port to clients, so the host port
+      # must equal the port the proxy binds inside the container (grpcServerPort).
+      # 8081 collides with McAfee (macmnsvc) on some Windows machines.
+      - "127.0.0.1:${RAG_ROCKETMQ_PROXY_PORT:-8081}:${RAG_ROCKETMQ_PROXY_PORT:-8081}"
     volumes:
       - ./deploy/rocketmq-broker.conf:/home/rocketmq/rocketmq-5.3.3/conf/praxis-broker.conf:ro
+      # The gRPC proxy reads conf/rmq-proxy.json (JSON), not the broker properties file.
+      - ./deploy/rocketmq-proxy.json:/tmp/rmq-proxy.template.json:ro
       - rocketmq_data:/home/rocketmq/store
-
-
 
   # Optional CDC bridge: tails the MySQL binlog of the transactional outbox
   # table and publishes one notification per committed upload. Enable with
@@ -109,6 +114,11 @@ services:
     container_name: praxis-rag-debezium
     restart: unless-stopped
     profiles: ["debezium"]
+    # The MySQL connector speaks the RocketMQ remoting protocol and must reach the
+    # broker address the broker advertises. Sharing the broker's network namespace
+    # makes that address (127.0.0.1:10911) directly reachable and keeps the
+    # host-side clients working with the same brokerIP1.
+    network_mode: "service:rocketmq"
     depends_on:
       mysql:
         condition: service_healthy
@@ -120,11 +130,15 @@ services:
       RAG_MYSQL_USER: ${RAG_MYSQL_DEBEZIUM_USER:-debezium}
       RAG_MYSQL_PASSWORD: ${RAG_MYSQL_DEBEZIUM_PASSWORD:?set RAG_MYSQL_DEBEZIUM_PASSWORD in .env}
       RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
+      # Must match the app-side RAG_DOCUMENT_TOPIC (RocketMQ topic names have no dots).
+      RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
+      DEBEZIUM_TOPIC_PREFIX: ${DEBEZIUM_TOPIC_PREFIX:-praxis_document_ingest}
       RAG_ROCKETMQ_NAMESRV: ${RAG_ROCKETMQ_NAMESRV:-rocketmq-namesrv:9876}
       DEBEZIUM_SERVER_ID: ${DEBEZIUM_SERVER_ID:-184054}
       QUARKUS_LOG_LEVEL: ${DEBEZIUM_LOG_LEVEL:-INFO}
     volumes:
-      - ./deploy/debezium/application.properties:/debezium/conf/application.properties:ro
+      # Debezium Server reads its config from /debezium/config (not /debezium/conf).
+      - ./deploy/debezium/application.properties:/debezium/config/application.properties:ro
       - debezium_data:/debezium/data
 
 volumes:

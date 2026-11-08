@@ -5,6 +5,7 @@ pin the wire contract, the poison/DLQ boundary and the ACK rules.
 """
 
 import json
+import os
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -13,6 +14,27 @@ import pytest
 from rag_mcp.state.cache_queue import RocketMQSettings
 from rag_mcp.state.document_jobs import document_job_envelope
 from rag_mcp.state.document_queue import RocketMQDocumentQueue, document_queue_settings
+
+def _rocketmq_log_dir_usable():
+    """The SDK configures a file handler under ~/logs at import time.
+
+    Skip when that path is not writable (sandboxed shells, read-only CI homes)
+    instead of failing with PermissionError from deep inside logging.config.
+    """
+
+    log_dir = os.path.join(os.path.expanduser("~"), "logs", "rocketmq_python")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        # The SDK opens the file itself, so probe the file rather than the directory.
+        with open(os.path.join(log_dir, "rocketmq_client.log"), "a"):
+            pass
+        return True
+    except OSError:
+        return False
+
+
+pytestmark = pytest.mark.skipif(not _rocketmq_log_dir_usable(),
+                               reason="RocketMQ SDK cannot create ~/logs/rocketmq_python")
 
 
 def job():

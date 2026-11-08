@@ -31,3 +31,5 @@ qdrant_storage/
 frontend/node_modules/
 frontend/*.tsbuildinfo
 /src/rag_mcp/web/
+# pytest temp root when the system temp dir is unavailable (sandboxed shells)
+pytest-of-*/
