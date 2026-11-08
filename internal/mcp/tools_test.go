@@ -390,7 +390,7 @@ func TestDocumentOperationResults(t *testing.T) {
 
 	t.Run("delete renames deleted record", func(t *testing.T) {
 		runtime := newFakeRuntime()
-		runtime.listDocuments = []DocumentSummary{{Name: "manual.txt"}}
+		runtime.listDocuments = []DocumentRecord{{"name": "manual.txt"}}
 		runtime.deletePayload = map[string]any{
 			"deleted":   map[string]any{"name": "manual.txt"},
 			"documents": []any{},

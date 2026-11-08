@@ -22,11 +22,12 @@ var namespacePattern = regexp.MustCompile(catalog.NamePattern)
 // transports of exactly one namespace. Sessions can never cross namespaces
 // because every namespace has its own stateful handler.
 type namespaceTransport struct {
-	namespace   string
-	server      *sdk.Server
-	stateful    *sdk.StreamableHTTPHandler
-	stateless   *sdk.StreamableHTTPHandler
-	promptNames map[string]struct{}
+	namespace     string
+	server        *sdk.Server
+	stateful      *sdk.StreamableHTTPHandler
+	stateless     *sdk.StreamableHTTPHandler
+	promptNames   map[string]struct{}
+	resourceNames map[string]struct{}
 }
 
 // Endpoint is the per-service MCP facade: it lazily creates one SDK server and
@@ -126,9 +127,14 @@ func (e *Endpoint) newNamespaceTransport(namespace string) (*namespaceTransport,
 		Capabilities: &sdk.ServerCapabilities{
 			Tools:   &sdk.ToolCapabilities{ListChanged: true},
 			Prompts: &sdk.PromptCapabilities{ListChanged: true},
-			// TODO(G6 resources): advertise resources/listChanged and
-			// resources/subscribe once document resources are ported.
+			Resources: &sdk.ResourceCapabilities{
+				ListChanged: true,
+				Subscribe:   true,
+			},
 		},
+		SubscribeHandler: e.subscribeHandler(namespace),
+		// Python's unsubscribe validates nothing; it only drops bookkeeping.
+		UnsubscribeHandler: func(context.Context, *sdk.UnsubscribeRequest) error { return nil },
 	})
 
 	handlers := make(map[string]sdk.ToolHandler, len(e.entries))
@@ -140,9 +146,10 @@ func (e *Endpoint) newNamespaceTransport(namespace string) (*namespaceTransport,
 	server.AddReceivingMiddleware(e.receivingMiddleware(namespace, handlers))
 
 	transport := &namespaceTransport{
-		namespace:   namespace,
-		server:      server,
-		promptNames: map[string]struct{}{},
+		namespace:     namespace,
+		server:        server,
+		promptNames:   map[string]struct{}{},
+		resourceNames: map[string]struct{}{},
 	}
 	transport.stateful = sdk.NewStreamableHTTPHandler(
 		func(*http.Request) *sdk.Server { return server },
@@ -210,6 +217,18 @@ func (e *Endpoint) receivingMiddleware(namespace string, handlers map[string]sdk
 			case methodPromptsList:
 				params, _ := req.GetParams().(*sdk.ListPromptsParams)
 				return e.listPrompts(ctx, namespace, params)
+			case methodResourcesList:
+				params, _ := req.GetParams().(*sdk.ListResourcesParams)
+				return e.listResources(ctx, namespace, params)
+			case methodResourceTemplates:
+				params, _ := req.GetParams().(*sdk.ListResourceTemplatesParams)
+				return e.listResourceTemplates(ctx, namespace, params)
+			case methodResourcesRead:
+				params, ok := req.GetParams().(*sdk.ReadResourceParams)
+				if !ok || params == nil {
+					return nil, invalidParams("Invalid resource URI")
+				}
+				return e.readResource(ctx, namespace, params)
 			case methodToolsCall:
 				params, ok := req.GetParams().(*sdk.CallToolParamsRaw)
 				if !ok || params == nil {

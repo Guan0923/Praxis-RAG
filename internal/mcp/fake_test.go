@@ -37,7 +37,7 @@ type fakeRuntime struct {
 
 	namespaces []string
 
-	listDocuments []DocumentSummary
+	listDocuments []DocumentRecord
 	listErr       error
 
 	readDocument DocumentContent
@@ -58,6 +58,7 @@ type fakeRuntime struct {
 
 	artifactPayload map[string]any
 	artifactErr     error
+	artifactCalls   []fakeArtifactCall
 
 	addPayload map[string]any
 	addErr     error
@@ -81,11 +82,11 @@ func newFakeRuntime() *fakeRuntime {
 	}
 }
 
-func (f *fakeRuntime) ListDocuments(_ context.Context, namespace string) ([]DocumentSummary, error) {
+func (f *fakeRuntime) ListDocuments(_ context.Context, namespace string) ([]DocumentRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.namespaces = append(f.namespaces, namespace)
-	return append([]DocumentSummary(nil), f.listDocuments...), f.listErr
+	return append([]DocumentRecord(nil), f.listDocuments...), f.listErr
 }
 
 func (f *fakeRuntime) ReadDocument(_ context.Context, namespace, _ string) (DocumentContent, error) {
@@ -142,10 +143,13 @@ func (f *fakeRuntime) GetSearchResult(_ context.Context, namespace, resultID str
 	}, nil
 }
 
-func (f *fakeRuntime) GetArtifact(_ context.Context, namespace, artifactID string, _, _ int) (map[string]any, error) {
+func (f *fakeRuntime) GetArtifact(_ context.Context, namespace, artifactID string, offset, length int) (map[string]any, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.namespaces = append(f.namespaces, namespace)
+	f.artifactCalls = append(f.artifactCalls, fakeArtifactCall{
+		Namespace: namespace, ArtifactID: artifactID, Offset: offset, Length: length,
+	})
 	return f.artifactPayload, f.artifactErr
 }
 
@@ -187,6 +191,14 @@ func (f *fakeRuntime) DeleteDocument(_ context.Context, namespace, name string) 
 		return nil, f.deleteErr
 	}
 	return f.deletePayload, nil
+}
+
+// fakeArtifactCall records one Runtime.GetArtifact invocation.
+type fakeArtifactCall struct {
+	Namespace  string
+	ArtifactID string
+	Offset     int
+	Length     int
 }
 
 // headerTransport injects the tenant headers the HTTP API layer would have

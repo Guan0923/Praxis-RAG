@@ -334,6 +334,12 @@ func TestLegacySessionIsNamespaceBound(t *testing.T) {
 
 func newModernClient(t *testing.T, server *httptest.Server, namespace string) *sdk.ClientSession {
 	t.Helper()
+	return newModernClientWithOptions(t, server, namespace, nil)
+}
+
+func newModernClientWithOptions(t *testing.T, server *httptest.Server, namespace string, options *sdk.ClientOptions) *sdk.ClientSession {
+	t.Helper()
+	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "1"}, options)
 	transport := &sdk.StreamableClientTransport{
 		Endpoint: server.URL + "/mcp",
 		HTTPClient: &http.Client{
@@ -344,7 +350,6 @@ func newModernClient(t *testing.T, server *httptest.Server, namespace string) *s
 			Timeout: 15 * time.Second,
 		},
 	}
-	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "1"}, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {

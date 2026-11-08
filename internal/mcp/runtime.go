@@ -49,11 +49,17 @@ var ErrInvalidNamespace = errors.New("Invalid RAG namespace.")
 // must keep error messages secret-free.
 var ErrUploadConflict = errors.New("upload conflict")
 
-// DocumentSummary is one knowledge-base document as exposed through MCP.
-type DocumentSummary struct {
-	Name string
-	// TODO(G6 resources): carry version/size/modified_at once document change
-	// notifications and resource subscriptions are ported.
+// DocumentRecord is one knowledge-base document: at least {"name": string}
+// plus whatever runtime metadata the service keeps (size, modified_at,
+// chunking, ...). MCP itself only depends on "name"; document change
+// detection compares complete records exactly like
+// rag_mcp.mcp_http.documents_changed.
+type DocumentRecord map[string]any
+
+// Name returns the document filename, or "" when the record is malformed.
+func (r DocumentRecord) Name() string {
+	name, _ := r["name"].(string)
+	return name
 }
 
 // DocumentContent is the stored text and version of one knowledge document.
@@ -68,7 +74,7 @@ type DocumentContent struct {
 // is the error message, matching rag_mcp.server.ToolRegistry.invoke.
 type Runtime interface {
 	// ListDocuments lists the documents of one namespace.
-	ListDocuments(ctx context.Context, namespace string) ([]DocumentSummary, error)
+	ListDocuments(ctx context.Context, namespace string) ([]DocumentRecord, error)
 	// ReadDocument returns the rendered text and current version of a document.
 	ReadDocument(ctx context.Context, namespace, name string) (DocumentContent, error)
 

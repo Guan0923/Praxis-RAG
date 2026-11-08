@@ -322,13 +322,13 @@ func (e *Endpoint) executeDocumentOperation(ctx context.Context, namespace, oper
 		return payload, nil
 
 	case deleteDocumentToolName:
-		documents, err := e.opts.Runtime.ListDocuments(ctx, namespace)
+		before, err := e.opts.Runtime.ListDocuments(ctx, namespace)
 		if err != nil {
 			return nil, err
 		}
 		found := false
-		for _, document := range documents {
-			if document.Name == request.name {
+		for _, document := range before {
+			if document.Name() == request.name {
 				found = true
 				break
 			}
@@ -343,6 +343,10 @@ func (e *Endpoint) executeDocumentOperation(ctx context.Context, namespace, oper
 			}
 			return nil, err
 		}
+		after, err := payloadDocumentRecords(payload)
+		if err != nil {
+			return nil, err
+		}
 		deleted, ok := payload["deleted"]
 		if !ok {
 			return nil, fmt.Errorf("Document operation failed: missing delete result")
@@ -350,13 +354,16 @@ func (e *Endpoint) executeDocumentOperation(ctx context.Context, namespace, oper
 		delete(payload, "deleted")
 		payload["document"] = deleted
 		payload["status"] = "deleted"
-		// TODO(G6 resources/subscriptions): publish resources/list_changed and
-		// notifications/resources/updated from the post-delete document list.
 		delete(payload, "documents")
 		payload["uri"] = resources.DocumentURI(namespace, request.name)
+		e.DocumentsChanged(namespace, before, after)
 		return payload, nil
 
 	case updateDocumentToolName:
+		before, err := e.opts.Runtime.ListDocuments(ctx, namespace)
+		if err != nil {
+			return nil, err
+		}
 		payload, err := e.opts.Runtime.WriteDocument(
 			ctx, namespace, request.name, request.content, true, request.idempotencyKey)
 		if err != nil {
@@ -365,13 +372,50 @@ func (e *Endpoint) executeDocumentOperation(ctx context.Context, namespace, oper
 			}
 			return nil, err
 		}
-		// TODO(G6 resources/subscriptions): publish resources/list_changed and
-		// notifications/resources/updated from the post-write document list.
+		after, err := payloadDocumentRecords(payload)
+		if err != nil {
+			return nil, err
+		}
 		delete(payload, "documents")
 		payload["uri"] = resources.DocumentURI(namespace, request.name)
+		e.DocumentsChanged(namespace, before, after)
 		return payload, nil
 	}
 	return nil, fmt.Errorf("Unknown document operation")
+}
+
+// payloadDocumentRecords extracts the post-write document list the runtime
+// returns for change notifications. Python consumed the same key with
+// result.pop("documents").
+func payloadDocumentRecords(payload map[string]any) ([]DocumentRecord, error) {
+	raw, ok := payload["documents"]
+	if !ok {
+		return nil, fmt.Errorf("Document operation failed: missing document list")
+	}
+	switch typed := raw.(type) {
+	case nil:
+		return nil, nil
+	case []DocumentRecord:
+		return typed, nil
+	case []map[string]any:
+		records := make([]DocumentRecord, 0, len(typed))
+		for _, item := range typed {
+			records = append(records, DocumentRecord(item))
+		}
+		return records, nil
+	case []any:
+		records := make([]DocumentRecord, 0, len(typed))
+		for _, item := range typed {
+			record, ok := item.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("Document operation failed: invalid document list")
+			}
+			records = append(records, DocumentRecord(record))
+		}
+		return records, nil
+	default:
+		return nil, fmt.Errorf("Document operation failed: invalid document list")
+	}
 }
 
 // toolEnabled reports whether one registered tool may execute for this
