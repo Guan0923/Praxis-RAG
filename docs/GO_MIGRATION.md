@@ -319,3 +319,34 @@ REST /v1/admin/tools -> 6 tools
 **全量验证**：`go build ./...` + `go test -count=1 ./...` 全部 23 个包通过（state 165、runtime 79、mq 8、workers 27、httpapi/mcp/searchrefs/检索栈等）。
 
 进行中：task-26（异步 e2e 集成测试）、task-27（P1-6 cached read views / P1-2 / P2 静态服务）、task-28（G8 文档切换）、task-29（真实 rag-mcp-ingest CLI）。
+
+## 当前切换状态（G8）
+
+> 本节是 G8 文档切换时追加的**状态快照**，不修改上方历史记录；后续进度请在本节末尾追加，不要改写历史轮次。快照时间：2026-11-08，以本次文档提交时的仓库状态为准。
+
+### 已切换 / 已验证
+
+- **用户文档已切换到 Go 后端**：[README](../README.md)、[USAGE](USAGE.md)、[DEPLOYMENT](DEPLOYMENT.md) 以 Go 服务 + 三个 worker 为主路径；新增 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 作为契约差异基线。本文历史记录保持原样。
+- **Go 目标后端已具备完整可运行面**：`rag-service`（REST `/v1/*`、MCP `/mcp`、Console `/console`、`/health`、OpenAPI `/openapi.json` + `/docs`、进程内 outbox relay、后台维护循环）、`rag-document-worker`、`rag-search-worker`、`rag-dead-letter-worker`，以及 `rag-service-migrate`、`rag-state-migrate`、`rag-mcp-debug` 和 `rag-mcp-ingest`（真实本地文件/目录批量导入，走运行时上传管线）。
+- **Parity P0 已关闭**：搜索资产投影（`pdf_assets.project_results` 移植）、MCP 排队/同步模式自动选择（按 `RAG_ROCKETMQ_ENDPOINT`）、三个 worker 可执行程序 + `ProcessDocumentJob`/`RecoverDocumentUploads`、已保存 `document.md` 预览；主要 P1（snapshot_context、`/v1/documents/check` 扩展名、KB HTTP 校验、delete annotation、md/txt UTF-8/长度、OpenAPI/docs）已修复并提交。
+- **验证边界**：`go build ./...` 与全量 `go test -count=1 ./...` 通过；`scripts/build-go.ps1` 本机构建 + 冒烟通过；worker 的 `--help`/无 broker/错误 backend/非法 `--kind`/本地 outbox 模式退出码行为已验证。**未连接真实 MySQL/Redis/RocketMQ/Qdrant**，未运行 Docker/Compose/systemd，未在 Go 环境实机验证 Docling/LibreOffice/视觉链路，也没有浏览器 E2E；真实 broker SDK 兼容性是已知风险（见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 与 [DEPLOYMENT](DEPLOYMENT.md)）。
+
+### Python 后端的定位
+
+- `src/rag_mcp/`、`tests/`、`pyproject.toml`、`scripts/start-stack.ps1` 等仍在仓库中：作为**迁移期的 parity oracle 与回退路径**，并保留 Python 外部解析器环境（Docling/视觉）的兼容入口。Go 后端运行不要求安装 Python 包。
+- 数据层兼容：Go 复用既有 MySQL/SQLite schema、`enc:v1:` 凭据与 `~/.praxis-rag/` 配置/数据目录；`rag-state-migrate` 可检查/幂等建表，`rag-service-migrate --apply` 只导入状态、**不重建向量**（需重新上传或等待 reindex）。
+- 文档中已明确标注 Python 旧路径专用项：`RAG_OUTBOX_BRIDGE=debezium`（Go 未实现，配置 broker 时 Go 总是进程内 relay）、Python worker 命令与 `start-stack.ps1`。
+
+### 尚未完成（G8 关闭条件）
+
+1. **真实依赖 e2e**：task-26 的异步链路集成测试（API 受理 → 真实/内存 MQ → document worker → 发布 → 状态终态），以及 MySQL/Redis/RocketMQ/Qdrant 实机回归、Go RocketMQ SDK 与 Broker 5.3.3 + Proxy 兼容性验证。
+2. **剩余 parity 项**：task-27 的 cached read views、P1-2 剩余部分与 P2 静态服务差异；`internal/parity` 黑盒 Python/Go 差分（同请求比较状态码/JSON 关键字段）。task-29 的真实 `rag-mcp-ingest` CLI 已随 `feat(go): real local-directory ingest CLI` 提交，但仍需连接真实 Qdrant/模型 API 做一次导入冒烟。
+3. **已知迁移差异需持续标注**：Go tokenizer 是确定性近似（句子/段落/结构边界一致，token 预算切分可能不同）；PDF/DOC/Word 视觉解析仍依赖外部 Python/LibreOffice 进程；无浏览器 E2E 与 Docker/systemd 实机验证；Word 视觉描述 worker 尚未接入 Go。
+4. **删除 Python 的门槛**：全部 parity 用例、真实依赖冒烟、打包/部署脚本切换与文档更新完成，并保留可回退 tag 后才删除 Python 后端；在此之前 Python 参考实现继续存在。
+
+### 下一步（按依赖顺序）
+
+1. 完成 task-26 异步 e2e 与真实基础设施冒烟（至少 SQLite/MySQL + 内存/真实 RocketMQ 之一）。
+2. 收口 task-27 的 P1/P2；对 `rag-mcp-ingest` 做一次真实 Qdrant/模型 API 小目录冒烟；建立 `internal/parity` 黑盒差分。
+3. 在具备 Docker 的 CI/主机验证镜像、Compose `app`/worker 与 systemd 模板。
+4. 更新 [PROGRESS](../PROGRESS.md)/[VALIDATION](../VALIDATION.md)，随后按 G8 门槛决定删除 Python 后端与切换打包。
