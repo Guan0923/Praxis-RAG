@@ -1,6 +1,6 @@
 // Command rag-mcp-ingest imports local Markdown/TXT/PDF/DOCX/DOC documents into
 // the configured Qdrant knowledge base. It is the Go port of
-// src/rag_mcp/ingest.py: walk a file or directory (sorted, recursive), index each
+// The former Python ingest.py: walk a file or directory (sorted, recursive), index each
 // supported document through the shared runtime upload pipeline, print one OK/
 // SKIP/FAIL line per document, and finish with the Python SUMMARY line.
 //
@@ -362,3 +362,4 @@ Exit codes:
   2  usage or configuration error (bad arguments, RAG_BACKEND, missing knowledge base)
 `)
 }
+
