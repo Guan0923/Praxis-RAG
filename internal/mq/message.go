@@ -1,7 +1,10 @@
 package mq
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 
 	"github.com/Guan0923/xinghe_rag/internal/state"
@@ -68,8 +71,8 @@ func EncodeSearchEnvelope(envelope state.SearchEnvelope) ([]byte, string, error)
 
 // DecodeSearchEnvelope parses and re-validates a schema-2 request envelope.
 func DecodeSearchEnvelope(body []byte) (state.SearchEnvelope, error) {
-	var payload any
-	if err := json.Unmarshal(body, &payload); err != nil {
+	payload, err := decodePayloadUseNumber(body)
+	if err != nil {
 		return state.SearchEnvelope{}, newSafeError(ErrPayloadInvalid, "decode search envelope", err)
 	}
 	envelope, err := state.ValidateSearchEnvelope(payload)
@@ -77,4 +80,26 @@ func DecodeSearchEnvelope(body []byte) (state.SearchEnvelope, error) {
 		return state.SearchEnvelope{}, newSafeError(ErrPayloadInvalid, "decode search envelope", err)
 	}
 	return envelope, nil
+}
+
+// decodePayloadUseNumber decodes exactly one JSON value while keeping every
+// number as json.Number. Python's json module preserves ints, and the queued
+// search contract validates candidate_k/top_k as integers; plain json.Unmarshal
+// would yield float64 and break broker round-trips (the MCP/httpapi decoders use
+// json.Decoder.UseNumber for the same reason).
+func decodePayloadUseNumber(body []byte) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var payload any
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("decode payload: trailing data")
+		}
+		return nil, err
+	}
+	return payload, nil
 }

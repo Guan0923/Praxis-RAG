@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -160,6 +161,7 @@ func (p *Processor) Handle(ctx context.Context, envelope state.SearchEnvelope) b
 	if searchErr != nil {
 		failure = searchErr
 	} else {
+		payload = normalizePayload(payload)
 		payload = p.capture(ctx, envelope, payload)
 		if _, completeErr := p.tasks.Complete(ctx, task, payload); completeErr != nil {
 			failure = completeErr
@@ -185,11 +187,60 @@ func (p *Processor) Handle(ctx context.Context, envelope state.SearchEnvelope) b
 // search converts the durable envelope arguments into the validated contract
 // and runs the injected retrieval.
 func (p *Processor) search(ctx context.Context, envelope state.SearchEnvelope, task *state.SearchTask) (map[string]any, error) {
-	request, err := contracts.SearchRequestFromArguments(task.Arguments)
+	request, err := contracts.SearchRequestFromArguments(normalizeArguments(task.Arguments))
 	if err != nil {
 		return nil, err
 	}
 	return p.searcher.Search(ctx, envelope.Namespace, request)
+}
+
+// normalizeArguments restores Python's integer typing for JSON numbers.
+//
+// The state (search_tasks.go scanSearchTask) and mq (DecodeSearchEnvelope)
+// decoders keep integer tokens as json.Number, which the contract validator
+// accepts; this is defence in depth for envelopes built in process or decoded by
+// an older producer that still yield float64 for candidate_k/top_k. Python's
+// json module preserves ints, so an integral float64 carries the same wire value.
+func normalizeArguments(arguments map[string]any) map[string]any {
+	if len(arguments) == 0 {
+		return arguments
+	}
+	normalized := make(map[string]any, len(arguments))
+	for key, value := range arguments {
+		if number, ok := value.(float64); ok && !math.IsNaN(number) && !math.IsInf(number, 0) &&
+			number == math.Trunc(number) && math.Abs(number) <= 1e15 {
+			normalized[key] = int(number)
+			continue
+		}
+		normalized[key] = value
+	}
+	return normalized
+}
+
+// normalizePayload renders programmatic slice values as the JSON-shaped []any the
+// state snapshot and searchrefs layers contract on (Python's json round-trip does
+// this implicitly). SearchEngine.SearchRaw returns results as []map[string]any;
+// state.ResultSnapshots.Prepare requires []any and searchrefs.project iterates
+// []any, so without this normalization the snapshot degrades and artifact
+// references are silently skipped.
+func normalizePayload(payload map[string]any) map[string]any {
+	if payload == nil {
+		return nil
+	}
+	results, ok := payload["results"].([]map[string]any)
+	if !ok {
+		return payload
+	}
+	normalized := make([]any, len(results))
+	for index, item := range results {
+		normalized[index] = map[string]any(item)
+	}
+	updated := make(map[string]any, len(payload))
+	for key, value := range payload {
+		updated[key] = value
+	}
+	updated["results"] = normalized
+	return updated
 }
 
 // capture projects artifacts onto the payload with saveSnapshot=false. Capture

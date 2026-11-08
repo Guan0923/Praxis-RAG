@@ -236,7 +236,14 @@ func scanSearchTask(scanner rowScanner) (*SearchTask, error) {
 		return nil, err
 	}
 	task.Owner = nullStringPointer(owner)
-	if err := json.Unmarshal([]byte(arguments), &task.Arguments); err != nil {
+	// Decode with UseNumber so integer JSON tokens stay json.Number. Python's
+	// json keeps ints as int, and contracts.SearchRequestFromArguments validates
+	// candidate_k/top_k with isinstance(int) semantics; plain json.Unmarshal would
+	// turn them into float64 after the database/broker round-trip and make every
+	// real queued task fail validation.
+	argumentDecoder := json.NewDecoder(strings.NewReader(arguments))
+	argumentDecoder.UseNumber()
+	if err := argumentDecoder.Decode(&task.Arguments); err != nil {
 		return nil, err
 	}
 	return &task, nil
