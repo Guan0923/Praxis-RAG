@@ -216,3 +216,17 @@ REST /v1/admin/tools -> 6 tools
 进行中：task-13 (`internal/redisstate` + `internal/searchrefs`)、task-15（Dockerfile/构建脚本）、task-16（runtime 上传/删除/写入路径，unexported entrypoints，Lead 负责替换 stub 委托）。
 
 下一步：替换 `Upload/Delete/WriteDocument/DeleteDocument` stub 为 task-16 实现；接入 redisstate/searchrefs 生成 result_id 快照；构建 `rag-document-worker` / `rag-search-worker` / `rag-dead-letter-worker` 主程序（RocketMQ 客户端）；最后 G8 打包、parity 回归与 Python 后端删除。
+
+### 2026-11-08 第六轮：Redis 状态层与搜索结果快照接线
+
+已提交：
+
+- `feat(go): Redis state layer, search reference capture and result snapshots wiring`
+  - `internal/redisstate`：Redis StateCache + TransientStore（go-redis，前缀/修订水位/TTL/JSON/禁用 no-op/可用性错误映射，miniredis 测试）。
+  - `internal/searchrefs`：SearchReferences.capture 移植（源文件/PDF·Word side-car/图片·表格资产 → 过期 Artifact 引用 + 不可变结果快照；失败降级不丢检索结果）。
+  - `main.go`：`redisstate.NewFromEnv` → `Attach(stores)` → `stores.CacheSync.Start()`；`runtime.SearchEngine.SetReferenceCapture(searchrefs.New(...))`。
+  - `SearchEngine.Search` 成功后自动捕获引用并写快照（Redis 不可用时 `snapshot_available=false` 安全降级）。
+
+新增依赖：`github.com/alicebob/miniredis/v2 v2.40.0`（+ `yuin/gopher-lua` 间接，测试用）。
+
+进行中：task-15（Dockerfile/构建脚本/Makefile，文件已出现）、task-16（runtime 上传/删除/写入，`documents_publish.go` 已出现）、task-17（`internal/mq` RocketMQ 传输层）。
