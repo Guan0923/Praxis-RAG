@@ -297,3 +297,14 @@ REST /v1/admin/tools -> 6 tools
 - 进行中：task-22（runtime ProcessDocumentJob/RecoverDocumentUploads）、task-23（三个 worker 主程序）、task-24（P0-1 资产投影 + P0-4 document.md 预览）、task-25（snapshot_context/OpenAPI/KB 校验）。
 
 审计建议顺序：P0-4+P0-1（共享资产/版本对象读取）→ P0-2 queued 标志 + MCP 测试 → P0-3 workers + ProcessDocumentJob → P1 批次 → 内部 parity 黑盒差分 → 删除 Python。
+
+### 2026-11-08 第十二轮：G7 闭环（jobs 执行 + 三个 worker 可执行程序）
+
+已提交：
+
+- `feat(go): runtime document-job execution with publication validation`：`Service.ProcessDocumentJob`（终态幂等、身份/执行栅栏校验、KB 版本预检、progress 阶段、journal task 绑定、**事务内 ValidatePublication**、成功 Succeed）、`Service.RecoverDocumentUploads`；`documents_upload.go`/`documents_publish.go` 仅做 nil-safe 增量编辑（Task 字段/进度/事务内校验），65 runtime 测试通过。
+- `feat(go): document, search and dead-letter worker binaries`：`cmd/rag-document-worker`（broker 消费或 `RAG_DOCUMENT_WORKER_LOCAL=1` 本地 outbox 模式 + 30s Recover ticker）、`cmd/rag-search-worker`（消费 schema-2 envelope → `SearchRaw` → `searchrefs.Capture(false)` → `SearchTasks.Complete`）、`cmd/rag-dead-letter-worker`（`--kind search|document`，`%DLQ%<source group>`，仅终态/不存在时 ack）。统一 exit code 0/1/2，worker 不调用 `StartBackground`。
+
+已验证：`go build ./cmd/...`、`go vet ./cmd/...` 全绿；三个二进制实跑：无 broker → 2（明确文案）、错误 backend → 2、`--kind` 非法 → 2、`--help` → 0、document worker 本地模式可启动并创建 SQLite 状态。
+
+**Worker 运行环境要点**（完整表见 CLI 输出/GO_MIGRATION 计划）：共享 `RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`RAG_REDIS_*`、`RAG_BACKEND=qdrant`、`QDRANT_URL`、`RAG_ROCKETMQ_*`；搜索 worker 另有 `RAG_SEARCH_TOPIC/GROUP/MAX_ATTEMPTS`；文档 worker 另有 `RAG_DOCUMENT_TOPIC/GROUP/BROKER_MAX_RETRIES`、`RAG_DOCUMENT_WORKER_LOCAL/POLL_SECONDS/RECOVER_SECONDS`；DLQ worker 另有 `RAG_*_DLQ_GROUP/TOPIC`。
