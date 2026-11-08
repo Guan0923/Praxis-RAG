@@ -1,0 +1,235 @@
+package state
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestDescribePingAndClose(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+
+	description := stores.Describe()
+	if description["backend"] != "sqlite" {
+		t.Fatalf("backend = %v", description["backend"])
+	}
+	expected := filepath.ToSlash(stores.Settings.SQLitePath)
+	if description["database"] != expected {
+		t.Fatalf("database = %v, want %q", description["database"], expected)
+	}
+	if description["host"] != nil {
+		t.Fatalf("host = %v, want nil", description["host"])
+	}
+	if description["encrypted"] != true {
+		t.Fatalf("encrypted = %v", description["encrypted"])
+	}
+	if err := stores.Ping(ctx); err != nil {
+		t.Fatalf("Ping() error = %v", err)
+	}
+	if err := stores.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := stores.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+	if err := stores.Ping(ctx); err == nil {
+		t.Fatal("Ping() after Close() succeeded")
+	}
+}
+
+func TestAutoSchemaCanBeDisabled(t *testing.T) {
+	isolateStateEnv(t)
+	useTestEncryptionKey(t)
+	root := filepath.Join(t.TempDir(), "state")
+	t.Setenv("RAG_STATE_AUTO_SCHEMA", "0")
+	stores, err := Create(root)
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	ctx := context.Background()
+	exists, err := stores.hasTable(ctx, "api_keys")
+	if err != nil {
+		t.Fatalf("hasTable() error = %v", err)
+	}
+	if exists {
+		t.Fatal("RAG_STATE_AUTO_SCHEMA=0 still created the schema")
+	}
+	if err := stores.Ping(ctx); err != nil {
+		t.Fatalf("Ping() error = %v", err)
+	}
+	if err := stores.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	t.Setenv("RAG_STATE_AUTO_SCHEMA", "1")
+	reopened, err := Create(root)
+	if err != nil {
+		t.Fatalf("Create() with auto schema error = %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	exists, err = reopened.hasTable(ctx, "api_keys")
+	if err != nil {
+		t.Fatalf("hasTable() error = %v", err)
+	}
+	if !exists {
+		t.Fatal("reopening with RAG_STATE_AUTO_SCHEMA=1 did not create the schema")
+	}
+}
+
+func TestSchemaCreationCanBeForcedOff(t *testing.T) {
+	isolateStateEnv(t)
+	useTestEncryptionKey(t)
+	settings, err := SettingsFromEnv(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatalf("SettingsFromEnv() error = %v", err)
+	}
+	if !settings.AutoSchema {
+		t.Fatal("default settings should auto-create the schema")
+	}
+	stores, err := Create("", WithSettings(settings), WithSchemaCreation(false))
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	defer func() { _ = stores.Close() }()
+	exists, err := stores.hasTable(context.Background(), "documents")
+	if err != nil {
+		t.Fatalf("hasTable() error = %v", err)
+	}
+	if exists {
+		t.Fatal("WithSchemaCreation(false) still created the schema")
+	}
+}
+
+func TestReopenKeepsPersistedState(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+	settings := map[string]any{"namespace": "alpha", "collection": "c1", "value": float64(1)}
+	if err := stores.KnowledgeBases.Create(ctx, settings); err != nil {
+		t.Fatalf("KnowledgeBases.Create() error = %v", err)
+	}
+	document := DocumentRecord{Name: "a.txt", DocumentID: "doc-a", Collection: "c1", SHA256: "0"}
+	if err := stores.Documents.Upsert(ctx, "alpha", document); err != nil {
+		t.Fatalf("Documents.Upsert() error = %v", err)
+	}
+	created, err := stores.APIKeys.Create(ctx, "app", []string{"alpha"})
+	if err != nil {
+		t.Fatalf("APIKeys.Create() error = %v", err)
+	}
+
+	reopened := reopenStores(t, stores)
+	settingsAfter, err := reopened.KnowledgeBases.Get(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("KnowledgeBases.Get() error = %v", err)
+	}
+	if settingsAfter["collection"] != "c1" {
+		t.Fatalf("collection = %v", settingsAfter["collection"])
+	}
+	version, found, err := reopened.KnowledgeBases.Version(ctx, "alpha")
+	if err != nil || !found || version != 1 {
+		t.Fatalf("Version() = %d, %v, %v", version, found, err)
+	}
+	documentAfter, err := reopened.Documents.Get(ctx, "alpha", "a.txt")
+	if err != nil || documentAfter == nil || documentAfter.DocumentID != "doc-a" {
+		t.Fatalf("Documents.Get() = %+v, %v", documentAfter, err)
+	}
+	secret, err := reopened.APIKeys.SecretForNamespace(ctx, created.ID, "alpha")
+	if err != nil {
+		t.Fatalf("SecretForNamespace() error = %v", err)
+	}
+	if secret != created.Key {
+		t.Fatalf("secret after restart = %q, want the created key", secret)
+	}
+}
+
+func TestInitializeFailureIsWrapped(t *testing.T) {
+	isolateStateEnv(t)
+	directory := t.TempDir()
+	settings := StateSettings{
+		URL:        "sqlite+pysqlite:///" + filepath.ToSlash(directory),
+		SQLitePath: directory,
+		AutoSchema: true,
+	}
+	stores, err := New(settings, true)
+	if stores != nil {
+		_ = stores.Close()
+	}
+	if err == nil {
+		t.Fatal("New() over a directory succeeded")
+	}
+	stateError := mustBeError[*StateError](t, err)
+	if !strings.HasPrefix(stateError.Message, "状态数据库初始化失败：") {
+		t.Fatalf("message = %q", stateError.Message)
+	}
+}
+
+func TestMigrationsAddMissingLegacyColumns(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+	for _, statement := range []string{
+		"ALTER TABLE documents DROP COLUMN del_flag",
+		"ALTER TABLE document_task_outbox DROP COLUMN owner",
+		"ALTER TABLE document_task_outbox DROP COLUMN lease_until",
+		"ALTER TABLE document_task_outbox DROP COLUMN attempts",
+		"ALTER TABLE document_task_outbox DROP COLUMN last_error",
+	} {
+		if _, err := stores.DB.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("%s error = %v", statement, err)
+		}
+	}
+	if columnExists(t, stores, "documents", "del_flag") {
+		t.Fatal("del_flag still exists after the simulated legacy ALTER")
+	}
+
+	reopened := reopenStores(t, stores)
+	if !columnExists(t, reopened, "documents", "del_flag") {
+		t.Fatal("reopen did not add documents.del_flag")
+	}
+	for _, column := range []string{"owner", "lease_until", "attempts", "last_error"} {
+		if !columnExists(t, reopened, "document_task_outbox", column) {
+			t.Fatalf("reopen did not add document_task_outbox.%s", column)
+		}
+	}
+}
+
+func TestListJSONNeverLeaksSecrets(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+	created, err := stores.APIKeys.Create(ctx, "app", []string{"alpha"})
+	if err != nil {
+		t.Fatalf("APIKeys.Create() error = %v", err)
+	}
+	keys, err := stores.APIKeys.List(ctx)
+	if err != nil {
+		t.Fatalf("APIKeys.List() error = %v", err)
+	}
+	encoded, err := json.Marshal(keys)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if strings.Contains(string(encoded), created.Key) {
+		t.Fatalf("list JSON leaked the secret: %s", encoded)
+	}
+	description := stores.Describe()
+	if _, containsSecret := description["key"]; containsSecret {
+		t.Fatal("describe payload exposes a key")
+	}
+}
+
+func TestOpenDatabaseChoosesDialect(t *testing.T) {
+	isolateStateEnv(t)
+	settings, err := SettingsFromEnv(t.TempDir())
+	if err != nil {
+		t.Fatalf("SettingsFromEnv() error = %v", err)
+	}
+	stores, err := New(settings, false)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = stores.Close() }()
+	if stores.Dialect() != DialectSQLite || stores.Dialect().String() != "sqlite" {
+		t.Fatalf("dialect = %v", stores.Dialect())
+	}
+}
