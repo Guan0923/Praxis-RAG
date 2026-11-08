@@ -347,6 +347,11 @@ type storeIndexOptions struct {
 	DeduplicateAcrossNames bool
 	Overwrite              *bool
 	EmbeddingModel         string
+	// Task, when non-nil, binds this publication to one queued document job
+	// (document-walker execution): stage progress, journal Bind and
+	// DocumentJobs.ValidatePublication before the journal commit. Nil keeps the
+	// synchronous upload wording and behavior unchanged.
+	Task *state.DocumentJobTask
 }
 
 // indexConfiguration mirrors _index_configuration + ChunkingConfig.metadata +
@@ -406,6 +411,9 @@ func (s *Service) storeAndIndex(
 	}
 	if operation.Status == state.UploadCommitted {
 		return replayCommittedUpload(operation, options.Content, name)
+	}
+	if options.Task != nil {
+		s.stores.DocumentJobs.Bind(options.Task, operation)
 	}
 
 	workspace := filepath.Join(os.TempDir(), "rag-txn-"+operation.ID)
@@ -505,11 +513,20 @@ func (s *Service) storeAndIndex(
 		return result, nil
 	}
 
+	if err := s.documentJobProgress(ctx, options.Task, "chunking"); err != nil {
+		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+	}
 	indexed, err := s.ingestDocument(ctx, journal, operation, workspace, temporary, name, resources)
 	if err != nil {
 		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
 	}
+	if err := s.documentJobProgress(ctx, options.Task, "staging"); err != nil {
+		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+	}
 	if err := s.stageArtifacts(ctx, journal, operation, indexed); err != nil {
+		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+	}
+	if err := s.documentJobProgress(ctx, options.Task, "embedding"); err != nil {
 		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
 	}
 	vectors, err := s.embedDocument(ctx, journal, operation, indexed, resources)
@@ -525,6 +542,9 @@ func (s *Service) storeAndIndex(
 		payload := asset.Payload(indexed.result.Chunks[0].Source)
 		payload["document_id"] = indexed.result.Chunks[0].DocumentID
 		assetPayloads = append(assetPayloads, payload)
+	}
+	if err := s.documentJobProgress(ctx, options.Task, "indexing"); err != nil {
+		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
 	}
 	stageValue, err := journal.RunStep(ctx, operation, "stage_qdrant", func() (any, error) {
 		count, stageErr := resources.store.StageVersion(ctx, indexed.qdrantChunks, vectors, sparseVectors,
@@ -556,11 +576,20 @@ func (s *Service) storeAndIndex(
 		Chunking:           configuration,
 	}
 	metadata := documentMetadata(name, size, sha256Value, indexed.document, configuration, operation.ID)
+	if options.Task != nil {
+		// Python stores the admitted configuration version with the publication so
+		// the worker's reconcile can prove the same request was indexed.
+		metadata["task_configuration_version"] = options.Task.ConfigurationVersion
+		metadata["task_artifact_id"] = options.Task.ArtifactID
+	}
+	if err := s.documentJobProgress(ctx, options.Task, "publishing"); err != nil {
+		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+	}
 	if err := journal.Intent(ctx, operation, "publish", map[string]any{"version": operation.ID}); err != nil {
 		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
 	}
 	if err := s.publishDocument(ctx, operation, record, metadata, options.Content,
-		indexed.artifactBucket, indexed.result.StagingDir); err != nil {
+		indexed.artifactBucket, indexed.result.StagingDir, options.Task); err != nil {
 		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
 	}
 	if _, cleanupErr := coordinator.CleanupWorkspace(ctx, operation); cleanupErr != nil {

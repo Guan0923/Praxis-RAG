@@ -114,6 +114,7 @@ func (s *Service) publishDocument(
 	content []byte,
 	artifactBucket string,
 	artifactDir string,
+	task *state.DocumentJobTask,
 ) error {
 	transaction, err := s.stores.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -138,6 +139,13 @@ func (s *Service) publishDocument(
 		}
 		if _, err := s.stores.Blobs.PutTreeTx(ctx, transaction, operation.Namespace,
 			artifactBucket, documentID, artifactDir); err != nil {
+			return err
+		}
+	}
+	// A queued document job may only publish while its admitted configuration
+	// version is still current (Python process_document_task validate_publication).
+	if task != nil {
+		if err := s.stores.DocumentJobs.ValidatePublication(ctx, transaction, task); err != nil {
 			return err
 		}
 	}
