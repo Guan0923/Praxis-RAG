@@ -291,15 +291,15 @@ func artifactError(err error) error {
 	return &apierrors.SnapshotUnavailable{Message: "Artifact is unavailable"}
 }
 
-// Upload is wired to the durable upload journal in G2. Until then the endpoint
-// reports the limitation instead of silently dropping a write.
-func (s *Service) Upload(context.Context, string, []UploadFile, string) (map[string]any, error) {
-	return nil, &apierrors.KnowledgeError{Message: "Document upload is not available in this build."}
+// Upload writes and indexes one or more documents through the durable upload
+// journal. See documents_upload.go for the transaction flow.
+func (s *Service) Upload(ctx context.Context, namespace string, files []UploadFile, idempotencyKey string) (map[string]any, error) {
+	return s.uploadDocuments(ctx, namespace, files, idempotencyKey)
 }
 
-// Delete is wired to the upload coordinator in G2.
-func (s *Service) Delete(context.Context, string, string) (map[string]any, error) {
-	return nil, &apierrors.KnowledgeError{Message: "Document deletion is not available in this build."}
+// Delete logically deletes one document through the upload coordinator.
+func (s *Service) Delete(ctx context.Context, namespace, name string) (map[string]any, error) {
+	return s.deleteDocumentByName(ctx, namespace, name)
 }
 
 // AddDocument (async MCP admission) needs the document jobs queue from G7.
@@ -312,14 +312,14 @@ func (s *Service) GetDocumentStatus(context.Context, string, string) (map[string
 	return nil, &apierrors.KnowledgeError{Message: "Document status is not available in this build."}
 }
 
-// WriteDocument (synchronous MCP create/update) shares the upload transaction.
-func (s *Service) WriteDocument(context.Context, string, string, []byte, bool, string) (map[string]any, error) {
-	return nil, &apierrors.KnowledgeError{Message: "Synchronous document writes are not available in this build."}
+// WriteDocument creates or updates one document synchronously (MCP writes).
+func (s *Service) WriteDocument(ctx context.Context, namespace, name string, content []byte, overwrite bool, idempotencyKey string) (map[string]any, error) {
+	return s.writeDocumentContent(ctx, namespace, name, content, overwrite, idempotencyKey)
 }
 
-// DeleteDocument (synchronous MCP delete) shares the upload transaction.
-func (s *Service) DeleteDocument(context.Context, string, string) (map[string]any, error) {
-	return nil, &apierrors.KnowledgeError{Message: "Document deletion is not available in this build."}
+// DeleteDocument deletes one document synchronously (MCP delete).
+func (s *Service) DeleteDocument(ctx context.Context, namespace, name string) (map[string]any, error) {
+	return s.deleteDocumentByName(ctx, namespace, name)
 }
 
 // UploadFile is one client-supplied document for the REST upload endpoint.
