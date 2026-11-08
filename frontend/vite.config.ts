@@ -13,7 +13,7 @@ export default defineConfig({
   })],
   base: "/console/assets/",
   build: {
-    outDir: "../src/rag_mcp/web",
+    outDir: "../build/web",
     emptyOutDir: true,
     assetsDir: "assets",
   },
@@ -28,3 +28,4 @@ export default defineConfig({
     ),
   },
 });
+

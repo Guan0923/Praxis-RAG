@@ -6,7 +6,7 @@
 #   ./scripts/build-go.sh build      # frontend + go
 #   ./scripts/build-go.sh test       # go test ./...
 #   ./scripts/build-go.sh smoke      # start the built service and check /health + /console
-#   ./scripts/build-go.sh clean      # remove dist/ (and the generated src/rag_mcp/web)
+#   ./scripts/build-go.sh clean      # remove dist/ (and the generated build/web)
 #
 # The smoke check needs curl and a free loopback port; it uses a temporary config
 # file, a temporary data root and SQLite, and never touches ~/.praxis-rag.
@@ -17,7 +17,7 @@ DIST="$ROOT/dist"
 BIN_DIR="$DIST/bin"
 WEB_DIR="$DIST/web"
 FRONTEND_DIR="$ROOT/frontend"
-WEB_BUILD_DIR="$ROOT/src/rag_mcp/web"
+WEB_BUILD_DIR="$ROOT/build/web"
 SMOKE_TIMEOUT="${SMOKE_TIMEOUT_SECONDS:-30}"
 
 case "$(uname -s 2>/dev/null || echo unknown)" in
@@ -39,7 +39,7 @@ build_frontend() {
         else
             say "[skip] frontend/node_modules already present"
         fi
-        say "[run] npm run build (vite -> src/rag_mcp/web)"
+        say "[run] npm run build (vite -> build/web)"
         npm run build
     )
     [ -f "$WEB_BUILD_DIR/index.html" ] || fail "Frontend build did not produce $WEB_BUILD_DIR/index.html"
@@ -162,3 +162,4 @@ case "$target" in
         fail "Unknown target '$target' (expected frontend|go|build|test|smoke|clean)"
         ;;
 esac
+

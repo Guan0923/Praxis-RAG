@@ -331,22 +331,31 @@ REST /v1/admin/tools -> 6 tools
 - **Parity P0 已关闭**：搜索资产投影（`pdf_assets.project_results` 移植）、MCP 排队/同步模式自动选择（按 `RAG_ROCKETMQ_ENDPOINT`）、三个 worker 可执行程序 + `ProcessDocumentJob`/`RecoverDocumentUploads`、已保存 `document.md` 预览；主要 P1（snapshot_context、`/v1/documents/check` 扩展名、KB HTTP 校验、delete annotation、md/txt UTF-8/长度、OpenAPI/docs）已修复并提交。
 - **验证边界**：`go build ./...` 与全量 `go test -count=1 ./...` 通过；`scripts/build-go.ps1` 本机构建 + 冒烟通过；worker 的 `--help`/无 broker/错误 backend/非法 `--kind`/本地 outbox 模式退出码行为已验证。**未连接真实 MySQL/Redis/RocketMQ/Qdrant**，未运行 Docker/Compose/systemd，未在 Go 环境实机验证 Docling/LibreOffice/视觉链路，也没有浏览器 E2E；真实 broker SDK 兼容性是已知风险（见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 与 [DEPLOYMENT](DEPLOYMENT.md)）。
 
-### Python 后端的定位
+### Python 后端的定位（已删除）
 
-- `src/rag_mcp/`、`tests/`、`pyproject.toml`、`scripts/start-stack.ps1` 等仍在仓库中：作为**迁移期的 parity oracle 与回退路径**，并保留 Python 外部解析器环境（Docling/视觉）的兼容入口。Go 后端运行不要求安装 Python 包。
+- 原 Python 后端（`src/rag_mcp/` 的 HTTP/MCP/状态/检索/文档/测试、`tests/`、`pyproject.toml`、`uv.lock`）**已从仓库删除**。
+- 仅保留 `python-workers/rag_mcp/`：PDF（Docling）与 Word 视觉解析两个**外部进程 worker** 及其最小依赖闭包（`document_readers`/`chunk_strategies`/`chunking`/`pdf_content`），由 Go 以 `python -m rag_mcp.<worker>` 子进程协议调用；`python-workers/README.md` 记录依赖与 `PYTHONPATH` 约定。
+- `benchmarks/`（Docling 评估脚本）保留为可选研究工具；`examples/` 保留示例知识库文件。
 - 数据层兼容：Go 复用既有 MySQL/SQLite schema、`enc:v1:` 凭据与 `~/.praxis-rag/` 配置/数据目录；`rag-state-migrate` 可检查/幂等建表，`rag-service-migrate --apply` 只导入状态、**不重建向量**（需重新上传或等待 reindex）。
-- 文档中已明确标注 Python 旧路径专用项：`RAG_OUTBOX_BRIDGE=debezium`（Go 未实现，配置 broker 时 Go 总是进程内 relay）、Python worker 命令与 `start-stack.ps1`。
+- 已删除 Python 旧路径专用项：`RAG_OUTBOX_BRIDGE=debezium`（Go 未实现，配置 broker 时 Go 总是进程内 relay）、Python worker 命令、`scripts/start-stack.ps1` 的 Python 入口（已改写为 Go 流程）、`scripts/start-debezium-stack.ps1`。
 
 ### 尚未完成（G8 关闭条件）
 
-1. **真实依赖 e2e**：task-26 的异步链路集成测试（API 受理 → 真实/内存 MQ → document worker → 发布 → 状态终态），以及 MySQL/Redis/RocketMQ/Qdrant 实机回归、Go RocketMQ SDK 与 Broker 5.3.3 + Proxy 兼容性验证。
-2. **剩余 parity 项**：task-27 的 cached read views、P1-2 剩余部分与 P2 静态服务差异；`internal/parity` 黑盒 Python/Go 差分（同请求比较状态码/JSON 关键字段）。task-29 的真实 `rag-mcp-ingest` CLI 已随 `feat(go): real local-directory ingest CLI` 提交，但仍需连接真实 Qdrant/模型 API 做一次导入冒烟。
-3. **已知迁移差异需持续标注**：Go tokenizer 是确定性近似（句子/段落/结构边界一致，token 预算切分可能不同）；PDF/DOC/Word 视觉解析仍依赖外部 Python/LibreOffice 进程；无浏览器 E2E 与 Docker/systemd 实机验证；Word 视觉描述 worker 尚未接入 Go。
-4. **删除 Python 的门槛**：全部 parity 用例、真实依赖冒烟、打包/部署脚本切换与文档更新完成，并保留可回退 tag 后才删除 Python 后端；在此之前 Python 参考实现继续存在。
+1. **真实依赖 e2e**：异步链路已由 `internal/e2e`（fake Qdrant/模型 + 内存 broker/Redis + 真实 SQLite/runtime）覆盖并通过；MySQL/Redis/RocketMQ/Qdrant 实机回归与 Go RocketMQ SDK 对 Broker 5.3.3 + Proxy 的兼容性仍需在具备环境的主机验证。
+2. **parity 收尾**：P0 全部关闭，主要 P1 已修复；剩余 P2（casefold 排序近似、API key 列表 read-view 来源、少量错误形状）与同步上传 notifier 的权威快照细节见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。Python 对照实现已删除，因此黑盒差分改为“固定预期/契约测试”。
+3. **已知迁移差异需持续标注**：Go tokenizer 是确定性近似；PDF/DOC/Word 视觉解析仍依赖外部 Python/LibreOffice 进程；Docker/systemd 实机验证与浏览器 E2E 仍未执行；Word 视觉描述 worker 尚未接入 Go。
+4. **打包切换**：`scripts/build-go.ps1`（含冒烟）与 Dockerfile/Compose `app` profile 已切到 Go；管理命令与迁移 CLI 全部为 Go 二进制。
 
 ### 下一步（按依赖顺序）
 
-1. 完成 task-26 异步 e2e 与真实基础设施冒烟（至少 SQLite/MySQL + 内存/真实 RocketMQ 之一）。
-2. 收口 task-27 的 P1/P2；对 `rag-mcp-ingest` 做一次真实 Qdrant/模型 API 小目录冒烟；建立 `internal/parity` 黑盒差分。
-3. 在具备 Docker 的 CI/主机验证镜像、Compose `app`/worker 与 systemd 模板。
-4. 更新 [PROGRESS](../PROGRESS.md)/[VALIDATION](../VALIDATION.md)，随后按 G8 门槛决定删除 Python 后端与切换打包。
+1. 在具备 Docker 的 CI/主机验证镜像、Compose `app`/worker 与 systemd 模板。
+2. 连接真实 MySQL/Redis/RocketMQ/Qdrant 做一次全链路冒烟（含 `rag-mcp-ingest` 真实导入、MCP queued search、DLQ）。
+3. 持续推进 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 剩余 P2 项，并把黑盒差分改为固定预期契约测试。
+
+### 2026-11-08 第十四轮：删除 Python 后端（G8 后端切换完成）
+
+- `git mv` 外部解析 worker → `python-workers/rag_mcp/`（仅 `document_readers.py`、`chunk_strategies.py`、`chunking.py`、`pdf_content.py`、`pdf_worker.py`、`word_vision_worker.py` 与新 `__init__.py`），并新增 `python-workers/README.md`、`requirements.txt`。
+- 删除 `src/rag_mcp/`、`tests/`、`pyproject.toml`、`uv.lock`、`scripts/start-debezium-stack.ps1`；`scripts/start-stack.ps1` 改写为 Go 流程（构建检查 → compose → `rag-state-migrate --apply` → `rag-service-migrate` → `dist/bin/rag-service.exe`）。
+- Console 构建输出从 `src/rag_mcp/web` 迁移到 `build/web`（vite/构建脚本/Dockerfile/.gitignore/`resolveWebRoot` 同步更新），不再保留 Python 包目录。
+- 文档同步：README/USAGE/DEPLOYMENT/本文件更新为“Python 后端已删除”，`docs/GO_PARITY_AUDIT.md` 标注为历史审计快照；旧设计文档（api-keys/knowledge-base-settings/result-references/state-cache/state-storage）加注为历史设计参考（Go 实现见 `internal/` 对应包）。
+- 验证：`go build ./...`、`go test -count=1 ./...` 全绿；`scripts/build-go.ps1` 全量构建 + 冒烟通过（含迁移后的 `build/web` 路径）。

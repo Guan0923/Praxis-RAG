@@ -4,7 +4,7 @@
 
 Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可以在网页中上传和管理资料，比较检索结果，也可以让 AI 助手通过 MCP 连接知识库，查找资料、读取正文和维护文档。
 
-当前对外运行的后端是 **Go 实现**（`internal/`、`cmd/`）：一个 `rag-service` 进程提供 REST、MCP 和 Console，另提供文档、搜索、死信三个独立 worker。Python 实现仍保留在 `src/rag_mcp/`，作为迁移期的 **parity oracle（对照实现）与回退路径**，Go 后端稳定后才会删除，详见 [迁移状态](#迁移状态) 与 [docs/GO_MIGRATION.md](docs/GO_MIGRATION.md)。
+当前对外运行的后端是 **Go 实现**（`internal/`、`cmd/`）：一个 `rag-service` 进程提供 REST、MCP 和 Console，另提供文档、搜索、死信三个独立 worker。Python 后端已从仓库删除；仅保留 `python-workers/` 下的 PDF（Docling）与 Word 视觉解析 **外部进程 worker**，由 Go 通过子进程协议调用，Go 代码不导入 Python。迁移历史见 [迁移状态](#迁移状态) 与 [docs/GO_MIGRATION.md](docs/GO_MIGRATION.md)。
 
 它负责提供资料和出处，**不直接生成最终回答**。如何提问、是否继续查找、如何组织答案，由接入的 AI 助手或业务应用决定。
 
@@ -196,9 +196,9 @@ MCP search（配置 MQ 时）-> search_task_outbox -> RocketMQ -> rag-search-wor
 ## 迁移状态
 
 - **Go 是目标后端**：`rag-service`、三个 worker、Console、OpenAPI、迁移/状态 CLI 与本地批量导入 CLI 均已落地；parity 审计的 P0（搜索资产投影、MCP 排队/同步选择、worker 可执行程序、已保存 `document.md` 预览）与主要 P1 已修复，`go build ./...` 与全量 `go test ./...` 通过。
-- **Python 后端仍在仓库中**（`src/rag_mcp/`、`tests/`）：作为行为对照与迁移期回退；`uv` 安装、Python worker 命令和旧 `scripts/start-stack.ps1` 仍存在，但不再是新用户运行 Go 后端的前置条件。
+- **Python 后端已删除**：原 `src/rag_mcp`、`tests`、`pyproject.toml`、`uv.lock` 已移除；仓库只保留 `python-workers/`（PDF/Word 视觉外部解析进程，可选）与 `benchmarks/`（Docling 评估脚本，可选研究工具）。Go 后端运行不需要安装 Python 包；使用 PDF/DOC/Word 视觉解析时才需要外部 Python/LibreOffice 环境。
 - **数据兼容**：Go 复用既有 MySQL/SQLite 表结构、`enc:v1:` 凭据格式和配置文件位置（`~/.praxis-rag/config.toml`），不需要数据迁移；旧 SQLite 状态用 `rag-state-migrate` 检查/建表，旧知识源用 `rag-service-migrate` 预览/导入（见已知差异）。
-- **仍待完成**（以 [GO_MIGRATION](docs/GO_MIGRATION.md) 为准）：异步链路真实 MQ/MySQL 端到端回归、cached read views 等剩余 P1/P2、黑盒 parity 差分、删除 Python 后端。真实环境冒烟与未验证项见[使用与部署](docs/USAGE.md) 的验证边界。
+- **仍待验证**（以 [GO_MIGRATION](docs/GO_MIGRATION.md) 为准）：真实 MQ/MySQL/Redis/Qdrant 环境的端到端回归（当前用 fake 服务覆盖）、Docker/systemd 实机验证、黑盒 parity 差分（Python 对照已删除，改用固定预期）。真实环境冒烟与未验证项见[使用与部署](docs/USAGE.md) 的验证边界。
 
 ## 使用边界
 

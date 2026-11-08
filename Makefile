@@ -22,7 +22,7 @@ help:
 	@echo "  build   build Console (dist/web) and Go binaries (dist/bin)"
 	@echo "  test    go test ./..."
 	@echo "  smoke   start the built service on a free port and check /health + /console"
-	@echo "  clean   remove dist/ and the generated src/rag_mcp/web"
+	@echo "  clean   remove dist/ and the generated build/web"
 
 frontend:
 	@bash scripts/build-go.sh frontend
@@ -44,3 +44,4 @@ smoke:
 
 clean:
 	@bash scripts/build-go.sh clean
+

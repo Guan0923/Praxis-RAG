@@ -108,7 +108,7 @@ function Get-BrokerMaxRetries {
     return $parsed
 }
 
-# These overrides configure Broker resources only; Python workers do not parse them.
+# These overrides configure Broker resources only; the worker binaries read them at startup.
 $documentMaxRetries = Get-BrokerMaxRetries "RAG_DOCUMENT_BROKER_MAX_RETRIES"
 $searchMaxRetries = Get-BrokerMaxRetries "RAG_SEARCH_BROKER_MAX_RETRIES"
 $normalGroups = @($env:RAG_ROCKETMQ_GROUP, $env:RAG_DOCUMENT_GROUP, $env:RAG_SEARCH_GROUP)
@@ -127,14 +127,15 @@ $consumerGroups = @(
     @{ Name = $env:RAG_SEARCH_DLQ_GROUP; MaxRetries = 16 }
 )
 
-$python = Join-Path $root ".venv\Scripts\python.exe"
-if (-not (Test-Path $python)) {
-    $python = "python"
+$binDir = Join-Path $root "dist\bin"
+$ragService = Join-Path $binDir "rag-service.exe"
+if (-not (Test-Path $ragService)) {
+    Write-Host "Building the Go backend (dist/bin) before starting..."
+    & (Join-Path $PSScriptRoot "build-go.ps1") -SkipFrontend
+    if ($LASTEXITCODE -ne 0) { throw "Go build failed; run scripts/build-go.ps1 and retry." }
 }
-$env:PYTHONPATH = (Join-Path $root "src") + [IO.Path]::PathSeparator + $env:PYTHONPATH
-
-& $python -c "import redis; import rocketmq"
-if ($LASTEXITCODE -ne 0) { throw "Cache dependencies missing. Install: pip install -e '.[cache]'" }
+$stateMigrate = Join-Path $binDir "rag-state-migrate.exe"
+$serviceMigrate = Join-Path $binDir "rag-service-migrate.exe"
 
 $composeProfiles = @()
 if ($env:RAG_OUTBOX_BRIDGE -eq "debezium") {
@@ -189,19 +190,23 @@ for ($attempt = 0; $attempt -lt 45; $attempt++) {
 }
 if (-not $mqReady) { throw "RocketMQ provisioning failed. Check docker-compose logs rocketmq." }
 Write-Host "Consumers are not started: run rag-search-worker for MCP search and rag-document-worker for MCP add_document separately."
-Write-Host "DLQ resources are provisioned; planned rag-dead-letter-worker --kind document|search needs reader permissions. Revalidate SDK/Broker versions other than tested 5.1.2/5.3.3."
+Write-Host "DLQ resources are provisioned; run rag-dead-letter-worker --kind document|search for them. Revalidate SDK/Broker versions other than tested 5.1.2/5.3.3."
 Write-Host "Document uploads are accepted by a MySQL commit; MQ only carries the notification. Deploy API and workers together; drain schema-2 chunked messages before upgrading."
 
 if (-not $SkipMigrate) {
+    # Go state schema migration is idempotent; run it before the service touches the database.
+    Write-Host "Ensuring the shared state schema is up to date..."
+    & $stateMigrate --apply
+    if ($LASTEXITCODE -ne 0) { throw "State schema migration failed; review the rag-state-migrate output." }
     if (Test-Path $LegacyRoot) {
-        Write-Host "Migrating legacy state from $LegacyRoot (repeatable)..."
-        & $python -m rag_mcp.state.migrate --legacy-root $LegacyRoot --apply
+        Write-Host "Importing legacy knowledge sources from $LegacyRoot (preview was applied with --apply)..."
+        & $serviceMigrate --legacy-root $LegacyRoot --apply
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Migration reported warnings; review them before serving traffic."
+            Write-Warning "Legacy import reported failures; review them before serving traffic (vectors are not reindexed by this import)."
         }
     }
     else {
-        Write-Host "Legacy data root not found ($LegacyRoot); skipping migration."
+        Write-Host "Legacy data root not found ($LegacyRoot); skipping legacy knowledge import."
     }
 }
 
@@ -211,4 +216,5 @@ if ($MigrateOnly) {
 }
 
 Write-Host "Starting rag-service on http://$($env:RAG_SERVICE_HOST):$($env:RAG_SERVICE_PORT)/console"
-& $python -m rag_mcp.http_service
+& $ragService
+

@@ -341,9 +341,9 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 
 注意：
 
-- Go 与 Python 共用同一表结构与 `enc:v1:` 凭据格式；上线 Go 前建议先停 Python 入口并备份数据库。
+- 表结构与 `enc:v1:` 凭据格式与旧 Python 版本兼容；从旧部署升级时应先停旧入口并备份数据库（Python 后端代码已从仓库删除）。
 - `rag-service-migrate --apply` 只写状态（blobs + documents），**不生成 Qdrant 向量**；迁移完成后需通过 HTTP/MCP 重新上传文档或等待后续 reindex，才能被检索到。
-- API 与 worker 一起发布：Go 文档通知 schema 3 与旧 Python worker 的 schema 2 不兼容，混跑会丢消息或重复处理。
+- API 与 worker 一起发布：Go 文档通知为 schema 3，旧 Python worker 的 schema 2 不兼容，禁止混跑。
 - 生产 `RAG_STATE_AUTO_SCHEMA` 可关闭，由迁移步骤预先建表；否则服务启动也会尝试建缺失表。
 
 ## 7. DLQ 监控
@@ -363,9 +363,9 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 | --- | --- | --- |
 | relay（Go 默认且唯一内建） | `RAG_ROCKETMQ_ENDPOINT` 设置 | `rag-service` 进程内轮询 `document_job_outbox` 投递纯通知；搜索请求也由进程内 relay 投递 |
 | 本地单进程 | 不设置 MQ + `RAG_DOCUMENT_WORKER_LOCAL=1` | 文档 worker 直接轮询 outbox；搜索只能是同步（MCP `search` 无 `wait_seconds`） |
-| Debezium（仅 Python 旧路径） | `RAG_OUTBOX_BRIDGE=debezium` + 外部 Debezium | Go **未实现**；不要让 Go relay 与 Debezium 同时投递，否则重复通知 |
+| Debezium | `RAG_OUTBOX_BRIDGE=debezium` + 外部 Debezium | Go **未实现**；不要让 Go relay 与 Debezium 同时投递，否则重复通知 |
 
-迁移期如果必须使用 Debezium CDC：继续运行 Python API/worker，或接受 Go relay + Debezium 双投递并由下游幂等吸收重复；两种做法都不能同时启动两套 worker 消费同一组。
+Go 没有 Debezium CDC 模式：不要启用该 profile；若确需 binlog 桥接，需要另行实现 Go 版本的 bridge，并避免与进程内 relay 双投递。
 
 ## 9. 安全与网络
 
@@ -384,3 +384,5 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 - 三个 worker 的启动/退出码行为（无 broker、错误 backend、非法 `--kind`、`--help`）。
 
 本环境**未验证**：Docker 镜像构建与 Compose profile、systemd 单元、真实 MySQL/Redis/RocketMQ/Qdrant、Go RocketMQ SDK 与 Broker 5.3.3/Proxy 的兼容性、Docling/LibreOffice/视觉模型实链路、多实例并发与故障切换。上线前请在预发环境按本指南逐项演练，并参考 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 的剩余 P1/P2 与 [GO_MIGRATION](GO_MIGRATION.md) 的进行中项。
+
+

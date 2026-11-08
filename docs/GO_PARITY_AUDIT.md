@@ -1,4 +1,6 @@
 # Go 后端与 Python/前端契约一致性审计
+> **历史审计快照（2026-11-08）**：本次审计针对迁移期的 Python 对照实现；Python 后端（`src/rag_mcp/`、`tests/`）随后已从仓库删除，文中 Python 行号/路径不再存在。当前 Go 实现与剩余差异见 [GO_MIGRATION](GO_MIGRATION.md)。
+
 
 审计对象：`D:\Project\Praxis-RAG\.agents\worktrees\dsh-d432f525-b2f1`
 审计类型：只读（本文件是唯一写入）

@@ -3,7 +3,7 @@
 # Praxis-RAG Go backend image.
 #
 # Stage 1 builds the React Console with the existing vite configuration. The
-# vite outDir is ../src/rag_mcp/web relative to frontend/, i.e. /repo/src/rag_mcp/web
+# vite outDir is ../build/web relative to frontend/, i.e. /repo/build/web
 # here; the runtime stage copies that directory to /app/web and the service reads
 # it through RAG_WEB_ROOT.
 #
@@ -34,7 +34,6 @@ RUN apk add --no-cache ca-certificates && update-ca-certificates
 COPY go.mod go.sum ./
 RUN go env -w GOPROXY="${GOPROXY}" && go mod download
 COPY . .
-COPY --from=web /repo/src/rag_mcp/web ./src/rag_mcp/web
 RUN set -eux; \
     mkdir -p /out; \
     for dir in ./cmd/*/; do \
@@ -49,7 +48,7 @@ RUN apk add --no-cache ca-certificates tzdata wget \
 
 WORKDIR /app
 COPY --from=build /out/ /app/bin/
-COPY --from=web /repo/src/rag_mcp/web /app/web
+COPY --from=web /repo/build/web /app/web
 COPY deploy/config.container.toml /app/config.toml
 RUN mkdir -p /app/data && chown -R rag:rag /app
 
@@ -66,3 +65,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD wget -qO- http://127.0.0.1:8011/health >/dev/null 2>&1 || exit 1
 
 ENTRYPOINT ["/app/bin/rag-service"]
+

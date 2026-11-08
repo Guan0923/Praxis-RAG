@@ -7,7 +7,7 @@ service locally.
 .DESCRIPTION
 Steps:
   1. Frontend: npm ci (when node_modules is missing or -FreshFrontendDeps) and
-     npm run build (vite writes to src/rag_mcp/web), copied to dist/web.
+     npm run build (vite writes to build/web), copied to dist/web.
   2. Go: every cmd/*/main.go entrypoint is built into dist/bin.
   3. Smoke: rag-service starts on a free loopback port with a temporary config
      and SQLite state, then the script polls /health and checks that /console
@@ -51,7 +51,7 @@ $webDir = Join-Path $dist "web"
 $exeSuffix = if ($env:OS -eq "Windows_NT") { ".exe" } else { "" }
 $serviceExe = Join-Path $binDir ("rag-service" + $exeSuffix)
 $frontendDir = Join-Path $root "frontend"
-$webBuildDir = Join-Path $root "src\rag_mcp\web"
+$webBuildDir = Join-Path $root "build\\web"
 
 Push-Location $root
 try {
@@ -80,7 +80,7 @@ try {
             } else {
                 Write-Host "[skip] frontend/node_modules already present (use -FreshFrontendDeps to reinstall)"
             }
-            Invoke-Native "npm" @("run", "build") "npm run build (vite -> src/rag_mcp/web)"
+            Invoke-Native "npm" @("run", "build") "npm run build (vite -> build/web)"
         } finally {
             Pop-Location
         }
@@ -308,3 +308,4 @@ try {
 finally {
     Pop-Location
 }
+

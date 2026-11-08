@@ -318,7 +318,7 @@ func resolveWebRoot(configured string) string {
 		return ""
 	}
 	candidates := []string{
-		filepath.Join("src", "rag_mcp", "web"),
+		filepath.Join("build", "web"),
 		"web",
 	}
 	if executable, err := os.Executable(); err == nil {
@@ -326,7 +326,7 @@ func resolveWebRoot(configured string) string {
 		candidates = append(candidates,
 			filepath.Join(executableDir, "web"),
 			filepath.Join(executableDir, "..", "web"),
-			filepath.Join(executableDir, "..", "src", "rag_mcp", "web"),
+			filepath.Join(executableDir, "..", "build", "web"),
 		)
 	}
 	for _, candidate := range candidates {

@@ -16,7 +16,7 @@ MCP search（配置 MQ 时）-> search_task_outbox -> RocketMQ -> rag-search-wor
 Broker DLQ（%DLQ%<源消费组>）-> rag-dead-letter-worker --kind document|search
 ```
 
-RAG 只返回证据，不生成最终回答。Python 实现（`src/rag_mcp/`）仍保留为迁移期对照与回退，不是运行 Go 后端的前置条件。
+RAG 只返回证据，不生成最终回答。后端为 Go 实现；Python 仅作为 PDF（Docling）与 Word 视觉解析的可选外部子进程存在于 `python-workers/`，不是运行 Go 后端的前置条件。
 
 ## 1. 安装与构建
 
@@ -66,11 +66,11 @@ dist/bin/rag-mcp-ingest(.exe)        # 本地文件/目录批量导入，见 §7
 dist/web/                            # Console（服务通过 RAG_WEB_ROOT 读取）
 ```
 
-脚本默认把 Console 复制到 `dist/web`；直接运行 `dist/bin/rag-service` 时请设置 `RAG_WEB_ROOT=<repo>/dist/web`，否则服务只探测当前目录/可执行文件邻居的 `web` 或 `src/rag_mcp/web`。构建脚本的 smoke 模式会自动设置临时端口、临时 config 与 SQLite 数据目录。
+脚本默认把 Console 复制到 `dist/web`；直接运行 `dist/bin/rag-service` 时请设置 `RAG_WEB_ROOT=<repo>/dist/web`，否则服务只探测当前目录/可执行文件邻居的 `web` 或 `build/web`。构建脚本的 smoke 模式会自动设置临时端口、临时 config 与 SQLite 数据目录。
 
 ### 前端构建与开发
 
-Console 使用 React + TypeScript + Ant Design；vite 输出到 `src/rag_mcp/web`（`.gitignore` 忽略），Go 构建脚本会再复制到 `dist/web`。手工构建：
+Console 使用 React + TypeScript + Ant Design；vite 输出到 `build/web`（`.gitignore` 忽略），Go 构建脚本会再复制到 `dist/web`。手工构建：
 
 ```powershell
 Push-Location .\frontend
@@ -101,7 +101,7 @@ docker compose up -d
 
 MySQL 默认映射 `127.0.0.1:3307`（避免与本地 3306 冲突），Qdrant 为 `6333/6334`，Redis 为 `6379`，RocketMQ gRPC Proxy 为 `127.0.0.1:8081`。停止保留数据：`docker compose down`。
 
-> RocketMQ 的 topic/group 需要**预先创建**（Broker 自动创建在仓库 Compose 中关闭）。仓库仍带有 Python 时代的 `scripts/start-stack.ps1`，可用 `-MigrateOnly` 启动依赖并创建缓存刷新/文档/搜索三组正常 topic/group 以及可读 DLQ topic 与独立处理组，然后自行启动 Go 服务；该脚本不是 Go 后端的一部分，在 Go 环境的等价性**未验证**。使用 `RAG_DOCUMENT_WORKER_LOCAL=1` 的单进程文档模式或纯同步 REST 场景可以不配置 RocketMQ。
+> RocketMQ 的 topic/group 需要**预先创建**（Broker 自动创建在仓库 Compose 中关闭）。`scripts/start-stack.ps1` 已切换为 Go 流程：启动依赖、创建缓存刷新/文档/搜索三组正常 topic/group 与可读 DLQ topic、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe`；用 `-MigrateOnly` 可只准备依赖与数据库。使用 `RAG_DOCUMENT_WORKER_LOCAL=1` 的单进程文档模式或纯同步 REST 场景可以不配置 RocketMQ。
 
 ### 手动依赖
 
@@ -230,7 +230,7 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 | `RAG_DOCUMENT_DLQ_GROUP` | `praxis_document_dead_letters` | 文档死信处理组（不是 topic） |
 | `RAG_SEARCH_TOPIC` / `RAG_SEARCH_GROUP` | `praxis_search` / `praxis_search_workers` | 排队搜索队列 |
 | `RAG_SEARCH_DLQ_GROUP` | `praxis_search_dead_letters` | 搜索死信处理组（不是 topic） |
-| `RAG_OUTBOX_BRIDGE` | `relay` | **仅 Python 旧路径生效**；Go 服务未实现 `debezium` 模式，配置 broker 时总是启用进程内 relay |
+| `RAG_OUTBOX_BRIDGE` | `relay` | **未实现 `debezium` 模式**；Go 服务配置 broker 时总是启用进程内 relay |
 | `RAG_DOCUMENT_BROKER_MAX_RETRIES` | `5` | 文档 worker 消费最大尝试次数（也可用 `RAG_DOCUMENT_MAX_ATTEMPTS`） |
 
 正常 Broker DLQ topic 是 `%DLQ%<源消费组>`：默认 `%DLQ%praxis_document_ingest_workers`、`%DLQ%praxis_search_workers`。死信 worker 用独立组（上表 `*_DLQ_GROUP`）读取这些物理 topic；需要预建 topic/组并授予读权限，Broker 自动创建在仓库 Compose 中关闭。
@@ -615,9 +615,9 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 - Docker 镜像构建、Compose `app` profile、systemd 单元未实际执行（本环境无 Docker/systemd）。
 - 未连接真实 RocketMQ/MySQL/Redis/Qdrant：Go RocketMQ SDK（apache/rocketmq-clients/golang v5）与 Broker 5.3.3 + gRPC Proxy 的兼容性、真实 DLQ 消费/ACK、真实 MySQL 上传事务与多实例锁均未实机验证。
 - Docling/LibreOffice/视觉模型链路未在 Go 环境实机验证；PDF/DOC/Word 视觉解析依赖外部 Python 环境。
-- 没有浏览器 E2E：Console 只验证构建与静态冒烟，交互/字段联动由 Python 前端测试与人工核对。
+- 没有浏览器 E2E：Console 只验证构建与静态冒烟，交互/字段联动由人工核对与前端源码检查。
 - Tokenizer 是确定性近似，不保证与 Python/BGE-M3 的 token 计数一致（句子/段落/结构边界一致）。
-- 异步 e2e（API 受理 → 真实 MQ → worker → 发布）与黑盒 Python/Go 差分测试仍在进行中（见 [GO_MIGRATION](GO_MIGRATION.md)）。
+- 异步 e2e（API 受理 → fake broker → worker → 发布）已由 `internal/e2e` 覆盖；真实 RocketMQ/MySQL/Redis/Qdrant 的黑盒回归仍未执行（见 [GO_MIGRATION](GO_MIGRATION.md)）。
 
 ## 11. 开发与测试
 
@@ -632,14 +632,16 @@ go test -count=1 ./internal/runtime/...
 go test -count=1 ./internal/httpapi/... ./internal/mcp/...
 ```
 
-Python 参考实现（迁移期可选）：
+外部解析器 worker（可选，Python 仅用于 PDF/Word 视觉解析）：
 
 ```powershell
-uv sync --extra api
-uv run --no-sync python -m pytest tests -q
+# 安装 Docling 等依赖（只影响 pdf_worker，不影响 Go 服务）
+python -m pip install -r python-workers/requirements.txt
+$env:PYTHONPATH = (Resolve-Path .\python-workers).Path
+python -m rag_mcp.pdf_worker --help
 ```
 
-Python 启动/worker 命令（`rag-service`、`*.exe` 或 `python -m rag_mcp.http_service`）仍可用于对照，但本文的 Go 流程不需要 Python 环境；不要在同一端口/数据目录同时运行两套后端。
+Go 服务会在 ingest 阶段以子进程方式调用 `rag_mcp.pdf_worker` / `rag_mcp.word_vision_worker`，其余后端能力全部在 Go 二进制内；详见 [python-workers/README.md](../python-workers/README.md)。
 
 ## 12. 当前限制
 
@@ -652,3 +654,5 @@ Python 启动/worker 命令（`rag-service`、`*.exe` 或 `python -m rag_mcp.htt
 - **管理边界**：`/v1/admin/*` 仅本机直连；没有账户体系或细粒度多用户权限；工作区不是权限隔离。
 - **数据**：旧 SQLite 状态用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。
 - 具体契约差异（cached read views、静态目录列表等剩余的 P1/P2）见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。
+
+
