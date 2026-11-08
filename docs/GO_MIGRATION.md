@@ -262,3 +262,17 @@ REST /v1/admin/tools -> 6 tools
 | task-21 | go-document | Go vs Python/前端 parity 审计报告 |
 
 剩余主要工作：worker 主程序、异步文档状态（MCP add_document 接线）、queued search 等待语义、G8 文档/README 切换、黑盒 parity 回归、删除 Python 后端。
+
+### 2026-11-08 第九轮：迁移与 CLI 命令
+
+已提交 `feat(go): migration and CLI commands (service/state migrate, ingest, debug)`：
+
+- `internal/migrate`：`NamespaceForLegacyUser`（"user-"+sha256[:16]）、`DiscoverLegacySources`（只读扫描/排序/过滤）、`BuildPlan`（稳定 document id/sha256/size）、`Apply`（blobs+documents 单事务/幂等/Force）、`StateSchemaStatus`/`EnsureStateSchema`（表就绪检查与幂等建表）。
+- `cmd/rag-service-migrate`：默认预览，`--apply` 导入，`--legacy-root`/`--user-id`；退出码 0/1/2。
+- `cmd/rag-state-migrate`：默认报告 schema 就绪度，`--apply` 幂等建表；退出码 0/1/2。
+- `cmd/rag-mcp-debug`：真实 mock orchestrator 调试输出（无外部服务）。
+- `cmd/rag-mcp-ingest`：明确限制的 TODO skeleton（退出码 2），不静默成功。
+
+**迁移差异（必须记录）**：`rag-service-migrate --apply` 当前只导入状态（blobs+documents），**不执行向量重建**（Python 版会调用 runtime.upload）；需要在迁移后用文档 worker/重新上传重新索引。`--skip-assets` 与旧版解析资产树仍未纳入发现计划（TODO）。
+
+验证：gofmt/vet clean；`go test -count=1 ./internal/migrate/...` 4/4 通过；`go build ./...` 全绿。
