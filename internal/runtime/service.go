@@ -84,7 +84,9 @@ func (s *Service) Status(context.Context) map[string]any {
 }
 
 // Close releases the runtime resources (search engine, then the shared store).
+// Close stops background workers, then releases the search engine and store.
 func (s *Service) Close(ctx context.Context) error {
+	s.StopBackground()
 	if s.search != nil {
 		_ = s.search.Close(ctx)
 	}
@@ -107,14 +109,16 @@ func (s *Service) PublicKnowledgeBase(ctx context.Context, namespace string) (ma
 
 // GetSearchResult reads one stored search-result page.
 func (s *Service) GetSearchResult(ctx context.Context, namespace, resultID string, page, pageSize int) (map[string]any, error) {
-	return s.search.GetSearchResult(ctx, namespace, resultID, page, pageSize)
+	return s.getSearchResultOrdered(ctx, namespace, resultID, page, pageSize)
 }
 
 // SubmitSearch enqueues a retrieval action. Queued search (Redis + RocketMQ)
 // arrives in G7; until then the service reports the limitation safely instead
 // of silently running retrieval.
-func (s *Service) SubmitSearch(context.Context, string, contracts.SearchRequest) (string, error) {
-	return "", &apierrors.KnowledgeError{Message: "Queued search is not available in this build."}
+// SubmitSearch enqueues one retrieval action and returns its result UUID.
+func (s *Service) SubmitSearch(ctx context.Context, namespace string, request contracts.SearchRequest) (string, error) {
+	result, err := s.submitSearchTask(ctx, namespace, request)
+	return result, err
 }
 
 // ListDocuments returns the namespace's document records. The shape matches
@@ -303,13 +307,14 @@ func (s *Service) Delete(ctx context.Context, namespace, name string) (map[strin
 }
 
 // AddDocument (async MCP admission) needs the document jobs queue from G7.
-func (s *Service) AddDocument(context.Context, string, string, []byte, string) (map[string]any, error) {
-	return nil, &apierrors.KnowledgeError{Message: "Asynchronous document admission is not available in this build."}
+// AddDocument durably admits one upload for asynchronous indexing.
+func (s *Service) AddDocument(ctx context.Context, namespace, name string, content []byte, idempotencyKey string) (map[string]any, error) {
+	return s.addDocumentAsync(ctx, namespace, name, content, idempotencyKey)
 }
 
-// GetDocumentStatus needs the document jobs table from G7.
-func (s *Service) GetDocumentStatus(context.Context, string, string) (map[string]any, error) {
-	return nil, &apierrors.KnowledgeError{Message: "Document status is not available in this build."}
+// GetDocumentStatus reports the indexing status of one artifact.
+func (s *Service) GetDocumentStatus(ctx context.Context, namespace, artifactID string) (map[string]any, error) {
+	return s.documentStatus(ctx, namespace, artifactID)
 }
 
 // WriteDocument creates or updates one document synchronously (MCP writes).

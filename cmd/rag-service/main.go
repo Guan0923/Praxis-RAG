@@ -71,6 +71,9 @@ func run() error {
 		return err
 	}
 	service.SearchEngine().SetReferenceCapture(searchrefs.New(stores, logger))
+	if err := service.StartBackground(context.Background()); err != nil {
+		return err
+	}
 	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{
 		Runtime:      wire.MCPRuntime{Service: service},
