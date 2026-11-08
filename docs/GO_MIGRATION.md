@@ -77,15 +77,24 @@ assets/                   可选嵌入资源目录（构建时生成，不入库
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| G0 | 迁移总纲、Go 模块骨架、配置/契约、HTTP 路由/认证/Console/健康检查 | 进行中 |
-| G1 | 共享状态层：schema、MySQL/SQLite 仓储、加密、知识库/文档/API Key 读模型 | 待开始 |
+| G0 | 迁移总纲、Go 模块骨架、配置/契约、HTTP 路由/认证/Console/健康检查 | 已完成 |
+| G1 | 共享状态层：schema、MySQL/SQLite 仓储、加密、知识库/文档/API Key 读模型 | 进行中（go-state） |
 | G2 | 上传事务：UploadJournal、租约、blob、制品注册、制品/结果快照、缓存 outbox | 待开始 |
-| G3 | 读取与切分：Markdown/TXT/DOCX 读取、PDF 解析进程编排、五类切分策略 | 待开始 |
-| G4 | 检索：Qdrant 客户端、BM25 sparse、Dense/Hybrid、Reranker、orchestrator | 待开始 |
+| G3 | 读取与切分：Markdown/TXT/DOCX 读取、PDF 解析进程编排、五类切分策略 | 进行中（go-document） |
+| G4 | 检索：Qdrant 客户端、BM25 sparse、Dense/Hybrid、Reranker、orchestrator | 进行中（go-retrieval） |
 | G5 | 运行时：知识库创建/更新/重向量化、文档 CRUD、搜索、恢复线程 | 待开始 |
-| G6 | MCP：Streamable HTTP transport、工具/提示词目录、订阅通知 | 待开始 |
+| G6 | MCP：Streamable HTTP transport、工具/提示词目录、订阅通知 | 进行中（go-mcp，官方 Go SDK） |
 | G7 | 异步：Redis 缓存/搜索任务/快照、RocketMQ outbox、文档/搜索/DLQ worker | 待开始 |
 | G8 | 迁移 CLI、Docker/脚本/文档切换、等价性回归、删除 Python 后端 | 待开始 |
+
+核心决策补充：
+
+- **MCP 传输采用官方 Go SDK** `github.com/modelcontextprotocol/go-sdk v1.7.0`，不再手写 JSON-RPC /
+  Streamable HTTP。SDK 对 `>= 2026-07-28` 现代协议只支持 stateless 传输，对遗留协议
+  （`<= 2025-11-25`）使用 stateful 会话；因此对接层需要一个按请求协议版本分发的双 handler，
+  这属于实现细节，不改对外 URL 与认证契约。
+- 工具/提示词目录（`internal/catalog`）与文档资源 URI/分页（`internal/resources`）已先于 MCP
+  传输完成，MCP 层直接复用。
 
 ## 5. 验证策略
 
@@ -124,3 +133,15 @@ assets/                   可选嵌入资源目录（构建时生成，不入库
 - G0 验收记录：`go vet ./...` 通过，Go 测试 42 个用例全部通过；构建 `rag-service` 后在
   `127.0.0.1:18011` 实测 `/health` 返回 backend/collection/state、无凭证访问租户接口返回 401、
   `/v1/search-results/*` 返回 `Cache-Control: no-store`、Console 未构建时 `/console` 返回 404。
+
+### 2026-11-08 并行迁移启动（G1/G3/G4/G6）
+
+- 新增 `internal/catalog`：工具覆盖设置合并/无变化检测、提示词定义校验与渲染、持久化
+  `catalog.Store` 接口与内存实现，对应 `rag_mcp/catalog.py`。
+- 新增 `internal/resources`：`rag://knowledge/{namespace}/{name}` 规范化、严格查询参数校验、
+  8000 字符段落分页、公式块/行内公式保护、`resource_page` 载荷，对应 `rag_mcp/resources.py`。
+- 引入并锁定 MCP Go SDK `v1.7.0`；`/mcp` 传输方案与协议双代分发写入上表决策。
+- 共享任务板启动四个互斥写域任务：task-1 状态层（`internal/state`）、task-2 检索栈
+  （`internal/{qdrant,retrieval,modelapi,sparse}`）、task-3 文档读取与切分
+  （`internal/{document,chunking}`）、task-4 MCP 服务层（`internal/mcp`）。
+- 本轮新增测试：catalog 6 项、resources 6 项；`go test ./internal/catalog/... ./internal/resources/...` 通过。
