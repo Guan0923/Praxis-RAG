@@ -141,8 +141,52 @@ services:
       - ./deploy/debezium/application.properties:/debezium/config/application.properties:ro
       - debezium_data:/debezium/data
 
+  # Go backend service. Kept out of the default (infra-only) profile:
+  #   docker compose --profile app up -d --build
+  # The image builds the Console and every cmd/* entrypoint from this repo.
+  # RAG_SERVICE_TOKEN is required at run time (the container binds 0.0.0.0);
+  # the state backend defaults to the shared MySQL below (override with
+  # RAG_STATE_URL / RAG_APP_MYSQL_*), and Qdrant runs as a compose service.
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${RAG_APP_IMAGE:-praxis-rag:local}
+    container_name: praxis-rag-app
+    restart: unless-stopped
+    profiles: ["app"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    environment:
+      RAG_SERVICE_TOKEN: ${RAG_SERVICE_TOKEN:-}
+      RAG_SERVICE_HOST: "0.0.0.0"
+      RAG_SERVICE_PORT: "8011"
+      RAG_WEB_ROOT: /app/web
+      QDRANT_URL: ${RAG_APP_QDRANT_URL:-http://qdrant:6333}
+      RAG_MYSQL_HOST: ${RAG_APP_MYSQL_HOST:-mysql}
+      RAG_MYSQL_PORT: "3306"
+      RAG_MYSQL_USER: ${RAG_MYSQL_USER:-rag}
+      RAG_MYSQL_PASSWORD: ${RAG_MYSQL_PASSWORD:-}
+      RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
+      RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
+      RAG_MCP_ALLOWED_HOSTS: ${RAG_MCP_ALLOWED_HOSTS:-127.0.0.1,127.0.0.1:*,localhost,localhost:*}
+      RAG_MCP_ALLOWED_ORIGINS: ${RAG_MCP_ALLOWED_ORIGINS:-http://127.0.0.1,http://127.0.0.1:*,http://localhost,http://localhost:*}
+    ports:
+      - "127.0.0.1:${RAG_APP_PORT:-8011}:8011"
+    volumes:
+      - praxis_app_data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8011/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 volumes:
   mysql_data:
+  praxis_app_data:
   qdrant_data:
   redis_data:
   rocketmq_data:
