@@ -160,6 +160,15 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_MCP_ALLOWED_ORIGINS` | 对应 loopback `http` 来源 | MCP Origin 白名单 |
 | `RAG_CONFIG_FILE` | `~/.praxis-rag/config.toml` | 启动配置文件路径 |
 
+### 账号、角色与知识库共享
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_INVITATION_TTL_HOURS` | `168` | 知识库邀请链接有效期（小时，1..8760） |
+| `RAG_DEFAULT_KB_TEMPLATE` | `default` | VIP/普通用户创建知识库时克隆模型连接（Embedding/Reranker/VLM）与向量维度的模板知识库；模板不存在时自建返回 409 |
+
+角色分管理员（`admin`）、VIP（`vip`）和普通用户（`user`），只有管理员可以改角色。知识库默认归创建者私有，共享通过邀请链接完成：仅 VIP 与管理员可邀请（VIP 只能邀请自己创建的知识库，管理员可邀请任意知识库），权限分「可读 / 可修改」、范围分「单文件 / 多文件 / 全库」；被邀请人登录后接受邀请才生效。完整流程见 [权限管理](PERMISSIONS.md)。
+
 ### 检索、模型与外部解析器
 
 | 变量 | 默认值 | 说明 |
@@ -326,8 +335,9 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
 Console 默认启用账号登录（`RAG_AUTH_ENABLED=true`）：
 
 1. 打开 `/console` 会进入登录页；切到"注册"创建账号，**第一个注册的账号自动成为管理员**。用户名不区分大小写（统一按小写保存）。
-2. 管理员在侧边栏"用户管理"页可以：把账号设为管理员/普通用户、启用/禁用、删除。系统始终保留至少一名启用状态的管理员（最后一个管理员不能被降级、禁用或删除）。
-3. 普通用户可检索、上传/删除文档、切换知识库；管理员额外可以管理知识库、API Key 和用户。
+2. 管理员在侧边栏"用户管理"页可以：把账号设为管理员 / VIP / 普通用户、启用/禁用、删除。系统始终保留至少一名启用状态的管理员（最后一个管理员不能被降级、禁用或删除）。
+3. 普通用户只能使用自己创建的知识库以及被邀请授权的知识库；管理员可以使用全部知识库并管理知识库配置、API Key 和用户；VIP 额外可以邀请他人共享自己创建的知识库。
+4. 共享入口在侧边栏「权限管理」（管理员与 VIP 可见）：选择知识库 → 邀请用户（权限：可读/可修改；范围：全库 / 若干文件）→ 复制邀请链接发给对方。被邀请人会在控制台通知铃铛看到待处理邀请，登录后打开链接即可接受；接受后权限立即生效。详见 [权限管理](PERMISSIONS.md)。
 
 会话使用 HttpOnly Cookie（`rag_session`）保存，默认有效期 7 天（`RAG_AUTH_SESSION_TTL_HOURS`），所有写操作要求 `X-CSRF-Token`（Console 自动带上）。判定规则：
 
@@ -440,6 +450,38 @@ curl.exe http://127.0.0.1:8011/v1/admin/knowledge-bases/default/key/embedding
 ```
 
 公开配置：`GET /v1/knowledge-base`（返回 `public_settings + strategies`，缺少知识库时 404）。创建/修改的请求体与 Python 实现一致，`embedding` 必填，`embedding_model` 长度 1..512。
+
+### 知识库归属、权限与邀请（Console 会话）
+
+知识库默认归创建者私有：管理员可见全部，其他账号只能看到自己创建的与被邀请授权的知识库。以下接口需要 Console 登录会话（Cookie + `X-CSRF-Token`）；完整语义见 [权限管理](PERMISSIONS.md)。
+
+```powershell
+# 当前账号可用的知识库与某个知识库上的有效权限
+curl.exe http://127.0.0.1:8011/v1/namespaces
+curl.exe http://127.0.0.1:8011/v1/knowledge-bases/team-kb/access
+
+# VIP/普通用户自建知识库（模型配置沿用 RAG_DEFAULT_KB_TEMPLATE 模板）
+curl.exe -X POST http://127.0.0.1:8011/v1/knowledge-bases `
+  -H "Content-Type: application/json" `
+  -d '{"namespace":"my-kb","strategy":"character","chunk_size":800,"chunk_overlap":100}'
+
+# 邀请人（管理员或知识库创建者）创建邀请并拿到一次性链接
+curl.exe -X POST http://127.0.0.1:8011/v1/knowledge-bases/team-kb/invitations `
+  -H "Content-Type: application/json" `
+  -d '{"username":"dave","permission":"read","scope":"files","document_names":["spec.md","guide.pdf"]}'
+
+# 被邀请人：收件箱、预览、接受/拒绝
+curl.exe http://127.0.0.1:8011/v1/invitations
+curl.exe -X POST http://127.0.0.1:8011/v1/invitations/preview -H "Content-Type: application/json" -d '{"token":"<link-token>"}'
+curl.exe -X POST http://127.0.0.1:8011/v1/invitations/accept  -H "Content-Type: application/json" -d '{"token":"<link-token>"}'
+
+# 管理已有授权与未接受的邀请
+curl.exe http://127.0.0.1:8011/v1/knowledge-bases/team-kb/permissions
+curl.exe -X DELETE http://127.0.0.1:8011/v1/knowledge-bases/team-kb/permissions/<user_id>
+curl.exe -X DELETE http://127.0.0.1:8011/v1/invitations/<invitation_id>
+```
+
+邀请链接形如 `http://127.0.0.1:8011/console#/invite?token=<一次性token>`；数据库只保存 token 的 SHA-256 摘要，链接只在创建响应中出现一次。邀请只能由被邀请的账号接受。
 
 ### 文档管理
 
@@ -702,7 +744,8 @@ Go 服务会在 ingest 阶段以子进程方式调用 `rag_mcp.pdf_worker` / `ra
 - **异步投递**：支持 relay（默认，进程内发件箱发布到 Kafka）、debezium（Debezium Server 读 MySQL binlog，经原生 Kafka sink 写 topic，应用不发布）与本地 worker 模式；Debezium 模式需要 MySQL 状态库。
 - **排队搜索**：`RAG_KAFKA_BOOTSTRAP_SERVERS` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 Kafka。
 - **上传受理**：`POST /v1/documents` 默认同步；`RAG_UPLOAD_MODE=async` 时逐文件异步受理并返回 `artifact_id`，状态由 `GET /v1/document-jobs/{artifact_id}` 读取，需要部署 `rag-document-worker`（配置 Kafka，或 `RAG_DOCUMENT_WORKER_LOCAL=1` 轮询发件箱）。`update_document`/`delete_document` 仍同步执行，与排队中的异步任务靠受理期同名检查与发布事务内的 `ValidatePublication` 互斥。
-- **管理边界**：`/v1/admin/*` 仅本机直连；没有账户体系或细粒度多用户权限；工作区不是权限隔离。
+- **权限与共享**：账号分为管理员 / VIP / 普通用户；知识库默认归创建者私有，共享靠邀请链接完成（权限：可读/可修改；范围：单文件/多文件/全库），只有 VIP 与管理员可发起邀请。邀请消息目前是站内通知（控制台铃铛），不发送邮件/IM；链接只展示一次，库内只存摘要。文件级写授权只能替换已授权的同名文档，不能上传新文件；历史无创建者的知识库仅管理员可用/可授权；受限账号在启用 Kafka 的排队搜索部署下会被拒绝异步检索（同步检索不受影响）。详见 [权限管理](PERMISSIONS.md)。
+- **管理边界**：`/v1/admin/*` 仅本机直连或管理员会话；管理凭证（Service Token / API Key）不做知识库归属校验，API Key 的 namespace 白名单仍然生效。
 - **数据**：状态表用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。
 - 具体契约差异（cached read views、静态目录列表等剩余的 P1/P2）见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。
 

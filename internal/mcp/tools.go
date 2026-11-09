@@ -91,9 +91,23 @@ func (e *Endpoint) buildToolEntries() []toolEntry {
 		},
 		execute: func(ctx context.Context, namespace string, input any) (map[string]any, error) {
 			if queued {
+				// A queued search runs outside this request and snapshots its
+				// results, so a per-request visibility restriction cannot be
+				// applied consistently. Reject it instead of leaking evidence.
+				if _, restricted := restrictedScope(ctx); restricted {
+					return nil, fmt.Errorf(messageRestrictedSearchQueued)
+				}
 				return e.executeQueuedSearch(ctx, namespace, input.(contracts.QueuedSearchRequest))
 			}
-			return e.opts.Runtime.Search(ctx, namespace, input.(contracts.SearchRequest))
+			request := input.(contracts.SearchRequest)
+			if scope, restricted := restrictedScope(ctx); restricted {
+				documentIDs, err := e.resolvedDocumentIDs(ctx, namespace, scope)
+				if err != nil {
+					return nil, err
+				}
+				request.DocumentIDs = documentIDs
+			}
+			return e.opts.Runtime.Search(ctx, namespace, request)
 		},
 	})
 
@@ -127,7 +141,18 @@ func (e *Endpoint) buildToolEntries() []toolEntry {
 		},
 		execute: func(ctx context.Context, namespace string, input any) (map[string]any, error) {
 			request := input.(contracts.SearchResultRequest)
-			return e.opts.Runtime.GetSearchResult(ctx, namespace, request.ResultID, request.Page, request.PageSize)
+			payload, err := e.opts.Runtime.GetSearchResult(ctx, namespace, request.ResultID, request.Page, request.PageSize)
+			if err != nil {
+				return nil, err
+			}
+			if scope, restricted := restrictedScope(ctx); restricted {
+				documentIDs, resolveErr := e.resolvedDocumentIDs(ctx, namespace, scope)
+				if resolveErr != nil {
+					return nil, resolveErr
+				}
+				payload = filterSearchResults(payload, documentIDs)
+			}
+			return payload, nil
 		},
 	})
 

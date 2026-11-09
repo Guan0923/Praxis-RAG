@@ -67,6 +67,18 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "GET", Path: "/v1/uploads/{operation_id}", Summary: "Upload operation details", Tag: "uploads", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/published-versions", Summary: "List published versions", Tag: "admin", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/upload-leases", Summary: "List upload leases", Tag: "admin", Response: "200"},
+	{Method: "GET", Path: "/v1/users", Summary: "List accounts available for an invitation", Tag: "sharing", Response: "200"},
+	{Method: "POST", Path: "/v1/knowledge-bases", Summary: "Create a knowledge base owned by the current account", Tag: "knowledge-bases", Request: "SelfCreateKnowledgeBaseBody", Response: "201"},
+	{Method: "GET", Path: "/v1/knowledge-bases/{namespace}/access", Summary: "Read the current account's knowledge-base access", Tag: "sharing", Response: "200"},
+	{Method: "GET", Path: "/v1/knowledge-bases/{namespace}/permissions", Summary: "List knowledge-base permissions", Tag: "sharing", Response: "200"},
+	{Method: "DELETE", Path: "/v1/knowledge-bases/{namespace}/permissions/{user_id}", Summary: "Revoke a knowledge-base permission", Tag: "sharing", Response: "204"},
+	{Method: "GET", Path: "/v1/knowledge-bases/{namespace}/invitations", Summary: "List knowledge-base invitations", Tag: "sharing", Response: "200"},
+	{Method: "POST", Path: "/v1/knowledge-bases/{namespace}/invitations", Summary: "Create a share invitation", Tag: "sharing", Request: "CreateInvitationBody", Response: "201"},
+	{Method: "GET", Path: "/v1/invitations", Summary: "List the invitations addressed to the current account", Tag: "sharing", Response: "200"},
+	{Method: "POST", Path: "/v1/invitations/preview", Summary: "Preview a share invitation link", Tag: "sharing", Request: "InvitationTokenBody", Response: "200"},
+	{Method: "POST", Path: "/v1/invitations/accept", Summary: "Accept a share invitation", Tag: "sharing", Request: "InvitationTokenBody", Response: "200"},
+	{Method: "POST", Path: "/v1/invitations/decline", Summary: "Decline a share invitation", Tag: "sharing", Request: "InvitationTokenBody", Response: "200"},
+	{Method: "DELETE", Path: "/v1/invitations/{invitation_id}", Summary: "Revoke a pending invitation", Tag: "sharing", Response: "204"},
 }
 
 // openAPISchemas returns the component schemas referenced by the route table.
@@ -107,8 +119,38 @@ func openAPISchemas() map[string]any {
 			"additionalProperties": false,
 			"required":             []any{"role"},
 			"properties": map[string]any{
-				"role":    map[string]any{"type": "string", "enum": []any{"admin", "user"}, "title": "Role"},
+				"role":    map[string]any{"type": "string", "enum": []any{"admin", "vip", "user"}, "title": "Role"},
 				"enabled": map[string]any{"type": "boolean", "default": true, "title": "Enabled"},
+			},
+		},
+		"SelfCreateKnowledgeBaseBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"namespace"},
+			"properties": map[string]any{
+				"namespace":     map[string]any{"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$", "title": "Namespace"},
+				"strategy":      map[string]any{"type": "string", "default": "recursive", "title": "Strategy"},
+				"chunk_size":    map[string]any{"type": "integer", "nullable": true, "title": "Chunk Size"},
+				"chunk_overlap": map[string]any{"type": "integer", "nullable": true, "title": "Chunk Overlap"},
+			},
+		},
+		"CreateInvitationBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"username", "permission", "scope"},
+			"properties": map[string]any{
+				"username":       map[string]any{"type": "string", "title": "Username"},
+				"permission":     map[string]any{"type": "string", "enum": []any{"read", "write"}, "title": "Permission"},
+				"scope":          map[string]any{"type": "string", "enum": []any{"all", "files"}, "title": "Scope"},
+				"document_names": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "default": []any{}, "title": "Document Names"},
+			},
+		},
+		"InvitationTokenBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"token"},
+			"properties": map[string]any{
+				"token": map[string]any{"type": "string", "title": "Token"},
 			},
 		},
 		"ProviderSettingsBody": map[string]any{

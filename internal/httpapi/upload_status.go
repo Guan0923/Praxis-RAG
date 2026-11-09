@@ -21,6 +21,9 @@ func (s *Server) handleUploadStatusList(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	if _, ok := s.requireScopeRead(w, r); !ok {
+		return
+	}
 	operations, err := s.runtime.UploadOperations(r.Context(), namespace)
 	if err != nil {
 		writeRuntimeError(w, err, true)
@@ -38,6 +41,9 @@ func (s *Server) handleUploadStatusList(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleUploadStatusDetail(w http.ResponseWriter, r *http.Request) {
 	namespace, ok := s.tenantNamespace(w, r)
 	if !ok {
+		return
+	}
+	if _, ok := s.requireScopeRead(w, r); !ok {
 		return
 	}
 	operationID := pathParam(r, "operation_id")

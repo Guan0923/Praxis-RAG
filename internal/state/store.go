@@ -71,6 +71,8 @@ type Stores struct {
 	APIKeys        *APIKeyRepository
 	Users          *UserRepository
 	Sessions       *UserSessionRepository
+	Permissions    *PermissionRepository
+	Invitations    *InvitationRepository
 	KnowledgeBases *KnowledgeBaseRepository
 	Documents      *DocumentRepository
 	Catalogs       *CatalogRepository
@@ -174,6 +176,8 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.APIKeys = newAPIKeyRepository(database, settings.EncryptionKey, cacheSync)
 	stores.Users = newUserRepository(database)
 	stores.Sessions = newUserSessionRepository(database)
+	stores.Permissions = newPermissionRepository(database)
+	stores.Invitations = newInvitationRepository(database)
 	stores.KnowledgeBases = newKnowledgeBaseRepository(database, cacheSync)
 	stores.Documents = newDocumentRepository(database, cacheSync)
 	stores.Catalogs = newCatalogRepository(database, cacheSync)
@@ -404,6 +408,9 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	if err := s.migrateSoftDelete(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateKnowledgeBaseOwner(ctx); err != nil {
+		return err
+	}
 	return s.migrateDocumentOutbox(ctx)
 }
 
@@ -483,6 +490,38 @@ func (s *Stores) migrateSoftDelete(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, statement); err != nil {
 		confirmed, confirmErr := s.tableColumns(ctx, "documents")
 		if confirmErr == nil && containsString(confirmed, "del_flag") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// migrateKnowledgeBaseOwner adds the ownership column to an existing
+// knowledge_bases table. Rows created before ownership existed stay NULL, which
+// the access layer treats as "administrator-only". Concurrent startup may race
+// the ALTER; only an independently confirmed existing column is accepted.
+func (s *Stores) migrateKnowledgeBaseOwner(ctx context.Context) error {
+	const table = "knowledge_bases"
+	exists, err := s.hasTable(ctx, table)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	columns, err := s.tableColumns(ctx, table)
+	if err != nil {
+		return err
+	}
+	if containsString(columns, "owner_user_id") {
+		return nil
+	}
+	statement := "ALTER TABLE " + quoteIdentifier(table) +
+		" ADD COLUMN " + quoteIdentifier("owner_user_id") + " VARCHAR(32) COLLATE utf8mb4_bin NULL"
+	if _, err := s.DB.ExecContext(ctx, statement); err != nil {
+		confirmed, confirmErr := s.tableColumns(ctx, table)
+		if confirmErr == nil && containsString(confirmed, "owner_user_id") {
 			return nil
 		}
 		return err

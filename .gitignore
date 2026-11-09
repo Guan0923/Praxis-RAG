@@ -34,6 +34,10 @@ frontend/*.tsbuildinfo
 # pytest temp root when the system temp dir is unavailable (sandboxed shells)
 pytest-of-*/
 
+# Local agent/dev scratch space (env helper, design notes, Go build cache).
+/.dev/
+/.gocache/
+
 # Go build output and local test scratch space.
 /bin/
 /rag-service

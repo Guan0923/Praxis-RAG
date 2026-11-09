@@ -6,8 +6,10 @@ import {
   Empty,
   Modal,
   Table,
+  Tag,
   Tooltip,
   Upload,
+  type TableColumnsType,
   type UploadFile,
 } from "antd";
 import {
@@ -21,10 +23,12 @@ import {
   api,
   chunkLabel,
   errorText,
+  fetchAccess,
   formatBytes,
   isNotFoundError,
   isUploadJobTerminal,
   uploadJobLabel,
+  type AccessView,
   type Connection,
   type DocumentInfo,
   type DocumentJobStatus,
@@ -39,6 +43,7 @@ import {
 type Props = {
   connection: Connection;
   active: boolean;
+  authEnabled: boolean;
   onOpenDocument: (name: string) => void;
   uploading: boolean;
   onUploading: (busy: boolean) => void;
@@ -78,6 +83,7 @@ function abortableDelay(ms: number, signal: AbortSignal) {
 export function DocumentsPage({
   connection,
   active,
+  authEnabled,
   onOpenDocument,
   uploading,
   onUploading,
@@ -87,6 +93,7 @@ export function DocumentsPage({
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [listError, setListError] = useState("");
+  const [access, setAccess] = useState<AccessView>();
   const [knowledgeBase, setKnowledgeBase] = useState<KnowledgeBase>();
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [settingsError, setSettingsError] = useState("");
@@ -145,8 +152,22 @@ export function DocumentsPage({
       if (!lifetime.current.signal.aborted) setSettingsError(errorText(error));
     }
   }
+  // loadAccess resolves the caller's effective scope so read-only users never
+  // see upload/delete controls. Legacy API-key mode has no console session, so
+  // it keeps the historical controls and the server decides.
+  async function loadAccess() {
+    if (!authEnabled) return;
+    try {
+      const data = await fetchAccess(connection.namespace, connection);
+      if (!lifetime.current.signal.aborted) setAccess(data);
+    } catch {
+      // A failed probe must not break document listing; the server still
+      // enforces write permissions on every mutation.
+    }
+  }
   useEffect(() => {
     void loadKnowledgeBase();
+    void loadAccess();
     return () => {
       lifetime.current.abort();
       listRequest.current?.abort();
@@ -397,10 +418,85 @@ export function DocumentsPage({
       : "没有文件进入后台处理"
     : "";
 
+  // Only whole-knowledge-base writers get upload/delete controls. File-level
+  // writers can still replace authorized documents through the API, but the
+  // Console keeps them read-only (matching the server-side restriction).
+  const readOnly = Boolean(authEnabled && access && (!access.can_write || !access.scope.whole_write));
+  const documentColumns: TableColumnsType<DocumentInfo> = [
+    {
+      title: "文档",
+      key: "name",
+      render: (_, doc) => (
+        <div className="document-name">
+          <FileTextOutlined />
+          <div>
+            <button
+              type="button"
+              className="document-link"
+              onClick={() => onOpenDocument(doc.name)}
+            >
+              {doc.name}
+            </button>
+            <div className="secondary">
+              {doc.chunk_count} 个片段 · {formatBytes(doc.size)}
+              {!!doc.skipped_object_count && <div>已跳过 {doc.skipped_object_count} 个对象</div>}
+            </div>
+            <div className="mobile-document-details secondary">
+              {chunkLabel(doc.chunking, strategies)}
+              <br />
+              {doc.collection}
+            </div>
+          </div>
+        </div>
+      ),
+    },
+    {
+      title: "切分设置",
+      key: "chunking",
+      responsive: ["md"],
+      render: (_, doc) => (
+        <span className="break-text">
+          {chunkLabel(doc.chunking, strategies)}
+        </span>
+      ),
+    },
+    {
+      title: "集合",
+      dataIndex: "collection",
+      responsive: ["lg"],
+      render: (value) => (
+        <span className="secondary break-text">{value}</span>
+      ),
+    },
+  ];
+  if (!readOnly) {
+    documentColumns.push({
+      title: "操作",
+      key: "actions",
+      width: 64,
+      render: (_, doc) => (
+        <Tooltip title="删除文档">
+          <Button
+            type="text"
+            danger
+            aria-label={`删除 ${doc.name}`}
+            icon={<DeleteOutlined />}
+            disabled={uploading || !!deleting}
+            loading={deleting === doc.name}
+            onClick={() => removeDocument(doc)}
+          />
+        </Tooltip>
+      ),
+    });
+  }
+
   return (
     <>
       <div className="page-heading">
-        <h1>知识文档</h1>
+        <div className="page-heading-title">
+          <h1>知识文档</h1>
+          {readOnly && <Tag color="orange">只读</Tag>}
+        </div>
         <div className="toolbar">
           <Tooltip title="刷新文档">
             <Button
@@ -410,17 +506,28 @@ export function DocumentsPage({
               onClick={() => void loadDocuments()}
             />
           </Tooltip>
-          <Button
-            aria-label="上传文档"
-            type="primary"
-            icon={<UploadOutlined />}
-            disabled={!!deleting}
-            onClick={() => setOpen(true)}
-          >
-            上传文档
-          </Button>
+          {!readOnly && (
+            <Button
+              aria-label="上传文档"
+              type="primary"
+              icon={<UploadOutlined />}
+              disabled={!!deleting}
+              onClick={() => setOpen(true)}
+            >
+              上传文档
+            </Button>
+          )}
         </div>
       </div>
+      {readOnly && (
+        <Alert
+          className="page-alert"
+          type="info"
+          showIcon
+          title="只读知识库"
+          description="你对该知识库没有整体写入权限，上传与删除入口已隐藏；文件列表由服务端按授权范围过滤。"
+        />
+      )}
       <div className="section-heading">
         <h2>已索引文档</h2>
         <span className="secondary">{documents.length} 个文档</span>
@@ -455,71 +562,7 @@ export function DocumentsPage({
             />
           ),
         }}
-        columns={[
-          {
-            title: "文档",
-            key: "name",
-            render: (_, doc) => (
-              <div className="document-name">
-                <FileTextOutlined />
-                <div>
-                  <button
-                    type="button"
-                    className="document-link"
-                    onClick={() => onOpenDocument(doc.name)}
-                  >
-                    {doc.name}
-                  </button>
-                  <div className="secondary">
-                    {doc.chunk_count} 个片段 · {formatBytes(doc.size)}
-                    {!!doc.skipped_object_count && <div>已跳过 {doc.skipped_object_count} 个对象</div>}
-                  </div>
-                  <div className="mobile-document-details secondary">
-                    {chunkLabel(doc.chunking, strategies)}
-                    <br />
-                    {doc.collection}
-                  </div>
-                </div>
-              </div>
-            ),
-          },
-          {
-            title: "切分设置",
-            key: "chunking",
-            responsive: ["md"],
-            render: (_, doc) => (
-              <span className="break-text">
-                {chunkLabel(doc.chunking, strategies)}
-              </span>
-            ),
-          },
-          {
-            title: "集合",
-            dataIndex: "collection",
-            responsive: ["lg"],
-            render: (value) => (
-              <span className="secondary break-text">{value}</span>
-            ),
-          },
-          {
-            title: "操作",
-            key: "actions",
-            width: 64,
-            render: (_, doc) => (
-              <Tooltip title="删除文档">
-                <Button
-                  type="text"
-                  danger
-                  aria-label={`删除 ${doc.name}`}
-                  icon={<DeleteOutlined />}
-                  disabled={uploading || !!deleting}
-                  loading={deleting === doc.name}
-                  onClick={() => removeDocument(doc)}
-                />
-              </Tooltip>
-            ),
-          },
-        ]}
+        columns={documentColumns}
       />
       <Modal
         title="上传知识文档"

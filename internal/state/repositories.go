@@ -389,8 +389,18 @@ func (r *KnowledgeBaseRepository) Get(ctx context.Context, namespace string) (ma
 	return decodeObject(raw)
 }
 
-// Create inserts a new knowledge base at version 1.
+// Create inserts a new knowledge base at version 1 without an owner.
 func (r *KnowledgeBaseRepository) Create(ctx context.Context, settings map[string]any) error {
+	return r.create(ctx, settings, "")
+}
+
+// CreateWithOwner inserts a new knowledge base at version 1 owned by the given
+// Console account. An empty ownerUserID is the same as Create.
+func (r *KnowledgeBaseRepository) CreateWithOwner(ctx context.Context, settings map[string]any, ownerUserID string) error {
+	return r.create(ctx, settings, ownerUserID)
+}
+
+func (r *KnowledgeBaseRepository) create(ctx context.Context, settings map[string]any, ownerUserID string) error {
 	namespace, err := requireSetting(settings, "namespace")
 	if err != nil {
 		return err
@@ -404,6 +414,10 @@ func (r *KnowledgeBaseRepository) Create(ctx context.Context, settings map[strin
 		return err
 	}
 	timestamp := nowISO()
+	var owner any
+	if ownerUserID != "" {
+		owner = ownerUserID
+	}
 	database, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return newStateError("知识库配置无法保存")
@@ -413,9 +427,9 @@ func (r *KnowledgeBaseRepository) Create(ctx context.Context, settings map[strin
 		return newStateError("知识库配置无法保存")
 	}
 	_, err = database.ExecContext(ctx,
-		"INSERT INTO knowledge_bases (namespace, collection, settings, version, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, ?, ?)",
-		namespace, collection, encoded, 1, timestamp, timestamp)
+		"INSERT INTO knowledge_bases (namespace, collection, settings, version, created_at, updated_at, owner_user_id) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?)",
+		namespace, collection, encoded, 1, timestamp, timestamp, owner)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return newStateConflict("该知识库已存在")
@@ -427,6 +441,107 @@ func (r *KnowledgeBaseRepository) Create(ctx context.Context, settings map[strin
 	}
 	r.flushPending(ctx, namespace)
 	return nil
+}
+
+// Namespaces lists every configured knowledge-base namespace ordered by name.
+func (r *KnowledgeBaseRepository) Namespaces(ctx context.Context) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, "SELECT namespace FROM knowledge_bases ORDER BY namespace")
+	if err != nil {
+		return nil, newStateError("知识库列表读取失败")
+	}
+	defer func() { _ = rows.Close() }()
+	namespaces := make([]string, 0, 8)
+	for rows.Next() {
+		var namespace string
+		if err := rows.Scan(&namespace); err != nil {
+			return nil, newStateError("知识库列表读取失败")
+		}
+		namespaces = append(namespaces, namespace)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, newStateError("知识库列表读取失败")
+	}
+	return namespaces, nil
+}
+
+// OwnerOf returns the owner account id of one knowledge base. A missing row or a
+// legacy row created before ownership existed returns "" (unowned).
+func (r *KnowledgeBaseRepository) OwnerOf(ctx context.Context, namespace string) (string, error) {
+	var owner sql.NullString
+	err := r.db.QueryRowContext(ctx,
+		"SELECT owner_user_id FROM knowledge_bases WHERE namespace = ?", namespace).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", newStateError("知识库归属读取失败")
+	}
+	if !owner.Valid {
+		return "", nil
+	}
+	return owner.String, nil
+}
+
+// Exists reports whether the namespace has a knowledge-base row.
+func (r *KnowledgeBaseRepository) Exists(ctx context.Context, namespace string) (bool, error) {
+	var found int
+	err := r.db.QueryRowContext(ctx,
+		"SELECT 1 FROM knowledge_bases WHERE namespace = ? LIMIT 1", namespace).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, newStateError("知识库归属读取失败")
+	}
+	return true, nil
+}
+
+// OwnedNamespaces lists the knowledge bases owned by one account.
+func (r *KnowledgeBaseRepository) OwnedNamespaces(ctx context.Context, ownerUserID string) ([]string, error) {
+	if ownerUserID == "" {
+		return nil, nil
+	}
+	rows, err := r.db.QueryContext(ctx,
+		"SELECT namespace FROM knowledge_bases WHERE owner_user_id = ? ORDER BY namespace", ownerUserID)
+	if err != nil {
+		return nil, newStateError("知识库归属读取失败")
+	}
+	defer func() { _ = rows.Close() }()
+	namespaces := make([]string, 0, 4)
+	for rows.Next() {
+		var namespace string
+		if err := rows.Scan(&namespace); err != nil {
+			return nil, newStateError("知识库归属读取失败")
+		}
+		namespaces = append(namespaces, namespace)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, newStateError("知识库归属读取失败")
+	}
+	return namespaces, nil
+}
+
+// SetOwner assigns or clears the owner of one knowledge base and reports whether
+// the row existed.
+func (r *KnowledgeBaseRepository) SetOwner(ctx context.Context, namespace, ownerUserID string) (bool, error) {
+	var owner any
+	if ownerUserID != "" {
+		owner = ownerUserID
+	}
+	result, err := r.db.ExecContext(ctx,
+		"UPDATE knowledge_bases SET owner_user_id = ?, updated_at = ? WHERE namespace = ?",
+		owner, nowISO(), namespace)
+	if err != nil {
+		return false, newStateError("知识库归属无法保存")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, newStateError("知识库归属无法保存")
+	}
+	if changed > 0 {
+		r.flushPending(ctx, namespace)
+	}
+	return changed > 0, nil
 }
 
 // Update rewrites a knowledge base and increments its version.
@@ -475,7 +590,9 @@ func (r *KnowledgeBaseRepository) Update(ctx context.Context, settings map[strin
 	return nil
 }
 
-// Delete removes one knowledge base and reports whether a row changed.
+// Delete removes one knowledge base and reports whether a row changed. Sharing
+// state of the namespace (permissions and invitations) is dropped in the same
+// transaction so a future knowledge base with the same name starts private.
 func (r *KnowledgeBaseRepository) Delete(ctx context.Context, namespace string) (bool, error) {
 	database, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -483,6 +600,14 @@ func (r *KnowledgeBaseRepository) Delete(ctx context.Context, namespace string) 
 	}
 	defer func() { _ = database.Rollback() }()
 	if _, err := touch(ctx, database, knowledgeKeys(namespace)...); err != nil {
+		return false, err
+	}
+	if _, err := database.ExecContext(ctx,
+		"DELETE FROM kb_permissions WHERE namespace = ?", namespace); err != nil {
+		return false, err
+	}
+	if _, err := database.ExecContext(ctx,
+		"DELETE FROM kb_invitations WHERE namespace = ?", namespace); err != nil {
 		return false, err
 	}
 	result, err := database.ExecContext(ctx,

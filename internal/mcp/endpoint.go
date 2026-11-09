@@ -176,6 +176,11 @@ func (e *Endpoint) newNamespaceTransport(namespace string) (*namespaceTransport,
 // runtime failures are surfaced as tool errors, never protocol errors.
 func (e *Endpoint) toolHandler(namespace string, entry toolEntry) sdk.ToolHandler {
 	return func(ctx context.Context, req *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		var extra *sdk.RequestExtra
+		if req != nil {
+			extra = req.Extra
+		}
+		ctx = withRequestScope(ctx, extra)
 		var raw []byte
 		if req != nil && req.Params != nil {
 			raw = req.Params.Arguments
@@ -195,6 +200,13 @@ func (e *Endpoint) toolHandler(namespace string, entry toolEntry) sdk.ToolHandle
 		if err != nil {
 			return toolError(err.Error()), nil
 		}
+		// Document write tools require the per-document write grant; a scope
+		// limited to other files must not be able to modify this one.
+		if document, isDocument := validated.(documentRequest); isDocument {
+			if scope, hasScope := scopeFor(ctx); hasScope && !scope.CanWriteDocument(document.name) {
+				return toolError(messageDocumentWriteRequired), nil
+			}
+		}
 		payload, err := entry.execute(ctx, namespace, validated)
 		if err != nil {
 			return toolError(err.Error()), nil
@@ -210,6 +222,11 @@ func (e *Endpoint) toolHandler(namespace string, entry toolEntry) sdk.ToolHandle
 func (e *Endpoint) receivingMiddleware(namespace string, handlers map[string]sdk.ToolHandler) sdk.Middleware {
 	return func(next sdk.MethodHandler) sdk.MethodHandler {
 		return func(ctx context.Context, method string, req sdk.Request) (sdk.Result, error) {
+			// Resolve this message's visibility once so the resource handlers
+			// below never inherit a stale session context.
+			if req != nil {
+				ctx = withRequestScope(ctx, req.GetExtra())
+			}
 			switch method {
 			case methodToolsList:
 				params, _ := req.GetParams().(*sdk.ListToolsParams)

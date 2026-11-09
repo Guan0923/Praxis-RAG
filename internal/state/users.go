@@ -5,10 +5,11 @@ import (
 	"database/sql"
 )
 
-// User roles. Admins manage users and service configuration; every other
-// account is a normal user.
+// User roles. Admins manage users and service configuration; VIP accounts may
+// share the knowledge bases they own; every other account is a normal user.
 const (
 	RoleAdmin = "admin"
+	RoleVIP   = "vip"
 	RoleUser  = "user"
 )
 
@@ -26,6 +27,18 @@ type User struct {
 
 // IsAdmin reports whether the account may administer users and configuration.
 func (u User) IsAdmin() bool { return u.Role == RoleAdmin }
+
+// IsVIP reports whether the account holds the VIP role.
+func (u User) IsVIP() bool { return u.Role == RoleVIP }
+
+// CanShare reports whether the account may manage knowledge-base permissions
+// and invitations. Only administrators and VIPs can share.
+func (u User) CanShare() bool { return u.IsAdmin() || u.IsVIP() }
+
+// IsRole reports whether value is one of the supported account roles.
+func IsRole(value string) bool {
+	return value == RoleAdmin || value == RoleVIP || value == RoleUser
+}
 
 // UserRepository persists accounts and their PBKDF2 password hashes.
 type UserRepository struct{ db *sql.DB }
@@ -154,7 +167,10 @@ func (r *UserRepository) Update(ctx context.Context, id, role string, enabled bo
 	return r.ByID(ctx, id)
 }
 
-// Delete removes one account and reports whether it existed.
+// Delete removes one account and reports whether it existed. The transaction
+// also drops the account's sessions, the knowledge-base permissions granted to
+// it, and the invitations it issued or received; knowledge bases it owned become
+// unowned (administrator-only) instead of being deleted with the account.
 func (r *UserRepository) Delete(ctx context.Context, id string) (bool, error) {
 	transaction, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -162,6 +178,17 @@ func (r *UserRepository) Delete(ctx context.Context, id string) (bool, error) {
 	}
 	defer func() { _ = transaction.Rollback() }()
 	if _, err := transaction.ExecContext(ctx, "DELETE FROM user_sessions WHERE user_id = ?", id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM kb_permissions WHERE grantee_user_id = ?", id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM kb_invitations WHERE inviter_user_id = ? OR invitee_user_id = ?", id, id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"UPDATE knowledge_bases SET owner_user_id = NULL WHERE owner_user_id = ?", id); err != nil {
 		return false, newStateError("用户无法删除")
 	}
 	result, err := transaction.ExecContext(ctx, "DELETE FROM users WHERE id = ?", id)

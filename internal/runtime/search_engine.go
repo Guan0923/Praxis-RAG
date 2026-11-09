@@ -79,7 +79,7 @@ func (e *SearchEngine) Search(
 	// into the payload, so saved references/result snapshots record which
 	// collection/config version produced the evidence.
 	snapshot := snapshotContext(tenant)
-	payload, err := tenant.orchestrator.Search(ctx, request)
+	payload, err := searchTenant(ctx, tenant, request)
 	if err != nil {
 		return nil, searchError(err)
 	}
@@ -89,6 +89,129 @@ func (e *SearchEngine) Search(
 		payload, _ = e.references.Capture(ctx, namespace, payload, true)
 	}
 	return payload, nil
+}
+
+// restrictedCandidateK is the internal candidate/selection bound used when a
+// search is restricted to a document set. A wider pool lets the reranker surface
+// visible documents before the post-retrieval visibility filter runs (DESIGN §7).
+const restrictedCandidateK = 100
+
+// Evidence guidance strings are the retrieval contract's fixed wording; the
+// runtime recomputes evidence_status/answer_guidance after visibility filtering.
+const (
+	evidenceFoundGuidance   = "Answer from the returned evidence and cite source plus chunk_id."
+	evidenceMissingGuidance = "No supporting local evidence was found; do not guess or present unsupported knowledge claims."
+)
+
+// searchTenant runs one retrieval request for a tenant, applying the server-side
+// document visibility restriction when request.DocumentIDs is non-nil (an empty
+// non-nil slice means "nothing is visible" and yields no evidence).
+func searchTenant(
+	ctx context.Context,
+	tenant *tenantResources,
+	request contracts.SearchRequest,
+) (map[string]any, error) {
+	restricted := request.DocumentIDs != nil
+	internal := request
+	if restricted {
+		internal = restrictedSearchRequest(request)
+	}
+	payload, err := tenant.orchestrator.Search(ctx, internal)
+	if err != nil {
+		return nil, err
+	}
+	if restricted {
+		payload = filterSearchPayload(payload, request)
+	}
+	return payload, nil
+}
+
+// restrictedSearchRequest returns the internal request used for a document-id
+// restricted search: CandidateK and the post-rerank selection are widened to
+// restrictedCandidateK so the visibility filter can still fill the caller's
+// top_k. The caller-visible candidate_k/top_k are restored on the payload by
+// filterSearchPayload.
+func restrictedSearchRequest(request contracts.SearchRequest) contracts.SearchRequest {
+	restricted := request
+	if restricted.CandidateK < restrictedCandidateK {
+		restricted.CandidateK = restrictedCandidateK
+	}
+	if restricted.TopK < restrictedCandidateK {
+		restricted.TopK = restrictedCandidateK
+	}
+	return restricted
+}
+
+// filterSearchPayload applies a DocumentIDs restriction to an orchestrator
+// payload: results whose document_id is not allowed are dropped, ranks are
+// renumbered from 1 and the list is bounded by the caller's top_k. The
+// caller-visible candidate_k/top_k are restored and evidence_status,
+// answer_guidance and debug.returned_count are recomputed so an empty filtered
+// result keeps the existing no-evidence semantics. It must run before
+// searchrefs.Capture so snapshots contain only visible results.
+func filterSearchPayload(payload map[string]any, request contracts.SearchRequest) map[string]any {
+	if payload == nil {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(request.DocumentIDs))
+	for _, documentID := range request.DocumentIDs {
+		allowed[documentID] = struct{}{}
+	}
+	filtered := make([]any, 0, len(request.DocumentIDs))
+	for _, item := range payloadResultItems(payload["results"]) {
+		if len(filtered) >= request.TopK {
+			break
+		}
+		documentID, _ := item["document_id"].(string)
+		if _, visible := allowed[documentID]; !visible {
+			continue
+		}
+		visible := make(map[string]any, len(item))
+		for key, value := range item {
+			visible[key] = value
+		}
+		visible["rank"] = len(filtered) + 1
+		filtered = append(filtered, visible)
+	}
+	updated := make(map[string]any, len(payload))
+	for key, value := range payload {
+		updated[key] = value
+	}
+	updated["results"] = filtered
+	// The restriction is server-side: the payload keeps echoing the caller's
+	// requested bounds, not the widened internal ones.
+	updated["candidate_k"] = request.CandidateK
+	updated["top_k"] = request.TopK
+	if len(filtered) == 0 {
+		updated["evidence_status"] = "no_evidence"
+		updated["answer_guidance"] = evidenceMissingGuidance
+	} else {
+		updated["evidence_status"] = "found"
+		updated["answer_guidance"] = evidenceFoundGuidance
+	}
+	if debug, ok := updated["debug"].(map[string]any); ok {
+		debug["returned_count"] = len(filtered)
+	}
+	return updated
+}
+
+// payloadResultItems accepts the orchestrator's typed result list and the
+// JSON-shaped ([]any) form produced by the runtime boundary.
+func payloadResultItems(raw any) []map[string]any {
+	switch results := raw.(type) {
+	case []map[string]any:
+		return results
+	case []any:
+		items := make([]map[string]any, 0, len(results))
+		for _, rawItem := range results {
+			if item, ok := rawItem.(map[string]any); ok {
+				items = append(items, item)
+			}
+		}
+		return items
+	default:
+		return nil
+	}
 }
 
 // snapshotContext mirrors the Python ingester-config context:
@@ -220,7 +343,7 @@ func (e *SearchEngine) SearchRaw(ctx context.Context, namespace string, request 
 		return nil, searchError(err)
 	}
 	snapshot := snapshotContext(tenant)
-	payload, err := tenant.orchestrator.Search(ctx, request)
+	payload, err := searchTenant(ctx, tenant, request)
 	if err != nil {
 		return nil, searchError(err)
 	}

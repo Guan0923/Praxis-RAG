@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
 	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
 	"github.com/Guan0923/xinghe_rag/internal/modelapi"
@@ -35,39 +37,117 @@ func (s *Service) ListKnowledgeBases(ctx context.Context) ([]map[string]any, err
 	return items, nil
 }
 
+// messageDefaultKBTemplateMissing is the fixed HTTP 409 detail returned when a
+// tenant self-create runs without an administrator-configured default
+// knowledge-base template (DESIGN §2).
+const messageDefaultKBTemplateMissing = "管理员尚未配置默认知识库模板，请联系管理员创建知识库"
+
 // CreateKnowledgeBase validates and persists one new knowledge base, probing the
 // embedding (and optional reranker) provider for connectivity and vector size.
 //
 // Python semantics: the namespace pattern is checked first, an existing row or
 // pre-existing documents in the namespace are rejected with the same messages,
 // and no row is written when a probe fails. The tenant cache is invalidated
-// after a successful create.
+// after a successful create. The row keeps a NULL owner (the administrator
+// route's legacy shape); CreateKnowledgeBaseForUser records ownership.
 func (s *Service) CreateKnowledgeBase(ctx context.Context, input kbconfig.CreateInput) (map[string]any, error) {
-	if err := kbconfig.ValidateNamespace(input.Namespace); err != nil {
-		return nil, adminError(err)
+	return s.createKnowledgeBase(ctx, input, "", kbconfig.HTTPProber{Timeout: modelapi.DefaultTimeout})
+}
+
+// CreateKnowledgeBaseForUser creates one knowledge base owned by a Console
+// account.
+//
+// The tenant self-create route (POST /v1/knowledge-bases) only accepts the
+// namespace and chunking for every role. When the request does not carry a
+// complete embedding provider draft — always the case for VIPs and normal
+// users, and the default for administrators too — the embedding/reranker/VLM
+// connections and the embedding vector size are cloned from the administrator
+// default template (config.RagConfig.DefaultKBTemplate, RAG_DEFAULT_KB_TEMPLATE).
+// An administrator who submits the full provider configuration (the admin route
+// shape) keeps those provider settings. The template's stored credentials are
+// decrypted with the state encryption key and re-encrypted for the new row. A
+// missing template is a *apierrors.KnowledgeConflictError (HTTP 409) and the
+// template's own name is never used as the new namespace.
+func (s *Service) CreateKnowledgeBaseForUser(
+	ctx context.Context,
+	ownerUserID string,
+	isAdmin bool,
+	input kbconfig.CreateInput,
+) (map[string]any, error) {
+	prober := kbconfig.Prober(kbconfig.HTTPProber{Timeout: modelapi.DefaultTimeout})
+	if !isAdmin || !providerInputConfigured(input) {
+		// Validate the request before touching the template so an invalid
+		// namespace is reported as a normal validation failure.
+		if err := s.validateKnowledgeBaseCreate(ctx, input.Namespace); err != nil {
+			return nil, err
+		}
+		cloned, templateProber, err := s.cloneDefaultKnowledgeBase(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		input = cloned
+		prober = templateProber
 	}
-	existing, err := s.stores.KnowledgeBases.Get(ctx, input.Namespace)
-	if err != nil {
-		return nil, &apierrors.KnowledgeError{Message: "知识库配置无法读取"}
+	return s.createKnowledgeBase(ctx, input, ownerUserID, prober)
+}
+
+// providerInputConfigured reports whether a create input carries a complete
+// provider draft (an embedding model plus an embedding base_url). Without both
+// the row cannot be created without the default template.
+func providerInputConfigured(input kbconfig.CreateInput) bool {
+	if strings.TrimSpace(input.EmbeddingModel) == "" {
+		return false
 	}
-	if existing != nil {
-		return nil, &apierrors.KnowledgeValidationError{Message: kbconfig.MessageKnowledgeBaseExists}
+	baseURL, _ := input.EmbeddingValues["base_url"].(string)
+	return strings.TrimSpace(baseURL) != ""
+}
+
+// ResolveDocumentIDs maps document names to their indexed document ids inside
+// one knowledge base. Names without a document row are skipped and duplicate
+// ids are collapsed, so the MCP visibility filter can feed the result straight
+// into contracts.SearchRequest.DocumentIDs.
+func (s *Service) ResolveDocumentIDs(ctx context.Context, namespace string, names []string) ([]string, error) {
+	ids := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		record, err := s.stores.Documents.Get(ctx, namespace, name)
+		if err != nil {
+			return nil, &apierrors.KnowledgeError{Message: "文档记录无法读取"}
+		}
+		if record == nil || record.DocumentID == "" {
+			continue
+		}
+		if _, duplicate := seen[record.DocumentID]; duplicate {
+			continue
+		}
+		seen[record.DocumentID] = struct{}{}
+		ids = append(ids, record.DocumentID)
 	}
-	documents, err := s.stores.Documents.List(ctx, input.Namespace)
-	if err != nil {
-		return nil, &apierrors.KnowledgeError{Message: "文档记录无法读取"}
-	}
-	if len(documents) > 0 {
-		return nil, &apierrors.KnowledgeValidationError{Message: kbconfig.MessageNamespaceHasDocuments}
+	return ids, nil
+}
+
+// createKnowledgeBase is the shared create path (validation, provider probe or
+// template replay, owner-aware insert, tenant-cache invalidation).
+func (s *Service) createKnowledgeBase(
+	ctx context.Context,
+	input kbconfig.CreateInput,
+	ownerUserID string,
+	prober kbconfig.Prober,
+) (map[string]any, error) {
+	if err := s.validateKnowledgeBaseCreate(ctx, input.Namespace); err != nil {
+		return nil, err
 	}
 	if input.EncryptionKey == "" {
 		input.EncryptionKey = s.stores.Settings.EncryptionKey
 	}
-	settings, err := kbconfig.CreateSettings(ctx, input, kbconfig.HTTPProber{Timeout: modelapi.DefaultTimeout})
+	settings, err := kbconfig.CreateSettings(ctx, input, prober)
 	if err != nil {
 		return nil, adminError(err)
 	}
-	if err := s.stores.KnowledgeBases.Create(ctx, settings); err != nil {
+	if err := s.stores.KnowledgeBases.CreateWithOwner(ctx, settings, ownerUserID); err != nil {
 		var conflict *state.StateConflict
 		if errors.As(err, &conflict) {
 			return nil, &apierrors.KnowledgeValidationError{Message: kbconfig.MessageKnowledgeBaseExists}
@@ -76,6 +156,112 @@ func (s *Service) CreateKnowledgeBase(ctx context.Context, input kbconfig.Create
 	}
 	s.Invalidate(input.Namespace)
 	return kbconfig.PublicSettings(settings), nil
+}
+
+// validateKnowledgeBaseCreate reproduces the pre-insert checks: namespace
+// pattern, no existing configuration row, no documents in the namespace.
+func (s *Service) validateKnowledgeBaseCreate(ctx context.Context, namespace string) error {
+	if err := kbconfig.ValidateNamespace(namespace); err != nil {
+		return adminError(err)
+	}
+	existing, err := s.stores.KnowledgeBases.Get(ctx, namespace)
+	if err != nil {
+		return &apierrors.KnowledgeError{Message: "知识库配置无法读取"}
+	}
+	if existing != nil {
+		return &apierrors.KnowledgeValidationError{Message: kbconfig.MessageKnowledgeBaseExists}
+	}
+	documents, err := s.stores.Documents.List(ctx, namespace)
+	if err != nil {
+		return &apierrors.KnowledgeError{Message: "文档记录无法读取"}
+	}
+	if len(documents) > 0 {
+		return &apierrors.KnowledgeValidationError{Message: kbconfig.MessageNamespaceHasDocuments}
+	}
+	return nil
+}
+
+// cloneDefaultKnowledgeBase reads the default template row and turns its stored
+// provider connections into a kbconfig.CreateInput identical to the request
+// except for the cloned provider settings. The returned prober replays the
+// template's validated vector size instead of probing the providers again (the
+// template was validated by the administrator create).
+func (s *Service) cloneDefaultKnowledgeBase(
+	ctx context.Context,
+	input kbconfig.CreateInput,
+) (kbconfig.CreateInput, kbconfig.Prober, error) {
+	templateNamespace := strings.TrimSpace(s.config.DefaultKBTemplate)
+	if templateNamespace == "" {
+		templateNamespace = config.DefaultKBTemplateNamespace
+	}
+	settings, err := s.stores.KnowledgeBases.Get(ctx, templateNamespace)
+	if err != nil {
+		return input, nil, &apierrors.KnowledgeError{Message: "知识库配置无法读取"}
+	}
+	if settings == nil {
+		return input, nil, &apierrors.KnowledgeConflictError{Message: messageDefaultKBTemplateMissing}
+	}
+	encryptionKey := s.stores.Settings.EncryptionKey
+	embedding, err := kbconfig.ModelConnectionForKey(settings, "embedding", encryptionKey)
+	if err != nil {
+		return input, nil, adminError(err)
+	}
+	reranker, err := kbconfig.ModelConnectionForKey(settings, "reranker", encryptionKey)
+	if err != nil {
+		return input, nil, adminError(err)
+	}
+	vlm, err := kbconfig.ModelConnectionForKey(settings, "vlm", encryptionKey)
+	if err != nil {
+		return input, nil, adminError(err)
+	}
+	vectorSize := 0
+	if embedding.VectorSize != nil {
+		vectorSize = *embedding.VectorSize
+	}
+	if vectorSize <= 0 {
+		return input, nil, adminError(fmt.Errorf("default knowledge base template has no vector size"))
+	}
+	cloned := input
+	cloned.EmbeddingModel = embedding.Model
+	cloned.EmbeddingValues = connectionValues(embedding)
+	cloned.RerankerModel = reranker.Model
+	cloned.RerankerValues = connectionValues(reranker)
+	cloned.VLMModel = vlm.Model
+	cloned.VLMValues = connectionValues(vlm)
+	if strings.TrimSpace(cloned.TokenizerModel) == "" {
+		if tokenizer, ok := settings["tokenizer"].(string); ok {
+			cloned.TokenizerModel = tokenizer
+		}
+	}
+	// The template's credentials are decrypted above and re-encrypted by
+	// CreateSettings with the same store key; never forward a caller key.
+	cloned.EncryptionKey = ""
+	return cloned, templateProber{vectorSize: vectorSize}, nil
+}
+
+// connectionValues renders one decrypted connection as the client provider
+// draft accepted by kbconfig.DraftConnection ({base_url, apikey}).
+func connectionValues(connection modelapi.ModelConnection) map[string]any {
+	return map[string]any{"base_url": connection.BaseURL, "apikey": connection.APIKey}
+}
+
+// templateProber replays the default template's validated provider state: the
+// embedding vector size recorded on the template row, and an already-probed
+// reranker. It performs no network I/O, so a template clone does not depend on
+// provider availability.
+type templateProber struct {
+	vectorSize int
+}
+
+// EmbeddingVectorSize returns the template's recorded dense dimension.
+func (p templateProber) EmbeddingVectorSize(context.Context, modelapi.ModelConnection) (int, error) {
+	return p.vectorSize, nil
+}
+
+// RerankerAccessible accepts the template's reranker (validated at template
+// creation).
+func (p templateProber) RerankerAccessible(context.Context, modelapi.ModelConnection) error {
+	return nil
 }
 
 // UpdateKnowledgeBase validates and publishes one configuration change.

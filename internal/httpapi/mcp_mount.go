@@ -32,6 +32,9 @@ func (s *Server) handleKnowledgeBase(w http.ResponseWriter, r *http.Request) {
 		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
 		return
 	}
+	if _, ok := s.requireScopeRead(w, r); !ok {
+		return
+	}
 	payload, err := s.runtime.PublicKnowledgeBase(r.Context(), namespace)
 	if err != nil {
 		var validation *apierrors.KnowledgeValidationError

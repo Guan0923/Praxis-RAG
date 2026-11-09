@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/Guan0923/xinghe_rag/internal/auth"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 )
 
@@ -32,6 +33,13 @@ func namespaceFromHeader(r *http.Request) (string, bool) {
 // tenantFromHeaders resolves the tenant namespace for a request. It returns the
 // namespace, or writes the HTTP error and returns ok=false.
 func (s *Server) tenantFromHeaders(w http.ResponseWriter, r *http.Request) (string, bool) {
+	namespace, _, ok := s.tenantFromRequest(w, r)
+	return namespace, ok
+}
+
+// tenantFromRequest is tenantFromHeaders plus the login session that
+// authenticated the request (nil for API-key/service-token/loopback access).
+func (s *Server) tenantFromRequest(w http.ResponseWriter, r *http.Request) (string, *auth.SessionUser, bool) {
 	authorization := r.Header.Get("Authorization")
 
 	// Console login sessions (cookies, or a bearer session token) take
@@ -42,14 +50,14 @@ func (s *Server) tenantFromHeaders(w http.ResponseWriter, r *http.Request) (stri
 			if err == nil && session != nil {
 				if !s.validateCSRF(r, session, viaCookie) {
 					writeDetail(w, http.StatusForbidden, "CSRF 校验失败，请刷新页面后重试")
-					return "", false
+					return "", nil, false
 				}
 				namespace, ok := namespaceFromHeader(r)
 				if !ok {
 					writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
-					return "", false
+					return "", nil, false
 				}
-				return namespace, true
+				return namespace, session, true
 			}
 		}
 	}
@@ -58,47 +66,47 @@ func (s *Server) tenantFromHeaders(w http.ResponseWriter, r *http.Request) (stri
 		namespace, ok := namespaceFromHeader(r)
 		if !ok {
 			writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
-			return "", false
+			return "", nil, false
 		}
-		return namespace, true
+		return namespace, nil, true
 	}
 
 	if strings.HasPrefix(authorization, "Bearer ") {
 		secret := strings.TrimPrefix(authorization, "Bearer ")
 		if s.keys == nil {
 			writeDetail(w, http.StatusUnauthorized, "RAG service authentication failed.")
-			return "", false
+			return "", nil, false
 		}
 		namespaces, err := s.keys.NamespacesForKey(r.Context(), secret)
 		if err != nil {
 			writeDetail(w, http.StatusUnauthorized, err.Error())
-			return "", false
+			return "", nil, false
 		}
 		namespace, ok := namespaceFromHeader(r)
 		if !ok {
 			writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
-			return "", false
+			return "", nil, false
 		}
 		for _, candidate := range namespaces {
 			if candidate == namespace {
-				return namespace, true
+				return namespace, nil, true
 			}
 		}
 		writeDetail(w, http.StatusForbidden, "API Key 未获授权访问此 Namespace")
-		return "", false
+		return "", nil, false
 	}
 
 	if authorization == "" && s.settings.Token == "" && localModelRequest(r) {
 		namespace, ok := namespaceFromHeader(r)
 		if !ok {
 			writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
-			return "", false
+			return "", nil, false
 		}
-		return namespace, true
+		return namespace, nil, true
 	}
 
 	writeDetail(w, http.StatusUnauthorized, "RAG service authentication failed.")
-	return "", false
+	return "", nil, false
 }
 
 // requireAdmin protects the management endpoints. An explicit login session is

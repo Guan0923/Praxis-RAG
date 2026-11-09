@@ -79,6 +79,26 @@ func (s *Server) handleNamespaceList(w http.ResponseWriter, r *http.Request) {
 			namespaces = append(namespaces, name)
 		}
 	}
+	// A login session only sees knowledge bases it owns or holds grants in;
+	// management credentials keep the full list.
+	if session, ok := sessionUserFromContext(r.Context()); ok && s.access != nil {
+		visible, err := s.access.VisibleNamespaces(r.Context(), session.User)
+		if err != nil {
+			writeDetail(w, http.StatusInternalServerError, "知识库权限服务异常")
+			return
+		}
+		allowed := make(map[string]struct{}, len(visible))
+		for _, name := range visible {
+			allowed[name] = struct{}{}
+		}
+		filtered := make([]string, 0, len(visible))
+		for _, name := range namespaces {
+			if _, ok := allowed[name]; ok {
+				filtered = append(filtered, name)
+			}
+		}
+		namespaces = filtered
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{"namespaces": namespaces})
 }

@@ -77,6 +77,12 @@ type Runtime interface {
 	ListDocuments(ctx context.Context, namespace string) ([]DocumentRecord, error)
 	// ReadDocument returns the rendered text and current version of a document.
 	ReadDocument(ctx context.Context, namespace, name string) (DocumentContent, error)
+	// ResolveDocumentIDs maps document names to the document ids stored in
+	// retrieval payloads. Names without a document row are skipped. MCP uses it
+	// to translate the caller's readable names into the server-side
+	// contracts.SearchRequest.DocumentIDs visibility restriction, and to
+	// defensively filter stored search results.
+	ResolveDocumentIDs(ctx context.Context, namespace string, names []string) ([]string, error)
 
 	// Search runs one retrieval action synchronously (legacy/mock mode).
 	Search(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error)

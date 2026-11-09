@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+
+	"github.com/Guan0923/xinghe_rag/internal/access"
 )
 
 // modernProtocolVersion is the first protocol era the SDK only serves over a
@@ -145,6 +147,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request := r.WithContext(WithNamespace(r.Context(), namespace))
+	// Carry the caller's access scope to the SDK handlers per request. The
+	// stateful (legacy) transport runs handlers on the session goroutine with
+	// the initialize request's context, so context values alone would be stale;
+	// the header is attached to every message as RequestExtra.Header. It always
+	// overrides any client-supplied value so a restricted caller cannot forge a
+	// broader scope.
+	request.Header = r.Header.Clone()
+	if request.Header == nil {
+		request.Header = http.Header{}
+	}
+	if scope, ok := access.ScopeFromContext(r.Context()); ok {
+		request.Header.Set(scopeHeaderName, encodeScopeHeader(scope))
+	} else {
+		request.Header.Set(scopeHeaderName, scopeHeaderNone)
+	}
 	if modern {
 		transport.stateless.ServeHTTP(w, request)
 		return

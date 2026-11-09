@@ -783,3 +783,121 @@ h3 {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Invitation bell, share links and permission-management screens. */
+.page-heading-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 0;
+}
+.invite-bell.ant-btn {
+  padding: 4px 8px;
+}
+.invite-bell .anticon {
+  font-size: 17px;
+}
+.invite-bell-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 320px;
+  padding: 2px 0;
+  white-space: normal;
+}
+.invite-bell-kb {
+  font-weight: 500;
+}
+.invite-link-opener {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 720px;
+  margin-bottom: 20px;
+}
+.invite-link-opener .ant-input-affix-wrapper {
+  flex: 1;
+  min-width: 0;
+}
+.invite-link-box {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 0 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--sidebar);
+}
+.invite-link-box code {
+  flex: 1;
+  min-width: 0;
+  font:
+    13px/1.7 Consolas,
+    monospace;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+.invite-created {
+  display: grid;
+  gap: 12px;
+}
+.invite-detail {
+  max-width: 780px;
+}
+.invite-detail-fields {
+  margin: 8px 0 20px;
+}
+.invite-detail-actions {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.scope-files {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+.scope-files .ant-tag {
+  margin: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.permissions-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin-bottom: 24px;
+}
+.permissions-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.permissions-select {
+  width: 280px;
+  max-width: 100%;
+}
+.permissions-table .ant-table {
+  background: transparent;
+}
+.section-heading-spaced {
+  margin-top: 32px;
+}
+@media (max-width: 767px) {
+  .invite-link-opener {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .invite-link-box {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .permissions-select {
+    width: 100%;
+  }
+}

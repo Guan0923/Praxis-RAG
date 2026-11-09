@@ -55,7 +55,7 @@ const (
 	MessageRegistrationClosed = "注册已关闭，请联系管理员创建账号"
 	MessageLastAdmin          = "至少保留一名启用状态的管理员"
 	MessageUserNotFound       = "用户不存在"
-	MessageRoleInvalid        = "角色只能是 admin 或 user"
+	MessageRoleInvalid        = "角色只能是 admin、vip 或 user"
 )
 
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$`)
@@ -210,7 +210,7 @@ func (s *Service) ListUsers(ctx context.Context) ([]state.User, error) {
 // UpdateUser changes role and enabled state while protecting the last enabled
 // administrator.
 func (s *Service) UpdateUser(ctx context.Context, userID, role string, enabled bool) (*state.User, error) {
-	if role != state.RoleAdmin && role != state.RoleUser {
+	if !state.IsRole(role) {
 		return nil, newError(KindValidation, MessageRoleInvalid)
 	}
 	current, err := s.users.ByID(ctx, userID)

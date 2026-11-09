@@ -460,3 +460,19 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 新增解析依赖只运行在 RAG Service 内，不改变 MCP `search` 工具 Schema，也不会让 Agent 直接接触原始文件。验证覆盖真实最小 PDF、真实 DOCX 段落/表格、扫描件提示、损坏文档和扩展名发现。
 
 本轮验证：Ruff lint/format 通过，独立模块测试 47 项通过，Console JavaScript 语法通过；`0.4.0` sdist/wheel 构建成功，PDF/Word 依赖和 Console HTML/CSS/JS 均已包含在包元数据或 wheel 中。
+
+## 2026-11-09 角色、知识库归属与权限邀请（Go 后端）
+
+本轮为 Console 账号增加三级角色与知识库级权限系统，全部在 Go 后端与 React 控制台内实现：
+
+- [x] 角色扩展为管理员（`admin`）、VIP（`vip`）、普通用户（`user`），仅管理员可改角色；保留“至少一名启用管理员”保护。
+- [x] `knowledge_bases` 增加 `owner_user_id`（含老库补列迁移）；知识库默认归创建者私有，历史无主知识库仅管理员可用。
+- [x] 所有已登录用户可创建自己的知识库；VIP/普通用户从 `RAG_DEFAULT_KB_TEMPLATE`（默认 `default`）模板克隆模型连接，管理员保留完整 provider 表单。
+- [x] 新增 `kb_permissions`（可读/可修改 × 单文件/多文件/全库）与 `kb_invitations`（只存 token 摘要）两张表及仓储、访问解析 `internal/access`。
+- [x] 邀请流程：管理员/VIP 创建邀请 → 被邀请人收到站内通知与一次性链接 → 登录并接受后写入授权；拒绝/过期/撤销/重复邀请语义完整。
+- [x] 归属与权限在 REST 层强制执行：文档列表过滤、上传/替换/删除逐文件写校验、检索结果与快照按可见文档过滤、附件与上传状态读校验、`/v1/namespaces` 过滤。
+- [x] MCP 同套可见性：请求上下文解析 scope（stateful 会话经 `X-Rag-Mcp-Scope` 内部头逐请求传递），search/结果/资源按文档过滤，写工具逐文件校验，受限账号拒绝排队检索。
+- [x] Console：角色导航、权限管理页、邀请中心与 `#/invite?token=` 详情页、顶部待处理邀请铃铛、只读文档页、VIP/普通用户简化建库表单。
+- [x] 文档与验证：新增 `docs/PERMISSIONS.md`，更新 README/USAGE/DEPLOYMENT/.env.example；Go 全包测试（除既有 e2e 失败）、前端 typecheck/build、35 项真实 HTTP 冒烟通过，详见 VALIDATION.md。
+
+已知限制：邀请消息仅站内通知（无邮件/IM）；文件级写授权只能替换已授权文件，不能新建；受限账号在 Kafka 排队搜索部署下会被拒绝异步检索；历史无主知识库需管理员显式授权。

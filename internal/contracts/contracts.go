@@ -117,6 +117,12 @@ type SearchRequest struct {
 	CandidateK int
 	TopK       int
 	Filters    map[string]any
+	// DocumentIDs is a server-side visibility restriction. It is never parsed
+	// from HTTP/MCP arguments: the transport sets it from the caller's access
+	// scope so a knowledge-base grantee only retrieves documents they may read.
+	// A nil slice means unrestricted; a non-nil empty slice means "no document
+	// is visible" and therefore returns no evidence.
+	DocumentIDs []string
 }
 
 // SearchRequestFromArguments validates MCP input without exposing

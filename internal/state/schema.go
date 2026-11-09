@@ -287,6 +287,11 @@ var schemaTables = []*SchemaTable{
 			bigint("version"),
 			varchar("created_at", 40),
 			varchar("updated_at", 40),
+			// owner_user_id is the Console account that created the knowledge
+			// base. It is appended after the ported columns so a migrated
+			// database and a freshly created one have the same column order.
+			// NULL means "unowned" (a row created before ownership existed).
+			identifier("owner_user_id", 32).Null(),
 		},
 		Indexes: []SchemaIndex{index("ix_knowledge_bases_collection", "collection")},
 	},
@@ -618,6 +623,48 @@ var schemaTables = []*SchemaTable{
 		},
 		Uniques: []SchemaUnique{unique("uq_user_sessions_token_digest", "token_digest")},
 		Indexes: []SchemaIndex{index("ix_user_sessions_user_id", "user_id")},
+	},
+	// kb_permissions and kb_invitations back the knowledge-base sharing model:
+	// one permission row per (namespace, grantee, document) where an empty
+	// document_name means the whole knowledge base, and one invitation row per
+	// issued share link (only the token digest is stored, like user_sessions).
+	{
+		Name: "kb_permissions",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("namespace", 64),
+			identifier("grantee_user_id", 32),
+			identifier("document_name", 200),
+			identifier("permission", 8),
+			identifier("granted_by", 32),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_kb_permissions_scope", "namespace", "grantee_user_id", "document_name")},
+		Indexes: []SchemaIndex{index("ix_kb_permissions_grantee", "grantee_user_id")},
+	},
+	{
+		Name: "kb_invitations",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("namespace", 64),
+			identifier("inviter_user_id", 32),
+			identifier("invitee_user_id", 32),
+			identifier("permission", 8),
+			identifier("scope", 16),
+			longText("document_names"),
+			identifier("token_digest", 64),
+			identifier("status", 16),
+			varchar("created_at", 40),
+			varchar("expires_at", 40),
+			varchar("accepted_at", 40).Null(),
+			varchar("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_kb_invitations_token_digest", "token_digest")},
+		Indexes: []SchemaIndex{
+			index("ix_kb_invitations_invitee", "invitee_user_id"),
+			index("ix_kb_invitations_namespace", "namespace"),
+		},
 	},
 }
 

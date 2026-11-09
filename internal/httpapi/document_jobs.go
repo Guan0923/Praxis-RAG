@@ -24,6 +24,9 @@ func (s *Server) handleDocumentJobStatus(w http.ResponseWriter, r *http.Request)
 		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
 		return
 	}
+	if _, ok := s.requireScopeRead(w, r); !ok {
+		return
+	}
 	payload, err := s.runtime.GetDocumentStatus(r.Context(), namespace, pathParam(r, "artifact_id"))
 	if err != nil {
 		// Invalid, unknown and other-tenant artifact ids are indistinguishable to

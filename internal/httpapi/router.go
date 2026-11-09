@@ -14,6 +14,9 @@ const (
 	authTenant
 	authAdmin
 	authMCP
+	// authSession requires a Console login session (plus CSRF on writes) with no
+	// loopback fallback; it protects the knowledge-base sharing endpoints.
+	authSession
 )
 
 // route is one method+path registration. Patterns use "{name}" for a single

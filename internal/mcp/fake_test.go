@@ -40,6 +40,9 @@ type fakeRuntime struct {
 	listDocuments []DocumentRecord
 	listErr       error
 
+	resolveCalls [][]string
+	resolveErr   error
+
 	readDocument DocumentContent
 	readErr      error
 
@@ -95,6 +98,26 @@ func (f *fakeRuntime) ReadDocument(_ context.Context, namespace, _ string) (Docu
 	f.namespaces = append(f.namespaces, namespace)
 	return f.readDocument, f.readErr
 }
+
+// ResolveDocumentIDs maps fake document names to stable ids so tests can assert
+// the visibility restriction end to end.
+func (f *fakeRuntime) ResolveDocumentIDs(_ context.Context, namespace string, names []string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.namespaces = append(f.namespaces, namespace)
+	f.resolveCalls = append(f.resolveCalls, append([]string(nil), names...))
+	if f.resolveErr != nil {
+		return nil, f.resolveErr
+	}
+	ids := make([]string, 0, len(names))
+	for _, name := range names {
+		ids = append(ids, fakeDocumentID(name))
+	}
+	return ids, nil
+}
+
+// fakeDocumentID is the fake runtime's document-name to document-id mapping.
+func fakeDocumentID(name string) string { return "doc:" + name }
 
 func (f *fakeRuntime) Search(_ context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error) {
 	f.mu.Lock()

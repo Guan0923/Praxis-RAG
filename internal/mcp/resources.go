@@ -12,6 +12,7 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/Guan0923/xinghe_rag/internal/access"
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
 	"github.com/Guan0923/xinghe_rag/internal/resources"
 )
@@ -36,10 +37,16 @@ func (e *Endpoint) listResources(ctx context.Context, namespace string, params *
 	if err != nil {
 		return nil, invalidParams(err.Error())
 	}
+	scope, hasScope := scopeFor(ctx)
 	available := make([]*sdk.Resource, 0, len(documents))
 	for _, document := range documents {
 		name := document.Name()
 		if name == "" {
+			continue
+		}
+		// A file-level grant exposes only the granted documents; management
+		// credentials (no scope) keep the historical full list.
+		if hasScope && !scope.CanReadDocument(name) {
 			continue
 		}
 		available = append(available, &sdk.Resource{
@@ -87,6 +94,7 @@ func (e *Endpoint) readResource(ctx context.Context, namespace string, params *s
 		return nil, invalidParams("Invalid resource URI")
 	}
 	uri := params.URI
+	scope, hasScope := scopeFor(ctx)
 	if parsed, err := url.Parse(uri); err == nil && parsed.Host == "artifacts" {
 		artifactID, offset, length, parseErr := parseArtifactURI(namespace, uri)
 		if parseErr != nil {
@@ -95,6 +103,15 @@ func (e *Endpoint) readResource(ctx context.Context, namespace string, params *s
 		payload, runtimeErr := e.opts.Runtime.GetArtifact(ctx, namespace, artifactID, offset, length)
 		if runtimeErr != nil {
 			return nil, invalidParams(runtimeErr.Error())
+		}
+		// Artifacts embed the source document name; a file-level grant may only
+		// read artifacts of readable documents. The generic message avoids
+		// revealing whether the UUID exists at all.
+		if hasScope && scope.Restricted() {
+			name, _ := payload["name"].(string)
+			if name == "" || !scope.CanReadDocument(name) {
+				return nil, invalidParams(access.MessageKnowledgeAccess)
+			}
 		}
 		// Copy before decorating so the runtime's payload is never mutated.
 		public := make(map[string]any, len(payload)+1)
@@ -117,6 +134,11 @@ func (e *Endpoint) readResource(ctx context.Context, namespace string, params *s
 	if err != nil {
 		return nil, invalidParams(err.Error())
 	}
+	// The document resource is part of the namespace's readable surface: an
+	// ungranted filename is answered like the REST document routes.
+	if hasScope && !scope.CanReadDocument(name) {
+		return nil, invalidParams(access.MessageKnowledgeAccess)
+	}
 	content, err := e.opts.Runtime.ReadDocument(ctx, namespace, name)
 	if err != nil {
 		return nil, invalidParams(err.Error())
@@ -136,6 +158,7 @@ func (e *Endpoint) resourceReadHandler(namespace string) sdk.ResourceHandler {
 		if request == nil {
 			return nil, invalidParams("Invalid resource URI")
 		}
+		ctx = withRequestScope(ctx, request.GetExtra())
 		return e.readResource(ctx, namespace, request.Params)
 	}
 }
@@ -342,12 +365,13 @@ func (e *Endpoint) subscribeHandler(namespace string) func(context.Context, *sdk
 		if request == nil || request.Params == nil {
 			return invalidParams("Invalid resource URI")
 		}
+		ctx = withRequestScope(ctx, request.GetExtra())
 		return e.validateSubscription(ctx, namespace, request.Params.URI)
 	}
 }
 
 // validateSubscription ports NamespaceEndpoint.validate_subscription: only the
-// canonical document URI of an existing document may be subscribed.
+// canonical document URI of an existing, readable document may be subscribed.
 func (e *Endpoint) validateSubscription(ctx context.Context, namespace, uri string) error {
 	name, _, _, err := resources.ParseURI(namespace, uri)
 	if err != nil {
@@ -355,6 +379,9 @@ func (e *Endpoint) validateSubscription(ctx context.Context, namespace, uri stri
 	}
 	if uri != resources.DocumentURI(namespace, name) {
 		return invalidParams("Subscribe to the document URI, not a page URI")
+	}
+	if scope, hasScope := scopeFor(ctx); hasScope && !scope.CanReadDocument(name) {
+		return invalidParams(access.MessageKnowledgeAccess)
 	}
 	documents, listErr := e.opts.Runtime.ListDocuments(ctx, namespace)
 	if listErr != nil {

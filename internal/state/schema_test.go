@@ -15,7 +15,7 @@ var expectedSchema = []struct {
 	columns []string
 }{
 	{"api_keys", []string{"id", "name", "prefix", "digest", "namespaces", "enabled", "created_at", "updated_at", "protected_key"}},
-	{"knowledge_bases", []string{"namespace", "collection", "settings", "version", "created_at", "updated_at"}},
+	{"knowledge_bases", []string{"namespace", "collection", "settings", "version", "created_at", "updated_at", "owner_user_id"}},
 	{"documents", []string{"namespace", "name", "document_id", "size", "sha256", "chunking", "collection", "chunk_count", "modified_at", "indexed_at", "diagnostics", "skipped_object_count", "del_flag"}},
 	{"blobs", []string{"namespace", "bucket", "key", "document_id", "content", "size", "sha256", "created_at"}},
 	{"mcp_catalogs", []string{"namespace", "data", "version", "updated_at"}},
@@ -36,6 +36,8 @@ var expectedSchema = []struct {
 	{"search_task_outbox", []string{"result_id", "pending", "generation", "retry_at"}},
 	{"users", []string{"id", "username", "password_hash", "role", "enabled", "created_at", "updated_at", "last_login_at"}},
 	{"user_sessions", []string{"id", "user_id", "token_digest", "csrf_token", "expires_at", "created_at", "last_seen_at", "revoked"}},
+	{"kb_permissions", []string{"id", "namespace", "grantee_user_id", "document_name", "permission", "granted_by", "created_at", "updated_at"}},
+	{"kb_invitations", []string{"id", "namespace", "inviter_user_id", "invitee_user_id", "permission", "scope", "document_names", "token_digest", "status", "created_at", "expires_at", "accepted_at", "updated_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -61,6 +63,8 @@ var expectedPrimaryKeys = map[string][]string{
 	"search_task_outbox":      {"result_id"},
 	"users":                   {"id"},
 	"user_sessions":           {"id"},
+	"kb_permissions":          {"id"},
+	"kb_invitations":          {"id"},
 }
 
 var expectedUniques = map[string]string{
@@ -72,6 +76,8 @@ var expectedUniques = map[string]string{
 	"document_jobs":      "uq_document_job_idempotency",
 	"users":              "uq_users_username",
 	"user_sessions":      "uq_user_sessions_token_digest",
+	"kb_permissions":     "uq_kb_permissions_scope",
+	"kb_invitations":     "uq_kb_invitations_token_digest",
 }
 
 var expectedIndexes = map[string][]string{
@@ -89,6 +95,8 @@ var expectedIndexes = map[string][]string{
 	"search_tasks":            {"ix_search_tasks_deadline", "ix_search_tasks_recovery", "ix_search_tasks_namespace"},
 	"search_task_outbox":      {"ix_search_task_dispatch"},
 	"user_sessions":           {"ix_user_sessions_user_id"},
+	"kb_permissions":          {"ix_kb_permissions_grantee"},
+	"kb_invitations":          {"ix_kb_invitations_invitee", "ix_kb_invitations_namespace"},
 }
 
 // expectedTableNames returns the schema table names in Python declaration order.

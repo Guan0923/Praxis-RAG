@@ -254,6 +254,30 @@ func TestUpdateUserProtectsLastAdmin(t *testing.T) {
 	}
 }
 
+func TestUpdateUserAcceptsVIPRole(t *testing.T) {
+	service, _ := newTestService(t, true, nil)
+	ctx := context.Background()
+	if _, err := service.Register(ctx, "alice", "password-one"); err != nil {
+		t.Fatalf("Register(admin) error = %v", err)
+	}
+	bob, err := service.Register(ctx, "bob", "password-two")
+	if err != nil {
+		t.Fatalf("Register(user) error = %v", err)
+	}
+	updated, err := service.UpdateUser(ctx, bob.User.ID, state.RoleVIP, true)
+	if err != nil {
+		t.Fatalf("UpdateUser(vip) error = %v", err)
+	}
+	if updated == nil || updated.Role != state.RoleVIP || !updated.IsVIP() || updated.CanShare() != true {
+		t.Fatalf("UpdateUser(vip) = %+v", updated)
+	}
+	if _, err := service.UpdateUser(ctx, bob.User.ID, "owner", true); err == nil {
+		t.Fatalf("UpdateUser(invalid role) succeeded")
+	} else {
+		assertAuthError(t, err, KindValidation, MessageRoleInvalid)
+	}
+}
+
 func TestListAndCountUsers(t *testing.T) {
 	service, _ := newTestService(t, true, nil)
 	ctx := context.Background()

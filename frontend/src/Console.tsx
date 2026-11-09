@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert, App, Badge, Button, Dropdown, Spin, Tooltip,
+  Alert, App, Badge, Button, Dropdown, Spin, Tooltip, type MenuProps,
 } from "antd";
 import {
   ApiOutlined,
   ArrowLeftOutlined,
+  BellOutlined,
   BookOutlined,
   DatabaseOutlined,
   DownOutlined,
   LogoutOutlined,
   MoonOutlined,
   KeyOutlined,
+  SafetyOutlined,
   SettingOutlined,
   ReloadOutlined,
   SearchOutlined,
@@ -23,13 +25,18 @@ import {
   errorText,
   fetchAuthStatus,
   fetchCurrentUser,
+  fetchInvitationInbox,
   logoutSession,
+  permissionLabels,
+  invitationStatus,
   readStorage,
+  roleLabel,
   setUnauthorizedHandler,
   type AuthStatus,
   type AuthUser,
   type Connection,
   type Health,
+  type InvitationView,
 } from "./api";
 import { SearchPage } from "./SearchPage";
 import { DocumentsPage } from "./DocumentsPage";
@@ -39,19 +46,28 @@ import { ApiKeysPage } from "./ApiKeysPage";
 import { CreateKnowledgeBase } from "./CreateKnowledgeBase";
 import { LoginPage } from "./LoginPage";
 import { UsersPage } from "./UsersPage";
-import { useConsoleRoute } from "./navigation";
+import { InvitationsPage, InvitePage } from "./InvitationsPage";
+import { PermissionsPage } from "./PermissionsPage";
+import {
+  readStoredInviteToken,
+  storeInviteToken,
+  useConsoleRoute,
+  type ConsolePage,
+} from "./navigation";
 
 const pages = [
   { key: "search", label: "检索调试", icon: <SearchOutlined /> },
   { key: "documents", label: "知识文档", icon: <DatabaseOutlined /> },
+  { key: "create", label: "创建知识库", icon: <ApiOutlined /> },
+  { key: "permissions", label: "权限管理", icon: <SafetyOutlined /> },
   { key: "api-keys", label: "API Key", icon: <KeyOutlined /> },
   { key: "knowledge-bases", label: "知识库", icon: <SettingOutlined /> },
-  { key: "create", label: "创建知识库", icon: <ApiOutlined /> },
   { key: "users", label: "用户管理", icon: <TeamOutlined /> },
 ] as const;
 
 // adminOnlyPages require the admin role once login is enabled.
-const adminOnlyPages = new Set<string>(["api-keys", "knowledge-bases", "create", "users"]);
+const adminOnlyPages = new Set<string>(["api-keys", "knowledge-bases", "users"]);
+const inviteBellPollMs = 60_000;
 
 export function Console({
   dark,
@@ -72,6 +88,7 @@ export function Console({
   const [authUser, setAuthUser] = useState<AuthUser>();
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState("");
+  const sessionMode = Boolean(auth?.auth_enabled);
   const connection = useMemo<Connection>(() => ({
     namespace,
     token: auth?.auth_enabled ? "" : token,
@@ -85,6 +102,10 @@ export function Console({
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
   const [workspaceError, setWorkspaceError] = useState(false);
   const workspaceRequest = useRef<AbortController | null>(null);
+  const [inbox, setInbox] = useState<InvitationView[]>([]);
+  const [inboxLoading, setInboxLoading] = useState(false);
+  const [inboxError, setInboxError] = useState("");
+  const [inboxRevision, setInboxRevision] = useState(0);
 
   async function loadAuth() {
     setAuthReady(false);
@@ -118,10 +139,56 @@ export function Console({
     return () => setUnauthorizedHandler(undefined);
   }, [message]);
 
-  // Non-admins cannot stay on an admin-only page.
+  // The invitation inbox drives the header notification bell. It only exists
+  // for console sessions; legacy API-key mode has no per-user inbox.
+  const loadInbox = useCallback(async () => {
+    if (!sessionMode || !authUser) {
+      setInbox([]);
+      return;
+    }
+    setInboxLoading(true);
+    try {
+      const rows = await fetchInvitationInbox();
+      setInbox(rows);
+      setInboxError("");
+    } catch (error) {
+      setInboxError(errorText(error));
+    } finally {
+      setInboxLoading(false);
+    }
+  }, [sessionMode, authUser]);
+
+  useEffect(() => {
+    if (!sessionMode || !authUser) {
+      setInbox([]);
+      setInboxError("");
+      return;
+    }
+    void loadInbox();
+    const timer = setInterval(() => void loadInbox(), inviteBellPollMs);
+    return () => clearInterval(timer);
+  }, [sessionMode, authUser, inboxRevision, loadInbox]);
+
+  // Keep the raw invitation token while the visitor authenticates: the login
+  // screen replaces the console but the token must survive until preview runs.
+  useEffect(() => {
+    if (route.page === "invite" && route.token) storeInviteToken(route.token);
+  }, [route.page, route.token]);
+
+  useEffect(() => {
+    if (!sessionMode || !authUser) return;
+    if (route.page !== "invite" || route.token) return;
+    const token = readStoredInviteToken();
+    if (token) navigate({ namespace, page: "invite", token }, true);
+  }, [sessionMode, authUser, route.page, route.token, namespace, navigate]);
+
+  // Non-admins cannot stay on an admin-only page, ordinary users cannot manage
+  // permissions, and the invitation pages require a console session.
   useEffect(() => {
     if (!auth?.auth_enabled || !authUser) return;
-    if (authUser.role !== "admin" && adminOnlyPages.has(view)) {
+    const adminOnly = adminOnlyPages.has(view) && authUser.role !== "admin";
+    const permissionsBlocked = view === "permissions" && authUser.role === "user";
+    if (adminOnly || permissionsBlocked) {
       navigate({ namespace, page: "search" }, true);
     }
   }, [auth, authUser, view, namespace, navigate]);
@@ -195,7 +262,7 @@ export function Console({
     return () => healthRequest.current?.abort();
   }, []);
 
-  function saveConnection(values: Connection, notice = "连接配置已保存") {
+  function saveConnection(values: Connection, notice = "连接配置已保存", page: ConsolePage = view) {
     if (uploading) return false;
     const next = {
       namespace: values.namespace.trim(),
@@ -207,7 +274,7 @@ export function Console({
       void message.error("浏览器无法保存配置，请检查存储权限");
       return false;
     }
-    navigate({ namespace: next.namespace, page: view });
+    navigate({ namespace: next.namespace, page });
     setToken(next.token);
     setRevision((value) => value + 1);
     void message.success(notice);
@@ -217,7 +284,6 @@ export function Console({
     saveConnection({ ...connection, namespace }, "知识库已切换");
   }
   const themeLabel = dark ? "切换浅色主题" : "切换深色主题";
-  const sessionMode = Boolean(auth?.auth_enabled);
 
   if (!authReady) {
     return (
@@ -248,8 +314,35 @@ export function Console({
     );
   }
 
-  const visiblePages = pages.filter((page) =>
-    !adminOnlyPages.has(page.key) || !sessionMode || authUser?.role === "admin");
+  const pendingInvitations = inbox.filter((invitation) => invitationStatus(invitation) === "pending");
+  const bellItems: MenuProps["items"] = [
+    ...(pendingInvitations.length
+      ? pendingInvitations.slice(0, 5).map((invitation) => ({
+          key: `invitation:${invitation.id}`,
+          label: (
+            <div className="invite-bell-item">
+              <span className="invite-bell-kb break-text">{invitation.namespace}</span>
+              <span className="secondary break-text">
+                {invitation.inviter_username} 邀请你 · {permissionLabels[invitation.permission] || invitation.permission} · {invitation.scope === "all" ? "全库" : `${invitation.document_names.length} 个文件`}
+              </span>
+            </div>
+          ),
+        }))
+      : [{
+          key: "empty",
+          disabled: true,
+          label: inboxLoading ? "正在加载…" : inboxError ? "邀请加载失败" : "暂无待处理邀请",
+        }]),
+    { type: "divider" },
+    { key: "all", label: pendingInvitations.length ? "查看全部邀请" : "邀请中心" },
+  ];
+  const visiblePages = pages.filter((page) => {
+    if (page.key === "permissions")
+      return sessionMode && (authUser?.role === "admin" || authUser?.role === "vip");
+    if (adminOnlyPages.has(page.key))
+      return !sessionMode || authUser?.role === "admin";
+    return true;
+  });
 
   return (
     <div className="console-shell">
@@ -333,12 +426,31 @@ export function Console({
             {sessionMode && authUser && (
               <Dropdown
                 trigger={["click"]}
+                placement="bottomRight"
+                menu={{
+                  items: bellItems,
+                  onClick: ({ key }) => {
+                    if (key === "all" || key.startsWith("invitation:"))
+                      navigate({ namespace, page: "invitations" });
+                  },
+                }}
+              >
+                <Button aria-label="邀请通知" title="邀请通知" type="text" className="invite-bell">
+                  <Badge count={pendingInvitations.length} size="small" offset={[2, -2]}>
+                    <BellOutlined />
+                  </Badge>
+                </Button>
+              </Dropdown>
+            )}
+            {sessionMode && authUser && (
+              <Dropdown
+                trigger={["click"]}
                 menu={{
                   items: [
                     {
                       key: "identity",
                       disabled: true,
-                      label: `${authUser.username} · ${authUser.role === "admin" ? "管理员" : "普通用户"}`,
+                      label: `${authUser.username} · ${roleLabel(authUser.role)}`,
                     },
                     { type: "divider" },
                     { key: "logout", icon: <LogoutOutlined />, label: "退出登录" },
@@ -373,6 +485,7 @@ export function Console({
               <DocumentsPage
                 connection={connection}
                 active={view === "documents" && documentName === undefined}
+                authEnabled={sessionMode}
                 onOpenDocument={(name) => navigate({ namespace, page: "documents", documentName: name })}
                 uploading={uploading}
                 onUploading={setUploading}
@@ -399,22 +512,51 @@ export function Console({
               </section>
             )}
           </div>
-          {view === "api-keys" && <ApiKeysPage namespaces={workspaceNames} />}
-          {view === "knowledge-bases" && <KnowledgeBasesPage disabled={uploading}
-            onCreate={() => navigate({ namespace, page: "create" })}
-            onChanged={() => { setRevision((value) => value + 1); void refreshHealth(); }} />}
+          {view === "api-keys" && (!sessionMode || authUser?.role === "admin") && (
+            <ApiKeysPage namespaces={workspaceNames} />
+          )}
+          {view === "knowledge-bases" && (!sessionMode || authUser?.role === "admin") && (
+            <KnowledgeBasesPage disabled={uploading}
+              onCreate={() => navigate({ namespace, page: "create" })}
+              onChanged={() => { setRevision((value) => value + 1); void refreshHealth(); }} />
+          )}
           {view === "users" && authUser?.role === "admin" && (
             <UsersPage currentUserId={authUser.id} />
+          )}
+          {view === "permissions" && authUser && (authUser.role === "admin" || authUser.role === "vip") && (
+            <PermissionsPage
+              connection={connection}
+              currentUserId={authUser.id}
+              role={authUser.role}
+              onCreateKnowledgeBase={() => navigate({ namespace, page: "create" })}
+            />
+          )}
+          {view === "invitations" && (
+            <InvitationsPage
+              onOpenInvite={(next) => navigate({ namespace, page: "invite", token: next })}
+            />
+          )}
+          {view === "invite" && (
+            <InvitePage
+              token={route.token || readStoredInviteToken() || undefined}
+              authEnabled={sessionMode}
+              onHandled={() => setInboxRevision((value) => value + 1)}
+              onOpenNamespace={(next) => {
+                saveConnection({ ...connection, namespace: next }, "已切换到知识库", "documents");
+              }}
+              onBack={() => navigate({ namespace, page: "invitations" })}
+            />
           )}
           <section hidden={view !== "create"} aria-label="创建知识库页面">
             <div className="page-heading">
               <h1>创建知识库</h1>
             </div>
-            <CreateKnowledgeBase active={view === "create"} disabled={uploading} onCreated={(namespace) => {
-              if (saveConnection({ ...connection, namespace }, "已切换到新知识库")) {
-                navigate({ namespace, page: "documents" });
-              }
-            }} />
+            <CreateKnowledgeBase active={view === "create"} disabled={uploading}
+              connection={connection} role={authUser?.role} onCreated={(namespace) => {
+                if (saveConnection({ ...connection, namespace }, "已切换到新知识库")) {
+                  navigate({ namespace, page: "documents" });
+                }
+              }} />
           </section>
         </div>
       </main>

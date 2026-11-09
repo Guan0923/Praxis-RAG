@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { Alert, App, AutoComplete, Button, Descriptions, Form, Input, InputNumber, Select, Switch, Tooltip } from "antd";
 import { DeleteOutlined, PlusOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
-import { api, errorText, type Chunking, type KnowledgeBase, type Strategy } from "./api";
+import { api, apiResponse, errorText, type Chunking, type Connection, type KnowledgeBase, type Role, type Strategy } from "./api";
 import { namespacePattern } from "./navigation";
 
 type Kind = "embedding" | "reranker" | "vlm";
 type ProviderValues = { base_url: string; apikey?: string };
 type Values = Chunking & { namespace: string; embedding_model: string; reranker_model?: string; vlm_model?: string;
   embedding: ProviderValues; reranker: ProviderValues; vlm: ProviderValues };
+type TenantValues = Chunking & { namespace: string };
 type Defaults = { default: string; strategies: Strategy[] };
 const kinds: Kind[] = ["embedding", "reranker", "vlm"];
 const cleanUrl = (value: string) => value.trim().replace(/\/+$/, "");
@@ -15,8 +16,9 @@ const cleanUrl = (value: string) => value.trim().replace(/\/+$/, "");
 // an accidental page switch never loses the other inputs.
 const draftKey = "rag.knowledge-base-draft";
 
-export function CreateKnowledgeBase({ active, disabled, onCreated }: {
+export function CreateKnowledgeBase({ active, disabled, onCreated, connection, role }: {
   active: boolean; disabled: boolean; onCreated: (namespace: string) => void;
+  connection: Connection; role?: Role;
 }) {
   // Keep the form mounted after the first visit so switching pages does not
   // discard what was typed.
@@ -25,8 +27,147 @@ export function CreateKnowledgeBase({ active, disabled, onCreated }: {
     if (active) setMounted(true);
   }, [active]);
   if (!mounted) return null;
+  // Admins keep the full provider configuration; VIPs and ordinary users only
+  // choose the namespace and chunking because the server clones the model
+  // configuration from the administrator's default knowledge-base template.
+  const simple = role === "vip" || role === "user";
   return <div hidden={!active}>
-    <KnowledgeBaseForm disabled={disabled} onSaved={(item) => onCreated(item.namespace)} />
+    {simple
+      ? <TenantKnowledgeBaseForm disabled={disabled} onCreated={onCreated} connection={connection} />
+      : <KnowledgeBaseForm disabled={disabled} onSaved={(item) => onCreated(item.namespace)} />}
+  </div>;
+}
+
+function TenantKnowledgeBaseForm({ disabled, onCreated, connection }: {
+  disabled: boolean; onCreated: (namespace: string) => void; connection: Connection;
+}) {
+  const { message } = App.useApp();
+  const [form] = Form.useForm<TenantValues>();
+  const [catalog, setCatalog] = useState<Defaults>();
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const lifetime = useRef(new AbortController());
+  const strategy = Form.useWatch("strategy", form);
+  const unit = catalog?.strategies.find((item) => item.id === strategy)?.unit === "characters" ? "字符" : "token";
+  const locked = disabled || saving;
+
+  async function loadCatalog() {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await api<Defaults>("/v1/chunking/strategies", connection, { signal: lifetime.current.signal });
+      if (lifetime.current.signal.aborted) return;
+      setCatalog(data);
+      if (!form.getFieldValue("strategy")) {
+        const selected = data.strategies.find((item) => item.id === data.default) || data.strategies[0];
+        form.setFieldsValue({ strategy: selected?.id, chunk_size: selected?.chunk_size, chunk_overlap: selected?.chunk_overlap });
+      }
+    } catch (reason) {
+      if (!lifetime.current.signal.aborted) setError(errorText(reason));
+    } finally {
+      if (!lifetime.current.signal.aborted) setLoading(false);
+    }
+  }
+  useEffect(() => {
+    void loadCatalog();
+    return () => lifetime.current.abort();
+  }, []);
+
+  async function save(values: TenantValues) {
+    if (saving) return;
+    setSaving(true);
+    setError("");
+    try {
+      const response = await apiResponse("/v1/knowledge-bases", connection, {
+        method: "POST",
+        body: JSON.stringify({
+          namespace: values.namespace.trim(),
+          strategy: values.strategy,
+          chunk_size: values.chunk_size,
+          chunk_overlap: values.chunk_overlap,
+        }),
+      });
+      // The endpoint normally returns the created knowledge base; tolerate an
+      // empty 201 body as well.
+      let created: Partial<KnowledgeBase> = {};
+      try {
+        created = await response.json() as Partial<KnowledgeBase>;
+      } catch {
+        created = {};
+      }
+      if (lifetime.current.signal.aborted) return;
+      const namespace = created.namespace || values.namespace.trim();
+      void message.success("知识库已创建");
+      form.resetFields();
+      onCreated(namespace);
+      void loadCatalog();
+    } catch (reason) {
+      if (!lifetime.current.signal.aborted) setError(errorText(reason));
+    } finally {
+      if (!lifetime.current.signal.aborted) setSaving(false);
+    }
+  }
+
+  return <div className="knowledge-base-form">
+    <Alert
+      className="page-alert"
+      type="info"
+      showIcon
+      title="模型配置沿用管理员模板"
+      description="无需填写 Embedding / Reranker / VLM 配置：服务端会从管理员配置的默认知识库模板克隆模型、服务地址与向量维度。"
+    />
+    {error && <Alert type="error" showIcon className="page-alert" title="知识库创建失败" description={error}
+      action={!catalog ? <Button icon={<ReloadOutlined />} aria-label="重新读取切分配置" loading={loading} onClick={() => void loadCatalog()} /> : undefined} />}
+    <Form<TenantValues>
+      form={form}
+      layout="vertical"
+      disabled={locked}
+      scrollToFirstError
+      onFinish={(values) => void save(values)}
+      initialValues={{ namespace: "", strategy: undefined, chunk_size: undefined, chunk_overlap: undefined }}
+    >
+      <Form.Item name="namespace" label="知识库标识（Namespace）" rules={[
+        { required: true, whitespace: true, message: "请输入知识库标识" },
+        { pattern: namespacePattern, message: "使用字母、数字、点、下划线或横线，首位为字母或数字" },
+      ]}>
+        <Input maxLength={64} autoComplete="off" />
+      </Form.Item>
+      <Form.Item name="strategy" label="切分方式" rules={[{ required: true, message: "请选择切分方式" }]}>
+        <Select
+          disabled={locked || !catalog}
+          virtual={false}
+          options={catalog?.strategies.map((item) => ({ value: item.id, label: item.label }))}
+          onChange={(id) => {
+            const selected = catalog?.strategies.find((item) => item.id === id);
+            form.setFieldsValue({ chunk_size: selected?.chunk_size, chunk_overlap: selected?.chunk_overlap });
+          }}
+        />
+      </Form.Item>
+      <div className="chunk-controls">
+        <Form.Item name="chunk_size" label={"块长度（" + unit + "）"} rules={[
+          { required: true, type: "integer", min: strategy === "character" ? 100 : 1, max: 100000 },
+        ]}>
+          <InputNumber disabled={locked || !catalog} min={strategy === "character" ? 100 : 1} max={100000} />
+        </Form.Item>
+        <Form.Item name="chunk_overlap" label={"重叠长度（" + unit + "）"} dependencies={["chunk_size"]} rules={[
+          { required: true, type: "integer", min: 0 },
+          ({ getFieldValue }) => ({
+            validator: (_, value) => value < getFieldValue("chunk_size")
+              ? Promise.resolve()
+              : Promise.reject(new Error("重叠长度必须小于块长度")),
+          }),
+        ]}>
+          <InputNumber disabled={locked || !catalog} min={0} />
+        </Form.Item>
+      </div>
+      <div className="toolbar">
+        <Button htmlType="submit" type="primary" loading={saving} disabled={disabled || !catalog}
+          icon={<PlusOutlined />}>
+          创建知识库
+        </Button>
+      </div>
+    </Form>
   </div>;
 }
 

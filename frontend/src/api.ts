@@ -1,12 +1,22 @@
 export type Connection = { namespace: string; token: string };
+export type Role = "admin" | "vip" | "user";
 export type AuthUser = {
   id: string;
   username: string;
-  role: "admin" | "user";
+  role: Role;
   enabled: boolean;
   created_at?: string;
   last_login_at?: string;
 };
+export const roleLabels: Record<Role, string> = {
+  admin: "管理员",
+  vip: "VIP",
+  user: "普通用户",
+};
+// roleLabel keeps unknown forward-compatible roles readable instead of blank.
+export function roleLabel(role: string | undefined) {
+  return role && role in roleLabels ? roleLabels[role as Role] : "普通用户";
+}
 export type AuthStatus = {
   auth_enabled: boolean;
   registration_enabled: boolean;
@@ -15,6 +25,104 @@ export type AuthStatus = {
 };
 export type AuthSession = { user: AuthUser; csrf_token: string; expires_at?: string };
 export type UserUpdate = { role: AuthUser["role"]; enabled: boolean };
+
+// --- Knowledge-base sharing types (roles / permissions / invitations) ------
+export type PermissionLevel = "read" | "write";
+export type ShareScope = "all" | "files";
+// "expired" is computed by the server from expires_at; it is never persisted.
+export type InvitationStatus = "pending" | "accepted" | "declined" | "revoked" | "expired";
+// ScopeView is one effective permission set inside a knowledge base.
+export type ScopeView = {
+  whole_read: boolean;
+  whole_write: boolean;
+  read_documents: string[];
+  write_documents: string[];
+};
+// AccessView is the caller's effective access in one knowledge base.
+export type AccessView = {
+  namespace: string;
+  owner: boolean;
+  can_manage: boolean;
+  can_share: boolean;
+  role: string;
+  can_read: boolean;
+  can_write: boolean;
+  scope: ScopeView;
+};
+export type GrantView = {
+  user_id: string;
+  username: string;
+  document_name: string;
+  permission: PermissionLevel;
+  granted_by: string;
+  granted_by_username: string;
+  created_at: string;
+  updated_at: string;
+};
+export type InvitationView = {
+  id: string;
+  namespace: string;
+  inviter_user_id: string;
+  inviter_username: string;
+  invitee_user_id: string;
+  invitee_username: string;
+  permission: PermissionLevel;
+  scope: ShareScope;
+  document_names: string[];
+  status: InvitationStatus;
+  created_at: string;
+  expires_at: string;
+  accepted_at: string | null;
+};
+// InviteUser is the minimal account projection of GET /v1/users.
+export type InviteUser = { id: string; username: string; role: Role };
+export type CreateInvitationInput = {
+  username: string;
+  permission: PermissionLevel;
+  scope: ShareScope;
+  document_names: string[];
+};
+export type CreateInvitationResult = {
+  invitation: InvitationView;
+  invite_path: string;
+};
+
+export const permissionLabels: Record<PermissionLevel, string> = {
+  read: "只读",
+  write: "读写",
+};
+export const scopeLabels: Record<ShareScope, string> = {
+  all: "全库",
+  files: "指定文件",
+};
+export const invitationStatusLabels: Record<string, string> = {
+  pending: "待处理",
+  accepted: "已接受",
+  declined: "已拒绝",
+  revoked: "已撤销",
+  expired: "已过期",
+};
+export const invitationStatusColors: Record<string, string> = {
+  pending: "processing",
+  accepted: "success",
+  declined: "default",
+  revoked: "default",
+  expired: "error",
+};
+// invitationStatus renders the display status: a pending invitation whose
+// expires_at already passed is expired for the invitee even before the server
+// records it on accept.
+export function invitationStatus(invitation: InvitationView, now = Date.now()) {
+  const expires = Date.parse(invitation.expires_at);
+  if (invitation.status === "pending" && Number.isFinite(expires) && expires <= now)
+    return "expired";
+  return invitation.status;
+}
+export function formatDateTime(value?: string | null) {
+  if (!value) return "—";
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? new Date(time).toLocaleString() : value;
+}
 
 export type Strategy = {
   id: string;
@@ -330,6 +438,121 @@ export async function updateUser(id: string, update: UserUpdate): Promise<AuthUs
 
 export async function deleteUser(id: string): Promise<void> {
   await apiResponse(`/v1/admin/users/${encodeURIComponent(id)}`, undefined, { method: "DELETE" });
+}
+
+// --- Knowledge-base permissions and invitations -----------------------------
+
+// fetchAccess returns the caller's effective access view for one knowledge
+// base (a session-only endpoint; legacy API-key mode has no session).
+export async function fetchAccess(namespace: string, connection: Connection): Promise<AccessView> {
+  return await api<AccessView>(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/access`,
+    { ...connection, namespace },
+    { cache: "no-store" },
+  );
+}
+
+export async function fetchGrants(namespace: string, connection: Connection): Promise<GrantView[]> {
+  const payload = await api<{ permissions: GrantView[] }>(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/permissions`,
+    { ...connection, namespace },
+    { cache: "no-store" },
+  );
+  return payload.permissions || [];
+}
+
+export async function revokeGrant(namespace: string, userId: string, connection: Connection): Promise<void> {
+  await apiResponse(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/permissions/${encodeURIComponent(userId)}`,
+    { ...connection, namespace },
+    { method: "DELETE" },
+  );
+}
+
+export async function fetchNamespaceInvitations(
+  namespace: string,
+  connection: Connection,
+): Promise<InvitationView[]> {
+  const payload = await api<{ invitations: InvitationView[] }>(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/invitations`,
+    { ...connection, namespace },
+    { cache: "no-store" },
+  );
+  return (payload.invitations || []).map(normalizeInvitation);
+}
+
+export async function createInvitation(
+  namespace: string,
+  input: CreateInvitationInput,
+  connection: Connection,
+): Promise<CreateInvitationResult> {
+  const result = await api<CreateInvitationResult>(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/invitations`,
+    { ...connection, namespace },
+    { method: "POST", body: JSON.stringify(input) },
+  );
+  return { ...result, invitation: normalizeInvitation(result.invitation) };
+}
+
+// normalizeInvitation tolerates a null document_names slice in JSON.
+function normalizeInvitation(invitation: InvitationView): InvitationView {
+  return {
+    ...invitation,
+    document_names: Array.isArray(invitation.document_names) ? invitation.document_names : [],
+  };
+}
+
+// fetchInvitationInbox lists the current account's invitations (pending first).
+export async function fetchInvitationInbox(): Promise<InvitationView[]> {
+  const payload = await api<{ invitations: InvitationView[] }>(
+    "/v1/invitations",
+    undefined,
+    { cache: "no-store" },
+  );
+  return (payload.invitations || []).map(normalizeInvitation);
+}
+
+export async function previewInvitation(token: string): Promise<InvitationView> {
+  const payload = await api<{ invitation: InvitationView }>("/v1/invitations/preview", undefined, {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
+  return normalizeInvitation(payload.invitation);
+}
+
+export async function acceptInvitation(
+  token: string,
+): Promise<{ invitation: InvitationView; namespace: string }> {
+  const payload = await api<{ invitation: InvitationView; namespace: string }>(
+    "/v1/invitations/accept",
+    undefined,
+    { method: "POST", body: JSON.stringify({ token }) },
+  );
+  return { ...payload, invitation: normalizeInvitation(payload.invitation) };
+}
+
+export async function declineInvitation(token: string): Promise<InvitationView> {
+  const payload = await api<{ invitation: InvitationView }>("/v1/invitations/decline", undefined, {
+    method: "POST",
+    body: JSON.stringify({ token }),
+  });
+  return normalizeInvitation(payload.invitation);
+}
+
+export async function revokeInvitation(invitationId: string): Promise<void> {
+  await apiResponse(`/v1/invitations/${encodeURIComponent(invitationId)}`, undefined, { method: "DELETE" });
+}
+
+// fetchInvitableUsers lists enabled accounts for the invitation picker.
+export async function fetchInvitableUsers(): Promise<InviteUser[]> {
+  const payload = await api<{ users: InviteUser[] }>("/v1/users", undefined, { cache: "no-store" });
+  return payload.users || [];
+}
+
+// invitationLink makes the shareable absolute URL from the invite_path returned
+// by the server (raw token appears only in this URL).
+export function invitationLink(invitePath: string) {
+  return `${location.origin}${invitePath}`;
 }
 
 export function errorText(error: unknown): string {

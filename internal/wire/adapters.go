@@ -17,6 +17,14 @@ import (
 // HTTPRuntime adapts *runtime.Service to httpapi.Runtime.
 type HTTPRuntime struct{ Service *runtime.Service }
 
+// Compile-time checks for the consumer-side interfaces added by the ownership
+// iteration: the tenant self-create route delegates to the runtime and the MCP
+// endpoint needs the document visibility mapping.
+var (
+	_ httpapi.KnowledgeBaseSelfCreateRuntime = HTTPRuntime{}
+	_ mcp.Runtime                            = MCPRuntime{}
+)
+
 // Search implements httpapi.SearchRuntime.
 func (a HTTPRuntime) Search(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error) {
 	return a.Service.Search(ctx, namespace, request)
@@ -104,6 +112,12 @@ func (a MCPRuntime) ListDocuments(ctx context.Context, namespace string) ([]mcp.
 		records = append(records, mcp.DocumentRecord(document))
 	}
 	return records, nil
+}
+
+// ResolveDocumentIDs implements the mcp.Runtime document visibility mapping: it
+// turns granted document names into the ids Qdrant payloads carry.
+func (a MCPRuntime) ResolveDocumentIDs(ctx context.Context, namespace string, names []string) ([]string, error) {
+	return a.Service.ResolveDocumentIDs(ctx, namespace, names)
 }
 
 // ReadDocument implements mcp.Runtime.
@@ -217,6 +231,28 @@ func (a HTTPRuntime) ListKnowledgeBases(ctx context.Context) ([]map[string]any, 
 // CreateKnowledgeBase implements httpapi.KnowledgeBaseAdminRuntime.
 func (a HTTPRuntime) CreateKnowledgeBase(ctx context.Context, input httpapi.KnowledgeBaseCreateInput) (map[string]any, error) {
 	return a.Service.CreateKnowledgeBase(ctx, kbconfig.CreateInput{
+		Namespace:       input.Namespace,
+		Chunking:        input.Chunking,
+		EmbeddingModel:  input.EmbeddingModel,
+		RerankerModel:   input.RerankerModel,
+		EmbeddingValues: input.EmbeddingValues,
+		RerankerValues:  input.RerankerValues,
+		VLMModel:        input.VLMModel,
+		VLMValues:       input.VLMValues,
+		TokenizerModel:  a.Service.Config().ChunkTokenizerModel,
+	})
+}
+
+// CreateKnowledgeBaseForUser implements httpapi.KnowledgeBaseSelfCreateRuntime.
+// The tenant self-create request carries no provider configuration: the runtime
+// clones the administrator default template for it.
+func (a HTTPRuntime) CreateKnowledgeBaseForUser(
+	ctx context.Context,
+	ownerUserID string,
+	isAdmin bool,
+	input httpapi.KnowledgeBaseCreateInput,
+) (map[string]any, error) {
+	return a.Service.CreateKnowledgeBaseForUser(ctx, ownerUserID, isAdmin, kbconfig.CreateInput{
 		Namespace:       input.Namespace,
 		Chunking:        input.Chunking,
 		EmbeddingModel:  input.EmbeddingModel,

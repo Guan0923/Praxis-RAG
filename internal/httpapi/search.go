@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Guan0923/xinghe_rag/internal/access"
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
 )
@@ -60,6 +61,10 @@ func runtimeErrorStatus(err error) (int, string) {
 	if errors.As(err, &conflict) {
 		return http.StatusConflict, conflict.Message
 	}
+	var knowledgeConflict *apierrors.KnowledgeConflictError
+	if errors.As(err, &knowledgeConflict) {
+		return http.StatusConflict, knowledgeConflict.Message
+	}
 	var unavailable *apierrors.SnapshotUnavailable
 	if errors.As(err, &unavailable) {
 		return http.StatusGone, unavailable.Message
@@ -101,6 +106,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
 		return
 	}
+	// Resolved only for login sessions with ownership enforcement enabled; a
+	// request without a scope keeps the historical unrestricted behaviour.
+	scope, hasScope := access.ScopeFromContext(r.Context())
+	if hasScope && !scope.AllowsAnyRead() {
+		writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
+		return
+	}
 	var body searchBody
 	if decoded, details := decodeSearchBody(r); details != nil {
 		writeValidation(w, http.StatusUnprocessableEntity, details)
@@ -118,6 +130,22 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeRuntimeError(w, err, true)
 		return
 	}
+	// A file-level grantee only retrieves the documents they may read: the
+	// runtime filters results and snapshots by these ids (nil = unrestricted,
+	// empty slice = nothing visible).
+	if hasScope && scope.Restricted() {
+		request.DocumentIDs = []string{}
+		if s.access != nil {
+			ids, resolveErr := s.access.ResolveDocumentIDs(r.Context(), namespace, scope.ReadDocumentNames())
+			if resolveErr != nil {
+				writeAccessError(w, resolveErr)
+				return
+			}
+			if ids != nil {
+				request.DocumentIDs = ids
+			}
+		}
+	}
 	payload, err := s.runtime.Search(r.Context(), namespace, request)
 	if err != nil {
 		writeRuntimeError(w, err, true)
@@ -133,6 +161,9 @@ func (s *Server) handleGetSearchResult(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.runtime == nil {
 		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
+		return
+	}
+	if _, ok := s.requireScopeRead(w, r); !ok {
 		return
 	}
 	resultID, err := contracts.ValidateUUID(pathParam(r, "result_id"))
@@ -172,6 +203,9 @@ func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request
 	}
 	if s.runtime == nil {
 		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
+		return
+	}
+	if _, ok := s.requireScopeRead(w, r); !ok {
 		return
 	}
 	artifactID, err := contracts.ValidateUUID(pathParam(r, "artifact_id"))
@@ -234,6 +268,9 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 	}
 	if s.runtime == nil {
 		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
+		return
+	}
+	if _, ok := s.requireScopeRead(w, r); !ok {
 		return
 	}
 	artifactID, err := contracts.ValidateUUID(pathParam(r, "artifact_id"))

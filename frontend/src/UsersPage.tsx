@@ -7,14 +7,15 @@ import {
   deleteUser,
   errorText,
   fetchUsers,
+  roleLabels,
   updateUser,
   type AuthUser,
 } from "./api";
 
-const roleLabels: Record<AuthUser["role"], string> = {
-  admin: "管理员",
-  user: "普通用户",
-};
+const roleOptions = (Object.keys(roleLabels) as AuthUser["role"][]).map((value) => ({
+  value,
+  label: roleLabels[value],
+}));
 
 export function UsersPage({ currentUserId }: { currentUserId?: string }) {
   const { message } = App.useApp();
@@ -83,7 +84,7 @@ export function UsersPage({ currentUserId }: { currentUserId?: string }) {
         type="info"
         showIcon
         title="权限说明"
-        description="管理员可管理知识库、API Key 与用户；普通用户可检索、上传和删除文档（所有知识库）。系统始终保留至少一名启用状态的管理员。"
+        description="管理员可管理全部知识库、用户、API Key 与授权；VIP 可创建知识库，并为自己创建的知识库创建邀请与授权；普通用户可创建知识库，并使用自己创建或被邀请的知识库。系统始终保留至少一名启用状态的管理员。"
       />
       {error && (
         <Alert className="page-alert" type="error" showIcon title="用户列表加载失败" description={error} />
@@ -115,10 +116,7 @@ export function UsersPage({ currentUserId }: { currentUserId?: string }) {
                 value={role}
                 style={{ width: 130 }}
                 loading={savingId === user.id}
-                options={[
-                  { value: "admin", label: roleLabels.admin },
-                  { value: "user", label: roleLabels.user },
-                ]}
+                options={roleOptions}
                 onChange={(value) => void change(user, { role: value as AuthUser["role"] })}
               />
             ),

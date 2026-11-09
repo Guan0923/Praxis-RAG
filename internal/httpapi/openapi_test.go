@@ -53,6 +53,43 @@ func TestOpenAPIAndDocsRoutes(t *testing.T) {
 		t.Fatalf("CreateKnowledgeBaseBody.required = %v", required)
 	}
 
+	// Sharing/invitation surface documented from the same table.
+	for _, path := range []string{
+		"/v1/users",
+		"/v1/knowledge-bases",
+		"/v1/knowledge-bases/{namespace}/access",
+		"/v1/knowledge-bases/{namespace}/permissions",
+		"/v1/knowledge-bases/{namespace}/permissions/{user_id}",
+		"/v1/knowledge-bases/{namespace}/invitations",
+		"/v1/invitations",
+		"/v1/invitations/preview",
+		"/v1/invitations/accept",
+		"/v1/invitations/decline",
+		"/v1/invitations/{invitation_id}",
+	} {
+		if _, present := paths[path]; !present {
+			t.Fatalf("paths missing %s", path)
+		}
+	}
+	invitationBody, _ := schemas["CreateInvitationBody"].(map[string]any)
+	invitationProperties, _ := invitationBody["properties"].(map[string]any)
+	permission, _ := invitationProperties["permission"].(map[string]any)
+	permissionEnum, _ := permission["enum"].([]any)
+	if len(permissionEnum) != 2 || permissionEnum[0] != "read" || permissionEnum[1] != "write" {
+		t.Fatalf("CreateInvitationBody.permission enum = %v", permission["enum"])
+	}
+	tokenBody, _ := schemas["InvitationTokenBody"].(map[string]any)
+	if tokenRequired, _ := tokenBody["required"].([]any); len(tokenRequired) != 1 || tokenRequired[0] != "token" {
+		t.Fatalf("InvitationTokenBody.required = %v", tokenBody["required"])
+	}
+	userUpdate, _ := schemas["UserUpdateBody"].(map[string]any)
+	userProperties, _ := userUpdate["properties"].(map[string]any)
+	role, _ := userProperties["role"].(map[string]any)
+	roleEnum, _ := role["enum"].([]any)
+	if len(roleEnum) != 3 || roleEnum[0] != "admin" || roleEnum[1] != "vip" || roleEnum[2] != "user" {
+		t.Fatalf("UserUpdateBody.role enum = %v", role["enum"])
+	}
+
 	// The document is generated deterministically from one table.
 	second := performRequest(handler, testRequest{method: "GET", target: "/openapi.json", remote: "127.0.0.1:5000"})
 	if second.Body.String() != response.Body.String() {

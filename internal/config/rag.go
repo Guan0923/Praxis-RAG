@@ -15,6 +15,10 @@ const DenseVectorSize = 1024
 // DefaultRerankerModel mirrors rag_mcp.rerankers.cross_encoder.DEFAULT_RERANKER_MODEL.
 const DefaultRerankerModel = "BAAI/bge-reranker-base"
 
+// DefaultKBTemplateNamespace is the knowledge-base namespace cloned for
+// tenant-created knowledge bases when RAG_DEFAULT_KB_TEMPLATE is not set.
+const DefaultKBTemplateNamespace = "default"
+
 // BackendName is the supported retrieval backend selector.
 type BackendName string
 
@@ -43,6 +47,9 @@ type RagConfig struct {
 	RerankerMaxLength     int
 	RerankerMaxTextChars  int
 	PreloadReranker       bool
+	// DefaultKBTemplate is the knowledge-base namespace cloned by the tenant
+	// self-create flow (RAG_DEFAULT_KB_TEMPLATE, default "default").
+	DefaultKBTemplate string
 	PDFParserPython       string
 	PDFModelsPath         string
 	PDFParseTimeout       int
@@ -164,6 +171,10 @@ func RagConfigFromEnv() (RagConfig, error) {
 	if err != nil {
 		return RagConfig{}, err
 	}
+	defaultKBTemplate := strings.TrimSpace(os.Getenv("RAG_DEFAULT_KB_TEMPLATE"))
+	if defaultKBTemplate == "" {
+		defaultKBTemplate = DefaultKBTemplateNamespace
+	}
 
 	return RagConfig{
 		Backend:               BackendName(rawBackend),
@@ -183,6 +194,7 @@ func RagConfigFromEnv() (RagConfig, error) {
 		RerankerMaxLength:     maxLength,
 		RerankerMaxTextChars:  maxTextChars,
 		PreloadReranker:       preloadReranker,
+		DefaultKBTemplate:     defaultKBTemplate,
 		PDFParserPython:       optionalPath("RAG_PDF_PARSER_PYTHON"),
 		PDFModelsPath:         optionalPath("RAG_PDF_MODELS_PATH"),
 		PDFParseTimeout:       pdfTimeout,

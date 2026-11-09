@@ -64,23 +64,25 @@ func WithChangeNotifier(notifier ChangeNotifier) Option {
 
 // Server hosts the REST API, MCP endpoint, and Console static assets.
 type Server struct {
-	settings    config.ServiceSettings
-	status      StatusProvider
-	keys        KeyLookup
-	keyStore    APIKeyStore
-	runtime     Runtime
-	mcpHandler  http.Handler
-	logger      *slog.Logger
-	router      *router
-	webRoot     string
-	catalog     catalog.Store
-	tools       ToolRegistry
-	kbAdmin     KnowledgeBaseAdminRuntime
-	notifier    ChangeNotifier
-	users       UserAuth
-	limiter     *loginLimiter
-	docNotifier DocumentChangeNotifier
-	handler     http.Handler
+	settings     config.ServiceSettings
+	status       StatusProvider
+	keys         KeyLookup
+	keyStore     APIKeyStore
+	runtime      Runtime
+	mcpHandler   http.Handler
+	logger       *slog.Logger
+	router       *router
+	webRoot      string
+	catalog      catalog.Store
+	tools        ToolRegistry
+	kbAdmin      KnowledgeBaseAdminRuntime
+	kbSelfCreate KnowledgeBaseSelfCreateRuntime
+	notifier     ChangeNotifier
+	users        UserAuth
+	access       AccessControl
+	limiter      *loginLimiter
+	docNotifier  DocumentChangeNotifier
+	handler      http.Handler
 }
 
 // New builds the HTTP server. A nil StatusProvider falls back to a static
@@ -148,6 +150,7 @@ func (s *Server) registerRoutes() {
 	s.registerDocumentationRoutes()
 	s.registerKnowledgeBaseAdminRoutes()
 	s.registerUserAuthRoutes()
+	s.registerAccessRoutes()
 	s.router.add("POST", "/mcp", authMCP, s.handleMCP)
 	s.router.add("GET", "/mcp", authMCP, s.handleMCP)
 	s.router.add("DELETE", "/mcp", authMCP, s.handleMCP)
@@ -207,11 +210,29 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch result.route.policy {
 	case authTenant:
-		namespace, ok := s.tenantFromHeaders(recorder, r)
+		namespace, session, ok := s.tenantFromRequest(recorder, r)
 		if !ok {
 			return
 		}
 		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, namespace))
+		if session != nil {
+			// Login sessions are subject to knowledge-base ownership/permission
+			// filtering; API keys, the service token and session-less loopback
+			// requests stay unrestricted.
+			r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, session))
+			if r = s.withAccessScope(recorder, r, session.User, namespace); r == nil {
+				return
+			}
+		}
+	case authSession:
+		// The sharing endpoints always act for one Console account and never use
+		// the loopback fallback; writes additionally require the CSRF header.
+		recorder.Header().Set("Cache-Control", "no-store")
+		session, ok := s.requireSession(recorder, r)
+		if !ok {
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, session))
 	case authAdmin:
 		if !s.requireAdmin(recorder, r) {
 			return
@@ -225,11 +246,18 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			writeDetail(recorder, http.StatusUnauthorized, "MCP 请求必须提供 Authorization: Bearer <API_KEY>")
 			return
 		}
-		namespace, ok := s.tenantFromHeaders(recorder, r)
+		namespace, session, ok := s.tenantFromRequest(recorder, r)
 		if !ok {
 			return
 		}
 		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, namespace))
+		if session != nil {
+			// A session bearer token resolves the same scope REST uses, and the
+			// MCP layer reads it through access.ScopeFromContext.
+			if r = s.withAccessScope(recorder, r, session.User, namespace); r == nil {
+				return
+			}
+		}
 	}
 	if len(result.params) > 0 {
 		r = r.WithContext(context.WithValue(r.Context(), pathParamsContext{}, result.params))

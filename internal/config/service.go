@@ -70,6 +70,8 @@ type ServiceSettings struct {
 	RegistrationEnabled bool
 	// SessionTTL is the lifetime of one login session.
 	SessionTTL time.Duration
+	// InvitationTTL is how long one knowledge-base share link stays acceptable.
+	InvitationTTL time.Duration
 	// CookieSecure marks the session cookie Secure (set it behind HTTPS).
 	CookieSecure bool
 }
@@ -140,6 +142,10 @@ func ServiceSettingsFromEnv() (ServiceSettings, error) {
 	if err != nil {
 		return ServiceSettings{}, err
 	}
+	invitationTTL, err := hoursSetting("RAG_INVITATION_TTL_HOURS", 168)
+	if err != nil {
+		return ServiceSettings{}, err
+	}
 	cookieSecure, err := boolSetting("RAG_AUTH_COOKIE_SECURE", false)
 	if err != nil {
 		return ServiceSettings{}, err
@@ -161,6 +167,7 @@ func ServiceSettingsFromEnv() (ServiceSettings, error) {
 		AuthEnabled:         authEnabled,
 		RegistrationEnabled: registration,
 		SessionTTL:          sessionTTL,
+		InvitationTTL:       invitationTTL,
 		CookieSecure:        cookieSecure,
 	}, nil
 }

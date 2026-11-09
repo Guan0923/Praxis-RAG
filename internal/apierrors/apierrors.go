@@ -1,7 +1,7 @@
 // Package apierrors defines the error categories shared by the service layers.
 // They mirror the Python exceptions that the HTTP layer maps to status codes:
 // KnowledgeValidationError -> 400/404/409, KnowledgeError -> 503,
-// SnapshotUnavailable -> 410 and UploadConflict -> 409.
+// SnapshotUnavailable -> 410, and UploadConflict/KnowledgeConflictError -> 409.
 package apierrors
 
 // KnowledgeError marks a safe service failure rendered as HTTP 503.
@@ -29,6 +29,14 @@ type UploadConflict struct{ Message string }
 
 // Error implements error.
 func (e *UploadConflict) Error() string { return e.Message }
+
+// KnowledgeConflict marks a knowledge-base conflict that is not an input
+// validation failure (HTTP 409). The tenant self-create flow uses it when the
+// administrator default knowledge-base template is not configured.
+type KnowledgeConflictError struct{ Message string }
+
+// Error implements error.
+func (e *KnowledgeConflictError) Error() string { return e.Message }
 
 // SnapshotUnavailableError builds a *SnapshotUnavailable.
 func SnapshotUnavailableError(message string) *SnapshotUnavailable {

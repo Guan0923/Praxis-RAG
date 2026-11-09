@@ -60,6 +60,9 @@ func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if _, ok := s.requireScopeRead(w, r); !ok {
+		return
+	}
 	if s.runtime == nil {
 		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
 		return
@@ -69,6 +72,8 @@ func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
 		writeRuntimeError(w, err, false)
 		return
 	}
+	// A file-level reader only ever sees the documents explicitly granted to it.
+	documents = scopedDocuments(r, documents)
 	extensions := append([]string(nil), SupportedExtensions...)
 	sort.Strings(extensions)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -100,6 +105,11 @@ func (s *Server) handleUploadDocuments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeDetail(w, problem.status, problem.detail)
+		return
+	}
+	// A file-level writer may only replace documents it holds write access to;
+	// a whole-knowledge-base writer may upload any file name.
+	if !s.requireScopeWriteBatch(w, r, files) {
 		return
 	}
 	if s.uploadMode() == config.UploadModeAsync {
@@ -319,6 +329,9 @@ func (s *Server) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.requireScopeWriteDocument(w, r, pathParam(r, "name")) {
+		return
+	}
 	if s.runtime == nil {
 		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
 		return
@@ -376,6 +389,9 @@ func (s *Server) handleDocumentContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := pathParam(r, "name")
+	if !s.requireScopeReadDocument(w, r, name) {
+		return
+	}
 	writeNoStore := func() { w.Header().Set("Cache-Control", "no-store") }
 	if strings.HasSuffix(strings.ToLower(name), ".pdf") {
 		content, err := s.runtime.ReadDocumentFile(r.Context(), namespace, name)
@@ -424,6 +440,12 @@ type checkFileBody struct {
 func (s *Server) handleCheckDocuments(w http.ResponseWriter, r *http.Request) {
 	namespace, ok := s.tenantNamespace(w, r)
 	if !ok {
+		return
+	}
+	// The check route reveals whether documents already exist, so it follows the
+	// same read visibility rule as GET /v1/documents. Management credentials and
+	// servers without ownership enforcement keep their historical behaviour.
+	if _, ok := s.requireScopeRead(w, r); !ok {
 		return
 	}
 	if s.runtime == nil {

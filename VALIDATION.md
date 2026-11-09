@@ -6,6 +6,54 @@
 > is recorded immediately below. RocketMQ wording in the historical sections is
 > retained as history.
 
+## Roles, knowledge-base ownership and invitation permissions — 2026-11-09
+
+Delivered: `admin` / `vip` / `user` roles (only administrators change roles),
+knowledge-base ownership (`knowledge_bases.owner_user_id`), invite-link sharing
+with read/write permissions over single-file / multi-file / whole-knowledge-base
+scopes, and enforcement across REST, MCP, document lists, search results and
+artifacts. Design/spec: `.dev/DESIGN.md` (local scratch); user docs:
+[docs/PERMISSIONS.md](docs/PERMISSIONS.md).
+
+Go verification (Windows, Go 1.27.3, MySQL 8 + Redis + Qdrant from the local
+compose stack; `GOCACHE` redirected into the worktree because the machine cache
+is outside the sandbox):
+
+- `go build ./...` and `go vet ./internal/...` — clean.
+- `go test ./... -p 1 -count=1 -timeout 25m` — every package passes except
+  `internal/e2e TestRESTAsyncUploadPipeline`, which also fails on the pristine
+  `8df52da` baseline in a separate worktree (pre-existing, unrelated to this
+  iteration: `documents after publish = []`).
+- New coverage: `internal/access` (scope resolution, invitation lifecycle,
+  expiry/revoke/idempotent accept, validation, 20s), `internal/state`
+  (permission/invitation repositories, ownership, delete cascades),
+  `internal/httpapi` (role checks, `authSession`/CSRF, ownership 403s, document
+  filtering, search `DocumentIDs`, invitation endpoints, 409 template mapping),
+  `internal/runtime` (template clone, restricted-search visibility filter,
+  `ResolveDocumentIDs`), `internal/mcp` (per-request scope through the internal
+  `X-Rag-Mcp-Scope` header, resource/tool/write filtering, queued-search 403).
+- Full `internal/state` suite: 403.9s green; `internal/runtime`: 458.4s green.
+
+Console verification:
+
+- `npm run typecheck` — clean.
+- `npm run build` — clean (1,239.66 kB JS / 13.41 kB CSS). Vite 8 aborts in this
+  sandbox because it probes Windows network drives through `child_process.exec`
+  (pipe EPERM); the build was verified with an uncommitted `child_process.exec`
+  shim via `NODE_OPTIONS`, which only affects the probe.
+
+Live HTTP smoke (`dist/bin/rag-service.exe` on the disposable MySQL schema,
+Qdrant/Redis from the stack; 35 assertions): roles and role updates, admin-only
+user picker, 409 for self-create without a template, owned/unowned namespace
+visibility, invitation create → inbox → preview (wrong account 403) → accept,
+whole-KB read vs. single-file write effective access, read-only upload/delete
+403, grant listing/revoke, non-owner VIP and normal-user invite 403, MCP 401,
+Console assets and OpenAPI entries.
+
+Not verified live: end-to-end document upload/search inside a shared knowledge
+base (needs a reachable embedding/reranker provider), queued-search behaviour for
+restricted grantees under a Kafka deployment, and browser E2E of the new pages.
+
 ## Kafka migration validation — 2026-11-09
 
 - Live Docker Desktop stack with existing MySQL/Qdrant/Redis data volumes:

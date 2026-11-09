@@ -50,7 +50,7 @@ REST `/v1/search`、Console 与本地调试同步执行。服务端 MCP `search`
 
 | 入口 | 能力 |
 | --- | --- |
-| Web Console：`/console` | 账号登录/注册、用户与权限管理、文档管理、检索调试、工作区切换和模型连接配置。 |
+| Web Console：`/console` | 账号登录/注册、角色与知识库权限管理、文档管理、检索调试、工作区切换和模型连接配置。 |
 | MCP：`/mcp` | 搜索、添加/更新/删除文档、分页读取正文、提示词模板及订阅变更。 |
 | REST API：`/v1/*` | 知识管理与检索接入现有应用；`/openapi.json` 与 `/docs` 提供 OpenAPI 3.1 契约。 |
 
@@ -136,7 +136,9 @@ $env:RAG_STATE_ENCRYPTION_KEY = "base64:<32-byte-key>"
 
 ### 创建管理员账号
 
-首次打开 Console 会显示登录页，切到"注册"创建账号，第一个账号自动成为管理员；之后可在"用户管理"页分配角色、启用/禁用或删除账号（始终保留至少一名启用状态的管理员）。自动化脚本继续使用 `RAG_SERVICE_TOKEN` 或 API Key，不受登录影响；也可以用 `RAG_AUTH_ENABLED=false` 关闭登录。详见 [docs/USAGE.md](docs/USAGE.md#用户登录与注册console)。
+首次打开 Console 会显示登录页，切到"注册"创建账号，第一个账号自动成为管理员；之后可在"用户管理"页分配角色（管理员 `admin` / VIP `vip` / 普通用户 `user`）、启用/禁用或删除账号（始终保留至少一名启用状态的管理员）。自动化脚本继续使用 `RAG_SERVICE_TOKEN` 或 API Key，不受登录影响；也可以用 `RAG_AUTH_ENABLED=false` 关闭登录。
+
+知识库默认归创建者私有：VIP 和管理员可以在「权限管理」页通过邀请链接把知识库按「可读 / 可修改」和「单文件 / 多文件 / 全库」范围共享给其他账号，被邀请人登录后接受邀请才生效。详见 [知识库权限管理](docs/PERMISSIONS.md)。详见 [docs/USAGE.md](docs/USAGE.md#用户登录与注册console)。
 
 创建第一批 API Key（管理接口仅本机可访问，或使用管理员登录会话远程访问）：
 
@@ -216,7 +218,7 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 - `RAG_UPLOAD_MODE` 默认 `sync`；改为 `async` 后果索引任务排队执行，必须部署 `rag-document-worker`（或 `RAG_DOCUMENT_WORKER_LOCAL=1`），并用 `GET /v1/document-jobs/{artifact_id}` 观察进度。
 - 每批最多 10 个文件、单文件 10 MiB；暂不支持 Excel、网页抓取和独立图片上传。
 - Word 保留内容控件、嵌套表格、合并范围与原生公式；未知公式结构、原生图表等无法可靠读取的内容会明确拒绝入库；图注关联有歧义时跳过并报告原因。
-- 工作区用于划分知识库，不是用户级权限系统；`/v1/admin/*` 只允许本机直连，MCP/普通 API 使用 Service Token 或 API Key。
+- 知识库（namespace）默认归创建者私有，只有创建者和管理员可以使用；共享通过「权限管理」页的邀请链接完成，权限分为可读/可修改、范围分为单文件/多文件/全库，仅 VIP 与管理员可邀请。管理凭证（Service Token / API Key / 本机无会话直连）沿用原有语义，不做知识库归属校验；`/v1/admin/*` 只允许本机直连或管理员会话，MCP/普通 API 使用 Service Token 或 API Key。详见 [知识库权限管理](docs/PERMISSIONS.md)。
 - 默认只监听 `127.0.0.1`。远程部署必须设置 `RAG_SERVICE_TOKEN` 与 MCP Host/Origin 白名单，并在前面配置 HTTPS 与访问控制。
 - PDF/Word 解析依赖外部进程（Docling + 本地版面/表格/OCR 模型、LibreOffice、Python 环境），不属于 Go 二进制；公式识别与图片描述调用远端 VLM（`RAG_VLM_*`），文档裁图会发送到该端点。未配置时相应文件上传会明确报错。
 - Redis 搜索快照有 TTL（`RAG_RESULT_TTL_SECONDS`，默认 3600 秒），丢失或到期后 `result_id` 不可用，无 SQL 回放。异步文档任务状态在 MySQL，不受 Redis TTL 影响。
@@ -227,6 +229,7 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 | 文档 | 内容 |
 | --- | --- |
 | [使用与部署](docs/USAGE.md) | Go 后端的构建、运行、环境变量、REST/MCP 示例、worker、迁移 CLI。 |
+| [知识库权限管理](docs/PERMISSIONS.md) | 角色、知识库归属、可读/可修改与单文件/多文件/全库权限、邀请链接流程与接口。 |
 | [部署指南](docs/DEPLOYMENT.md) | Docker/Compose 与 systemd 示例、worker 重启策略、DLQ 监控、outbox 模式。 |
 | [Go 迁移总纲](docs/GO_MIGRATION.md) | 目标架构、兼容性硬约束、阶段与进度记录、当前切换状态。 |
 | [Go Parity 审计](docs/GO_PARITY_AUDIT.md) | Go 与 Python/前端契约差异、P0/P1/P2 清单与验证限制。 |

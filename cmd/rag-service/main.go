@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Guan0923/xinghe_rag/internal/access"
 	"github.com/Guan0923/xinghe_rag/internal/apikeys"
 	"github.com/Guan0923/xinghe_rag/internal/auth"
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
@@ -110,9 +111,16 @@ func run() error {
 		RegistrationEnabled: serviceSettings.RegistrationEnabled,
 		SessionTTL:          serviceSettings.SessionTTL,
 	})
+	// Knowledge-base ownership and the invite-based sharing rules are enforced
+	// by the access service; httpapi only maps its typed errors to HTTP.
+	accessService := access.NewService(stores, access.Options{
+		InvitationTTL: serviceSettings.InvitationTTL,
+	})
 	api := httpapi.New(serviceSettings, service, nil, logger,
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
+		httpapi.WithKnowledgeBaseSelfCreateRuntime(wire.HTTPRuntime{Service: service}),
+		httpapi.WithAccessControl(accessService),
 		httpapi.WithAPIKeyStore(apikeys.New(stores.APIKeys)),
 		httpapi.WithCatalogStore(catalogStore),
 		httpapi.WithToolRegistry(mcpEndpoint),

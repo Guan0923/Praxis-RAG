@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRagConfigDefaults(t *testing.T) {
@@ -112,6 +113,32 @@ func TestServiceSettingsUploadMode(t *testing.T) {
 	}
 	t.Setenv("RAG_UPLOAD_MODE", "queue")
 	if _, err := ServiceSettingsFromEnv(); err == nil || err.Error() != "RAG_UPLOAD_MODE must be sync or async" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestServiceSettingsInvitationTTL(t *testing.T) {
+	isolateEnv(t)
+	settings, err := ServiceSettingsFromEnv()
+	if err != nil {
+		t.Fatalf("ServiceSettingsFromEnv() error = %v", err)
+	}
+	if settings.InvitationTTL != 168*time.Hour {
+		t.Fatalf("default invitation ttl = %v, want 168h", settings.InvitationTTL)
+	}
+
+	t.Setenv("RAG_INVITATION_TTL_HOURS", "24")
+	settings, err = ServiceSettingsFromEnv()
+	if err != nil {
+		t.Fatalf("ServiceSettingsFromEnv() error = %v", err)
+	}
+	if settings.InvitationTTL != 24*time.Hour {
+		t.Fatalf("invitation ttl = %v, want 24h", settings.InvitationTTL)
+	}
+
+	t.Setenv("RAG_INVITATION_TTL_HOURS", "0")
+	if _, err := ServiceSettingsFromEnv(); err == nil ||
+		!strings.Contains(err.Error(), "RAG_INVITATION_TTL_HOURS must be an integer between 1 and 8760") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
