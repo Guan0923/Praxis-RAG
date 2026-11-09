@@ -2,7 +2,9 @@ package kbconfig
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/Guan0923/xinghe_rag/internal/modelapi"
 )
@@ -54,5 +56,19 @@ func ModelsFor(
 	if factory == nil {
 		factory = DefaultModelListerFactory
 	}
-	return factory(draft).Models(ctx)
+	models, err := factory(draft).Models(ctx)
+	if err != nil {
+		// A 404 usually means the provider has no /models route (reranker-only
+		// endpoints are common). Model listing is a convenience for the Console,
+		// so report "no models" instead of failing the form.
+		var modelError *modelapi.ModelAPIError
+		if errors.As(err, &modelError) && modelError.Status == http.StatusNotFound {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	if models == nil {
+		return []string{}, nil
+	}
+	return models, nil
 }

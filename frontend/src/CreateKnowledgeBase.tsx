@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Alert, App, Button, Descriptions, Form, Input, InputNumber, Select, Switch, Tooltip } from "antd";
+import { Alert, App, AutoComplete, Button, Descriptions, Form, Input, InputNumber, Select, Switch, Tooltip } from "antd";
 import { DeleteOutlined, PlusOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
 import { api, errorText, type Chunking, type KnowledgeBase, type Strategy } from "./api";
 import { namespacePattern } from "./navigation";
@@ -11,11 +11,23 @@ type Values = Chunking & { namespace: string; embedding_model: string; reranker_
 type Defaults = { default: string; strategies: Strategy[] };
 const kinds: Kind[] = ["embedding", "reranker", "vlm"];
 const cleanUrl = (value: string) => value.trim().replace(/\/+$/, "");
+// The create form keeps an unsaved draft (without API keys) so a failed save or
+// an accidental page switch never loses the other inputs.
+const draftKey = "rag.knowledge-base-draft";
 
 export function CreateKnowledgeBase({ active, disabled, onCreated }: {
   active: boolean; disabled: boolean; onCreated: (namespace: string) => void;
 }) {
-  return active ? <KnowledgeBaseForm disabled={disabled} onSaved={(item) => onCreated(item.namespace)} /> : null;
+  // Keep the form mounted after the first visit so switching pages does not
+  // discard what was typed.
+  const [mounted, setMounted] = useState(active);
+  useEffect(() => {
+    if (active) setMounted(true);
+  }, [active]);
+  if (!mounted) return null;
+  return <div hidden={!active}>
+    <KnowledgeBaseForm disabled={disabled} onSaved={(item) => onCreated(item.namespace)} />
+  </div>;
 }
 
 export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: {
@@ -30,6 +42,8 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
   const [rerankerEnabled, setRerankerEnabled] = useState(Boolean(initial?.reranker_model));
   const [vlmEnabled, setVlmEnabled] = useState(Boolean(initial?.vlm_model));
   const [models, setModels] = useState<Record<Kind, string[]>>({ embedding: [], reranker: [], vlm: [] });
+  const [modelsLoaded, setModelsLoaded] = useState<Record<Kind, boolean>>({ embedding: false, reranker: false, vlm: false });
+  const [modelHints, setModelHints] = useState<Record<Kind, string>>({ embedding: "", reranker: "", vlm: "" });
   const [loading, setLoading] = useState({ embedding: false, reranker: false, vlm: false });
   const [visibleKeys, setVisibleKeys] = useState({ embedding: false, reranker: false, vlm: false });
   const [editedKeys, setEditedKeys] = useState({ embedding: false, reranker: false, vlm: false });
@@ -65,26 +79,74 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
     };
   }, []);
 
+  // Restore an unsaved create draft (API keys are never written to storage).
+  useEffect(() => {
+    if (initial) return;
+    try {
+      const raw = sessionStorage.getItem(draftKey);
+      if (!raw) return;
+      const draft = JSON.parse(raw) as Partial<Values> | null;
+      if (!draft || typeof draft !== "object") return;
+      form.setFieldsValue(draft as Values);
+      if (typeof draft.reranker_model === "string" && draft.reranker_model) setRerankerEnabled(true);
+      if (typeof draft.vlm_model === "string" && draft.vlm_model) setVlmEnabled(true);
+    } catch {
+      // An unreadable draft must never block the form.
+    }
+  }, []);
+
+  // saveDraft persists the create form between navigation and page reloads so a
+  // validation error never discards the other inputs.
+  function saveDraft() {
+    if (initial) return;
+    try {
+      const values = form.getFieldsValue(true) as Values;
+      const draft = {
+        ...values,
+        embedding: { base_url: values.embedding?.base_url || "" },
+        reranker: { base_url: values.reranker?.base_url || "" },
+        vlm: { base_url: values.vlm?.base_url || "" },
+      };
+      sessionStorage.setItem(draftKey, JSON.stringify(draft));
+    } catch {
+      // Draft persistence is best effort only.
+    }
+  }
+
   function providerValues(kind: Kind): ProviderValues {
     const value = form.getFieldValue(kind) as ProviderValues;
     return { base_url: value.base_url.trim(), ...(!initial || editedKeys[kind] ? { apikey: value.apikey || "" } : {}) };
   }
 
   async function loadModels(kind: Kind) {
+    if (modelsLoaded[kind] || loading[kind]) return;
     try { await form.validateFields([[kind, "base_url"]]); } catch { return; }
     modelRequests.current[kind]?.abort();
     const controller = new AbortController();
     modelRequests.current[kind] = controller;
     setLoading((value) => ({ ...value, [kind]: true }));
     setModels((value) => ({ ...value, [kind]: [] }));
-    setError("");
     try {
       const result = await api<{ models: string[] }>(
         "/v1/admin/knowledge-bases/models/" + kind, undefined,
         { method: "POST", body: JSON.stringify({ ...providerValues(kind), namespace: initial?.namespace }), signal: controller.signal });
-      if (!controller.signal.aborted) setModels((value) => ({ ...value, [kind]: result.models }));
-    } catch (reason) { if (!controller.signal.aborted) setError(errorText(reason)); }
-    finally { if (!controller.signal.aborted) setLoading((value) => ({ ...value, [kind]: false })); }
+      if (!controller.signal.aborted) {
+        setModels((value) => ({ ...value, [kind]: result.models }));
+        setModelsLoaded((value) => ({ ...value, [kind]: true }));
+        setModelHints((value) => ({
+          ...value,
+          [kind]: result.models.length > 0 ? "" : "该地址未返回模型列表，可直接输入模型名称",
+        }));
+      }
+    } catch {
+      // A provider without a /models endpoint is normal for rerankers. Model
+      // listing is only a convenience: keep the field editable and show a
+      // neutral hint instead of failing the form.
+      if (!controller.signal.aborted) {
+        setModelsLoaded((value) => ({ ...value, [kind]: true }));
+        setModelHints((value) => ({ ...value, [kind]: "无法从该地址获取模型列表，可直接输入模型名称" }));
+      }
+    } finally { if (!controller.signal.aborted) setLoading((value) => ({ ...value, [kind]: false })); }
   }
 
   async function showKey(kind: Kind, visible: boolean) {
@@ -120,6 +182,15 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
         }) });
       if (!lifetime.current.signal.aborted) {
         void message.success(initial ? reembed ? "重新向量化完成，配置已切换" : "知识库配置已保存" : "知识库已创建");
+        if (!initial) {
+          try { sessionStorage.removeItem(draftKey); } catch { /* Draft cleanup is best effort. */ }
+          form.resetFields();
+          setRerankerEnabled(false);
+          setVlmEnabled(false);
+          setModelsLoaded({ embedding: false, reranker: false, vlm: false });
+          setModelHints({ embedding: "", reranker: "", vlm: "" });
+          void loadDefaults();
+        }
         onSaved(result);
       }
     } catch (reason) { if (!lifetime.current.signal.aborted) setError(errorText(reason)); }
@@ -140,7 +211,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
       { key: "dimension", label: "向量维度", children: initial.vector_size },
       { key: "collection", label: "索引集合", children: <span className="break-text">{initial.collection}</span> },
     ]} />}
-    <Form form={form} layout="vertical" disabled={locked} onFinish={(values) => submit(values)}
+    <Form form={form} layout="vertical" disabled={locked} scrollToFirstError onFinish={(values) => submit(values)}
       initialValues={{ namespace: initial?.namespace || "", embedding_model: initial?.embedding_model || "", reranker_model: initial?.reranker_model || "",
         vlm_model: initial?.vlm_model || "",
         embedding: { base_url: initial?.embedding.base_url || "", apikey: "" }, reranker: { base_url: initial?.reranker.base_url || "", apikey: "" },
@@ -158,11 +229,14 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
             modelRequests.current[kind]?.abort(); keyRequests.current[kind]?.abort();
             setLoading((value) => ({ ...value, [kind]: false }));
             setModels((value) => ({ ...value, [kind]: [] }));
+            setModelsLoaded((value) => ({ ...value, [kind]: false }));
+            setModelHints((value) => ({ ...value, [kind]: "" }));
             form.setFieldValue([kind, "apikey"], "");
             setEditedKeys((value) => ({ ...value, [kind]: true }));
             setVisibleKeys((value) => ({ ...value, [kind]: false }));
           }
         });
+        saveDraft();
       }}>
       {!initial && <Form.Item name="namespace" label="知识库标识（Namespace）" rules={[
         { required: true, message: "请输入知识库标识" }, { pattern: namespacePattern, message: "使用字母、数字、点、下划线或横线，首位为字母或数字" },
@@ -192,12 +266,19 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
           </div>
           {kind === "vlm"
             ? <Form.Item name="vlm_model" label={title + " 模型"} rules={enabled ? [{ required: true, whitespace: true, message: "请输入 VLM 模型名称" }] : []}>
-                <Input disabled={locked || !enabled} maxLength={512} autoComplete="off" placeholder="例如 qwen2.5-vl-7b" />
+                <Input disabled={locked || !enabled} maxLength={512} autoComplete="off" placeholder="例如 qwen2.5-vl-7b，可直接输入" />
               </Form.Item>
-            : <Form.Item name={kind + "_model"} label={title + " 模型"} rules={enabled ? [{ required: true, message: "请选择模型" }] : []}>
-                <Select showSearch virtual={false} disabled={locked || !enabled} loading={loading[kind]}
-                  options={models[kind].map((value) => ({ value, label: value }))}
-                  onOpenChange={(open) => { if (open) void loadModels(kind); }} />
+            : <Form.Item name={kind + "_model"} label={title + " 模型"}
+                rules={enabled ? [{ required: true, whitespace: true, message: "请输入或选择模型" }] : []}
+                extra={enabled && modelHints[kind] ? modelHints[kind] : undefined}>
+                <AutoComplete
+                  disabled={locked || !enabled}
+                  options={models[kind].map((value) => ({ value }))}
+                  placeholder={loading[kind] ? "正在获取模型列表…" : "选择或手动输入模型名称"}
+                  allowClear
+                  onFocus={() => { if (enabled) void loadModels(kind); }}
+                  filterOption={(input, option) => String(option?.value ?? "").toLowerCase().includes(input.toLowerCase())}
+                />
               </Form.Item>}
         </section>;
       })}

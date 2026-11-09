@@ -28,8 +28,13 @@ import (
 const DefaultTimeout = 60.0
 
 // ModelAPIError is a safe, user-facing model service error without credentials
-// or payloads. It mirrors rag_mcp.model_api.ModelAPIError.
-type ModelAPIError struct{ Message string }
+// or payloads. It mirrors rag_mcp.model_api.ModelAPIError. Status carries the
+// provider HTTP status when one was received (0 for local failures), so callers
+// can treat "no /models route" differently from a real fault.
+type ModelAPIError struct {
+	Message string
+	Status  int
+}
 
 func (e *ModelAPIError) Error() string { return e.Message }
 
@@ -161,7 +166,10 @@ func (c *ModelHTTPClient) Request(ctx context.Context, endpoint string, body map
 		case http.StatusTooManyRequests:
 			detail = "请求过于频繁或额度不足，请稍后重试"
 		}
-		return nil, modelError(fmt.Sprintf("HTTP %d：%s", response.StatusCode, detail))
+		return nil, &ModelAPIError{
+			Message: fmt.Sprintf("HTTP %d：%s", response.StatusCode, detail),
+			Status:  response.StatusCode,
+		}
 	}
 
 	raw, err := io.ReadAll(response.Body)

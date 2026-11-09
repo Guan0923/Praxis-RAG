@@ -135,3 +135,34 @@ func TestModelsForCurrentSettingsError(t *testing.T) {
 		t.Errorf("corrupt current settings error = %v", err)
 	}
 }
+func TestModelsForToleratesMissingModelEndpoint(t *testing.T) {
+	factory := func(modelapi.ModelConnection) ModelLister {
+		return staticErrLister{err: &modelapi.ModelAPIError{
+			Message: "HTTP 404：接口或模型不存在，请检查地址和模型名称", Status: 404,
+		}}
+	}
+	models, err := ModelsFor(context.Background(), "reranker", nil, map[string]any{
+		"base_url": "http://host:8080",
+	}, factory)
+	if err != nil {
+		t.Fatalf("ModelsFor() error = %v, want a tolerant empty list", err)
+	}
+	if len(models) != 0 {
+		t.Fatalf("models = %v, want empty", models)
+	}
+
+	factory = func(modelapi.ModelConnection) ModelLister {
+		return staticErrLister{err: &modelapi.ModelAPIError{
+			Message: "HTTP 401：认证失败，请检查 apikey", Status: 401,
+		}}
+	}
+	if _, err := ModelsFor(context.Background(), "reranker", nil, map[string]any{
+		"base_url": "http://host:8080",
+	}, factory); err == nil {
+		t.Fatalf("a 401 must still surface as an error")
+	}
+}
+
+type staticErrLister struct{ err error }
+
+func (l staticErrLister) Models(context.Context) ([]string, error) { return nil, l.err }
