@@ -99,7 +99,7 @@ func run() error {
 		return configError(err)
 	}
 	if !mqSettings.Configured() {
-		return usagef("RAG_ROCKETMQ_ENDPOINT is required to run the search worker")
+		return usagef("RAG_KAFKA_BOOTSTRAP_SERVERS is required to run the search worker")
 	}
 	maxAttempts, err := positiveIntEnv("RAG_SEARCH_MAX_ATTEMPTS", defaultMaxAttempts)
 	if err != nil {
@@ -138,7 +138,7 @@ func run() error {
 
 	consumerConfig := mq.DefaultConsumerConfig(mqSettings.SearchTopic, mqSettings.SearchGroup)
 	consumerConfig.MaxAttempts = maxAttempts
-	consumer, err := mq.NewRocketMQPullConsumer(mqSettings, consumerConfig, worker.MessageHandler())
+	consumer, err := mq.NewKafkaPullConsumer(mqSettings, consumerConfig, worker.MessageHandler())
 	if err != nil {
 		return err
 	}

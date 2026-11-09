@@ -67,6 +67,9 @@ func TestDocumentPipelineEndToEnd(t *testing.T) {
 		current, readErr := h.Stores.DocumentJobs.Get(context.Background(), artifactID, nil)
 		return readErr == nil && current != nil && current.Status == state.DocumentJobSucceeded
 	})
+	// The durable job becomes succeeded inside Handle; the commit/ack happens
+	// right after it returns, so wait for the delivery to be acknowledged too.
+	waitFor(t, 5*time.Second, "document delivery acked", func() bool { return transport.ackCount() == 1 })
 	cancel()
 	select {
 	case runErr := <-done:

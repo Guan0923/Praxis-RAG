@@ -62,6 +62,7 @@ func TestDocumentDeadLetterExhaustion(t *testing.T) {
 		current, readErr := h.Stores.DocumentJobs.Get(context.Background(), artifactID, nil)
 		return readErr == nil && current != nil && current.Status == state.DocumentJobFailed
 	})
+	waitFor(t, 5*time.Second, "document dead-letter committed", func() bool { return transport.ackCount() == 1 })
 	cancel()
 	select {
 	case runErr := <-done:
@@ -142,6 +143,7 @@ func TestSearchDeadLetterExhaustion(t *testing.T) {
 		terminal, terminalErr := h.Stores.SearchTasks.Terminal(context.Background(), resultID)
 		return terminalErr == nil && terminal
 	})
+	waitFor(t, 5*time.Second, "search dead-letter committed", func() bool { return transport.ackCount() == 1 })
 	cancel()
 	select {
 	case runErr := <-done:

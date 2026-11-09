@@ -89,6 +89,9 @@ func TestSearchPipelineEndToEnd(t *testing.T) {
 		view, readErr := h.Stores.SearchTasks.Get(context.Background(), "alpha", resultID, 1, 10)
 		return readErr == nil && view != nil && view.Status == state.SearchTaskSucceeded
 	})
+	// The durable task becomes terminal inside Handle; the commit happens right
+	// after it returns, so wait for the delivery to be acknowledged too.
+	waitFor(t, 5*time.Second, "search delivery acked", func() bool { return transport.ackCount() == 1 })
 	cancel()
 	select {
 	case runErr := <-done:

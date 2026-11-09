@@ -1,9 +1,9 @@
-// Package mq is the RocketMQ transport for the G7 async pipeline. It adapts the
-// official Go client (apache/rocketmq-clients/golang/v5) to the narrow publisher
-// and consumer seams used by internal/state and the future worker binaries.
+// Package mq is the Kafka transport for the G7 async pipeline. It adapts
+// github.com/segmentio/kafka-go to the narrow publisher and consumer seams used
+// by internal/state and the worker binaries.
 //
 // There is no broker in CI: the adapters are unit-tested through fake transports
-// and the SDK-backed transports are only constructed when an endpoint is
+// and the SDK-backed transports are only constructed when bootstrap servers are
 // configured.
 package mq
 
@@ -15,19 +15,35 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
-// Defaults mirror the Python queue settings.
+// Defaults mirror the shared Kafka queue contract (RAG_KAFKA_* + the queue
+// topic/group envs). They are kept exported for workers, tests, and docs.
 const (
-	DefaultSearchTopic       = "praxis_search"
-	DefaultSearchGroup       = "praxis_search_workers"
+	DefaultClientID         = "praxis-rag"
+	DefaultSecurityProtocol = "PLAINTEXT"
+
+	DefaultCacheTopic = "praxis_state_cache_refresh"
+	DefaultCacheGroup = "praxis_state_cache_refresh_workers"
+
+	DefaultDocumentTopic = "praxis_document_ingest"
+	DefaultDocumentGroup = "praxis_document_ingest_workers"
+
+	DefaultSearchTopic = "praxis_search"
+	DefaultSearchGroup = "praxis_search_workers"
+
+	DefaultDocumentDLQTopic = "praxis_document_ingest_dead_letters"
+	DefaultSearchDLQTopic   = "praxis_search_dead_letters"
+
 	DefaultPublishTimeout    = 10 * time.Second
 	DefaultVisibilityTimeout = 60 * time.Second
 	DefaultAwaitDuration     = 5 * time.Second
 	DefaultBatchSize         = int32(16)
 	DefaultPollInterval      = 500 * time.Millisecond
+	DefaultRetryBaseDelay    = 100 * time.Millisecond
+	DefaultRetryMaxDelay     = 5 * time.Second
 )
 
-// ConfigError is a validation failure in mq-level settings (the document and
-// cache settings reuse state's Python-equivalent validation).
+// ConfigError is a validation failure in mq-level settings (Kafka bootstrap,
+// security, topic/group separation) or a hand-built ConsumerConfig.
 type ConfigError struct{ Message string }
 
 // Error implements error.
@@ -35,62 +51,159 @@ func (e *ConfigError) Error() string { return e.Message }
 
 func newConfigError(message string) *ConfigError { return &ConfigError{Message: message} }
 
-// Settings is the resolved RocketMQ configuration for one process.
+// Settings is the resolved Kafka configuration for one process.
 type Settings struct {
-	Endpoint  string
-	Namespace string
-	TLS       bool
-	AccessKey string
-	SecretKey string
+	BootstrapServers []string
+	ClientID         string
+	SecurityProtocol string
+	SASLMechanism    string
+	SASLUsername     string
+	SASLPassword     string
+	TLSCA            string
+	TLSInsecure      bool
+
+	CacheTopic string
+	CacheGroup string
 
 	DocumentTopic string
 	DocumentGroup string
-	SearchTopic   string
-	SearchGroup   string
 
-	PublishTimeout    time.Duration
-	VisibilityTimeout time.Duration
-	AwaitDuration     time.Duration
+	SearchTopic string
+	SearchGroup string
+
+	DocumentDLQTopic string
+	SearchDLQTopic   string
+
+	PublishTimeout time.Duration
 }
 
-// SettingsFromEnv resolves the queue settings with the same validation and
-// messages as the Python cache/document/search queue settings. Cache and
-// document validation is reused from internal/state; only the search queue
-// separation is defined here (matching rag_mcp.state.search_queue).
+// SettingsFromEnv resolves the Kafka queue settings from the shared env contract.
+// The broker/security/topic values come from internal/state (BrokerSettings and
+// DocumentQueueSettings) so producer, consumer, and state agree; the search and
+// DLQ topics/groups plus the publish timeout are mq-level settings.
 func SettingsFromEnv() (Settings, error) {
-	cache := state.RocketMQSettingsFromEnv()
+	broker := state.BrokerSettingsFromEnv()
 	document, err := state.DocumentQueueSettingsFromEnv()
 	if err != nil {
 		return Settings{}, err
 	}
+	publishTimeout, err := durationEnv("RAG_KAFKA_PUBLISH_TIMEOUT_SECONDS", DefaultPublishTimeout)
+	if err != nil {
+		return Settings{}, err
+	}
 	settings := Settings{
-		Endpoint:      cache.Endpoint,
-		Namespace:     cache.Namespace,
-		TLS:           cache.TLS,
-		AccessKey:     cache.AccessKey,
-		SecretKey:     cache.SecretKey,
-		DocumentTopic: document.Topic,
-		DocumentGroup: document.Group,
-		SearchTopic:   strings.TrimSpace(envOrDefault("RAG_SEARCH_TOPIC", DefaultSearchTopic)),
-		SearchGroup:   strings.TrimSpace(envOrDefault("RAG_SEARCH_GROUP", DefaultSearchGroup)),
+		BootstrapServers: splitBootstrapServers(broker.BootstrapServers),
+		ClientID:         strings.TrimSpace(broker.ClientID),
+		SecurityProtocol: strings.TrimSpace(broker.SecurityProtocol),
+		SASLMechanism:    strings.TrimSpace(broker.SASLMechanism),
+		SASLUsername:     broker.SASLUsername,
+		SASLPassword:     broker.SASLPassword,
+		TLSCA:            strings.TrimSpace(broker.TLSCA),
+		TLSInsecure:      broker.TLSInsecure,
+		CacheTopic:       broker.CacheTopic,
+		CacheGroup:       broker.CacheGroup,
+		DocumentTopic:    document.Topic,
+		DocumentGroup:    document.Group,
+		SearchTopic:      strings.TrimSpace(envOrDefault("RAG_SEARCH_TOPIC", DefaultSearchTopic)),
+		SearchGroup:      strings.TrimSpace(envOrDefault("RAG_SEARCH_GROUP", DefaultSearchGroup)),
+		DocumentDLQTopic: strings.TrimSpace(envOrDefault("RAG_DOCUMENT_DLQ_TOPIC", DefaultDocumentDLQTopic)),
+		SearchDLQTopic:   strings.TrimSpace(envOrDefault("RAG_SEARCH_DLQ_TOPIC", DefaultSearchDLQTopic)),
+		PublishTimeout:   publishTimeout,
 	}
-	if settings.SearchTopic == "" || settings.SearchGroup == "" {
-		return Settings{}, newConfigError("Search topic and consumer group must not be empty")
+	if settings.ClientID == "" {
+		settings.ClientID = DefaultClientID
 	}
-	if settings.SearchTopic == cache.Topic || settings.SearchTopic == document.Topic ||
-		settings.SearchGroup == cache.Group || settings.SearchGroup == document.Group {
-		return Settings{}, newConfigError("Search topic/group must be separate from cache and document queues")
+	if settings.SecurityProtocol == "" {
+		settings.SecurityProtocol = DefaultSecurityProtocol
 	}
-	if settings.PublishTimeout, err = durationEnv("RAG_ROCKETMQ_PUBLISH_TIMEOUT_SECONDS", DefaultPublishTimeout); err != nil {
-		return Settings{}, err
-	}
-	if settings.VisibilityTimeout, err = durationEnv("RAG_ROCKETMQ_VISIBILITY_SECONDS", DefaultVisibilityTimeout); err != nil {
-		return Settings{}, err
-	}
-	if settings.AwaitDuration, err = durationEnv("RAG_ROCKETMQ_AWAIT_SECONDS", DefaultAwaitDuration); err != nil {
+	if err := settings.Validate(); err != nil {
 		return Settings{}, err
 	}
 	return settings, nil
+}
+
+// splitBootstrapServers parses the comma-separated bootstrap list.
+func splitBootstrapServers(raw string) []string {
+	servers := make([]string, 0, 2)
+	for _, item := range strings.Split(raw, ",") {
+		trimmed := strings.TrimSpace(item)
+		if trimmed != "" {
+			servers = append(servers, trimmed)
+		}
+	}
+	return servers
+}
+
+// Configured reports whether Kafka bootstrap servers are set. An empty list
+// means brokerless (the service runs fail-closed until a broker is configured).
+func (s Settings) Configured() bool { return len(s.BootstrapServers) > 0 }
+
+// Validate re-checks the Kafka settings a hand-built value can get wrong.
+// Broker absence is reported later as ErrNotConfigured so the state layer can run
+// without a broker; zero durations fall back to defaults in the constructors.
+func (s Settings) Validate() error {
+	if err := validateSecurity(s); err != nil {
+		return err
+	}
+	if strings.TrimSpace(s.DocumentTopic) == "" || strings.TrimSpace(s.DocumentGroup) == "" {
+		return newConfigError("Document topic and consumer group must not be empty")
+	}
+	if strings.TrimSpace(s.SearchTopic) == "" || strings.TrimSpace(s.SearchGroup) == "" {
+		return newConfigError("Search topic and consumer group must not be empty")
+	}
+	if s.SearchTopic == s.DocumentTopic || s.SearchGroup == s.DocumentGroup {
+		return newConfigError("Search topic/group must be separate from the cache and document queues")
+	}
+	if s.CacheTopic != "" || s.CacheGroup != "" {
+		if s.CacheTopic == s.DocumentTopic || s.CacheTopic == s.SearchTopic ||
+			s.CacheGroup == s.DocumentGroup || s.CacheGroup == s.SearchGroup {
+			return newConfigError("Cache topic/group must be separate from the document and search queues")
+		}
+	}
+	if s.DocumentDLQTopic != "" {
+		if s.DocumentDLQTopic == s.DocumentTopic || s.DocumentDLQTopic == s.SearchTopic ||
+			s.DocumentDLQTopic == s.CacheTopic {
+			return newConfigError("Document dead-letter topic must be separate from the business topics")
+		}
+	}
+	if s.SearchDLQTopic != "" {
+		if s.SearchDLQTopic == s.DocumentTopic || s.SearchDLQTopic == s.SearchTopic ||
+			s.SearchDLQTopic == s.CacheTopic || s.SearchDLQTopic == s.DocumentDLQTopic {
+			return newConfigError("Search dead-letter topic must be separate from the business topics")
+		}
+	}
+	return nil
+}
+
+// validateSecurity checks the Kafka security protocol/SASL/topic settings that a
+// hand-built Settings value can get wrong.
+func validateSecurity(settings Settings) error {
+	switch strings.ToUpper(strings.TrimSpace(settings.SecurityProtocol)) {
+	case "", "PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL":
+	default:
+		return newConfigError("RAG_KAFKA_SECURITY_PROTOCOL must be PLAINTEXT, SSL, SASL_PLAINTEXT or SASL_SSL")
+	}
+	switch strings.ToUpper(strings.TrimSpace(settings.SASLMechanism)) {
+	case "", "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512":
+	default:
+		return newConfigError("RAG_KAFKA_SASL_MECHANISM must be PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512")
+	}
+	return nil
+}
+
+// DLQTopicFor maps a business topic to its configured dead-letter topic; an
+// unknown topic returns "" (no dead-lettering).
+func (s Settings) DLQTopicFor(topic string) string {
+	switch strings.TrimSpace(topic) {
+	case "":
+		return ""
+	case s.DocumentTopic:
+		return s.DocumentDLQTopic
+	case s.SearchTopic:
+		return s.SearchDLQTopic
+	default:
+		return ""
+	}
 }
 
 func envOrDefault(name, fallback string) string {
@@ -110,24 +223,4 @@ func durationEnv(name string, fallback time.Duration) (time.Duration, error) {
 		return 0, newConfigError(name + " must be positive")
 	}
 	return time.Duration(seconds * float64(time.Second)), nil
-}
-
-// Configured reports whether a broker endpoint is set.
-func (s Settings) Configured() bool { return strings.TrimSpace(s.Endpoint) != "" }
-
-// Validate re-checks the settings that a hand-built Settings value can get
-// wrong. Endpoint absence is reported later as ErrNotConfigured so callers can
-// run the state layer without a broker; zero durations fall back to defaults in
-// the publisher/consumer constructors.
-func (s Settings) Validate() error {
-	if strings.TrimSpace(s.DocumentTopic) == "" || strings.TrimSpace(s.DocumentGroup) == "" {
-		return newConfigError("Document topic and consumer group must not be empty")
-	}
-	if strings.TrimSpace(s.SearchTopic) == "" || strings.TrimSpace(s.SearchGroup) == "" {
-		return newConfigError("Search topic and consumer group must not be empty")
-	}
-	if s.SearchTopic == s.DocumentTopic || s.SearchGroup == s.DocumentGroup {
-		return newConfigError("Search topic/group must be separate from cache and document queues")
-	}
-	return nil
 }

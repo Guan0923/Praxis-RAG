@@ -7,7 +7,7 @@ import (
 )
 
 // ReceivedMessage is one delivered payload plus the opaque transport handle used
-// for ack/nack. Workers only need Body/Topic/Key/DeliveryAttempt.
+// for ack/commit. Workers only need Body/Topic/Key/DeliveryAttempt.
 type ReceivedMessage struct {
 	Topic           string
 	MessageID       string
@@ -18,6 +18,9 @@ type ReceivedMessage struct {
 }
 
 // PullTransport is the SDK seam for consumers (fakes implement it in tests).
+//
+// Ack commits the record; ChangeInvisibleDuration is retained for seam
+// compatibility but Kafka consumers retry in-process without committing.
 type PullTransport interface {
 	Start() error
 	Stop() error
@@ -26,9 +29,9 @@ type PullTransport interface {
 	ChangeInvisibleDuration(ctx context.Context, message ReceivedMessage, invisibleDuration time.Duration) error
 }
 
-// Handler consumes one message. Returning true acknowledges it; false is a
-// nack (the visibility timeout makes it redeliverable, or OnExhausted decides
-// after MaxAttempts deliveries).
+// Handler consumes one message. Returning true acknowledges it (Kafka commit);
+// false triggers an in-process retry of the same record with exponential
+// backoff, and after MaxAttempts deliveries the consumer dead-letters it.
 type Handler func(ctx context.Context, message ReceivedMessage) bool
 
 // Consumer is the worker-facing lifecycle seam.
@@ -37,7 +40,15 @@ type Consumer interface {
 	Stop() error
 }
 
-// ConsumerConfig is the simple-pull consumer configuration.
+// RawPublisher publishes raw payloads to a Kafka topic (dead letters).
+type RawPublisher interface {
+	Publish(ctx context.Context, topic, key string, body []byte) error
+	Close() error
+}
+
+// ConsumerConfig is the Kafka consumer configuration. BatchSize, VisibilityTimeout
+// and AwaitDuration are kept for the shared transport/worker contract; a Kafka
+// reader fetches one record at a time and retries in-process.
 type ConsumerConfig struct {
 	Topic             string
 	Group             string
@@ -45,11 +56,17 @@ type ConsumerConfig struct {
 	VisibilityTimeout time.Duration
 	AwaitDuration     time.Duration
 	PollInterval      time.Duration
-	// MaxAttempts > 0 sends exhausted messages to OnExhausted and acks them.
+	// MaxAttempts > 0 bounds in-process redeliveries; the record is published to
+	// DLQTopic (when configured), OnExhausted runs, and only then is it committed.
 	MaxAttempts int
+	// DLQTopic receives the raw payload on exhaustion; empty disables publishing.
+	DLQTopic string
+	// RetryBaseDelay/RetryMaxDelay shape the exponential in-process backoff.
+	RetryBaseDelay time.Duration
+	RetryMaxDelay  time.Duration
 }
 
-// DefaultConsumerConfig returns the Python SDK-compatible pull defaults.
+// DefaultConsumerConfig returns the Python SDK-compatible defaults.
 func DefaultConsumerConfig(topic, group string) ConsumerConfig {
 	return ConsumerConfig{
 		Topic:             topic,
@@ -58,6 +75,8 @@ func DefaultConsumerConfig(topic, group string) ConsumerConfig {
 		VisibilityTimeout: DefaultVisibilityTimeout,
 		AwaitDuration:     DefaultAwaitDuration,
 		PollInterval:      DefaultPollInterval,
+		RetryBaseDelay:    DefaultRetryBaseDelay,
+		RetryMaxDelay:     DefaultRetryMaxDelay,
 	}
 }
 
@@ -72,18 +91,30 @@ func (c ConsumerConfig) Validate() error {
 	if c.VisibilityTimeout <= 0 {
 		return newConfigError("Consumer visibility timeout must be positive")
 	}
+	if c.MaxAttempts < 0 {
+		return newConfigError("Consumer max attempts must not be negative")
+	}
+	if c.RetryBaseDelay < 0 || c.RetryMaxDelay < 0 {
+		return newConfigError("Consumer retry delays must not be negative")
+	}
 	return nil
 }
 
-// PullConsumer is the framework-light simple-pull loop used by the future
-// worker binaries. It never interprets payloads: the handler gets raw bytes.
+// PullConsumer is the framework-light consumer loop used by the worker binaries.
+// It never interprets payloads: the handler gets raw bytes.
+//
+// Semantics (Kafka): handler true => commit; handler false => retry the same
+// record in-process with exponential backoff without committing; after
+// MaxAttempts the raw body is published to DLQTopic (when set), OnExhausted runs,
+// and the record is committed so the group advances.
 type PullConsumer struct {
 	Config    ConsumerConfig
 	transport PullTransport
 	handler   Handler
-	// OnExhausted runs before a message at MaxAttempts is acked (dead letter
-	// bookkeeping); an error is recorded but still acks to stop redelivery.
+	// OnExhausted runs after the DLQ publish and before the commit.
 	OnExhausted func(ctx context.Context, message ReceivedMessage) error
+	// DLQ publishes exhausted raw payloads; nil (or empty DLQTopic) skips it.
+	DLQ RawPublisher
 
 	mutex   sync.Mutex
 	started bool
@@ -92,6 +123,8 @@ type PullConsumer struct {
 	doneCh  chan struct{}
 	cancel  context.CancelFunc
 	lastErr error
+
+	dlqOnce sync.Once
 }
 
 var _ Consumer = (*PullConsumer)(nil)
@@ -101,11 +134,17 @@ func NewPullConsumer(config ConsumerConfig, transport PullTransport, handler Han
 	return &PullConsumer{Config: config, transport: transport, handler: handler}
 }
 
-// NewRocketMQPullConsumer builds the SDK-backed consumer. A missing endpoint is
-// reported as ErrNotConfigured.
-func NewRocketMQPullConsumer(settings Settings, config ConsumerConfig, handler Handler) (*PullConsumer, error) {
+// NewKafkaPullConsumer builds the kafka-go-backed consumer. A missing bootstrap
+// list is reported as ErrNotConfigured.
+func NewKafkaPullConsumer(settings Settings, config ConsumerConfig, handler Handler) (*PullConsumer, error) {
 	if !settings.Configured() {
 		return nil, newSafeError(ErrNotConfigured, "consumer", nil)
+	}
+	if err := settings.Validate(); err != nil {
+		return nil, err
+	}
+	if config.DLQTopic == "" {
+		config.DLQTopic = settings.DLQTopicFor(config.Topic)
 	}
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -114,7 +153,16 @@ func NewRocketMQPullConsumer(settings Settings, config ConsumerConfig, handler H
 	if err != nil {
 		return nil, newSafeError(ErrConsumerFailed, "consumer start", err)
 	}
-	return NewPullConsumer(config, transport, handler), nil
+	consumer := NewPullConsumer(config, transport, handler)
+	if config.DLQTopic != "" {
+		raw, err := newSDKRawPublisher(settings, config.DLQTopic)
+		if err != nil {
+			_ = transport.Stop()
+			return nil, newSafeError(ErrConsumerFailed, "consumer start", err)
+		}
+		consumer.DLQ = raw
+	}
+	return consumer, nil
 }
 
 // Start validates, starts the transport and launches the pull loop.
@@ -152,7 +200,7 @@ func (c *PullConsumer) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop stops the loop and closes the transport exactly once.
+// Stop stops the loop and closes the transport/DLQ publisher exactly once.
 func (c *PullConsumer) Stop() error {
 	c.mutex.Lock()
 	if c.stopped {
@@ -172,16 +220,21 @@ func (c *PullConsumer) Stop() error {
 	if doneCh != nil {
 		<-doneCh
 	}
-	if !started || c.transport == nil {
-		return nil
+	var firstErr error
+	if c.transport != nil {
+		if err := c.transport.Stop(); err != nil {
+			firstErr = newSafeError(ErrConsumerFailed, "consumer stop", err)
+		}
 	}
-	if err := c.transport.Stop(); err != nil {
-		return newSafeError(ErrConsumerFailed, "consumer stop", err)
-	}
-	return nil
+	c.dlqOnce.Do(func() {
+		if c.DLQ != nil {
+			_ = c.DLQ.Close()
+		}
+	})
+	return firstErr
 }
 
-// LastError returns the sanitized last receive error (nil after success).
+// LastError returns the sanitized last error (nil after success).
 func (c *PullConsumer) LastError() error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
@@ -214,28 +267,87 @@ func (c *PullConsumer) loop(ctx context.Context) {
 			continue
 		}
 		for _, message := range messages {
-			select {
-			case <-ctx.Done():
+			if !c.process(ctx, message) {
 				return
-			default:
 			}
-			acked := c.handler(ctx, message)
-			if acked {
-				_ = c.transport.Ack(ctx, message)
-				continue
-			}
-			if c.Config.MaxAttempts > 0 && message.DeliveryAttempt >= c.Config.MaxAttempts {
-				if c.OnExhausted != nil {
-					if exhaustedErr := c.OnExhausted(ctx, message); exhaustedErr != nil {
-						c.setLastError(newSafeError(ErrConsumerFailed, "consumer exhausted", exhaustedErr))
-					}
-				}
-				_ = c.transport.Ack(ctx, message)
-				continue
-			}
-			// Nack: extend the invisibility window; the broker redelivers it.
-			_ = c.transport.ChangeInvisibleDuration(ctx, message, c.Config.VisibilityTimeout)
 		}
+	}
+}
+
+// process runs one delivery through handler until it ackes, exhausts, or the
+// context is cancelled. It returns false when the loop must stop.
+func (c *PullConsumer) process(ctx context.Context, message ReceivedMessage) bool {
+	for attempt := 1; ; attempt++ {
+		message.DeliveryAttempt = attempt
+		if c.handler(ctx, message) {
+			if err := c.transport.Ack(ctx, message); err != nil {
+				c.setLastError(newSafeError(ErrConsumerFailed, "consumer commit", err))
+			}
+			return true
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		if c.Config.MaxAttempts > 0 && attempt >= c.Config.MaxAttempts {
+			c.deadLetter(ctx, message)
+			if err := c.transport.Ack(ctx, message); err != nil {
+				c.setLastError(newSafeError(ErrConsumerFailed, "consumer commit", err))
+			}
+			return true
+		}
+		if !c.retryDelay(ctx, attempt) {
+			return false
+		}
+	}
+}
+
+// deadLetter publishes the raw payload (when a DLQ topic is configured) and runs
+// the OnExhausted bookkeeping before the offset is committed.
+func (c *PullConsumer) deadLetter(ctx context.Context, message ReceivedMessage) {
+	if c.Config.DLQTopic != "" && c.DLQ != nil {
+		publishContext, cancel := context.WithTimeout(ctx, DefaultPublishTimeout)
+		err := c.DLQ.Publish(publishContext, c.Config.DLQTopic, message.Key, message.Body)
+		cancel()
+		if err != nil {
+			c.setLastError(newSafeError(ErrPublishFailed, "consumer dead-letter", err))
+		}
+	}
+	if c.OnExhausted != nil {
+		if err := c.OnExhausted(ctx, message); err != nil {
+			c.setLastError(newSafeError(ErrConsumerFailed, "consumer exhausted", err))
+		}
+	}
+}
+
+// retryDelay waits the exponential backoff before redelivering the same record
+// in-process. It returns false when the context is cancelled.
+func (c *PullConsumer) retryDelay(ctx context.Context, attempt int) bool {
+	base := c.Config.RetryBaseDelay
+	if base <= 0 {
+		base = DefaultRetryBaseDelay
+	}
+	maxDelay := c.Config.RetryMaxDelay
+	if maxDelay <= 0 {
+		maxDelay = DefaultRetryMaxDelay
+	}
+	delay := base
+	for step := 1; step < attempt; step++ {
+		if delay >= maxDelay {
+			delay = maxDelay
+			break
+		}
+		delay *= 2
+	}
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

@@ -8,12 +8,12 @@
 //
 //	rag-dead-letter-worker --kind search|document
 //
-// The consumer listens on the broker's physical dead-letter topic
-// (%DLQ%<source consumer group>) with an independent dead-letter group. It acks
-// only after the durable terminal outcome is saved (or the task is already
-// absent/terminal); a live lease or an uncommitted journal publication returns
-// false so the broker redelivers the message. Malformed dead-letter payloads are
-// logged by safe category and left unacked, matching the Python worker.
+// The consumer listens on an explicit Kafka dead-letter topic
+// (RAG_DOCUMENT_DLQ_TOPIC / RAG_SEARCH_DLQ_TOPIC) with an independent
+// RAG_*_DLQ_GROUP. It acks only after the durable terminal outcome is saved (or
+// the task is already absent/terminal); a live lease or an uncommitted journal
+// publication returns false so the record stays uncommitted and is redelivered.
+// Malformed dead-letter payloads are logged by safe category and left unacked.
 package main
 
 import (
@@ -47,8 +47,8 @@ const (
 	shutdownTimeout = 10 * time.Second
 )
 
-// deadLetterGroupPattern mirrors the Python group validation.
-var deadLetterGroupPattern = regexp.MustCompile(`^[%A-Za-z0-9_-]+$`)
+// deadLetterGroupPattern is the Kafka consumer-group character set.
+var deadLetterGroupPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // usageError marks configuration/usage failures so main can exit 2.
 type usageError struct{ err error }
@@ -100,14 +100,14 @@ func run(args []string) error {
 	if err != nil {
 		return configError(err)
 	}
-	// Python validates the dead-letter consumer groups before the endpoint
-	// requirement, so a misconfigured group is reported first.
+	// Validate the dead-letter consumer groups before the bootstrap requirement,
+	// so a misconfigured group is reported first.
 	target, err := deadLetterTarget(kind, mqSettings)
 	if err != nil {
 		return err
 	}
 	if !mqSettings.Configured() {
-		return usagef("RAG_ROCKETMQ_ENDPOINT is required to run the dead-letter worker")
+		return usagef("RAG_KAFKA_BOOTSTRAP_SERVERS is required to run the dead-letter worker")
 	}
 
 	stores, err := state.New(stateSettings, stateSettings.AutoSchema)
@@ -148,7 +148,7 @@ func run(args []string) error {
 	// Never ack exhausted deliveries here: a dead letter that cannot be
 	// recorded yet (live lease, transient storage error) must stay retryable.
 	consumerConfig.MaxAttempts = 0
-	consumer, err := mq.NewRocketMQPullConsumer(mqSettings, consumerConfig, handler)
+	consumer, err := mq.NewKafkaPullConsumer(mqSettings, consumerConfig, handler)
 	if err != nil {
 		return err
 	}
@@ -207,24 +207,31 @@ func deadLetterTarget(kind string, settings mq.Settings) (consumerTarget, error)
 		"document": settings.DocumentGroup,
 		"search":   settings.SearchGroup,
 	}
+	topics := map[string]string{
+		"document": settings.DocumentDLQTopic,
+		"search":   settings.SearchDLQTopic,
+	}
 	groups := make(map[string]string, len(sources))
 	for _, name := range []string{"document", "search"} {
-		groups[name] = strings.TrimSpace(envOr("RAG_"+strings.ToUpper(name)+"_DLQ_GROUP", "praxis_"+name+"_dead_letters"))
+		groups[name] = strings.TrimSpace(envOr("RAG_"+strings.ToUpper(name)+"_DLQ_GROUP", defaultDeadLetterGroup(name)))
 	}
 	source, ok := sources[kind]
 	if !ok {
 		return consumerTarget{}, usagef(`--kind is required and must be "search" or "document"`)
 	}
-	cache := state.RocketMQSettingsFromEnv()
-	reserved := map[string]struct{}{
-		settings.DocumentGroup: {},
-		settings.SearchGroup:   {},
-		cache.Group:            {},
+	topic := strings.TrimSpace(topics[kind])
+	if topic == "" {
+		return consumerTarget{}, usagef("RAG_%s_DLQ_TOPIC must not be empty", strings.ToUpper(kind))
 	}
 	if !deadLetterGroupPattern.MatchString(groups["document"]) ||
 		!deadLetterGroupPattern.MatchString(groups["search"]) ||
 		groups["document"] == groups["search"] {
 		return consumerTarget{}, usagef("Dead-letter consumer groups must be valid, independent groups")
+	}
+	reserved := map[string]struct{}{
+		settings.DocumentGroup: {},
+		settings.SearchGroup:   {},
+		settings.CacheGroup:    {},
 	}
 	for _, group := range groups {
 		if _, clash := reserved[group]; clash {
@@ -234,13 +241,18 @@ func deadLetterTarget(kind string, settings mq.Settings) (consumerTarget, error)
 	if !deadLetterGroupPattern.MatchString(source) {
 		return consumerTarget{}, usagef("Invalid dead-letter source consumer group")
 	}
-	topic := "%DLQ%" + source
-	if override := strings.TrimSpace(os.Getenv("RAG_" + strings.ToUpper(kind) + "_DLQ_TOPIC")); override != "" {
-		topic = override
-	}
 	return consumerTarget{topic: topic, group: groups[kind], sourceGroup: source}, nil
 }
 
+// defaultDeadLetterGroup mirrors the shared contract defaults.
+func defaultDeadLetterGroup(kind string) string {
+	switch kind {
+	case "document":
+		return "praxis_document_dead_letters"
+	default:
+		return "praxis_search_dead_letters"
+	}
+}
 func dataRootFromEnv() (string, error) {
 	raw := strings.TrimSpace(os.Getenv("RAG_SERVICE_DATA_ROOT"))
 	if raw == "" {

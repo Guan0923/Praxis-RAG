@@ -4,7 +4,7 @@
 // records retryable or terminal failures.
 //
 // Two modes are supported:
-//   - broker mode (default; RAG_ROCKETMQ_ENDPOINT set): pull the document topic
+//   - broker mode (default; RAG_KAFKA_BOOTSTRAP_SERVERS set): pull the document topic
 //     with the document consumer group;
 //   - single-process outbox mode (RAG_DOCUMENT_WORKER_LOCAL=1, no endpoint): poll
 //     the committed document_job_outbox rows directly, for development and
@@ -116,7 +116,7 @@ func run() error {
 	}
 	localMode := isTruthy(os.Getenv("RAG_DOCUMENT_WORKER_LOCAL"))
 	if !mqSettings.Configured() && !localMode {
-		return usagef("RAG_ROCKETMQ_ENDPOINT is required unless RAG_DOCUMENT_WORKER_LOCAL=1 selects the single-process outbox mode")
+		return usagef("RAG_KAFKA_BOOTSTRAP_SERVERS is required unless RAG_DOCUMENT_WORKER_LOCAL=1 selects the single-process outbox mode")
 	}
 
 	stores, err := state.New(stateSettings, stateSettings.AutoSchema)
@@ -126,7 +126,7 @@ func run() error {
 	defer func() { _ = stores.Close() }()
 	logger := newLogger()
 	if mqSettings.Configured() && localMode {
-		logger.Warn("RAG_DOCUMENT_WORKER_LOCAL is ignored because RAG_ROCKETMQ_ENDPOINT is configured; using broker mode")
+		logger.Warn("RAG_DOCUMENT_WORKER_LOCAL is ignored because RAG_KAFKA_BOOTSTRAP_SERVERS is configured; using broker mode")
 		localMode = false
 	}
 
@@ -188,7 +188,7 @@ func run() error {
 		}
 		consumerConfig := mq.DefaultConsumerConfig(mqSettings.DocumentTopic, mqSettings.DocumentGroup)
 		consumerConfig.MaxAttempts = maxAttempts
-		consumer, err := mq.NewRocketMQPullConsumer(mqSettings, consumerConfig, worker.MessageHandler())
+		consumer, err := mq.NewKafkaPullConsumer(mqSettings, consumerConfig, worker.MessageHandler())
 		if err != nil {
 			return err
 		}

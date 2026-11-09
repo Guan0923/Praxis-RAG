@@ -2,91 +2,75 @@ package mq
 
 import (
 	"context"
-	"crypto/tls"
+	"fmt"
 	"time"
 
-	rmq "github.com/apache/rocketmq-clients/golang/v5"
-	"github.com/apache/rocketmq-clients/golang/v5/credentials"
+	"github.com/segmentio/kafka-go"
 )
 
-// sdkPullTransport wraps the official Go client simple consumer.
+// sdkPullTransport wraps a kafka-go consumer-group Reader. Offsets are committed
+// manually (CommitInterval=0): Ack commits the record, so a crash or nack leaves
+// the offset uncommitted and the record is redelivered after rebalance/restart.
 type sdkPullTransport struct {
-	consumer rmq.SimpleConsumer
+	reader *kafka.Reader
 }
 
 func newSDKPullTransport(settings Settings, config ConsumerConfig) (*sdkPullTransport, error) {
-	sdkConfig := &rmq.Config{
-		Endpoint:      settings.Endpoint,
-		NameSpace:     settings.Namespace,
-		ConsumerGroup: config.Group,
-		Credentials: &credentials.SessionCredentials{
-			AccessKey:    settings.AccessKey,
-			AccessSecret: settings.SecretKey,
-		},
-	}
-	awaitDuration := config.AwaitDuration
-	if awaitDuration <= 0 {
-		awaitDuration = DefaultAwaitDuration
-	}
-	options := []rmq.SimpleConsumerOption{
-		rmq.WithSimpleAwaitDuration(awaitDuration),
-		rmq.WithSimpleSubscriptionExpressions(map[string]*rmq.FilterExpression{
-			config.Topic: rmq.SUB_ALL,
-		}),
-	}
-	if settings.TLS {
-		options = append(options, rmq.WithClientFuncForSimpleConsumer(func(clientConfig *rmq.Config, clientOptions ...rmq.ClientOption) (rmq.Client, error) {
-			clientOptions = append(clientOptions, rmq.WithConnOptions(rmq.WithTLSConfig(&tls.Config{
-				MinVersion: tls.VersionTLS12,
-			})))
-			return rmq.NewClient(clientConfig, clientOptions...)
-		}))
-	}
-	consumer, err := rmq.NewSimpleConsumer(sdkConfig, options...)
+	dialer, err := newKafkaDialer(settings)
 	if err != nil {
 		return nil, err
 	}
-	return &sdkPullTransport{consumer: consumer}, nil
+	maxWait := config.AwaitDuration
+	if maxWait <= 0 {
+		maxWait = DefaultAwaitDuration
+	}
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        settings.BootstrapServers,
+		GroupID:        config.Group,
+		Topic:          config.Topic,
+		Dialer:         dialer,
+		CommitInterval: 0,
+		MinBytes:       1,
+		MaxBytes:       10 << 20,
+		MaxWait:        maxWait,
+	})
+	return &sdkPullTransport{reader: reader}, nil
 }
 
-func (t *sdkPullTransport) Start() error { return t.consumer.Start() }
+// Start is a no-op: kafka-go starts connections lazily on the first fetch.
+func (t *sdkPullTransport) Start() error { return nil }
 
-func (t *sdkPullTransport) Stop() error { return t.consumer.GracefulStop() }
+// Stop closes the reader and leaves the consumer group cleanly.
+func (t *sdkPullTransport) Stop() error { return t.reader.Close() }
 
-func (t *sdkPullTransport) Receive(ctx context.Context, maxMessages int32, invisibleDuration time.Duration) ([]ReceivedMessage, error) {
-	views, err := t.consumer.Receive(ctx, maxMessages, invisibleDuration)
+// Receive fetches exactly one record (Kafka has no visibility timeout; the
+// consumer implements retries in-process without committing).
+func (t *sdkPullTransport) Receive(ctx context.Context, _ int32, _ time.Duration) ([]ReceivedMessage, error) {
+	message, err := t.reader.FetchMessage(ctx)
 	if err != nil {
 		return nil, err
 	}
-	messages := make([]ReceivedMessage, 0, len(views))
-	for _, view := range views {
-		message := ReceivedMessage{
-			Topic:           view.GetTopic(),
-			MessageID:       view.GetMessageId(),
-			Body:            view.GetBody(),
-			DeliveryAttempt: int(view.GetDeliveryAttempt()),
-			handle:          view,
-		}
-		if keys := view.GetKeys(); len(keys) > 0 {
-			message.Key = keys[0]
-		}
-		messages = append(messages, message)
-	}
-	return messages, nil
+	return []ReceivedMessage{{
+		Topic:           message.Topic,
+		MessageID:       fmt.Sprintf("%s/%d/%d", message.Topic, message.Partition, message.Offset),
+		Key:             string(message.Key),
+		Body:            message.Value,
+		DeliveryAttempt: 0,
+		handle:          message,
+	}}, nil
 }
 
+// Ack commits the record offset (ack => commit).
 func (t *sdkPullTransport) Ack(ctx context.Context, message ReceivedMessage) error {
-	view, ok := message.handle.(*rmq.MessageView)
-	if !ok || view == nil {
-		return newSafeError(ErrConsumerFailed, "consumer ack", nil)
+	record, ok := message.handle.(kafka.Message)
+	if !ok {
+		return newSafeError(ErrConsumerFailed, "consumer commit", nil)
 	}
-	return t.consumer.Ack(ctx, view)
+	return t.reader.CommitMessages(ctx, record)
 }
 
-func (t *sdkPullTransport) ChangeInvisibleDuration(_ context.Context, message ReceivedMessage, invisibleDuration time.Duration) error {
-	view, ok := message.handle.(*rmq.MessageView)
-	if !ok || view == nil {
-		return newSafeError(ErrConsumerFailed, "consumer nack", nil)
-	}
-	return t.consumer.ChangeInvisibleDuration(view, invisibleDuration)
+// ChangeInvisibleDuration is retained for the PullTransport seam. Kafka has no
+// visibility timeout; nacks are retried in-process without committing.
+func (t *sdkPullTransport) ChangeInvisibleDuration(context.Context, ReceivedMessage, time.Duration) error {
+	return nil
 }

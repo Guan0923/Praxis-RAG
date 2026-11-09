@@ -355,7 +355,7 @@ func (h *harness) startBackgroundPublisher(t *testing.T) {
 }
 
 // fakeBroker implements runtime.BackgroundPublisher: it records published search
-// envelopes and document notifications instead of using RocketMQ.
+// envelopes and document notifications instead of using a Kafka broker.
 type fakeBroker struct {
 	mutex     sync.Mutex
 	searches  []state.SearchEnvelope

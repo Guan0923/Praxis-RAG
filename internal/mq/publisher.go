@@ -12,13 +12,13 @@ import (
 // credentials; the wrapped cause is available through Cause() for diagnostics
 // that must not be logged verbatim.
 var (
-	ErrNotConfigured   = errors.New("rocketmq endpoint is not configured")
-	ErrPublishFailed   = errors.New("rocketmq publish failed")
-	ErrPublishTimeout  = errors.New("rocketmq publish timed out")
-	ErrPayloadInvalid  = errors.New("rocketmq payload is invalid")
-	ErrPublisherClosed = errors.New("rocketmq publisher is closed")
-	ErrConsumerFailed  = errors.New("rocketmq consumer failed")
-	ErrReceiveFailed   = errors.New("rocketmq receive failed")
+	ErrNotConfigured   = errors.New("kafka bootstrap servers are not configured")
+	ErrPublishFailed   = errors.New("kafka publish failed")
+	ErrPublishTimeout  = errors.New("kafka publish timed out")
+	ErrPayloadInvalid  = errors.New("kafka payload is invalid")
+	ErrPublisherClosed = errors.New("kafka publisher is closed")
+	ErrConsumerFailed  = errors.New("kafka consumer failed")
+	ErrReceiveFailed   = errors.New("kafka receive failed")
 )
 
 // SafeError maps a transport failure to a sanitized category while keeping the
@@ -57,7 +57,7 @@ type ProducerTransport interface {
 }
 
 // Publisher implements both state notification publisher seams with one
-// RocketMQ producer. It lazily starts the transport on the first send.
+// Kafka writer set. It lazily starts the transport on the first send.
 type Publisher struct {
 	Settings  Settings
 	transport ProducerTransport
