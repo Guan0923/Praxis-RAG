@@ -584,9 +584,7 @@ class RagServiceRuntime:
         if self.data_root.is_symlink():
             raise KnowledgeError("RAG service data root cannot be a symbolic link.")
         self.data_root.mkdir(parents=True, exist_ok=True)
-        self.state = state or StateStores.create(
-            self.data_root, settings=StateSettings.from_env(self.data_root)
-        )
+        self.state = state or StateStores.create(settings=StateSettings.from_env())
         logging.getLogger(__name__).info("State store: %s", self.state.describe())
         self._client = QdrantClient(
             url=config.qdrant_url,

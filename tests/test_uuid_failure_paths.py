@@ -53,7 +53,6 @@ class FaultRedis(MemoryRedis, FakeRedis):
 
 @pytest.fixture(autouse=True)
 def local_state_only(tmp_path, monkeypatch):
-    monkeypatch.setenv("RAG_STATE_URL", f"sqlite+pysqlite:///{tmp_path / 'state.sqlite3'}")
     monkeypatch.setenv("RAG_STATE_AUTO_SCHEMA", "1")
     monkeypatch.setenv("RAG_REDIS_ENABLED", "0")
     monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
@@ -336,11 +335,14 @@ def test_stale_display_cache_never_controls_live_get_or_new_queries_and_flush_re
     assert state.views.documents("ns") == []
 
 
-def test_raw_legacy_schema_migrates_twice_and_startup_preserves_live_and_deleted_rows(tmp_path):
-    settings = StateSettings(url=f"sqlite+pysqlite:///{tmp_path / 'legacy.sqlite3'}")
+def test_raw_legacy_schema_migrates_twice_and_startup_preserves_live_and_deleted_rows(state_url):
+    from rag_mcp.state.schema import metadata
+
+    settings = StateSettings(url=state_url)
     engine = create_engine(settings.url)
     try:
         with engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS documents"))
             conn.execute(text("""CREATE TABLE documents (
                 namespace VARCHAR(64) NOT NULL, name VARCHAR(200) NOT NULL,
                 document_id VARCHAR(64) NOT NULL, size BIGINT NOT NULL,
@@ -360,18 +362,22 @@ def test_raw_legacy_schema_migrates_twice_and_startup_preserves_live_and_deleted
             assert conn.execute(text("SELECT del_flag FROM documents")).scalars().all() == [0, 0]
             conn.execute(text("UPDATE documents SET del_flag=1 WHERE name='deleted.txt'"))
             before = conn.execute(text("SELECT * FROM documents ORDER BY name")).all()
+        for _ in range(2):
+            state = StateStores.create(settings=settings)
+            try:
+                with state.engine.connect() as conn:
+                    assert conn.execute(text("SELECT * FROM documents ORDER BY name")).all() == before
+                live = state.documents.get("ns", "live.txt")
+                assert live["diagnostics"] == ["retained"] and live["sha256"] == "retained-hash"
+                assert live["chunking"] == {"strategy": "character"}
+                assert [row["name"] for row in state.documents.list("ns")] == ["live.txt"]
+                assert state.documents.get("ns", "deleted.txt") is None
+                assert state.documents.namespaces() == {"ns": 1}
+            finally:
+                state.close()
     finally:
+        # Restore the authoritative table shape for the rest of the session.
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS documents"))
+        metadata.create_all(engine)
         engine.dispose()
-    for _ in range(2):
-        state = StateStores.create(settings=settings)
-        try:
-            with state.engine.connect() as conn:
-                assert conn.execute(text("SELECT * FROM documents ORDER BY name")).all() == before
-            live = state.documents.get("ns", "live.txt")
-            assert live["diagnostics"] == ["retained"] and live["sha256"] == "retained-hash"
-            assert live["chunking"] == {"strategy": "character"}
-            assert [row["name"] for row in state.documents.list("ns")] == ["live.txt"]
-            assert state.documents.get("ns", "deleted.txt") is None
-            assert state.documents.namespaces() == {"ns": 1}
-        finally:
-            state.close()

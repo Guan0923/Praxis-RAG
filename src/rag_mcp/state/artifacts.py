@@ -14,7 +14,6 @@ from urllib.parse import quote
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .schema import artifact_snapshots
 
@@ -89,20 +88,10 @@ class ArtifactRegistry:
             "name": name, "mime_type": mime_type, "content": content,
             "created_at": now, "expires_at": expiry,
         }
-        dialect = self.state.engine.dialect.name
-        if dialect == "sqlite":
-            statement = sqlite_insert(artifact_snapshots).values(**values)
-            statement = statement.on_conflict_do_update(
-                index_elements=[artifact_snapshots.c.namespace, artifact_snapshots.c.identity],
-                set_={"expires_at": func.max(artifact_snapshots.c.expires_at, statement.excluded.expires_at)},
-            )
-        elif dialect in {"mysql", "mariadb"}:
-            statement = mysql_insert(artifact_snapshots).values(**values)
-            statement = statement.on_duplicate_key_update(
-                expires_at=func.greatest(artifact_snapshots.c.expires_at, statement.inserted.expires_at),
-            )
-        else:
-            raise ValueError("Artifact snapshots require SQLite or MySQL")
+        statement = mysql_insert(artifact_snapshots).values(**values)
+        statement = statement.on_duplicate_key_update(
+            expires_at=func.greatest(artifact_snapshots.c.expires_at, statement.inserted.expires_at),
+        )
         with self.state.engine.begin() as conn:
             conn.execute(statement)
             row = conn.execute(select(*_metadata_columns()).where(
@@ -162,8 +151,8 @@ class ArtifactRegistry:
             ).order_by(artifact_snapshots.c.expires_at, artifact_snapshots.c.id).limit(limit)).scalars())
         if not candidates:
             return 0
-        # Separate selection from deletion so SQLite need not upgrade a stale
-        # read transaction; the write predicate protects concurrently renewed IDs.
+        # Separate selection from deletion keeps the purge bounded and lets the
+        # write predicate protect concurrently renewed IDs.
         with self.state.engine.begin() as conn:
             result = conn.execute(delete(artifact_snapshots).where(
                 artifact_snapshots.c.id.in_(candidates), artifact_snapshots.c.expires_at <= now,

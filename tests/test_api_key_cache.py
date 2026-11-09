@@ -23,12 +23,12 @@ class WriteUnavailableCache(MemoryCache):
 
 
 @pytest.fixture()
-def state(monkeypatch):
+def state(monkeypatch, state_url):
     monkeypatch.delenv("RAG_REDIS_URL", raising=False)
     monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
     monkeypatch.setenv("RAG_REDIS_ENABLED", "0")
     settings = StateSettings(
-        url="sqlite+pysqlite:///:memory:",
+        url=state_url,
         encryption_key="base64:" + base64.b64encode(b"k" * 32).decode(),
     )
     value = StateStores(settings)

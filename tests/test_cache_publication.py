@@ -35,11 +35,11 @@ VECTOR = [1.0, 0.0]
 
 
 @pytest.fixture()
-def stack(tmp_path, monkeypatch):
+def stack(tmp_path, monkeypatch, state_url):
     monkeypatch.delenv("RAG_REDIS_URL", raising=False)
     # Keep journal workspaces inside pytest's explicitly project-local base directory.
     monkeypatch.setattr("rag_mcp.service_knowledge.tempfile.gettempdir", lambda: str(tmp_path))
-    state = StateStores(StateSettings(url="sqlite+pysqlite:///" + (tmp_path / "state.db").as_posix()))
+    state = StateStores(StateSettings(url=state_url))
     state.cache_sync.backend = MemoryCache()
     state.uploads.auto_heartbeat = False
     client = QdrantClient(":memory:")

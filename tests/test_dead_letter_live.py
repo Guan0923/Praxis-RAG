@@ -1,7 +1,7 @@
 """Opt-in SDK 5.1.2/Broker 5.3.3 DLQ regression on freshly provisioned resources.
 
 Run with RAG_TEST_DLQ_LIVE=1; defaults to the local disposable Docker broker.
-No service configuration/.env is read. SQL uses an isolated pytest SQLite file; transient state uses injected Redis.
+No service configuration/.env is read. SQL uses the disposable test schema via RAG_TEST_MYSQL_URL; transient state uses injected Redis.
 """
 
 import json
@@ -57,7 +57,7 @@ def test_broker_exhaustion_redis_failure_redelivery_and_terminal_ack(tmp_path, m
         monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
         monkeypatch.setenv("RAG_REDIS_ENABLED", "0")
         monkeypatch.setenv("RAG_SEARCH_TIMEOUT_SECONDS", "300")
-        state = StateStores(StateSettings(url=f"sqlite+pysqlite:///{tmp_path / 'dlq.sqlite3'}"))
+        state = StateStores(StateSettings.from_env())
         redis = MemoryRedis()
         state.cache_sync.backend = RedisStateCache(
             StateCacheSettings(prefix=marker, enabled=True), client=redis)

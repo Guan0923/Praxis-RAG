@@ -31,7 +31,6 @@ from uuid import uuid4
 
 from sqlalchemy import delete, insert, select, text, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 
 from . import cache_events
@@ -137,22 +136,17 @@ class UploadJournal:
                 namespace, operation_id, heads=heads, leases=leases))
 
     def _now(self, conn):
-        if conn.dialect.name == "mysql":
-            return float(conn.scalar(text("SELECT UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6))")))
-        return float(conn.scalar(text("SELECT (julianday('now') - 2440587.5) * 86400.0")))
+        return float(conn.scalar(text("SELECT UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6))")))
 
     def _insert_ignore(self, conn, table, values):
-        if conn.dialect.name == "mysql":
-            statement = mysql_insert(table).values(**values)
-            column = next(iter(table.primary_key.columns))
-            statement = statement.on_duplicate_key_update({column.name: column})
-        else:
-            statement = sqlite_insert(table).values(**values).on_conflict_do_nothing()
+        statement = mysql_insert(table).values(**values)
+        column = next(iter(table.primary_key.columns))
+        statement = statement.on_duplicate_key_update({column.name: column})
         conn.execute(statement)
 
     def _guard(self, conn, namespace):
-        # This persistent row serializes namespace/document lock acquisition. An
-        # INSERT also obtains SQLite's writer lock before any ownership reads.
+        # This persistent row serializes namespace/document lock acquisition; the
+        # INSERT reserves the guard row before any ownership reads.
         self._insert_ignore(conn, leases, dict(namespace=namespace, resource=_GUARD,
                                               owner="", operation_id=None, expires_at=0))
         conn.execute(select(leases).where(

@@ -1,6 +1,6 @@
 """Delivery boundaries: SQL lease, duplicate workers, failures and dead letters.
 
-Everything here runs against the real SQLite state database with the in-memory
+Everything here runs against the real MySQL state database with the in-memory
 broker stand-in from :mod:`test_document_tasks`; no worker shares Redis state.
 """
 

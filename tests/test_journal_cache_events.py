@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, select, update
-from sqlalchemy.pool import StaticPool
 
 from rag_mcp.state.cache import CacheUnavailable
 from rag_mcp.state.cache_sync import CacheSynchronizer
@@ -42,10 +41,9 @@ class MemoryCache:
 
 
 @pytest.fixture()
-def state(monkeypatch):
+def state(monkeypatch, state_url):
     monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
-    engine = create_engine("sqlite://", poolclass=StaticPool,
-                           connect_args={"check_same_thread": False})
+    engine = create_engine(state_url, pool_pre_ping=True, future=True)
     metadata.create_all(engine)
     value = SimpleNamespace(engine=engine)
     value.cache_sync = CacheSynchronizer(value, backend=MemoryCache())

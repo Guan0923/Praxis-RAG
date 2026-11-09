@@ -7,8 +7,8 @@ Two bridges turn one committed MySQL outbox row into a broker notification:
   talks to the broker on the submission path, so a broker outage cannot lose
   or block an accepted upload.
 * ``RAG_OUTBOX_BRIDGE=relay`` (default) -- an in-process relay publishes
-  pending rows and marks them ``PUBLISHED``. Used for SQLite/local development
-  and any deployment without a CDC pipeline.
+  pending rows and marks them ``PUBLISHED``. Used for any deployment without
+  a CDC pipeline.
 
 Either way the message carries identifiers only. File bytes stay in MySQL and
 the worker reads them back by ``artifact_id``.

@@ -108,17 +108,29 @@ def test_soft_deleted_legacy_points_are_hidden_without_physical_deletion(stack):
     assert len(points) == 1
 
 
-def test_additive_soft_delete_migration_preserves_old_rows(tmp_path):
-    engine = create_engine("sqlite+pysqlite:///" + (tmp_path / "old.sqlite3").as_posix())
-    with engine.begin() as conn:
-        conn.execute(text("CREATE TABLE documents (name TEXT PRIMARY KEY, content TEXT)"))
-        conn.execute(text("INSERT INTO documents VALUES ('old.txt','retained')"))
-    migrate_soft_delete(engine)
-    migrate_soft_delete(engine)
-    assert "del_flag" in {c["name"] for c in inspect(engine).get_columns("documents")}
-    with engine.connect() as conn:
-        assert tuple(conn.execute(text("SELECT content, del_flag FROM documents")).one()) == ("retained", 0)
-    engine.dispose()
+def test_additive_soft_delete_migration_preserves_old_rows(state_url):
+    from rag_mcp.state.schema import metadata
+
+    engine = create_engine(state_url, pool_pre_ping=True, future=True)
+    try:
+        # Rebuild the legacy document table shape on the disposable schema only.
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS documents"))
+            conn.execute(text(
+                "CREATE TABLE documents ("
+                "name VARCHAR(200) NOT NULL PRIMARY KEY, content TEXT) "
+                "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
+            conn.execute(text("INSERT INTO documents VALUES ('old.txt','retained')"))
+        migrate_soft_delete(engine)
+        migrate_soft_delete(engine)
+        assert "del_flag" in {c["name"] for c in inspect(engine).get_columns("documents")}
+        with engine.connect() as conn:
+            assert tuple(conn.execute(text("SELECT content, del_flag FROM documents")).one()) == ("retained", 0)
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS documents"))
+        metadata.create_all(engine)
+        engine.dispose()
 
 
 def test_original_hit_image_and_table_refs_survive_soft_delete_and_cleanup(stack):

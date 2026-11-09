@@ -38,13 +38,13 @@ def service(tmp_path, monkeypatch):
         state.close()
 
 
-def build_state(tmp_path, monkeypatch, mode=None, name="outbox.sqlite3"):
+def build_state(tmp_path, monkeypatch, mode=None):
     if mode is None:
         monkeypatch.delenv("RAG_OUTBOX_BRIDGE", raising=False)
     else:
         monkeypatch.setenv("RAG_OUTBOX_BRIDGE", mode)
     monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
-    state = StateStores(StateSettings(url=f"sqlite+pysqlite:///{tmp_path / name}"))
+    state = StateStores(StateSettings.from_env())
     state.cache_sync.backend = RedisStateCache(StateCacheSettings(), client=MemoryRedis())
     state.knowledge_bases.create({
         "namespace": "manuals", "collection": "test", "embedding_model": "test",
@@ -167,7 +167,7 @@ def test_relay_background_thread_publishes_pending_rows_and_stops(service):
 
 
 def test_default_bridge_mode_publishes_in_process(tmp_path, monkeypatch):
-    state = build_state(tmp_path, monkeypatch, name="relay.sqlite3")
+    state = build_state(tmp_path, monkeypatch)
     try:
         assert document_bridge_mode() == "relay"
         dispatcher = state.document_dispatcher
@@ -184,7 +184,7 @@ def test_default_bridge_mode_publishes_in_process(tmp_path, monkeypatch):
 
 
 def test_debezium_bridge_never_publishes_from_the_application(tmp_path, monkeypatch):
-    state = build_state(tmp_path, monkeypatch, mode="debezium", name="cdc.sqlite3")
+    state = build_state(tmp_path, monkeypatch, mode="debezium")
     try:
         dispatcher = state.document_dispatcher
         assert dispatcher.mode == "debezium" and dispatcher.relay is None
@@ -206,7 +206,7 @@ def test_invalid_bridge_mode_is_rejected(tmp_path, monkeypatch, mode):
     with pytest.raises(ValueError, match="relay or debezium"):
         document_bridge_mode()
     with pytest.raises(ValueError, match="relay or debezium"):
-        StateStores(StateSettings(url=f"sqlite+pysqlite:///{tmp_path / 'bad.sqlite3'}"))
+        StateStores(StateSettings.from_env())
 
 
 def test_notification_shape_is_content_free(service):

@@ -7,7 +7,6 @@ from pathlib import Path
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.engine import make_url
-from sqlalchemy.pool import StaticPool
 
 from .blobs import BlobStore
 from .repositories import (
@@ -72,7 +71,10 @@ class StateStores:
         settings: StateSettings | None = None,
         create_schema: bool = True,
     ) -> "StateStores":
-        resolved = settings or StateSettings.from_env(data_root)
+        # data_root is still accepted by callers that pass their service data
+        # directory, but it never selects the database: the connection always
+        # comes from StateSettings/RAG_STATE_URL (MySQL only).
+        resolved = settings or StateSettings.from_env()
         return cls(resolved, create_schema=create_schema and resolved.auto_schema)
 
     def close(self) -> None:
@@ -89,7 +91,7 @@ class StateStores:
     def describe(self) -> dict[str, object]:
         url = make_url(self.settings.url)
         return {
-            "backend": "mysql" if self.settings.is_mysql else "sqlite",
+            "backend": "mysql",
             "database": url.database,
             "host": url.host,
             "encrypted": bool(self.settings.encryption_key),
@@ -97,32 +99,20 @@ class StateStores:
 
 
 def _create_engine(settings: StateSettings) -> Engine:
-    url = make_url(settings.url)
-    common = {
-        "pool_pre_ping": True,
-        "echo": settings.echo,
-        "future": True,
-    }
-    if url.get_backend_name() == "sqlite":
-        database = url.database
-        if database not in (None, "", ":memory:") and not database.startswith("file:"):
-            Path(database).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-        options = {"connect_args": {"check_same_thread": False}}
-        if url.database in (None, "", ":memory:"):
-            options["poolclass"] = StaticPool
-        return create_engine(settings.url, **common, **options)
     return create_engine(
         settings.url,
         pool_size=settings.pool_size,
         max_overflow=settings.max_overflow,
         pool_recycle=settings.pool_recycle,
         pool_timeout=settings.pool_timeout,
-        **common,
+        pool_pre_ping=True,
+        echo=settings.echo,
+        future=True,
     )
 
 
 def _warn_if_unencrypted(settings: StateSettings) -> None:
-    if settings.is_mysql and not settings.encryption_key:
+    if not settings.encryption_key:
         logger.warning(
             "RAG_STATE_ENCRYPTION_KEY is not set: provider and API keys may not be readable on other instances"
         )

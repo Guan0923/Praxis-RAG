@@ -61,7 +61,7 @@ def make_service(tmp_path):
     states = []
 
     def make(runtime_type=KeyedRuntime):
-        state = StateStores(StateSettings(url=f"sqlite+pysqlite:///{tmp_path / f'state-{len(states)}.sqlite3'}"))
+        state = StateStores(StateSettings.from_env())
         states.append(state)
         runtime = runtime_type(state)
         app = create_service_app(runtime, settings=RagHttpSettings(

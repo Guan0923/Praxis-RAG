@@ -1,4 +1,4 @@
-"""Portable schema for all service state (MySQL in production, SQLite for tests)."""
+"""MySQL schema for all service state."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from sqlalchemy import (
     Double,
     Index,
     Integer,
-    LargeBinary,
     MetaData,
     String,
     Table,
@@ -24,15 +23,15 @@ _MYSQL_TABLE = {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4", "mysql_col
 def _ci_string(length: int) -> String:
     """Case-sensitive identifier column; MySQL collations are otherwise case-insensitive."""
 
-    return String(length).with_variant(String(length, collation="utf8mb4_bin"), "mysql")
+    return String(length, collation="utf8mb4_bin")
 
 
 def _long_blob():
-    return LargeBinary().with_variant(mysql.LONGBLOB(), "mysql")
+    return mysql.LONGBLOB()
 
 
 def _long_text():
-    return Text().with_variant(mysql.LONGTEXT(), "mysql")
+    return mysql.LONGTEXT()
 
 
 metadata = MetaData()

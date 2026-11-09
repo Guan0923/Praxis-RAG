@@ -101,7 +101,11 @@ def test_real_service_reads_config_and_environment_override(tmp_path):
         port = listener.getsockname()[1]
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("RAG_", "QDRANT_"))}
-    env.update(RAG_CONFIG_FILE=str(path), RAG_SERVICE_PORT=str(port), QDRANT_PATH=str(tmp_path / "qdrant"))
+    env.update(RAG_CONFIG_FILE=str(path), RAG_SERVICE_PORT=str(port),
+               QDRANT_PATH=str(tmp_path / "qdrant"),
+               # The state layer is MySQL-only, so the child process needs the
+               # same disposable schema the rest of the suite uses.
+               RAG_STATE_URL=os.environ["RAG_STATE_URL"])
     log = tmp_path / "service.log"
     with log.open("w", encoding="utf-8") as output:
         python = os.getenv("PRAXIS_TEST_PYTHON", sys.executable)

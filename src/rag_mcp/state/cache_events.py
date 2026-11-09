@@ -7,7 +7,6 @@ from uuid import uuid4
 
 from sqlalchemy import insert, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .schema import cache_outbox, cache_revisions
 
@@ -34,11 +33,8 @@ def touch(conn, *keys: tuple[str, str]) -> list[str]:
         if kind not in KINDS:
             raise ValueError("Unknown state cache kind")
         values = dict(kind=kind, scope=scope, revision=0)
-        if conn.dialect.name == "mysql":
-            stmt = mysql_insert(cache_revisions).values(**values)
-            stmt = stmt.on_duplicate_key_update(revision=cache_revisions.c.revision)
-        else:
-            stmt = sqlite_insert(cache_revisions).values(**values).on_conflict_do_nothing()
+        stmt = mysql_insert(cache_revisions).values(**values)
+        stmt = stmt.on_duplicate_key_update(revision=cache_revisions.c.revision)
         conn.execute(stmt)
         conn.execute(update(cache_revisions).where(
             cache_revisions.c.kind == kind, cache_revisions.c.scope == scope

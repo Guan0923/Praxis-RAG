@@ -1,4 +1,4 @@
-"""Upload journal tests use only local SQLite and version-scoped fake callbacks."""
+"""Upload journal tests use the disposable MySQL schema and version-scoped fake callbacks."""
 
 import threading
 import time
@@ -16,8 +16,6 @@ from rag_mcp.state.uploads import LeaseLost, UploadConflict, UploadJournal
 
 @pytest.fixture()
 def state(tmp_path, monkeypatch):
-    monkeypatch.delenv("RAG_STATE_URL", raising=False)
-    monkeypatch.delenv("RAG_STATE_BACKEND", raising=False)
     state = StateStores.create(tmp_path)
     yield state
     state.close()
@@ -255,10 +253,12 @@ def test_heartbeat_renews_during_long_callback(state):
 
 
 def test_automatic_heartbeat_covers_work_between_steps(state):
-    journal = UploadJournal(state, lease_seconds=0.3)
+    # The heartbeat runs every lease/3; keep the lease long enough that a MySQL
+    # round trip cannot starve it, but far shorter than the sleep below.
+    journal = UploadJournal(state, lease_seconds=1.0)
     try:
         op = begin(journal)
-        time.sleep(0.7)
+        time.sleep(2.5)
         assert journal.claim_recovery(op["id"]) is None
         journal.assert_owner(op)
         journal.rollback(op, lambda _: None)

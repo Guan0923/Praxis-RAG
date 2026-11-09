@@ -51,8 +51,8 @@ class FakeSync:
 
 
 @pytest.fixture()
-def state():
-    stores = StateStores(StateSettings(url="sqlite+pysqlite:///:memory:"))
+def state(state_url):
+    stores = StateStores(StateSettings(url=state_url))
     stores.cache_sync = FakeSync(stores.engine)
     stores.views = CachedReadViews(stores)
     yield stores

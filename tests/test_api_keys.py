@@ -5,10 +5,24 @@ import anyio
 import base64
 import httpx2 as httpx
 import json
+import os
 
 import pytest
+from sqlalchemy import create_engine, select
 
 from rag_mcp.http_service import RagHttpSettings, create_service_app
+from rag_mcp.state.schema import api_keys as api_keys_table
+
+
+def stored_api_key_rows() -> list[dict]:
+    """Read the authoritative MySQL rows so plaintext leaks are caught in SQL."""
+
+    engine = create_engine(os.environ["RAG_STATE_URL"])
+    try:
+        with engine.connect() as conn:
+            return [dict(row) for row in conn.execute(select(api_keys_table)).mappings()]
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture(autouse=True)
@@ -36,9 +50,10 @@ def test_key_lifecycle_and_persistence(tmp_path):
         assert client.get("/v1/documents", headers={**headers, "X-RAG-Namespace": "other"}).status_code == 403
         assert client.get("/v1/admin/api-keys", headers=headers).status_code == 200
         assert key["key"] not in client.get("/v1/admin/api-keys", headers=admin).text
-        database = (tmp_path / "state.sqlite3").read_bytes()
-        assert key["key"].encode() not in database
-        assert b"dpapi:" not in database
+        stored = stored_api_key_rows()
+        assert stored
+        assert key["key"] not in repr(stored)
+        assert "dpapi:" not in repr(stored)
         assert client.post("/v1/admin/api-keys", headers=admin,
                            json={"name": "empty", "namespaces": []}).status_code == 422
     with TestClient(create_service_app(Runtime(), settings=settings), base_url="http://127.0.0.1", client=("127.0.0.1", 1234)) as client:

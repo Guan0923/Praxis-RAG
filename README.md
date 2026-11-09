@@ -67,7 +67,7 @@ PDF 的公式与表格行会按内容边界处理，减少在切分过程中拆�
 
 ### 独立部署与模型连接
 
-Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档入库任务（含文件原字节）与发件箱、文档清单、知识库配置、MCP 配置和 API Key 保存在共享状态数据库（生产环境使用 MySQL，本地开发和测试可使用 SQLite 文件，此时投递只能使用进程内 relay）。
+Praxis-RAG 不依赖其他 Agent 项目，可独立安装和运行。Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档入库任务（含文件原字节）与发件箱、文档清单、知识库配置、MCP 配置和 API Key 保存在共享状态数据库 MySQL（唯一支持的后端，开发、测试和部署一致）。
 
 架构总纲（异步文档入库）：**MySQL 存真相**——文件字节、任务状态与发件箱在同一个事务里提交；**Redis 存短期搜索状态与展示缓存**，不再保存文档任务状态；**RocketMQ 只传通知**（`{"schema":3,"artifact_id","namespace","name","created_at"}`，不含文件内容）；**Debezium（可选）负责把已提交的事务投递到 MQ**。搜索路径保持原样，仍把完整查询请求直投 MQ。
 
@@ -101,7 +101,7 @@ Redis 缓存覆盖知识库公开配置、MCP 工具/提示词、文档与知识
 4. 上传文档，在“检索调试”中检查返回内容与来源。
 5. 将同一工作区接入 MCP 客户端或业务系统；服务端 MCP 搜索另启动 `rag-search-worker`，使用异步 `add_document` 时另启动 `rag-document-worker`；分别轮询结果和入库状态。
 
-服务启动时自动读取 `~/.praxis-rag/config.toml`，首次运行会创建默认配置。生产环境请配置 `RAG_MYSQL_HOST`（以及 `RAG_MYSQL_USER`、`RAG_MYSQL_DATABASE`、`RAG_MYSQL_PASSWORD`）或显式 `RAG_STATE_URL`，并设置 `RAG_STATE_ENCRYPTION_KEY` 以便多实例解密密钥。已有 SQLite/本地文件数据使用 `rag-state-migrate` 显式迁移，不会自动迁移；详见 [共享状态存储](docs/state-storage.md)。
+服务启动时自动读取 `~/.praxis-rag/config.toml`，首次运行会创建默认配置。必须配置 `RAG_MYSQL_HOST`（以及 `RAG_MYSQL_USER`、`RAG_MYSQL_DATABASE`、`RAG_MYSQL_PASSWORD`）或显式 `RAG_STATE_URL`，并设置 `RAG_STATE_ENCRYPTION_KEY` 以便多实例解密密钥；未配置 MySQL 时服务直接报错，不再回退本地文件数据库。详见 [共享状态存储](docs/state-storage.md)。
 
 安装步骤、配置文件、模型接口要求和接入示例见 [使用与部署指南](docs/USAGE.md)。
 

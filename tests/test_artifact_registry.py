@@ -2,12 +2,10 @@
 
 import base64
 import json
-import shutil
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from pathlib import Path
 
 import pytest
 from sqlalchemy import event, func, select
@@ -20,15 +18,12 @@ from rag_mcp.state.store import StateStores
 
 
 @pytest.fixture()
-def state():
-    root = Path.cwd() / f".artifact-registry-tests-{uuid.uuid4().hex}"
-    root.mkdir()
-    stores = StateStores(StateSettings(url="sqlite+pysqlite:///" + (root / "state.sqlite3").as_posix()))
+def state(state_url):
+    stores = StateStores(StateSettings(url=state_url))
     try:
         yield stores
     finally:
         stores.close()
-        shutil.rmtree(root)
 
 
 def register(registry, **overrides):
@@ -102,7 +97,12 @@ def test_namespace_is_exact_even_if_database_collation_pads_spaces(state):
 
     def pad_space_comparison(conn, cursor, statement, parameters, context, executemany):
         if statement.startswith("SELECT artifact_snapshots."):
-            parameters = tuple("alpha" if value == "alpha " else value for value in parameters)
+            # MySQL uses pyformat parameters (a mapping), SQLite used a tuple.
+            if isinstance(parameters, dict):
+                return statement, {
+                    key: ("alpha" if value == "alpha " else value) for key, value in parameters.items()
+                }
+            return statement, tuple("alpha" if value == "alpha " else value for value in parameters)
         return statement, parameters
 
     event.listen(state.engine, "before_cursor_execute", pad_space_comparison, retval=True)
@@ -307,7 +307,7 @@ def test_concurrent_duplicate_registration_extends_to_maximum(state):
 
 @pytest.mark.parametrize("renew", [False, True])
 @pytest.mark.parametrize("rollback", [False, True])
-def test_sqlite_read_observes_only_committed_atomic_registration(state, renew, rollback):
+def test_read_observes_only_committed_atomic_registration(state, renew, rollback):
     registry = ArtifactRegistry(state, clock=lambda: 100)
     original = register(registry, expires_at=1000)
     name = "report.pdf" if renew else "new.pdf"

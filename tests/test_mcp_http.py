@@ -154,8 +154,7 @@ class ProtocolRuntime(RagServiceRuntime):
         self.config = RagConfig()
         self._connections = {"embedding": ModelConnection("http://unused.invalid/v1", self.config.embedding_model, vector_size=self.config.vector_size)}
         self.data_root = root
-        self.state = StateStores.create(root, settings=StateSettings(
-            url="sqlite+pysqlite:///" + str(root / "state.sqlite3")))
+        self.state = StateStores.create(settings=StateSettings.from_env())
         self.state.cache_sync.backend = RedisStateCache(
             StateCacheSettings(prefix="protocol-test", enabled=True), client=MemoryRedis())
         self.state.document_dispatcher.transport = MemoryDocumentTransport()
@@ -880,7 +879,9 @@ def test_partial_upload_notifications_and_resource_listing_pages(tmp_path):
     with running_service(tmp_path) as (url, _, _):
 
         async def scenario():
-            async with httpx.AsyncClient(headers=AUTH) as http, mcp_client(url) as client:
+            # MySQL round trips and commits make multi-file uploads slower than
+            # the SQLite-era default; this test exercises notifications, not latency.
+            async with httpx.AsyncClient(headers=AUTH, timeout=60) as http, mcp_client(url) as client:
                 async with client.listen(resources_list_changed=True) as sub:
                     result = await http.post(
                         url + "/v1/documents",

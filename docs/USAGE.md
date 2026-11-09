@@ -90,7 +90,7 @@ $env:RAG_MYSQL_PASSWORD = "<password>"
 $env:RAG_STATE_ENCRYPTION_KEY = "base64:<32-byte-key>"
 ```
 
-也可以直接设置完整的 SQLAlchemy URL（包含用户名、密码、主机和数据库，字符需 URL 编码）：`RAG_STATE_URL = "<SQLAlchemy MySQL URL>"`。未配置 MySQL 时，服务回退到 `RAG_SERVICE_DATA_ROOT/state.sqlite3`，仅适合本地开发和测试。表结构、迁移与多实例说明见 [共享状态存储](state-storage.md)。
+也可以直接设置完整的 SQLAlchemy URL（包含用户名、密码、主机和数据库，字符需 URL 编码）：`RAG_STATE_URL = "<SQLAlchemy MySQL URL>"`。共享状态库只支持 MySQL/MariaDB，未配置时服务启动直接报错，不存在本地文件回退。表结构、迁移与多实例说明见 [共享状态存储](state-storage.md)。
 
 ### 3. 启动 RAG Service 和独立前端
 
@@ -122,7 +122,7 @@ RAG_MYSQL_DATABASE = "praxis_rag"
 
 环境变量优先于文件；`RAG_CONFIG_FILE` 可指定其他配置文件（指定的文件必须存在）。设置 `QDRANT_PATH` 环境变量时不会再套用文件中的 `QDRANT_URL`，反之亦然。若使用本地数据库文件，请删除配置中的 `QDRANT_URL`，改为 `QDRANT_PATH = "~/.praxis-rag/qdrant"`，不要同时配置两者。
 
-源文件、PDF/Word 解析产物、文档清单、知识库配置、MCP 配置和 API Key 默认保存在共享状态数据库 `state.sqlite3`（仅本地开发）；生产环境使用 MySQL。Qdrant 仍需按所选连接方式准备；配置文件不会代替数据库服务。已有 SQLite/本地文件数据请先执行 `rag-state-migrate`，详见 [共享状态存储](state-storage.md)。
+源文件、PDF/Word 解析产物、文档清单、知识库配置、MCP 配置和 API Key 保存在共享状态数据库 MySQL。Qdrant 仍需按所选连接方式准备；配置文件不会代替数据库服务。测试使用可丢弃的 MySQL 测试库（见 [共享状态存储](state-storage.md)）。
 
 仓库开发环境中也可以执行：
 
@@ -178,7 +178,7 @@ rag-document-worker
 | `RAG_DOCUMENT_JOB_SWEEP_SECONDS` | `120`；滞留任务补发通知、回收过期租约的判定窗口 |
 | `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS` | `604800`（7 天）；发件箱行的保留期，超期由 worker 维护任务清理 |
 
-`add_document` 在一个 MySQL 事务里写入 `document_jobs`（完整任务，含文件原字节，单文件仍最多 **10 MiB**）和 `document_job_outbox`（发件箱行），**提交成功即返回 `artifact_id`**；是否已投递或处理，不改变受理结果。投递由 `RAG_OUTBOX_BRIDGE` 选择：`relay`（默认）由 API 进程内轮询 PENDING 发件箱行并发布到 RocketMQ，发布成功后标记 `PUBLISHED`，适用于 SQLite/本地开发和无 CDC 部署；`debezium` 关闭应用内 relay，由 Debezium 读取 `document_job_outbox` 的 binlog INSERT 后投递，需要 MySQL ROW binlog 与独立连接器部署。两种模式互斥，部署细节见 [deploy/debezium/README.md](../deploy/debezium/README.md)。RocketMQ 消息只含 `{"schema":3,"artifact_id","namespace","name","created_at"}`，worker 同时兼容 Debezium 原始 change event（读取 `after` 字段）。
+`add_document` 在一个 MySQL 事务里写入 `document_jobs`（完整任务，含文件原字节，单文件仍最多 **10 MiB**）和 `document_job_outbox`（发件箱行），**提交成功即返回 `artifact_id`**；是否已投递或处理，不改变受理结果。投递由 `RAG_OUTBOX_BRIDGE` 选择：`relay`（默认）由 API 进程内轮询 PENDING 发件箱行并发布到 RocketMQ，发布成功后标记 `PUBLISHED`，适用于无 CDC 基础设施的部署；`debezium` 关闭应用内 relay，由 Debezium 读取 `document_job_outbox` 的 binlog INSERT 后投递，需要 MySQL ROW binlog 与独立连接器部署。两种模式互斥，部署细节见 [deploy/debezium/README.md](../deploy/debezium/README.md)。RocketMQ 消息只含 `{"schema":3,"artifact_id","namespace","name","created_at"}`，worker 同时兼容 Debezium 原始 change event（读取 `after` 字段）。
 
 **升级顺序**：先停止旧 API 接收新任务，保持旧 worker/relay 运行直至旧 outbox、排队和执行中任务排空，处置剩余旧死信；再同时升级 API、文档与搜索 worker。schema 3 通知只含标识，与旧 schema 2 文档消息不兼容，不能混跑或将旧消息交给新 worker；搜索仍为 schema 2 完整请求。旧任务和结果**不迁移**；`document_tasks`、`document_task_outbox`、`search_tasks`、`search_task_outbox`、`search_result_snapshots` 表与历史行保留、不删除，但退出活跃路径。旧 `RAG_DOCUMENT_DISPATCH_*` 和 `RAG_DOCUMENT_MAX_ATTEMPTS` / `RAG_DOCUMENT_LEASE_SECONDS` / `RAG_DOCUMENT_RETRY_SECONDS` 已停用；旧配置文件中的这些键会被接受但忽略，应删除。Broker 重试策略使用 `RAG_DOCUMENT_BROKER_MAX_RETRIES`；独立 `cache_outbox` 仍用于持久读模型刷新。
 

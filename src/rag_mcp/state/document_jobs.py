@@ -4,7 +4,7 @@ MySQL is the single source of truth for an asynchronous upload. Submission
 writes the complete job (including the file bytes) and one outbox row inside
 the *same* transaction, so a committed upload can never be missing from the
 outbox -- a Debezium binlog reader (production) or :class:`DocumentOutboxRelay`
-(SQLite/local development) turns that row into a RocketMQ notification.
+(deployments without a CDC pipeline) turns that row into a RocketMQ notification.
 
 The queue therefore carries a small notification only: no file bytes, no
 512 KiB chunking, no Redis reassembly state and no Redis task state. Redis is

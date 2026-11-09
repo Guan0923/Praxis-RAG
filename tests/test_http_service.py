@@ -111,7 +111,7 @@ def test_runtime_health_reports_http_configuration_without_calling_models() -> N
         reranker_device="cpu",
     )
     from types import SimpleNamespace
-    runtime.state = SimpleNamespace(describe=lambda: {"backend": "sqlite"})
+    runtime.state = SimpleNamespace(describe=lambda: {"backend": "mysql"})
     status = runtime.status()
 
     assert status["service"] == "praxis-rag"

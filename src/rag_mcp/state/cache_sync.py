@@ -12,7 +12,6 @@ import time
 
 from sqlalchemy import select, update, func, tuple_
 from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .cache import CacheSettings, CacheUnavailable, RedisStateCache
 from .cache_queue import RocketMQSettings, RocketMQCacheQueue
@@ -42,11 +41,8 @@ class CacheSynchronizer:
         # this same latch before changing the underlying read model.
         with self.engine.begin() as conn:
             values = dict(kind=kind, scope=scope, revision=0)
-            if conn.dialect.name == "mysql":
-                stmt = mysql_insert(cache_revisions).values(**values)
-                stmt = stmt.on_duplicate_key_update(revision=cache_revisions.c.revision)
-            else:
-                stmt = sqlite_insert(cache_revisions).values(**values).on_conflict_do_nothing()
+            stmt = mysql_insert(cache_revisions).values(**values)
+            stmt = stmt.on_duplicate_key_update(revision=cache_revisions.c.revision)
             conn.execute(stmt)
             rev = int(conn.scalar(select(cache_revisions.c.revision).where(
                 cache_revisions.c.kind == kind, cache_revisions.c.scope == scope).with_for_update()))

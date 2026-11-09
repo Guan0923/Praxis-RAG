@@ -92,7 +92,7 @@ def build_service(tmp_path, monkeypatch):
     monkeypatch.delenv("RAG_ROCKETMQ_ENDPOINT", raising=False)
     monkeypatch.delenv("RAG_REDIS_URL", raising=False)
     monkeypatch.delenv("RAG_OUTBOX_BRIDGE", raising=False)
-    state = StateStores(StateSettings(url=f"sqlite+pysqlite:///{tmp_path / 'tasks.sqlite3'}"))
+    state = StateStores(StateSettings.from_env())
     state.cache_sync.backend = RedisStateCache(StateCacheSettings(), client=MemoryRedis())
     state.knowledge_bases.create({
         "namespace": "manuals", "collection": "test", "embedding_model": "test",

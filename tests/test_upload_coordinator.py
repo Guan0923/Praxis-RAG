@@ -1,4 +1,4 @@
-"""SQLite-only orchestration tests; no Qdrant service or global temp sweep."""
+"""Upload orchestration tests against the disposable MySQL schema; no Qdrant service."""
 
 import shutil
 import socket
@@ -29,8 +29,6 @@ class FakeQdrant:
 
 @pytest.fixture()
 def coordinator(tmp_path, monkeypatch):
-    monkeypatch.delenv("RAG_STATE_URL", raising=False)
-    monkeypatch.delenv("RAG_STATE_BACKEND", raising=False)
     monkeypatch.setenv("RAG_UPLOAD_CLEANUP_DELAY_SECONDS", "0")
     state = StateStores.create(tmp_path / "state")
     state.uploads.auto_heartbeat = False

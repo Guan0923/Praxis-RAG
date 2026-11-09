@@ -1,8 +1,8 @@
 # Shared state storage
 
 Praxis-RAG keeps the retrieval index in Qdrant and permanent published data in
-one shared relational database. The production target is MySQL 8.0+; a SQLite
-file is still accepted for local development and the test suite. MySQL is the
+one shared MySQL 8.0+ database. There is no SQLite backend: MySQL is the only
+supported state store, for development, tests and production alike. MySQL is the
 single source of truth for asynchronous document ingestion: the complete job
 (file bytes included), its status and the outbox notification commit in one
 transaction. RocketMQ carries identifiers only for documents; Redis holds
@@ -34,8 +34,8 @@ notification; without it, the in-process relay polls the outbox.
 | Consumer retries, message invisibility and dead letters | RocketMQ Broker (not SQL task scheduling) |
 | Legacy MCP tasks, dispatch and search results | `document_tasks`, `document_task_outbox`, `search_tasks`, `search_task_outbox`, `search_result_snapshots`; retained, inactive, not migrated |
 
-`RAG_SERVICE_DATA_ROOT` remains the default location only for the local
-`state.sqlite3` fallback; it is no longer the authoritative document store.
+`RAG_SERVICE_DATA_ROOT` only locates service working files; the database is
+always reached through `RAG_STATE_URL` or the `RAG_MYSQL_*` variables.
 
 ## Configuration
 
@@ -88,8 +88,8 @@ RAG_STATE_ENCRYPTION_KEY=base64:<32-byte key>
 The value is AES-GCM (`enc:v1:` prefix). Without the key, Windows falls back to
 DPAPI and other platforms store a plaintext `private-file:` value; neither is
 usable from another machine, so set the key for every instance. Existing
-`dpapi:` / `private-file:` rows remain readable and are re-encrypted by the
-migration CLI.
+`dpapi:` / `private-file:` rows remain readable but must be re-saved through the
+API to pick up the shared key; the removed SQLite importer no longer rewrites them.
 
 ## Schema
 
@@ -150,7 +150,7 @@ from `document_jobs` and reuses the same upload journal to parse, index and publ
 
 Delivery mode is chosen by `RAG_OUTBOX_BRIDGE` (two mutually exclusive modes):
 
-- `relay` (default; used for SQLite and deployments without a CDC pipeline): the
+- `relay` (default; for deployments without a CDC pipeline): the
   API process runs `DocumentOutboxRelay`, which makes one best-effort publish
   right after commit, then polls `PENDING` outbox rows every 2 seconds, publishes
   each notification to RocketMQ and marks the row `PUBLISHED`. Failures leave the
@@ -321,29 +321,9 @@ not a substitute for the journaled HTTP/MCP upload path.
 
 ## Migration
 
-Run the migration on a machine that can still read the old secrets (DPAPI-bound
-keys require the original Windows account):
-
-```powershell
-rag-state-migrate --legacy-root ~/.praxis-rag/data
-rag-state-migrate --legacy-root ~/.praxis-rag/data --apply
-```
-
-The first command is a read-only dry run. `--apply` imports:
-
-- `api-keys.sqlite3` (`id`, `digest`, assignments and protected key);
-- `knowledge-bases.sqlite3` (settings JSON, re-encrypted with the new key);
-- `<namespace>/manifest.json` plus `<namespace>/knowledge/*` source files;
-- `<namespace>/knowledge/.pdf-assets/<document_id>` and `.word-assets`;
-- `<namespace>/mcp_catalog.json`.
-
-The command is idempotent and does not delete the legacy files. Use `--force` to
-overwrite document records already present in the target and `--skip-assets` to
-skip artifact copy. Warnings are printed for records that cannot be decrypted or
-whose source file is missing; any warning makes the command exit nonzero.
-
-Keep `api-keys.sqlite3`, `knowledge-bases.sqlite3` and the tenant directories as
-a rollback copy until a MySQL deployment has been verified.
+State databases are MySQL only; the old SQLite/JSON importer was removed. A
+deployment that still holds legacy files must be migrated once with the release
+that shipped `rag-state-migrate`, before upgrading to a version without it.
 
 ## Knowledge-base index publication
 
@@ -391,11 +371,17 @@ retry. HTTP response delivery itself is outside the publication transaction.
 python -m pytest tests/test_upload_journal.py tests/test_upload_coordinator.py tests/test_upload_transaction.py tests/test_upload_entrypoints.py tests/test_qdrant_versions.py
 ```
 
-The default tests use SQLite and in-memory Qdrant without inference. For real
-integration set `RAG_TEST_MYSQL_URL` to a disposable schema named
-`praxis_txn_test_*`, optionally `RAG_TEST_QDRANT_URL`, and run
-`tests/test_mysql_upload_transactions.py`. This suite deletes its schema's rows
-and its own `txn_test_*` Qdrant collection; never point it at production state.
+The whole suite runs against a disposable MySQL schema. Set `RAG_TEST_MYSQL_URL`
+(or put it in `.env`) to a database whose name contains `test`, for example
+`mysql+pymysql://rag:...@127.0.0.1:3307/praxis_unit_test?charset=utf8mb4`.
+`tests/conftest.py` exports it as `RAG_STATE_URL`, creates the schema once and
+truncates every state table before each test. Without it the state-backed tests
+fail with the `StateSettings` configuration error.
+
+Opt-in integration suites additionally use their own disposable schemas
+(`praxis_txn_test_*`, `praxis_cache_test_*`, ...) plus `RAG_TEST_QDRANT_URL`,
+`RAG_TEST_REDIS_URL` and `RAG_TEST_ROCKETMQ_*`; each deletes only its own rows,
+collections and prefixes. Never point any of them at production state.
 
 ## Redis 状态读模型
 

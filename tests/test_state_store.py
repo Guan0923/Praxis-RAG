@@ -1,30 +1,27 @@
 """Shared state database: repositories, blobs, encryption and migrations."""
 
 import base64
-import hashlib
-import json
-import sqlite3
 
 import pytest
+from sqlalchemy import select
 
 from rag_mcp.api_keys import ApiKeyStore
 from rag_mcp.knowledge_bases import KnowledgeBaseStore
-from rag_mcp.state.migrate import main as migrate_main
-from rag_mcp.state.schema import metadata
+from rag_mcp.state.schema import api_keys as api_keys_table, metadata
 from rag_mcp.state.store import StateStores
 
 KEY = "base64:" + base64.b64encode(b"k" * 32).decode()
 
 
 @pytest.fixture()
-def stores(tmp_path, monkeypatch):
+def stores(monkeypatch):
     monkeypatch.setenv("RAG_STATE_ENCRYPTION_KEY", KEY)
-    state = StateStores.create(tmp_path / "state")
+    state = StateStores.create()
     yield state
     state.close()
 
 
-def test_api_key_lifecycle_and_portable_encryption(tmp_path, stores):
+def test_api_key_lifecycle_and_portable_encryption(stores):
     store = ApiKeyStore(stores)
     created = store.create("app", ["alpha", "beta"])
     assert store.namespaces_for_key(created["key"]) == ["alpha", "beta"]
@@ -32,7 +29,10 @@ def test_api_key_lifecycle_and_portable_encryption(tmp_path, stores):
     assert all("key" not in item for item in store.list())
     with pytest.raises(PermissionError):
         store.secret_for_namespace(created["id"], "other")
-    assert created["key"].encode() not in (tmp_path / "state" / "state.sqlite3").read_bytes()
+    with stores.engine.connect() as conn:
+        stored = [dict(row) for row in conn.execute(select(api_keys_table)).mappings()]
+    assert stored
+    assert created["key"] not in repr(stored)
     assert store.update(created["id"], "renamed", ["beta"], False)["enabled"] is False
     with pytest.raises(ValueError, match="停用"):
         store.namespaces_for_key(created["key"])
@@ -111,48 +111,3 @@ def test_mysql_schema_compiles_with_long_columns():
     assert "LONGBLOB" in ddl
     assert "LONGTEXT" in ddl
     assert "utf8mb4_bin" in ddl
-
-
-def test_legacy_migration_imports_sqlite_files_and_blobs(tmp_path, monkeypatch):
-    root = tmp_path / "legacy"
-    target = tmp_path / "target"
-    alpha = root / "alpha"
-    (alpha / "knowledge" / ".pdf-assets" / "doc-a").mkdir(parents=True)
-    (alpha / "knowledge" / "a.txt").write_bytes(b"legacy text")
-    (alpha / "knowledge" / ".pdf-assets" / "doc-a" / "document.md").write_text("saved pdf", encoding="utf-8")
-    (alpha / "manifest.json").write_text(json.dumps({"a.txt": {
-        "name": "a.txt", "size": 11, "document_id": "doc-a",
-        "sha256": hashlib.sha256(b"legacy text").hexdigest(), "chunk_count": 1,
-        "collection": "c", "indexed_at": "2026-01-01", "chunking": {},
-    }}), encoding="utf-8")
-    (alpha / "mcp_catalog.json").write_text('{"tools":{},"prompts":{}}', encoding="utf-8")
-    with sqlite3.connect(root / "api-keys.sqlite3") as db:
-        db.execute("CREATE TABLE api_keys (id TEXT PRIMARY KEY, name TEXT, prefix TEXT, digest TEXT,"
-                   " namespaces TEXT, enabled INTEGER, created_at TEXT, protected_key TEXT)")
-        db.execute("INSERT INTO api_keys VALUES (?,?,?,?,?,?,?,?)",
-                   ("k1", "App", "prk_x", hashlib.sha256(b"prk_secret").hexdigest(),
-                    '["alpha"]', 1, "2026-01-01", None))
-    with sqlite3.connect(root / "knowledge-bases.sqlite3") as db:
-        db.execute("CREATE TABLE knowledge_bases (namespace TEXT PRIMARY KEY, settings TEXT)")
-        db.execute("INSERT INTO knowledge_bases VALUES (?,?)", ("alpha", json.dumps({
-            "namespace": "alpha", "collection": "c", "vector_size": 3,
-            "embedding_model": "m", "reranker_model": "",
-            "embedding": {"base_url": "u", "protected_key": ""},
-            "reranker": {"base_url": "", "protected_key": ""},
-            "tokenizer": "t", "strategy": "character", "chunk_size": 100, "chunk_overlap": 10,
-        })))
-    monkeypatch.setenv("RAG_STATE_ENCRYPTION_KEY", KEY)
-    monkeypatch.setenv("RAG_STATE_URL", "sqlite+pysqlite:///" + (target / "state.sqlite3").as_posix())
-    assert migrate_main(["--legacy-root", str(root), "--apply"]) == 0
-    assert migrate_main(["--legacy-root", str(root), "--apply"]) == 0
-
-    state = StateStores.create(target)
-    try:
-        assert state.api_keys.namespaces_for_key("prk_secret") == ["alpha"]
-        assert state.knowledge_bases.get("alpha")["collection"] == "c"
-        assert state.documents.get("alpha", "a.txt")["document_id"] == "doc-a"
-        assert state.blobs.get("alpha", "source", "a.txt") == b"legacy text"
-        assert state.blobs.get_text("alpha", "pdf-assets", "doc-a/document.md") == "saved pdf"
-        assert json.loads(state.catalogs.load("alpha")) == {"tools": {}, "prompts": {}}
-    finally:
-        state.close()

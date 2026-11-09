@@ -1,4 +1,4 @@
-# Start dependencies, provision normal queues and readable DLQs, migrate, then run rag-service.
+# Start dependencies, provision normal queues and readable DLQs, then run rag-service.
 # Normal DLQ receive/ACK verified with SDK 5.1.2 / Apache Broker 5.3.3; revalidate other deployments.
 # Run rag-document-worker and rag-search-worker separately with the same database,
 # Redis, Qdrant, encryption and RocketMQ settings. Without a search consumer,
@@ -10,17 +10,11 @@
 # Both deliver the same identifier-only notification; never enable both.
 #
 #   .\scripts\start-stack.ps1                 # full start
-#   .\scripts\start-stack.ps1 -MigrateOnly    # only start dependencies + migrate
-#   .\scripts\start-stack.ps1 -SkipMigrate    # start without importing legacy data
 #
 # Run this from a normal PowerShell window (not the sandboxed agent shell), because
 # Docker Desktop exposes a named pipe that the agent sandbox cannot open.
 
-param(
-    [switch]$MigrateOnly,
-    [switch]$SkipMigrate,
-    [string]$LegacyRoot = (Join-Path $env:USERPROFILE ".praxis-rag\data")
-)
+param()
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -191,24 +185,6 @@ if (-not $mqReady) { throw "RocketMQ provisioning failed. Check docker-compose l
 Write-Host "Consumers are not started: run rag-search-worker for MCP search and rag-document-worker for MCP add_document separately."
 Write-Host "DLQ resources are provisioned; planned rag-dead-letter-worker --kind document|search needs reader permissions. Revalidate SDK/Broker versions other than tested 5.1.2/5.3.3."
 Write-Host "Document uploads are accepted by a MySQL commit; MQ only carries the notification. Deploy API and workers together; drain schema-2 chunked messages before upgrading."
-
-if (-not $SkipMigrate) {
-    if (Test-Path $LegacyRoot) {
-        Write-Host "Migrating legacy state from $LegacyRoot (repeatable)..."
-        & $python -m rag_mcp.state.migrate --legacy-root $LegacyRoot --apply
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Migration reported warnings; review them before serving traffic."
-        }
-    }
-    else {
-        Write-Host "Legacy data root not found ($LegacyRoot); skipping migration."
-    }
-}
-
-if ($MigrateOnly) {
-    Write-Host "Dependencies started and migration finished."
-    exit 0
-}
 
 Write-Host "Starting rag-service on http://$($env:RAG_SERVICE_HOST):$($env:RAG_SERVICE_PORT)/console"
 & $python -m rag_mcp.http_service

@@ -1,12 +1,10 @@
 """Index publication must survive lost commit acknowledgements and post-commit failures."""
 
-import os
 import threading
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import delete, update
-from sqlalchemy.engine import make_url
+from sqlalchemy import update
 
 from rag_mcp.config import RagConfig
 from rag_mcp.service_knowledge import KnowledgeError, RagServiceRuntime
@@ -16,20 +14,11 @@ from rag_mcp.state.store import StateStores
 
 
 @pytest.fixture
-def publication(tmp_path, monkeypatch):
+def publication(tmp_path, monkeypatch, state_url):
     import rag_mcp.service_knowledge as module
     from rag_mcp.storage.qdrant_store import QdrantStore
 
-    url = os.getenv("RAG_TEST_PUBLICATION_MYSQL_URL")
-    if url:
-        assert make_url(url).database.startswith("praxis_publication_test_"), "Disposable schema only"
-    state = StateStores(StateSettings(url=url or f"sqlite+pysqlite:///{tmp_path / 'publication.sqlite3'}"))
-    if url:
-        from rag_mcp.state.schema import metadata
-
-        with state.engine.begin() as conn:
-            for table in reversed(metadata.sorted_tables):
-                conn.execute(delete(table))
+    state = StateStores(StateSettings(url=state_url))
     state.knowledge_bases.create({
         "namespace": "alpha", "collection": "old", "embedding_model": "model", "reranker_model": "", "vector_size": 3,
         "tokenizer": "unused", "strategy": "character", "chunk_size": 100, "chunk_overlap": 10,
