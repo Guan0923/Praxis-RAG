@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"errors"
 	"log"
 	"os"
 	"strconv"
@@ -15,7 +14,7 @@ import (
 )
 
 // BackgroundPublisher is one broker adapter that publishes both notification
-// kinds (mq.Publisher implements it with one RocketMQ producer).
+// kinds (mq.Publisher implements it with one Kafka producer).
 type BackgroundPublisher interface {
 	state.DocumentNotificationPublisher
 	state.SearchNotificationPublisher
@@ -76,7 +75,7 @@ var (
 // document outbox relays when their transports are available, and launches the
 // periodic maintenance loop (upload recovery/cleanup, search expiry, document
 // job sweep/GC, snapshot/artifact purges). It never blocks on broker
-// availability: a missing RocketMQ endpoint simply leaves submissions
+// availability: a missing Kafka bootstrap server list simply leaves submissions
 // fail-closed until a publisher is injected.
 func (s *Service) StartBackground(ctx context.Context, options ...BackgroundOption) error {
 	configuration := backgroundOptions{
@@ -117,11 +116,17 @@ func (s *Service) StartBackground(ctx context.Context, options ...BackgroundOpti
 	}
 	if s.stores.DocumentDispatcher != nil {
 		s.stores.DocumentDispatcher.Transport = publisher
-		if publisher != nil {
-			s.stores.DocumentDispatcher.Start()
+		bridgeMode := strings.TrimSpace(s.stores.DocumentDispatcher.Mode)
+		if bridgeMode == "" {
+			bridgeMode = "relay"
 		}
-		if s.stores.DocumentDispatcher.Mode == "debezium" {
-			log.Printf("Document outbox bridge mode=debezium; in-process relay disabled (external CDC publishes outbox notifications)")
+		// Debezium streams the committed outbox rows to Kafka itself; the
+		// in-process relay must not double-publish them. Without a broker the
+		// relay stays idle so submissions remain fail-closed.
+		relayEnabled := publisher != nil && bridgeMode != "debezium"
+		log.Printf("Document outbox bridge mode=%s relay_enabled=%t", bridgeMode, relayEnabled)
+		if relayEnabled {
+			s.stores.DocumentDispatcher.Start()
 		}
 	}
 	if s.stores.CacheSync != nil && s.stores.CacheSync.Enabled() {
@@ -169,23 +174,23 @@ func (s *Service) BackgroundRunning() bool {
 	return exists
 }
 
-// newBrokerPublisher resolves RocketMQ settings lazily. A missing endpoint means
-// "run without a broker" (nil, no error); an invalid configuration is logged and
-// also degrades to nil so the service can start and report fail-closed
-// submissions instead of crashing.
+// newBrokerPublisher resolves Kafka settings lazily. A missing bootstrap server
+// list means "run without a broker" (nil, no error); an invalid configuration is
+// logged and also degrades to nil so the service can start and report
+// fail-closed submissions instead of crashing.
 func (s *Service) newBrokerPublisher() BackgroundPublisher {
 	settings, err := mq.SettingsFromEnv()
 	if err != nil {
-		log.Printf("Message queue settings are invalid; async submissions stay fail-closed category=%s", errorTypeName(err))
+		log.Printf("Kafka settings are invalid; async submissions stay fail-closed category=%s", errorTypeName(err))
+		return nil
+	}
+	if !settings.Configured() {
+		log.Printf("Kafka bootstrap servers are not configured; async submissions stay fail-closed")
 		return nil
 	}
 	publisher, err := mq.NewPublisher(settings)
 	if err != nil {
-		if errors.Is(err, mq.ErrNotConfigured) {
-			log.Printf("RocketMQ endpoint is not configured; async submissions stay fail-closed")
-			return nil
-		}
-		log.Printf("RocketMQ publisher unavailable; async submissions stay fail-closed category=%s", errorTypeName(err))
+		log.Printf("Kafka publisher unavailable; async submissions stay fail-closed category=%s", errorTypeName(err))
 		return nil
 	}
 	return publisher

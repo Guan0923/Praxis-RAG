@@ -25,6 +25,8 @@ task deadline, so the retrieval implementation must honour `ctx`.
 ## main.go lifecycle sketch
 
 ```go
+// Kafka settings: bootstrap servers (RAG_KAFKA_BOOTSTRAP_SERVERS) plus the
+// search topic/group (RAG_SEARCH_TOPIC / RAG_SEARCH_GROUP).
 settings, err := mq.SettingsFromEnv()
 if err != nil { return err }
 
@@ -51,8 +53,8 @@ worker, err := searchworker.New(searchworker.Options{
 if err != nil { return err }
 
 config := mq.DefaultConsumerConfig(settings.SearchTopic, settings.SearchGroup)
-config.MaxAttempts = 5                                     // broker retry budget; exhausted -> DLQ
-consumer, err := mq.NewRocketMQPullConsumer(settings, config, worker.MessageHandler())
+config.MaxAttempts = 5                                     // Kafka consumer retries in-process; exhausted -> DLQ topic
+consumer, err := mq.NewKafkaPullConsumer(settings, config, worker.MessageHandler())
 if err != nil { return err }
 consumer.OnExhausted = worker.ExhaustedHandler()           // durable terminal state, then ack
 
@@ -64,11 +66,12 @@ return service.Close(ctx)
 ```
 
 Dead-letter binary (`cmd/rag-dead-letter-worker --kind search`): construct the
-processor with only `Tasks` (no Searcher) and the DLQ topic configuration
-(`%DLQ%<search group>`), then run
-`mq.NewPullConsumer(config, transport, worker.DeadLetterHandler())`. The handler
-returns true only after the durable task is terminal (or already absent), so the
-broker only acks confirmed outcomes.
+processor with only `Tasks` (no Searcher) and a Kafka consumer subscribed to the
+search DLQ topic (`RAG_SEARCH_DLQ_TOPIC`), then run
+`mq.NewKafkaPullConsumer(settings, dlqConfig, worker.DeadLetterHandler())`. The
+Kafka adapter publishes exhausted deliveries to that topic; the handler returns
+true only after the durable task is terminal (or already absent), so the consumer
+only acks confirmed outcomes.
 
 ## Broker-less / local mode
 
@@ -83,7 +86,8 @@ Production workers use `RunConsumer` with `mq.PullConsumer`.
   `SearchTasks.Fail(retry)` where Python-ValueError-shaped errors are terminal.
   Ack = `Terminal` says unknown/timed-out/failed/succeeded.
 * Poison/malformed broker payloads are nacked (`MessageHandler` returns false)
-  so the broker retry/DLQ policy applies; dead-letter payloads that cannot be
-  decoded are ignored (not acked) by `DeadLetterHandler`.
+  so the Kafka consumer's in-process retry policy applies (exhausted deliveries
+  are published to the search DLQ topic by the adapter); dead-letter payloads
+  that cannot be decoded are ignored (not acked) by `DeadLetterHandler`.
 * No comment is written on `Fail` (state keeps the Python-compatible status only;
   the cause is logged by category).

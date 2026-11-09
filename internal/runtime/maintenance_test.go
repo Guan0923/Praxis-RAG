@@ -178,6 +178,81 @@ func TestMaintenancePurgesExpiredArtifacts(t *testing.T) {
 	}
 }
 
+// TestStartBackgroundRespectsOutboxBridgeMode pins the Kafka/Debezium relay
+// contract: relay mode publishes committed outbox rows in-process, debezium mode
+// leaves them for the external CDC bridge and never starts the in-process relay.
+func TestStartBackgroundRespectsOutboxBridgeMode(t *testing.T) {
+	ctx := context.Background()
+	submitPending := func(t *testing.T, stores *state.Stores, name string) {
+		t.Helper()
+		if err := stores.KnowledgeBases.Create(ctx,
+			testKnowledgeBaseSettings(t, "alpha", "http://127.0.0.1:1", "knowledge_test")); err != nil {
+			t.Fatalf("KnowledgeBases.Create() error = %v", err)
+		}
+		if _, err := stores.DocumentJobs.Submit(ctx, "alpha", name, []byte("bridge bytes"), nil); err != nil {
+			t.Fatalf("DocumentJobs.Submit() error = %v", err)
+		}
+	}
+
+	t.Run("relay publishes in-process", func(t *testing.T) {
+		t.Setenv("RAG_OUTBOX_BRIDGE", "relay")
+		service, stores := newMaintenanceService(t)
+		if stores.DocumentDispatcher.Relay == nil {
+			t.Fatalf("relay mode must build an in-process document outbox relay")
+		}
+		stores.DocumentDispatcher.Relay.PollSeconds = 0.02
+		submitPending(t, stores, "relay.md")
+		broker := &fakeBroker{}
+		if err := service.StartBackground(ctx,
+			WithBackgroundPublisher(broker),
+			WithMaintenanceInterval(0),
+			WithInitialMaintenancePass(false),
+		); err != nil {
+			t.Fatalf("StartBackground() error = %v", err)
+		}
+		t.Cleanup(service.StopBackground)
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && broker.documentNotificationCount() == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if broker.documentNotificationCount() == 0 {
+			t.Fatalf("relay mode did not publish the committed outbox row")
+		}
+		if events, err := stores.DocumentJobs.PendingOutbox(ctx, 10); err != nil {
+			t.Fatalf("PendingOutbox() error = %v", err)
+		} else if len(events) != 0 {
+			t.Errorf("pending outbox rows after relay = %d", len(events))
+		}
+	})
+
+	t.Run("debezium leaves persistence to the CDC bridge", func(t *testing.T) {
+		t.Setenv("RAG_OUTBOX_BRIDGE", "debezium")
+		service, stores := newMaintenanceService(t)
+		if stores.DocumentDispatcher.Relay != nil {
+			t.Fatalf("debezium mode must not build an in-process relay")
+		}
+		submitPending(t, stores, "debezium.md")
+		broker := &fakeBroker{}
+		if err := service.StartBackground(ctx,
+			WithBackgroundPublisher(broker),
+			WithMaintenanceInterval(0),
+			WithInitialMaintenancePass(false),
+		); err != nil {
+			t.Fatalf("StartBackground() error = %v", err)
+		}
+		t.Cleanup(service.StopBackground)
+		time.Sleep(150 * time.Millisecond)
+		if broker.documentNotificationCount() != 0 {
+			t.Errorf("debezium mode published %d notification(s) in-process", broker.documentNotificationCount())
+		}
+		if events, err := stores.DocumentJobs.PendingOutbox(ctx, 10); err != nil {
+			t.Fatalf("PendingOutbox() error = %v", err)
+		} else if len(events) == 0 {
+			t.Errorf("debezium mode must leave the outbox row pending for the CDC bridge")
+		}
+	})
+}
+
 func TestBackgroundLifecycle(t *testing.T) {
 	service, stores := newMaintenanceService(t)
 	ctx := context.Background()

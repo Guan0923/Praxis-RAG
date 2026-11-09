@@ -30,6 +30,8 @@ return nil until G2 journal recovery lands.
 ## main.go lifecycle sketch
 
 ```go
+// Kafka settings: bootstrap servers (RAG_KAFKA_BOOTSTRAP_SERVERS) plus the
+// document topic/group (RAG_DOCUMENT_TOPIC / RAG_DOCUMENT_GROUP).
 settings, err := mq.SettingsFromEnv()
 if err != nil { return err }
 stateSettings, err := state.SettingsFromEnv(serviceSettings.DataRoot)
@@ -55,8 +57,8 @@ worker, err := documentworker.New(documentworker.Options{
 if err != nil { return err }
 
 config := mq.DefaultConsumerConfig(settings.DocumentTopic, settings.DocumentGroup)
-config.MaxAttempts = 5                                    // exhausted -> DLQ
-consumer, err := mq.NewRocketMQPullConsumer(settings, config, worker.MessageHandler())
+config.MaxAttempts = 5                                    // Kafka consumer retries in-process; exhausted -> DLQ topic
+consumer, err := mq.NewKafkaPullConsumer(settings, config, worker.MessageHandler())
 if err != nil { return err }
 consumer.OnExhausted = worker.ExhaustedHandler()          // durable "failed", then ack
 
@@ -87,10 +89,12 @@ which drains committed PENDING outbox rows without a broker; job retries are
 re-emitted by `Sweep`. Override `Options.Receiver` for tests/fakes.
 
 Dead-letter binary (`cmd/rag-dead-letter-worker --kind document`): construct the
-processor with only `Jobs` (no Ingester) and the DLQ topic
-(`%DLQ%<document group>`), then run `worker.DeadLetterHandler()` through a pull
-consumer. The handler acks only once the job is durably terminal (or absent), and
-returns false while a live lease or unfinished journal publication exists.
+processor with only `Jobs` (no Ingester) and a Kafka consumer subscribed to the
+document DLQ topic (`RAG_DOCUMENT_DLQ_TOPIC`), then run
+`worker.DeadLetterHandler()` through that consumer. The Kafka adapter publishes
+exhausted deliveries to the DLQ topic; the handler acks only once the job is
+durably terminal (or absent), and returns false while a live lease or unfinished
+journal publication exists.
 
 ## Semantics distilled from document_worker.py
 

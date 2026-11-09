@@ -128,7 +128,7 @@ func (s *Service) GetSearchResult(ctx context.Context, namespace, resultID strin
 	return s.getSearchResultOrdered(ctx, namespace, resultID, page, pageSize)
 }
 
-// SubmitSearch enqueues a retrieval action. Queued search (Redis + RocketMQ)
+// SubmitSearch enqueues a retrieval action. Queued search (Redis + Kafka)
 // arrives in G7; until then the service reports the limitation safely instead
 // of silently running retrieval.
 // SubmitSearch enqueues one retrieval action and returns its result UUID.
