@@ -94,24 +94,32 @@ func TestCacheSettingsValidation(t *testing.T) {
 	}
 }
 
-func TestRocketMQSettingsAndEventID(t *testing.T) {
+func TestBrokerSettingsAndEventID(t *testing.T) {
 	isolateStateEnv(t)
-	settings := RocketMQSettingsFromEnv()
-	if settings.Endpoint != "" || settings.Topic != "praxis_state_cache_refresh" ||
-		settings.Group != "praxis_state_cache_refresh_workers" || settings.TLS {
-		t.Fatalf("unexpected queue defaults: %+v", settings)
+	settings := BrokerSettingsFromEnv()
+	if settings.BootstrapServers != "" || settings.CacheTopic != "praxis_state_cache_refresh" ||
+		settings.CacheGroup != "praxis_state_cache_refresh_workers" ||
+		settings.ClientID != "praxis-rag" || settings.SecurityProtocol != "PLAINTEXT" ||
+		settings.SASLMechanism != "" || settings.TLSCA != "" || settings.TLSInsecure {
+		t.Fatalf("unexpected broker defaults: %+v", settings)
 	}
-	t.Setenv("RAG_ROCKETMQ_ENDPOINT", "localhost:8081")
-	t.Setenv("RAG_ROCKETMQ_TOPIC", "topic")
-	t.Setenv("RAG_ROCKETMQ_GROUP", "group")
-	t.Setenv("RAG_ROCKETMQ_NAMESPACE", "ns")
-	t.Setenv("RAG_ROCKETMQ_ACCESS_KEY", "key")
-	t.Setenv("RAG_ROCKETMQ_SECRET_KEY", "secret")
-	t.Setenv("RAG_ROCKETMQ_TLS", "YES")
-	settings = RocketMQSettingsFromEnv()
-	if settings.Endpoint != "localhost:8081" || settings.Topic != "topic" || settings.Group != "group" ||
-		settings.Namespace != "ns" || settings.AccessKey != "key" || settings.SecretKey != "secret" || !settings.TLS {
-		t.Fatalf("unexpected queue settings: %+v", settings)
+	t.Setenv("RAG_KAFKA_BOOTSTRAP_SERVERS", "localhost:9092,localhost:9093")
+	t.Setenv("RAG_CACHE_TOPIC", "topic")
+	t.Setenv("RAG_CACHE_GROUP", "group")
+	t.Setenv("RAG_KAFKA_CLIENT_ID", "client")
+	t.Setenv("RAG_KAFKA_SECURITY_PROTOCOL", "SASL_SSL")
+	t.Setenv("RAG_KAFKA_SASL_MECHANISM", "SCRAM-SHA-512")
+	t.Setenv("RAG_KAFKA_SASL_USERNAME", "user")
+	t.Setenv("RAG_KAFKA_SASL_PASSWORD", "secret")
+	t.Setenv("RAG_KAFKA_TLS_CA", "C:/certs/ca.pem")
+	t.Setenv("RAG_KAFKA_TLS_INSECURE", "YES")
+	settings = BrokerSettingsFromEnv()
+	if settings.BootstrapServers != "localhost:9092,localhost:9093" || settings.CacheTopic != "topic" ||
+		settings.CacheGroup != "group" || settings.ClientID != "client" ||
+		settings.SecurityProtocol != "SASL_SSL" || settings.SASLMechanism != "SCRAM-SHA-512" ||
+		settings.SASLUsername != "user" || settings.SASLPassword != "secret" ||
+		settings.TLSCA != "C:/certs/ca.pem" || !settings.TLSInsecure {
+		t.Fatalf("unexpected broker settings: %+v", settings)
 	}
 	if !ValidateCacheEventID("0123456789abcdef0123456789abcdef") {
 		t.Fatal("valid event id rejected")

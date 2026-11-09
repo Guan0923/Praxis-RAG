@@ -32,7 +32,7 @@ type StateCache interface {
 }
 
 // EventPublisher is the durable retry transport for cache refresh events
-// (RocketMQ in production). Only 32-char lowercase event ids cross the queue.
+// (Kafka in production). Only 32-char lowercase event ids cross the queue.
 type EventPublisher interface {
 	Send(eventID string) error
 	ConsumeOnce(callback func(eventID string) bool)
@@ -135,27 +135,39 @@ func (s CacheSettings) backendEnabled() bool {
 	return s.URL != ""
 }
 
-// RocketMQSettings mirrors rag_mcp.state.cache_queue.RocketMQSettings.
-type RocketMQSettings struct {
-	Endpoint  string
-	Topic     string
-	Group     string
-	Namespace string
-	AccessKey string
-	SecretKey string
-	TLS       bool
+// The cache refresh queue uses Kafka (see BrokerSettingsFromEnv).
+//
+// BrokerSettings mirrors the Kafka broker/queue settings shared with the
+// transport packages (rag_mcp.state.cache_queue). An empty BootstrapServers
+// means the process runs brokerless and events stay in the durable outbox.
+type BrokerSettings struct {
+	BootstrapServers string
+	CacheTopic       string
+	CacheGroup       string
+	ClientID         string
+	SecurityProtocol string
+	SASLMechanism    string
+	SASLUsername     string
+	SASLPassword     string
+	TLSCA            string
+	TLSInsecure      bool
 }
 
-// RocketMQSettingsFromEnv mirrors RocketMQSettings.from_env.
-func RocketMQSettingsFromEnv() RocketMQSettings {
-	return RocketMQSettings{
-		Endpoint:  strings.TrimSpace(os.Getenv("RAG_ROCKETMQ_ENDPOINT")),
-		Topic:     strings.TrimSpace(envOrDefault("RAG_ROCKETMQ_TOPIC", "praxis_state_cache_refresh")),
-		Group:     strings.TrimSpace(envOrDefault("RAG_ROCKETMQ_GROUP", "praxis_state_cache_refresh_workers")),
-		Namespace: strings.TrimSpace(os.Getenv("RAG_ROCKETMQ_NAMESPACE")),
-		AccessKey: os.Getenv("RAG_ROCKETMQ_ACCESS_KEY"),
-		SecretKey: os.Getenv("RAG_ROCKETMQ_SECRET_KEY"),
-		TLS:       isTruthyValue(os.Getenv("RAG_ROCKETMQ_TLS")),
+// BrokerSettingsFromEnv reads the RAG_KAFKA_*/RAG_CACHE_* contract. The cache
+// topic/group defaults match the Python queue settings; every string setting is
+// trimmed like the Python parser.
+func BrokerSettingsFromEnv() BrokerSettings {
+	return BrokerSettings{
+		BootstrapServers: strings.TrimSpace(os.Getenv("RAG_KAFKA_BOOTSTRAP_SERVERS")),
+		CacheTopic:       strings.TrimSpace(envOrDefault("RAG_CACHE_TOPIC", "praxis_state_cache_refresh")),
+		CacheGroup:       strings.TrimSpace(envOrDefault("RAG_CACHE_GROUP", "praxis_state_cache_refresh_workers")),
+		ClientID:         strings.TrimSpace(envOrDefault("RAG_KAFKA_CLIENT_ID", "praxis-rag")),
+		SecurityProtocol: strings.TrimSpace(envOrDefault("RAG_KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")),
+		SASLMechanism:    strings.TrimSpace(os.Getenv("RAG_KAFKA_SASL_MECHANISM")),
+		SASLUsername:     os.Getenv("RAG_KAFKA_SASL_USERNAME"),
+		SASLPassword:     os.Getenv("RAG_KAFKA_SASL_PASSWORD"),
+		TLSCA:            strings.TrimSpace(os.Getenv("RAG_KAFKA_TLS_CA")),
+		TLSInsecure:      isTruthyValue(os.Getenv("RAG_KAFKA_TLS_INSECURE")),
 	}
 }
 
@@ -169,7 +181,7 @@ func isTruthyValue(raw string) bool {
 	}
 }
 
-// ValidateCacheEventID mirrors RocketMQCacheQueue.send's event id guard.
+// ValidateCacheEventID mirrors the cache queue send's event id guard.
 func ValidateCacheEventID(eventID string) bool {
 	if len(eventID) != 32 {
 		return false

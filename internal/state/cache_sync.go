@@ -30,7 +30,7 @@ type CacheSynchronizer struct {
 	Settings CacheSettings
 	// Backend is the read-through snapshot cache (Redis in production).
 	Backend StateCache
-	// Transport is the durable retry publisher (RocketMQ in production).
+	// Transport is the durable retry publisher (Kafka in production).
 	Transport EventPublisher
 
 	loaders map[string]ViewLoader
@@ -45,10 +45,10 @@ type CacheSynchronizer struct {
 }
 
 // NewDefaultCacheSynchronizer builds the synchronizer from RAG_REDIS_* and
-// RAG_ROCKETMQ_* environment settings. The Redis client and RocketMQ producer
-// are not ported yet (deferred to the async phase); configured endpoints log a
-// warning and fall back to authoritative reads while the durable outbox keeps
-// pending events.
+// RAG_KAFKA_* environment settings. The Redis client and Kafka producer are not
+// ported yet (deferred to the async phase); configured endpoints log a warning
+// and fall back to authoritative reads while the durable outbox keeps pending
+// events.
 func NewDefaultCacheSynchronizer(stores *Stores) (*CacheSynchronizer, error) {
 	settings, err := CacheSettingsFromEnv()
 	if err != nil {
@@ -64,8 +64,8 @@ func NewDefaultCacheSynchronizer(stores *Stores) (*CacheSynchronizer, error) {
 		log.Printf("RAG_REDIS_URL/RAG_REDIS_ENABLED is set but the Go Redis state-cache client is not ported yet; " +
 			"reads use the authoritative database (deferred to the async phase)")
 	}
-	if RocketMQSettingsFromEnv().Endpoint != "" {
-		log.Printf("RAG_ROCKETMQ_ENDPOINT is set but the Go RocketMQ transport is not ported yet; " +
+	if BrokerSettingsFromEnv().BootstrapServers != "" {
+		log.Printf("RAG_KAFKA_BOOTSTRAP_SERVERS is set but the Go Kafka transport is not ported yet; " +
 			"cache refresh events stay in the durable outbox (deferred to the async phase)")
 	}
 	return synchronizer, nil

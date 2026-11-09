@@ -51,7 +51,7 @@ func isUniqueViolation(err error) bool {
 // process. It mirrors rag_mcp.state.store.StateStores.
 //
 // TODO(G2/G7) still deferred from the state-layer port:
-//   - Concrete RocketMQ document/search notification publishers and the Redis
+//   - Concrete Kafka document/search notification publishers and the Redis
 //     StateCache/TransientStore clients; the narrow interfaces and durable
 //     outbox state machines are in place for the worker binaries.
 //   - Worker main packages (rag-document-worker / rag-search-worker /

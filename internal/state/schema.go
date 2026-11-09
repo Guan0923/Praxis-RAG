@@ -489,7 +489,7 @@ var schemaTables = []*SchemaTable{
 	},
 	// Retired tables: retained so existing databases keep their history, but
 	// they are no longer read or written. The active path is document_jobs +
-	// document_job_outbox (MySQL is the source of truth, RocketMQ carries a
+	// document_job_outbox (MySQL is the source of truth, Kafka carries a
 	// notification only).
 	{
 		Name: "document_tasks",
