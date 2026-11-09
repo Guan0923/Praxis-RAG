@@ -31,8 +31,11 @@ Docling, so the Python environment and the model directory are still required.
 
 The Go runtime sets `PYTHONUTF8=1`, prepends `PYTHONPATH` and injects the
 `RAG_VLM_*` variables before spawning the workers, so the API key never appears
-on a command line. Point `PYTHONPATH` at this directory (i.e. the parent of the
-`rag_mcp` package) when it is not installed into the interpreter's environment:
+on a command line. The values come from the knowledge base's Console settings
+(VLM section, stored encrypted in the state database) and fall back to the
+service environment when the knowledge base has none. Point `PYTHONPATH` at this
+directory (i.e. the parent of the `rag_mcp` package) when it is not installed
+into the interpreter's environment:
 
 ```powershell
 $env:PYTHONPATH = (Resolve-Path .\python-workers).Path

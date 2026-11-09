@@ -213,6 +213,8 @@ func (a HTTPRuntime) CreateKnowledgeBase(ctx context.Context, input httpapi.Know
 		RerankerModel:   input.RerankerModel,
 		EmbeddingValues: input.EmbeddingValues,
 		RerankerValues:  input.RerankerValues,
+		VLMModel:        input.VLMModel,
+		VLMValues:       input.VLMValues,
 		TokenizerModel:  a.Service.Config().ChunkTokenizerModel,
 	})
 }

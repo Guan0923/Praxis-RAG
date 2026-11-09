@@ -15,12 +15,14 @@ export type ProviderSettings = { base_url: string; api_key_set: boolean };
 export type KnowledgeBase = Chunking & {
   embedding: ProviderSettings;
   reranker: ProviderSettings;
+  vlm: ProviderSettings;
   updated_at?: string;
   reembedded_at?: string;
   namespace: string;
   vector_size: number;
   embedding_model: string;
   reranker_model: string;
+  vlm_model?: string;
   collection: string;
   tokenizer: string;
   created_at: string;

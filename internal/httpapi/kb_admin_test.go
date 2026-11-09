@@ -146,6 +146,19 @@ func TestKnowledgeBaseAdminCreate(t *testing.T) {
 		t.Fatalf("embedding values = %v", input.EmbeddingValues)
 	}
 
+	vlmBody := `{"namespace":"beta","embedding":{"base_url":"http://model.local/v1"},` +
+		`"embedding_model":"BAAI/bge-m3","vlm":{"base_url":"http://vlm.local/v1","apikey":"vlm-sekret"},` +
+		`"vlm_model":"qwen2.5-vl-7b","strategy":"character","chunk_size":700,"chunk_overlap":100}`
+	if created := performRequest(handler, testRequest{
+		method: "POST", target: "/v1/admin/knowledge-bases", remote: "127.0.0.1:5000", body: vlmBody,
+	}); created.Code != http.StatusCreated {
+		t.Fatalf("vlm create status = %d body = %s", created.Code, created.Body.String())
+	}
+	if input := runtime.createInput; input.VLMModel != "qwen2.5-vl-7b" ||
+		input.VLMValues["base_url"] != "http://vlm.local/v1" || input.VLMValues["apikey"] != "vlm-sekret" {
+		t.Fatalf("vlm input = %+v values = %v", input, input.VLMValues)
+	}
+
 	invalidNamespace := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/admin/knowledge-bases", remote: "127.0.0.1:5000",
 		body: `{"namespace":"bad namespace","embedding_model":"x"}`,

@@ -182,15 +182,15 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_PDF_PARSER_PYTHON` | 空 | Docling 解析进程的 Python 可执行文件 |
 | `RAG_PDF_MODELS_PATH` | 空 | Docling 本地版面/表格/OCR 模型目录 |
 | `RAG_PDF_PARSE_TIMEOUT` | `900` 秒（30..7200） | PDF 解析外部进程超时 |
-| `RAG_VLM_BASE_URL` | 空 | 远端 OpenAI 兼容 VLM 端点，如 `https://llm.internal/v1` |
+| `RAG_VLM_BASE_URL` | 空 | 远端 OpenAI 兼容 VLM 端点的**环境回退值**；Console 知识库设置优先 |
 | `RAG_VLM_API_KEY` | 空 | VLM 端点密钥，作为 `Authorization: Bearer` 发送 |
-| `RAG_VLM_MODEL` | 空 | 端点上的模型名，如 `qwen2.5-vl-7b` |
+| `RAG_VLM_MODEL` | 空 | 端点上的模型名，如 `qwen2.5-vl-7b`（环境回退值） |
 | `RAG_VLM_TIMEOUT` | `120` 秒（1..3600） | 单次 VLM 请求超时 |
 | `RAG_VLM_CONCURRENCY` | `4`（1..64） | 并发 VLM 请求数 |
 | `RAG_WORD_CONVERTER_PATH` | 空 | LibreOffice `soffice` 路径（DOC 转换） |
 | `RAG_WORD_CONVERT_TIMEOUT` | `120` 秒（1..7200） | DOC 转换超时 |
 
-外部解析器的实际调用发生在 ingest 阶段：Go 进程启动外部 Python/soffice 子进程，通过文件协议交换解析产物。PDF 解析仍需要 Python/Docling 环境与本地模型目录（版面、表格、OCR 在本地跑）；**公式识别与图片描述改为调用远端 VLM**，由 `RAG_VLM_BASE_URL`/`RAG_VLM_API_KEY`/`RAG_VLM_MODEL` 配置，未配置时 PDF 解析会明确失败而不是回退到本地模型。Word 无图注图片同样走该远端端点；配置了 VLM 后 Go 会自动启用 `word_vision_worker`。这些外部依赖未在本仓库的 Go 测试环境中实机验证。
+外部解析器的实际调用发生在 ingest 阶段：Go 进程启动外部 Python/soffice 子进程，通过文件协议交换解析产物。PDF 解析仍需要 Python/Docling 环境与本地模型目录（版面、表格、OCR 在本地跑）；**公式识别与图片描述改为调用远端 VLM**，由 `RAG_VLM_BASE_URL`/`RAG_VLM_API_KEY`/`RAG_VLM_MODEL` 配置，未配置时 PDF 解析会明确失败而不是回退到本地模型。Word 无图注图片同样走该远端端点；配置了 VLM 后 Go 会自动启用 `word_vision_worker`。这些外部依赖未在本仓库的 Go 测试环境中实机验证。`r`n`r`n**VLM 优先取知识库配置**：Console 的知识库设置页在 Embedding/Reranker 之外提供 VLM 区块（URL / Key / 模型，可开关），保存后该知识库随后的上传与 worker 解析立即使用它；未配置或关闭时回退到 `RAG_VLM_*` 环境变量。API Key 与其他 provider 一样加密存储，前端只显示"已保存"。
 
 ### 共享状态库
 

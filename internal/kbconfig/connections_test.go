@@ -201,13 +201,13 @@ func TestDraftConnectionRejectsInvalidCurrentURL(t *testing.T) {
 }
 
 func TestIsKind(t *testing.T) {
-	if !IsKind("embedding") || !IsKind("reranker") {
+	if !IsKind("embedding") || !IsKind("reranker") || !IsKind("vlm") {
 		t.Errorf("expected embedding/reranker kinds")
 	}
 	if IsKind("") || IsKind("Embedding") || IsKind("bm25") {
 		t.Errorf("unexpected kind accepted")
 	}
-	if !reflect.DeepEqual(Kinds, []string{"embedding", "reranker"}) {
+	if !reflect.DeepEqual(Kinds, []string{"embedding", "reranker", "vlm"}) {
 		t.Errorf("Kinds = %v", Kinds)
 	}
 }

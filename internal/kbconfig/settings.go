@@ -111,6 +111,11 @@ type CreateInput struct {
 	// ({base_url, apikey}) validated by DraftConnection.
 	EmbeddingValues map[string]any
 	RerankerValues  map[string]any
+	// VLMModel/VLMValues are the optional remote vision-language endpoint used
+	// for PDF formula recognition and picture descriptions. Both empty disables
+	// it and lets the service environment (RAG_VLM_*) apply.
+	VLMModel  string
+	VLMValues map[string]any
 	// TokenizerModel defaults to DefaultTokenizerModel when blank.
 	TokenizerModel string
 	// Collection overrides the generated collection name (tests/imports only).
@@ -182,6 +187,14 @@ func CreateSettings(ctx context.Context, input CreateInput, prober Prober) (map[
 	if err != nil {
 		return nil, err
 	}
+	vlmConnection, err := vlmConnectionFor(modelapi.ModelConnection{}, input.VLMValues, input.VLMModel)
+	if err != nil {
+		return nil, err
+	}
+	storedVLM, err := StoredConnectionWithKey(vlmConnection, input.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
 	collection := input.Collection
 	if collection == "" {
 		collection, err = NewCollectionName()
@@ -204,6 +217,8 @@ func CreateSettings(ctx context.Context, input CreateInput, prober Prober) (map[
 		"reranker_model":  rerankerModel,
 		"embedding":       storedEmbedding,
 		"reranker":        storedReranker,
+		"vlm":             storedVLM,
+		"vlm_model":       vlmConnection.Model,
 		"collection":      collection,
 		"tokenizer":       tokenizer,
 		"strategy":        input.Chunking.Strategy,
@@ -333,6 +348,26 @@ func UpdateSettings(
 	if err != nil {
 		return UpdateResult{}, err
 	}
+	oldVLM, err := ModelConnectionForKey(current, "vlm", input.EncryptionKey)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	vlmValues, err := providerValues(input.Values, "vlm")
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	vlmModel, err := optionalString(input.Values, "vlm_model", oldVLM.Model)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	vlm, err := vlmConnectionFor(oldVLM, vlmValues, vlmModel)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	storedVLM, err := StoredConnectionWithKey(vlm, input.EncryptionKey)
+	if err != nil {
+		return UpdateResult{}, err
+	}
 	updatedAt := input.UpdatedAt
 	if updatedAt.IsZero() {
 		updatedAt = time.Now()
@@ -340,6 +375,8 @@ func UpdateSettings(
 	updated := copySettings(current)
 	updated["embedding"] = storedEmbedding
 	updated["reranker"] = storedReranker
+	updated["vlm"] = storedVLM
+	updated["vlm_model"] = vlm.Model
 	updated["embedding_model"] = embedding.Model
 	updated["reranker_model"] = reranker.Model
 	updated["vector_size"] = vectorSize

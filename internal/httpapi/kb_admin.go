@@ -9,7 +9,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
 )
 
-var knowledgeBaseKinds = map[string]struct{}{"embedding": {}, "reranker": {}}
+var knowledgeBaseKinds = map[string]struct{}{"embedding": {}, "reranker": {}, "vlm": {}}
 
 // providerSettings mirrors http_service.ProviderSettingsBody.
 type providerSettings struct {
@@ -36,6 +36,8 @@ type KnowledgeBaseCreateInput struct {
 	RerankerModel   string
 	EmbeddingValues map[string]any
 	RerankerValues  map[string]any
+	VLMModel        string
+	VLMValues       map[string]any
 }
 
 // KnowledgeBaseUpdateInput is the transport-neutral patch request.
@@ -64,6 +66,8 @@ type createKnowledgeBaseBody struct {
 	Reranker       *providerSettings `json:"reranker"`
 	EmbeddingModel *string           `json:"embedding_model"`
 	RerankerModel  string            `json:"reranker_model"`
+	VLM            *providerSettings `json:"vlm"`
+	VLMModel       string            `json:"vlm_model"`
 	Strategy       string            `json:"strategy"`
 	ChunkSize      *int              `json:"chunk_size"`
 	ChunkOverlap   *int              `json:"chunk_overlap"`
@@ -74,6 +78,8 @@ type updateKnowledgeBaseBody struct {
 	Reranker       *providerSettings `json:"reranker"`
 	EmbeddingModel *string           `json:"embedding_model"`
 	RerankerModel  *string           `json:"reranker_model"`
+	VLM            *providerSettings `json:"vlm"`
+	VLMModel       *string           `json:"vlm_model"`
 	Reembed        bool              `json:"reembed"`
 }
 
@@ -90,6 +96,12 @@ func (body updateKnowledgeBaseBody) values() map[string]any {
 	}
 	if body.RerankerModel != nil {
 		values["reranker_model"] = *body.RerankerModel
+	}
+	if body.VLM != nil {
+		values["vlm"] = body.VLM.values()
+	}
+	if body.VLMModel != nil {
+		values["vlm_model"] = *body.VLMModel
 	}
 	return values
 }
@@ -183,6 +195,13 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		}})
 		return
 	}
+	if len([]rune(body.VLMModel)) > 512 {
+		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
+			Type: "string_too_long", Loc: []any{"body", "vlm_model"},
+			Msg: "String should have at most 512 characters",
+		}})
+		return
+	}
 	strategy := body.Strategy
 	if strategy == "" {
 		strategy = chunking.DefaultStrategy
@@ -197,6 +216,10 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 	if body.Reranker != nil {
 		rerankerValues = body.Reranker.values()
 	}
+	vlmValues := map[string]any{}
+	if body.VLM != nil {
+		vlmValues = body.VLM.values()
+	}
 	payload, err := s.kbAdmin.CreateKnowledgeBase(r.Context(), KnowledgeBaseCreateInput{
 		Namespace:       body.Namespace,
 		Chunking:        configuration,
@@ -204,6 +227,8 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		RerankerModel:   body.RerankerModel,
 		EmbeddingValues: embeddingValues,
 		RerankerValues:  rerankerValues,
+		VLMModel:        body.VLMModel,
+		VLMValues:       vlmValues,
 	})
 	if err != nil {
 		writeCreateKnowledgeBaseError(w, err)
@@ -248,7 +273,7 @@ func (s *Server) handleKnowledgeBaseKey(w http.ResponseWriter, r *http.Request) 
 	if _, ok := knowledgeBaseKinds[kind]; !ok {
 		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
 			Type: "literal_error", Loc: []any{"path", "kind"},
-			Msg: "Input should be 'embedding' or 'reranker'",
+			Msg: "Input should be 'embedding', 'reranker' or 'vlm'",
 		}})
 		return
 	}
@@ -274,7 +299,7 @@ func (s *Server) handleKnowledgeBaseModels(w http.ResponseWriter, r *http.Reques
 	if _, ok := knowledgeBaseKinds[kind]; !ok {
 		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
 			Type: "literal_error", Loc: []any{"path", "kind"},
-			Msg: "Input should be 'embedding' or 'reranker'",
+			Msg: "Input should be 'embedding', 'reranker' or 'vlm'",
 		}})
 		return
 	}
@@ -351,6 +376,13 @@ func (s *Server) handleUpdateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 	if body.RerankerModel != nil && len([]rune(*body.RerankerModel)) > 512 {
 		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
 			Type: "string_too_long", Loc: []any{"body", "reranker_model"},
+			Msg: "String should have at most 512 characters",
+		}})
+		return
+	}
+	if body.VLMModel != nil && len([]rune(*body.VLMModel)) > 512 {
+		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
+			Type: "string_too_long", Loc: []any{"body", "vlm_model"},
 			Msg: "String should have at most 512 characters",
 		}})
 		return

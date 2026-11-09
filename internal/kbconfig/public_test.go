@@ -27,6 +27,10 @@ func TestPublicSettingsReplacesProviders(t *testing.T) {
 		"reranker": map[string]any{
 			"base_url": "http://rank:8080/v1", "protected_key": "",
 		},
+		"vlm": map[string]any{
+			"base_url": "http://vlm:8000/v1", "protected_key": "enc:v1:vlm-secret",
+		},
+		"vlm_model": "qwen2.5-vl-7b",
 	}
 	want := map[string]any{
 		"namespace":       "alpha",
@@ -43,6 +47,8 @@ func TestPublicSettingsReplacesProviders(t *testing.T) {
 		"version":         4,
 		"embedding":       map[string]any{"base_url": "http://host:8080/v1", "api_key_set": true},
 		"reranker":        map[string]any{"base_url": "http://rank:8080/v1", "api_key_set": false},
+		"vlm":             map[string]any{"base_url": "http://vlm:8000/v1", "api_key_set": true},
+		"vlm_model":       "qwen2.5-vl-7b",
 	}
 	public := PublicSettings(settings)
 	if !reflect.DeepEqual(public, want) {
@@ -59,6 +65,7 @@ func TestPublicSettingsDefaultsMissingProviders(t *testing.T) {
 		"namespace": "alpha",
 		"embedding": map[string]any{"base_url": "", "api_key_set": false},
 		"reranker":  map[string]any{"base_url": "", "api_key_set": false},
+		"vlm":       map[string]any{"base_url": "", "api_key_set": false},
 	}
 	if !reflect.DeepEqual(public, want) {
 		t.Fatalf("PublicSettings() = %#v, want %#v", public, want)

@@ -78,7 +78,7 @@ docker run -d --name praxis-rag-service \
 - 公开到宿主机时加 TLS 反向代理；不要直接把 8011 暴露到公网。
 - 使用 MySQL 时先执行一次 schema 检查/建表（见 §6）：`docker run --rm --entrypoint /app/bin/rag-state-migrate ... --apply`。
 - 镜像不含 Docling/LibreOffice/Python 环境：需要 PDF/DOC/Word 解析时，把外部环境 bind mount 进容器，并设置 `RAG_PDF_PARSER_PYTHON`、`RAG_PDF_MODELS_PATH`、`RAG_WORD_CONVERTER_PATH`；解析进程的路径必须在容器内可见。
-- 公式识别与图片描述调用远端 OpenAI 兼容 VLM：设置 `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`（可选 `RAG_VLM_TIMEOUT`/`RAG_VLM_CONCURRENCY`）。内容（公式裁图、图片）会离开本机到该端点，选型时确认合规；未配置时 PDF 解析直接失败，不会回退本地模型。
+- 公式识别与图片描述调用远端 OpenAI 兼容 VLM：优先在 Console 的知识库设置页配置（URL/Key/模型），也可用 `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`（可选 `RAG_VLM_TIMEOUT`/`RAG_VLM_CONCURRENCY`）作为未配置知识库时的环境回退。内容（公式裁图、图片）会离开本机到该端点，选型时确认合规；未配置时 PDF 解析直接失败，不会回退本地模型。
 - 数据目录卷保存上传恢复工作区与 artifact 工作区；不要用匿名卷。
 
 ### 3.3 Compose：app profile

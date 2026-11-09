@@ -4,12 +4,12 @@ import { DeleteOutlined, PlusOutlined, ReloadOutlined, SaveOutlined } from "@ant
 import { api, errorText, type Chunking, type KnowledgeBase, type Strategy } from "./api";
 import { namespacePattern } from "./navigation";
 
-type Kind = "embedding" | "reranker";
+type Kind = "embedding" | "reranker" | "vlm";
 type ProviderValues = { base_url: string; apikey?: string };
-type Values = Chunking & { namespace: string; embedding_model: string; reranker_model?: string;
-  embedding: ProviderValues; reranker: ProviderValues };
+type Values = Chunking & { namespace: string; embedding_model: string; reranker_model?: string; vlm_model?: string;
+  embedding: ProviderValues; reranker: ProviderValues; vlm: ProviderValues };
 type Defaults = { default: string; strategies: Strategy[] };
-const kinds: Kind[] = ["embedding", "reranker"];
+const kinds: Kind[] = ["embedding", "reranker", "vlm"];
 const cleanUrl = (value: string) => value.trim().replace(/\/+$/, "");
 
 export function CreateKnowledgeBase({ active, disabled, onCreated }: {
@@ -28,10 +28,11 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const [rerankerEnabled, setRerankerEnabled] = useState(Boolean(initial?.reranker_model));
-  const [models, setModels] = useState<Record<Kind, string[]>>({ embedding: [], reranker: [] });
-  const [loading, setLoading] = useState({ embedding: false, reranker: false });
-  const [visibleKeys, setVisibleKeys] = useState({ embedding: false, reranker: false });
-  const [editedKeys, setEditedKeys] = useState({ embedding: false, reranker: false });
+  const [vlmEnabled, setVlmEnabled] = useState(Boolean(initial?.vlm_model));
+  const [models, setModels] = useState<Record<Kind, string[]>>({ embedding: [], reranker: [], vlm: [] });
+  const [loading, setLoading] = useState({ embedding: false, reranker: false, vlm: false });
+  const [visibleKeys, setVisibleKeys] = useState({ embedding: false, reranker: false, vlm: false });
+  const [editedKeys, setEditedKeys] = useState({ embedding: false, reranker: false, vlm: false });
   const modelRequests = useRef<Partial<Record<Kind, AbortController>>>({});
   const keyRequests = useRef<Partial<Record<Kind, AbortController>>>({});
   const lifetime = useRef(new AbortController());
@@ -109,7 +110,9 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
     setError("");
     const body = { embedding: providerValues("embedding"), embedding_model: values.embedding_model,
       reranker: rerankerEnabled ? providerValues("reranker") : { base_url: "", apikey: "" },
-      reranker_model: rerankerEnabled ? values.reranker_model || "" : "" };
+      reranker_model: rerankerEnabled ? values.reranker_model || "" : "",
+      vlm: vlmEnabled ? providerValues("vlm") : { base_url: "", apikey: "" },
+      vlm_model: vlmEnabled ? values.vlm_model || "" : "" };
     try {
       const result = await api<KnowledgeBase>("/v1/admin/knowledge-bases" + (initial ? "/" + initial.namespace : ""), undefined,
         { method: initial ? "PATCH" : "POST", body: JSON.stringify(initial ? { ...body, reembed } : {
@@ -139,7 +142,9 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
     ]} />}
     <Form form={form} layout="vertical" disabled={locked} onFinish={(values) => submit(values)}
       initialValues={{ namespace: initial?.namespace || "", embedding_model: initial?.embedding_model || "", reranker_model: initial?.reranker_model || "",
+        vlm_model: initial?.vlm_model || "",
         embedding: { base_url: initial?.embedding.base_url || "", apikey: "" }, reranker: { base_url: initial?.reranker.base_url || "", apikey: "" },
+        vlm: { base_url: initial?.vlm?.base_url || "", apikey: "" },
         strategy: initial?.strategy, chunk_size: initial?.chunk_size, chunk_overlap: initial?.chunk_overlap }}
       onValuesChange={(changed) => {
         setError("");
@@ -163,11 +168,13 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
         { required: true, message: "请输入知识库标识" }, { pattern: namespacePattern, message: "使用字母、数字、点、下划线或横线，首位为字母或数字" },
       ]}><Input maxLength={64} autoComplete="off" /></Form.Item>}
       {kinds.map((kind) => {
-        const title = kind === "embedding" ? "Embedding" : "Reranker";
-        const enabled = kind === "embedding" || rerankerEnabled;
+        const title = kind === "embedding" ? "Embedding" : kind === "reranker" ? "Reranker" : "VLM";
+        const enabled = kind === "embedding" || (kind === "reranker" ? rerankerEnabled : vlmEnabled);
         return <section className="knowledge-provider" aria-label={title + " 配置"} key={kind}>
           <div className="section-heading"><h2>{title}</h2>{kind === "reranker" &&
-            <Switch aria-label="启用 Reranker" checked={rerankerEnabled} disabled={locked} onChange={setRerankerEnabled} />}</div>
+            <Switch aria-label="启用 Reranker" checked={rerankerEnabled} disabled={locked} onChange={setRerankerEnabled} />}
+            {kind === "vlm" &&
+            <Switch aria-label="启用 VLM" checked={vlmEnabled} disabled={locked} onChange={setVlmEnabled} />}</div>
           <Form.Item name={[kind, "base_url"]} label={title + " URL"} rules={enabled ? [{ required: true, whitespace: true, message: "请输入服务 URL" }] : []}>
             <Input disabled={locked || !enabled} maxLength={2048} autoComplete="off" />
           </Form.Item>
@@ -183,11 +190,15 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
                 setEditedKeys((value) => ({ ...value, [kind]: true }));
               }} /></Tooltip>}
           </div>
-          <Form.Item name={kind + "_model"} label={title + " 模型"} rules={enabled ? [{ required: true, message: "请选择模型" }] : []}>
-            <Select showSearch virtual={false} disabled={locked || !enabled} loading={loading[kind]}
-              options={models[kind].map((value) => ({ value, label: value }))}
-              onOpenChange={(open) => { if (open) void loadModels(kind); }} />
-          </Form.Item>
+          {kind === "vlm"
+            ? <Form.Item name="vlm_model" label={title + " 模型"} rules={enabled ? [{ required: true, whitespace: true, message: "请输入 VLM 模型名称" }] : []}>
+                <Input disabled={locked || !enabled} maxLength={512} autoComplete="off" placeholder="例如 qwen2.5-vl-7b" />
+              </Form.Item>
+            : <Form.Item name={kind + "_model"} label={title + " 模型"} rules={enabled ? [{ required: true, message: "请选择模型" }] : []}>
+                <Select showSearch virtual={false} disabled={locked || !enabled} loading={loading[kind]}
+                  options={models[kind].map((value) => ({ value, label: value }))}
+                  onOpenChange={(open) => { if (open) void loadModels(kind); }} />
+              </Form.Item>}
         </section>;
       })}
       <section className="knowledge-provider" aria-label="切分配置"><h2>文本切分</h2>

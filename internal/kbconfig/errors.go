@@ -34,6 +34,12 @@ const (
 	// confirmed; the new index is retained and operators must inspect it.
 	MessagePublicationUnconfirmed = "Knowledge-base publication outcome is unconfirmed; the new index was retained. " +
 		"Check the current configuration before retrying."
+	// MessageVLMURLRequired is raised when a VLM model is configured without a
+	// service URL.
+	MessageVLMURLRequired = "请填写 VLM 服务 URL"
+	// MessageVLMModelRequired is raised when a VLM service URL is configured
+	// without a model name.
+	MessageVLMModelRequired = "请填写 VLM 模型名称"
 )
 
 // Error mirrors KnowledgeError: a safe knowledge-base error that may occur after

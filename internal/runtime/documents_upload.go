@@ -59,6 +59,7 @@ type uploadResources struct {
 	chunking       chunking.Config
 	tokenizerModel string
 	embeddingModel string
+	vlm            document.VLMSettings
 	collection     string
 	vectorSize     int
 	embedder       *modelapi.HTTPEmbedder
@@ -101,6 +102,10 @@ func (s *Service) resolveUploadResources(ctx context.Context, namespace string) 
 	if err != nil {
 		return nil, adminError(err)
 	}
+	vlm, err := s.uploadVLM(settings)
+	if err != nil {
+		return nil, err
+	}
 	store, err := s.newDocumentStore(ctx, namespace, collection)
 	if err != nil {
 		return nil, &apierrors.KnowledgeError{Message: "Qdrant 索引不可用，请检查 Qdrant 服务配置"}
@@ -110,6 +115,7 @@ func (s *Service) resolveUploadResources(ctx context.Context, namespace string) 
 		chunking:       configuration,
 		tokenizerModel: tokenizerModel,
 		embeddingModel: embeddingModel,
+		vlm:            vlm,
 		collection:     collection,
 		vectorSize:     vectorSize,
 		embedder:       modelapi.NewHTTPEmbedder(embeddingConnection, modelapi.DefaultTimeout),
@@ -634,7 +640,7 @@ func (s *Service) ingestDocument(
 			PDF: ingest.PDFOptions{
 				Executable: s.config.PDFParserPython,
 				ModelsPath: s.config.PDFModelsPath,
-				VLM:        s.vlmSettings(),
+				VLM:        resources.vlm,
 				Timeout:    time.Duration(s.config.PDFParseTimeout) * time.Second,
 			},
 			Word: ingest.WordOptions{
@@ -642,7 +648,7 @@ func (s *Service) ingestDocument(
 					Executable: s.config.WordConverterPath,
 					Timeout:    time.Duration(s.config.WordConvertTimeout) * time.Second,
 				},
-				Vision: s.wordVisionWorker(),
+				Vision: s.wordVisionWorker(resources.vlm),
 			},
 		})
 	}, nil)
@@ -1168,10 +1174,10 @@ func (s *Service) vlmSettings() document.VLMSettings {
 	}
 }
 
-// wordVisionWorker builds the Word image describer. It returns nil when no
-// remote VLM is configured so uploads keep working without one.
-func (s *Service) wordVisionWorker() *document.WordVisionWorker {
-	vlm := s.vlmSettings()
+// wordVisionWorker builds the Word image describer for one knowledge base. It
+// returns nil when no remote VLM is configured so uploads keep working without
+// one.
+func (s *Service) wordVisionWorker(vlm document.VLMSettings) *document.WordVisionWorker {
 	if !vlm.Configured() {
 		return nil
 	}
@@ -1181,4 +1187,25 @@ func (s *Service) wordVisionWorker() *document.WordVisionWorker {
 		VLM:        vlm,
 		Timeout:    time.Duration(s.config.PDFParseTimeout) * time.Second,
 	}
+}
+
+// uploadVLM prefers the knowledge base's own VLM provider and falls back to the
+// service environment (RAG_VLM_*) when the knowledge base has none, so the
+// Console settings take precedence while existing deployments keep working.
+func (s *Service) uploadVLM(settings map[string]any) (document.VLMSettings, error) {
+	connection, err := kbconfig.ModelConnectionForKey(settings, "vlm", s.stores.Settings.EncryptionKey)
+	if err != nil {
+		return document.VLMSettings{}, adminError(err)
+	}
+	fallback := s.vlmSettings()
+	if !connection.Configured() || connection.Model == "" {
+		return fallback, nil
+	}
+	return document.VLMSettings{
+		BaseURL:     connection.BaseURL,
+		APIKey:      connection.APIKey,
+		Model:       connection.Model,
+		Timeout:     fallback.Timeout,
+		Concurrency: fallback.Concurrency,
+	}, nil
 }

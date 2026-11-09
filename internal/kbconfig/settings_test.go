@@ -476,3 +476,92 @@ func TestUpdateSettingsPropagatesProbeErrors(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestCreateSettingsStoresVLMProvider(t *testing.T) {
+	prober := &fakeProber{vectorSize: 3}
+	input := newTestCreateInput("http://host:8080/v1/")
+	input.VLMModel = " qwen2.5-vl-7b "
+	input.VLMValues = map[string]any{"base_url": "http://vlm:8000/v1/", "apikey": "vlm-key"}
+	settings, err := CreateSettings(context.Background(), input, prober)
+	if err != nil {
+		t.Fatalf("CreateSettings() error: %v", err)
+	}
+	connection, err := ModelConnectionForKey(settings, "vlm", testEncryptionKey)
+	if err != nil {
+		t.Fatalf("ModelConnectionForKey(vlm) error: %v", err)
+	}
+	if connection.BaseURL != "http://vlm:8000/v1" || connection.Model != "qwen2.5-vl-7b" || connection.APIKey != "vlm-key" {
+		t.Fatalf("vlm connection = %+v", connection)
+	}
+	public := PublicSettings(settings)
+	vlm, ok := public["vlm"].(map[string]any)
+	if !ok || vlm["base_url"] != "http://vlm:8000/v1" || vlm["api_key_set"] != true {
+		t.Fatalf("public vlm = %v", public["vlm"])
+	}
+	if public["vlm_model"] != "qwen2.5-vl-7b" {
+		t.Fatalf("public vlm_model = %v", public["vlm_model"])
+	}
+}
+
+func TestCreateSettingsRejectsIncompleteVLM(t *testing.T) {
+	cases := map[string]struct {
+		mutate  func(*CreateInput)
+		message string
+	}{
+		"model without url": {
+			mutate:  func(input *CreateInput) { input.VLMModel = "qwen2.5-vl-7b" },
+			message: MessageVLMURLRequired,
+		},
+		"url without model": {
+			mutate:  func(input *CreateInput) { input.VLMValues = map[string]any{"base_url": "http://vlm:8000/v1"} },
+			message: MessageVLMModelRequired,
+		},
+	}
+	for name, testCase := range cases {
+		t.Run(name, func(t *testing.T) {
+			input := newTestCreateInput("http://host:8080/v1/")
+			testCase.mutate(&input)
+			_, err := CreateSettings(context.Background(), input, &fakeProber{vectorSize: 3})
+			assertValidationMessage(t, err, testCase.message)
+		})
+	}
+}
+
+func TestUpdateSettingsKeepsVLMWhenOmitted(t *testing.T) {
+	input := newTestCreateInput("http://host:8080/v1/")
+	input.VLMModel = "qwen2.5-vl-7b"
+	input.VLMValues = map[string]any{"base_url": "http://vlm:8000/v1", "apikey": "vlm-key"}
+	current, err := CreateSettings(context.Background(), input, &fakeProber{vectorSize: 3})
+	if err != nil {
+		t.Fatalf("CreateSettings() error: %v", err)
+	}
+	result, err := UpdateSettings(context.Background(), current, UpdateInput{
+		Values:        map[string]any{"embedding_model": "embed-a", "reranker_model": ""},
+		EncryptionKey: testEncryptionKey,
+	}, &fakeProber{vectorSize: 3})
+	if err != nil {
+		t.Fatalf("UpdateSettings() error: %v", err)
+	}
+	connection, err := ModelConnectionForKey(result.Settings, "vlm", testEncryptionKey)
+	if err != nil {
+		t.Fatalf("ModelConnectionForKey(vlm) error: %v", err)
+	}
+	if connection.BaseURL != "http://vlm:8000/v1" || connection.Model != "qwen2.5-vl-7b" || connection.APIKey != "vlm-key" {
+		t.Fatalf("vlm connection after unrelated update = %+v", connection)
+	}
+
+	cleared, err := UpdateSettings(context.Background(), result.Settings, UpdateInput{
+		Values:        map[string]any{"vlm": map[string]any{"base_url": "", "apikey": ""}, "vlm_model": ""},
+		EncryptionKey: testEncryptionKey,
+	}, &fakeProber{vectorSize: 3})
+	if err != nil {
+		t.Fatalf("UpdateSettings(clear) error: %v", err)
+	}
+	clearedConnection, err := ModelConnectionForKey(cleared.Settings, "vlm", testEncryptionKey)
+	if err != nil {
+		t.Fatalf("ModelConnectionForKey(cleared) error: %v", err)
+	}
+	if clearedConnection.Configured() {
+		t.Fatalf("cleared vlm connection = %+v", clearedConnection)
+	}
+}

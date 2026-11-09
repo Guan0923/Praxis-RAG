@@ -14,7 +14,11 @@ import (
 
 // Kinds lists the provider settings replaced by public views and
 // stored as {base_url, protected_key} pairs (rag_mcp.model_settings.KINDS).
-var Kinds = []string{"embedding", "reranker"}
+//
+// "vlm" is the remote vision-language endpoint used for PDF formula recognition
+// and picture descriptions; it is optional per knowledge base and falls back to
+// the service environment (RAG_VLM_*) when unset.
+var Kinds = []string{"embedding", "reranker", "vlm"}
 
 // IsKind reports whether kind is one of Kinds.
 func IsKind(kind string) bool {
@@ -68,7 +72,12 @@ func ModelConnectionForKey(settings map[string]any, kind, encryptionKey string) 
 	}
 	model, err := requiredString(settings, kind+"_model")
 	if err != nil {
-		return modelapi.ModelConnection{}, err
+		// Knowledge bases created before the remote VLM existed have no
+		// vlm_model; treat that as "not configured" instead of corrupt settings.
+		if kind != "vlm" {
+			return modelapi.ModelConnection{}, err
+		}
+		model = ""
 	}
 	connection := modelapi.ModelConnection{BaseURL: baseURL, Model: model, APIKey: apiKey}
 	if kind == "embedding" {
@@ -256,4 +265,37 @@ func pythonString(value any) string {
 	default:
 		return fmt.Sprint(typed)
 	}
+}
+
+// vlmConnectionFor resolves the optional remote VLM provider. The URL and the
+// model name must be configured together; clearing both disables the provider
+// and lets the service environment (RAG_VLM_*) apply again.
+func vlmConnectionFor(current modelapi.ModelConnection, values map[string]any, model string) (modelapi.ModelConnection, error) {
+	model = strings.TrimSpace(model)
+	rawURL := current.BaseURL
+	if values != nil {
+		if raw, ok := values["base_url"]; ok {
+			text, ok := raw.(string)
+			if !ok {
+				return modelapi.ModelConnection{}, NewValidationError("VLM 服务配置格式无效")
+			}
+			rawURL = text
+		}
+	}
+	baseURL := strings.TrimSpace(rawURL)
+	if baseURL == "" && model == "" {
+		return modelapi.ModelConnection{}, nil
+	}
+	if baseURL == "" {
+		return modelapi.ModelConnection{}, NewValidationError(MessageVLMURLRequired)
+	}
+	if model == "" {
+		return modelapi.ModelConnection{}, NewValidationError(MessageVLMModelRequired)
+	}
+	connection, err := DraftConnection(current, values)
+	if err != nil {
+		return modelapi.ModelConnection{}, err
+	}
+	connection.Model = model
+	return connection, nil
 }
