@@ -1,4 +1,0 @@
-{
-  "rocketMQClusterName": "DefaultCluster",
-  "grpcServerPort": __GRPC_PORT__
-}

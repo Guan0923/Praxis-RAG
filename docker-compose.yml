@@ -1,3 +1,5 @@
+name: praxis-rag
+
 services:
   mysql:
     image: mysql:8.0
@@ -57,55 +59,54 @@ services:
       timeout: 3s
       retries: 20
 
-  rocketmq-namesrv:
-    image: apache/rocketmq:5.3.3
-    container_name: praxis-rag-rocketmq-namesrv
+  # Single-node KRaft Kafka used by the async document/search queues and the
+  # optional Debezium bridge. Two listeners:
+  #   INTERNAL kafka:9092   -> rag-service/worker/Debezium containers on this network
+  #   EXTERNAL 127.0.0.1:9092 -> processes on the host (start-stack, local binaries)
+  # The external listener binds container port 29092 and is published on the host
+  # as 9092. Kafka advertises the address clients must use, so host and container
+  # clients intentionally see different bootstrap addresses.
+  # Auto topic creation is enabled with 4 partitions; the start-stack script may
+  # create the known topics explicitly.
+  kafka:
+    image: ${RAG_KAFKA_IMAGE:-apache/kafka:3.9.0}
+    container_name: praxis-rag-kafka
+    hostname: kafka
     restart: unless-stopped
-    command: ["sh", "mqnamesrv"]
-    environment:
-      JAVA_OPT_EXT: "-Xms128m -Xmx128m -Xmn64m"
-
-  rocketmq-storage-init:
-    image: apache/rocketmq:5.3.3
-    user: "0:0"
-    entrypoint: ["sh", "-c", "chown -R 3000:3000 /home/rocketmq/store"]
-    volumes:
-      - rocketmq_data:/home/rocketmq/store
-
-  rocketmq:
-    image: apache/rocketmq:5.3.3
-    container_name: praxis-rag-rocketmq
-    restart: unless-stopped
-    depends_on:
-      rocketmq-namesrv:
-        condition: service_started
-      rocketmq-storage-init:
-        condition: service_completed_successfully
-    environment:
-      NAMESRV_ADDR: rocketmq-namesrv:9876
-      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
-    command:
-      - sh
-      - -c
-      - >-
-        sed "s/^brokerIP1=.*/brokerIP1=${RAG_ROCKETMQ_BROKER_IP:-127.0.0.1}/"
-        /home/rocketmq/rocketmq-5.3.3/conf/praxis-broker.conf > /tmp/praxis-broker.conf
-        && sed "s/__GRPC_PORT__/${RAG_ROCKETMQ_PROXY_PORT:-8081}/"
-        /tmp/rmq-proxy.template.json > /home/rocketmq/rocketmq-5.3.3/conf/rmq-proxy.json
-        && exec sh mqbroker --enable-proxy -c /tmp/praxis-broker.conf
     ports:
-      # The gRPC proxy advertises its *internal* port to clients, so the host port
-      # must equal the port the proxy binds inside the container (grpcServerPort).
-      # 8081 collides with McAfee (macmnsvc) on some Windows machines.
-      - "127.0.0.1:${RAG_ROCKETMQ_PROXY_PORT:-8081}:${RAG_ROCKETMQ_PROXY_PORT:-8081}"
+      - "127.0.0.1:${RAG_KAFKA_HOST_PORT:-9092}:29092"
+    environment:
+      CLUSTER_ID: ${RAG_KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://127.0.0.1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "4"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      # apache/kafka defaults log.dirs to /tmp/kafka-logs; point it at the volume
+      # so topics/offsets survive container recreation.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     volumes:
-      - ./deploy/rocketmq-broker.conf:/home/rocketmq/rocketmq-5.3.3/conf/praxis-broker.conf:ro
-      # The gRPC proxy reads conf/rmq-proxy.json (JSON), not the broker properties file.
-      - ./deploy/rocketmq-proxy.json:/tmp/rmq-proxy.template.json:ro
-      - rocketmq_data:/home/rocketmq/store
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
 
   # Optional CDC bridge: tails the MySQL binlog of the transactional outbox
-  # table and publishes one notification per committed upload. Enable with
+  # table and publishes each committed notification to Kafka with the native
+  # Debezium Kafka sink. Enable with
   #   docker compose --profile debezium up -d
   # and run rag-service/rag-document-worker with RAG_OUTBOX_BRIDGE=debezium.
   # See deploy/debezium/README.md. Not started by default.
@@ -114,26 +115,22 @@ services:
     container_name: praxis-rag-debezium
     restart: unless-stopped
     profiles: ["debezium"]
-    # The MySQL connector speaks the RocketMQ remoting protocol and must reach the
-    # broker address the broker advertises. Sharing the broker's network namespace
-    # makes that address (127.0.0.1:10911) directly reachable and keeps the
-    # host-side clients working with the same brokerIP1.
-    network_mode: "service:rocketmq"
     depends_on:
       mysql:
         condition: service_healthy
-      rocketmq:
-        condition: service_started
+      kafka:
+        condition: service_healthy
     environment:
       RAG_MYSQL_HOST: mysql
       RAG_MYSQL_PORT: "3306"
       RAG_MYSQL_USER: ${RAG_MYSQL_DEBEZIUM_USER:-debezium}
       RAG_MYSQL_PASSWORD: ${RAG_MYSQL_DEBEZIUM_PASSWORD:?set RAG_MYSQL_DEBEZIUM_PASSWORD in .env}
       RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
-      # Must match the app-side RAG_DOCUMENT_TOPIC (RocketMQ topic names have no dots).
+      # Container-internal bootstrap address. The host-facing value in .env is
+      # 127.0.0.1:9092; do not pass it into Debezium containers.
+      RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      # SMT target topic; must match the app-side RAG_DOCUMENT_TOPIC.
       RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
-      DEBEZIUM_TOPIC_PREFIX: ${DEBEZIUM_TOPIC_PREFIX:-praxis_document_ingest}
-      RAG_ROCKETMQ_NAMESRV: ${RAG_ROCKETMQ_NAMESRV:-rocketmq-namesrv:9876}
       DEBEZIUM_SERVER_ID: ${DEBEZIUM_SERVER_ID:-184054}
       QUARKUS_LOG_LEVEL: ${DEBEZIUM_LOG_LEVEL:-INFO}
     volumes:
@@ -147,6 +144,8 @@ services:
   # RAG_SERVICE_TOKEN is required at run time (the container binds 0.0.0.0);
   # the state backend defaults to the shared MySQL below (override with
   # RAG_STATE_URL / RAG_APP_MYSQL_*), and Qdrant runs as a compose service.
+  # Kafka is required for async queues; this service uses the container-internal
+  # bootstrap address even though the host .env uses 127.0.0.1:9092.
   app:
     build:
       context: .
@@ -160,6 +159,8 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+      kafka:
+        condition: service_healthy
     environment:
       RAG_SERVICE_TOKEN: ${RAG_SERVICE_TOKEN:-}
       RAG_SERVICE_HOST: "0.0.0.0"
@@ -172,6 +173,18 @@ services:
       RAG_MYSQL_PASSWORD: ${RAG_MYSQL_PASSWORD:-}
       RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
       RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
+      RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      RAG_OUTBOX_BRIDGE: ${RAG_OUTBOX_BRIDGE:-relay}
+      RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
+      RAG_CACHE_GROUP: ${RAG_CACHE_GROUP:-praxis_state_cache_refresh_workers}
+      RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
+      RAG_DOCUMENT_GROUP: ${RAG_DOCUMENT_GROUP:-praxis_document_ingest_workers}
+      RAG_SEARCH_TOPIC: ${RAG_SEARCH_TOPIC:-praxis_search}
+      RAG_SEARCH_GROUP: ${RAG_SEARCH_GROUP:-praxis_search_workers}
+      RAG_DOCUMENT_DLQ_TOPIC: ${RAG_DOCUMENT_DLQ_TOPIC:-praxis_document_ingest_dead_letters}
+      RAG_SEARCH_DLQ_TOPIC: ${RAG_SEARCH_DLQ_TOPIC:-praxis_search_dead_letters}
+      RAG_DOCUMENT_DLQ_GROUP: ${RAG_DOCUMENT_DLQ_GROUP:-praxis_document_dead_letters}
+      RAG_SEARCH_DLQ_GROUP: ${RAG_SEARCH_DLQ_GROUP:-praxis_search_dead_letters}
       RAG_MCP_ALLOWED_HOSTS: ${RAG_MCP_ALLOWED_HOSTS:-127.0.0.1,127.0.0.1:*,localhost,localhost:*}
       RAG_MCP_ALLOWED_ORIGINS: ${RAG_MCP_ALLOWED_ORIGINS:-http://127.0.0.1,http://127.0.0.1:*,http://localhost,http://localhost:*}
     ports:
@@ -185,9 +198,9 @@ services:
       start_period: 20s
       retries: 3
 volumes:
+  kafka_data:
   mysql_data:
   praxis_app_data:
   qdrant_data:
   redis_data:
-  rocketmq_data:
   debezium_data:

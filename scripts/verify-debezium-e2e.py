@@ -2,7 +2,7 @@
 
 Pipeline under test:
   MCP add_document -> MySQL document_job_outbox COMMIT
-  -> Debezium (binlog CDC) -> RocketMQ topic praxis_document_ingest
+  -> Debezium (binlog CDC) -> Kafka topic praxis_document_ingest
   -> rag-document-worker -> Qdrant + MySQL documents
   -> get_document_status = succeeded, REST search returns the document.
 
@@ -11,7 +11,7 @@ the outbox row must still be unpublished (published_at IS NULL) while the
 worker processed it, and the service log must contain the debezium-mode line.
 
 Requires the docker compose infra (MySQL 3307, Qdrant 6333, Redis 6379,
-RocketMQ proxy 18081, Debezium) to be running, and dist/bin binaries built.
+Kafka 9092, Debezium) to be running, and dist/bin binaries built.
 """
 from __future__ import annotations
 
@@ -44,6 +44,19 @@ MYSQL_PORT = os.environ.get("RAG_MYSQL_PORT", "3307")
 MYSQL_PASSWORD = os.environ.get("RAG_MYSQL_PASSWORD", "praxis-dev-pw")
 MYSQL_DATABASE = os.environ.get("RAG_MYSQL_DATABASE", "praxis_rag")
 VECTOR_SIZE = int(os.environ.get("RAG_E2E_VECTOR_SIZE", "1024"))
+KAFKA_BOOTSTRAP = os.environ.get("RAG_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")
+CACHE_TOPIC = os.environ.get("RAG_CACHE_TOPIC", "praxis_state_cache_refresh")
+CACHE_GROUP = os.environ.get("RAG_CACHE_GROUP", "praxis_state_cache_refresh_workers")
+DOCUMENT_TOPIC = os.environ.get("RAG_DOCUMENT_TOPIC", "praxis_document_ingest")
+DOCUMENT_GROUP = os.environ.get("RAG_DOCUMENT_GROUP", "praxis_document_ingest_workers")
+SEARCH_TOPIC = os.environ.get("RAG_SEARCH_TOPIC", "praxis_search")
+SEARCH_GROUP = os.environ.get("RAG_SEARCH_GROUP", "praxis_search_workers")
+DOCUMENT_DLQ_TOPIC = os.environ.get(
+    "RAG_DOCUMENT_DLQ_TOPIC", "praxis_document_ingest_dead_letters")
+SEARCH_DLQ_TOPIC = os.environ.get("RAG_SEARCH_DLQ_TOPIC", "praxis_search_dead_letters")
+DOCUMENT_DLQ_GROUP = os.environ.get(
+    "RAG_DOCUMENT_DLQ_GROUP", "praxis_document_dead_letters")
+SEARCH_DLQ_GROUP = os.environ.get("RAG_SEARCH_DLQ_GROUP", "praxis_search_dead_letters")
 
 results: list[tuple[bool, str]] = []
 
@@ -267,16 +280,19 @@ def base_env() -> dict:
         "RAG_STATE_ENCRYPTION_KEY": "base64:" + base64.b64encode(b"praxis-e2e-debezium-key-32byte!!"[:32]).decode(),
         "RAG_REDIS_ENABLED": "false",
         "QDRANT_URL": "http://127.0.0.1:6333",
-        "RAG_ROCKETMQ_ENDPOINT": "127.0.0.1:18081",
-        "RAG_ROCKETMQ_NAMESPACE": "",
-        "RAG_ROCKETMQ_TLS": "false",
+        "RAG_KAFKA_BOOTSTRAP_SERVERS": KAFKA_BOOTSTRAP,
+        "RAG_KAFKA_CLIENT_ID": "praxis-rag-e2e",
         "RAG_OUTBOX_BRIDGE": "debezium",
-        "RAG_DOCUMENT_TOPIC": "praxis_document_ingest",
-        "RAG_DOCUMENT_GROUP": "praxis_document_ingest_workers",
-        "RAG_SEARCH_TOPIC": "praxis_search",
-        "RAG_SEARCH_GROUP": "praxis_search_workers",
-        "RAG_ROCKETMQ_TOPIC": "praxis_state_cache_refresh",
-        "RAG_ROCKETMQ_GROUP": "praxis_state_cache_refresh_workers",
+        "RAG_CACHE_TOPIC": CACHE_TOPIC,
+        "RAG_CACHE_GROUP": CACHE_GROUP,
+        "RAG_DOCUMENT_TOPIC": DOCUMENT_TOPIC,
+        "RAG_DOCUMENT_GROUP": DOCUMENT_GROUP,
+        "RAG_SEARCH_TOPIC": SEARCH_TOPIC,
+        "RAG_SEARCH_GROUP": SEARCH_GROUP,
+        "RAG_DOCUMENT_DLQ_TOPIC": DOCUMENT_DLQ_TOPIC,
+        "RAG_SEARCH_DLQ_TOPIC": SEARCH_DLQ_TOPIC,
+        "RAG_DOCUMENT_DLQ_GROUP": DOCUMENT_DLQ_GROUP,
+        "RAG_SEARCH_DLQ_GROUP": SEARCH_DLQ_GROUP,
     })
     return env
 
@@ -338,23 +354,23 @@ def mysql_query(sql: str) -> str:
     return "\n".join(lines).strip()
 
 
-def rocketmq_probe(artifact_id: str) -> tuple[bool, str]:
-    group = "e2e_debezium_probe_" + str(int(time.time()))[-6:]
+def kafka_probe(artifact_id: str) -> tuple[bool, str]:
+    """Info-only probe: read the document topic from the beginning for 5 seconds.
+
+    Kafka offsets/consumer groups decide what a fresh probe can see; a missing
+    hit is not a failure because the PENDING outbox row plus succeeded worker
+    already prove Debezium delivered it.
+    """
     try:
-        subprocess.run([
-            "docker", "exec", "praxis-rag-rocketmq", "sh", "mqadmin", "updateSubGroup",
-            "-n", "rocketmq-namesrv:9876", "-c", "DefaultCluster", "-g", group, "-r", "16",
-        ], capture_output=True, text=True, timeout=60)
-        output = ""
-        for queue_id in range(8):
-            completed = subprocess.run([
-                "docker", "exec", "praxis-rag-rocketmq", "sh", "mqadmin", "consumeMessage",
-                "-n", "rocketmq-namesrv:9876", "-t", "praxis_document_ingest",
-                "-g", group, "-i", str(queue_id), "-c", "50",
-            ], capture_output=True, text=True, timeout=60)
-            output += (completed.stdout or "") + (completed.stderr or "")
-            if artifact_id in output:
-                break
+        completed = subprocess.run([
+            "docker", "exec", "praxis-rag-kafka",
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server", "kafka:9092",
+            "--topic", DOCUMENT_TOPIC,
+            "--from-beginning",
+            "--timeout-ms", "5000",
+        ], capture_output=True, text=True, timeout=30)
+        output = (completed.stdout or "") + (completed.stderr or "")
         return artifact_id in output, output[-6000:]
     except Exception as error:  # noqa: BLE001 - probe is optional evidence
         return False, f"probe failed: {error}"
@@ -416,8 +432,8 @@ def main() -> int:
         collection = (kb or {}).get("collection", "")
         try:
             mysql_query(
-                "DELETE FROM praxis_rag.document_job_outbox WHERE namespace <> '" + namespace + "';"
-                "DELETE FROM praxis_rag.document_jobs WHERE namespace <> '" + namespace + "';")
+                f"DELETE FROM {MYSQL_DATABASE}.document_job_outbox WHERE namespace <> '" + namespace + "';"
+                f"DELETE FROM {MYSQL_DATABASE}.document_jobs WHERE namespace <> '" + namespace + "';")
         except Exception as cleanup_error:  # noqa: BLE001 - best effort on a dev database
             print("WARN stale job cleanup failed:", cleanup_error)
         vector_size = (kb or {}).get("vector_size")
@@ -448,7 +464,7 @@ def main() -> int:
         check(bool(artifact_id), f"add_document accepted artifact_id={mask(artifact_id)}")
 
         outbox_row = mysql_query(
-            "SELECT published_at IS NULL FROM praxis_rag.document_job_outbox "
+            f"SELECT published_at IS NULL FROM {MYSQL_DATABASE}.document_job_outbox "
             f"WHERE artifact_id = '{artifact_id}';")
         check(outbox_row.strip() == "1",
               "outbox row is still unpublished after admission (application did not publish)")
@@ -470,7 +486,7 @@ def main() -> int:
             raise RuntimeError("document job did not succeed")
 
         job_row = mysql_query(
-            "SELECT status, stage FROM praxis_rag.document_jobs "
+            f"SELECT status, stage FROM {MYSQL_DATABASE}.document_jobs "
             f"WHERE artifact_id = '{artifact_id}';")
         check(job_row.startswith("succeeded"), f"MySQL document_jobs row = {job_row}")
 
@@ -493,17 +509,17 @@ def main() -> int:
         check(status == 200 and any(document_name in str(name) for name in names),
               f"REST search returns the indexed document (hits={len(hits)})")
 
-        delivered, probe_output = rocketmq_probe(artifact_id)
+        delivered, probe_output = kafka_probe(artifact_id)
         if delivered:
-            print("PASS topic probe found the artifact notification in praxis_document_ingest")
+            print(f"PASS topic probe found the artifact notification in {DOCUMENT_TOPIC}")
         else:
-            print("INFO mqadmin consumeMessage could not replay the artifact message for this probe "
-                  "group; the PENDING outbox row plus the succeeded worker are the conclusive "
-                  "evidence that only Debezium delivered it")
+            print("INFO kafka-console-consumer could not replay the artifact message "
+                  "for this probe; the PENDING outbox row plus the succeeded worker "
+                  "are the conclusive evidence that only Debezium delivered it")
 
         # Evidence that the row itself was never marked published by the app.
         still_pending = mysql_query(
-            "SELECT published_at IS NULL FROM praxis_rag.document_job_outbox "
+            f"SELECT published_at IS NULL FROM {MYSQL_DATABASE}.document_job_outbox "
             f"WHERE artifact_id = '{artifact_id}';")
         check(still_pending.strip() == "1",
               "outbox row remained PENDING after processing (only Debezium published it)")
