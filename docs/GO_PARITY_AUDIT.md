@@ -1,6 +1,8 @@
 # Go 后端与 Python/前端契约一致性审计
 > **历史审计快照（2026-11-08）**：本次审计针对迁移期的 Python 对照实现；Python 后端（`src/rag_mcp/`、`tests/`）随后已从仓库删除，文中 Python 行号/路径不再存在。当前 Go 实现与剩余差异见 [GO_MIGRATION](GO_MIGRATION.md)。
 
+> **传输层历史说明**：文中提到的 RocketMQ 指审计时的旧传输/旧部署。当前实现已完全切换到 Kafka（`RAG_KAFKA_*` 与显式 `RAG_*_DLQ_TOPIC`，见 [GO_MIGRATION](GO_MIGRATION.md) 最后一轮）；这些 RocketMQ 字样仅作为审计历史的对照保留，不是当前部署指令。
+
 
 审计对象：`D:\Project\Praxis-RAG\.agents\worktrees\dsh-d432f525-b2f1`
 审计类型：只读（本文件是唯一写入）

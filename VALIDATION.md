@@ -1,8 +1,35 @@
 # Historical UUID results/artifacts and logical deletion — 2026-10-23
 
+> **Transport note (2026-11-09):** The dated records in this file were produced
+> while the repository still used RocketMQ. The current transport is Kafka
+> (`RAG_KAFKA_*`, explicit `RAG_*_DLQ_TOPIC`); the Kafka/MySQL/Debezium live check
+> is recorded immediately below. RocketMQ wording in the historical sections is
+> retained as history.
+
+## Kafka migration validation — 2026-11-09
+
+- Live Docker Desktop stack with existing MySQL/Qdrant/Redis data volumes:
+  Apache Kafka 3.9.0 KRaft container `healthy`; Kafka 3.9.0 started; topics
+  auto-created with 4 partitions and the start-stack provisioning created
+  cache/document/search plus both explicit DLQ topics.
+- Debezium Server 3.7.1.Final on MySQL 8.0: `Snapshot completed` and
+  `Starting streaming`; native Kafka sink producer logged
+  `bootstrap.servers=[kafka:9092]`, `acks=-1`, idempotence enabled and String
+  serializers.
+- Consumed a real Debezium record from `praxis_document_ingest` whose
+  `artifact_id` matched the MySQL `document_job_outbox` row; the row remained
+  `PENDING` (the application did not publish), proving the CDC bridge delivered it.
+- Verified on 2026-11-09 with the Go backend: the document async pipeline
+  end-to-end in both bridge modes (`scripts/verify-debezium-e2e.py`: 14/14
+  debezium, 13/0 relay, outbox PENDING vs PUBLISHED), live DLQ delivery for a
+  poison payload (`scripts/verify-kafka-dlq.py`) and queued MCP search through
+  the Kafka search topic with Redis snapshots (`scripts/verify-kafka-search.py`).
+- Not yet verified: SASL/TLS Kafka clusters, Docker app image/Compose profiles,
+  systemd units and live multi-instance MySQL failover.
+
 The dated results below describe their tested revisions, not verification of the
-current architecture migration. The approved active design uses schema 2 complete
-RocketMQ requests (document chunks: at most 512 KiB decoded; files: at most 10 MiB),
+current architecture migration. The approved active design used schema 2 complete
+Kafka requests (document chunks: at most 512 KiB decoded; files: at most 10 MiB),
 all-message broker confirmation before API success, and required Redis transient
 task/reassembly/result storage. Search snapshots use `RAG_RESULT_TTL_SECONDS=3600`
 with no SQL fallback. Task CAS and atomic result/success writes are Redis-local,
@@ -25,7 +52,7 @@ Current migration validation — 2026-10-25:
   extracted checkout. Known pre-existing failure; not fixed by this migration.
 - Changed/added Python files have zero **new** Ruff findings versus HEAD;
   existing baseline findings remain. `git diff --check` passed.
-- No live RocketMQ/Redis validation or runtime deployment verification is claimed.
+- No live Kafka/Redis validation was performed for that historical revision; the later Kafka/MySQL/Debezium migration check is recorded at the top of this file.
 
 - At this revision, confirmed one-hour expiry, full backward-compatible search
   responses, and del_flag soft deletion hiding new access while preserving UUIDs.
@@ -71,7 +98,7 @@ schema 2 queued-request, chunk replay/ACK or migration acceptance verification.
 - At that revision, Redis outage/oversized snapshot returned synchronous search
   results with explicit snapshot_available=false; unavailable-result lookup errored.
   This is not queued MCP acceptance during an outage: queued operations require
-  Redis/MQ and all broker confirmations, with no durable SQL fallback.
+  Redis/Kafka and all producer acknowledgements, with no durable SQL fallback.
 
 # Historical second-batch state-cache validation — 2026-10-22
 
@@ -85,7 +112,7 @@ does not forbid temporary raw document chunks in Redis reassembly.
   display, latest operation list and redacted step/rollback progress.
 - Default Python regression: 434 passed, 27 skipped, four existing MCP warnings;
   three optional browser modules excluded.
-- Live MySQL/Redis/RocketMQ/Qdrant plus Redis Lua backend suite: 45 passed using
+- Live MySQL/Redis/Kafka (historical RocketMQ test stack)/Qdrant plus Redis Lua backend suite: 45 passed using
   isolated praxis_cache_test_* schemas, Redis prefixes and test collections.
   Includes real upload commit/aborted publication/delete refreshing state views,
   stale enabled display not authorizing a disabled key, and expired ownership
@@ -107,14 +134,14 @@ fallback for queued MCP uploads/search in the current architecture.
   authoritative. Cache-hit tests assert zero SQL and no tenant/model startup.
 - Default Python regression: 399 passed, 24 skipped, four existing MCP warnings
   (three browser modules excluded because their optional environment is absent).
-- Isolated MySQL/Redis/RocketMQ and actual Redis Lua: 42 passed, including the
+- Isolated MySQL/Redis/Kafka (historical RocketMQ test stack) and actual Redis Lua: 42 passed, including the
   live MySQL rollback assertion. The live suite uses disposable
   praxis_cache_test_* schemas, unique Redis prefixes and a test consumer group.
-- Live coverage includes synchronous refresh, Redis outage fallback, MQ delivery
+- Live coverage includes synchronous refresh, Redis outage fallback, Kafka delivery
   after failed cache writes, unacknowledged message redelivery, BIGINT ordering,
   persistent deletion watermark and TTL expiry.
 - Versioned delayed-fill/duplicate/out-of-order events, transactional outbox
-  rollback and simultaneous Redis/MQ outage are covered by unit/integration tests.
+  rollback and simultaneous Redis/Kafka outage are covered by unit/integration tests.
 - Docker startup/provisioning script validated with -MigrateOnly -SkipMigrate;
   production documents/credentials were not migrated or modified by these tests.
 - Ruff F/E9 passed; no editor diagnostics on new cache code and integration paths.

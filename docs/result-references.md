@@ -14,7 +14,7 @@
 ## 保存与取回
 
 ```text
-服务端 MCP search → RocketMQ schema 2（完整查询/参数）→ Broker 确认
+服务端 MCP search → Kafka schema 2（完整查询/参数）→ producer 确认
                                              ↓
                          rag-search-worker → 原有检索/重排
                                              ↓
@@ -25,7 +25,7 @@
 异步文档新增（MCP add_document）→ MySQL 单事务（document_jobs 完整任务含文件字节
                                   + document_job_outbox 通知）→ 提交即返回 artifact_id
                                              ↓
-                  relay / Debezium → RocketMQ schema 3 纯通知（仅标识）
+                  relay / Debezium → Kafka schema 3 纯通知（仅标识）
                                              ↓
                   rag-document-worker → 从 MySQL 读回任务并解析/索引
                                              ↓
@@ -35,7 +35,7 @@ REST /v1/search / 本地调试 → 同步检索/重排（不经搜索任务队�
 结果按 ID 读取 Redis；artifact 按 ID 读取 MySQL；不调用搜索或模型
 ```
 
-每次搜索生成独立 UUIDv4 result_id，不按查询文本匹配。MCP 的任务与最终快照使用同一 UUID。**两条路径的受理语义不同**：搜索消息仍携带完整查询与参数直投 RocketMQ，必须在 Broker 确认、Redis 快照就绪后才返回成功；异步文档新增只提交一个 MySQL 事务（完整任务含文件原字节 + 发件箱通知），提交成功即返回 `artifact_id`，MQ 只传 schema 3 纯通知，Redis 不参与受理、状态或投递。文档投递失败不影响受理，由发件箱 relay/Debezium 重试；"发送确认超时可能不确定"只适用于搜索。
+每次搜索生成独立 UUIDv4 result_id，不按查询文本匹配。MCP 的任务与最终快照使用同一 UUID。**两条路径的受理语义不同**：搜索消息仍携带完整查询与参数直投 Kafka，必须在 Kafka producer 确认、Redis 快照就绪后才返回成功；异步文档新增只提交一个 MySQL 事务（完整任务含文件原字节 + 发件箱通知），提交成功即返回 `artifact_id`，Kafka 只传 schema 3 纯通知，Redis 不参与受理、状态或投递。文档投递失败不影响受理，由发件箱 relay/Debezium 重试；"发送确认超时可能不确定"只适用于搜索。
 
 Redis 保存排队搜索的 namespace、短期任务状态、完整搜索响应和绝对过期时间。key 包含 namespace 哈希及 ID，结果 TTL 与展示缓存独立；UUID 不允许覆盖其他快照。快照保留原结果顺序、分数、证据、debug 元数据及产物引用，分页只切片原快照，不再查 Qdrant。读取不延长绝对过期时间。文档任务状态、租约和文件字节保存在 MySQL，不使用该 Redis 快照，也没有 TTL。
 
@@ -87,7 +87,7 @@ ALTER TABLE documents ADD COLUMN del_flag BOOLEAN NOT NULL DEFAULT 0;
 }
 ```
 
-同步 REST 搜索若 Redis 保存失败或快照过大，仍返回原搜索结果，设置 snapshot_available=false / snapshot_error，不签发无法读取的 result_id；它不享有 SQL 结果回源。MCP 排队提交则要求 Redis/MQ 可用，不能以未保存的结果冒充完成快照。已成功签发的 MySQL artifact 引用仍可用。单个产物保存失败或超过限制时，artifact_warning 提示部分引用不可用，不影响原结果。
+同步 REST 搜索若 Redis 保存失败或快照过大，仍返回原搜索结果，设置 snapshot_available=false / snapshot_error，不签发无法读取的 result_id；它不享有 SQL 结果回源。MCP 排队提交则要求 Redis/Kafka 可用，不能以未保存的结果冒充完成快照。已成功签发的 MySQL artifact 引用仍可用。单个产物保存失败或超过限制时，artifact_warning 提示部分引用不可用，不影响原结果。
 
 ### 结果分页
 
@@ -121,11 +121,14 @@ ALTER TABLE documents ADD COLUMN del_flag BOOLEAN NOT NULL DEFAULT 0;
 ## 配置与限制
 
 ```text
+RAG_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
+RAG_KAFKA_CLIENT_ID=praxis-rag
+RAG_KAFKA_SECURITY_PROTOCOL=PLAINTEXT
 RAG_SEARCH_TOPIC=praxis_search
 RAG_SEARCH_GROUP=praxis_search_workers
 RAG_SEARCH_TIMEOUT_SECONDS=120
-# Provisioning only; Broker owns consumer retries (not runtime Python settings).
-RAG_SEARCH_BROKER_MAX_RETRIES=16
+RAG_SEARCH_MAX_ATTEMPTS=5
+RAG_SEARCH_DLQ_TOPIC=praxis_search_dead_letters
 RAG_SEARCH_DLQ_GROUP=praxis_search_dead_letters
 RAG_RESULT_TTL_SECONDS=3600
 RAG_RESULT_MAX_BYTES=16777216
@@ -133,22 +136,20 @@ RAG_ARTIFACT_MAX_BYTES=67108864
 RAG_RESULT_MAX_ARTIFACTS=100
 ```
 
-- MCP 搜索必须运行独立 `rag-search-worker`；没有消费者会排队直至 deadline。每个消费进程默认顺序执行，文档、搜索、缓存刷新使用独立 topic/group；worker 与 API 共享 MySQL、必需的 Redis/MQ、Qdrant 和状态加密设置。文档异步新增另需 `rag-document-worker`（不依赖 Redis），投递模式由 `RAG_OUTBOX_BRIDGE` 选择。
-- 任务默认总超时 120 秒，包含排队等待，与 `wait_seconds`（默认 10 秒）和完成快照的 3600 秒 TTL 独立。生产检索在子进程执行；MQ 可见性续期失败有界重试，不承诺立即取消正在执行的检索或下游调用。
-- MQ 携带完整查询参数，Redis 保存短期搜索任务/结果；任务状态采用 CAS，结果快照与成功终态在 Redis 内原子保存（不含 MySQL 事务）；消费重试、invisible 与 DLQ 由 Broker 管理。临时故障不 ACK；确定性失败先写 Redis 失败终态再 ACK，成功先存结果/终态再 ACK。终态 first-terminal-wins；续期失败后已记录终态仍尝试 ACK，重复消息不覆盖仍存在的终态；Redis 丢失后不保证搜索持久去重。
-- 文档消息只含 schema 3 通知标识；worker 按 `artifact_id` 从 MySQL 读回任务与文件字节，用 SQL 租约 claim 并心跳续租，只有 MySQL 记录终态才 ACK，瞬时失败不 ACK 由 Broker 重投。没有 Redis 任务状态或重组 TTL，也没有 Redis+MySQL 原子事务：文档 `succeeded` 就是 MySQL 持久发布结果。
+- MCP 搜索必须运行独立 `rag-search-worker`；没有消费者会排队直至 deadline。每个消费进程默认顺序执行，文档、搜索、缓存刷新使用独立 topic/group；worker 与 API 共享 MySQL、必需的 Redis/Kafka、Qdrant 和状态加密设置。文档异步新增另需 `rag-document-worker`（不依赖 Redis），投递模式由 `RAG_OUTBOX_BRIDGE` 选择。
+- 任务默认总超时 120 秒，包含排队等待，与 `wait_seconds`（默认 10 秒）和完成快照的 3600 秒 TTL 独立。生产检索在子进程执行；Kafka 消费失败在同一进程内指数退避重试（100ms 起、上限 5s），不承诺立即取消正在执行的检索或下游调用。
+- Kafka 携带完整查询参数，Redis 保存短期搜索任务/结果；任务状态采用 CAS，结果快照与成功终态在 Redis 内原子保存（不含 MySQL 事务）。消费语义：成功提交 offset；临时故障在同一进程内重试同一条记录；达到 `RAG_SEARCH_MAX_ATTEMPTS` 后原始消息写入 `RAG_SEARCH_DLQ_TOPIC` 再提交；至少一次。确定性失败先写 Redis 失败终态再提交，成功先存结果/终态再提交。终态 first-terminal-wins；重复消息不覆盖仍存在的终态；Redis 丢失后不保证搜索持久去重。
+- 文档消息只含 schema 3 通知标识；worker 按 `artifact_id` 从 MySQL 读回任务与文件字节，用 SQL 租约 claim 并心跳续租，只有 MySQL 记录终态才提交 offset；瞬时失败在同一进程内重试，达到 `RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS` 后写入 `RAG_DOCUMENT_DLQ_TOPIC` 再提交（至少一次）。没有 Redis 任务状态或重组 TTL，也没有 Redis+MySQL 原子事务：文档 `succeeded` 就是 MySQL 持久发布结果。
 - 文档重投通过 UploadJournal 对账，不重复发布；MySQL 仍保存业务操作/租约、fencing、补偿与恢复。
-- 独立 `rag-dead-letter-worker --kind search`（也支持 `--kind document`）把尚未终结的任务标记失败：搜索写 Redis、文档写 MySQL，成功写入后才 ACK，不加载模型或执行推理。正常 Broker 死信 topic 为 `%DLQ%<源消费组>`，处理组使用独立 `RAG_SEARCH_DLQ_GROUP`；不能把处理组名当死信 topic。传输层已验证 Python SDK 5.1.2 / Apache Broker 5.3.3 的正常 DLQ 接收及 ACK；其他版本上线前需重新验证，并预建可读 topic、处理组及权限，详见 [Broker 消费与死信处理](USAGE.md#broker-消费与死信处理)。
+- 独立 `rag-dead-letter-worker --kind search`（也支持 `--kind document`）把尚未终结的任务标记失败：搜索写 Redis、文档写 MySQL，成功写入后才提交 offset，不加载模型或执行推理。死信 topic 是显式的 `RAG_DOCUMENT_DLQ_TOPIC` / `RAG_SEARCH_DLQ_TOPIC`（不再使用 `%DLQ%<源消费组>`），两个 worker 各自使用独立的 `RAG_DOCUMENT_DLQ_GROUP` / `RAG_SEARCH_DLQ_GROUP`。Kafka 3.9.0 + Debezium 3.7.1 + MySQL 8.0 的 CDC 投递已实机验证（记录进入 topic，outbox 仍 PENDING）；完整 Go worker 消费与 DLQ 实机回归仍未执行。
 - 结果快照默认最大 16 MiB；保持原图片兼容响应。同步 REST 搜索快照过大时仍可返回原结果并标记快照不可用；MCP 排队任务不能以未写入 Redis 的结果冒充已完成快照。
 - 每次搜索默认至多签发 100 个产物，累计字节预算 64 MiB；同一搜索的重复产物不重复计费。
 - 单个 artifact 默认也受 64 MiB 上限约束，MySQL max_allowed_packet 必须满足实际产物大小；默认 Compose 为 64 MiB，接近上限的大对象可能因协议开销失败并提示引用不可用。
-- Redis 使用已有连接配置和前缀；结果存储不采用展示缓存修订水位/cache outbox，也没有 SQL fallback。Redis 丢失或 TTL 到期不会通过 MQ 自动重跑已完成结果；客户端可能需要重新提交。不要将 MySQL artifact 保留保证与短期搜索结果混淆。
+- Redis 使用已有连接配置和前缀；结果存储不采用展示缓存修订水位/cache outbox，也没有 SQL fallback。Redis 丢失或 TTL 到期不会通过 Kafka 自动重跑已完成结果；客户端可能需要重新提交。不要将 MySQL artifact 保留保证与短期搜索结果混淆。
 - 此版本不增加前端快照历史/下载入口；现有搜索 UI 继续使用完整结果。
 
 ## 验证
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_result_snapshots.py tests\test_artifact_registry.py tests\test_uuid_protocol.py tests\test_soft_delete_references.py
-```
+`go test -count=1 ./internal/searchrefs/... ./internal/state/...` 覆盖结果快照、artifact 注册/读取、软删除引用与 UUID 协议。
 
-真实服务测试：RAG_TEST_UUID_MYSQL_URL 指向可丢弃的 praxis_uuid_test_* 库，RAG_TEST_REDIS_URL 指向 Redis，可选 RAG_TEST_QDRANT_URL。运行 tests/test_uuid_live.py；测试会清空独立 schema、删除自己前缀的 Redis key 及独立 uuid_test_* 集合，不可指向生产库。
+历史 Python 测试已随后端删除。Kafka 迁移后的真实验证在 Kafka 3.9.0 + Debezium 3.7.1 + MySQL 8.0 上完成到“记录进入 topic 且 outbox 保持 PENDING”；Go worker 消费真实 Kafka 及 Redis 实机验收仍未执行，详见 [GO_MIGRATION](GO_MIGRATION.md) 最后一轮。

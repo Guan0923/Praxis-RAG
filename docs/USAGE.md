@@ -7,13 +7,13 @@
 MCP 客户端 -> /mcp ------------> rag-service ──> Qdrant
 REST /v1/* --------------------> rag-service ──> 共享状态库（MySQL / SQLite）
                                              ├─> Redis（读模型缓存、搜索结果快照；可选，排队搜索快照需要）
-                                             └─> RocketMQ（outbox relay / 搜索队列；可选）
+                                             └─> Kafka（outbox relay / 搜索队列；可选）
 
 MCP add_document -> 状态库单事务（document_jobs + document_job_outbox）
-                 -> relay（rag-service 配置 MQ 时）或本地 outbox 轮询
-                 -> RocketMQ 通知 -> rag-document-worker -> 解析/切分/Embedding/Qdrant 发布
-MCP search（配置 MQ 时）-> search_task_outbox -> RocketMQ -> rag-search-worker -> SearchRaw + 快照
-Broker DLQ（%DLQ%<源消费组>）-> rag-dead-letter-worker --kind document|search
+                 -> relay（rag-service 配置 Kafka 时）或本地 outbox 轮询
+                 -> Kafka 通知 -> rag-document-worker -> 解析/切分/Embedding/Qdrant 发布
+MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-worker -> SearchRaw + 快照
+Kafka 死信（显式 DLQ topic）-> rag-dead-letter-worker --kind document|search
 ```
 
 RAG 只返回证据，不生成最终回答。后端为 Go 实现；Python 仅作为 PDF（Docling）与 Word 视觉解析的可选外部子进程存在于 `python-workers/`，不是运行 Go 后端的前置条件。
@@ -29,7 +29,7 @@ RAG 只返回证据，不生成最终回答。后端为 Go 实现；Python 仅�
 | Qdrant | HTTP API（默认 `6333`） | 检索索引；Go **不支持** `QDRANT_PATH` 本地文件模式 |
 | 共享状态库 | MySQL 8.0+（`utf8mb4`）或 SQLite | 文档、KB、API Key、任务、发件箱、UploadJournal |
 | Redis | 可选，7.x | 搜索结果快照、读模型缓存；排队 MCP 搜索的快照读取必需（搜索任务状态在共享状态库） |
-| RocketMQ | 可选，Broker + gRPC Proxy | 异步文档通知、排队搜索；Go SDK 实机兼容性未验证 |
+| Kafka | 可选，单节点 KRaft（Compose `kafka`）或外部集群 | 异步文档通知、排队搜索；可用 SASL/TLS 环境变量连接外部集群，Compose 本身只提供 PLAINTEXT |
 | 外部解析器 | 可选 | PDF（Docling Python 环境/模型）、DOC（LibreOffice）；**不包含在 Go 二进制或镜像中** |
 
 ### 构建命令
@@ -91,7 +91,7 @@ npm run dev
 
 ### Docker Compose
 
-仓库自带 `docker-compose.yml`，默认 profile 只启动基础设施（MySQL、Qdrant、Redis、RocketMQ）：
+仓库自带 `docker-compose.yml`，默认 profile 只启动基础设施（MySQL、Qdrant、Redis、Kafka）：
 
 ```powershell
 Copy-Item .env.example .env
@@ -99,9 +99,9 @@ Copy-Item .env.example .env
 docker compose up -d
 ```
 
-MySQL 默认映射 `127.0.0.1:3307`（避免与本地 3306 冲突），Qdrant 为 `6333/6334`，Redis 为 `6379`，RocketMQ gRPC Proxy 为 `127.0.0.1:8081`。停止保留数据：`docker compose down`。
+MySQL 默认映射 `127.0.0.1:3307`（避免与本地 3306 冲突），Qdrant 为 `6333/6334`，Redis 为 `6379`，Kafka 宿主监听 `127.0.0.1:9092`（容器内 `kafka:9092`）。停止保留数据：`docker compose down`。
 
-> RocketMQ 的 topic/group 需要**预先创建**（Broker 自动创建在仓库 Compose 中关闭）。`scripts/start-stack.ps1` 已切换为 Go 流程：启动依赖、创建缓存刷新/文档/搜索三组正常 topic/group 与可读 DLQ topic、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe`；用 `-MigrateOnly` 可只准备依赖与数据库。使用 `RAG_DOCUMENT_WORKER_LOCAL=1` 的单进程文档模式或纯同步 REST 场景可以不配置 RocketMQ。
+> Kafka 默认自动创建 topic（4 partitions、副本 1）；`scripts/start-stack.ps1` 仍会显式创建 cache/document/search 与两个 DLQ topic、等待 Kafka healthy、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe`；`RAG_OUTBOX_BRIDGE=debezium` 时带 `--profile debezium` 并等待 Debezium 输出 `Starting streaming`。用 `-MigrateOnly` 可只准备依赖与数据库。使用 `RAG_DOCUMENT_WORKER_LOCAL=1` 的单进程文档模式或纯同步 REST 场景可以不配置 Kafka（保持 `RAG_KAFKA_BOOTSTRAP_SERVERS` 为空）。
 
 ### 手动依赖
 
@@ -129,6 +129,15 @@ RAG_SERVICE_DATA_ROOT = "~/.praxis-rag/data"
 QDRANT_URL = "http://127.0.0.1:6333"
 RAG_COLLECTION = "mini_agent_knowledge_pdf_assets_v1"
 RAG_WORD_CONVERT_TIMEOUT = "120"
+# Kafka（宿主机进程用 127.0.0.1:9092；compose 容器由 compose 注入 kafka:9092）
+# RAG_KAFKA_BOOTSTRAP_SERVERS = "127.0.0.1:9092"
+# RAG_KAFKA_CLIENT_ID = "praxis-rag"
+# RAG_CACHE_TOPIC = "praxis_state_cache_refresh"
+# RAG_DOCUMENT_TOPIC = "praxis_document_ingest"
+# RAG_SEARCH_TOPIC = "praxis_search"
+# RAG_DOCUMENT_DLQ_TOPIC = "praxis_document_ingest_dead_letters"
+# RAG_SEARCH_DLQ_TOPIC = "praxis_search_dead_letters"
+# RAG_OUTBOX_BRIDGE = "relay"
 # RAG_MYSQL_HOST = "127.0.0.1"
 # RAG_MYSQL_PORT = "3306"
 # RAG_MYSQL_USER = "rag"
@@ -136,7 +145,7 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 # RAG_STATE_URL = "mysql+pymysql://rag:password@127.0.0.1:3306/praxis_rag?charset=utf8mb4"
 ```
 
-凭据只放环境变量（`RAG_MYSQL_PASSWORD`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_SERVICE_TOKEN`、`RAG_ROCKETMQ_ACCESS_KEY/SECRET_KEY`），不要写入配置文件。配置值必须是带引号的字符串；Windows 路径用 `/`。未知键或 TOML 语法错误会让进程明确失败，不会静默忽略。
+凭据只放环境变量（`RAG_MYSQL_PASSWORD`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_SERVICE_TOKEN`、`RAG_KAFKA_SASL_USERNAME/PASSWORD`、`RAG_KAFKA_TLS_CA`），不要写入配置文件。配置值必须是带引号的字符串；Windows 路径用 `/`。未知键或 TOML 语法错误会让进程明确失败，不会静默忽略。
 
 ### 服务入口
 
@@ -214,26 +223,37 @@ SQLite 路径为 `<RAG_SERVICE_DATA_ROOT>/state.sqlite3`；未配置 MySQL/URL �
 
 Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的结果快照必须用 Redis**，没有 SQL 回放。REST 同步搜索、Console 与本地调试不依赖 Redis（快照可降级为 `snapshot_available=false`）。
 
-### RocketMQ 与队列
+### Kafka 与队列
+
+单节点 Compose Kafka 使用 INTERNAL/EXTERNAL 双 listener：宿主机进程用 `127.0.0.1:9092`，同一 compose 网络的容器用 `kafka:9092`；`RAG_KAFKA_BOOTSTRAP_SERVERS` 为空表示 brokerless（异步受理仍可提交，但投递/排队搜索不可用）。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RAG_ROCKETMQ_ENDPOINT` | 空 | gRPC Proxy 地址（Compose 默认 `127.0.0.1:8081`）；设置后服务启用进程内 relay 与排队 MCP 搜索 |
-| `RAG_ROCKETMQ_TOPIC` / `RAG_ROCKETMQ_GROUP` | `praxis_state_cache_refresh` / `praxis_state_cache_refresh_workers` | 缓存刷新队列 |
-| `RAG_ROCKETMQ_NAMESPACE` | 空 | RocketMQ namespace（与知识库 namespace 不同） |
-| `RAG_ROCKETMQ_TLS` | `false` | 共享 TLS 开关 |
-| `RAG_ROCKETMQ_ACCESS_KEY` / `RAG_ROCKETMQ_SECRET_KEY` | 空 | 可选凭据，仅从环境读取 |
-| `RAG_ROCKETMQ_PUBLISH_TIMEOUT_SECONDS` | `10` | 发布超时 |
-| `RAG_ROCKETMQ_VISIBILITY_SECONDS` | `60` | 消费不可见期 |
-| `RAG_ROCKETMQ_AWAIT_SECONDS` | `5` | 消费者拉取等待时长 |
-| `RAG_DOCUMENT_TOPIC` / `RAG_DOCUMENT_GROUP` | `praxis_document_ingest` / `praxis_document_ingest_workers` | 文档通知队列 |
-| `RAG_DOCUMENT_DLQ_GROUP` | `praxis_document_dead_letters` | 文档死信处理组（不是 topic） |
-| `RAG_SEARCH_TOPIC` / `RAG_SEARCH_GROUP` | `praxis_search` / `praxis_search_workers` | 排队搜索队列 |
-| `RAG_SEARCH_DLQ_GROUP` | `praxis_search_dead_letters` | 搜索死信处理组（不是 topic） |
-| `RAG_OUTBOX_BRIDGE` | `relay` | `relay`：进程内发布发件箱；`debezium`：应用不发布，由 MySQL binlog CDC 投递（需 compose `debezium` profile / 外部 Debezium；两者不可同时启用） |
-| `RAG_DOCUMENT_BROKER_MAX_RETRIES` | `5` | 文档 worker 消费最大尝试次数（也可用 `RAG_DOCUMENT_MAX_ATTEMPTS`） |
+| `RAG_KAFKA_BOOTSTRAP_SERVERS` | 空 | 逗号分隔 `host:port`；宿主默认 `127.0.0.1:9092`，compose 容器 `kafka:9092`；空 = brokerless |
+| `RAG_KAFKA_CLIENT_ID` | `praxis-rag` | Kafka 客户端标识 |
+| `RAG_KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` | `PLAINTEXT` / `SSL` / `SASL_PLAINTEXT` / `SASL_SSL` |
+| `RAG_KAFKA_SASL_MECHANISM` | 空 | `PLAIN` / `SCRAM-SHA-256` / `SCRAM-SHA-512`（仅 SASL 协议使用） |
+| `RAG_KAFKA_SASL_USERNAME` / `RAG_KAFKA_SASL_PASSWORD` | 空 | SASL 凭据，仅从环境读取 |
+| `RAG_KAFKA_TLS_CA` | 空 | 可选 CA PEM 路径 |
+| `RAG_KAFKA_TLS_INSECURE` | `false` | 跳过 TLS 证书校验（仅测试） |
+| `RAG_KAFKA_PUBLISH_TIMEOUT_SECONDS` | `10` | 发布超时 |
+| `RAG_CACHE_TOPIC` / `RAG_CACHE_GROUP` | `praxis_state_cache_refresh` / `praxis_state_cache_refresh_workers` | 缓存刷新 topic/group |
+| `RAG_DOCUMENT_TOPIC` / `RAG_DOCUMENT_GROUP` | `praxis_document_ingest` / `praxis_document_ingest_workers` | 文档通知 topic/group |
+| `RAG_SEARCH_TOPIC` / `RAG_SEARCH_GROUP` | `praxis_search` / `praxis_search_workers` | 排队搜索 topic/group |
+| `RAG_DOCUMENT_DLQ_TOPIC` | `praxis_document_ingest_dead_letters` | 文档死信 topic（显式配置，不是 `%DLQ%` 约定） |
+| `RAG_SEARCH_DLQ_TOPIC` | `praxis_search_dead_letters` | 搜索死信 topic（显式配置） |
+| `RAG_DOCUMENT_DLQ_GROUP` / `RAG_SEARCH_DLQ_GROUP` | `praxis_document_dead_letters` / `praxis_search_dead_letters` | 死信 worker 的独立 group |
+| `RAG_OUTBOX_BRIDGE` | `relay` | `relay`：进程内发布发件箱到 Kafka；`debezium`：应用不发布，由 Debezium Server 读取 MySQL binlog 并通过原生 Kafka sink 投递（需 compose `debezium` profile / 外部 Debezium；两者不可同时启用） |
+| `RAG_APP_KAFKA_BOOTSTRAP_SERVERS` | 空（compose 内默认 `kafka:9092`） | 仅 compose app/Debezium 容器读取的 bootstrap 覆盖；宿主 Go 进程读 `RAG_KAFKA_BOOTSTRAP_SERVERS` |
 
-正常 Broker DLQ topic 是 `%DLQ%<源消费组>`：默认 `%DLQ%praxis_document_ingest_workers`、`%DLQ%praxis_search_workers`。死信 worker 用独立组（上表 `*_DLQ_GROUP`）读取这些物理 topic；需要预建 topic/组并授予读权限，Broker 自动创建在仓库 Compose 中关闭。
+**消费语义（至少一次）**：
+
+- handler 成功 → 提交 Kafka offset；
+- handler 失败（nack）→ 在**同一进程内**重试同一条记录，指数退避从 `100ms` 开始、上限 `5s`，`DeliveryAttempt` 从 1 递增；
+- 达到 `MaxAttempts`（文档/搜索 worker 默认 5）→ 把原始消息发布到对应 `RAG_*_DLQ_TOPIC`、执行终态回调、再提交 offset；
+- `MaxAttempts=0` → 不设上限，一直重试直到进程或 context 取消；
+- 死信 worker 的 `--kind document|search` 实例消费显式 DLQ topic 与独立 `RAG_*_DLQ_GROUP`，不再使用 `%DLQ%<源组>` 或 mqadmin；`MaxAttempts=0` 的死信 worker 自身不会二次死信。
+- 消费重试与死信发布由 Go 消费端完成，不依赖 Kafka 的不可见期/重投机制；重复投递由 handler 幂等与 MySQL 业务租约吸收。
 
 ### 异步文档与 worker 环境
 
@@ -244,17 +264,17 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 | `RAG_DOCUMENT_JOB_SWEEP_SECONDS` | `120` | 滞留/过期任务回收窗口 |
 | `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS` | `604800`（7 天） | 发件箱行保留期 |
 | `RAG_DOCUMENT_JOB_RETENTION_SECONDS` | `2592000`（30 天） | 终态任务保留期 |
-| `RAG_DOCUMENT_WORKER_LOCAL` | `false` | 文档 worker 单进程 outbox 模式；仅在未配置 `RAG_ROCKETMQ_ENDPOINT` 时生效 |
+| `RAG_DOCUMENT_WORKER_LOCAL` | `false` | 文档 worker 单进程 outbox 模式；仅在未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时生效 |
 | `RAG_DOCUMENT_WORKER_POLL_SECONDS` | `0.5` | 本地 outbox / 消费轮询间隔 |
 | `RAG_DOCUMENT_WORKER_RECOVER_SECONDS` | `30` | 文档 worker 周期性 Recover（恢复中断上传/补偿） |
-| `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_DOCUMENT_MAX_ATTEMPTS` | `5` | worker 消费最大尝试次数（前者优先） |
+| `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_DOCUMENT_MAX_ATTEMPTS` | `5` | 文档 worker 的 Kafka 进程内最大尝试次数（前者优先；名称为兼容旧配置保留） |
 
 ### 排队搜索任务环境
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `RAG_SEARCH_TIMEOUT_SECONDS` | `120` | 搜索任务总截止时间（包含排队），与调用方 `wait_seconds` 不同 |
-| `RAG_SEARCH_MAX_ATTEMPTS` | `5` | worker Broker 重试上限 |
+| `RAG_SEARCH_MAX_ATTEMPTS` | `5` | 搜索 worker 的 Kafka 进程内重试上限 |
 | `RAG_SEARCH_LEASE_SECONDS` | `120` | 任务执行租约（Go 状态机扩展） |
 | `RAG_SEARCH_RETRY_SECONDS` | `5` | 失败重投或重试等待 |
 
@@ -262,12 +282,12 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 
 | 命令 | 作用 | 必需 | 退出码 |
 | --- | --- | --- | --- |
-| `rag-service` | REST + MCP + Console + 进程内 relay/维护循环 | Qdrant、状态库；MCP 需要 token；异步/排队需要 MQ | `0` 正常停止，`1` 运行时失败 |
-| `rag-document-worker` | 消费文档通知，解析/切分/Embedding/发布 | 状态库、Qdrant；broker 模式需 `RAG_ROCKETMQ_ENDPOINT`，或 `RAG_DOCUMENT_WORKER_LOCAL=1` | `0/1/2` |
-| `rag-search-worker` | 消费 schema 2 搜索请求，执行 `SearchRaw` + 快照 + 终态 | `RAG_ROCKETMQ_ENDPOINT`、状态库、Qdrant、Redis（快照） | `0/1/2` |
-| `rag-dead-letter-worker --kind document\|search` | 读取 `%DLQ%<源组>`，把可确认的失败写入持久终态并 ACK | `RAG_ROCKETMQ_ENDPOINT`、对应 `*_DLQ_GROUP` | `0/1/2` |
+| `rag-service` | REST + MCP + Console + 进程内 relay/维护循环 | Qdrant、状态库；MCP 需要 token；异步/排队需要 Kafka | `0` 正常停止，`1` 运行时失败 |
+| `rag-document-worker` | 消费文档通知，解析/切分/Embedding/发布 | 状态库、Qdrant；Kafka 模式需 `RAG_KAFKA_BOOTSTRAP_SERVERS`，或 `RAG_DOCUMENT_WORKER_LOCAL=1` | `0/1/2` |
+| `rag-search-worker` | 消费 schema 2 搜索请求，执行 `SearchRaw` + 快照 + 终态 | `RAG_KAFKA_BOOTSTRAP_SERVERS`、状态库、Qdrant、Redis（快照） | `0/1/2` |
+| `rag-dead-letter-worker --kind document\|search` | 消费显式 `RAG_DOCUMENT_DLQ_TOPIC` / `RAG_SEARCH_DLQ_TOPIC`，把可确认的失败写入持久终态并 ACK | `RAG_KAFKA_BOOTSTRAP_SERVERS`、对应 `RAG_*_DLQ_GROUP` | `0/1/2` |
 
-退出码约定（worker 与全部 CLI）：`0` = 收到 SIGINT/SIGTERM 正常停止；`1` = 运行时失败（应重启/告警）；`2` = 配置或用法错误（修配置，不要自动重启）。服务本身配置错误也以 `1` 退出。文档 worker 的本地模式适合单进程开发：无 broker 时它直接轮询 `document_job_outbox`，有 broker 时变量被忽略并切换为 broker 模式。**worker 不在 `rag-service` 进程内运行**；服务只负责受理、relay 和维护循环。
+退出码约定（worker 与全部 CLI）：`0` = 收到 SIGINT/SIGTERM 正常停止；`1` = 运行时失败（应重启/告警）；`2` = 配置或用法错误（修配置，不要自动重启）。服务本身配置错误也以 `1` 退出。文档 worker 的本地模式适合单进程开发：未配置 Kafka 时它直接轮询 `document_job_outbox`，有 Kafka 时变量被忽略并切换为 Kafka 消费模式。**worker 不在 `rag-service` 进程内运行**；服务只负责受理、relay 和维护循环。
 
 ## 4. 启动与冒烟
 
@@ -298,7 +318,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
 ### 启动 worker
 
 ```powershell
-# 异步 MCP add_document（broker 模式；无 broker 可加 $env:RAG_DOCUMENT_WORKER_LOCAL="1"）
+# 异步 MCP add_document（Kafka 模式；无 Kafka 可加 $env:RAG_DOCUMENT_WORKER_LOCAL="1"）
 .\dist\bin\rag-document-worker.exe
 
 # 服务端 MCP 排队搜索
@@ -317,8 +337,8 @@ worker 必须与 `rag-service` 使用**同一** `RAG_CONFIG_FILE`、`RAG_SERVICE
 2. `/console` 返回 Console 页面（构建了 `dist/web` 且 `RAG_WEB_ROOT` 正确时）。
 3. REST `/v1/documents` 需要认证，未认证返回 401。
 4. MCP 初始化成功，`tools/list` 返回 6 个工具。
-5. 异步链路：配置 MQ 并启动 document worker 后，MCP `add_document` 得到 `artifact_id`，轮询 `get_document_status` 至 `succeeded`。
-6. 排队搜索：配置 MQ/Redis 并启动 search worker 后，MCP `search` 返回结果或 `result_id`，`get_search_result` 可轮询到完成。
+5. 异步链路：配置 Kafka 并启动 document worker 后，MCP `add_document` 得到 `artifact_id`，轮询 `get_document_status` 至 `succeeded`。
+6. 排队搜索：配置 Kafka/Redis 并启动 search worker 后，MCP `search` 返回结果或 `result_id`，`get_search_result` 可轮询到完成。
 
 ## 5. REST API 示例
 
@@ -480,7 +500,7 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 
 | 工具 | 参数 | 行为 |
 | --- | --- | --- |
-| `search` | `query`、`retrieval`、`rerank`、`candidate_k`、`top_k`、`filters`；配置 MQ 时还有 `wait_seconds` | 检索；排队模式下超时只返回 `result_id` |
+| `search` | `query`、`retrieval`、`rerank`、`candidate_k`、`top_k`、`filters`；配置 Kafka 时还有 `wait_seconds` | 检索；排队模式下超时只返回 `result_id` |
 | `get_search_result` | `result_id`、`page`、`page_size` | 读取排队状态或结果分页；不重复检索 |
 | `add_document` | `name` + `content`/`content_base64`，可选 `idempotency_key` | 异步入库，成功只返回 `artifact_id` |
 | `get_document_status` | `artifact_id` | 查询 `status/stage/error`，状态在 MySQL/SQLite |
@@ -489,19 +509,19 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 
 工具名与 schema 与 Python 实现一致；`delete_document` 标注为 destructive。是否启用某个工具可经 `/v1/admin/tools` 管理；执行时会实时读取 catalog，禁用后返回错误。
 
-### 排队搜索（配置 `RAG_ROCKETMQ_ENDPOINT` 时）
+### 排队搜索（配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时）
 
 - `search` 增加 `wait_seconds`（0..30，默认 10）。等待内完成返回完整结果；否则只返回 `{"result_id":"<uuid>"}`。
 - `get_search_result`：未完成返回 `{"result_id","status":"queued","stage":"queued|processing|retry_wait"}`；成功返回快照分页；失败/超时/快照过期是 `isError=true`。
 - 必需：`rag-search-worker`、Redis（结果快照）、状态库（任务/发件箱）。任务截止 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120 秒）包含排队时间。
-- 未配置 MQ 时 MCP `search` 退化为同步执行，schema 不包含 `wait_seconds`；客户端应按实际工具 schema 调用。
+- 未配置 Kafka 时 MCP `search` 退化为同步执行，schema 不包含 `wait_seconds`；客户端应按实际工具 schema 调用。
 - `RAG_RESULT_TTL_SECONDS`（默认 3600 秒）到期或 Redis 丢失后 result_id 不可用，无 SQL 回放。
 
 ### 异步文档
 
 `add_document` 在状态库单事务写入完整任务（含文件字节）与发件箱，提交后返回 `{"artifact_id": "<uuid>"}`，不代表已解析/可检索。`get_document_status` 返回 `status`（`queued/processing/succeeded/failed`）、`stage`、`error`；仅 `succeeded` 表示已持久发布。同名文档已存在或已有排队/执行中的新增会被拒绝；不确定提交结果时用同一 `idempotency_key` 重试，不会重复入队。
 
-投递方式：默认 `RAG_OUTBOX_BRIDGE=relay`，服务进程内发布发件箱；设为 `debezium` 时服务不发布，由外部 Debezium 读取 MySQL binlog 投递（`docker compose --profile debezium up -d`，配置见 [deploy/debezium/README.md](../deploy/debezium/README.md)）。未配置 broker 时可用 `RAG_DOCUMENT_WORKER_LOCAL=1` 让文档 worker 直接轮询发件箱。**不要把 Debezium 与 relay 同时启用**（重复投递）。
+投递方式：默认 `RAG_OUTBOX_BRIDGE=relay`，服务进程内发布发件箱；设为 `debezium` 时服务不发布，由外部 Debezium 读取 MySQL binlog 投递（`docker compose --profile debezium up -d`，配置见 [deploy/debezium/README.md](../deploy/debezium/README.md)）。未配置 Kafka 时可用 `RAG_DOCUMENT_WORKER_LOCAL=1` 让文档 worker 直接轮询发件箱。**不要把 Debezium 与 relay 同时启用**（重复投递）。
 
 ### 资源、提示词与订阅
 
@@ -585,7 +605,7 @@ docker compose --profile app up -d --build
 - 非 root 用户 `rag`，`/app/data` 为数据卷；健康检查调用 `/health`。
 - 镜像**不含** Python、Docling、LibreOffice 或视觉模型：PDF/DOC/Word 视觉解析需要把外部环境挂载到容器并设置 `RAG_PDF_PARSER_PYTHON`、`RAG_PDF_MODELS_PATH`、`RAG_WORD_CONVERTER_PATH` 等变量；否则相应上传会明确失败。
 - Compose `app` 服务只运行 `rag-service`；worker 没有内置 compose 服务，可用一次性容器（把入口覆盖为 worker 二进制、连接到同一网络并复用同一环境）或参考 [DEPLOYMENT](DEPLOYMENT.md) 的 systemd/override 示例。
-- **未验证**：本环境没有 Docker，镜像构建与 compose `app` profile 均未实机验证；Dockerfile/compose 仅经过人工检查与本地二进制冒烟。
+- **已验证/未验证**：本机 Docker 已实机拉起 Kafka + Debezium 基础设施，并用 host 模式 Go 服务/worker 跑通 debezium/relay 两种异步链路、排队搜索与 DLQ（见 §10；脚本 `scripts/verify-debezium-e2e.py`、`scripts/verify-kafka-search.py`、`scripts/verify-kafka-dlq.py`）；镜像构建、compose `app` profile 与 worker 容器仍未经实机验证。
 
 ## 9. Token 与远程部署
 
@@ -607,17 +627,17 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 
 - `go build ./...` 全部通过；`go test -count=1 ./...` 全部通过（包数与用例数随代码演进：迁移闭环时为 24 个有测试的包，含 state/runtime/workers/httpapi/mcp/searchrefs/检索栈等）。
 - `scripts/build-go.ps1` 本机构建 + 冒烟：`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200。POSIX 的 `scripts/build-go.sh`/`make` 未在当前 Windows 验证环境执行。
-- 三个 worker 二进制 `--help`、无 broker、错误 backend、非法 `--kind` 的退出码行为；文档 worker 本地模式可启动并创建 SQLite 状态。
+- 三个 worker 二进制 `--help`、无 Kafka、错误 backend、非法 `--kind` 的退出码行为；文档 worker 本地模式可启动并创建 SQLite 状态。
 - Go 端 REST/MCP/检索/文档/资产投影/`document.md` 预览/上传事务的单元与集成测试（真实 SQLite + fake Qdrant/model）。
 
 **未验证**（不要据此宣称生产就绪）：
 
 - Docker 镜像构建、Compose `app` profile、systemd 单元未实际执行（本环境无 Docker/systemd）。
-- 未连接真实 RocketMQ/MySQL/Redis/Qdrant：Go RocketMQ SDK（apache/rocketmq-clients/golang v5）与 Broker 5.3.3 + gRPC Proxy 的兼容性、真实 DLQ 消费/ACK、真实 MySQL 上传事务与多实例锁均未实机验证。
+- 已实机验证 Kafka 3.9.0 + Debezium Server 3.7.1 + MySQL 8.0 + Redis + Qdrant：CDC 投递（Kafka healthy、`Starting streaming`、topic 记录与 outbox 一致），以及 Go 服务/worker 的完整异步链路（debezium 与 relay 两种模式）、显式 DLQ topic、排队 MCP 搜索与 Redis 快照。仍未验证 SASL/TLS 外部 Kafka、MySQL 多实例锁与 systemd 部署。
 - Docling/LibreOffice/视觉模型链路未在 Go 环境实机验证；PDF/DOC/Word 视觉解析依赖外部 Python 环境。
 - 没有浏览器 E2E：Console 只验证构建与静态冒烟，交互/字段联动由人工核对与前端源码检查。
 - Tokenizer 是确定性近似，不保证与 Python/BGE-M3 的 token 计数一致（句子/段落/结构边界一致）。
-- 异步 e2e（API 受理 → fake broker → worker → 发布）已由 `internal/e2e` 覆盖；真实 RocketMQ/MySQL/Redis/Qdrant 的黑盒回归仍未执行（见 [GO_MIGRATION](GO_MIGRATION.md)）。
+- 异步 e2e（API 受理 → fake Kafka transport → worker → 发布）已由 `internal/e2e` 覆盖；真实 Kafka/MySQL/Redis/Qdrant 上由 Go worker 完成整条链路的黑盒回归已执行并通过：`scripts/verify-debezium-e2e.py`（debezium/relay）、`scripts/verify-kafka-search.py`（排队搜索）、`scripts/verify-kafka-dlq.py`（DLQ）。
 
 ## 11. 开发与测试
 
@@ -648,8 +668,8 @@ Go 服务会在 ingest 阶段以子进程方式调用 `rag_mcp.pdf_worker` / `ra
 - **Qdrant**：仅支持 HTTP 模式；`QDRANT_PATH` 会在启动时被拒绝。
 - **Tokenizer**：见 §10；token 预算切分位置可能与 Python 不同。
 - **外部解析器**：PDF（Docling）、DOC（LibreOffice）、Word 视觉描述都不是 Go 内置能力；未配置时相应功能报错。Go 暂未接入 Word 视觉 worker，无图注图片没有生成描述。
-- **异步投递**：支持 relay（默认，进程内发件箱发布）、debezium（MySQL binlog CDC，应用不发布）与本地 worker 模式；Debezium 模式需要 MySQL 状态库。
-- **排队搜索**：`RAG_ROCKETMQ_ENDPOINT` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 MQ。
+- **异步投递**：支持 relay（默认，进程内发件箱发布到 Kafka）、debezium（Debezium Server 读 MySQL binlog，经原生 Kafka sink 写 topic，应用不发布）与本地 worker 模式；Debezium 模式需要 MySQL 状态库。
+- **排队搜索**：`RAG_KAFKA_BOOTSTRAP_SERVERS` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 Kafka。
 - **REST 上传/更新/删除**仍同步执行，大文件索引期间请求会等待；异步只用于 MCP `add_document`。
 - **管理边界**：`/v1/admin/*` 仅本机直连；没有账户体系或细粒度多用户权限；工作区不是权限隔离。
 - **数据**：旧 SQLite 状态用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。

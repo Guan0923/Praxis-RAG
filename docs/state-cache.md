@@ -1,6 +1,8 @@
 # Redis 短期搜索状态与持久读模型缓存
 > **历史设计文档**：对应的 Python 后端实现已删除；当前 Go 实现位于 `internal/` 对应包，迁移状态与差异见 [GO_MIGRATION](GO_MIGRATION.md)。本文的 schema/契约描述仍作为共享状态层的设计参考。
 
+> **传输层更新（2026-11-09）**：旧 RocketMQ 传输已全部替换为 Kafka；本文的队列/topic 示例按当前 `RAG_KAFKA_*` 与显式 `RAG_*_DLQ_TOPIC` 契约阅读，历史验证命令仅作记录。
+
 
 ## 范围
 
@@ -38,11 +40,11 @@ Redis 有两种不同职责，不能混用其故障语义：
 
 ## MCP 短期搜索任务与结果快照
 
-搜索路径未随文档入库改造变化：API 直接向 RocketMQ 投递 schema 2 完整查询请求，获 Broker 确认后才返回成功；Redis 保存任务状态和完成快照，`wait_seconds=0` 也不能跳过确认。**文档入库不在此路径**：`add_document` 只提交一个 MySQL 事务（`document_jobs` 完整任务 + `document_job_outbox` 发件箱行），MQ 只传 schema 3 纯通知，Redis 不参与受理、状态或投递。
+搜索路径未随文档入库改造变化：API 直接向 Kafka 投递 schema 2 完整查询请求，获 Kafka producer 确认后才返回成功；Redis 保存任务状态和完成快照，`wait_seconds=0` 也不能跳过确认。**文档入库不在此路径**：`add_document` 只提交一个 MySQL 事务（`document_jobs` 完整任务 + `document_job_outbox` 发件箱行），Kafka 只传 schema 3 纯通知，Redis 不参与受理、状态或投递。
 
-搜索的 MQ/Redis 未配置、SDK 缺失、连接失败或发送确认失败必须明确报错；故障期间没有 SQL 持久接收和补发保证。部分发送后的超时可能不确定，重试应保留原 idempotency_key、内容和参数。Redis 丢失、淘汰或 TTL 到期可使搜索结果引用不可用，可能需要重新提交；不读旧 SQL 结果表，也不自动重新搜索来伪造原快照。
+搜索的 Kafka/Redis 未配置、客户端不可用、连接失败或发送确认失败必须明确报错；故障期间没有 SQL 持久接收和补发保证。部分发送后的超时可能不确定，重试应保留原 idempotency_key、内容和参数。Redis 丢失、淘汰或 TTL 到期可使搜索结果引用不可用，可能需要重新提交；不读旧 SQL 结果表，也不自动重新搜索来伪造原快照。
 
-搜索由独立 worker、独立 topic/group 消费；缓存刷新使用第三组独立 topic/group，文档通知使用文档 topic/group。消费者续期 MQ visibility；搜索临时故障不 ACK，确定性故障先写 Redis 失败终态再 ACK，成功也先写结果/终态再 ACK。Redis 任务状态通过 CAS 条件更新，结果与成功终态原子写入 Redis；重复消息遵循 first-terminal-wins，不能覆盖仍存在的终态。Redis 丢失后不承诺搜索持久去重。
+搜索由独立 worker、独立 topic/group 消费；缓存刷新使用第三组独立 topic/group，文档通知使用文档 topic/group。Kafka 消费语义为 ack=提交 offset、nack=同一进程内指数退避重试同一条记录、达到 `MaxAttempts` 后写入显式 `RAG_*_DLQ_TOPIC` 并提交、`MaxAttempts=0` 无限重试（至少一次）。搜索临时故障不提交，确定性故障先写 Redis 失败终态再提交，成功也先写结果/终态再提交。Redis 任务状态通过 CAS 条件更新，结果与成功终态原子写入 Redis；重复消息遵循 first-terminal-wins，不能覆盖仍存在的终态。Redis 丢失后不承诺搜索持久去重。
 
 文档侧没有 Redis 参与：任务状态、租约与终态全部由 MySQL 提供，worker 用 SQL 租约 claim 并心跳续租，只有 MySQL 记录终态后才 ACK；`get_document_status` 直接读 MySQL，无 TTL。UploadJournal 继续保障文档发布版本一致性，不存在 Redis+MySQL 原子事务问题，也没有 Redis 回源。发件箱行按 `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS`（默认 7 天）清理，任务行不在该清理范围内。日志仅记录任务/操作 ID 与安全错误类别，不记录查询、文件/消息正文或凭据。
 
@@ -54,7 +56,7 @@ Redis 有两种不同职责，不能混用其故障语义：
 读取：Redis 命中 → 返回；未命中 → MySQL 一致快照 → 带修订号回填
 写入：MySQL 同事务更新业务数据、cache_revisions、cache_outbox
       → 提交成功后同步刷新 Redis
-      → 失败投递 RocketMQ（消息只含 event_id）
+      → 失败投递 Kafka（消息只含 event_id）
       → 消费者重新读取最新公开快照，刷新成功才 ACK
 ```
 
@@ -63,13 +65,13 @@ Redis 有两种不同职责，不能混用其故障语义：
 - MySQL 修订行是快照锁：写方先获取修订行再改业务数据；缓存未命中和消息刷新读取同一提交快照的数据与修订号。
 - Redis payload 默认 TTL 60 秒；另一个持久水位 key 保存版本/删除标记，防止 payload 过期后旧回填复活已删除数据。相同修订号不能覆盖删除标记。
 - 同步消息是 at-least-once，重复、乱序消息允许；消费者读最新数据库快照，不回放消息中的陈旧数据。
-- Redis、MQ 都故障或进程中断时，MySQL outbox 保留任务；后台每 2 秒处理待同步事件，MQ 已发送但未完成的事件超过 60 秒再次投递。MQ 达到最大重试次数进 DLQ 后，outbox 仍可补发；需监控持续失败。
+- Redis、Kafka 都故障或进程中断时，MySQL outbox 保留任务；后台每 2 秒处理待同步事件，Kafka 已发送但未完成的事件超过 60 秒再次投递。消费者耗尽进程内重试后进入显式 DLQ topic，outbox 仍可补发；需监控持续失败。
 - 同一 kind/scope 的积压刷新会合并到最新修订。成功刷新后，将所有不大于该修订的事件标记 DONE。
 - Redis 不可读时直接回源 MySQL。Redis 可读但刷新失败时可能暂时返回旧值，补偿/TTL 后收敛；这是最终一致性，不是跨库原子提交。
 - 新增/更新/删除知识库刷新公开配置、文档展示及全局列表；文档发布/删除刷新文档与全局列表；MCP 修改刷新 catalog。
 - 上传未发布时，公开文档和发布指针保持旧版本，但 RUNNING/FAILED/ROLLING_BACK 等进度缓存照常提交。最终发布的 heads 和 COMMITTED/步骤状态事件，与业务记录在同一 MySQL 事务中提交；发布回滚不会留下这些未提交事件。补偿完成则另行提交 ROLLED_BACK 的状态事件。
 - API Key 创建、修改、删除/导入刷新管理列表。续租只刷新 leases，不制造无关步骤状态；租约过期是时间事件，展示端每次用 expires_at 重新计算 expired，不必等待缓存 TTL。
-- 提交/删除等由外部事务持有的 journal 方法仅写 outbox，不在事务内访问 Redis/MQ；由调用方提交后同步刷新。真实状态查询、恢复扫描和 fencing 不追加缓存事件。
+- 提交/删除等由外部事务持有的 journal 方法仅写 outbox，不在事务内访问 Redis/Kafka；由调用方提交后同步刷新。真实状态查询、恢复扫描和 fencing 不追加缓存事件。
 
 ## 第二批状态查询接口
 
@@ -85,11 +87,7 @@ Redis 有两种不同职责，不能混用其故障语义：
 
 ## 配置
 
-普通安装包含 redis-py；RocketMQ 重试需要可选 SDK：
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[cache]"
-```
+当前 Go 实现使用 kafka-go 客户端；宿主进程连接宿主机 listener，compose 容器使用内部 listener。
 
 环境变量（可放入服务配置中的非敏感项）：
 
@@ -99,32 +97,44 @@ RAG_REDIS_ENABLED=true
 RAG_REDIS_PREFIX=rag:state:v1
 RAG_REDIS_TTL_SECONDS=60
 RAG_REDIS_TIMEOUT_SECONDS=0.3
-RAG_ROCKETMQ_ENDPOINT=127.0.0.1:8081   # 端口由 RAG_ROCKETMQ_PROXY_PORT 决定
-RAG_ROCKETMQ_TOPIC=praxis_state_cache_refresh
-RAG_ROCKETMQ_GROUP=praxis_state_cache_refresh_workers
-RAG_ROCKETMQ_NAMESPACE=
-RAG_ROCKETMQ_TLS=false
+RAG_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
+RAG_KAFKA_CLIENT_ID=praxis-rag
+RAG_KAFKA_SECURITY_PROTOCOL=PLAINTEXT
+# RAG_KAFKA_SASL_MECHANISM / RAG_KAFKA_SASL_USERNAME / RAG_KAFKA_SASL_PASSWORD
+# RAG_KAFKA_TLS_CA / RAG_KAFKA_TLS_INSECURE
+RAG_KAFKA_PUBLISH_TIMEOUT_SECONDS=10
+RAG_CACHE_TOPIC=praxis_state_cache_refresh
+RAG_CACHE_GROUP=praxis_state_cache_refresh_workers
+RAG_DOCUMENT_TOPIC=praxis_document_ingest
+RAG_DOCUMENT_GROUP=praxis_document_ingest_workers
+RAG_SEARCH_TOPIC=praxis_search
+RAG_SEARCH_GROUP=praxis_search_workers
+RAG_DOCUMENT_DLQ_TOPIC=praxis_document_ingest_dead_letters
+RAG_SEARCH_DLQ_TOPIC=praxis_search_dead_letters
+RAG_DOCUMENT_DLQ_GROUP=praxis_document_dead_letters
+RAG_SEARCH_DLQ_GROUP=praxis_search_dead_letters
+RAG_OUTBOX_BRIDGE=relay
 ```
 
-`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存，搜索任务与快照用 `RAG_RESULT_TTL_SECONDS=3600`。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis，但**不能使用排队搜索或可复用搜索结果快照**，不可将禁用缓存当作这些路径的降级方式。文档异步新增不依赖 Redis：禁用后仍可提交、查询状态并完成 MySQL 持久发布（默认 relay 模式仍需 MQ 完成通知投递，但不影响受理与状态查询）。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；持久数据展示读取可回源 MySQL。多实例共享相同 Redis、前缀、MySQL 和各自 topic/group。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；MQ 凭据仅从环境变量 RAG_ROCKETMQ_ACCESS_KEY / RAG_ROCKETMQ_SECRET_KEY 读取。
+`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存，搜索任务与快照用 `RAG_RESULT_TTL_SECONDS=3600`。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis，但**不能使用排队搜索或可复用搜索结果快照**，不可将禁用缓存当作这些路径的降级方式。文档异步新增不依赖 Redis：禁用后仍可提交、查询状态并完成 MySQL 持久发布（默认 relay 模式仍需 Kafka 完成通知投递，但不影响受理与状态查询）。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；持久数据展示读取可回源 MySQL。多实例共享相同 Redis、前缀、MySQL 和各自的 cache/document/search topic/group（以及两个显式 DLQ topic）。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；Kafka SASL/TLS 凭据仅从 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*` 读取。
 
 ## Docker 与启动
 
-Compose 新增 Redis 7.4、RocketMQ 5.3.3 NameServer、Broker/Proxy 和存储卷初始化。仅向本机发布 Redis 6379 与 gRPC Proxy 8081，NameServer 不发布端口。Redis 开启 AOF 和 noeviction；Broker 同步刷盘。初始化服务仅修复 RocketMQ 自有卷 UID，不访问宿主机其他目录。
+Compose 提供 Redis 7.4、单节点 KRaft Kafka（`apache/kafka:3.9.0`，宿主 `127.0.0.1:9092` / 容器 `kafka:9092`，4 partitions、自动创建 topic、`kafka_data` 持久卷）以及可选的 Debezium profile。Redis 开启 AOF 和 noeviction；Kafka 数据写入 `KAFKA_LOG_DIRS=/var/lib/kafka/data`。不再有旧 RocketMQ 组件或存储卷 UID 初始化。
 
 ```powershell
 .\scripts\start-stack.ps1 -MigrateOnly -SkipMigrate
 .\scripts\start-stack.ps1 -SkipMigrate
 ```
 
-脚本启动依赖、等待 MySQL、创建/更新 MQ topic 和 consumer group（最大重试 16 次），随后运行服务；HTTP lifespan 启停缓存 relay/consumer，**并在 `RAG_OUTBOX_BRIDGE=relay`（默认）时启动文档发件箱 relay**。只运行 docker-compose up 不会自动创建 topic/group，需脚本或手动执行：
+脚本启动依赖、等待 MySQL 与 Kafka healthy、显式创建 cache/document/search 与两个 DLQ topic（4 partitions、RF=1），随后运行服务；`RAG_OUTBOX_BRIDGE=relay`（默认）时服务进程内启动发件箱 relay，`debezium` 时等待 Debezium streaming 且应用不发布。Kafka 虽开启自动建 topic，仍建议由脚本或手动显式创建：
 
 ```powershell
-docker exec praxis-rag-rocketmq sh mqadmin updatetopic -n rocketmq-namesrv:9876 -c DefaultCluster -t praxis_state_cache_refresh
-docker exec praxis-rag-rocketmq sh mqadmin updateSubGroup -n rocketmq-namesrv:9876 -c DefaultCluster -g praxis_state_cache_refresh_workers -r 16
+docker exec praxis-rag-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 `
+  --create --if-not-exists --topic praxis_state_cache_refresh --partitions 4 --replication-factor 1
 ```
 
-对持久读模型刷新，Redis/RocketMQ 失败不回滚已提交的 MySQL 业务操作，`cache_outbox` 保留待处理事件。对排队搜索，Redis/MQ 是提交前置依赖；缺 SDK/配置或连接失败直接报错，不通过 SQL task outbox 持久接收。对异步文档新增，MySQL 提交即受理，投递由发件箱 relay/Debezium 补足，MQ 故障既不回滚也不阻塞受理。启动前安装 cache extra，确认 Redis、MQ 连接、topic/group 和权限。
+对持久读模型刷新，Redis/Kafka 失败不回滚已提交的 MySQL 业务操作，`cache_outbox` 保留待处理事件。对排队搜索，Redis/Kafka 是提交前置依赖；缺配置或连接失败直接报错，不通过 SQL task outbox 持久接收。对异步文档新增，MySQL 提交即受理，投递由发件箱 relay/Debezium 补足，Kafka 故障既不回滚也不阻塞受理。启动前确认 Redis、Kafka 连接、topic/group 和权限。
 
 ## 运维与限制
 
@@ -137,7 +147,7 @@ docker exec praxis-rag-rocketmq sh mqadmin updateSubGroup -n rocketmq-namesrv:98
 ## 验证
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_state_cache.py tests\test_cache_synchronization.py tests\test_cached_read_views.py tests\test_cache_publication.py tests\test_cache_queue.py tests\test_api_key_cache.py tests\test_second_batch_cache.py tests\test_journal_cache_events.py
+go test -count=1 ./internal/state/ ./internal/redisstate/...
 ```
 
-可选真实 Redis 测试设置 RAG_TEST_REDIS_URL；完整 MySQL/Redis/RocketMQ 验证设置 RAG_TEST_CACHE_MYSQL_URL 指向名为 praxis_cache_test_* 的独立测试库，并创建独立 RAG_TEST_ROCKETMQ_GROUP。tests/test_cache_live.py 会清空测试 schema 的表，仅可使用可丢弃数据库；仅删除自身前缀的 Redis key。
+历史 Python 测试已随 Python 后端删除；当前 Go 状态层的缓存/Redis 测试使用上述命令。Kafka 迁移后的真实验证（Kafka 3.9.0 + Debezium 3.7.1 + MySQL 8.0 的 CDC 投递）见 [GO_MIGRATION](GO_MIGRATION.md) 最后一轮；真实 Redis/SASL/TLS 集群未验证。
