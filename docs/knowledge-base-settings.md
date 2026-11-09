@@ -1,4 +1,6 @@
 # Knowledge-base configuration
+> **历史设计文档**：对应的 Python 后端实现已删除；当前 Go 实现位于 `internal/` 对应包，迁移状态与差异见 [GO_MIGRATION](GO_MIGRATION.md)。本文的 schema/契约描述仍作为共享状态层的设计参考。
+
 
 Create Knowledge Base combines connection URL, API key, model selection and chunk
 settings. Opening a model dropdown fetches models using that form's URL and key.

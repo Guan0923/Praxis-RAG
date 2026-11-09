@@ -1,0 +1,595 @@
+package runtime
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/xinghe_rag/internal/chunking"
+	"github.com/Guan0923/xinghe_rag/internal/sparse"
+	"github.com/Guan0923/xinghe_rag/internal/state"
+)
+
+const uploadDocumentText = "One document paragraph with enough text for chunking. " +
+	"E03 水路供水不足的处理步骤需要排出管路空气。 " +
+	"Another sentence keeps the chunk boundaries meaningful. "
+
+// newUploadService builds a Service with a committed knowledge-base row, a fake
+// Qdrant collection backend and a fake model API.
+func newUploadService(t *testing.T) (*Service, *state.Stores, *fakeKBQdrant, *httpRecorder) {
+	t.Helper()
+	modelURL, modelCalls := newFakeModelAPI(t, kbModelHandler(nil))
+	qdrantFake, qdrantURL := newFakeKBQdrant(t, "")
+	service, stores := newKBService(t, qdrantURL)
+	if err := stores.KnowledgeBases.Create(context.Background(),
+		testKnowledgeBaseSettings(t, "alpha", modelURL, "knowledge_test")); err != nil {
+		t.Fatalf("KnowledgeBases.Create() error = %v", err)
+	}
+	return service, stores, qdrantFake, modelCalls
+}
+
+func repeatedDocumentText(repetitions int) string {
+	var builder strings.Builder
+	for index := 0; index < repetitions; index++ {
+		builder.WriteString(uploadDocumentText)
+		builder.WriteString(" \n\n")
+	}
+	return builder.String()
+}
+
+func uploadFile(name, content string) UploadFile {
+	return UploadFile{Name: name, Content: []byte(content)}
+}
+
+func operationStatus(t *testing.T, stores *state.Stores, operationID string) *state.UploadOperation {
+	t.Helper()
+	operation, err := stores.Uploads.Get(context.Background(), operationID)
+	if err != nil || operation == nil {
+		t.Fatalf("Uploads.Get(%q) = %v, %v", operationID, operation, err)
+	}
+	return operation
+}
+
+func assertKnowledgeValidation(t *testing.T, err error, message string) {
+	t.Helper()
+	var validation *apierrors.KnowledgeValidationError
+	if !errors.As(err, &validation) {
+		t.Fatalf("error = %v, want KnowledgeValidationError", err)
+	}
+	if message != "" && validation.Message != message {
+		t.Fatalf("message = %q, want %q", validation.Message, message)
+	}
+}
+
+func TestUploadMarkdownHappyPath(t *testing.T) {
+	service, stores, qdrantFake, modelCalls := newUploadService(t)
+	ctx := context.Background()
+	content := repeatedDocumentText(6)
+
+	payload, err := service.uploadDocuments(ctx, "alpha", []UploadFile{uploadFile("guide.md", content)}, "")
+	if err != nil {
+		t.Fatalf("uploadDocuments() error = %v", err)
+	}
+	imported, _ := payload["imported"].([]map[string]any)
+	skipped, _ := payload["skipped"].([]map[string]any)
+	failed, _ := payload["failed"].([]map[string]any)
+	if len(imported) != 1 || len(skipped) != 0 || len(failed) != 0 {
+		t.Fatalf("imported/skipped/failed = %d/%d/%d (%v)", len(imported), len(skipped), len(failed), payload)
+	}
+	record := imported[0]
+	if record["name"] != "guide.md" {
+		t.Errorf("name = %v", record["name"])
+	}
+	operationID, _ := record["operation_id"].(string)
+	if operationID == "" {
+		t.Fatalf("operation_id missing: %v", record)
+	}
+	if record["sha256"] == "" || record["document_id"] == "" {
+		t.Errorf("sha256/document_id = %v/%v", record["sha256"], record["document_id"])
+	}
+	chunkCount, _ := record["chunk_count"].(int)
+	if chunkCount < 2 {
+		t.Errorf("chunk_count = %v, want >= 2", record["chunk_count"])
+	}
+	if record["collection"] != "knowledge_test" {
+		t.Errorf("collection = %v", record["collection"])
+	}
+	chunkingMetadata, _ := record["chunking"].(map[string]any)
+	if chunkingMetadata["strategy"] != "character" || chunkingMetadata["chunk_size"] != 120 ||
+		chunkingMetadata["embedding_model"] != "embed-a" {
+		t.Errorf("chunking metadata = %v", chunkingMetadata)
+	}
+	for _, field := range []string{"modified_at", "indexed_at"} {
+		if text, ok := record[field].(string); !ok || text == "" {
+			t.Errorf("%s = %v", field, record[field])
+		}
+	}
+	documents, _ := payload["documents"].([]map[string]any)
+	if len(documents) != 1 || documents[0]["name"] != "guide.md" {
+		t.Fatalf("documents = %v", payload["documents"])
+	}
+
+	stored, err := stores.Documents.Get(ctx, "alpha", "guide.md")
+	if err != nil || stored == nil {
+		t.Fatalf("Documents.Get() = %v, %v", stored, err)
+	}
+	if stored.SHA256 != record["sha256"] || stored.ChunkCount != chunkCount {
+		t.Errorf("stored record = %+v", stored)
+	}
+	blob, found, err := stores.Blobs.Get(ctx, "alpha", state.SourceBucket, "guide.md")
+	if err != nil || !found || string(blob) != content {
+		t.Fatalf("source blob missing or different (found=%v err=%v)", found, err)
+	}
+	operation := operationStatus(t, stores, operationID)
+	if operation.Status != state.UploadCommitted {
+		t.Errorf("operation status = %q", operation.Status)
+	}
+
+	// Qdrant received one staged version with dense (3 dims) and sparse vectors.
+	upserts := qdrantFake.find("PUT", "/points")
+	if len(upserts) != 1 {
+		t.Fatalf("Qdrant upserts = %d", len(upserts))
+	}
+	points, _ := upserts[0].Body["points"].([]any)
+	if len(points) != chunkCount {
+		t.Fatalf("staged points = %d, want %d", len(points), chunkCount)
+	}
+	first := points[0].(map[string]any)
+	vector, _ := first["vector"].(map[string]any)
+	dense, _ := vector["dense"].([]any)
+	if len(dense) != 3 {
+		t.Errorf("dense length = %d", len(dense))
+	}
+	if _, ok := vector["sparse"].(map[string]any); !ok {
+		t.Errorf("sparse vector missing: %v", vector)
+	}
+	pointPayload, _ := first["payload"].(map[string]any)
+	if pointPayload["record_type"] != "chunk" || pointPayload["upload_version"] != operationID {
+		t.Errorf("point payload = %v", pointPayload)
+	}
+	if pointPayload["document_id"] == "" || pointPayload["chunk_id"] == "" || pointPayload["text"] == "" {
+		t.Errorf("point payload fields = %v", pointPayload)
+	}
+
+	embeddings := modelCalls.find("POST", "/embeddings")
+	if len(embeddings) != 1 {
+		t.Fatalf("embedding calls = %d", len(embeddings))
+	}
+	if embeddings[0].Header.Get("Authorization") != "Bearer embedding-key" {
+		t.Errorf("embedding Authorization = %q", embeddings[0].Header.Get("Authorization"))
+	}
+	inputs, _ := embeddings[0].Body["input"].([]any)
+	if len(inputs) != chunkCount {
+		t.Errorf("embedded texts = %d, want %d", len(inputs), chunkCount)
+	}
+}
+
+func TestUploadDuplicateIsSkipped(t *testing.T) {
+	service, stores, qdrantFake, _ := newUploadService(t)
+	ctx := context.Background()
+	content := repeatedDocumentText(4)
+	first, err := service.uploadDocuments(ctx, "alpha", []UploadFile{uploadFile("guide.md", content)}, "")
+	if err != nil {
+		t.Fatalf("first upload error = %v", err)
+	}
+	imported, _ := first["imported"].([]map[string]any)
+	firstOperation := imported[0]["operation_id"]
+	upsertsBefore := len(qdrantFake.find("PUT", "/points"))
+
+	second, err := service.uploadDocuments(ctx, "alpha", []UploadFile{uploadFile("guide.md", content)}, "")
+	if err != nil {
+		t.Fatalf("second upload error = %v", err)
+	}
+	skipped, _ := second["skipped"].([]map[string]any)
+	imported, _ = second["imported"].([]map[string]any)
+	if len(imported) != 0 || len(skipped) != 1 {
+		t.Fatalf("second upload imported/skipped = %d/%d", len(imported), len(skipped))
+	}
+	entry := skipped[0]
+	if entry["requested_name"] != "guide.md" || entry["operation_id"] == "" {
+		t.Errorf("skipped entry = %v", entry)
+	}
+	if entry["request_sha256"] != imported0SHA(first) {
+		t.Errorf("skipped request_sha256 = %v", entry["request_sha256"])
+	}
+	if _, popped := entry["skipped"]; popped {
+		t.Errorf("skipped flag leaked into the public record")
+	}
+	documents, _ := stores.Documents.List(ctx, "alpha")
+	if len(documents) != 1 {
+		t.Fatalf("documents = %d", len(documents))
+	}
+	if len(qdrantFake.find("PUT", "/points")) != upsertsBefore {
+		t.Errorf("duplicate upload staged new Qdrant points")
+	}
+	replay := operationStatus(t, stores, firstOperation.(string))
+	if replay.Status != state.UploadCommitted {
+		t.Errorf("first operation status = %q", replay.Status)
+	}
+}
+
+func imported0SHA(payload map[string]any) any {
+	imported, _ := payload["imported"].([]map[string]any)
+	if len(imported) == 0 {
+		return nil
+	}
+	return imported[0]["sha256"]
+}
+
+func TestUploadExistingNameCreatesNewVersion(t *testing.T) {
+	service, stores, qdrantFake, _ := newUploadService(t)
+	ctx := context.Background()
+	if _, err := service.uploadDocuments(ctx, "alpha", []UploadFile{uploadFile("guide.md", repeatedDocumentText(3))}, ""); err != nil {
+		t.Fatalf("first upload error = %v", err)
+	}
+	newContent := repeatedDocumentText(2) + " changed content"
+	payload, err := service.uploadDocuments(ctx, "alpha", []UploadFile{uploadFile("guide.md", newContent)}, "")
+	if err != nil {
+		t.Fatalf("second upload error = %v", err)
+	}
+	imported, _ := payload["imported"].([]map[string]any)
+	if len(imported) != 1 {
+		t.Fatalf("imported = %v", payload["imported"])
+	}
+	newRecord := imported[0]
+	if newRecord["sha256"] == "" {
+		t.Fatalf("new record has no sha256")
+	}
+	documents, _ := stores.Documents.List(ctx, "alpha")
+	if len(documents) != 1 || documents[0].SHA256 != newRecord["sha256"] {
+		t.Fatalf("documents after overwrite = %+v", documents)
+	}
+	if len(qdrantFake.find("PUT", "/points")) != 2 {
+		t.Errorf("each upload should stage one version")
+	}
+	blob, found, err := stores.Blobs.Get(ctx, "alpha", state.SourceBucket, "guide.md")
+	if err != nil || !found || string(blob) != newContent {
+		t.Errorf("source blob was not replaced (found=%v err=%v)", found, err)
+	}
+}
+
+func TestUploadValidationErrors(t *testing.T) {
+	service, _, _, _ := newUploadService(t)
+	ctx := context.Background()
+	if _, err := service.uploadDocuments(ctx, "alpha", nil, ""); err == nil {
+		t.Fatalf("empty upload accepted")
+	} else {
+		assertKnowledgeValidation(t, err, "请选择要上传的 Markdown、TXT、PDF 或 DOCX 文件。")
+	}
+	tooMany := make([]UploadFile, maxFilesPerBatch+1)
+	for index := range tooMany {
+		tooMany[index] = uploadFile("file.txt", "text")
+	}
+	if _, err := service.uploadDocuments(ctx, "alpha", tooMany, ""); err == nil {
+		t.Fatalf("too many files accepted")
+	} else {
+		assertKnowledgeValidation(t, err, "单次最多上传 10 个知识文件。")
+	}
+	if _, err := service.uploadDocuments(ctx, "alpha", []UploadFile{uploadFile("data.xyz", "text")}, ""); err == nil {
+		t.Fatalf("unsupported extension accepted")
+	} else {
+		assertKnowledgeValidation(t, err, "暂不支持该文件类型：data.xyz；请选择 .doc、.docx、.md、.pdf、.txt。")
+	}
+	missingKnowledgeBase := func() {
+		if _, err := service.uploadDocuments(ctx, "missing", []UploadFile{uploadFile("a.txt", "text")}, ""); err == nil {
+			t.Fatalf("upload to unknown namespace accepted")
+		}
+	}
+	missingKnowledgeBase()
+
+	// Oversized files are rejected per file with the Python size message.
+	oversized := strings.Repeat("x", maxFileBytes+1)
+	payload, err := service.uploadDocuments(ctx, "alpha", []UploadFile{uploadFile("big.txt", oversized)}, "")
+	if err != nil {
+		t.Fatalf("uploadDocuments() error = %v", err)
+	}
+	failed, _ := payload["failed"].([]map[string]any)
+	if len(failed) != 1 || !strings.Contains(failed[0]["error"].(string), "单个知识文件不能超过 10 MiB：big.txt") {
+		t.Fatalf("oversized failure = %v", failed)
+	}
+	if failed[0]["operation_id"] == "" {
+		t.Errorf("failed entry missing operation_id: %v", failed[0])
+	}
+}
+
+func TestUploadRejectsInvalidIdempotencyKey(t *testing.T) {
+	service, stores, _, _ := newUploadService(t)
+	// The REST batch hashes the caller key per file, so only the synchronous
+	// write path can see an oversized raw key (Python validates 1..200 chars).
+	longKey := strings.Repeat("k", 201)
+	_, err := service.writeDocumentContent(context.Background(), "alpha", "note.txt",
+		[]byte(repeatedDocumentText(2)), false, longKey)
+	var knowledge *apierrors.KnowledgeError
+	if !errors.As(err, &knowledge) || knowledge.Message != "Invalid idempotency key" {
+		t.Fatalf("error = %v, want KnowledgeError(Invalid idempotency key)", err)
+	}
+	records, _ := stores.Documents.List(context.Background(), "alpha")
+	if len(records) != 0 {
+		t.Errorf("invalid idempotency key wrote a document")
+	}
+}
+
+func TestUploadIdempotentReplay(t *testing.T) {
+	service, stores, _, _ := newUploadService(t)
+	ctx := context.Background()
+	content := repeatedDocumentText(3)
+	first, err := service.uploadDocuments(ctx, "alpha", []UploadFile{uploadFile("guide.md", content)}, "batch-1")
+	if err != nil {
+		t.Fatalf("first upload error = %v", err)
+	}
+	imported, _ := first["imported"].([]map[string]any)
+	firstOperation := imported[0]["operation_id"].(string)
+
+	replay, err := service.uploadDocuments(ctx, "alpha", []UploadFile{uploadFile("guide.md", content)}, "batch-1")
+	if err != nil {
+		t.Fatalf("replay upload error = %v", err)
+	}
+	replayedRecords, _ := replay["imported"].([]map[string]any)
+	if len(replayedRecords) != 1 || replayedRecords[0]["replayed"] != true {
+		t.Fatalf("replayed record = %v", replay["imported"])
+	}
+	if replayedRecords[0]["operation_id"] != firstOperation {
+		t.Errorf("replayed operation_id = %v, want %v", replayedRecords[0]["operation_id"], firstOperation)
+	}
+	documents, _ := stores.Documents.List(ctx, "alpha")
+	if len(documents) != 1 {
+		t.Fatalf("replayed upload created %d documents", len(documents))
+	}
+
+	// Same key with different bytes is a conflict, reported per file.
+	conflict, err := service.uploadDocuments(ctx, "alpha",
+		[]UploadFile{uploadFile("guide.md", content+"different bytes")}, "batch-1")
+	if err != nil {
+		t.Fatalf("conflict upload error = %v", err)
+	}
+	failed, _ := conflict["failed"].([]map[string]any)
+	if len(failed) != 1 || !strings.Contains(failed[0]["error"].(string), "UploadConflict") {
+		t.Fatalf("conflicting replay failure = %v", failed)
+	}
+}
+
+func TestUploadModelFailureRollsBack(t *testing.T) {
+	modelURL, _ := newFakeModelAPI(t, unauthorizedModelHandler)
+	qdrantFake, qdrantURL := newFakeKBQdrant(t, "")
+	service, stores := newKBService(t, qdrantURL)
+	ctx := context.Background()
+	if err := stores.KnowledgeBases.Create(ctx,
+		testKnowledgeBaseSettings(t, "alpha", modelURL, "knowledge_test")); err != nil {
+		t.Fatalf("KnowledgeBases.Create() error = %v", err)
+	}
+	payload, err := service.uploadDocuments(ctx, "alpha",
+		[]UploadFile{uploadFile("guide.md", repeatedDocumentText(3))}, "")
+	if err != nil {
+		t.Fatalf("uploadDocuments() error = %v", err)
+	}
+	failed, _ := payload["failed"].([]map[string]any)
+	if len(failed) != 1 {
+		t.Fatalf("failed = %v", failed)
+	}
+	if !strings.Contains(failed[0]["error"].(string), "HTTP 401") {
+		t.Errorf("failure message = %v", failed[0]["error"])
+	}
+	operationID, _ := failed[0]["operation_id"].(string)
+	if operationID == "" {
+		t.Fatalf("operation_id missing")
+	}
+	operation := operationStatus(t, stores, operationID)
+	if operation.Status == state.UploadCommitted || operation.Status == state.UploadRunning || operation.Status == state.UploadIntent {
+		t.Errorf("failed operation status = %q", operation.Status)
+	}
+	documents, _ := stores.Documents.List(ctx, "alpha")
+	if len(documents) != 0 {
+		t.Errorf("failed upload left documents: %v", documents)
+	}
+	if len(qdrantFake.find("PUT", "/points")) != 0 {
+		t.Errorf("failed upload staged Qdrant points")
+	}
+	if _, statErr := os.Stat(filepath.Join(os.TempDir(), "rag-txn-"+operationID)); !os.IsNotExist(statErr) {
+		t.Errorf("failed upload left its workspace: %v", statErr)
+	}
+}
+
+func TestUploadQdrantFailureCompensates(t *testing.T) {
+	service, stores, qdrantFake, _ := newUploadService(t)
+	qdrantFake.failUpsert = true
+	ctx := context.Background()
+	payload, err := service.uploadDocuments(ctx, "alpha",
+		[]UploadFile{uploadFile("guide.md", repeatedDocumentText(3))}, "")
+	if err != nil {
+		t.Fatalf("uploadDocuments() error = %v", err)
+	}
+	failed, _ := payload["failed"].([]map[string]any)
+	if len(failed) != 1 || failed[0]["operation_id"] == "" {
+		t.Fatalf("failed = %v", failed)
+	}
+	operation := operationStatus(t, stores, failed[0]["operation_id"].(string))
+	if operation.Status == state.UploadCommitted {
+		t.Errorf("operation was committed despite a Qdrant failure")
+	}
+	documents, _ := stores.Documents.List(ctx, "alpha")
+	if len(documents) != 0 {
+		t.Errorf("failed upload left documents: %v", documents)
+	}
+	// Version-scoped compensation deletes only the staged version.
+	if len(qdrantFake.find("POST", "/points/delete")) == 0 {
+		t.Errorf("Qdrant version compensation was not attempted")
+	}
+}
+
+func TestDeleteDocument(t *testing.T) {
+	service, stores, qdrantFake, _ := newUploadService(t)
+	ctx := context.Background()
+	if _, err := service.uploadDocuments(ctx, "alpha",
+		[]UploadFile{uploadFile("guide.md", repeatedDocumentText(3))}, ""); err != nil {
+		t.Fatalf("upload error = %v", err)
+	}
+	deletesBefore := len(qdrantFake.find("POST", "/points/delete"))
+	payload, err := service.deleteDocumentByName(ctx, "alpha", "guide.md")
+	if err != nil {
+		t.Fatalf("deleteDocumentByName() error = %v", err)
+	}
+	deleted, _ := payload["deleted"].(map[string]any)
+	if deleted["name"] != "guide.md" {
+		t.Errorf("deleted = %v", deleted)
+	}
+	documents, _ := payload["documents"].([]map[string]any)
+	if len(documents) != 0 {
+		t.Errorf("documents after delete = %v", documents)
+	}
+	if record, _ := stores.Documents.Get(ctx, "alpha", "guide.md"); record != nil {
+		t.Errorf("document record still visible after delete")
+	}
+	if len(qdrantFake.find("POST", "/points/delete")) != deletesBefore {
+		t.Errorf("logical delete must not touch Qdrant bytes")
+	}
+
+	if _, err := service.deleteDocumentByName(ctx, "alpha", "guide.md"); err == nil {
+		t.Fatalf("second delete succeeded")
+	} else {
+		assertKnowledgeValidation(t, err, "知识文件不存在：guide.md")
+	}
+
+	if _, err := service.uploadDocuments(ctx, "alpha",
+		[]UploadFile{uploadFile("locked.txt", repeatedDocumentText(2))}, ""); err != nil {
+		t.Fatalf("upload for lock test error = %v", err)
+	}
+	record, _ := stores.Documents.Get(ctx, "alpha", "locked.txt")
+	if record == nil {
+		t.Fatalf("locked document missing")
+	}
+	documentID := record.DocumentID
+	token, err := stores.Uploads.AcquireLock(ctx, "alpha", &documentID)
+	if err != nil {
+		t.Fatalf("AcquireLock() error = %v", err)
+	}
+	defer func() { _ = stores.Uploads.ReleaseLock(ctx, token) }()
+	if _, err := service.deleteDocumentByName(ctx, "alpha", "locked.txt"); err == nil {
+		t.Fatalf("delete under lock succeeded")
+	} else {
+		assertKnowledgeValidation(t, err, "文档正在更新，请稍后再删除")
+	}
+}
+
+func TestWriteDocumentCreateUpdateAndRules(t *testing.T) {
+	service, stores, _, _ := newUploadService(t)
+	ctx := context.Background()
+	content := repeatedDocumentText(3)
+
+	created, err := service.writeDocumentContent(ctx, "alpha", "note.md", []byte(content), false, "")
+	if err != nil {
+		t.Fatalf("create write error = %v", err)
+	}
+	if created["status"] != "added" {
+		t.Errorf("create status = %v", created["status"])
+	}
+	if documents, _ := created["documents"].([]map[string]any); len(documents) != 1 {
+		t.Errorf("created documents = %v", created["documents"])
+	}
+
+	updated, err := service.writeDocumentContent(ctx, "alpha", "note.md", []byte(content+" updated"), true, "")
+	if err != nil {
+		t.Fatalf("update write error = %v", err)
+	}
+	if updated["status"] != "updated" {
+		t.Errorf("update status = %v", updated["status"])
+	}
+	unchanged, err := service.writeDocumentContent(ctx, "alpha", "note.md", []byte(content+" updated"), true, "")
+	if err != nil {
+		t.Fatalf("unchanged write error = %v", err)
+	}
+	if unchanged["status"] != "unchanged" {
+		t.Errorf("unchanged status = %v", unchanged["status"])
+	}
+
+	if _, err := service.writeDocumentContent(ctx, "alpha", "missing.md", []byte(content), true, ""); err == nil {
+		t.Fatalf("overwrite of a missing document succeeded")
+	} else {
+		assertKnowledgeValidation(t, err, "Document does not exist: missing.md")
+	}
+	if _, err := service.writeDocumentContent(ctx, "alpha", "note.md", []byte(content), false, ""); err == nil {
+		t.Fatalf("duplicate create succeeded")
+	} else {
+		assertKnowledgeValidation(t, err, "Document already exists: note.md; use update_document")
+	}
+	if _, err := service.writeDocumentContent(ctx, "alpha", "bad:name.md", []byte(content), false, ""); err == nil {
+		t.Fatalf("invalid name accepted")
+	} else {
+		assertKnowledgeValidation(t, err, "Invalid document name")
+	}
+	records, _ := stores.Documents.List(ctx, "alpha")
+	if len(records) != 1 || records[0].Name != "note.md" {
+		t.Errorf("documents = %+v", records)
+	}
+}
+
+func TestUploadRecoversInterruptedOperation(t *testing.T) {
+	service, stores, _, _ := newUploadService(t)
+	ctx := context.Background()
+	// Simulate a crashed worker: a short lease with no heartbeat that expires
+	// before the next upload runs recovery.
+	journal, err := state.NewUploadJournal(stores, state.WithLeaseSeconds(0.02), state.WithAutoHeartbeat(false))
+	if err != nil {
+		t.Fatalf("NewUploadJournal() error = %v", err)
+	}
+	documentID := chunking.StableID("doc", sparse.CaseFold("crashed.txt"))
+	operation, err := journal.Begin(ctx, "alpha", "crashed.txt", documentID, "knowledge_test", state.BeginOptions{})
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	workspace := filepath.Join(os.TempDir(), "rag-txn-"+operation.ID)
+	if _, err := journal.RegisterWorkspace(ctx, operation, workspace, nil); err != nil {
+		t.Fatalf("RegisterWorkspace() error = %v", err)
+	}
+	if err := journal.Intent(ctx, operation, "stage_qdrant", map[string]any{"version": operation.ID}); err != nil {
+		t.Fatalf("Intent() error = %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+
+	if _, err := service.uploadDocuments(ctx, "alpha",
+		[]UploadFile{uploadFile("guide.md", repeatedDocumentText(3))}, ""); err != nil {
+		t.Fatalf("upload error = %v", err)
+	}
+	recovered := operationStatus(t, stores, operation.ID)
+	if recovered.Status != state.UploadRolledBack && recovered.Status != state.UploadRollbackFailed {
+		t.Errorf("interrupted operation status = %q, want rolled back", recovered.Status)
+	}
+	documents, _ := stores.Documents.List(ctx, "alpha")
+	if len(documents) != 1 || documents[0].Name != "guide.md" {
+		t.Errorf("documents after recovery = %+v", documents)
+	}
+	// The crashed operation's workspace is reclaimed by compensation.
+	if _, statErr := os.Stat(workspace); !os.IsNotExist(statErr) {
+		t.Errorf("recovered operation left its workspace: %v", statErr)
+	}
+}
+
+// TestUploadStagedVersionIDsAreDeterministic pins the deterministic point id
+// derivation used for staged versions (uuid5 over the operation id).
+func TestUploadStagedVersionIDs(t *testing.T) {
+	service, _, qdrantFake, _ := newUploadService(t)
+	payload, err := service.uploadDocuments(context.Background(), "alpha",
+		[]UploadFile{uploadFile("guide.md", repeatedDocumentText(2))}, "")
+	if err != nil {
+		t.Fatalf("upload error = %v", err)
+	}
+	imported, _ := payload["imported"].([]map[string]any)
+	operationID := imported[0]["operation_id"].(string)
+	upserts := qdrantFake.find("PUT", "/points")
+	if len(upserts) == 0 {
+		t.Fatalf("no Qdrant upsert")
+	}
+	points, _ := upserts[0].Body["points"].([]any)
+	first := points[0].(map[string]any)
+	id, _ := first["id"].(string)
+	if len(id) != 36 || strings.Count(id, "-") != 4 {
+		t.Errorf("point id = %q, want UUID", id)
+	}
+	if len(operationID) == 0 {
+		t.Errorf("operation id missing")
+	}
+}

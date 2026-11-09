@@ -1,0 +1,21 @@
+# Container defaults for the Go rag-service image.
+#
+# Values here come from config.LoadStartupConfig's [environment] section and
+# apply only when the matching variable is not already set in the environment.
+# Secrets never go in this file: RAG_SERVICE_TOKEN, RAG_MYSQL_PASSWORD and
+# RAG_STATE_ENCRYPTION_KEY must be provided at run time.
+#
+# RAG_SERVICE_HOST is 0.0.0.0 inside the container so the published port works;
+# ServiceSettingsFromEnv then requires RAG_SERVICE_TOKEN plus non-empty MCP
+# allowlists (the defaults below).
+[environment]
+RAG_BACKEND = "qdrant"
+RAG_SERVICE_HOST = "0.0.0.0"
+RAG_SERVICE_PORT = "8011"
+RAG_SERVICE_DATA_ROOT = "/app/data"
+QDRANT_URL = "http://qdrant:6333"
+RAG_COLLECTION = "mini_agent_knowledge_pdf_assets_v1"
+RAG_MCP_ALLOWED_HOSTS = "127.0.0.1,127.0.0.1:*,localhost,localhost:*"
+RAG_MCP_ALLOWED_ORIGINS = "http://127.0.0.1,http://127.0.0.1:*,http://localhost,http://localhost:*,http://[::1],http://[::1]:*"
+RAG_PDF_PARSE_TIMEOUT = "900"
+RAG_WORD_CONVERT_TIMEOUT = "120"

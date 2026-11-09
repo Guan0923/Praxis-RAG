@@ -1,0 +1,9 @@
+# Python parser worker dependencies (PDF worker only).
+#
+# The Go backend never imports these packages; they are required exclusively by
+# `python -m rag_mcp.pdf_worker`. Install with:
+#   python -m pip install -r python-workers/requirements.txt
+docling>=2.0
+docling-core>=2.0
+torch>=2.0
+pillow>=10.0

@@ -1,106 +1,124 @@
-# Praxis-RAG 使用与部署
+# Praxis-RAG 使用与部署（Go 后端）
 
-本文介绍 Praxis-RAG 的安装、部署、接口和开发方式。产品概览见 [README](../README.md)。`rag-service` 一个进程同时提供：
-
-- 标准 Streamable HTTP MCP：`/mcp`
-- 知识管理和检索 REST API：`/v1/*`
-- 独立 Web Console：`/console`
-- 文本切分、Embedding、BM25、Qdrant 和 Reranking
+本文面向运行 **Go 后端**（`rag-service` + 三个 worker）的用户，介绍构建、配置、启动、REST/MCP 使用、worker、迁移 CLI、Docker 与验证边界。产品概览见 [README](../README.md)；迁移背景与阶段见 [GO_MIGRATION](GO_MIGRATION.md)；契约差异见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)；容器与 systemd 示例见 [DEPLOYMENT](DEPLOYMENT.md)。
 
 ```text
-浏览器 ----------> http://127.0.0.1:8011/console
-MCP HTTP Client -> http://127.0.0.1:8011/mcp -> rag-service
-MCP search: RocketMQ（schema 2 完整查询，Broker 确认）-> rag-search-worker -> Qdrant :6333
-MCP add_document: MySQL 单事务（document_jobs 完整任务 + document_job_outbox 通知）
-                  -> relay（默认，进程内轮询）或 Debezium（可选，binlog -> MQ）
-                  -> RocketMQ 纯通知（schema 3，仅标识）-> rag-document-worker
-Redis: 短期搜索任务状态 / 搜索结果快照 / 持久读模型展示缓存（不再保存文档任务状态）
-MySQL: 异步文档任务（含文件原字节）与发件箱 / 已发布文档与 blobs / KB、Key、catalog /
-       artifact / UploadJournal 操作与租约（唯一真相）
-REST /v1/search / Console: rag-service -> Qdrant :6333（同步）
+浏览器 ------------------------> /console
+MCP 客户端 -> /mcp ------------> rag-service ──> Qdrant
+REST /v1/* --------------------> rag-service ──> 共享状态库（MySQL / SQLite）
+                                             ├─> Redis（读模型缓存、搜索结果快照；可选，排队搜索快照需要）
+                                             └─> Kafka（outbox relay / 搜索队列；可选）
+
+MCP add_document -> 状态库单事务（document_jobs + document_job_outbox）
+                 -> relay（rag-service 配置 Kafka 时）或本地 outbox 轮询
+                 -> Kafka 通知 -> rag-document-worker -> 解析/切分/Embedding/Qdrant 发布
+MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-worker -> SearchRaw + 快照
+Kafka 死信（显式 DLQ topic）-> rag-dead-letter-worker --kind document|search
 ```
 
-架构总纲（异步文档入库）：**MySQL 存真相**（文件字节、任务状态、发件箱同事务提交），**Redis 存短期搜索状态与展示缓存**，**RocketMQ 只传通知**，**Debezium（可选）负责把已提交的事务投递到 MQ**。搜索路径保持原样，仍把完整查询请求直投 MQ。
+RAG 只返回证据，不生成最终回答。后端为 Go 实现；Python 仅作为 PDF（Docling）与 Word 视觉解析的可选外部子进程存在于 `python-workers/`，不是运行 Go 后端的前置条件。
 
-RAG 只返回证据，不生成最终回答。是否调用、是否改写查询、是否多跳检索以及如何组织答案，仍由 Agent 决定。
+## 1. 安装与构建
 
-## 安装
+### 前置条件
 
-在本仓库中开发：
+| 依赖 | 版本/要求 | 用途 |
+| --- | --- | --- |
+| Go | 1.27+（`go.mod`） | 构建 `rag-service` 与全部命令 |
+| Node.js | 20.19+ 或 22.12+ | 构建 Console（只使用 API/MCP 可跳过） |
+| Qdrant | HTTP API（默认 `6333`） | 检索索引；Go **不支持** `QDRANT_PATH` 本地文件模式 |
+| 共享状态库 | MySQL 8.0+（`utf8mb4`）或 SQLite | 文档、KB、API Key、任务、发件箱、UploadJournal |
+| Redis | 可选，7.x | 搜索结果快照、读模型缓存；排队 MCP 搜索的快照读取必需（搜索任务状态在共享状态库） |
+| Kafka | 可选，单节点 KRaft（Compose `kafka`）或外部集群 | 异步文档通知、排队搜索；可用 SASL/TLS 环境变量连接外部集群，Compose 本身只提供 PLAINTEXT |
+| 外部解析器 | 可选 | PDF（Docling Python 环境/模型）、DOC（LibreOffice）；**不包含在 Go 二进制或镜像中** |
+
+### 构建命令
 
 ```powershell
-uv sync --extra api
+# Windows PowerShell 5.1+ / 7+
+pwsh -File scripts/build-go.ps1                 # 前端 + Go 二进制 + 本机冒烟
+pwsh -File scripts/build-go.ps1 -SkipFrontend   # 复用已有 dist/web
+pwsh -File scripts/build-go.ps1 -SkipGo         # 只重建 Console
+pwsh -File scripts/build-go.ps1 -SmokeOnly      # 只跑本机冒烟
+pwsh -File scripts/build-go.ps1 -Test           # 构建后 go test ./...
 ```
 
-作为独立工具安装当前目录：
+```bash
+# POSIX（Makefile 内部调用 scripts/build-go.sh）
+make build       # frontend + go
+make test        # go test ./...
+make vet         # go vet ./...
+make smoke       # 启动 dist/bin/rag-service 检查 /health、/console、/
+make clean
+```
+
+构建产物（`dist/`）：
+
+```text
+dist/bin/rag-service(.exe)
+dist/bin/rag-document-worker(.exe)
+dist/bin/rag-search-worker(.exe)
+dist/bin/rag-dead-letter-worker(.exe)
+dist/bin/rag-service-migrate(.exe)
+dist/bin/rag-state-migrate(.exe)
+dist/bin/rag-mcp-debug(.exe)
+dist/bin/rag-mcp-ingest(.exe)        # 本地文件/目录批量导入，见 §7
+dist/web/                            # Console（服务通过 RAG_WEB_ROOT 读取）
+```
+
+脚本默认把 Console 复制到 `dist/web`；直接运行 `dist/bin/rag-service` 时请设置 `RAG_WEB_ROOT=<repo>/dist/web`，否则服务只探测当前目录/可执行文件邻居的 `web` 或 `build/web`。构建脚本的 smoke 模式会自动设置临时端口、临时 config 与 SQLite 数据目录。
+
+### 前端构建与开发
+
+Console 使用 React + TypeScript + Ant Design；vite 输出到 `build/web`（`.gitignore` 忽略），Go 构建脚本会再复制到 `dist/web`。手工构建：
 
 ```powershell
-uv tool install --editable ".[api,pdf]"
+Push-Location .\frontend
+try { npm ci; npm run build } finally { Pop-Location }
 ```
 
-首次从 Git 获取源码时，先克隆到本地；构建产物不再提交到 Git，不能通过直接安装 Git URL 获得完整 Console：
+热更新开发服务器（把 API 代理到本地服务）：
 
 ```powershell
-git clone https://github.com/Guan0923/xinghe_rag.git
-Set-Location .\xinghe_rag
+Set-Location .\frontend
+$env:RAG_DEV_API = "http://127.0.0.1:8011"
+npm run dev
 ```
 
-上述源码安装方式如需 Console，必须先按[前端开发与打包](#前端开发与打包)构建前端，再安装当前目录。仅使用 API/MCP 时不需要前端构建。
+只使用 API/MCP 时无需构建前端；未构建时 `/console` 返回 404。
 
-安装后，`rag-service`、`rag-document-worker`、`rag-search-worker`、`rag-dead-letter-worker`、`rag-mcp-debug`、`rag-mcp-ingest` 和 `rag-service-migrate` 都是独立命令。异步 MCP 文档投递（relay 模式与 worker 消费）和服务端 MCP 搜索还需要安装现有可选依赖 `[cache]`（包含 RocketMQ SDK），例如 `uv sync --extra api --extra cache`；独立工具安装时在 extras 中加入 `cache`。
+## 2. 启动基础设施
 
-以上本地安装命令在仓库根目录运行，需要先安装 uv。项目产品名为 Praxis-RAG，Python 分发包名为 `praxis-rag`；远程仓库地址以当前 Git 配置为准。内部 Python 模块仍为 `rag_mcp`，集合名和命令保留原值。服务配置与新数据使用下文的 `~/.praxis-rag/` 目录，已有知识库不自动迁移。下文开发和测试命令也默认从仓库根目录运行，前端命令另有说明。
+### Docker Compose
 
-## 启动
-
-### 1. 启动 MySQL、Qdrant、Redis 和 RocketMQ（本地 Docker）
-
-仓库自带 `docker-compose.yml`，会同时启动 MySQL 8、Qdrant、Redis 和 RocketMQ：
+仓库自带 `docker-compose.yml`，默认 profile 只启动基础设施（MySQL、Qdrant、Redis、Kafka）：
 
 ```powershell
 Copy-Item .env.example .env
-# 编辑 .env，填入 RAG_MYSQL_PASSWORD、MYSQL_ROOT_PASSWORD、RAG_STATE_ENCRYPTION_KEY
-.\scripts\start-stack.ps1 -MigrateOnly
+# 必填：RAG_MYSQL_PASSWORD、MYSQL_ROOT_PASSWORD、RAG_STATE_ENCRYPTION_KEY
+docker compose up -d
 ```
 
-MySQL 默认映射到 `127.0.0.1:3307`，避免和已有的 3306 冲突；Qdrant 使用 `6333/6334`。停止但保留数据：`.\scripts\stop-stack.ps1`。
+MySQL 默认映射 `127.0.0.1:3307`（避免与本地 3306 冲突），Qdrant 为 `6333/6334`，Redis 为 `6379`，Kafka 宿主监听 `127.0.0.1:9092`（容器内 `kafka:9092`）。停止保留数据：`docker compose down`。
 
-也可以手动启动 Qdrant：
+> Kafka 默认自动创建 topic（4 partitions、副本 1）；`scripts/start-stack.ps1` 仍会显式创建 cache/document/search 与两个 DLQ topic、等待 Kafka healthy、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe`；`RAG_OUTBOX_BRIDGE=debezium` 时带 `--profile debezium` 并等待 Debezium 输出 `Starting streaming`。用 `-MigrateOnly` 可只准备依赖与数据库。使用 `RAG_DOCUMENT_WORKER_LOCAL=1` 的单进程文档模式或纯同步 REST 场景可以不配置 Kafka（保持 `RAG_KAFKA_BOOTSTRAP_SERVERS` 为空）。
+
+### 手动依赖
+
+只使用同步 REST/Console 时，最小依赖是 Qdrant + 状态库：
 
 ```powershell
-docker run -d --name mini-agent-qdrant -p 6333:6333 -p 6334:6334 -v mini_agent_qdrant_data:/qdrant/storage qdrant/qdrant:latest
+docker run -d --name praxis-qdrant -p 6333:6333 -p 6334:6334 `
+  -v praxis_qdrant_data:/qdrant/storage qdrant/qdrant:latest
 ```
 
-容器已经创建过时执行：
+本地开发可不启动 MySQL，服务会使用 `RAG_SERVICE_DATA_ROOT/state.sqlite3`（默认 `~/.praxis-rag/data/state.sqlite3`）。生产请使用 MySQL，并设置 `RAG_STATE_ENCRYPTION_KEY` 以便多实例解密模型 Key。
 
-```powershell
-docker start mini-agent-qdrant
-```
+## 3. 配置
 
-### 2. 启动共享状态数据库
+### config.toml
 
-生产环境使用 MySQL 8.0+（`utf8mb4`，InnoDB）。创建数据库和账号后，通过环境变量或 `config.toml` 配置：
-
-```powershell
-$env:RAG_MYSQL_HOST = "127.0.0.1"
-$env:RAG_MYSQL_PORT = "3307"
-$env:RAG_MYSQL_USER = "rag"
-$env:RAG_MYSQL_DATABASE = "praxis_rag"
-$env:RAG_MYSQL_PASSWORD = "<password>"
-$env:RAG_STATE_ENCRYPTION_KEY = "base64:<32-byte-key>"
-```
-
-也可以直接设置完整的 SQLAlchemy URL（包含用户名、密码、主机和数据库，字符需 URL 编码）：`RAG_STATE_URL = "<SQLAlchemy MySQL URL>"`。共享状态库只支持 MySQL/MariaDB，未配置时服务启动直接报错，不存在本地文件回退。表结构、迁移与多实例说明见 [共享状态存储](state-storage.md)。
-
-### 3. 启动 RAG Service 和独立前端
-
-本地使用 Compose 时，直接执行 `.\scripts\start-stack.ps1`（不带 `-MigrateOnly`）会加载 `.env`、启动依赖、显式创建缓存刷新、文档入库与搜索的三组 RocketMQ topic/group、迁移旧状态并运行服务。脚本还显式创建可读的正常 Broker DLQ topic 和独立处理组，但不启动任何消费者，也不证明 SDK/Proxy DLQ 订阅可用；MCP 异步新增还需 `rag-document-worker`，排队搜索还需 `rag-search-worker`。默认 `RAG_OUTBOX_BRIDGE=relay`，文档通知由 API 进程内的 relay 投递；配置为 `debezium` 时应用内 relay 关闭，改由独立部署的 Debezium 连接器投递（见 [deploy/debezium/README.md](../deploy/debezium/README.md)）。手动配置环境变量时也可以直接执行：
-
-```powershell
-rag-service
-```
-
-`rag-service` 自动读取 `~/.praxis-rag/config.toml`，首次启动会创建默认文件。主目录已经安装 `.venv` 时，可以直接执行 `.\.venv\Scripts\rag-service.exe`，不需要每次设置 `$env:RAG_BACKEND`。
+服务与 worker 启动时读取 `~/.praxis-rag/config.toml`（首次自动创建；`RAG_CONFIG_FILE` 可指定其他路径，指定的文件必须存在）。格式为单个 `[environment]` 节；**进程环境变量优先于文件值**，文件中的值会写入进程环境，因此 worker 也会共享同样的配置文件。
 
 ```toml
 [environment]
@@ -111,531 +129,553 @@ RAG_SERVICE_DATA_ROOT = "~/.praxis-rag/data"
 QDRANT_URL = "http://127.0.0.1:6333"
 RAG_COLLECTION = "mini_agent_knowledge_pdf_assets_v1"
 RAG_WORD_CONVERT_TIMEOUT = "120"
-RAG_MYSQL_HOST = "127.0.0.1"
-RAG_MYSQL_PORT = "3306"
-RAG_MYSQL_USER = "rag"
-RAG_MYSQL_DATABASE = "praxis_rag"
-# RAG_STATE_URL = "<SQLAlchemy MySQL URL>"
+# Kafka（宿主机进程用 127.0.0.1:9092；compose 容器由 compose 注入 kafka:9092）
+# RAG_KAFKA_BOOTSTRAP_SERVERS = "127.0.0.1:9092"
+# RAG_KAFKA_CLIENT_ID = "praxis-rag"
+# RAG_CACHE_TOPIC = "praxis_state_cache_refresh"
+# RAG_DOCUMENT_TOPIC = "praxis_document_ingest"
+# RAG_SEARCH_TOPIC = "praxis_search"
+# RAG_DOCUMENT_DLQ_TOPIC = "praxis_document_ingest_dead_letters"
+# RAG_SEARCH_DLQ_TOPIC = "praxis_search_dead_letters"
+# RAG_OUTBOX_BRIDGE = "relay"
+# RAG_MYSQL_HOST = "127.0.0.1"
+# RAG_MYSQL_PORT = "3306"
+# RAG_MYSQL_USER = "rag"
+# RAG_MYSQL_DATABASE = "praxis_rag"
+# RAG_STATE_URL = "mysql+pymysql://rag:password@127.0.0.1:3306/praxis_rag?charset=utf8mb4"
 ```
 
-配置值使用带引号的字符串。Windows 路径建议使用 `/`，例如 `C:/models`。DOC 转换器和 PDF/Word 图片模型路径也可写入该节，键名与下文环境变量相同。修改后重启生效；配置格式错误会明确报错，不忽略文件继续运行。`RAG_MYSQL_PASSWORD` 和 `RAG_STATE_ENCRYPTION_KEY` 只从环境变量读取，不要写入配置文件。
+凭据只放环境变量（`RAG_MYSQL_PASSWORD`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_SERVICE_TOKEN`、`RAG_KAFKA_SASL_USERNAME/PASSWORD`、`RAG_KAFKA_TLS_CA`），不要写入配置文件。配置值必须是带引号的字符串；Windows 路径用 `/`。未知键或 TOML 语法错误会让进程明确失败，不会静默忽略。
 
-环境变量优先于文件；`RAG_CONFIG_FILE` 可指定其他配置文件（指定的文件必须存在）。设置 `QDRANT_PATH` 环境变量时不会再套用文件中的 `QDRANT_URL`，反之亦然。若使用本地数据库文件，请删除配置中的 `QDRANT_URL`，改为 `QDRANT_PATH = "~/.praxis-rag/qdrant"`，不要同时配置两者。
+### 服务入口
 
-源文件、PDF/Word 解析产物、文档清单、知识库配置、MCP 配置和 API Key 保存在共享状态数据库 MySQL。Qdrant 仍需按所选连接方式准备；配置文件不会代替数据库服务。测试使用可丢弃的 MySQL 测试库（见 [共享状态存储](state-storage.md)）。
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_SERVICE_HOST` | `127.0.0.1` | 绑定地址；非 loopback 时必须提供 token 与 MCP 白名单 |
+| `RAG_SERVICE_PORT` | `8011` | HTTP 端口 |
+| `RAG_SERVICE_TOKEN` | 空 | Service Token；非 loopback 宿主强制要求，客户端用 `Authorization: Bearer` |
+| `RAG_SERVICE_DATA_ROOT` | `~/.praxis-rag/data` | SQLite 状态库与上传恢复工作区根目录 |
+| `RAG_WEB_ROOT` | 空（自动探测） | Console 构建目录；`dist/web` 或 `/app/web` |
+| `RAG_MCP_ALLOWED_HOSTS` | `127.0.0.1,127.0.0.1:*,localhost,localhost:*,[::1],[::1]:*` | MCP Host 白名单（逗号分隔） |
+| `RAG_MCP_ALLOWED_ORIGINS` | 对应 loopback `http` 来源 | MCP Origin 白名单 |
+| `RAG_CONFIG_FILE` | `~/.praxis-rag/config.toml` | 启动配置文件路径 |
 
-仓库开发环境中也可以执行：
+### 检索、模型与外部解析器
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_BACKEND` | `mock`（服务拒绝启动） | 必须为 `qdrant`；`mock` 仅用于 mcp-debug |
+| `QDRANT_URL` | 未设置时 `http://localhost:6333` | Qdrant HTTP 地址 |
+| `QDRANT_PATH` | 空 | **Go 不支持**；设置会启动失败（改用 `QDRANT_URL`） |
+| `RAG_COLLECTION` | `mini_agent_knowledge_pdf_assets_v1` | 默认集合名；实际集合由知识库配置决定 |
+| `RAG_DENSE_VECTOR_SIZE` | `1024` | 固定值，其他尺寸报错 |
+| `RAG_EMBEDDING_MODEL` | `BAAI/bge-m3` | 默认模型标识（实际连接由知识库配置覆盖） |
+| `RAG_EMBEDDING_DEVICE` | 空 | 传给兼容模型 API 的可选设备提示 |
+| `RAG_CHUNK_TOKENIZER_MODEL` | `BAAI/bge-m3` | tokenizer 标识；Go 当前使用确定性近似 token 计数（见 §12） |
+| `RAG_RERANKER_MODEL` | `BAAI/bge-reranker-base` | 默认 reranker 标识 |
+| `RAG_RERANKER_DEVICE` / `RAG_RERANKER_BATCH_SIZE` | 空 / `4` | reranker 设备提示与批大小 |
+| `RAG_RERANKER_MAX_CANDIDATES` | `30` | 进入重排的候选上限 |
+| `RAG_RERANKER_MAX_LENGTH` | `512` | 重排文本 token 上限 |
+| `RAG_RERANKER_MAX_TEXT_CHARS` | `4000` | 重排文本字符上限 |
+| `RAG_PRELOAD_MODEL` / `RAG_PRELOAD_RERANKER` | `false` | Go 通过 HTTP 调用模型，不加载本地权重 |
+| `RAG_NAMESPACE` | 空 | 可选的 Qdrant 物理 namespace 过滤 |
+| `RAG_PDF_PARSER_PYTHON` | 空 | Docling 解析进程的 Python 可执行文件 |
+| `RAG_PDF_MODELS_PATH` | 空 | Docling/视觉模型目录 |
+| `RAG_PDF_PARSE_TIMEOUT` | `900` 秒（30..7200） | PDF 解析外部进程超时 |
+| `RAG_WORD_CONVERTER_PATH` | 空 | LibreOffice `soffice` 路径（DOC 转换） |
+| `RAG_WORD_CONVERT_TIMEOUT` | `120` 秒（1..7200） | DOC 转换超时 |
+
+外部解析器的实际调用发生在 ingest 阶段：Go 进程启动外部 Python/soffice 子进程，通过文件协议交换解析产物。PDF 解析依赖 Docling 与模型目录；不配置 `RAG_PDF_PARSER_PYTHON` 时 PDF 上传会明确失败。DOC 同理需要 `RAG_WORD_CONVERTER_PATH`。Go 当前**没有**接入 Word 视觉描述 worker：无图注的 Word 图片不会生成视觉描述，检索只用已有图注/脚注。这些外部依赖未在本仓库的 Go 测试环境中实机验证。
+
+### 共享状态库
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_STATE_URL` | 空 | 显式 SQLAlchemy 风格 URL，优先级最高：`mysql+pymysql://...`、`sqlite+pysqlite:///...` |
+| `RAG_MYSQL_HOST` | 空 | 未设置 `RAG_STATE_URL` 时，设置该变量即选择 MySQL 后端 |
+| `RAG_MYSQL_PORT` | `3306` | MySQL 端口 |
+| `RAG_MYSQL_USER` / `RAG_MYSQL_PASSWORD` | `rag` / 空 | MySQL 账号；密码只从环境读取 |
+| `RAG_MYSQL_DATABASE` | `praxis_rag` | 数据库名 |
+| `RAG_MYSQL_SSL_CA` | 空 | 可选 CA PEM 路径 |
+| `RAG_STATE_ENCRYPTION_KEY` | 空 | `base64:` 前缀的 32 字节密钥；加密模型 API Key，多实例必须一致 |
+| `RAG_STATE_POOL_SIZE` / `RAG_STATE_MAX_OVERFLOW` | `10` / `20` | 连接池 |
+| `RAG_STATE_POOL_RECYCLE` / `RAG_STATE_POOL_TIMEOUT` | `1800` / `30` 秒 | 连接回收与等待 |
+| `RAG_STATE_ECHO` | `false` | SQL 回显（调试用，勿在生产开启） |
+| `RAG_STATE_AUTO_SCHEMA` | `true` | 启动时创建缺失表；生产可关闭并由部署账号预建 |
+| `RAG_UPLOAD_LEASE_SECONDS` | `120` | 上传事务业务租约时长 |
+| `RAG_UPLOAD_CLEANUP_DELAY_SECONDS` | `3600` | 已完成上传工作区清理延迟 |
+
+SQLite 路径为 `<RAG_SERVICE_DATA_ROOT>/state.sqlite3`；未配置 MySQL/URL 时自动使用。已有 SQLite 或旧数据先用 §7 的 CLI 检查/建表。
+
+### Redis、搜索结果快照
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_REDIS_ENABLED` | 未设置 = 按 URL 自动启用 | `false/0/off` 显式禁用；禁用时排队搜索快照不可读 |
+| `RAG_REDIS_URL` | 空 | 例如 `redis://127.0.0.1:6379/0` |
+| `RAG_REDIS_PREFIX` | `rag:state:v1` | 缓存/任务键前缀 |
+| `RAG_REDIS_TTL_SECONDS` | `60` | 读模型展示缓存 TTL |
+| `RAG_REDIS_TIMEOUT_SECONDS` | `0.3` | Redis 连接/命令超时 |
+| `RAG_RESULT_TTL_SECONDS` | `3600` | 搜索结果快照 TTL（与搜索任务截止时间独立） |
+| `RAG_RESULT_MAX_BYTES` | `16777216` | 单结果快照上限 |
+| `RAG_ARTIFACT_MAX_BYTES` | `67108864` | 单 artifact 上限 |
+| `RAG_RESULT_MAX_ARTIFACTS` | `100` | 每次搜索最多 artifact 数 |
+
+Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的结果快照必须用 Redis**，没有 SQL 回放。REST 同步搜索、Console 与本地调试不依赖 Redis（快照可降级为 `snapshot_available=false`）。
+
+### Kafka 与队列
+
+单节点 Compose Kafka 使用 INTERNAL/EXTERNAL 双 listener：宿主机进程用 `127.0.0.1:9092`，同一 compose 网络的容器用 `kafka:9092`；`RAG_KAFKA_BOOTSTRAP_SERVERS` 为空表示 brokerless（异步受理仍可提交，但投递/排队搜索不可用）。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_KAFKA_BOOTSTRAP_SERVERS` | 空 | 逗号分隔 `host:port`；宿主默认 `127.0.0.1:9092`，compose 容器 `kafka:9092`；空 = brokerless |
+| `RAG_KAFKA_CLIENT_ID` | `praxis-rag` | Kafka 客户端标识 |
+| `RAG_KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` | `PLAINTEXT` / `SSL` / `SASL_PLAINTEXT` / `SASL_SSL` |
+| `RAG_KAFKA_SASL_MECHANISM` | 空 | `PLAIN` / `SCRAM-SHA-256` / `SCRAM-SHA-512`（仅 SASL 协议使用） |
+| `RAG_KAFKA_SASL_USERNAME` / `RAG_KAFKA_SASL_PASSWORD` | 空 | SASL 凭据，仅从环境读取 |
+| `RAG_KAFKA_TLS_CA` | 空 | 可选 CA PEM 路径 |
+| `RAG_KAFKA_TLS_INSECURE` | `false` | 跳过 TLS 证书校验（仅测试） |
+| `RAG_KAFKA_PUBLISH_TIMEOUT_SECONDS` | `10` | 发布超时 |
+| `RAG_CACHE_TOPIC` / `RAG_CACHE_GROUP` | `praxis_state_cache_refresh` / `praxis_state_cache_refresh_workers` | 缓存刷新 topic/group |
+| `RAG_DOCUMENT_TOPIC` / `RAG_DOCUMENT_GROUP` | `praxis_document_ingest` / `praxis_document_ingest_workers` | 文档通知 topic/group |
+| `RAG_SEARCH_TOPIC` / `RAG_SEARCH_GROUP` | `praxis_search` / `praxis_search_workers` | 排队搜索 topic/group |
+| `RAG_DOCUMENT_DLQ_TOPIC` | `praxis_document_ingest_dead_letters` | 文档死信 topic（显式配置，不是 `%DLQ%` 约定） |
+| `RAG_SEARCH_DLQ_TOPIC` | `praxis_search_dead_letters` | 搜索死信 topic（显式配置） |
+| `RAG_DOCUMENT_DLQ_GROUP` / `RAG_SEARCH_DLQ_GROUP` | `praxis_document_dead_letters` / `praxis_search_dead_letters` | 死信 worker 的独立 group |
+| `RAG_OUTBOX_BRIDGE` | `relay` | `relay`：进程内发布发件箱到 Kafka；`debezium`：应用不发布，由 Debezium Server 读取 MySQL binlog 并通过原生 Kafka sink 投递（需 compose `debezium` profile / 外部 Debezium；两者不可同时启用） |
+| `RAG_APP_KAFKA_BOOTSTRAP_SERVERS` | 空（compose 内默认 `kafka:9092`） | 仅 compose app/Debezium 容器读取的 bootstrap 覆盖；宿主 Go 进程读 `RAG_KAFKA_BOOTSTRAP_SERVERS` |
+
+**消费语义（至少一次）**：
+
+- handler 成功 → 提交 Kafka offset；
+- handler 失败（nack）→ 在**同一进程内**重试同一条记录，指数退避从 `100ms` 开始、上限 `5s`，`DeliveryAttempt` 从 1 递增；
+- 达到 `MaxAttempts`（文档/搜索 worker 默认 5）→ 把原始消息发布到对应 `RAG_*_DLQ_TOPIC`、执行终态回调、再提交 offset；
+- `MaxAttempts=0` → 不设上限，一直重试直到进程或 context 取消；
+- 死信 worker 的 `--kind document|search` 实例消费显式 DLQ topic 与独立 `RAG_*_DLQ_GROUP`，不再使用 `%DLQ%<源组>` 或 mqadmin；`MaxAttempts=0` 的死信 worker 自身不会二次死信。
+- 消费重试与死信发布由 Go 消费端完成，不依赖 Kafka 的不可见期/重投机制；重复投递由 handler 幂等与 MySQL 业务租约吸收。
+
+### 异步文档与 worker 环境
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_DOCUMENT_JOB_LEASE_SECONDS` | `300` | 文档任务 SQL 租约 |
+| `RAG_DOCUMENT_JOB_HEARTBEAT_SECONDS` | `20` | 处理期间续租间隔 |
+| `RAG_DOCUMENT_JOB_SWEEP_SECONDS` | `120` | 滞留/过期任务回收窗口 |
+| `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS` | `604800`（7 天） | 发件箱行保留期 |
+| `RAG_DOCUMENT_JOB_RETENTION_SECONDS` | `2592000`（30 天） | 终态任务保留期 |
+| `RAG_DOCUMENT_WORKER_LOCAL` | `false` | 文档 worker 单进程 outbox 模式；仅在未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时生效 |
+| `RAG_DOCUMENT_WORKER_POLL_SECONDS` | `0.5` | 本地 outbox / 消费轮询间隔 |
+| `RAG_DOCUMENT_WORKER_RECOVER_SECONDS` | `30` | 文档 worker 周期性 Recover（恢复中断上传/补偿） |
+| `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_DOCUMENT_MAX_ATTEMPTS` | `5` | 文档 worker 的 Kafka 进程内最大尝试次数（前者优先；名称为兼容旧配置保留） |
+
+### 排队搜索任务环境
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_SEARCH_TIMEOUT_SECONDS` | `120` | 搜索任务总截止时间（包含排队），与调用方 `wait_seconds` 不同 |
+| `RAG_SEARCH_MAX_ATTEMPTS` | `5` | 搜索 worker 的 Kafka 进程内重试上限 |
+| `RAG_SEARCH_LEASE_SECONDS` | `120` | 任务执行租约（Go 状态机扩展） |
+| `RAG_SEARCH_RETRY_SECONDS` | `5` | 失败重投或重试等待 |
+
+### Worker 二进制与运行模式
+
+| 命令 | 作用 | 必需 | 退出码 |
+| --- | --- | --- | --- |
+| `rag-service` | REST + MCP + Console + 进程内 relay/维护循环 | Qdrant、状态库；MCP 需要 token；异步/排队需要 Kafka | `0` 正常停止，`1` 运行时失败 |
+| `rag-document-worker` | 消费文档通知，解析/切分/Embedding/发布 | 状态库、Qdrant；Kafka 模式需 `RAG_KAFKA_BOOTSTRAP_SERVERS`，或 `RAG_DOCUMENT_WORKER_LOCAL=1` | `0/1/2` |
+| `rag-search-worker` | 消费 schema 2 搜索请求，执行 `SearchRaw` + 快照 + 终态 | `RAG_KAFKA_BOOTSTRAP_SERVERS`、状态库、Qdrant、Redis（快照） | `0/1/2` |
+| `rag-dead-letter-worker --kind document\|search` | 消费显式 `RAG_DOCUMENT_DLQ_TOPIC` / `RAG_SEARCH_DLQ_TOPIC`，把可确认的失败写入持久终态并 ACK | `RAG_KAFKA_BOOTSTRAP_SERVERS`、对应 `RAG_*_DLQ_GROUP` | `0/1/2` |
+
+退出码约定（worker 与全部 CLI）：`0` = 收到 SIGINT/SIGTERM 正常停止；`1` = 运行时失败（应重启/告警）；`2` = 配置或用法错误（修配置，不要自动重启）。服务本身配置错误也以 `1` 退出。文档 worker 的本地模式适合单进程开发：未配置 Kafka 时它直接轮询 `document_job_outbox`，有 Kafka 时变量被忽略并切换为 Kafka 消费模式。**worker 不在 `rag-service` 进程内运行**；服务只负责受理、relay 和维护循环。
+
+## 4. 启动与冒烟
+
+### 启动 rag-service
 
 ```powershell
-uv run --package praxis-rag rag-service
+$env:RAG_SERVICE_HOST = "127.0.0.1"
+$env:RAG_SERVICE_PORT = "8011"
+$env:QDRANT_URL = "http://127.0.0.1:6333"
+$env:RAG_WEB_ROOT = "$PWD/dist/web"     # 若 Console 已构建
+.\dist\bin\rag-service.exe
 ```
 
-默认地址：
+默认地址：Console `/console`、MCP `/mcp`、API 文档 `/docs`（`/openapi.json`）、健康检查 `/health`。
 
-- Web Console：`http://127.0.0.1:8011/console`
-- MCP：`http://127.0.0.1:8011/mcp`
-- OpenAPI：`http://127.0.0.1:8011/docs`
-- 健康检查：`http://127.0.0.1:8011/health`
+### 创建 API Key
 
-进程启动、Console 可访问或 `/health` 成功，不代表 MCP 队列已就绪。部署冒烟检查：异步新增须确认 MySQL 可写、`rag-document-worker` 在运行（relay 模式还需 MQ，Debezium 模式需 CDC 管道），实际提交 `add_document` 并轮询至终态；排队搜索须确认 Redis/MQ 连接、topic/group 与 `rag-search-worker`，实际提交搜索并轮询至终态。显式 `RAG_REDIS_ENABLED=false` 会停止依赖 Redis 的搜索队列操作和结果快照，也不影响文档异步新增（MySQL 任务与状态）以及同步 REST 文档上传、更新/删除的 MySQL journal 路径。
-
-Console 包含知识上传、文档删除、BM25/Embedding/Hybrid 检索、Reranker 切换、Top-K 结果、score、source、chunk_id 和阶段耗时。它直接访问同源 RAG API，不经过 Mini-Agent。调试页还提供“三模式对比”，固定关闭重排并并排展示三种 Retriever 的原始结果，避免 Cross Encoder 把不同召回重新排成相同顺序。
-
-启动后在“模型配置”中分别设置 Embedding 和 Reranker 的 URL 和 Key；模型在创建知识库时选择。RAG HTTP 服务不再加载本地 Embedding/Reranker 权重，也不控制推理框架的 CPU/GPU；本地推理框架需自行运行，再填写其地址与端口。未配置时，相应操作明确报错，不回退到本地模型。
-
-PDF 仍由独立 Docling 2.126.0 子进程解析，使用 PDFium、CUDA 和本机解析模型；图片或表格没有有效原文说明时，才使用固定版本的 Granite Vision 3.3 2B 生成检索描述。解析产物（含图片原图）保存在共享状态数据库，图表原始数据和检索文字写入 Qdrant。每批最多 10 个文件，单文件最大 10 MiB。
-
-PDF 公式使用本地 CodeFormulaV2 转为 LaTeX，开启生成缓存，并以紧裁剪、单公式推理减少相邻文字干扰。模型错误、空公式输出或生成被截断会导致该文件解析失败，不静默跳过。模型能够输出 LaTeX 不代表数学内容一定正确，复杂公式仍需要用原页验证。
-
-OCR 不再按默认置信度阈值丢弃已识别文字；低置信度内容保留，并在 `ocr.json`、解析清单和相关检索块的 `source_warnings` 中记录。保留文字不等于识别正确，扫描件仍可能有错字。
-
-每份 PDF 的原生 `document.json`、按阅读顺序保存的 `manifest.json`、正文 `document.md`、OCR 记录 `ocr.json` 和图片保存在共享数据库 `blobs` 表的 `pdf-assets` 桶中，键为 `<document_id>/...`。正文、图片、表格与公式保持 Docling 的遍历顺序；图注、表题、脚注保留原文关联，不按长度丢弃，也不猜配未关联注解。生成描述仅用于检索，不充当原文注解。命令行 PDF 导入和 MCP 正文读取使用同一份解析结果。
-
-### 4. 启动独立文档 worker（MCP 异步新增必需）
-
-在另一个终端或进程管理器中启动消费者；先为该进程配置与 API 相同的 MySQL（或 `RAG_STATE_URL`）、Qdrant、`RAG_STATE_ENCRYPTION_KEY` 和队列连接环境。文档 worker 需要 MySQL 与 RocketMQ（消费通知），但**不需要 Redis**：文件字节、任务状态和租约都在 MySQL。需要处理 PDF/Word 时，也要准备对应解析依赖和模型。不要假设另一个终端会继承启动脚本加载的 `.env`。
+管理接口仅允许本机直连（loopback、无代理头、同源 Origin）：
 
 ```powershell
-rag-document-worker
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
+  -H "Content-Type: application/json" `
+  -d '{"name":"cli","namespaces":["default"]}'
 ```
 
-每个 worker 默认同一时间只执行一个消费任务；通过多个独立 `rag-document-worker` 进程扩容，它们使用相同文档 topic/group。API 只提交 MySQL 事务，不内嵌文档消费者，也不直接发送文件内容。收到通知后，worker 用 SQL 租约 claim 任务、从 MySQL 读回完整任务与文件字节、解析并索引；只有 MySQL 已记录终态才 ACK。API/worker 应共享以下配置；缓存队列环境变量保留原义，不要把文档队列配置写入缓存 topic/group：
+响应中的 `key` 只出现一次；后续请求带 `Authorization: Bearer <key>` 和 `X-RAG-Namespace: default`。也可直接使用 `RAG_SERVICE_TOKEN`（本地链接可用 Service Token 代替 API Key）。
 
-| 环境变量 | 默认值 / 作用 |
-| --- | --- |
-| `RAG_ROCKETMQ_ENDPOINT` | Compose 为 `127.0.0.1:8081`；缓存、文档和搜索共用连接。宿主 8081 被占用时改 `RAG_ROCKETMQ_PROXY_PORT`（如 18081）并同步修改此值 |
-| `RAG_ROCKETMQ_NAMESPACE` | 可选 RocketMQ namespace，与知识库 namespace 不同 |
-| `RAG_ROCKETMQ_ACCESS_KEY` / `RAG_ROCKETMQ_SECRET_KEY` | 可选凭据，仅从环境提供 |
-| `RAG_ROCKETMQ_TLS` | `false`；共享 TLS 开关 |
-| `RAG_ROCKETMQ_TOPIC` / `RAG_ROCKETMQ_GROUP` | 原缓存刷新队列，保持不变 |
-| `RAG_OUTBOX_BRIDGE` | `relay`（默认）或 `debezium`；文档通知投递方式，两种模式互斥 |
-| `RAG_DOCUMENT_TOPIC` | `praxis_document_ingest`；Debezium 也投递到该 topic |
-| `RAG_DOCUMENT_GROUP` | `praxis_document_ingest_workers` |
-| `RAG_DOCUMENT_BROKER_MAX_RETRIES` | `16`；仅供部署脚本 `updateSubGroup -r` 使用，非 Python 运行时设置 |
-| `RAG_DOCUMENT_DLQ_GROUP` | `praxis_document_dead_letters`；独立死信处理消费组，不是死信 topic |
-| `RAG_DOCUMENT_JOB_LEASE_SECONDS` | `300`；worker claim 任务的 SQL 租约时长 |
-| `RAG_DOCUMENT_JOB_HEARTBEAT_SECONDS` | `20`；处理期间续租间隔 |
-| `RAG_DOCUMENT_JOB_SWEEP_SECONDS` | `120`；滞留任务补发通知、回收过期租约的判定窗口 |
-| `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS` | `604800`（7 天）；发件箱行的保留期，超期由 worker 维护任务清理 |
-
-`add_document` 在一个 MySQL 事务里写入 `document_jobs`（完整任务，含文件原字节，单文件仍最多 **10 MiB**）和 `document_job_outbox`（发件箱行），**提交成功即返回 `artifact_id`**；是否已投递或处理，不改变受理结果。投递由 `RAG_OUTBOX_BRIDGE` 选择：`relay`（默认）由 API 进程内轮询 PENDING 发件箱行并发布到 RocketMQ，发布成功后标记 `PUBLISHED`，适用于无 CDC 基础设施的部署；`debezium` 关闭应用内 relay，由 Debezium 读取 `document_job_outbox` 的 binlog INSERT 后投递，需要 MySQL ROW binlog 与独立连接器部署。两种模式互斥，部署细节见 [deploy/debezium/README.md](../deploy/debezium/README.md)。RocketMQ 消息只含 `{"schema":3,"artifact_id","namespace","name","created_at"}`，worker 同时兼容 Debezium 原始 change event（读取 `after` 字段）。
-
-**升级顺序**：先停止旧 API 接收新任务，保持旧 worker/relay 运行直至旧 outbox、排队和执行中任务排空，处置剩余旧死信；再同时升级 API、文档与搜索 worker。schema 3 通知只含标识，与旧 schema 2 文档消息不兼容，不能混跑或将旧消息交给新 worker；搜索仍为 schema 2 完整请求。旧任务和结果**不迁移**；`document_tasks`、`document_task_outbox`、`search_tasks`、`search_task_outbox`、`search_result_snapshots` 表与历史行保留、不删除，但退出活跃路径。旧 `RAG_DOCUMENT_DISPATCH_*` 和 `RAG_DOCUMENT_MAX_ATTEMPTS` / `RAG_DOCUMENT_LEASE_SECONDS` / `RAG_DOCUMENT_RETRY_SECONDS` 已停用；旧配置文件中的这些键会被接受但忽略，应删除。Broker 重试策略使用 `RAG_DOCUMENT_BROKER_MAX_RETRIES`；独立 `cache_outbox` 仍用于持久读模型刷新。
-
-持久发布所需的 MySQL 表（`document_jobs`、`document_job_outbox`、UploadJournal）仍须就绪；关闭自动 schema 时由部署账号预建缺失表并应用相关增量迁移，`create_all` 不会补齐已有列。请求记录知识库配置版本，消费前或发布时配置已改变会拒绝发布，需按新配置重新提交。
-
-本地 Broker 的 `autoCreateTopicEnable` 和 `autoCreateSubscriptionGroup` 都为 `false`。启动脚本沿用 `mqadmin updatetopic` 和 `mqadmin updateSubGroup` 循环，保留缓存、文档和搜索三组正常 topic/group。生产部署或手动启动也需预建资源并配置权限；死信读取还需下述独立处理组及可读 DLQ topic，不能依赖自动创建。
-
-### 5. 启动独立搜索 worker（服务端 MCP search 必需）
-
-**已有安装升级后也必须启动搜索消费者，否则 MCP 搜索会保持排队，直至任务截止时间后报错。** 服务端 MCP 搜索不再由 API 进程执行；REST `/v1/search`、Console 和本地同步调试路径保持同步，不需要搜索消费者。
-
-先在另一个终端或进程管理器中配置与 API 相同的 MySQL（或 `RAG_STATE_URL`）、Redis、RocketMQ、Qdrant 和 `RAG_STATE_ENCRYPTION_KEY`。不要假设新终端会继承启动脚本加载的环境；也不要为 worker 使用独立数据库或不同模型配置。
+### 启动 worker
 
 ```powershell
-rag-search-worker
+# 异步 MCP add_document（Kafka 模式；无 Kafka 可加 $env:RAG_DOCUMENT_WORKER_LOCAL="1"）
+.\dist\bin\rag-document-worker.exe
+
+# 服务端 MCP 排队搜索
+.\dist\bin\rag-search-worker.exe
+
+# 死信处理（两个独立实例）
+.\dist\bin\rag-dead-letter-worker.exe --kind document
+.\dist\bin\rag-dead-letter-worker.exe --kind search
 ```
 
-每个进程默认顺序执行搜索，可用多个独立进程扩容，使用同一搜索 topic/group。文档、搜索及缓存刷新使用三组独立 topic/group，分别消费。搜索路径未随本次文档入库改造变化：API 直接发送携带完整查询与参数的 schema 2 消息，获 Broker 确认后才返回成功响应，Redis 保存短期任务状态和完成快照。没有消费者时搜索会一直排队至任务截止时间。
+worker 必须与 `rag-service` 使用**同一** `RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`RAG_BACKEND=qdrant`/`QDRANT_URL`、`RAG_STATE_ENCRYPTION_KEY`、Redis/队列设置。它们不继承其他终端的 `.env`（PowerShell 中请显式设置或使用进程管理器）。
 
-| 环境变量 | 默认值 / 作用 |
-| --- | --- |
-| `RAG_SEARCH_TOPIC` | `praxis_search`；与缓存、文档 topic 独立 |
-| `RAG_SEARCH_GROUP` | `praxis_search_workers`；独立搜索消费组 |
-| `RAG_SEARCH_TIMEOUT_SECONDS` | `120`；任务总超时，包含排队等待 |
-| `RAG_SEARCH_BROKER_MAX_RETRIES` | `16`；仅供部署脚本 `updateSubGroup -r` 使用，非 Python 运行时设置 |
-| `RAG_SEARCH_DLQ_GROUP` | `praxis_search_dead_letters`；独立死信处理消费组 |
-| `RAG_RESULT_TTL_SECONDS` | `3600`；排队搜索任务状态与完成结果快照 TTL，与搜索执行超时不同 |
+### 冒烟检查
 
-任务超时不是调用端 `wait_seconds`（默认 10 秒）：后者只控制完成等待，不延长任务截止时间，也不能跳过 Broker 确认。生产检索在子进程中执行；MQ 可见性续期失败不承诺立即取消该进程或下游调用。完成结果**只写 Redis**；Redis 未启用、故障、丢失或 TTL 到期后结果引用不可用，不回源 SQL 或自动重新检索，客户端可能需要重新提交。MySQL 仍保存已签发 artifact 快照及永久业务数据。升级须遵守上一节排空和 API/worker 同步部署要求。
+1. `GET /health` 返回 `status=ok`，`backend=qdrant`，`state` 显示实际 SQLite/MySQL。
+2. `/console` 返回 Console 页面（构建了 `dist/web` 且 `RAG_WEB_ROOT` 正确时）。
+3. REST `/v1/documents` 需要认证，未认证返回 401。
+4. MCP 初始化成功，`tools/list` 返回 6 个工具。
+5. 异步链路：配置 Kafka 并启动 document worker 后，MCP `add_document` 得到 `artifact_id`，轮询 `get_document_status` 至 `succeeded`。
+6. 排队搜索：配置 Kafka/Redis 并启动 search worker 后，MCP `search` 返回结果或 `result_id`，`get_search_result` 可轮询到完成。
 
-### Broker 消费与死信处理
+## 5. REST API 示例
 
-**Broker 管理消费重试、消息不可见期（invisible）及 DLQ**。文档消息只含 schema 3 通知标识，worker 从 MySQL 读回任务与文件字节；搜索消息仍携带完整查询，Redis 保存短期搜索任务与结果快照。文档投递可靠性由事务性发件箱 + relay/Debezium 保证，**不由 Broker 确认受理**；旧 SQL 任务及 outbox 不在活跃路径，旧消费租约/重试配置不能调整 Broker 行为；历史表/字段保留，无破坏性删除迁移。
+### 认证与命名空间
 
-- 临时故障：不 ACK，由 Broker 重试；同时发件箱 sweep 会为脱离通知的滞留任务补发通知，但不直接执行任务。
-- 确定性故障：文档把任务在 MySQL 标记 `failed`，搜索把失败终态写入 Redis，然后 ACK；成功也先持久化终态再 ACK。终态写入失败不视为已安全终结。
-- 终态更新遵循 **first-terminal-wins**，重复消息或迟到执行不能覆盖已有终态；读取到仍存在的终态后可直接尝试 ACK。搜索任务终态在 Redis，丢失/TTL 到期后不承诺搜索持久去重。
-- MQ visibility 续期失败只作有界重试，不保证立即取消工作。终态已持久化后仍尝试 ACK；ACK 失败可导致重复投递。
-- 文档 worker 用 SQL 租约（`RAG_DOCUMENT_JOB_LEASE_SECONDS`，默认 300 秒）claim 任务，处理期间按 `RAG_DOCUMENT_JOB_HEARTBEAT_SECONDS`（默认 20 秒）续租；租约过期由 sweep 回收并重新发出通知，崩溃不会留下只存在于内存的半终态。
-- 文档 `succeeded` 就是 MySQL 持久发布结果；UploadJournal 对账防止重投重复发布，不依赖 Redis 状态。
-- UploadJournal 操作、每文档/名称业务租约及 SQL heartbeat、fenced 提交、补偿与恢复留在 MySQL，保障业务版本一致性，不取代 Broker 的重试调度。
-- 日志仅含任务/操作 ID 和安全错误类别，不打印查询、上传内容、MQ 正文、连接凭据或密钥。
-
-正常源消费组默认最大重试为 **16**，与既有 `mqadmin updateSubGroup -r 16` 一致。可用 `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_SEARCH_BROKER_MAX_RETRIES` 在资源部署时覆盖；Python API/worker 不解析这两个变量。缓存 topic/group 及其设置保持不变。
-
-独立、无模型/推理的死信处理命令（传输层已验证 Python SDK 5.1.2 / Apache Broker 5.3.3 正常 DLQ 读取和 ACK）：
+- 普通 `/v1/*`、`/mcp`：`Authorization: Bearer <RAG_SERVICE_TOKEN 或 API Key>`；未设置 Token 时，本机 loopback 可直接使用 Headers 的 `X-RAG-Namespace` 访问普通租户接口。
+- `/v1/admin/*`：额外要求本机直连（loopback/无 Forwarded 代理头/同源 Origin），不接受远程管理。
+- 所有租户接口都需要 `X-RAG-Namespace: <知识库>`；MCP 否则无法确定工作区。
 
 ```powershell
-rag-dead-letter-worker --kind document
-rag-dead-letter-worker --kind search
-```
-
-它把尚未终结的任务标记失败（文档写入 MySQL，搜索写入 Redis），成功写入后 ACK；已有终态不覆盖，写入临时失败不 ACK，不重新解析、检索或重跑模型。两个处理组分别配置为 `RAG_DOCUMENT_DLQ_GROUP=praxis_document_dead_letters`、`RAG_SEARCH_DLQ_GROUP=praxis_search_dead_letters`，不能与正常源消费组共用。
-
-**正常 Broker DLQ topic 是 `%DLQ%<源消费组>`**：默认分别为 `%DLQ%praxis_document_ingest_workers` 和 `%DLQ%praxis_search_workers`，不是自定义失败 topic，也不是 `%DLQ%<死信处理组>`。需显式建立独立处理组，确保 DLQ topic 可读（RocketMQ topic permission 至少包含读位 `4`；正常读写为 `6`），并为连接身份授予这些 topic 的读取、处理组订阅和 ACK 权限。Broker 自动创建关闭时不能省略资源部署。启动脚本用 `updatetopic -p 6 -r 1 -w 1` 显式保留 Broker 写入并开启读取，再创建独立处理组；这不替代生产 ACL。传输层已用独立临时资源验证 Python SDK 5.1.2 / Apache Broker 5.3.3：正常消息未 ACK，经 Broker 重试耗尽后进入 `%DLQ%<源消费组>`，独立处理组收到原消息并成功 ACK。此结论不自动覆盖其他 SDK/Proxy/Broker 版本；更换部署组合须重新验证，不能仅凭资源已创建便宣称订阅可用。
-
-DLQ 名称必须从 **Broker 实际源消费组名** 推导。若源组显式为 `ns%group`，对应 topic 是 `%DLQ%ns%group`，不是 `ns%%DLQ%group`。不要假设 `RAG_ROCKETMQ_NAMESPACE` 的 SDK metadata 会自动映射为物理资源前缀；传输层还验证了显式物理源组 `probe_ns%<group>` 对应 `%DLQ%probe_ns%<group>` 的直接接收及 ACK；适配器在接收请求中保留物理 topic，并在 ACK 前恢复 Broker 响应中可能被去掉的物理前缀。此验证不代表 metadata-only namespace 隔离成立；其他部署仍需验证 SDK/Proxy 映射。
-
-### 知识库模型配置
-
-创建知识库时填写 Embedding 的 URL、Key 并从下拉列表选择模型；Reranker 可选，每个知识库独立保存配置。侧边栏“知识库”可以查看和修改配置，Key 默认隐藏，点击眼睛后按需读取。
-
-- 修改 Embedding URL、模型或向量长度必须重新向量化：使用已有片段建立新索引，全部成功后才切换配置；失败保留原索引。原文件、附件和旧集合不删除。
-- 仅修改 Key 或 Reranker 不需要重新向量化。模型列表使用当前表单中的 URL/Key 获取。
-- URL 保留路径前缀，例如服务要求 /v1 时应填写完整地址；不自动补 /v1。创建和保存会验证实际模型调用。
-- 配置保存在共享状态数据库的 `knowledge_bases` 表；Windows Key 使用 DPAPI 加密，其他系统使用状态加密密钥，多实例部署必须设置 `RAG_STATE_ENCRYPTION_KEY`。Key 不进入浏览器存储，修改地址不会复用旧 Key。
-- 管理接口仅允许本机直连；普通文档和检索接口仍使用服务 API Key，不能与模型提供方 Key 混用。
-- POST /v1/admin/knowledge-bases 创建；PATCH /v1/admin/knowledge-bases/{namespace} 修改，reembed=true 执行重新向量化。旧全局 /v1/model-settings 接口已移除。
-- 分词器由 RAG_CHUNK_TOKENIZER_MODEL 指定，与远端模型别名分开配置。重新向量化不重新切分文档。
-
-真实 API 浏览器验收需要独立 RAG 服务、独立数据目录和真正运行模型的推理服务：
-
-```powershell
-conda activate dev
-$env:RAG_MODEL_API_TEST_URL = "http://127.0.0.1:8031"
-$env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
-.venv\Scripts\python -m pytest tests/test_real_model_api_ui.py -q -s
-```
-
-本仓库的测试辅助服务 `tests/model_api_inference_server.py --port 8032` 在 `dl` 环境中使用真实缓存 BGE 模型提供验收接口（模型别名 `served-embedding`、`served-reranker`），不属于生产 RAG 服务。测试截图在 `.test-tmp/model-api-browser/`。
-
-### 前端开发与打包
-
-Console 使用 React、TypeScript 和 Ant Design，提供浅色与深色主题。主题和 Namespace 保存在当前浏览器；Service Token 仅保存在当前会话，MCP 配置示例不会显示真实 Token。
-
-Console 正常运行只需启动 `rag-service`，通过 `/console` 打开页面，不需要 Node.js 或额外前端进程；服务端 MCP 搜索另需 `rag-search-worker`，MCP 异步新增另需 `rag-document-worker`。`src/rag_mcp/web/` 是自动生成并随 Python 包交付的构建目录，已由 `.gitignore` 忽略，不再提交到 Git。修改界面请编辑 `frontend/src/`，不要手动修改构建文件。
-
-首次克隆源码、修改前端后，或安装/打包 Python 包前，在仓库根目录执行（需要 Node.js 22.12+）：
-
-```powershell
-Push-Location .\frontend
-try {
-    npm ci
-    npm run build
-} finally {
-    Pop-Location
+$headers = @{
+  "Authorization"   = "Bearer <token-or-key>"
+  "X-RAG-Namespace" = "default"
+  "Content-Type"    = "application/json"
 }
 ```
 
-构建会先清空 `src/rag_mcp/web/` 再写入当前版本，避免多份哈希文件积累。构建成功后再运行上文的本地安装命令，或打包 Python 分发包；现有 package-data 配置会将生成的页面、JS、CSS 和 PDF.js 资源包含在包中。只做 `git pull` 不会更新本机构建目录，更新源码后需重新构建。未构建的全新源码目录不提供 `/console`，但仍可使用 API/MCP。运行已包含构建资源的安装包不需要 Node.js。
-
-需要热更新时，可以单独运行开发服务器：
+### 健康与 OpenAPI
 
 ```powershell
-Set-Location .\frontend
-$env:RAG_DEV_API = "http://127.0.0.1:8011"
-npm run dev
+curl.exe http://127.0.0.1:8011/health
+curl.exe http://127.0.0.1:8011/openapi.json   # OpenAPI 3.1
+curl.exe http://127.0.0.1:8011/docs           # 自包含交互文档
 ```
 
-访问终端输出地址下的 `/console/assets/`。开发服务器将 API 请求转发给 `RAG_DEV_API`；生产环境始终使用同源接口。
-
-真实浏览器验收必须指向独立测试服务和独立数据目录，测试会创建自己的 Namespace，并只清理其中的测试文档：
+### API Key 管理（本机管理）
 
 ```powershell
-conda activate dl
-$env:PYTHONPATH = "$PWD/src"
-$env:RAG_BROWSER_URL = "http://127.0.0.1:8021"
-python -m pytest tests/test_browser_chunking.py -v
+curl.exe http://127.0.0.1:8011/v1/admin/api-keys
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
+  -H "Content-Type: application/json" `
+  -d '{"name":"cli","namespaces":["default","product-manuals"]}'
+curl.exe -X PUT http://127.0.0.1:8011/v1/admin/api-keys/<id> `
+  -H "Content-Type: application/json" `
+  -d '{"name":"cli","namespaces":["default"],"enabled":false}'
+curl.exe -X DELETE http://127.0.0.1:8011/v1/admin/api-keys/<id>
+curl.exe "http://127.0.0.1:8011/v1/admin/api-keys/<id>/mcp-config" `
+  -H "X-RAG-Namespace: default"
 ```
 
-测试需要 Python Playwright 和本机 Edge。截图写入 `.test-tmp/console-browser/`；真实上传、检索与重排使用实际模型，额外的失败和延迟响应测试使用浏览器拦截。
+`mcp-config` 返回 `{"url":"http://<host>/mcp","headers":{"Authorization":"Bearer <key>","X-RAG-Namespace":"default"}}`，可直接粘贴到 MCP 客户端配置。
 
-### 切分策略与上传去重
-
-Web Console 的“知识文档”页面可选择五种切分策略。网页及上传 API 默认使用 `recursive`，块长度为 512 token，重叠上限为 64 token；参数可调整。命令行导入仍使用原字符策略，不增加新参数。
-
-| 策略值 | 行为 |
-| --- | --- |
-| `character` | 原字符切分，默认 700 字符、100 字符重叠，优先在换行或标点处结束。 |
-| `token` | 使用服务配置的 tokenizer，按原文位置截取 token 窗口。 |
-| `sentence` | 完整句子合块，超长单句按 token 拆分。支持常见中英文断句和英文缩写，不做语言模型语义判断。 |
-| `recursive` | 段落、句子、token 逐级细分，再合并完整内容单元。 |
-| `structure` | Markdown 按标题；TXT 按空行段落；PDF 按页、段落、句子；DOCX 按标题样式及段落，表格过长按行处理。 |
-
-短内容按原文顺序合并，允许跨章节和 PDF 页面。重叠计入长度上限，句子重叠可能少于设置值或为零；超长句子使用 token 重叠。chunk 元数据记录字符位置、实际页码、标题路径和段落位置。PDF 正式上传按 Docling 的页码和版面顺序生成正文块；图片按原图注检索并返回原图，表格按表题、表头和行内容检索并返回行列及合并信息。扫描文本使用 Docling OCR；无法稳定恢复结构的表格会终止该文件入库。
-
-PDF 正文实际执行所选切分策略；公式整体保留，表格按完整行附带全部表头层级入库，不跨图表或公式边界拼接正文。表格的 `header_rows` 保存多层表头，`cells` 保存合并范围，空列不会被删除。不可拆分的公式、图注或表格行可以超过目标块长度，但不得超过 Embedding 模型输入上限，超过时明确报错。PDF 块记录原始引用、页码及位置；跨页原文保留全部 `locations`，`page` 是起始页。普通正文的字符偏移对应当前连续正文段，不是 PDF 文件字节位置；来源的 `charspan` 对应 Docling 原始元素。
-
-- `GET /v1/chunking/strategies` 返回策略选项、单位和默认参数。
-- `POST /v1/documents` 在原 `files` multipart 字段外接收 `strategy`、`chunk_size`、`chunk_overlap`。
-- `POST /v1/documents/check` 接收 JSON：`{"files":[{"name":"guide.md","sha256":"64位小写十六进制哈希"}],"strategy":"recursive","chunk_size":512,"chunk_overlap":64}`，返回同序的 `files`，每项 `document` 为已有文档或 `null`。
-- 三个接口均沿用 `X-RAG-Namespace` 和服务认证。去重仅在同一 namespace 内比较文件 SHA-256、策略、长度、重叠、Embedding 模型及 tokenizer 标识；文件名不参与比较。
-- PDF 去重还比较 `pdf_parser_version`，解析器更新后重新上传会重新索引。旧 PDF 不自动迁移，缺少当前版本解析正文时 MCP 会要求显式重新导入，不回退到旧的纯文本提取。
-- 浏览器先计算哈希并检查，命中则不发送文件正文。需要 HTTPS 或 localhost 安全连接。后端接收正文时重新计算哈希，并在租户锁内再次去重。
-- 上传结果分别包含 `imported`、`skipped`、`failed` 和 `documents`。更改参数会重新索引；改名但配置相同则返回已有文档，不新建别名。已有文档不会自动重建。
-- 旧清单首次检查时按需补齐哈希，缺失配置按原 700/100 字符策略解释。tokenizer 下载或加载失败会明确报错，不退回字符计数。
-
-真实验收（在已安装 `.[dense]` 和 `pytest` 的 `dl` 环境运行）：
+### 知识库管理（本机管理）
 
 ```powershell
-conda activate dl
-$env:RAG_REAL_SMOKE = "1"
-$env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
-python -m pytest tests/test_real_chunking.py -q -s
+# 列表与详情
+curl.exe http://127.0.0.1:8011/v1/admin/knowledge-bases
+curl.exe http://127.0.0.1:8011/v1/admin/knowledge-bases/default
+
+# 创建：需要可访问的 Embedding API；创建时会真实探测向量维度
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/knowledge-bases `
+  -H "Content-Type: application/json" `
+  -d '{
+    "namespace":"default",
+    "embedding":{"base_url":"http://127.0.0.1:8032/v1","apikey":"<provider-key>"},
+    "embedding_model":"bge-m3",
+    "reranker":{"base_url":"http://127.0.0.1:8032/v1","apikey":""},
+    "reranker_model":"",
+    "strategy":"recursive",
+    "chunk_size":512,
+    "chunk_overlap":64
+  }'
+
+# 修改（修改 embedding URL/模型/维度必须 reembed=true）
+curl.exe -X PATCH http://127.0.0.1:8011/v1/admin/knowledge-bases/default `
+  -H "Content-Type: application/json" `
+  -d '{"reranker_model":"bge-reranker-base","reranker":{"base_url":"http://127.0.0.1:8032/v1"},"reembed":false}'
+
+# 模型列表、切分策略目录、模型 Key 读取（本机管理）
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/knowledge-bases/models/embedding `
+  -H "Content-Type: application/json" -d '{"base_url":"http://127.0.0.1:8032/v1"}'
+curl.exe http://127.0.0.1:8011/v1/admin/knowledge-bases/defaults
+curl.exe http://127.0.0.1:8011/v1/admin/knowledge-bases/default/key/embedding
 ```
 
-该测试用真实 BGE-M3、BM25 和本地 Qdrant，在临时目录中验证五种策略及四种文件。浏览器验收另需 `playwright` 和本机 Edge：设置 `RAG_BROWSER_URL` 为独立测试服务地址后，运行 `tests/test_browser_chunking.py`；截图保存在 `.mini_agent-rag/chunking-ui/`。
+公开配置：`GET /v1/knowledge-base`（返回 `public_settings + strategies`，缺少知识库时 404）。创建/修改的请求体与 Python 实现一致，`embedding` 必填，`embedding_model` 长度 1..512。
 
-PDF 最多解析 1000 页；DOCX 解压后的内部文件总量最多 50 MiB；单个文档最多提取 500 万字符。扫描版 PDF 使用本地 OCR；旧版二进制 `.doc` 由独立 LibreOffice 进程转换后解析。
-
-### Word 解析和图片检索
+### 文档管理
 
 ```powershell
-$env:RAG_WORD_CONVERTER_PATH = "C:/Program Files/LibreOffice/program/soffice.exe"
-$env:RAG_WORD_CONVERT_TIMEOUT = "120"
-# 无图注的图片使用已有 Docling + Granite Vision 环境和模型目录。
-$env:RAG_PDF_PARSER_PYTHON = "C:/path/to/pdf-parser/python.exe"
-$env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
+# 上传前检查（按顺序返回 files，document 为已存在文档或 null）
+curl.exe -X POST http://127.0.0.1:8011/v1/documents/check `
+  -H $headers -d '{"files":[{"name":"guide.md","sha256":"<64-hex>"}]}'
+
+# 同步上传（multipart，字段名必须为 files；可选 Idempotency-Key）
+curl.exe -X POST http://127.0.0.1:8011/v1/documents `
+  -H "Authorization: Bearer <token-or-key>" `
+  -H "X-RAG-Namespace: default" `
+  -H "Idempotency-Key: batch-20261108-01" `
+  -F "files=@guide.md" -F "files=@manual.txt"
+
+# 列表、读取正文、删除
+curl.exe http://127.0.0.1:8011/v1/documents -H $headers
+curl.exe "http://127.0.0.1:8011/v1/documents/guide.md/content" -H $headers   # 文本
+curl.exe -X DELETE "http://127.0.0.1:8011/v1/documents/guide.md" -H $headers
 ```
 
-- DOCX 读取正文、内容控件、文本框、页眉页脚、脚注尾注及嵌套表格。只保留最终正文，忽略删除和移出修订。
-- 表格保留空列、合并范围、嵌套单元格、表题及表注。每行检索文字携带表头，命中后返回完整结构。
-- 原生公式通过 `docxlatex` 转为 LaTeX；不支持的公式结构、损坏内容、外链图片及未能提取的原生图表会明确拒绝入库。
-- 图片保存原始字节。真实图注用于检索；没有图注时生成简短视觉描述，仅用于索引，不冒充图注。Word 视觉推理缩放输入到最长边 384 像素，不改变保存的原图；拒答或无效描述导致入库失败。
-- 图注、表注按编号、明确引用和相邻关系关联。仍有歧义的对象不保存，注释文字保留，上传结果与文档详情显示跳过数量、位置和原因。
-- Word 资产保存在共享数据库 `blobs` 表的 `word-assets` 桶中，与源文件和索引一同更新、回滚和删除。旧文档需重新上传才能使用新解析结果，不会自动重建已有知识库。
-- REST 图片结果的 `asset.data` 是 Base64，`asset.mime_type` 是实际类型；MCP 返回图片内容块。Word 使用章节、段落和对象位置，不提供虚构页码或坐标。控制台支持图片下载和表格展示。
-- DOC 转换使用独立临时目录及 LibreOffice 配置，禁用宏和链接更新。DOC 原文件仍保留；其图片字节以转换后的 DOCX 为准。转换超时、工具缺失或加密文档会报错，不降级成不完整文本。
+上传响应包含 `imported`、`skipped`、`failed`、`documents`；`skipped` 条目带 `requested_name`。单文件 10 MiB、单批 10 个；上传切分参数来自知识库配置，不接受请求级覆盖。PDF 返回原始文件字节（`Content-Type: application/pdf`）；版本化 PDF/Word 的正文读取已保存的 `document.md`。
 
-真实验收：在 `dev` 的隔离环境运行 `tests/test_real_word_fidelity.py`，设置 `RAG_REAL_WORD=1`、上述转换/模型配置，以及指向测试模型服务的 `RAG_MODEL_PROVIDER_URL`、`RAG_TEST_EMBEDDING_MODEL`。涉及 PyTorch 的进程使用 `dl` 或基于 `dl` 的模型环境。测试使用 `.test-tmp/word-real` 下的独立数据，不访问正式知识库。控制台验收使用 `RAG_WORD_PREVIEW_URL` 和 `tests/test_browser_word.py`。
+### 搜索、结果与产物
 
-## Namespace
+```powershell
+curl.exe -X POST http://127.0.0.1:8011/v1/search `
+  -H $headers `
+  -d '{"query":"E03 怎么处理？","retrieval":"hybrid","rerank":"cross_encoder","candidate_k":10,"top_k":5,"filters":{}}'
 
-namespace 是一个独立知识库标识，例如 `default`、`product-manuals` 或 `team-a`。Console 与 MCP 配置必须使用相同值，否则 Agent 检索不到网页上传的文档。
+# 排队/已完成结果（REST 也读取任务状态与快照）
+curl.exe "http://127.0.0.1:8011/v1/search-results/<result_id>?page=1&page_size=10" -H $headers
 
-允许 1～64 个字符，只能包含字母、数字、点、下划线和横线。知识源文件位于：
-
-```text
-~/.mini_agent-rag/<namespace>/knowledge/
-~/.mini_agent-rag/<namespace>/manifest.json
+# artifact（源文件/图片/表格 JSON）
+curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>" -H $headers
+curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>/content" -H $headers
 ```
 
-namespace 不在 Agent 可见的工具 Schema 中；MCP HTTP 客户端必须在每个请求中发送 `X-RAG-Namespace`。同一个 MCP 会话不能切换 namespace，需要切换时应重新初始化会话。
+搜索同步执行（REST 不经队列），结果包含 `retrieval`、`rerank`、`evidence_status`、`results`、`debug`、`snapshot_context`；资产命中带 `asset`（图片 base64 或表格结构）和 `artifacts`。分页/偏移参数越界返回 400。
 
-## 接入 Streamable HTTP MCP Client
+### 上传状态、发布版本与租约
 
-MCP 客户端使用以下连接信息：
+```powershell
+curl.exe "http://127.0.0.1:8011/v1/uploads" -H $headers
+curl.exe "http://127.0.0.1:8011/v1/uploads/<operation_id>" -H $headers
+curl.exe "http://127.0.0.1:8011/v1/admin/published-versions" -H "X-RAG-Namespace: default"
+curl.exe "http://127.0.0.1:8011/v1/admin/upload-leases" -H "X-RAG-Namespace: default"
+```
+
+后两者属于只读展示模型，除租户认证外也要求本机管理边界。
+
+### 工具与提示词管理（本机管理）
+
+```powershell
+curl.exe http://127.0.0.1:8011/v1/admin/tools -H "X-RAG-Namespace: default"
+curl.exe -X PATCH http://127.0.0.1:8011/v1/admin/tools/search `
+  -H "X-RAG-Namespace: default" -H "Content-Type: application/json" -d '{"enabled":false}'
+curl.exe http://127.0.0.1:8011/v1/admin/prompts -H "X-RAG-Namespace: default"
+curl.exe -X PUT http://127.0.0.1:8011/v1/admin/prompts/summary `
+  -H "X-RAG-Namespace: default" -H "Content-Type: application/json" `
+  -d '{"description":"总结资料","arguments":[{"name":"text","description":"正文","required":true}],"messages":[{"role":"user","text":"{{text}}"}]}'
+```
+
+模板只替换 `{{argument}}`，不执行表达式；提示词 `PUT` 校验参数名与消息角色。
+
+## 6. MCP 使用
+
+### 连接
 
 ```json
 {
   "url": "http://127.0.0.1:8011/mcp",
   "headers": {
+    "Authorization": "Bearer <RAG_SERVICE_TOKEN 或 API Key>",
     "X-RAG-Namespace": "default"
   }
 }
 ```
 
-启用 Token 后还需要发送：
+MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理界面可用 `mcp-config` 生成配置。支持的协议：旧版 `2025-11-25`（initialize → initialized → tools/list/call）与新版 `2026-07-28`（每次请求自描述，可不建旧会话）；由官方 Go SDK 按请求分发，客户端不能把新版版本号塞进旧版 initialize。订阅/资源通知只在 API 进程内投递，不跨进程推送、无历史重放。
 
-```text
-Authorization: Bearer <RAG_SERVICE_TOKEN>
-```
-
-客户端可使用 MCP `2025-11-25` 或 `2026-07-28` 的 Streamable HTTP 传输。旧版先初始化，新版可发现服务或直接调用；具体流程见后面的“双版本”章节。取消调用只结束等待，不撤销已提交的搜索任务；任务截止时间仍有效，MQ 可见性续期失败不保证立即取消生产检索或下游调用。其他已进入模型或 Qdrant 的同步计算不因取消调用而强制终止。
-
-MCP 提供 `search`、`get_search_result`、文件管理、`get_document_status` 等工具。若 Host 使用 `rag` 作为 server 名，搜索工具展示名通常是 `mcp_rag_search`。
-
-### MCP 搜索与结果轮询
-
-以下队列语义仅适用于服务端 MCP `search`，REST `/v1/search`、Console 和本地同步调试行为不变。`search` 保留原检索参数，并接受 `wait_seconds`：必须是有限数值（可为小数），范围 0..30，默认 10；字符串、布尔值、NaN、无穷及越界值不是合法等待秒数。
-
-搜索以 schema 2 完整查询请求直接发送到 RocketMQ，由独立搜索消费者执行，Redis 保存短期状态。必须完成 Redis 提交前置检查并获 Broker 发送确认，才可返回成功响应；MQ/Redis 缺失或故障会报错，不会持久接收到 SQL 后后台补发。每次提交生成独立任务 UUID，始终作为 `result_id` 使用。`wait_seconds` 只控制完成等待，不能跳过发送确认。等待内完成返回原完整搜索 payload，加上同一 `result_id` 及快照引用；否则返回对象**只有** ID，没有 `status`、空结果或占位快照：
-
-```json
-{"result_id": "6cec23f3-0452-4289-a1b5-b18c018d0634"}
-```
-
-继续调用**现有**工具 `get_search_result`，不新增第二个查询工具；参数为 `result_id`、可选 `page`（从 1 开始）和 `page_size`（1..100）。未完成时返回：
-
-```json
-{
-  "result_id": "6cec23f3-0452-4289-a1b5-b18c018d0634",
-  "status": "queued",
-  "stage": "processing"
-}
-```
-
-待执行、执行中和等待重试的 `status` 均为 `queued`，以 `stage="queued" | "processing" | "retry_wait"` 区分。成功后返回已保存的完整结果快照（指定分页时仅切片原结果），沿用原有图片渲染，不重新执行检索/模型。执行最终失败、任务截止时间到达或结果快照过期均为明确 MCP 错误（`isError=true`），不是成功的空结果；跨 namespace 或无权限也不能读取。
-
-`wait_seconds=0` 可在 Broker 确认后不等待执行完成便取回 ID；等待结束不等于失败，也不延长默认 120 秒任务总超时（包含排队等待）。没有搜索消费者会一直排队至截止时间，必须单独运行 `rag-search-worker`。完成快照只存 Redis，默认 `RAG_RESULT_TTL_SECONDS=3600`；丢失或到期后引用不可用，无 SQL 回源，可能需重新提交。这与任务截止时间是独立期限，MySQL artifact 保留保证不适用于结果 ID。
-
-### MCP 文件管理
-
-文件管理和状态工具只操作连接时 `X-RAG-Namespace` 指定的知识库，使用普通 Service Token，不需要管理 Token。请仅向可信客户端提供具有写入权限的连接；工具提示不能替代权限控制。管理员可通过工具管理接口分别禁用这些工具。
+### 工具
 
 | 工具 | 参数 | 行为 |
-|---|---|---|
-| `add_document` | `name` 和 `content` 或 `content_base64`；可选 `idempotency_key` | 异步新增，不覆盖同名文档；成功仅返回 `artifact_id`，不代表索引完成 |
-| `get_document_status` | `artifact_id` | 查询该新增任务的 `artifact_id`、`status`、`stage`、`error` |
-| `update_document` | `name` 和 `content` 或 `content_base64` | 仍为同步：完整替换已存在文件并重建索引，保留切分设置；不存在时报错 |
-| `delete_document` | `name` | 仍为同步：删除文件和索引；不存在时报错 |
+| --- | --- | --- |
+| `search` | `query`、`retrieval`、`rerank`、`candidate_k`、`top_k`、`filters`；配置 Kafka 时还有 `wait_seconds` | 检索；排队模式下超时只返回 `result_id` |
+| `get_search_result` | `result_id`、`page`、`page_size` | 读取排队状态或结果分页；不重复检索 |
+| `add_document` | `name` + `content`/`content_base64`，可选 `idempotency_key` | 异步入库，成功只返回 `artifact_id` |
+| `get_document_status` | `artifact_id` | 查询 `status/stage/error`，状态在 MySQL/SQLite |
+| `update_document` | `name` + `content`/`content_base64`，可选 `idempotency_key` | 同步替换并重建索引 |
+| `delete_document` | `name` | 同步逻辑删除 |
 
-`name` 必须是含扩展名的准确文件名，不能传路径。支持 TXT、Markdown（`.md`）、PDF、DOCX、DOC，单文件最大 10 MiB。TXT/Markdown 可使用 UTF-8 文本 `content`；PDF/DOCX/DOC 必须由客户端读取文件后传标准 Base64 到 `content_base64`。两种内容参数只能传一种，不支持服务器路径或 URL。
+工具名与 schema 与 Python 实现一致；`delete_document` 标注为 destructive。是否启用某个工具可经 `/v1/admin/tools` 管理；执行时会实时读取 catalog，禁用后返回错误。
 
-```json
-{"name": "manual.txt", "content": "E03 表示温度传感器故障。", "idempotency_key": "manual-import-20261023-001"}
+### 排队搜索（配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时）
+
+- `search` 增加 `wait_seconds`（0..30，默认 10）。等待内完成返回完整结果；否则只返回 `{"result_id":"<uuid>"}`。
+- `get_search_result`：未完成返回 `{"result_id","status":"queued","stage":"queued|processing|retry_wait"}`；成功返回快照分页；失败/超时/快照过期是 `isError=true`。
+- 必需：`rag-search-worker`、Redis（结果快照）、状态库（任务/发件箱）。任务截止 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120 秒）包含排队时间。
+- 未配置 Kafka 时 MCP `search` 退化为同步执行，schema 不包含 `wait_seconds`；客户端应按实际工具 schema 调用。
+- `RAG_RESULT_TTL_SECONDS`（默认 3600 秒）到期或 Redis 丢失后 result_id 不可用，无 SQL 回放。
+
+### 异步文档
+
+`add_document` 在状态库单事务写入完整任务（含文件字节）与发件箱，提交后返回 `{"artifact_id": "<uuid>"}`，不代表已解析/可检索。`get_document_status` 返回 `status`（`queued/processing/succeeded/failed`）、`stage`、`error`；仅 `succeeded` 表示已持久发布。同名文档已存在或已有排队/执行中的新增会被拒绝；不确定提交结果时用同一 `idempotency_key` 重试，不会重复入队。
+
+投递方式：默认 `RAG_OUTBOX_BRIDGE=relay`，服务进程内发布发件箱；设为 `debezium` 时服务不发布，由外部 Debezium 读取 MySQL binlog 投递（`docker compose --profile debezium up -d`，配置见 [deploy/debezium/README.md](../deploy/debezium/README.md)）。未配置 Kafka 时可用 `RAG_DOCUMENT_WORKER_LOCAL=1` 让文档 worker 直接轮询发件箱。**不要把 Debezium 与 relay 同时启用**（重复投递）。
+
+### 资源、提示词与订阅
+
+- `resources/list` / `resources/templates/list` / `resources/read`：文档 URI 为 `rag://knowledge/<namespace>/<文件名>`，正文按段落分页（每页最多 8000 字符），返回 JSON 含 `uri/text/page/total_pages/version/truncated/next_uri`。
+- `prompts/list` / `prompts/get`：使用 `/v1/admin/prompts` 管理的模板。
+- 旧版 `resources/subscribe`、列表变化通知与新版 `subscriptions/listen` 可用；通知仅表示“发生变化”，客户端需重新列出/读取。
+
+## 7. 迁移与 CLI
+
+### rag-state-migrate
+
+```powershell
+.\dist\bin\rag-state-migrate.exe                 # 只报告 schema 就绪度
+.\dist\bin\rag-state-migrate.exe --apply         # 幂等创建缺失表/增量迁移
+.\dist\bin\rag-state-migrate.exe --data-root D:/praxis-rag/data
 ```
 
-#### 异步新增与状态轮询
+环境同服务（`RAG_STATE_URL`/`RAG_MYSQL_*`/`RAG_SERVICE_DATA_ROOT`）。退出码：`0` schema 就绪，`1` 不完整/失败，`2` 配置错误。
 
-`add_document` 在一个 MySQL 事务里写入 `document_jobs`（完整任务，含文件原字节，单文件仍最多 **10 MiB**）和 `document_job_outbox`（发件箱行），**事务提交成功即返回**。Redis 与 RocketMQ 都不在受理路径上：投递由 relay 或 Debezium 异步完成，投递失败不影响受理。成功工具结果**只有**以下对象，不含 `status`、文档或 URI：
+### rag-service-migrate（旧知识源导入）
 
-```json
-{"artifact_id": "123e4567-e89b-42d3-a456-426614174000"}
+```powershell
+# 默认只读预演
+.\dist\bin\rag-service-migrate.exe --legacy-root "$env:USERPROFILE/.mini_agent"
+# 实际导入（写入状态库：blobs + documents）
+.\dist\bin\rag-service-migrate.exe --apply --legacy-root "$env:USERPROFILE/.mini_agent"
+# 只迁移指定用户（可重复）
+.\dist\bin\rag-service-migrate.exe --apply --user-id <uuid>
 ```
 
-此 UUID 表示任务已持久受理（accepted），不表示已投递、解析、索引或可检索（indexed）。MySQL 不可写或事务提交失败才会报错；提交结果不确定时用同一 `idempotency_key` 重试，会复用原任务。没有消费者时任务保持 `queued`，通知由发件箱继续重试。独立 worker 收到通知后从 MySQL 读回文件字节，再解析、切分、索引与发布。客户端在同一 namespace 调用 `get_document_status`，按需间隔轮询，直到终态：
+**重要差异**：`--apply` 只导入状态（源文件 blob 与文档记录），**不执行向量重建**（Python 版会重跑上传）。迁移后必须通过 HTTP/MCP 重新上传（或等待后续 reindex 支持）才会进入 Qdrant 可检索；`--skip-assets` 与旧版解析资产树尚未实现（TODO）。退出码 `0/1/2` 同上；`WARN` 行最多打印 20 条。
 
-```json
-{"artifact_id": "123e4567-e89b-42d3-a456-426614174000"}
+### rag-mcp-ingest（本地批量导入）与 rag-mcp-debug
+
+`rag-mcp-ingest` 是 Python `ingest.py` 的 Go 移植：递归发现支持的文档，逐个走 `Service.WriteDocument` 上传/索引管线，输出 `OK/SKIP/FAIL` 行，最后打印 `SUMMARY discovered=<n> imported=<n> chunks=<n> failed=<n>`。
+
+```powershell
+# 需要 RAG_BACKEND=qdrant、QDRANT_URL、可用模型 API 和目标 namespace 的知识库配置
+.\dist\bin\rag-mcp-ingest.exe --namespace default .\docs
+.\dist\bin\rag-mcp-ingest.exe --dry-run .\docs            # 只列出将导入的文件
+.\dist\bin\rag-mcp-ingest.exe --verbose --dir .\docs     # 打印配置/进度
 ```
 
-状态结果包含以下字段（`stage` 为当前阶段，示例中的处理阶段文字仅为占位；排队阶段见下文；`error` 为失败信息）：
+- 目录内文档按相对 POSIX 路径命名（与 Python 一致）；单文件按 basename。
+- 同名已存在文档默认覆盖；内容未变时输出 `SKIP ... unchanged content`，不重复 embedding（Python 会无条件重跑）。
+- 退出码：`0` 全部成功；`1` 至少一个文档失败或运行时不可用；`2` 参数/配置错误（缺 `RAG_BACKEND=qdrant`、`QDRANT_PATH`、namespace 或知识库不存在）。
+- PDF/DOCX/DOC 与 HTTP 上传使用同一外部解析器配置；未配置解析器时按上传同规则失败。`--dry-run` 不打开运行时/状态库。
+- 兼容性说明：该命令在本仓库验证环境中未连接真实 Qdrant/模型 API 实跑，上线前先用 `--dry-run` 和一个小目录验证。
 
-```json
-{
-  "artifact_id": "123e4567-e89b-42d3-a456-426614174000",
-  "status": "processing",
-  "stage": "<当前处理阶段>",
-  "error": null
-}
+`rag-mcp-debug`：无 Qdrant/模型的 mock 检索调试：
+
+```powershell
+.\dist\bin\rag-mcp-debug.exe "RRF 怎么融合 BM25 和 Dense？"
+.\dist\bin\rag-mcp-debug.exe --query "E03" --limit 3
 ```
 
-`status` 为 `queued`、`processing`、`succeeded` 或 `failed`；仅 `succeeded` 表示已完成 MySQL 持久发布，此时刷新文档/资源列表再读取正文或检索。`failed` 时查看安全类别的 `stage`、`error`，不要将 UUID 当作索引成功。状态**直接读 MySQL，没有 TTL，不会因 Redis 过期或不可用而失效**；`stage` 示例包括 `receiving`、`parsing`、`chunking`、`embedding`、`staging`、`indexing`、`publishing`、`completed`、`failed` 和 `retry_wait`，具体取决于文件类型与失败点。MySQL 同时是 UploadJournal 业务租约和版本发布权威，Broker 管理消息可见性及消费重试。
+## 8. Docker 与 Compose
 
-通知被消费后任务进入 `processing`；worker 用 SQL 租约 claim（`RAG_DOCUMENT_JOB_LEASE_SECONDS`，默认 300 秒）并按 `RAG_DOCUMENT_JOB_HEARTBEAT_SECONDS`（默认 20 秒）心跳续租，崩溃或租约过期由 sweep 回收并重新通知。同一任务的重复通知不会重复发布：租约只允许一个执行者，终态 first-terminal-wins，重复消息读取 MySQL 终态后再 ACK。瞬时失败不 ACK，由 Broker 重投；没有可用通知时任务保持 `queued` / `retry_wait`，等待发件箱补发。
+```powershell
+# 构建镜像：Node 阶段构建 Console，Go 阶段编译全部 cmd/*，alpine 非 root 运行
+docker build -t praxis-rag:local .
+# 受限网络可覆盖：
+# docker build --build-arg NPM_REGISTRY=https://registry.npmmirror.com `
+#              --build-arg GOPROXY=https://goproxy.cn,direct -t praxis-rag:local .
 
-断线或响应丢失时，提交可能已经成功：用同一 `idempotency_key`、内容与参数重试，会返回原 `artifact_id`，不会重复入队；不要盲目换 key。已知 ID 时优先轮询 `get_document_status`，任务状态在 MySQL，不会因 Redis 数据丢失或 TTL 到期失效。同名文档已发布或已有排队/执行中的新增任务时，`add_document` 会明确拒绝；确需替换已存在文档请使用同步 `update_document`。
+# 直接运行（容器绑定 0.0.0.0，RAG_SERVICE_TOKEN 必填；allowlist 已在镜像配置中提供 loopback 默认值）
+docker run --rm -p 127.0.0.1:8011:8011 `
+  -e RAG_SERVICE_TOKEN="<random-secret>" `
+  -e QDRANT_URL="http://host.docker.internal:6333" `
+  -v praxis-data:/app/data `
+  praxis-rag:local
 
-这里的上传 `artifact_id` 用于 `get_document_status`，不是搜索产物的 artifact ID，不能直接用 `rag://artifacts` 或 `/v1/artifacts` 读取。未到 `succeeded` 的任务及其文件原字节仍保存在 MySQL，不会因 Redis 过期或 MQ 消息丢失而消失；发件箱行按 `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS`（默认 7 天）清理，任务行不在该清理范围内。worker 提交后，API **不会自动推送 MCP 资源变更通知**；客户端必须轮询并主动刷新列表，不能依赖订阅确认入库。
-
-新增使用提交时对应版本的知识库切分配置（新知识库默认递归切分）。同内容不同文件名会分别保存，确保更新始终针对指定文件。同名、同内容、同切分设置的同步更新返回 `unchanged`；同步更新/删除的成功结果仍使用原有 `status`、`document`、`uri` 协议，不受异步新增影响。HTTP 上传也仍为同步请求，完成索引后返回原有上传结果。工具参数错误或调用失败返回 MCP `isError=true`；异步执行失败通过状态查询报告。整个请求另有大小上限，超过后返回 HTTP 413；既有文档解析安全上限仍然适用。删除无法通过 MCP 撤销，更新前需要保留旧版本时应先读取或备份。
-
-搜索工具输入：
-
-```json
-{
-  "query": "星河 X7 出现 E03 应该怎么处理？",
-  "retrieval": "hybrid",
-  "rerank": "cross_encoder",
-  "candidate_k": 10,
-  "top_k": 5,
-  "filters": {}
-}
+# Compose 的 app profile（会构建镜像；默认 compose 仍只启动基础设施）
+docker compose --profile app up -d --build
 ```
 
-允许的 filter 只有 `document_id`、`source` 和 `title`，不接受原始 Qdrant Filter。
+镜像内容与约定：
 
-## Token 与远程部署
+- `/app/bin/` 包含全部命令（含三个 worker）；`ENTRYPOINT` 为 `/app/bin/rag-service`。
+- `/app/web` 为 Console，`RAG_WEB_ROOT=/app/web`；`/app/config.toml` 为非敏感默认配置（`RAG_SERVICE_HOST=0.0.0.0`、端口 8011、`/app/data`、Qdrant 服务名、loopback MCP 白名单）。
+- 非 root 用户 `rag`，`/app/data` 为数据卷；健康检查调用 `/health`。
+- 镜像**不含** Python、Docling、LibreOffice 或视觉模型：PDF/DOC/Word 视觉解析需要把外部环境挂载到容器并设置 `RAG_PDF_PARSER_PYTHON`、`RAG_PDF_MODELS_PATH`、`RAG_WORD_CONVERTER_PATH` 等变量；否则相应上传会明确失败。
+- Compose `app` 服务只运行 `rag-service`；worker 没有内置 compose 服务，可用一次性容器（把入口覆盖为 worker 二进制、连接到同一网络并复用同一环境）或参考 [DEPLOYMENT](DEPLOYMENT.md) 的 systemd/override 示例。
+- **已验证/未验证**：本机 Docker 已实机拉起 Kafka + Debezium 基础设施，并用 host 模式 Go 服务/worker 跑通 debezium/relay 两种异步链路、排队搜索与 DLQ（见 §10；脚本 `scripts/verify-debezium-e2e.py`、`scripts/verify-kafka-search.py`、`scripts/verify-kafka-dlq.py`）；镜像构建、compose `app` profile 与 worker 容器仍未经实机验证。
 
-默认只监听 loopback。绑定非 loopback 地址时必须设置 Token，以及 MCP Host、Origin 白名单：
+## 9. Token 与远程部署
+
+默认只监听 loopback。绑定非 loopback 地址时必须设置 Token 与 MCP 白名单：
 
 ```powershell
 $env:RAG_SERVICE_HOST = "0.0.0.0"
 $env:RAG_SERVICE_TOKEN = "replace-with-a-random-secret"
 $env:RAG_MCP_ALLOWED_HOSTS = "rag.example.com"
 $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
-rag-service
+.\dist\bin\rag-service.exe
 ```
 
-线上 MCP 客户端连接：
+线上 MCP 客户端需同时发送 `Authorization: Bearer <RAG_SERVICE_TOKEN>` 与 `X-RAG-Namespace`。生产环境应在服务前配置 HTTPS、访问控制和请求大小限制；`/v1/admin/*` 仍只允许本机直连，远程管理需自行通过受控跳板或关闭管理入口。Console 的 Token 只保存在浏览器 `sessionStorage`。
 
-```json
-{
-  "url": "https://rag.example.com/mcp",
-  "headers": {
-    "X-RAG-Namespace": "product-manuals",
-    "Authorization": "Bearer <RAG_SERVICE_TOKEN>"
-  }
-}
-```
+## 10. 验证范围与未验证项
 
-Console 的 Token 只保存到浏览器 `sessionStorage`。生产环境还应在 RAG Service 前配置 HTTPS、访问控制和请求大小限制。
+已在仓库内验证：
 
-## 开发与验证
+- `go build ./...` 全部通过；`go test -count=1 ./...` 全部通过（包数与用例数随代码演进：迁移闭环时为 24 个有测试的包，含 state/runtime/workers/httpapi/mcp/searchrefs/检索栈等）。
+- `scripts/build-go.ps1` 本机构建 + 冒烟：`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200。POSIX 的 `scripts/build-go.sh`/`make` 未在当前 Windows 验证环境执行。
+- 三个 worker 二进制 `--help`、无 Kafka、错误 backend、非法 `--kind` 的退出码行为；文档 worker 本地模式可启动并创建 SQLite 状态。
+- Go 端 REST/MCP/检索/文档/资产投影/`document.md` 预览/上传事务的单元与集成测试（真实 SQLite + fake Qdrant/model）。
+
+**未验证**（不要据此宣称生产就绪）：
+
+- Docker 镜像构建、Compose `app` profile、systemd 单元未实际执行（本环境无 Docker/systemd）。
+- 已实机验证 Kafka 3.9.0 + Debezium Server 3.7.1 + MySQL 8.0 + Redis + Qdrant：CDC 投递（Kafka healthy、`Starting streaming`、topic 记录与 outbox 一致），以及 Go 服务/worker 的完整异步链路（debezium 与 relay 两种模式）、显式 DLQ topic、排队 MCP 搜索与 Redis 快照。仍未验证 SASL/TLS 外部 Kafka、MySQL 多实例锁与 systemd 部署。
+- Docling/LibreOffice/视觉模型链路未在 Go 环境实机验证；PDF/DOC/Word 视觉解析依赖外部 Python 环境。
+- 没有浏览器 E2E：Console 只验证构建与静态冒烟，交互/字段联动由人工核对与前端源码检查。
+- Tokenizer 是确定性近似，不保证与 Python/BGE-M3 的 token 计数一致（句子/段落/结构边界一致）。
+- 异步 e2e（API 受理 → fake Kafka transport → worker → 发布）已由 `internal/e2e` 覆盖；真实 Kafka/MySQL/Redis/Qdrant 上由 Go worker 完成整条链路的黑盒回归已执行并通过：`scripts/verify-debezium-e2e.py`（debezium/relay）、`scripts/verify-kafka-search.py`（排队搜索）、`scripts/verify-kafka-dlq.py`（DLQ）。
+
+## 11. 开发与测试
 
 ```powershell
-uv run --no-sync python -m pytest tests -q
-uv run --no-sync python -m ruff check src tests
-uv run --package praxis-rag rag-mcp-debug "RRF 怎么融合 BM25 和 Dense？"
-uv run --package praxis-rag rag-mcp-debug --schema
+gofmt -l internal cmd
+go vet ./...
+go test -count=1 ./...
+go build ./...
+
+# 只跑某一部分
+go test -count=1 ./internal/runtime/...
+go test -count=1 ./internal/httpapi/... ./internal/mcp/...
 ```
 
-协议测试会启动真实本机 HTTP 服务，使用官方客户端和真实文件存储，但以可控检索器和 PDF 解析结果替代模型，不下载模型或连接 Qdrant。这不等于真实模型效果验证。
-
-本地 GPU 的 PDF 完整链路验收使用 `tests/test_real_pdf_fidelity.py`。先激活 `dl`，指定已安装依赖的解析器 Python、本地模型目录和样本目录，再执行：
+外部解析器 worker（可选，Python 仅用于 PDF/Word 视觉解析）：
 
 ```powershell
-conda activate dl
-$env:PYTHONPATH = "$PWD/src"
-$env:HF_HUB_OFFLINE = "1"
-$env:TRANSFORMERS_OFFLINE = "1"
-$env:RAG_REAL_PDF = "1"
-$env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
-$env:RAG_PDF_PARSER_PYTHON = "C:/path/to/pdf-parser/python.exe"
-$env:RAG_PDF_MODELS_PATH = "C:/path/to/docling/models"
-$env:RAG_PDF_SAMPLES = "C:/path/to/pdf/samples"
-$env:RAG_PDF_SAMPLE_FILES = "aviation.pdf,doclaynet.pdf,mineru_demo2.pdf,scan.pdf"
-& $env:RAG_PDF_PARSER_PYTHON -m pytest tests/test_real_pdf_fidelity.py -q -s
+# 安装 Docling 等依赖（只影响 pdf_worker，不影响 Go 服务）
+python -m pip install -r python-workers/requirements.txt
+$env:PYTHONPATH = (Resolve-Path .\python-workers).Path
+python -m rag_mcp.pdf_worker --help
 ```
 
-此测试在独立临时目录启动 HTTP 服务和本地 Qdrant，调用真实 Docling、CodeFormulaV2、OCR、BGE-M3；检查上传、重复检测、检索和 MCP 全文读取。耗时、显存分配峰值、公式与图表数量、检索结果写入 `.test-tmp/pdf-fidelity-real/<run>/report.json`。这些检查证明链路保留情况，不等于公式语义或版面识别准确率；仍须对照原页和原生结果检查。
+Go 服务会在 ingest 阶段以子进程方式调用 `rag_mcp.pdf_worker` / `rag_mcp.word_vision_worker`，其余后端能力全部在 Go 二进制内；详见 [python-workers/README.md](../python-workers/README.md)。
 
-实测结果及未解决样例见 [PDF 修复验证记录](../benchmarks/PDF_VALIDATION.md)。
+## 12. 当前限制
 
-### Conda 开发环境
+- **Qdrant**：仅支持 HTTP 模式；`QDRANT_PATH` 会在启动时被拒绝。
+- **Tokenizer**：见 §10；token 预算切分位置可能与 Python 不同。
+- **外部解析器**：PDF（Docling）、DOC（LibreOffice）、Word 视觉描述都不是 Go 内置能力；未配置时相应功能报错。Go 暂未接入 Word 视觉 worker，无图注图片没有生成描述。
+- **异步投递**：支持 relay（默认，进程内发件箱发布到 Kafka）、debezium（Debezium Server 读 MySQL binlog，经原生 Kafka sink 写 topic，应用不发布）与本地 worker 模式；Debezium 模式需要 MySQL 状态库。
+- **排队搜索**：`RAG_KAFKA_BOOTSTRAP_SERVERS` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 Kafka。
+- **REST 上传/更新/删除**仍同步执行，大文件索引期间请求会等待；异步只用于 MCP `add_document`。
+- **管理边界**：`/v1/admin/*` 仅本机直连；没有账户体系或细粒度多用户权限；工作区不是权限隔离。
+- **数据**：旧 SQLite 状态用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。
+- 具体契约差异（cached read views、静态目录列表等剩余的 P1/P2）见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。
 
-其他项目可能仍依赖 MCP 1.x。为避免改动共享环境，在激活 `dev` 后给本项目创建独立虚拟环境：
 
-```powershell
-conda activate dev
-python -m venv --system-site-packages .venv
-.venv\Scripts\python -m pip install -e ".[api]"
-.venv\Scripts\python -m pytest tests -q
-.venv\Scripts\python -m rag_mcp.http_service
-```
 
-HTTP 模型检索需要在控制台设置可用的模型 API，并准备 Qdrant；上述协议测试不调用模型。独立命令行的本地模型流程未改动，仍需要 `.[dense]`。
 
-## MCP 双版本
 
-依赖固定为 `mcp==2.1.1`，同一个 `/mcp` 支持以下两种流程，客户端不能把新版版本号放进旧版 `initialize` 来切换流程：
-
-```text
-2025-11-25: initialize → notifications/initialized → tools/list / tools/call
-2026-07-28: server/discover（可选）→ tools/list / tools/call → subscriptions/listen（按需）
-```
-
-新版每次请求携带自己的协议信息，不要求先建立旧版会话。协议头和请求格式应由 SDK 处理。Python SDK `Client` 的 `mode="legacy"` 使用旧版，默认 `mode="auto"` 发现新版，`mode="2026-07-28"` 跳过发现直接使用新版。
-
-请求均携带 `X-RAG-Namespace` 和配置要求的 Service Token。旧会话不能跨 namespace 使用；订阅固定建立时的 namespace。工具调用取消只停止等待和发送结果，不强停后台模型线程。
-
-HTTP MCP 注册搜索、文件管理及 `get_document_status` 等工具；本地搜索调试入口仍只提供搜索。新增工具要在项目中登记定义、参数校验和执行函数；配置接口不能上传代码，也不能注册外部 HTTP 转发。
-
-## 工具与提示词管理
-
-管理接口仅允许本机直接访问，不使用管理员凭证。MCP 管理接口仍需 `X-RAG-Namespace` 指定知识库。普通 MCP/REST 请求继续使用访问 API Key。
-
-| 接口 | 行为 |
-|---|---|
-| `GET /v1/admin/tools` | 返回本 namespace 的已注册工具和启用状态 |
-| `PATCH /v1/admin/tools/{name}` | 仅支持 `enabled`、`description`；未知工具返回 404 |
-| `GET /v1/admin/prompts` | 返回提示词模板及正文 |
-| `PUT /v1/admin/prompts/{name}` | 新建或完整替换模板 |
-| `DELETE /v1/admin/prompts/{name}` | 删除模板，不存在返回 404 |
-
-工具修改示例：`{"enabled": false}`。提示词 PUT 请求示例：
-
-```json
-{
-  "description": "总结已读取的资料",
-  "arguments": [{"name": "text", "description": "资料正文", "required": true}],
-  "messages": [{"role": "user", "text": "请总结以下资料：\n{{text}}"}]
-}
-```
-
-模板仅替换 `{{argument}}`；参数必须是字符串，消息角色仅为 `user` 或 `assistant`，不执行表达式或代码。可选参数未提供时替换为空字符串。MCP 客户端通过 `prompts/list`、`prompts/get` 使用这些模板。
-
-配置保存在共享状态数据库的 `mcp_catalogs` 表，重启恢复，管理配置不会加载检索模型。管理 Token 仍可管理所有 namespace，不提供用户级权限隔离。配置修改请走管理接口，不手工编辑数据库记录。
-
-## 文档资源与订阅
-
-- `resources/list` 返回当前知识库已导入文档，列表每页最多 50 项，按 `nextCursor` 继续；`resources/templates/list` 返回分页地址规则。
-- 文档地址为 `rag://knowledge/<namespace>/<编码后的文件名>`，`resources/read` 默认读取第一页，不返回本地路径。
-- 正文按段落分页，通常每页最多 8000 字符；长公式独占一页且不截断，可以超过此值。单个公式已在入库时受模型输入上限约束。这不是 PDF 原始页码，也不是自动识别的章节。
-- 返回标准文本资源，其中 `text` 是 JSON：`uri`、`text`、`page`、`total_pages`、`version`、`has_more`、`truncated` 和 `next_uri`。`truncated=true` 表示当前页未包含剩余正文，可继续读取 `next_uri`。
-- 下一页地址携带文档版本。文档替换后旧的下一页地址会报错，客户端应从文档 URI 重读。解析安全上限与上传规则不变，超限或解析失败明确报错，不静默截断整份文档。
-- 指定资源更新订阅使用稳定的文档 URI，不使用分页 URI；删除后通知订阅者，后续读取返回不存在。
-
-新版 `subscriptions/listen` 可选择工具列表、提示词列表、资源列表及指定文档更新。旧版仍使用列表变化通知与 `resources/subscribe`、`resources/unsubscribe`。通知只表示“发生变化”，客户端需要重新列出或读取内容。
-
-启停工具或修改描述、增删改提示词，以及 API 进程内完成的同步上传/替换/删除，会在对应操作成功后通知。失败项和没有变化的重复操作不通知；同名相同内容同步上传跳过重复索引。通知不会跨 namespace。MCP `add_document` 返回 UUID 时尚未发布文档；独立 worker 的提交不会自动触发 API 的 MCP 资源推送，客户端须轮询 `get_document_status` 并刷新列表。
-
-订阅通知仍仅在 API 进程内投递，不提供跨进程通知、历史事件重放或断线补发；这不限制独立文档 worker 进程的横向扩容。订阅断线后客户端重新订阅并读取最新状态。服务退出时释放会话与订阅，不部署 OAuth、账户系统或云服务。
-
-## 当前限制
-
-- 文档解析支持 Markdown/TXT、电子版和扫描版 PDF、DOCX，以及安装 LibreOffice 后的 DOC；Excel、网页抓取和独立图片上传尚未实现。
-- PDF 使用本机 Docling、OCR 和公式模型；不能保证任意扫描件、旋转表格或复杂公式都准确。公式处理针对 Docling 检出的公式块，不保证所有行内数学符号转换为 LaTeX。明确的解析错误会失败，但不能自动识别所有内容错误。
-- HTTP `embedding` 使用配置的兼容模型 API，向量长度由实际响应检测。
-- `hybrid` 使用 Qdrant Dense + Sparse 预取和 RRF 融合。
-- 重排仅支持 `none`（不重排）与 `cross_encoder`（调用配置的 Reranker API）。
-- Console 会同时展示 Cross Encoder 最终分数和重排前的 `retrieval_score`；请求失败时会清空旧结果并保留错误面板。
-- 推理服务离线、认证失败或返回格式不兼容时明确报错；可选择“不重排”验证不依赖 Reranker 的召回流程。
-- HTTP/Console 上传及 MCP 更新、删除仍为同步请求，大文件索引期间网页会等待；MCP `add_document` 和服务端 MCP `search` 使用各自独立 worker 与状态/结果轮询，REST 搜索及本地同步调试不变。
-- Console 用于本地开发调试，不提供账户系统或细粒度多用户权限。
-
-历史阶段和变更记录见 [PROGRESS.md](../PROGRESS.md)。
-
-## 第一批 Redis 缓存
-
-Compose 包含 Redis 和 RocketMQ。安装可选队列 SDK：`pip install -e ".[cache]"`，使用启动脚本会创建缓存刷新、文档入库和搜索的三组正常 topic/group，以及可读正常 Broker DLQ topic 和独立处理组，并加载本地环境变量（不启动任何消费者）。直接启动 rag-service 时自行设置 RAG_REDIS_URL 和 RAG_ROCKETMQ_ENDPOINT。持久数据展示缓存未配置 Redis 时仍可读 MySQL；排队搜索必须有 Redis/MQ，不能用此回源降级；文档异步新增只需要 MySQL，Redis 与 MQ 不在其受理路径上（默认 relay 模式需要 MQ 完成投递，但不影响受理与状态查询）。命中展示缓存不查 MySQL；执行鉴权、上传事务租约和版本发布校验不使用缓存。详见 [状态缓存与可靠刷新](state-cache.md)。
-
-## 第二批状态缓存（严格模式）
-
-API Key 管理列表、发布版本展示、租约执行者展示和事务/步骤/回滚进度已接入 Redis。新增 `/v1/uploads`、`/v1/uploads/{operation_id}` 查询当前 namespace 的状态；本机管理员可查询 `/v1/admin/published-versions` 和 `/v1/admin/upload-leases`。缓存快照只用于查询展示；实际鉴权、版本选择、租约认领、提交和回滚仍查 MySQL。无需新增环境变量，沿用第一批 outbox、修订号和 RocketMQ 重试。详见 [第二批状态接口及安全边界](state-cache.md#第二批状态查询接口)。
-
-## 按 UUID 复用搜索与产物
-
-搜索完成响应保留原 results，并新增 result_id、expires_at 和 artifacts；MCP `search` 获 Broker 确认但未等到完成时仅返回 result_id，通过现有 `get_search_result` 轮询。MCP get_search_result 或 GET /v1/search-results/{result_id} 只读取 Redis 完成快照，默认 TTL 3600 秒；Redis 丢失/到期即不可用，无 SQL 回源，可能需重新提交。REST 结果接口不提供 MCP 排队状态。rag://artifacts 或 /v1/artifacts/{artifact_id} 读取 MySQL 中版本固定的源文件、图片、JSON、Markdown 等，不重跑模型或检索。文档 del_flag 软删除不撤销已签发 artifact 的到期前保留保证；该保证不适用于 Redis 搜索结果。鉴权仍检查当前 Key 权限。详见 [UUID 结果与产物引用](result-references.md)。

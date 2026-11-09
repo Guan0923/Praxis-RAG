@@ -1,0 +1,392 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strings"
+	"time"
+
+	"github.com/Guan0923/xinghe_rag/internal/catalog"
+	"github.com/Guan0923/xinghe_rag/internal/chunking"
+	"github.com/Guan0923/xinghe_rag/internal/config"
+)
+
+// StatusProvider renders the secret-free service health payload.
+type StatusProvider interface {
+	Status(ctx context.Context) map[string]any
+}
+
+// Option customizes the HTTP server.
+type Option func(*Server)
+
+// WithCatalogStore enables the MCP catalog administration endpoints.
+func WithCatalogStore(store catalog.Store) Option {
+	return func(s *Server) { s.catalog = store }
+}
+
+// ChangeNotifier receives catalog mutations so the MCP layer can publish
+// tools/list_changed and prompts/list_changed notifications, plus document
+// mutations for resources/list_changed and resources/updated.
+type ChangeNotifier interface {
+	PromptsChanged(namespace string)
+	ToolsChanged(namespace string)
+}
+
+// DocumentChangeNotifier receives document mutations so the MCP layer can
+// publish resources/list_changed and resources/updated notifications.
+type DocumentChangeNotifier interface {
+	DocumentsChanged(namespace string, before, after []map[string]any)
+}
+
+// WithDocumentNotifier wires document-change notifications.
+func WithDocumentNotifier(notifier DocumentChangeNotifier) Option {
+	return func(s *Server) { s.docNotifier = notifier }
+}
+
+// WithChangeNotifier wires MCP change notifications.
+func WithChangeNotifier(notifier ChangeNotifier) Option {
+	return func(s *Server) { s.notifier = notifier }
+}
+
+// Server hosts the REST API, MCP endpoint, and Console static assets.
+type Server struct {
+	settings    config.ServiceSettings
+	status      StatusProvider
+	keys        KeyLookup
+	keyStore    APIKeyStore
+	runtime     Runtime
+	mcpHandler  http.Handler
+	logger      *slog.Logger
+	router      *router
+	webRoot     string
+	catalog     catalog.Store
+	tools       ToolRegistry
+	kbAdmin     KnowledgeBaseAdminRuntime
+	notifier    ChangeNotifier
+	docNotifier DocumentChangeNotifier
+	handler     http.Handler
+}
+
+// New builds the HTTP server. A nil StatusProvider falls back to a static
+// healthy payload; a nil KeyLookup disables API-key authentication.
+func New(settings config.ServiceSettings, status StatusProvider, keys KeyLookup, logger *slog.Logger, options ...Option) *Server {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if status == nil {
+		status = staticStatus{}
+	}
+	server := &Server{
+		settings: settings,
+		status:   status,
+		keys:     keys,
+		logger:   logger,
+		router:   newRouter(),
+		webRoot:  resolveWebRoot(settings.WebRoot),
+	}
+	for _, option := range options {
+		option(server)
+	}
+	server.registerRoutes()
+	server.handler = server.buildHandler()
+	return server
+}
+
+// WebRoot reports the resolved Console asset directory ("" when unavailable).
+func (s *Server) WebRoot() string { return s.webRoot }
+
+// Handler returns the composed HTTP handler.
+func (s *Server) Handler() http.Handler { return s.handler }
+
+func (s *Server) registerRoutes() {
+	s.router.add("GET", "/health", authNone, s.handleHealth)
+	s.router.add("GET", "/v1/chunking/strategies", authTenant, s.handleChunkingStrategies)
+	s.router.add("GET", "/v1/admin/knowledge-bases/defaults", authAdmin, s.handleKnowledgeBaseDefaults)
+	s.router.add("GET", "/v1/admin/prompts", authAdmin, s.handleListPrompts)
+	s.router.add("PUT", "/v1/admin/prompts/{name}", authAdmin, s.handlePutPrompt)
+	s.router.add("DELETE", "/v1/admin/prompts/{name}", authAdmin, s.handleDeletePrompt)
+	s.router.add("GET", "/v1/admin/tools", authAdmin, s.handleListTools)
+	s.router.add("PATCH", "/v1/admin/tools/{name}", authAdmin, s.handlePatchTool)
+	s.router.add("GET", "/v1/admin/api-keys", authAdmin, s.handleListAPIKeys)
+	s.router.add("POST", "/v1/admin/api-keys", authAdmin, s.handleCreateAPIKey)
+	s.router.add("PUT", "/v1/admin/api-keys/{key_id}", authAdmin, s.handleUpdateAPIKey)
+	s.router.add("DELETE", "/v1/admin/api-keys/{key_id}", authAdmin, s.handleDeleteAPIKey)
+	s.router.add("GET", "/v1/admin/api-keys/{key_id}/mcp-config", authAdmin, s.handleAPIKeyMCPConfig)
+	s.router.add("POST", "/v1/search", authTenant, s.handleSearch)
+	s.router.add("GET", "/v1/search-results/{result_id}", authTenant, s.handleGetSearchResult)
+	s.router.add("GET", "/v1/artifacts/{artifact_id}", authTenant, s.handleDownloadArtifact)
+	s.router.add("GET", "/v1/artifacts/{artifact_id}/content", authTenant, s.handleGetArtifactContent)
+	s.router.add("GET", "/v1/documents", authTenant, s.handleListDocuments)
+	s.router.add("POST", "/v1/documents", authTenant, s.handleUploadDocuments)
+	s.router.add("POST", "/v1/documents/check", authTenant, s.handleCheckDocuments)
+	s.router.add("GET", "/v1/documents/{name}/content", authTenant, s.handleDocumentContent)
+	s.router.add("DELETE", "/v1/documents/{name}", authTenant, s.handleDeleteDocument)
+	s.router.add("GET", "/v1/knowledge-base", authTenant, s.handleKnowledgeBase)
+	s.router.add("GET", "/v1/uploads", authTenant, s.handleUploadStatusList)
+	s.router.add("GET", "/v1/uploads/{operation_id}", authTenant, s.handleUploadStatusDetail)
+	s.router.add("GET", "/v1/admin/published-versions", authNone, s.handlePublishedVersions)
+	s.router.add("GET", "/v1/admin/upload-leases", authNone, s.handleUploadLeases)
+	s.registerDocumentationRoutes()
+	s.registerKnowledgeBaseAdminRoutes()
+	s.router.add("POST", "/mcp", authMCP, s.handleMCP)
+	s.router.add("GET", "/mcp", authMCP, s.handleMCP)
+	s.router.add("DELETE", "/mcp", authMCP, s.handleMCP)
+
+	if s.webRoot != "" {
+		s.router.add("GET", "/", authNone, s.handleConsoleIndex)
+		s.router.add("GET", "/console", authNone, s.handleConsoleIndex)
+		s.router.add("GET", "/console/assets/*", authNone, s.handleConsoleAsset)
+	}
+}
+
+func (s *Server) buildHandler() http.Handler {
+	return http.HandlerFunc(s.serveHTTP)
+}
+
+func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	started := time.Now()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("http handler panicked",
+				"error", fmt.Sprint(recovered),
+				"method", r.Method,
+				"path", r.URL.Path,
+				"stack", string(debug.Stack()),
+			)
+			if !recorder.wroteHeader {
+				writeDetail(recorder, http.StatusInternalServerError, "Internal Server Error")
+			}
+		}
+		s.logRequest(r, recorder, started)
+	}()
+
+	if isSnapshotPath(r.URL.Path) {
+		recorder.Header().Set("Cache-Control", "no-store")
+	}
+
+	// Python's StaticFiles never serves directory listings: reject directory
+	// paths (including the assets root) instead of letting http.FileServer render
+	// HTML listings or fall back to webRoot/index.html.
+	if s.webRoot != "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		strings.HasPrefix(r.URL.Path, "/console/assets") && !consoleAssetFile(s.webRoot, r.URL.Path) {
+		writeDetail(recorder, http.StatusNotFound, "Not Found")
+		return
+	}
+
+	result, pathMatched, allowed := s.router.match(r.Method, r.URL.Path)
+	if result.route == nil {
+		if !pathMatched {
+			writeDetail(recorder, http.StatusNotFound, "Not Found")
+			return
+		}
+		recorder.Header().Set("Allow", strings.Join(allowed, ", "))
+		writeDetail(recorder, http.StatusMethodNotAllowed, "Method Not Allowed")
+		return
+	}
+
+	switch result.route.policy {
+	case authTenant:
+		namespace, ok := s.tenantFromHeaders(recorder, r)
+		if !ok {
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, namespace))
+	case authAdmin:
+		if !s.requireLocalAdmin(recorder, r) {
+			return
+		}
+	case authMCP:
+		// MCP requires credentials even on loopback; the protocol endpoint
+		// answers 401 with a Bearer challenge instead of the local-admin
+		// fallback used by the REST tenant routes.
+		if r.Header.Get("Authorization") == "" {
+			recorder.Header().Set("WWW-Authenticate", "Bearer")
+			writeDetail(recorder, http.StatusUnauthorized, "MCP 请求必须提供 Authorization: Bearer <API_KEY>")
+			return
+		}
+		namespace, ok := s.tenantFromHeaders(recorder, r)
+		if !ok {
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, namespace))
+	}
+	if len(result.params) > 0 {
+		r = r.WithContext(context.WithValue(r.Context(), pathParamsContext{}, result.params))
+	}
+
+	result.route.handler(recorder, r)
+}
+
+func (s *Server) logRequest(r *http.Request, recorder *statusRecorder, started time.Time) {
+	s.logger.Info("http request",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"status", recorder.status,
+		"duration_ms", float64(time.Since(started).Microseconds())/1000.0,
+	)
+}
+
+// namespaceContextKey carries the authenticated tenant namespace.
+type namespaceContextKey struct{}
+
+// tenantNamespace returns the namespace authenticated by the route policy.
+func (s *Server) tenantNamespace(w http.ResponseWriter, r *http.Request) (string, bool) {
+	namespace, ok := NamespaceFromContext(r.Context())
+	if !ok {
+		writeDetail(w, http.StatusUnauthorized, "RAG service authentication failed.")
+		return "", false
+	}
+	return namespace, true
+}
+
+// pathParamsContext carries router path parameters to handlers.
+type pathParamsContext struct{}
+
+// NamespaceFromContext returns the authenticated tenant namespace.
+func NamespaceFromContext(ctx context.Context) (string, bool) {
+	value, ok := ctx.Value(namespaceContextKey{}).(string)
+	return value, ok
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	payload := s.status.Status(r.Context())
+	if payload == nil {
+		payload = map[string]any{"status": "ok"}
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *Server) handleChunkingStrategies(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, chunking.StrategyCatalog())
+}
+
+func (s *Server) handleKnowledgeBaseDefaults(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, chunking.StrategyCatalog())
+}
+
+type staticStatus struct{}
+
+func (staticStatus) Status(context.Context) map[string]any {
+	return map[string]any{"status": "ok"}
+}
+
+// isSnapshotPath reports paths that must never be cached, mirroring
+// _SnapshotNoStoreMiddleware.
+func isSnapshotPath(path string) bool {
+	if path == "/mcp" || path == "/v1/search" {
+		return true
+	}
+	return strings.HasPrefix(path, "/v1/search-results/") || strings.HasPrefix(path, "/v1/artifacts/")
+}
+
+// consoleAssetFile reports whether the request maps to a regular file under the
+// Console web root (not a directory, not outside the root).
+func consoleAssetFile(webRoot, requestPath string) bool {
+	relative := strings.TrimPrefix(requestPath, "/console/assets")
+	relative = strings.TrimPrefix(relative, "/")
+	if relative == "" || strings.Contains(relative, "..") {
+		return false
+	}
+	root, err := filepath.Abs(webRoot)
+	if err != nil {
+		return false
+	}
+	target, err := filepath.Abs(filepath.Join(root, filepath.FromSlash(relative)))
+	if err != nil || target != root && !strings.HasPrefix(target, root+string(os.PathSeparator)) {
+		return false
+	}
+	info, err := os.Stat(target)
+	return err == nil && !info.IsDir()
+}
+
+// resolveWebRoot locates the built Console. An explicit setting wins; otherwise
+// the repository layout and the executable directory are probed.
+func resolveWebRoot(configured string) string {
+	if configured != "" {
+		root := config.ExpandPath(configured)
+		if info, err := os.Stat(root); err == nil && info.IsDir() {
+			return root
+		}
+		return ""
+	}
+	candidates := []string{
+		filepath.Join("build", "web"),
+		"web",
+	}
+	if executable, err := os.Executable(); err == nil {
+		executableDir := filepath.Dir(executable)
+		candidates = append(candidates,
+			filepath.Join(executableDir, "web"),
+			filepath.Join(executableDir, "..", "web"),
+			filepath.Join(executableDir, "..", "build", "web"),
+		)
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(filepath.Join(candidate, "index.html")); err == nil && !info.IsDir() {
+			absolute, absErr := filepath.Abs(candidate)
+			if absErr == nil {
+				return absolute
+			}
+			return candidate
+		}
+	}
+	return ""
+}
+
+// statusRecorder captures the response status for request logging.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	if !r.wroteHeader {
+		r.status = status
+		r.wroteHeader = true
+	}
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(data []byte) (int, error) {
+	if !r.wroteHeader {
+		r.wroteHeader = true
+	}
+	return r.ResponseWriter.Write(data)
+}
+
+// Flush forwards streaming flushes when the underlying writer supports them.
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// writeJSON writes an application/json response the way Starlette's
+// JSONResponse does (UTF-8 preserved, no trailing newline).
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	buffer := &bytes.Buffer{}
+	encoder := json.NewEncoder(buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(payload); err != nil {
+		writeDetail(w, http.StatusInternalServerError, "Internal Server Error")
+		return
+	}
+	body := bytes.TrimRight(buffer.Bytes(), "\n")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+// writeDetail writes FastAPI's {"detail": ...} error envelope.
+func writeDetail(w http.ResponseWriter, status int, detail string) {
+	writeJSON(w, status, map[string]string{"detail": detail})
+}

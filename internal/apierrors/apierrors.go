@@ -1,0 +1,42 @@
+// Package apierrors defines the error categories shared by the service layers.
+// They mirror the Python exceptions that the HTTP layer maps to status codes:
+// KnowledgeValidationError -> 400/404/409, KnowledgeError -> 503,
+// SnapshotUnavailable -> 410 and UploadConflict -> 409.
+package apierrors
+
+// KnowledgeError marks a safe service failure rendered as HTTP 503.
+type KnowledgeError struct{ Message string }
+
+// Error implements error.
+func (e *KnowledgeError) Error() string { return e.Message }
+
+// KnowledgeValidationError marks a user-input failure rendered as HTTP 400.
+type KnowledgeValidationError struct{ Message string }
+
+// Error implements error.
+func (e *KnowledgeValidationError) Error() string { return e.Message }
+
+// SnapshotUnavailable marks an expired or missing stored result snapshot
+// (HTTP 410, never retried from SQL).
+type SnapshotUnavailable struct{ Message string }
+
+// Error implements error.
+func (e *SnapshotUnavailable) Error() string { return e.Message }
+
+// UploadConflict marks a colliding document name, queued upload or reused
+// idempotency key (HTTP 409).
+type UploadConflict struct{ Message string }
+
+// Error implements error.
+func (e *UploadConflict) Error() string { return e.Message }
+
+// SnapshotUnavailableError builds a *SnapshotUnavailable.
+func SnapshotUnavailableError(message string) *SnapshotUnavailable {
+	return &SnapshotUnavailable{Message: message}
+}
+
+// IsSnapshotUnavailable reports whether err is a *SnapshotUnavailable.
+func IsSnapshotUnavailable(err error) bool {
+	_, ok := err.(*SnapshotUnavailable)
+	return ok
+}
