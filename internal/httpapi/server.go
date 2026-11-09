@@ -136,6 +136,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/documents", authTenant, s.handleListDocuments)
 	s.router.add("POST", "/v1/documents", authTenant, s.handleUploadDocuments)
 	s.router.add("POST", "/v1/documents/check", authTenant, s.handleCheckDocuments)
+	s.router.add("GET", "/v1/document-jobs/{artifact_id}", authTenant, s.handleDocumentJobStatus)
 	s.router.add("GET", "/v1/documents/{name}/content", authTenant, s.handleDocumentContent)
 	s.router.add("DELETE", "/v1/documents/{name}", authTenant, s.handleDeleteDocument)
 	s.router.add("GET", "/v1/knowledge-base", authTenant, s.handleKnowledgeBase)

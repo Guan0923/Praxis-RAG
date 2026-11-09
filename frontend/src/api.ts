@@ -114,11 +114,85 @@ export type SearchResult = {
     rerank_ms?: number;
   };
 };
-export type UploadResult = {
+export type UploadFailure = { name: string; error: string; operation_id?: string };
+export type UploadJobStatus = "queued" | "processing" | "succeeded" | "failed";
+export type UploadJob = {
+  name: string;
+  artifact_id: string;
+  status: UploadJobStatus;
+  reused?: boolean;
+};
+export type DocumentJobStage =
+  | "receiving"
+  | "parsing"
+  | "chunking"
+  | "staging"
+  | "embedding"
+  | "indexing"
+  | "publishing"
+  | "retry_wait"
+  | "completed"
+  | "failed";
+export type DocumentJobStatus = {
+  artifact_id: string;
+  status: UploadJobStatus;
+  stage?: DocumentJobStage | string;
+  error?: string | null;
+};
+export type SyncUploadResult = {
+  mode?: "sync";
   imported: DocumentInfo[];
   skipped: (DocumentInfo & { requested_name?: string })[];
-  failed: { name: string; error: string; operation_id?: string }[];
+  failed: UploadFailure[];
 };
+export type AsyncUploadResult = {
+  mode: "async";
+  jobs: UploadJob[];
+  failed: UploadFailure[];
+};
+// UploadResult is discriminated by mode: an absent mode keeps the historical
+// synchronous response, while mode "async" returns background jobs to poll.
+export type UploadResult = SyncUploadResult | AsyncUploadResult;
+
+export const uploadJobStatusLabels: Record<UploadJobStatus, string> = {
+  queued: "排队中",
+  processing: "处理中",
+  succeeded: "已索引",
+  failed: "失败",
+};
+export const uploadJobStageLabels: Record<string, string> = {
+  receiving: "接收中",
+  parsing: "解析中",
+  chunking: "切分中",
+  staging: "暂存中",
+  embedding: "向量化中",
+  indexing: "写入索引中",
+  publishing: "发布中",
+  retry_wait: "等待重试",
+  completed: "已索引",
+  failed: "失败",
+};
+
+// uploadJobLabel resolves the Chinese label shown for one background job:
+// terminal states win, otherwise the finer-grained stage is preferred.
+export function uploadJobLabel(status: UploadJobStatus, stage?: string | null) {
+  if (status === "succeeded" || status === "failed")
+    return uploadJobStatusLabels[status];
+  return (
+    (stage && uploadJobStageLabels[stage]) ||
+    uploadJobStatusLabels[status] ||
+    "处理中"
+  );
+}
+
+export function isUploadJobTerminal(status: UploadJobStatus) {
+  return status === "succeeded" || status === "failed";
+}
+
+// isNotFoundError recognises the HTTP 404 shape produced by apiResponse().
+export function isNotFoundError(error: unknown) {
+  return /\bHTTP 404\b/.test(errorText(error));
+}
 
 export const retrievalLabels = {
   bm25: "BM25",

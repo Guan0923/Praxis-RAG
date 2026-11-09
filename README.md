@@ -19,9 +19,9 @@ Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可
 
 ### 文档导入与管理
 
-支持 Markdown、TXT、PDF、DOCX，以及安装 LibreOffice 后的 DOC。网页/REST 上传与 MCP `update_document`、`delete_document` 为同步请求；MCP `add_document` 为异步：在共享状态数据库（MySQL）的一个事务内写入完整任务与发件箱通知，**提交成功即返回 `artifact_id`**，由 `rag-document-worker` 完成解析与索引。每批最多 10 个文件，单文件最大 10 MiB。
+支持 Markdown、TXT、PDF、DOCX，以及安装 LibreOffice 后的 DOC。网页/REST 上传默认同步执行；设置 `RAG_UPLOAD_MODE=async` 后改为异步受理：每个文件在共享状态数据库（MySQL）的一个事务内写入完整任务与发件箱通知，**提交成功即返回 `artifact_id`**，由 `rag-document-worker` 完成解析与索引，前端用 `GET /v1/document-jobs/{artifact_id}` 轮询 `status`/`stage`。MCP `add_document` 始终异步，行为不变；MCP `update_document`、`delete_document` 仍为同步请求。每批最多 10 个文件，单文件最大 10 MiB。
 
-相同内容与切分配置的重复上传会跳过；`add_document` 不覆盖同名文档，替换请用 `update_document`。状态用 `get_document_status` 轮询，终态为 `succeeded` / `failed`，状态在 MySQL，不依赖 Redis TTL。
+相同内容与切分配置的重复上传会跳过；`add_document` 与异步 REST 上传不覆盖同名文档，替换请用 `update_document`。状态用 MCP `get_document_status` 或 REST `GET /v1/document-jobs/{artifact_id}` 轮询，终态为 `succeeded` / `failed`，状态在 MySQL，不依赖 Redis TTL。
 
 ### PDF 与 Word 解析
 
@@ -151,7 +151,8 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
 ### 4. 启动 worker（按需）
 
 ```powershell
-# 异步 MCP add_document 必需；需要 MySQL + Kafka（或本地 outbox 模式）
+# 异步上传（MCP add_document，或 RAG_UPLOAD_MODE=async 的网页/REST 上传）必需；
+# 需要 MySQL + Kafka（或本地 outbox 模式）
 .\dist\bin\rag-document-worker.exe
 
 # 服务端 MCP 排队搜索必需；需要 Redis + Kafka + MySQL
@@ -186,12 +187,14 @@ docker compose --profile app up -d --build
 ```text
 浏览器  --------------------------> http://127.0.0.1:8011/console
 MCP 客户端 -> /mcp（Streamable HTTP）-> rag-service
-REST /v1/* ------------------------> rag-service（同步搜索/上传/管理/状态）
+REST /v1/* ------------------------> rag-service（同步搜索/管理/状态；上传由 RAG_UPLOAD_MODE 决定）
 rag-service -> Qdrant（检索索引）、共享状态库（文档/KB/Key/任务/发件箱）、
                Redis（读模型缓存 + 搜索快照；可选）、Kafka（outbox relay/搜索队列；可选）
 MCP add_document -> 状态库单事务写入 document_jobs + document_job_outbox
                  -> relay（rag-service 内置，配置 Kafka 时）或单进程本地轮询
                  -> Kafka 通知 -> rag-document-worker（解析/切分/Embedding/Qdrant 发布）
+REST 上传（RAG_UPLOAD_MODE=async）-> 同一 document_jobs/outbox 管道，返回 artifact_id
+                 -> GET /v1/document-jobs/{artifact_id} 轮询 status/stage
 MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-worker -> SearchRaw + Redis 快照
 ```
 
@@ -209,7 +212,8 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 
 ## 使用边界
 
-- MCP 异步新增的受理点是状态库单事务提交（任务 + 发件箱），不是 Kafka 确认；HTTP/Console 上传和 MCP 更新/删除仍是同步请求，索引期间会等待。
+- 异步受理（MCP `add_document` 与 `RAG_UPLOAD_MODE=async` 的网页/REST 上传）的受理点是状态库单事务提交（任务 + 发件箱），不是 Kafka 确认；MCP 更新/删除与同步模式的上传仍在请求内完成，索引期间会等待。
+- `RAG_UPLOAD_MODE` 默认 `sync`；改为 `async` 后果索引任务排队执行，必须部署 `rag-document-worker`（或 `RAG_DOCUMENT_WORKER_LOCAL=1`），并用 `GET /v1/document-jobs/{artifact_id}` 观察进度。
 - 每批最多 10 个文件、单文件 10 MiB；暂不支持 Excel、网页抓取和独立图片上传。
 - Word 保留内容控件、嵌套表格、合并范围与原生公式；未知公式结构、原生图表等无法可靠读取的内容会明确拒绝入库；图注关联有歧义时跳过并报告原因。
 - 工作区用于划分知识库，不是用户级权限系统；`/v1/admin/*` 只允许本机直连，MCP/普通 API 使用 Service Token 或 API Key。

@@ -196,6 +196,9 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
 if (-not $topicsReady) { throw "Kafka topic creation failed. Check docker compose logs kafka." }
 Write-Host "Kafka topics ready: $((& docker exec praxis-rag-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list) -join ', ')"
 Write-Host "Consumers are not started: run rag-search-worker for MCP search and rag-document-worker for MCP add_document separately."
+if ($env:RAG_UPLOAD_MODE -eq "async") {
+    Write-Host "RAG_UPLOAD_MODE=async: REST/Console uploads only queue document jobs; run rag-document-worker (or set RAG_DOCUMENT_WORKER_LOCAL=1) or they stay queued."
+}
 Write-Host "Workers retry in-process and publish exhausted messages to RAG_*_DLQ_TOPIC; run rag-dead-letter-worker --kind document|search for them."
 Write-Host "Document uploads are accepted by a MySQL commit; Kafka only carries the identifier notification. Deploy API and workers together; drain schema-2 chunked messages before upgrading."
 

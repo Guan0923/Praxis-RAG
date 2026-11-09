@@ -20,6 +20,31 @@ const asyncSubmissionFailedMessage = "Document submission failed; retry with the
 // generic safe failure message for status lookups.
 const documentOperationUnavailableMessage = "Document operation unavailable"
 
+// admitDocument durably submits one upload and maps admission failures to the
+// runtime's safe public categories. Callers decide how much of the admission
+// projection to expose: MCP returns artifact_id only, REST also reports the
+// queued status and the idempotent-reuse flag.
+func (s *Service) admitDocument(
+	ctx context.Context,
+	namespace, name string,
+	content []byte,
+	idempotencyKey string,
+) (state.DocumentAdmission, error) {
+	dispatcher := s.stores.DocumentDispatcher
+	if dispatcher == nil {
+		return state.DocumentAdmission{}, &apierrors.KnowledgeError{Message: asyncSubmissionFailedMessage}
+	}
+	var key *string
+	if idempotencyKey != "" {
+		key = &idempotencyKey
+	}
+	admission, err := dispatcher.Submit(ctx, namespace, name, content, key)
+	if err != nil {
+		return state.DocumentAdmission{}, asyncDocumentError(err)
+	}
+	return admission, nil
+}
+
 // addDocumentAsync is the real implementation behind Service.AddDocument:
 // durable asynchronous admission (job + outbox in one transaction) committed
 // before any broker delivery is attempted.
@@ -29,20 +54,33 @@ func (s *Service) addDocumentAsync(
 	content []byte,
 	idempotencyKey string,
 ) (map[string]any, error) {
-	dispatcher := s.stores.DocumentDispatcher
-	if dispatcher == nil {
-		return nil, &apierrors.KnowledgeError{Message: asyncSubmissionFailedMessage}
-	}
-	var key *string
-	if idempotencyKey != "" {
-		key = &idempotencyKey
-	}
-	admission, err := dispatcher.Submit(ctx, namespace, name, content, key)
+	admission, err := s.admitDocument(ctx, namespace, name, content, idempotencyKey)
 	if err != nil {
-		return nil, asyncDocumentError(err)
+		return nil, err
 	}
 	// Python's DocumentJobDispatcher.submit returns exactly {"artifact_id": ...}.
 	return map[string]any{"artifact_id": admission.ArtifactID}, nil
+}
+
+// AdmitDocument is the REST projection of the same durable admission. The
+// Console renders the admitted jobs immediately, so it also gets the queued
+// status and the "same idempotency key reused" flag: a resent batch must show
+// the original artifact ids instead of looking like a fresh submission.
+func (s *Service) AdmitDocument(
+	ctx context.Context,
+	namespace, name string,
+	content []byte,
+	idempotencyKey string,
+) (map[string]any, error) {
+	admission, err := s.admitDocument(ctx, namespace, name, content, idempotencyKey)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"artifact_id": admission.ArtifactID,
+		"status":      admission.Status,
+		"reused":      admission.Reused,
+	}, nil
 }
 
 // asyncDocumentError maps state admission errors to the Python runtime

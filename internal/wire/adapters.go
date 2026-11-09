@@ -51,6 +51,16 @@ func (a HTTPRuntime) Upload(ctx context.Context, namespace string, files []httpa
 	return a.Service.Upload(ctx, namespace, converted, idempotencyKey)
 }
 
+// AdmitDocument implements httpapi.DocumentRuntime.
+func (a HTTPRuntime) AdmitDocument(ctx context.Context, namespace, name string, content []byte, idempotencyKey string) (map[string]any, error) {
+	return a.Service.AdmitDocument(ctx, namespace, name, content, idempotencyKey)
+}
+
+// GetDocumentStatus implements httpapi.DocumentRuntime.
+func (a HTTPRuntime) GetDocumentStatus(ctx context.Context, namespace, artifactID string) (map[string]any, error) {
+	return a.Service.GetDocumentStatus(ctx, namespace, artifactID)
+}
+
 // Delete implements httpapi.DocumentRuntime.
 func (a HTTPRuntime) Delete(ctx context.Context, namespace, name string) (map[string]any, error) {
 	return a.Service.Delete(ctx, namespace, name)

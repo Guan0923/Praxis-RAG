@@ -201,6 +201,60 @@ func TestAddDocumentAsyncAdmissionReplayAndConflicts(t *testing.T) {
 	}
 }
 
+func TestAdmitDocumentProjection(t *testing.T) {
+	service, _, _ := newAsyncService(t)
+	ctx := context.Background()
+	content := []byte("# Projection\n\nREST admission keeps the queued status and reuse flag.")
+
+	payload, err := service.AdmitDocument(ctx, "alpha", "projection.md", content, "proj-1")
+	if err != nil {
+		t.Fatalf("AdmitDocument() error = %v", err)
+	}
+	if len(payload) != 3 {
+		t.Fatalf("admission projection = %v, want artifact_id/status/reused", payload)
+	}
+	artifactID, _ := payload["artifact_id"].(string)
+	if !canonicalUUIDPattern.MatchString(artifactID) {
+		t.Fatalf("artifact_id = %v", payload["artifact_id"])
+	}
+	if payload["status"] != state.DocumentJobQueued || payload["reused"] != false {
+		t.Fatalf("admission projection = %v", payload)
+	}
+
+	// The same key and bytes project the original artifact as reused.
+	replay, err := service.AdmitDocument(ctx, "alpha", "projection.md", content, "proj-1")
+	if err != nil {
+		t.Fatalf("replayed AdmitDocument() error = %v", err)
+	}
+	if replay["artifact_id"] != artifactID || replay["reused"] != true {
+		t.Fatalf("replay projection = %v", replay)
+	}
+	// The same key with different bytes keeps the MCP-compatible conflict text.
+	_, err = service.AdmitDocument(ctx, "alpha", "projection.md", []byte("different"), "proj-1")
+	var validation *apierrors.KnowledgeValidationError
+	if !errors.As(err, &validation) || validation.Message != asyncUploadConflictMessage {
+		t.Fatalf("conflicting projection error = %v", err)
+	}
+
+	// The MCP projection stays exactly {"artifact_id": ...}.
+	mcpPayload, err := service.addDocumentAsync(ctx, "alpha", "mcp.md", []byte("mcp bytes"), "")
+	if err != nil {
+		t.Fatalf("addDocumentAsync() error = %v", err)
+	}
+	if len(mcpPayload) != 1 || mcpPayload["artifact_id"] == nil {
+		t.Fatalf("MCP admission payload = %v", mcpPayload)
+	}
+
+	// The admitted artifact is readable through the shared status projection.
+	status, err := service.GetDocumentStatus(ctx, "alpha", artifactID)
+	if err != nil {
+		t.Fatalf("GetDocumentStatus() error = %v", err)
+	}
+	if status["artifact_id"] != artifactID || status["status"] != state.DocumentJobQueued {
+		t.Fatalf("status = %v", status)
+	}
+}
+
 func TestAddDocumentAsyncValidationAndStatus(t *testing.T) {
 	service, stores, _ := newAsyncService(t)
 	ctx := context.Background()

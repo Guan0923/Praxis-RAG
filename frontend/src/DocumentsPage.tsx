@@ -22,10 +22,17 @@ import {
   chunkLabel,
   errorText,
   formatBytes,
-  type KnowledgeBase,
-  type Strategy,
+  isNotFoundError,
+  isUploadJobTerminal,
+  uploadJobLabel,
   type Connection,
   type DocumentInfo,
+  type DocumentJobStatus,
+  type KnowledgeBase,
+  type Strategy,
+  type SyncUploadResult,
+  type UploadFailure,
+  type UploadJob,
   type UploadResult,
 } from "./api";
 
@@ -37,6 +44,36 @@ type Props = {
   onUploading: (busy: boolean) => void;
   onHealth: () => Promise<void>;
 };
+
+const uploadJobPollIntervalMs = 1500;
+
+type TrackedUploadJob = UploadJob & { stage?: string; error?: string };
+type SkippedDocument = DocumentInfo & { requested_name?: string };
+type AsyncUploadReport = {
+  jobs: TrackedUploadJob[];
+  failed: UploadFailure[];
+  skipped: SkippedDocument[];
+  done: boolean;
+};
+
+function abortableDelay(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout>;
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 export function DocumentsPage({
   connection,
@@ -56,12 +93,15 @@ export function DocumentsPage({
   const [open, setOpen] = useState(false);
   const [files, setFiles] = useState<UploadFile[]>([]);
   const [uploadError, setUploadError] = useState("");
-  const [report, setReport] = useState<UploadResult>();
+  const [report, setReport] = useState<SyncUploadResult>();
+  const [asyncReport, setAsyncReport] = useState<AsyncUploadReport>();
   const [stage, setStage] = useState("");
   const [deleting, setDeleting] = useState<string>();
   const lifetime = useRef(new AbortController());
   const listRequest = useRef<AbortController | null>(null);
   const listSequence = useRef(0);
+  const jobPolling = useRef<AbortController | null>(null);
+  const jobPollingSequence = useRef(0);
   const mutation = useRef(false);
   const confirmDialog = useRef<{ destroy: () => void } | null>(null);
 
@@ -110,6 +150,7 @@ export function DocumentsPage({
     return () => {
       lifetime.current.abort();
       listRequest.current?.abort();
+      jobPolling.current?.abort();
       confirmDialog.current?.destroy();
     };
   }, []);
@@ -117,11 +158,102 @@ export function DocumentsPage({
     if (active) void loadDocuments();
   }, [active]);
 
+  function stopJobPolling() {
+    jobPolling.current?.abort();
+    jobPolling.current = null;
+  }
+
+  async function pollUploadJobs(
+    initial: TrackedUploadJob[],
+    failed: UploadFailure[],
+    skipped: SkippedDocument[],
+  ) {
+    stopJobPolling();
+    const controller = new AbortController();
+    jobPolling.current = controller;
+    const sequence = ++jobPollingSequence.current;
+    let jobs = initial;
+    const publish = (next: TrackedUploadJob[], done: boolean) => {
+      if (sequence !== jobPollingSequence.current || lifetime.current.signal.aborted)
+        return;
+      setAsyncReport({ jobs: next, failed, skipped, done });
+    };
+    publish(jobs, false);
+    let completed = false;
+    try {
+      while (!controller.signal.aborted) {
+        if (!jobs.some((job) => !isUploadJobTerminal(job.status))) {
+          completed = true;
+          break;
+        }
+        await abortableDelay(uploadJobPollIntervalMs, controller.signal);
+        if (controller.signal.aborted || sequence !== jobPollingSequence.current)
+          break;
+        let notFound = false;
+        const updates = await Promise.all(
+          jobs
+            .filter((job) => !isUploadJobTerminal(job.status))
+            .map(async (job) => {
+              try {
+                const status = await api<DocumentJobStatus>(
+                  `/v1/document-jobs/${encodeURIComponent(job.artifact_id)}`,
+                  connection,
+                  { signal: controller.signal, cache: "no-store" },
+                );
+                return { job, status };
+              } catch (error) {
+                if (controller.signal.aborted) return null;
+                if (isNotFoundError(error)) notFound = true;
+                return { job, error: errorText(error) };
+              }
+            }),
+        );
+        if (controller.signal.aborted || sequence !== jobPollingSequence.current)
+          break;
+        jobs = jobs.map((job) => {
+          const update = updates.find(
+            (item) => item?.job.artifact_id === job.artifact_id,
+          );
+          if (!update) return job;
+          if ("error" in update)
+            return { ...job, status: "failed" as const, error: update.error };
+          return {
+            ...job,
+            status: update.status.status,
+            stage: update.status.stage ?? undefined,
+            error: update.status.error ?? undefined,
+          };
+        });
+        publish(jobs, false);
+        if (notFound) {
+          // A 404 means the backend no longer tracks this artifact, so retrying
+          // its status can never succeed: record the failure and stop polling.
+          completed = true;
+          controller.abort();
+          break;
+        }
+      }
+    } finally {
+      if (jobPolling.current === controller) jobPolling.current = null;
+    }
+    if (!completed || sequence !== jobPollingSequence.current) return;
+    publish(jobs, true);
+    await loadDocuments();
+    void onHealth();
+  }
+
+  function closeUploadModal() {
+    stopJobPolling();
+    setOpen(false);
+  }
+
   async function upload() {
     if (mutation.current || !knowledgeBase) return;
     mutation.current = true;
+    stopJobPolling();
     setUploadError("");
     setReport(undefined);
+    setAsyncReport(undefined);
     try {
       const selected = files
         .map((file) => file.originFileObj)
@@ -180,6 +312,15 @@ export function DocumentsPage({
         });
       }
       if (lifetime.current.signal.aborted) return;
+      if (result.mode === "async") {
+        // Jobs keep running server-side: render the accepted list and poll each
+        // artifact id until it reaches a terminal state.
+        const jobs: TrackedUploadJob[] = result.jobs ?? [];
+        const failed = result.failed ?? [];
+        if (!failed.length) setFiles([]);
+        void pollUploadJobs(jobs, failed, skipped);
+        return;
+      }
       const complete = {
         ...result,
         skipped: [...skipped, ...(result.skipped || [])],
@@ -239,6 +380,21 @@ export function DocumentsPage({
   }
   const summary = report
     ? `新增 ${report.imported.length} 个，跳过 ${report.skipped.length} 个，失败 ${report.failed.length} 个`
+    : "";
+  const asyncJobs = asyncReport?.jobs ?? [];
+  const asyncCompleted = asyncJobs.filter((job) =>
+    isUploadJobTerminal(job.status),
+  ).length;
+  const asyncFailed =
+    !!asyncReport &&
+    (asyncReport.failed.length > 0 ||
+      asyncJobs.some((job) => job.status === "failed"));
+  const asyncSummary = asyncReport
+    ? asyncJobs.length
+      ? asyncReport.done
+        ? `已受理 ${asyncJobs.length} 个文件，后台处理完成（${asyncCompleted}/${asyncJobs.length} 已完成）`
+        : `已受理 ${asyncJobs.length} 个文件，正在处理后台上传（${asyncCompleted}/${asyncJobs.length} 已完成）`
+      : "没有文件进入后台处理"
     : "";
 
   return (
@@ -372,7 +528,7 @@ export function DocumentsPage({
         forceRender
         width={640}
         onCancel={() => {
-          if (!uploading) setOpen(false);
+          if (!uploading) closeUploadModal();
         }}
         closable={!uploading}
         mask={{ closable: !uploading }}
@@ -382,7 +538,7 @@ export function DocumentsPage({
             <Button
               aria-label="关闭"
               disabled={uploading}
-              onClick={() => setOpen(false)}
+              onClick={closeUploadModal}
             >
               关闭
             </Button>
@@ -483,6 +639,35 @@ export function DocumentsPage({
                     ))}
                     {report.failed.map((item, index) => (
                       <div key={`fail-${index}`}>
+                        {item.name}：{item.error}
+                      </div>
+                    ))}
+                  </div>
+                }
+              />
+            )}
+            {asyncReport && (
+              <Alert
+                type={asyncFailed ? "warning" : asyncReport.done ? "success" : "info"}
+                showIcon
+                title={asyncSummary}
+                description={
+                  <div className="upload-report">
+                    {asyncJobs.map((job) => (
+                      <div key={job.artifact_id}>
+                        {job.name}：{uploadJobLabel(job.status, job.stage)}
+                        {job.status === "failed" && job.error
+                          ? `（${job.error}）`
+                          : null}
+                      </div>
+                    ))}
+                    {asyncReport.skipped.map((item, index) => (
+                      <div key={`async-skip-${index}`}>
+                        {item.requested_name || item.name}：已存在 {item.name}
+                      </div>
+                    ))}
+                    {asyncReport.failed.map((item, index) => (
+                      <div key={`async-fail-${index}`}>
                         {item.name}：{item.error}
                       </div>
                     ))}

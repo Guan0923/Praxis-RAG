@@ -133,6 +133,7 @@ func run() error {
 		"address", address,
 		"backend", string(ragConfig.Backend),
 		"console", api.WebRoot(),
+		"upload_mode", serviceSettings.UploadMode,
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

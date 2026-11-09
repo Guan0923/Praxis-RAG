@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -33,6 +34,13 @@ type fakeDocRuntime struct {
 	readFileErr   error
 	publicKB      map[string]any
 	publicKBErr   error
+
+	admitted     []string
+	admittedKeys []string
+	admitPayload map[string]any
+	admitErrFor  map[string]error
+	statusByID   map[string]map[string]any
+	statusErr    error
 }
 
 func newFakeDocRuntime() *fakeDocRuntime {
@@ -43,6 +51,8 @@ func newFakeDocRuntime() *fakeDocRuntime {
 		checkPayload:       map[string]any{"duplicates": []any{}},
 		readText:           "hello",
 		publicKB:           map[string]any{"namespace": "alpha", "collection": "knowledge_x"},
+		admitErrFor:        map[string]error{},
+		statusByID:         map[string]map[string]any{},
 	}
 }
 
@@ -54,6 +64,35 @@ func (f *fakeDocRuntime) Upload(_ context.Context, _ string, files []UploadFile,
 	f.upoadFiles = files
 	f.uploadKey = idempotencyKey
 	return f.uploadPayload, f.uploadErr
+}
+
+func (f *fakeDocRuntime) AdmitDocument(_ context.Context, _ string, name string, content []byte, idempotencyKey string) (map[string]any, error) {
+	f.admitted = append(f.admitted, name)
+	f.admittedKeys = append(f.admittedKeys, idempotencyKey)
+	if failure, ok := f.admitErrFor[name]; ok {
+		return nil, failure
+	}
+	if f.admitPayload != nil {
+		return f.admitPayload, nil
+	}
+	return map[string]any{
+		"artifact_id": fmt.Sprintf("9b2f9e9e-0000-4000-8000-%012d", len(f.admitted)),
+		"status":      "queued",
+		"reused":      false,
+	}, nil
+}
+
+func (f *fakeDocRuntime) GetDocumentStatus(_ context.Context, _ string, artifactID string) (map[string]any, error) {
+	if f.statusErr != nil {
+		return nil, f.statusErr
+	}
+	status, ok := f.statusByID[artifactID]
+	if !ok {
+		return map[string]any{
+			"artifact_id": artifactID, "status": "queued", "stage": "queued", "error": nil,
+		}, nil
+	}
+	return status, nil
 }
 
 func (f *fakeDocRuntime) Delete(context.Context, string, string) (map[string]any, error) {

@@ -20,7 +20,7 @@
 
 - **每个进程独立部署**：`rag-service` 不内嵌消费者；worker 不监听端口。
 - 所有进程必须共享同一份基础设施配置：`RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`RAG_BACKEND=qdrant`/`QDRANT_URL`、`RAG_STATE_ENCRYPTION_KEY`、Redis 与 Kafka（bootstrap、topic/group、DLQ）设置。配置不一致会造成 401/找不到任务/重复发布等难以排查的问题。
-- 仅同步 REST/Console 的最小部署是 `rag-service + Qdrant + 状态库`；MCP 异步新增需要文档 worker；服务端 MCP 排队搜索需要 search worker + Redis + Kafka。
+- 仅同步 REST/Console 的最小部署是 `rag-service + Qdrant + 状态库`；MCP 异步新增与 `RAG_UPLOAD_MODE=async` 的 REST 上传都需要文档 worker（配合 Kafka，或 `RAG_DOCUMENT_WORKER_LOCAL=1` 的本地发件箱模式）；服务端 MCP 排队搜索需要 search worker + Redis + Kafka。
 
 ## 2. 二进制与目录布局
 

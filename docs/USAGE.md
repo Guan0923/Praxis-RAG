@@ -209,6 +209,7 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_STATE_AUTO_SCHEMA` | `true` | 启动时创建缺失表；生产可关闭并由部署账号预建 |
 | `RAG_UPLOAD_LEASE_SECONDS` | `120` | 上传事务业务租约时长 |
 | `RAG_UPLOAD_CLEANUP_DELAY_SECONDS` | `3600` | 已完成上传工作区清理延迟 |
+| `RAG_UPLOAD_MODE` | `sync` | `POST /v1/documents` 受理方式：`sync` 请求内解析/切分/Embedding/发布后返回；`async` 每文件提交 `document_jobs`+发件箱后立即返回 `artifact_id`，需运行 `rag-document-worker` |
 
 `RAG_SERVICE_DATA_ROOT` 只决定上传恢复工作区等本地文件的位置，不再决定数据库。两项都未配置时启动报错；表结构可用 §7 的 `rag-state-migrate` 检查/建表。
 
@@ -447,12 +448,15 @@ curl.exe http://127.0.0.1:8011/v1/admin/knowledge-bases/default/key/embedding
 curl.exe -X POST http://127.0.0.1:8011/v1/documents/check `
   -H $headers -d '{"files":[{"name":"guide.md","sha256":"<64-hex>"}]}'
 
-# 同步上传（multipart，字段名必须为 files；可选 Idempotency-Key）
+# 上传（默认同步；multipart，字段名必须为 files；可选 Idempotency-Key）
 curl.exe -X POST http://127.0.0.1:8011/v1/documents `
   -H "Authorization: Bearer <token-or-key>" `
   -H "X-RAG-Namespace: default" `
   -H "Idempotency-Key: batch-20261108-01" `
   -F "files=@guide.md" -F "files=@manual.txt"
+
+# 异步受理模式（RAG_UPLOAD_MODE=async）返回 jobs[].artifact_id，按 id 轮询状态
+curl.exe "http://127.0.0.1:8011/v1/document-jobs/<artifact_id>" -H $headers
 
 # 列表、读取正文、删除
 curl.exe http://127.0.0.1:8011/v1/documents -H $headers
@@ -460,7 +464,7 @@ curl.exe "http://127.0.0.1:8011/v1/documents/guide.md/content" -H $headers   # �
 curl.exe -X DELETE "http://127.0.0.1:8011/v1/documents/guide.md" -H $headers
 ```
 
-上传响应包含 `imported`、`skipped`、`failed`、`documents`；`skipped` 条目带 `requested_name`。单文件 10 MiB、单批 10 个；上传切分参数来自知识库配置，不接受请求级覆盖。PDF 返回原始文件字节（`Content-Type: application/pdf`）；版本化 PDF/Word 的正文读取已保存的 `document.md`。
+同步模式（默认）的上传响应包含 `imported`、`skipped`、`failed`、`documents` 与 `mode:"sync"`；`skipped` 条目带 `requested_name`。异步模式（`RAG_UPLOAD_MODE=async`）的响应为 `mode:"async"`、`jobs:[{name, artifact_id, status, reused}]` 与 `failed:[{name, error}]`：每批每个文件独立受理，单个文件冲突只进入 `failed` 不阻塞其它文件；重复提交同一 `Idempotency-Key` 的同一批文件会复用原 `artifact_id`（`reused:true`）。异步任务状态：`GET /v1/document-jobs/{artifact_id}` 返回 `{artifact_id, status, stage, error}`（`queued` / `processing` + `stage` / `succeeded` / `failed`），未知或跨工作区 id 返回 404。单文件 10 MiB、单批 10 个；上传切分参数来自知识库配置，不接受请求级覆盖。PDF 返回原始文件字节（`Content-Type: application/pdf`）；版本化 PDF/Word 的正文读取已保存的 `document.md`。
 
 ### 搜索、结果与产物
 
@@ -697,7 +701,7 @@ Go 服务会在 ingest 阶段以子进程方式调用 `rag_mcp.pdf_worker` / `ra
 - **外部解析器**：PDF（Docling）、DOC（LibreOffice）、Word 图片描述都不是 Go 内置能力；未配置时相应功能报错。配置了 `RAG_VLM_BASE_URL` 后 Go 会自动启用 `word_vision_worker`，无图注图片由远端 VLM 生成描述。
 - **异步投递**：支持 relay（默认，进程内发件箱发布到 Kafka）、debezium（Debezium Server 读 MySQL binlog，经原生 Kafka sink 写 topic，应用不发布）与本地 worker 模式；Debezium 模式需要 MySQL 状态库。
 - **排队搜索**：`RAG_KAFKA_BOOTSTRAP_SERVERS` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 Kafka。
-- **REST 上传/更新/删除**仍同步执行，大文件索引期间请求会等待；异步只用于 MCP `add_document`。
+- **上传受理**：`POST /v1/documents` 默认同步；`RAG_UPLOAD_MODE=async` 时逐文件异步受理并返回 `artifact_id`，状态由 `GET /v1/document-jobs/{artifact_id}` 读取，需要部署 `rag-document-worker`（配置 Kafka，或 `RAG_DOCUMENT_WORKER_LOCAL=1` 轮询发件箱）。`update_document`/`delete_document` 仍同步执行，与排队中的异步任务靠受理期同名检查与发布事务内的 `ValidatePublication` 互斥。
 - **管理边界**：`/v1/admin/*` 仅本机直连；没有账户体系或细粒度多用户权限；工作区不是权限隔离。
 - **数据**：状态表用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。
 - 具体契约差异（cached read views、静态目录列表等剩余的 P1/P2）见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。

@@ -1,0 +1,41 @@
+package httpapi
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+)
+
+// handleDocumentJobStatus serves one asynchronous admission status. The
+// artifact id is the only lookup key a client holds after POST /v1/documents
+// returns in async mode, so it must stay readable until the job's terminal
+// retention window expires.
+//
+// Status values: queued, processing (with a stage such as parsing, chunking,
+// embedding, indexing or publishing), succeeded and failed. Failed jobs carry
+// the durable terminal error text.
+func (s *Server) handleDocumentJobStatus(w http.ResponseWriter, r *http.Request) {
+	namespace, ok := s.tenantNamespace(w, r)
+	if !ok {
+		return
+	}
+	if s.runtime == nil {
+		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
+		return
+	}
+	payload, err := s.runtime.GetDocumentStatus(r.Context(), namespace, pathParam(r, "artifact_id"))
+	if err != nil {
+		// Invalid, unknown and other-tenant artifact ids are indistinguishable to
+		// the caller: a 404 keeps them from probing other namespaces.
+		var validation *apierrors.KnowledgeValidationError
+		if errors.As(err, &validation) {
+			writeDetail(w, http.StatusNotFound, validation.Message)
+			return
+		}
+		writeRuntimeError(w, err, true)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, payload)
+}

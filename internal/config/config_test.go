@@ -91,6 +91,29 @@ func TestServiceSettingsDefaults(t *testing.T) {
 	if settings.Token != "" {
 		t.Fatalf("token = %q, want empty", settings.Token)
 	}
+	if settings.UploadMode != UploadModeSync {
+		t.Fatalf("upload mode = %q, want %q", settings.UploadMode, UploadModeSync)
+	}
+}
+
+func TestServiceSettingsUploadMode(t *testing.T) {
+	isolateEnv(t)
+	t.Setenv("RAG_UPLOAD_MODE", "async")
+	settings, err := ServiceSettingsFromEnv()
+	if err != nil {
+		t.Fatalf("ServiceSettingsFromEnv() error = %v", err)
+	}
+	if settings.UploadMode != UploadModeAsync {
+		t.Fatalf("upload mode = %q, want %q", settings.UploadMode, UploadModeAsync)
+	}
+	t.Setenv("RAG_UPLOAD_MODE", "sync")
+	if settings, err = ServiceSettingsFromEnv(); err != nil || settings.UploadMode != UploadModeSync {
+		t.Fatalf("sync upload mode = %+v, %v", settings, err)
+	}
+	t.Setenv("RAG_UPLOAD_MODE", "queue")
+	if _, err := ServiceSettingsFromEnv(); err == nil || err.Error() != "RAG_UPLOAD_MODE must be sync or async" {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestServiceSettingsRejectsInvalidPort(t *testing.T) {
