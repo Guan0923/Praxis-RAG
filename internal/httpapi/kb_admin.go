@@ -60,6 +60,29 @@ func WithKnowledgeBaseAdminRuntime(runtime KnowledgeBaseAdminRuntime) Option {
 	return func(s *Server) { s.kbAdmin = runtime }
 }
 
+// handleNamespaceList returns the namespace names a logged-in session may
+// browse. It is the tenant-scoped counterpart of the admin list: normal users
+// need the switch list, but only admins may see provider configuration.
+func (s *Server) handleNamespaceList(w http.ResponseWriter, r *http.Request) {
+	if s.kbAdmin == nil {
+		writeDetail(w, http.StatusServiceUnavailable, "Knowledge base admin runtime is not available")
+		return
+	}
+	items, err := s.kbAdmin.ListKnowledgeBases(r.Context())
+	if err != nil {
+		writeDetail(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	namespaces := make([]string, 0, len(items))
+	for _, item := range items {
+		if name, ok := item["namespace"].(string); ok && name != "" {
+			namespaces = append(namespaces, name)
+		}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"namespaces": namespaces})
+}
+
 type createKnowledgeBaseBody struct {
 	Namespace      string            `json:"namespace"`
 	Embedding      *providerSettings `json:"embedding"`

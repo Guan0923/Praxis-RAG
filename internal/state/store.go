@@ -35,6 +35,20 @@ func isUniqueViolation(err error) bool {
 	return false
 }
 
+// isAlreadyExists reports schema DDL that lost a creation race to another
+// process. Concurrent test binaries share one schema, so "table already exists"
+// (1050) and "duplicate key name" (1061) mean the desired object is present.
+func isAlreadyExists(err error) bool {
+	var mysqlError *mysql.MySQLError
+	if errors.As(err, &mysqlError) {
+		switch mysqlError.Number {
+		case 1050, 1061:
+			return true
+		}
+	}
+	return false
+}
+
 // Stores is one shared database handle plus every repository in a service
 // process. It mirrors rag_mcp.state.store.StateStores.
 //
@@ -55,6 +69,8 @@ type Stores struct {
 	DB       *sql.DB
 
 	APIKeys        *APIKeyRepository
+	Users          *UserRepository
+	Sessions       *UserSessionRepository
 	KnowledgeBases *KnowledgeBaseRepository
 	Documents      *DocumentRepository
 	Catalogs       *CatalogRepository
@@ -156,6 +172,8 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	}
 	stores.CacheSync = cacheSync
 	stores.APIKeys = newAPIKeyRepository(database, settings.EncryptionKey, cacheSync)
+	stores.Users = newUserRepository(database)
+	stores.Sessions = newUserSessionRepository(database)
 	stores.KnowledgeBases = newKnowledgeBaseRepository(database, cacheSync)
 	stores.Documents = newDocumentRepository(database, cacheSync)
 	stores.Catalogs = newCatalogRepository(database, cacheSync)
@@ -374,11 +392,11 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 		if existing[table.Name] {
 			continue
 		}
-		if _, err := s.DB.ExecContext(ctx, table.DDL()); err != nil {
+		if _, err := s.DB.ExecContext(ctx, table.DDL()); err != nil && !isAlreadyExists(err) {
 			return err
 		}
 		for _, statement := range table.IndexDDL() {
-			if _, err := s.DB.ExecContext(ctx, statement); err != nil {
+			if _, err := s.DB.ExecContext(ctx, statement); err != nil && !isAlreadyExists(err) {
 				return err
 			}
 		}

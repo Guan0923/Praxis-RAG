@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/xinghe_rag/internal/auth"
 )
 
 type fakeKBAdminRuntime struct {
@@ -327,5 +328,44 @@ func TestKnowledgeBaseAdminRequiresRuntime(t *testing.T) {
 	})
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d", response.Code)
+	}
+}
+func TestNamespaceListReturnsNamesForTenantSessions(t *testing.T) {
+	adminRuntime := &fakeKBAdminRuntime{
+		fakeDocRuntime: newFakeDocRuntime(),
+		listPayload: []map[string]any{
+			{"namespace": "alpha", "collection": "knowledge_x"},
+			{"namespace": "beta"},
+			{"namespace": ""},
+		},
+	}
+	settings := testSettings("")
+	settings.AuthEnabled = true
+	users := &fakeUserAuth{
+		sessions: map[string]*auth.SessionUser{"user-token": userSession("user-token")},
+	}
+	handler := New(settings, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithKnowledgeBaseAdminRuntime(adminRuntime),
+		WithUserAuth(users),
+	).Handler()
+
+	anonymous := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "10.0.0.9:5000",
+		headers: map[string]string{"X-RAG-Namespace": "alpha"},
+	})
+	if anonymous.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous status = %d", anonymous.Code)
+	}
+
+	response := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "10.0.0.9:5000",
+		headers: mergeHeaders(cookieFor("user-token"), map[string]string{"X-RAG-Namespace": "alpha"}),
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+	namespaces, _ := decodeBody(t, response)["namespaces"].([]any)
+	if len(namespaces) != 2 || namespaces[0] != "alpha" || namespaces[1] != "beta" {
+		t.Fatalf("namespaces = %v", decodeBody(t, response)["namespaces"])
 	}
 }

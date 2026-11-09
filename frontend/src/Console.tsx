@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert, App, Badge, Button, Dropdown, Tooltip,
+  Alert, App, Badge, Button, Dropdown, Spin, Tooltip,
 } from "antd";
 import {
   ApiOutlined,
@@ -8,17 +8,26 @@ import {
   BookOutlined,
   DatabaseOutlined,
   DownOutlined,
+  LogoutOutlined,
   MoonOutlined,
   KeyOutlined,
   SettingOutlined,
   ReloadOutlined,
   SearchOutlined,
   SunOutlined,
+  TeamOutlined,
+  UserOutlined,
 } from "@ant-design/icons";
 import {
   api,
   errorText,
+  fetchAuthStatus,
+  fetchCurrentUser,
+  logoutSession,
   readStorage,
+  setUnauthorizedHandler,
+  type AuthStatus,
+  type AuthUser,
   type Connection,
   type Health,
 } from "./api";
@@ -28,6 +37,8 @@ import { DocumentPreview } from "./DocumentPreview";
 import { KnowledgeBasesPage } from "./KnowledgeBasesPage";
 import { ApiKeysPage } from "./ApiKeysPage";
 import { CreateKnowledgeBase } from "./CreateKnowledgeBase";
+import { LoginPage } from "./LoginPage";
+import { UsersPage } from "./UsersPage";
 import { useConsoleRoute } from "./navigation";
 
 const pages = [
@@ -36,7 +47,11 @@ const pages = [
   { key: "api-keys", label: "API Key", icon: <KeyOutlined /> },
   { key: "knowledge-bases", label: "知识库", icon: <SettingOutlined /> },
   { key: "create", label: "创建知识库", icon: <ApiOutlined /> },
+  { key: "users", label: "用户管理", icon: <TeamOutlined /> },
 ] as const;
+
+// adminOnlyPages require the admin role once login is enabled.
+const adminOnlyPages = new Set<string>(["api-keys", "knowledge-bases", "create", "users"]);
 
 export function Console({
   dark,
@@ -53,7 +68,14 @@ export function Console({
   const { route, navigate } = useConsoleRoute(uploading, onNavigationBlocked);
   const { page: view, documentName, namespace } = route;
   const [token, setToken] = useState(() => readStorage(sessionStorage, "rag.token"));
-  const connection = useMemo<Connection>(() => ({ namespace, token }), [namespace, token]);
+  const [auth, setAuth] = useState<AuthStatus>();
+  const [authUser, setAuthUser] = useState<AuthUser>();
+  const [authReady, setAuthReady] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const connection = useMemo<Connection>(() => ({
+    namespace,
+    token: auth?.auth_enabled ? "" : token,
+  }), [namespace, token, auth]);
   const [revision, setRevision] = useState(0);
   const [health, setHealth] = useState<Health>();
   const [healthError, setHealthError] = useState("");
@@ -64,6 +86,53 @@ export function Console({
   const [workspaceError, setWorkspaceError] = useState(false);
   const workspaceRequest = useRef<AbortController | null>(null);
 
+  async function loadAuth() {
+    setAuthReady(false);
+    setAuthError("");
+    try {
+      const status = await fetchAuthStatus();
+      setAuth(status);
+      if (status.auth_enabled && status.authenticated) {
+        const session = await fetchCurrentUser();
+        setAuthUser(session.user);
+      } else {
+        setAuthUser(undefined);
+      }
+    } catch (error) {
+      setAuthError(errorText(error));
+    } finally {
+      setAuthReady(true);
+    }
+  }
+
+  useEffect(() => {
+    void loadAuth();
+  }, []);
+
+  // A rejected request means the session expired; drop back to the login page.
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      setAuthUser(undefined);
+      void message.warning("登录已失效，请重新登录");
+    });
+    return () => setUnauthorizedHandler(undefined);
+  }, [message]);
+
+  // Non-admins cannot stay on an admin-only page.
+  useEffect(() => {
+    if (!auth?.auth_enabled || !authUser) return;
+    if (authUser.role !== "admin" && adminOnlyPages.has(view)) {
+      navigate({ namespace, page: "search" }, true);
+    }
+  }, [auth, authUser, view, namespace, navigate]);
+
+  async function handleLogout() {
+    await logoutSession();
+    setAuthUser(undefined);
+    setAuth((current) => current ? { ...current, authenticated: false, user: undefined } : current);
+    void message.success("已退出登录");
+  }
+
   async function loadWorkspaces() {
     workspaceRequest.current?.abort();
     const controller = new AbortController();
@@ -72,10 +141,10 @@ export function Console({
     setWorkspaceError(false);
     setWorkspaceNames([]);
     try {
-      const data = await api<{ knowledge_bases: { namespace: string }[] }>(
-        "/v1/admin/knowledge-bases", undefined, { signal: controller.signal, cache: "no-store" },
+      const data = await api<{ namespaces: string[] }>(
+        "/v1/namespaces", connection, { signal: controller.signal, cache: "no-store" },
       );
-      if (!controller.signal.aborted) setWorkspaceNames(data.knowledge_bases.map((item) => item.namespace));
+      if (!controller.signal.aborted) setWorkspaceNames(data.namespaces);
     } catch (error) {
       if (!controller.signal.aborted) {
         setWorkspaceError(true);
@@ -148,6 +217,39 @@ export function Console({
     saveConnection({ ...connection, namespace }, "知识库已切换");
   }
   const themeLabel = dark ? "切换浅色主题" : "切换深色主题";
+  const sessionMode = Boolean(auth?.auth_enabled);
+
+  if (!authReady) {
+    return (
+      <div className="auth-shell">
+        <Spin size="large" tip="正在检查登录状态…" />
+      </div>
+    );
+  }
+  if (sessionMode && !authUser) {
+    return (
+      <LoginPage
+        registrationEnabled={Boolean(auth?.registration_enabled)}
+        onAuthenticated={(user) => {
+          setAuthUser(user);
+          setAuth((current) => current
+            ? { ...current, authenticated: true, user }
+            : { auth_enabled: true, registration_enabled: false, authenticated: true, user });
+        }}
+      />
+    );
+  }
+  if (sessionMode && authError) {
+    return (
+      <div className="auth-shell">
+        <Alert type="error" showIcon title="无法连接服务" description={authError} />
+        <Button onClick={() => void loadAuth()}>重试</Button>
+      </div>
+    );
+  }
+
+  const visiblePages = pages.filter((page) =>
+    !adminOnlyPages.has(page.key) || !sessionMode || authUser?.role === "admin");
 
   return (
     <div className="console-shell">
@@ -157,7 +259,7 @@ export function Console({
           <span>Praxis-RAG</span>
         </div>
         <nav aria-label="主导航">
-          {pages.map((page) => (
+          {visiblePages.map((page) => (
             <Button
               key={page.key}
               type="text"
@@ -228,6 +330,29 @@ export function Console({
                 onClick={toggleTheme}
               />
             </Tooltip>
+            {sessionMode && authUser && (
+              <Dropdown
+                trigger={["click"]}
+                menu={{
+                  items: [
+                    {
+                      key: "identity",
+                      disabled: true,
+                      label: `${authUser.username} · ${authUser.role === "admin" ? "管理员" : "普通用户"}`,
+                    },
+                    { type: "divider" },
+                    { key: "logout", icon: <LogoutOutlined />, label: "退出登录" },
+                  ],
+                  onClick: ({ key }) => {
+                    if (key === "logout") void handleLogout();
+                  },
+                }}
+              >
+                <Button aria-label="账号菜单" className="account-button" icon={<UserOutlined />}>
+                  {authUser.username}
+                </Button>
+              </Dropdown>
+            )}
           </div>
         </header>
         <div className="page-content">
@@ -278,6 +403,9 @@ export function Console({
           {view === "knowledge-bases" && <KnowledgeBasesPage disabled={uploading}
             onCreate={() => navigate({ namespace, page: "create" })}
             onChanged={() => { setRevision((value) => value + 1); void refreshHealth(); }} />}
+          {view === "users" && authUser?.role === "admin" && (
+            <UsersPage currentUserId={authUser.id} />
+          )}
           <section hidden={view !== "create"} aria-label="创建知识库页面">
             <div className="page-heading">
               <h1>创建知识库</h1>

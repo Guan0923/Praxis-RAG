@@ -34,6 +34,26 @@ func namespaceFromHeader(r *http.Request) (string, bool) {
 func (s *Server) tenantFromHeaders(w http.ResponseWriter, r *http.Request) (string, bool) {
 	authorization := r.Header.Get("Authorization")
 
+	// Console login sessions (cookies, or a bearer session token) take
+	// precedence over the legacy service token and per-namespace API keys.
+	if s.authEnabled() {
+		if token, viaCookie := s.sessionTokenFromRequest(r); token != "" {
+			session, err := s.users.Authenticate(r.Context(), token)
+			if err == nil && session != nil {
+				if !s.validateCSRF(r, session, viaCookie) {
+					writeDetail(w, http.StatusForbidden, "CSRF 校验失败，请刷新页面后重试")
+					return "", false
+				}
+				namespace, ok := namespaceFromHeader(r)
+				if !ok {
+					writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
+					return "", false
+				}
+				return namespace, true
+			}
+		}
+	}
+
 	if s.settings.Token != "" && secureEqual(authorization, "Bearer "+s.settings.Token) {
 		namespace, ok := namespaceFromHeader(r)
 		if !ok {
@@ -81,8 +101,24 @@ func (s *Server) tenantFromHeaders(w http.ResponseWriter, r *http.Request) (stri
 	return "", false
 }
 
-// requireLocalAdmin enforces the local-only management boundary.
-func (s *Server) requireLocalAdmin(w http.ResponseWriter, r *http.Request) bool {
+// requireAdmin protects the management endpoints. An explicit login session is
+// always checked against its role (a normal user cannot borrow loopback trust);
+// requests without a session keep the local break-glass access used by dev
+// machine automation.
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if s.authEnabled() {
+		if session, viaCookie := s.requestSessionUser(r); session != nil {
+			if !s.validateCSRF(r, session, viaCookie) {
+				writeDetail(w, http.StatusForbidden, "CSRF 校验失败，请刷新页面后重试")
+				return false
+			}
+			if !session.User.IsAdmin() {
+				writeDetail(w, http.StatusForbidden, "需要管理员权限")
+				return false
+			}
+			return true
+		}
+	}
 	if localModelRequest(r) {
 		return true
 	}

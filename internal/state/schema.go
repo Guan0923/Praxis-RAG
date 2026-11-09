@@ -587,6 +587,38 @@ var schemaTables = []*SchemaTable{
 		},
 		Indexes: []SchemaIndex{index("ix_search_task_dispatch", "pending", "retry_at")},
 	},
+	// users + user_sessions back the Console login/registration flow. The
+	// password hash is a self-describing PBKDF2 string; session tokens are only
+	// stored as SHA-256 digests so a database leak cannot replay them.
+	{
+		Name: "users",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("username", 64),
+			varchar("password_hash", 255),
+			identifier("role", 16),
+			boolean("enabled"),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+			varchar("last_login_at", 40).Null(),
+		},
+		Uniques: []SchemaUnique{unique("uq_users_username", "username")},
+	},
+	{
+		Name: "user_sessions",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("user_id", 32),
+			identifier("token_digest", 64),
+			varchar("csrf_token", 64),
+			varchar("expires_at", 40),
+			varchar("created_at", 40),
+			varchar("last_seen_at", 40),
+			boolean("revoked"),
+		},
+		Uniques: []SchemaUnique{unique("uq_user_sessions_token_digest", "token_digest")},
+		Indexes: []SchemaIndex{index("ix_user_sessions_user_id", "user_id")},
+	},
 }
 
 // SchemaTables returns the schema tables in creation order. The returned slice

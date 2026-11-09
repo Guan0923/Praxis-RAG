@@ -50,7 +50,7 @@ REST `/v1/search`、Console 与本地调试同步执行。服务端 MCP `search`
 
 | 入口 | 能力 |
 | --- | --- |
-| Web Console：`/console` | 文档管理、检索调试、工作区切换和模型连接配置。 |
+| Web Console：`/console` | 账号登录/注册、用户与权限管理、文档管理、检索调试、工作区切换和模型连接配置。 |
 | MCP：`/mcp` | 搜索、添加/更新/删除文档、分页读取正文、提示词模板及订阅变更。 |
 | REST API：`/v1/*` | 知识管理与检索接入现有应用；`/openapi.json` 与 `/docs` 提供 OpenAPI 3.1 契约。 |
 
@@ -134,7 +134,11 @@ $env:RAG_STATE_ENCRYPTION_KEY = "base64:<32-byte-key>"
 - API 文档：`http://127.0.0.1:8011/docs`（机器可读：`/openapi.json`）
 - 健康检查：`http://127.0.0.1:8011/health`
 
-创建第一批 API Key（管理接口仅本机可访问）：
+### 创建管理员账号
+
+首次打开 Console 会显示登录页，切到"注册"创建账号，第一个账号自动成为管理员；之后可在"用户管理"页分配角色、启用/禁用或删除账号（始终保留至少一名启用状态的管理员）。自动化脚本继续使用 `RAG_SERVICE_TOKEN` 或 API Key，不受登录影响；也可以用 `RAG_AUTH_ENABLED=false` 关闭登录。详见 [docs/USAGE.md](docs/USAGE.md#用户登录与注册console)。
+
+创建第一批 API Key（管理接口仅本机可访问，或使用管理员登录会话远程访问）：
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `

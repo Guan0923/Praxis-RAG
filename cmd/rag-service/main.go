@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/apikeys"
+	"github.com/Guan0923/xinghe_rag/internal/auth"
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
@@ -105,6 +106,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	userAuth := auth.NewService(stores.Users, stores.Sessions, auth.Options{
+		RegistrationEnabled: serviceSettings.RegistrationEnabled,
+		SessionTTL:          serviceSettings.SessionTTL,
+	})
 	api := httpapi.New(serviceSettings, service, nil, logger,
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
@@ -114,6 +119,7 @@ func run() error {
 		httpapi.WithChangeNotifier(wire.Notifier{Endpoint: mcpEndpoint}),
 		httpapi.WithDocumentNotifier(wire.Notifier{Endpoint: mcpEndpoint}),
 		httpapi.WithMCPHandler(mcpHandler),
+		httpapi.WithUserAuth(userAuth),
 	)
 
 	address := net.JoinHostPort(serviceSettings.Host, strconv.Itoa(serviceSettings.Port))

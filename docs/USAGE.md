@@ -320,6 +320,25 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
 
 响应中的 `key` 只出现一次；后续请求带 `Authorization: Bearer <key>` 和 `X-RAG-Namespace: default`。也可直接使用 `RAG_SERVICE_TOKEN`（本地链接可用 Service Token 代替 API Key）。
 
+### 用户登录与注册（Console）
+
+Console 默认启用账号登录（`RAG_AUTH_ENABLED=true`）：
+
+1. 打开 `/console` 会进入登录页；切到"注册"创建账号，**第一个注册的账号自动成为管理员**。用户名不区分大小写（统一按小写保存）。
+2. 管理员在侧边栏"用户管理"页可以：把账号设为管理员/普通用户、启用/禁用、删除。系统始终保留至少一名启用状态的管理员（最后一个管理员不能被降级、禁用或删除）。
+3. 普通用户可检索、上传/删除文档、切换知识库；管理员额外可以管理知识库、API Key 和用户。
+
+会话使用 HttpOnly Cookie（`rag_session`）保存，默认有效期 7 天（`RAG_AUTH_SESSION_TTL_HOURS`），所有写操作要求 `X-CSRF-Token`（Console 自动带上）。判定规则：
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `RAG_AUTH_ENABLED` | `true` | 设为 `false` 关闭登录，Console 回到旧的本机/Token 模式 |
+| `RAG_AUTH_REGISTRATION` | `open` | `closed` 关闭自助注册（仍需先存在管理员） |
+| `RAG_AUTH_SESSION_TTL_HOURS` | `168` | 会话有效期（小时） |
+| `RAG_AUTH_COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true` |
+
+管理员会话可以让远程浏览器访问 `/v1/admin/*`（此前只允许本机）；自动化脚本继续使用 `RAG_SERVICE_TOKEN` 或 API Key，不受影响。
+
 ### 启动 worker
 
 ```powershell
@@ -349,8 +368,8 @@ worker 必须与 `rag-service` 使用**同一** `RAG_CONFIG_FILE`、`RAG_SERVICE
 
 ### 认证与命名空间
 
-- 普通 `/v1/*`、`/mcp`：`Authorization: Bearer <RAG_SERVICE_TOKEN 或 API Key>`；未设置 Token 时，本机 loopback 可直接使用 Headers 的 `X-RAG-Namespace` 访问普通租户接口。
-- `/v1/admin/*`：额外要求本机直连（loopback/无 Forwarded 代理头/同源 Origin），不接受远程管理。
+- 普通 `/v1/*`、`/mcp`：`Authorization: Bearer <RAG_SERVICE_TOKEN 或 API Key>`；未设置 Token 时，本机 loopback 可直接使用 Headers 的 `X-RAG-Namespace` 访问普通租户接口。Console 登录后也接受会话 Cookie（或 Bearer 会话 Token）。
+- `/v1/admin/*`：本机直连（loopback/无 Forwarded 代理头/同源 Origin）**或**登录管理员的会话（Cookie 写操作需 `X-CSRF-Token`）。
 - 所有租户接口都需要 `X-RAG-Namespace: <知识库>`；MCP 否则无法确定工作区。
 
 ```powershell

@@ -1,4 +1,21 @@
 export type Connection = { namespace: string; token: string };
+export type AuthUser = {
+  id: string;
+  username: string;
+  role: "admin" | "user";
+  enabled: boolean;
+  created_at?: string;
+  last_login_at?: string;
+};
+export type AuthStatus = {
+  auth_enabled: boolean;
+  registration_enabled: boolean;
+  authenticated: boolean;
+  user?: AuthUser;
+};
+export type AuthSession = { user: AuthUser; csrf_token: string; expires_at?: string };
+export type UserUpdate = { role: AuthUser["role"]; enabled: boolean };
+
 export type Strategy = {
   id: string;
   label: string;
@@ -121,11 +138,31 @@ export function readStorage(storage: Storage, key: string, fallback = "") {
   }
 }
 
+// csrfToken is the double-submit token of the current login session. It is
+// kept in memory only: the session cookie itself is HttpOnly.
+let csrfToken = "";
+let unauthorizedHandler: (() => void) | undefined;
+
+export function setCSRFToken(token: string) {
+  csrfToken = token;
+}
+
+export function currentCSRFToken() {
+  return csrfToken;
+}
+
+// setUnauthorizedHandler installs the fallback that runs when a request is
+// rejected because the session expired.
+export function setUnauthorizedHandler(handler: (() => void) | undefined) {
+  unauthorizedHandler = handler;
+}
+
 export async function apiResponse(
   path: string,
   connection?: Connection,
   options: RequestInit = {},
 ): Promise<Response> {
+  const method = (options.method || "GET").toUpperCase();
   const headers = new Headers(options.headers);
   if (!headers.has("Accept")) headers.set("Accept", "application/json");
   if (connection) {
@@ -133,10 +170,15 @@ export async function apiResponse(
     if (connection.token)
       headers.set("Authorization", `Bearer ${connection.token}`);
   }
+  if (csrfToken && method !== "GET" && method !== "HEAD")
+    headers.set("X-CSRF-Token", csrfToken);
   if (typeof options.body === "string")
     headers.set("Content-Type", "application/json");
-  const response = await fetch(path, { ...options, headers });
+  const response = await fetch(path, { ...options, headers, credentials: "same-origin" });
   if (response.ok) return response;
+  if (response.status === 401 && !path.startsWith("/v1/auth/"))
+    unauthorizedHandler?.();
+
   const body = await response.text();
   let detail = body || response.statusText;
   try {
@@ -157,6 +199,63 @@ export async function api<T>(
 ): Promise<T> {
   const response = await apiResponse(path, connection, options);
   return await response.json() as T;
+}
+
+// --- Console authentication -------------------------------------------------
+
+export async function fetchAuthStatus(): Promise<AuthStatus> {
+  return await api<AuthStatus>("/v1/auth/status", undefined, { cache: "no-store" });
+}
+
+export async function fetchCurrentUser(): Promise<AuthSession> {
+  const session = await api<AuthSession>("/v1/auth/me", undefined, { cache: "no-store" });
+  setCSRFToken(session.csrf_token);
+  return session;
+}
+
+export async function login(username: string, password: string): Promise<AuthSession> {
+  const session = await api<AuthSession>("/v1/auth/login", undefined, {
+    method: "POST",
+    body: JSON.stringify({ username, password }),
+  });
+  setCSRFToken(session.csrf_token);
+  return session;
+}
+
+export async function registerAccount(username: string, password: string): Promise<AuthSession> {
+  const session = await api<AuthSession>("/v1/auth/register", undefined, {
+    method: "POST",
+    body: JSON.stringify({ username, password }),
+  });
+  setCSRFToken(session.csrf_token);
+  return session;
+}
+
+export async function logoutSession() {
+  try {
+    await apiResponse("/v1/auth/logout", undefined, { method: "POST" });
+  } catch {
+    // Logout stays best effort; the local session is cleared regardless.
+  } finally {
+    setCSRFToken("");
+  }
+}
+
+export async function fetchUsers(): Promise<AuthUser[]> {
+  const payload = await api<{ users: AuthUser[] }>("/v1/admin/users", undefined, { cache: "no-store" });
+  return payload.users;
+}
+
+export async function updateUser(id: string, update: UserUpdate): Promise<AuthUser> {
+  const payload = await api<{ user: AuthUser }>(`/v1/admin/users/${encodeURIComponent(id)}`, undefined, {
+    method: "PATCH",
+    body: JSON.stringify(update),
+  });
+  return payload.user;
+}
+
+export async function deleteUser(id: string): Promise<void> {
+  await apiResponse(`/v1/admin/users/${encodeURIComponent(id)}`, undefined, { method: "DELETE" });
 }
 
 export function errorText(error: unknown): string {

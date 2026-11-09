@@ -61,7 +61,7 @@ func (s *Server) handleUploadStatusDetail(w http.ResponseWriter, r *http.Request
 // adminTenant enforces both the local-management boundary and tenant
 // credentials (Python's published-versions/upload-leases dependencies).
 func (s *Server) adminTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
-	if !s.requireLocalAdmin(w, r) {
+	if !s.requireAdmin(w, r) {
 		return "", false
 	}
 	return s.tenantFromHeaders(w, r)

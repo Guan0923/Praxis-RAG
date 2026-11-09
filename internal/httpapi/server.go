@@ -31,6 +31,13 @@ func WithCatalogStore(store catalog.Store) Option {
 	return func(s *Server) { s.catalog = store }
 }
 
+// WithUserAuth enables the Console login/registration flow and the
+// user-management endpoints. Without it the server keeps the legacy
+// token/loopback behaviour.
+func WithUserAuth(users UserAuth) Option {
+	return func(s *Server) { s.users = users }
+}
+
 // ChangeNotifier receives catalog mutations so the MCP layer can publish
 // tools/list_changed and prompts/list_changed notifications, plus document
 // mutations for resources/list_changed and resources/updated.
@@ -70,6 +77,8 @@ type Server struct {
 	tools       ToolRegistry
 	kbAdmin     KnowledgeBaseAdminRuntime
 	notifier    ChangeNotifier
+	users       UserAuth
+	limiter     *loginLimiter
 	docNotifier DocumentChangeNotifier
 	handler     http.Handler
 }
@@ -89,6 +98,7 @@ func New(settings config.ServiceSettings, status StatusProvider, keys KeyLookup,
 		keys:     keys,
 		logger:   logger,
 		router:   newRouter(),
+		limiter:  newLoginLimiter(),
 		webRoot:  resolveWebRoot(settings.WebRoot),
 	}
 	for _, option := range options {
@@ -129,12 +139,14 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/documents/{name}/content", authTenant, s.handleDocumentContent)
 	s.router.add("DELETE", "/v1/documents/{name}", authTenant, s.handleDeleteDocument)
 	s.router.add("GET", "/v1/knowledge-base", authTenant, s.handleKnowledgeBase)
+	s.router.add("GET", "/v1/namespaces", authTenant, s.handleNamespaceList)
 	s.router.add("GET", "/v1/uploads", authTenant, s.handleUploadStatusList)
 	s.router.add("GET", "/v1/uploads/{operation_id}", authTenant, s.handleUploadStatusDetail)
 	s.router.add("GET", "/v1/admin/published-versions", authNone, s.handlePublishedVersions)
 	s.router.add("GET", "/v1/admin/upload-leases", authNone, s.handleUploadLeases)
 	s.registerDocumentationRoutes()
 	s.registerKnowledgeBaseAdminRoutes()
+	s.registerUserAuthRoutes()
 	s.router.add("POST", "/mcp", authMCP, s.handleMCP)
 	s.router.add("GET", "/mcp", authMCP, s.handleMCP)
 	s.router.add("DELETE", "/mcp", authMCP, s.handleMCP)
@@ -200,7 +212,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, namespace))
 	case authAdmin:
-		if !s.requireLocalAdmin(recorder, r) {
+		if !s.requireAdmin(recorder, r) {
 			return
 		}
 	case authMCP:

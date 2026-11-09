@@ -7,7 +7,9 @@ import (
 )
 
 // expectedSchema is the literal port of src/rag_mcp/state/schema.py: the table
-// order and every column name must stay identical for existing databases.
+// order and every column name must stay identical for existing databases. The
+// users/user_sessions tables are Go-only additions (Console login) and must stay
+// after the ported tables so shared databases keep the Python order.
 var expectedSchema = []struct {
 	name    string
 	columns []string
@@ -32,6 +34,8 @@ var expectedSchema = []struct {
 	{"document_job_outbox", []string{"id", "artifact_id", "namespace", "name", "status", "attempts", "retry_at", "created_at", "published_at", "last_error"}},
 	{"search_tasks", []string{"result_id", "namespace", "arguments", "status", "stage", "attempts", "owner", "lease_until", "retry_at", "deadline", "created_at", "updated_at"}},
 	{"search_task_outbox", []string{"result_id", "pending", "generation", "retry_at"}},
+	{"users", []string{"id", "username", "password_hash", "role", "enabled", "created_at", "updated_at", "last_login_at"}},
+	{"user_sessions", []string{"id", "user_id", "token_digest", "csrf_token", "expires_at", "created_at", "last_seen_at", "revoked"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -55,6 +59,8 @@ var expectedPrimaryKeys = map[string][]string{
 	"document_job_outbox":     {"id"},
 	"search_tasks":            {"result_id"},
 	"search_task_outbox":      {"result_id"},
+	"users":                   {"id"},
+	"user_sessions":           {"id"},
 }
 
 var expectedUniques = map[string]string{
@@ -64,6 +70,8 @@ var expectedUniques = map[string]string{
 	"artifact_snapshots": "uq_artifact_identity",
 	"document_tasks":     "uq_document_task_idempotency",
 	"document_jobs":      "uq_document_job_idempotency",
+	"users":              "uq_users_username",
+	"user_sessions":      "uq_user_sessions_token_digest",
 }
 
 var expectedIndexes = map[string][]string{
@@ -80,6 +88,7 @@ var expectedIndexes = map[string][]string{
 	"document_job_outbox":     {"ix_document_job_outbox_pending", "ix_document_job_outbox_artifact", "ix_document_job_outbox_age"},
 	"search_tasks":            {"ix_search_tasks_deadline", "ix_search_tasks_recovery", "ix_search_tasks_namespace"},
 	"search_task_outbox":      {"ix_search_task_dispatch"},
+	"user_sessions":           {"ix_user_sessions_user_id"},
 }
 
 // expectedTableNames returns the schema table names in Python declaration order.

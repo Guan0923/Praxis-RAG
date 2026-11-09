@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // LoopbackHosts are the host names allowed to serve without a service token.
@@ -46,6 +47,15 @@ type ServiceSettings struct {
 	// WebRoot is the directory containing the built Console (index.html and
 	// assets). An empty value means "resolve a default location".
 	WebRoot string
+	// AuthEnabled turns on the Console login/registration flow. When it is
+	// false the Console keeps the legacy token/loopback behaviour.
+	AuthEnabled bool
+	// RegistrationEnabled allows self-service registration.
+	RegistrationEnabled bool
+	// SessionTTL is the lifetime of one login session.
+	SessionTTL time.Duration
+	// CookieSecure marks the session cookie Secure (set it behind HTTPS).
+	CookieSecure bool
 }
 
 // ServiceSettingsFromEnv loads the HTTP service settings, enforcing the same
@@ -102,15 +112,75 @@ func ServiceSettingsFromEnv() (ServiceSettings, error) {
 	}
 	dataRoot = ExpandPath(dataRoot)
 
+	authEnabled, err := boolSetting("RAG_AUTH_ENABLED", true)
+	if err != nil {
+		return ServiceSettings{}, err
+	}
+	registration, err := registrationSetting()
+	if err != nil {
+		return ServiceSettings{}, err
+	}
+	sessionTTL, err := hoursSetting("RAG_AUTH_SESSION_TTL_HOURS", 168)
+	if err != nil {
+		return ServiceSettings{}, err
+	}
+	cookieSecure, err := boolSetting("RAG_AUTH_COOKIE_SECURE", false)
+	if err != nil {
+		return ServiceSettings{}, err
+	}
+
 	return ServiceSettings{
-		Host:              host,
-		Port:              port,
-		DataRoot:          dataRoot,
-		Token:             emptyToZero(token),
-		MCPAllowedHosts:   allowedHosts,
-		MCPAllowedOrigins: allowedOrigins,
-		WebRoot:           strings.TrimSpace(os.Getenv("RAG_WEB_ROOT")),
+		Host:                host,
+		Port:                port,
+		DataRoot:            dataRoot,
+		Token:               emptyToZero(token),
+		MCPAllowedHosts:     allowedHosts,
+		MCPAllowedOrigins:   allowedOrigins,
+		WebRoot:             strings.TrimSpace(os.Getenv("RAG_WEB_ROOT")),
+		AuthEnabled:         authEnabled,
+		RegistrationEnabled: registration,
+		SessionTTL:          sessionTTL,
+		CookieSecure:        cookieSecure,
 	}, nil
+}
+
+// boolSetting parses one boolean environment flag.
+func boolSetting(name string, fallback bool) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseBool(strings.ToLower(raw))
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false", name)
+	}
+	return value, nil
+}
+
+// registrationSetting parses RAG_AUTH_REGISTRATION: "open" or "closed".
+func registrationSetting() (bool, error) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("RAG_AUTH_REGISTRATION")))
+	switch raw {
+	case "", "open":
+		return true, nil
+	case "closed":
+		return false, nil
+	default:
+		return false, fmt.Errorf("RAG_AUTH_REGISTRATION must be open or closed")
+	}
+}
+
+// hoursSetting parses a positive duration expressed in hours.
+func hoursSetting(name string, fallback int) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return time.Duration(fallback) * time.Hour, nil
+	}
+	hours, err := strconv.Atoi(raw)
+	if err != nil || hours < 1 || hours > 24*365 {
+		return 0, fmt.Errorf("%s must be an integer between 1 and 8760", name)
+	}
+	return time.Duration(hours) * time.Hour, nil
 }
 
 func csvSetting(raw string, set bool, defaults []string) ([]string, error) {

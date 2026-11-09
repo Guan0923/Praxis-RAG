@@ -751,3 +751,35 @@ h3 {
   gap: 4px;
   overflow-wrap: anywhere;
 }
+/* Login/registration screen and account controls. */
+.auth-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 32px 16px;
+  background: var(--surface);
+  color: var(--text);
+}
+.auth-card {
+  width: min(420px, 100%);
+}
+.auth-brand {
+  margin-bottom: 20px;
+}
+.auth-mode {
+  margin-bottom: 20px;
+}
+.auth-title {
+  margin: 0 0 4px !important;
+}
+.auth-description {
+  margin-bottom: 16px !important;
+}
+.account-button {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
