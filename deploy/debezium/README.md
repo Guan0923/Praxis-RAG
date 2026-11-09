@@ -20,7 +20,7 @@
 
 | 模式 | 谁把 `document_job_outbox` 的行变成 Kafka 消息 | 适用场景 |
 | --- | --- | --- |
-| `relay`（默认） | `rag-service` 进程内的 outbox relay 轮询 PENDING 行并发送 | SQLite、本地开发、没有 CDC 基础设施的部署 |
+| `relay`（默认） | `rag-service` 进程内的 outbox relay 轮询 PENDING 行并发送 | 本地开发、没有 CDC 基础设施的部署 |
 | `debezium` | Debezium Server 读取 MySQL binlog 中该表的 INSERT 事件并写入 Kafka | 生产环境：投递不依赖应用进程，事务提交即保证有投递 |
 
 两种模式**不能同时开启**，否则同一行会被投递两次。重复投递本身安全（worker 幂等），但会浪费 Kafka 容量并让排障变复杂。使用 `debezium` 时应用**不会**启动进程内 relay。

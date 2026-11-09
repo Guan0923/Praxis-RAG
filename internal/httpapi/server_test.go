@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,6 +17,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
 
 type fakeNotifier struct{ namespaces []string }
@@ -64,7 +64,7 @@ func newTestServer(t *testing.T, settings config.ServiceSettings, keys KeyLookup
 		"service":    "praxis-rag",
 		"backend":    "qdrant",
 		"collection": "test_hybrid",
-		"state":      map[string]any{"backend": "sqlite"},
+		"state":      map[string]any{"backend": "mysql"},
 	}}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return New(settings, status, keys, logger)
@@ -649,17 +649,20 @@ func strPtr(value string) *string { return &value }
 
 func newStateBackedServer(t *testing.T) *Server {
 	t.Helper()
-	root := t.TempDir()
-	settings := config.StateSettings{
-		URL:           "sqlite+pysqlite:///" + filepath.ToSlash(filepath.Join(root, "state.sqlite3")),
-		SQLitePath:    filepath.Join(root, "state.sqlite3"),
+	url, key := statetest.Connection(t)
+	stores, err := state.New(state.StateSettings{
+		URL:           url,
+		EncryptionKey: key,
 		AutoSchema:    true,
-		EncryptionKey: "base64:" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")),
-	}
-	stores, err := state.New(settings, true)
+		PoolSize:      10,
+		MaxOverflow:   20,
+		PoolRecycle:   1800,
+		PoolTimeout:   30,
+	}, true)
 	if err != nil {
-		t.Fatalf("state.New() error = %v", err)
+		t.Fatalf("state.New(MySQL) error = %v", err)
 	}
+	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return New(testSettings(""), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		WithAPIKeyStore(apikeys.New(stores.APIKeys)),

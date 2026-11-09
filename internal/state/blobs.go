@@ -11,12 +11,11 @@ import (
 // BlobStore is namespace-scoped, database-backed object storage. It is a port
 // of rag_mcp.state.blobs.BlobStore.
 type BlobStore struct {
-	db      *sql.DB
-	dialect Dialect
+	db *sql.DB
 }
 
-func newBlobStore(db *sql.DB, dialect Dialect) *BlobStore {
-	return &BlobStore{db: db, dialect: dialect}
+func newBlobStore(db *sql.DB) *BlobStore {
+	return &BlobStore{db: db}
 }
 
 const blobSelectContent = "SELECT content FROM blobs WHERE namespace = ? AND bucket = ? AND `key` = ?"

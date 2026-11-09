@@ -1,35 +1,17 @@
 // Package state is the Go port of rag_mcp.state: the authoritative shared
-// state database schema, its repositories, credential protection, and the
-// SQLite/MySQL store assembly.
+// state database schema, its repositories, credential protection, and the MySQL
+// store assembly.
 //
-// The schema is a literal transcription of src/rag_mcp/state/schema.py: table
-// names, column names, primary keys, unique constraints, index names, MySQL
-// table options (InnoDB/utf8mb4/utf8mb4_bin), and MySQL LONGTEXT/LONGBLOB
-// variants are kept identical so existing databases can be read in place.
+// MySQL is the only supported backend. The schema keeps table names, column
+// names, primary keys, unique constraints, index names, MySQL table options
+// (InnoDB/utf8mb4/utf8mb4_bin) and LONGTEXT/LONGBLOB types identical to the
+// Python implementation so existing databases can be read in place.
 package state
 
 import (
 	"fmt"
 	"strings"
 )
-
-// Dialect identifies the SQL flavor of the state database.
-type Dialect int
-
-const (
-	// DialectSQLite is the portable default (state.sqlite3 under the data root).
-	DialectSQLite Dialect = iota
-	// DialectMySQL is the production shared database.
-	DialectMySQL
-)
-
-// String renders the dialect name the way Settings.Describe does.
-func (d Dialect) String() string {
-	if d == DialectMySQL {
-		return "mysql"
-	}
-	return "sqlite"
-}
 
 // ColumnKind is the storage class of a schema column.
 type ColumnKind int
@@ -57,10 +39,11 @@ type SchemaColumn struct {
 	Kind ColumnKind
 	// Length is the VARCHAR length for ColumnVarchar.
 	Length int
-	// CaseSensitive mirrors schema.py::_ci_string: MySQL emits an explicit
-	// utf8mb4_bin collation (SQLite TEXT comparison is already case-sensitive).
+	// CaseSensitive emits an explicit utf8mb4_bin collation, mirroring
+	// schema.py::_ci_string.
 	CaseSensitive bool
-	// Large mirrors _long_text()/_long_blob(): LONGTEXT/LONGBLOB on MySQL.
+	// Large selects LONGTEXT/LONGBLOB instead of TEXT/BLOB, mirroring
+	// _long_text()/_long_blob().
 	Large bool
 	// AllowNull marks nullable columns (all others are NOT NULL).
 	AllowNull bool
@@ -101,7 +84,7 @@ type SchemaUnique struct {
 	Columns []string
 }
 
-// SchemaTable is one table definition that can render SQLite and MySQL DDL.
+// SchemaTable is one table definition rendered as MySQL DDL.
 type SchemaTable struct {
 	Name    string
 	Columns []SchemaColumn
@@ -139,35 +122,26 @@ func (t *SchemaTable) ColumnNames() []string {
 	return names
 }
 
-func quoteIdentifier(dialect Dialect, name string) string {
-	if dialect == DialectMySQL {
-		return "`" + name + "`"
-	}
-	return `"` + name + `"`
+func quoteIdentifier(name string) string {
+	return "`" + name + "`"
 }
 
-func (c SchemaColumn) sqlType(dialect Dialect) string {
+func (c SchemaColumn) sqlType() string {
 	switch c.Kind {
 	case ColumnVarchar:
-		if dialect == DialectMySQL && c.CaseSensitive {
+		if c.CaseSensitive {
 			return fmt.Sprintf("VARCHAR(%d) COLLATE utf8mb4_bin", c.Length)
 		}
 		return fmt.Sprintf("VARCHAR(%d)", c.Length)
 	case ColumnText:
-		if dialect == DialectMySQL && c.Large {
+		if c.Large {
 			return "LONGTEXT"
 		}
 		return "TEXT"
 	case ColumnBlob:
-		if dialect == DialectMySQL {
-			return "LONGBLOB"
-		}
-		return "BLOB"
+		return "LONGBLOB"
 	case ColumnBoolean:
-		if dialect == DialectMySQL {
-			return "BOOL"
-		}
-		return "BOOLEAN"
+		return "BOOL"
 	case ColumnBigInt:
 		return "BIGINT"
 	case ColumnInteger:
@@ -179,11 +153,11 @@ func (c SchemaColumn) sqlType(dialect Dialect) string {
 	}
 }
 
-func (c SchemaColumn) ddl(dialect Dialect) string {
+func (c SchemaColumn) ddl() string {
 	var builder strings.Builder
-	builder.WriteString(quoteIdentifier(dialect, c.Name))
+	builder.WriteString(quoteIdentifier(c.Name))
 	builder.WriteString(" ")
-	builder.WriteString(c.sqlType(dialect))
+	builder.WriteString(c.sqlType())
 	if !c.AllowNull {
 		builder.WriteString(" NOT NULL")
 	}
@@ -194,43 +168,40 @@ func (c SchemaColumn) ddl(dialect Dialect) string {
 	return builder.String()
 }
 
-// DDL renders the CREATE TABLE statement for the dialect.
-func (t *SchemaTable) DDL(dialect Dialect) string {
+// DDL renders the CREATE TABLE statement.
+func (t *SchemaTable) DDL() string {
 	parts := make([]string, 0, len(t.Columns)+len(t.Uniques)+1)
 	for _, column := range t.Columns {
-		parts = append(parts, "  "+column.ddl(dialect))
+		parts = append(parts, "  "+column.ddl())
 	}
 	if primary := t.PrimaryKey(); len(primary) > 0 {
 		quoted := make([]string, len(primary))
 		for index, name := range primary {
-			quoted[index] = quoteIdentifier(dialect, name)
+			quoted[index] = quoteIdentifier(name)
 		}
 		parts = append(parts, "  PRIMARY KEY ("+strings.Join(quoted, ", ")+")")
 	}
 	for _, unique := range t.Uniques {
 		quoted := make([]string, len(unique.Columns))
 		for index, name := range unique.Columns {
-			quoted[index] = quoteIdentifier(dialect, name)
+			quoted[index] = quoteIdentifier(name)
 		}
-		parts = append(parts, "  CONSTRAINT "+quoteIdentifier(dialect, unique.Name)+" UNIQUE ("+strings.Join(quoted, ", ")+")")
+		parts = append(parts, "  CONSTRAINT "+quoteIdentifier(unique.Name)+" UNIQUE ("+strings.Join(quoted, ", ")+")")
 	}
-	statement := "CREATE TABLE " + quoteIdentifier(dialect, t.Name) + " (\n" + strings.Join(parts, ",\n") + "\n)"
-	if dialect == DialectMySQL {
-		statement += " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
-	}
-	return statement
+	return "CREATE TABLE " + quoteIdentifier(t.Name) + " (\n" + strings.Join(parts, ",\n") + "\n)" +
+		" ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
 }
 
-// IndexDDL renders the CREATE INDEX statements for the dialect.
-func (t *SchemaTable) IndexDDL(dialect Dialect) []string {
+// IndexDDL renders the CREATE INDEX statements.
+func (t *SchemaTable) IndexDDL() []string {
 	statements := make([]string, 0, len(t.Indexes))
 	for _, index := range t.Indexes {
 		quoted := make([]string, len(index.Columns))
 		for position, name := range index.Columns {
-			quoted[position] = quoteIdentifier(dialect, name)
+			quoted[position] = quoteIdentifier(name)
 		}
-		statements = append(statements, "CREATE INDEX "+quoteIdentifier(dialect, index.Name)+
-			" ON "+quoteIdentifier(dialect, t.Name)+" ("+strings.Join(quoted, ", ")+")")
+		statements = append(statements, "CREATE INDEX "+quoteIdentifier(index.Name)+
+			" ON "+quoteIdentifier(t.Name)+" ("+strings.Join(quoted, ", ")+")")
 	}
 	return statements
 }

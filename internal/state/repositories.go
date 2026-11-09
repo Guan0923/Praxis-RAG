@@ -45,13 +45,12 @@ type APIKeyImport struct {
 // APIKeyRepository is the SQL implementation of ApiKeyRepository.
 type APIKeyRepository struct {
 	db            *sql.DB
-	dialect       Dialect
 	encryptionKey string
 	cacheSync     *CacheSynchronizer
 }
 
-func newAPIKeyRepository(db *sql.DB, dialect Dialect, encryptionKey string, cacheSync *CacheSynchronizer) *APIKeyRepository {
-	return &APIKeyRepository{db: db, dialect: dialect, encryptionKey: encryptionKey, cacheSync: cacheSync}
+func newAPIKeyRepository(db *sql.DB, encryptionKey string, cacheSync *CacheSynchronizer) *APIKeyRepository {
+	return &APIKeyRepository{db: db, encryptionKey: encryptionKey, cacheSync: cacheSync}
 }
 
 // flushPending refreshes the committed api_keys display cache; failures stay in
@@ -141,7 +140,7 @@ func (r *APIKeyRepository) Create(ctx context.Context, name string, namespaces [
 		return CreatedAPIKey{}, newStateError("API Key 无法保存")
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, r.dialect, apiKeyKeys()...); err != nil {
+	if _, err := touch(ctx, database, apiKeyKeys()...); err != nil {
 		return CreatedAPIKey{}, newStateError("API Key 无法保存")
 	}
 	_, err = database.ExecContext(ctx,
@@ -172,7 +171,7 @@ func (r *APIKeyRepository) Update(ctx context.Context, keyID, name string, names
 		return nil, newStateError("API Key 无法更新")
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, r.dialect, apiKeyKeys()...); err != nil {
+	if _, err := touch(ctx, database, apiKeyKeys()...); err != nil {
 		return nil, newStateError("API Key 无法更新")
 	}
 	result, err := database.ExecContext(ctx,
@@ -208,7 +207,7 @@ func (r *APIKeyRepository) Delete(ctx context.Context, keyID string) (bool, erro
 		return false, err
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, r.dialect, apiKeyKeys()...); err != nil {
+	if _, err := touch(ctx, database, apiKeyKeys()...); err != nil {
 		return false, err
 	}
 	result, err := database.ExecContext(ctx, "DELETE FROM api_keys WHERE id = ?", keyID)
@@ -297,7 +296,7 @@ func (r *APIKeyRepository) ImportRow(ctx context.Context, row APIKeyImport) erro
 		return err
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, r.dialect, apiKeyKeys()...); err != nil {
+	if _, err := touch(ctx, database, apiKeyKeys()...); err != nil {
 		return err
 	}
 	var existing string
@@ -340,12 +339,11 @@ type KnowledgeBaseSnapshot struct {
 // KnowledgeBaseRepository.
 type KnowledgeBaseRepository struct {
 	db        *sql.DB
-	dialect   Dialect
 	cacheSync *CacheSynchronizer
 }
 
-func newKnowledgeBaseRepository(db *sql.DB, dialect Dialect, cacheSync *CacheSynchronizer) *KnowledgeBaseRepository {
-	return &KnowledgeBaseRepository{db: db, dialect: dialect, cacheSync: cacheSync}
+func newKnowledgeBaseRepository(db *sql.DB, cacheSync *CacheSynchronizer) *KnowledgeBaseRepository {
+	return &KnowledgeBaseRepository{db: db, cacheSync: cacheSync}
 }
 
 // flushPending refreshes the committed knowledge-base display caches.
@@ -411,7 +409,7 @@ func (r *KnowledgeBaseRepository) Create(ctx context.Context, settings map[strin
 		return newStateError("知识库配置无法保存")
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, r.dialect, knowledgeKeys(namespace)...); err != nil {
+	if _, err := touch(ctx, database, knowledgeKeys(namespace)...); err != nil {
 		return newStateError("知识库配置无法保存")
 	}
 	_, err = database.ExecContext(ctx,
@@ -453,7 +451,7 @@ func (r *KnowledgeBaseRepository) Update(ctx context.Context, settings map[strin
 		return err
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, r.dialect, knowledgeKeys(namespace)...); err != nil {
+	if _, err := touch(ctx, database, knowledgeKeys(namespace)...); err != nil {
 		return err
 	}
 	result, err := database.ExecContext(ctx,
@@ -484,7 +482,7 @@ func (r *KnowledgeBaseRepository) Delete(ctx context.Context, namespace string) 
 		return false, err
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, r.dialect, knowledgeKeys(namespace)...); err != nil {
+	if _, err := touch(ctx, database, knowledgeKeys(namespace)...); err != nil {
 		return false, err
 	}
 	result, err := database.ExecContext(ctx,
@@ -558,12 +556,11 @@ type DocumentRecord struct {
 // DocumentRepository is the SQL implementation of DocumentRepository.
 type DocumentRepository struct {
 	db        *sql.DB
-	dialect   Dialect
 	cacheSync *CacheSynchronizer
 }
 
-func newDocumentRepository(db *sql.DB, dialect Dialect, cacheSync *CacheSynchronizer) *DocumentRepository {
-	return &DocumentRepository{db: db, dialect: dialect, cacheSync: cacheSync}
+func newDocumentRepository(db *sql.DB, cacheSync *CacheSynchronizer) *DocumentRepository {
+	return &DocumentRepository{db: db, cacheSync: cacheSync}
 }
 
 // flushPending refreshes the committed document display caches. Transactional
@@ -739,7 +736,7 @@ func (r *DocumentRepository) Upsert(ctx context.Context, namespace string, recor
 // UpsertTx writes one document inside the caller's transaction, like the
 // `conn=` keyword of DocumentRepository.upsert.
 func (r *DocumentRepository) UpsertTx(ctx context.Context, tx *sql.Tx, namespace string, record DocumentRecord) error {
-	if _, err := touch(ctx, tx, r.dialect, documentKeys(namespace)...); err != nil {
+	if _, err := touch(ctx, tx, documentKeys(namespace)...); err != nil {
 		return err
 	}
 	chunking := record.Chunking
@@ -818,7 +815,7 @@ func (r *DocumentRepository) Delete(ctx context.Context, namespace, name string)
 
 // DeleteTx soft-deletes one document inside the caller's transaction.
 func (r *DocumentRepository) DeleteTx(ctx context.Context, tx *sql.Tx, namespace, name string) (bool, error) {
-	if _, err := touch(ctx, tx, r.dialect, documentKeys(namespace)...); err != nil {
+	if _, err := touch(ctx, tx, documentKeys(namespace)...); err != nil {
 		return false, err
 	}
 	result, err := tx.ExecContext(ctx,
@@ -873,12 +870,11 @@ type CatalogTransform func(current *string) (data string, result any, changed bo
 // CatalogRepository is the SQL implementation of CatalogRepository.
 type CatalogRepository struct {
 	db        *sql.DB
-	dialect   Dialect
 	cacheSync *CacheSynchronizer
 }
 
-func newCatalogRepository(db *sql.DB, dialect Dialect, cacheSync *CacheSynchronizer) *CatalogRepository {
-	return &CatalogRepository{db: db, dialect: dialect, cacheSync: cacheSync}
+func newCatalogRepository(db *sql.DB, cacheSync *CacheSynchronizer) *CatalogRepository {
+	return &CatalogRepository{db: db, cacheSync: cacheSync}
 }
 
 // flushPending refreshes the committed catalog display cache.
@@ -912,13 +908,10 @@ func (r *CatalogRepository) Mutate(ctx context.Context, namespace string, transf
 	}
 	defer func() { _ = database.Rollback() }()
 	// Serialize first creation as well as later updates across nodes.
-	if _, err := touch(ctx, database, r.dialect, catalogKeys(namespace)...); err != nil {
+	if _, err := touch(ctx, database, catalogKeys(namespace)...); err != nil {
 		return nil, newStateError("MCP 配置无法保存")
 	}
-	query := "SELECT data FROM mcp_catalogs WHERE namespace = ?"
-	if r.dialect == DialectMySQL {
-		query += " FOR UPDATE"
-	}
+	query := "SELECT data FROM mcp_catalogs WHERE namespace = ? FOR UPDATE"
 	var current string
 	var currentPointer *string
 	err = database.QueryRowContext(ctx, query, namespace).Scan(&current)

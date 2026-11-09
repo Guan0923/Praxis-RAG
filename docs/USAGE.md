@@ -5,7 +5,7 @@
 ```text
 浏览器 ------------------------> /console
 MCP 客户端 -> /mcp ------------> rag-service ──> Qdrant
-REST /v1/* --------------------> rag-service ──> 共享状态库（MySQL / SQLite）
+REST /v1/* --------------------> rag-service ──> 共享状态库（MySQL）
                                              ├─> Redis（读模型缓存、搜索结果快照；可选，排队搜索快照需要）
                                              └─> Kafka（outbox relay / 搜索队列；可选）
 
@@ -27,7 +27,7 @@ RAG 只返回证据，不生成最终回答。后端为 Go 实现；Python 仅�
 | Go | 1.27+（`go.mod`） | 构建 `rag-service` 与全部命令 |
 | Node.js | 20.19+ 或 22.12+ | 构建 Console（只使用 API/MCP 可跳过） |
 | Qdrant | HTTP API（默认 `6333`） | 检索索引；Go **不支持** `QDRANT_PATH` 本地文件模式 |
-| 共享状态库 | MySQL 8.0+（`utf8mb4`）或 SQLite | 文档、KB、API Key、任务、发件箱、UploadJournal |
+| 共享状态库 | MySQL 8.0+（`utf8mb4`） | 文档、KB、API Key、任务、发件箱、UploadJournal |
 | Redis | 可选，7.x | 搜索结果快照、读模型缓存；排队 MCP 搜索的快照读取必需（搜索任务状态在共享状态库） |
 | Kafka | 可选，单节点 KRaft（Compose `kafka`）或外部集群 | 异步文档通知、排队搜索；可用 SASL/TLS 环境变量连接外部集群，Compose 本身只提供 PLAINTEXT |
 | 外部解析器 | 可选 | PDF（Docling Python 环境/模型）、DOC（LibreOffice）；**不包含在 Go 二进制或镜像中** |
@@ -66,7 +66,7 @@ dist/bin/rag-mcp-ingest(.exe)        # 本地文件/目录批量导入，见 §7
 dist/web/                            # Console（服务通过 RAG_WEB_ROOT 读取）
 ```
 
-脚本默认把 Console 复制到 `dist/web`；直接运行 `dist/bin/rag-service` 时请设置 `RAG_WEB_ROOT=<repo>/dist/web`，否则服务只探测当前目录/可执行文件邻居的 `web` 或 `build/web`。构建脚本的 smoke 模式会自动设置临时端口、临时 config 与 SQLite 数据目录。
+脚本默认把 Console 复制到 `dist/web`；直接运行 `dist/bin/rag-service` 时请设置 `RAG_WEB_ROOT=<repo>/dist/web`，否则服务只探测当前目录/可执行文件邻居的 `web` 或 `build/web`。构建脚本的 smoke 模式会自动设置临时端口、临时 config 与数据目录。
 
 ### 前端构建与开发
 
@@ -112,7 +112,7 @@ docker run -d --name praxis-qdrant -p 6333:6333 -p 6334:6334 `
   -v praxis_qdrant_data:/qdrant/storage qdrant/qdrant:latest
 ```
 
-本地开发可不启动 MySQL，服务会使用 `RAG_SERVICE_DATA_ROOT/state.sqlite3`（默认 `~/.praxis-rag/data/state.sqlite3`）。生产请使用 MySQL，并设置 `RAG_STATE_ENCRYPTION_KEY` 以便多实例解密模型 Key。
+状态库只有 MySQL 一种后端，本地开发也必须先把 MySQL 跑起来（`start-stack.ps1` 会拉起 broker 与数据库容器）；未配置 `RAG_STATE_URL` / `RAG_MYSQL_*` 时服务直接启动失败，不会回退到本地文件。请设置 `RAG_STATE_ENCRYPTION_KEY` 以便多实例解密模型 Key。
 
 ## 3. 配置
 
@@ -154,7 +154,7 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_SERVICE_HOST` | `127.0.0.1` | 绑定地址；非 loopback 时必须提供 token 与 MCP 白名单 |
 | `RAG_SERVICE_PORT` | `8011` | HTTP 端口 |
 | `RAG_SERVICE_TOKEN` | 空 | Service Token；非 loopback 宿主强制要求，客户端用 `Authorization: Bearer` |
-| `RAG_SERVICE_DATA_ROOT` | `~/.praxis-rag/data` | SQLite 状态库与上传恢复工作区根目录 |
+| `RAG_SERVICE_DATA_ROOT` | `~/.praxis-rag/data` | 上传恢复工作区根目录 |
 | `RAG_WEB_ROOT` | 空（自动探测） | Console 构建目录；`dist/web` 或 `/app/web` |
 | `RAG_MCP_ALLOWED_HOSTS` | `127.0.0.1,127.0.0.1:*,localhost,localhost:*,[::1],[::1]:*` | MCP Host 白名单（逗号分隔） |
 | `RAG_MCP_ALLOWED_ORIGINS` | 对应 loopback `http` 来源 | MCP Origin 白名单 |
@@ -191,8 +191,8 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RAG_STATE_URL` | 空 | 显式 SQLAlchemy 风格 URL，优先级最高：`mysql+pymysql://...`、`sqlite+pysqlite:///...` |
-| `RAG_MYSQL_HOST` | 空 | 未设置 `RAG_STATE_URL` 时，设置该变量即选择 MySQL 后端 |
+| `RAG_STATE_URL` | 空 | 显式 MySQL URL，优先级最高：`mysql+pymysql://...`；非 MySQL 的 scheme 会被拒绝 |
+| `RAG_MYSQL_HOST` | 空 | 未设置 `RAG_STATE_URL` 时使用这组变量拼出 MySQL 连接 |
 | `RAG_MYSQL_PORT` | `3306` | MySQL 端口 |
 | `RAG_MYSQL_USER` / `RAG_MYSQL_PASSWORD` | `rag` / 空 | MySQL 账号；密码只从环境读取 |
 | `RAG_MYSQL_DATABASE` | `praxis_rag` | 数据库名 |
@@ -205,7 +205,7 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_UPLOAD_LEASE_SECONDS` | `120` | 上传事务业务租约时长 |
 | `RAG_UPLOAD_CLEANUP_DELAY_SECONDS` | `3600` | 已完成上传工作区清理延迟 |
 
-SQLite 路径为 `<RAG_SERVICE_DATA_ROOT>/state.sqlite3`；未配置 MySQL/URL 时自动使用。已有 SQLite 或旧数据先用 §7 的 CLI 检查/建表。
+`RAG_SERVICE_DATA_ROOT` 只决定上传恢复工作区等本地文件的位置，不再决定数据库。两项都未配置时启动报错；表结构可用 §7 的 `rag-state-migrate` 检查/建表。
 
 ### Redis、搜索结果快照
 
@@ -333,7 +333,7 @@ worker 必须与 `rag-service` 使用**同一** `RAG_CONFIG_FILE`、`RAG_SERVICE
 
 ### 冒烟检查
 
-1. `GET /health` 返回 `status=ok`，`backend=qdrant`，`state` 显示实际 SQLite/MySQL。
+1. `GET /health` 返回 `status=ok`，`backend=qdrant`，`state` 显示 MySQL 后端。
 2. `/console` 返回 Console 页面（构建了 `dist/web` 且 `RAG_WEB_ROOT` 正确时）。
 3. REST `/v1/documents` 需要认证，未认证返回 401。
 4. MCP 初始化成功，`tools/list` 返回 6 个工具。
@@ -503,7 +503,7 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 | `search` | `query`、`retrieval`、`rerank`、`candidate_k`、`top_k`、`filters`；配置 Kafka 时还有 `wait_seconds` | 检索；排队模式下超时只返回 `result_id` |
 | `get_search_result` | `result_id`、`page`、`page_size` | 读取排队状态或结果分页；不重复检索 |
 | `add_document` | `name` + `content`/`content_base64`，可选 `idempotency_key` | 异步入库，成功只返回 `artifact_id` |
-| `get_document_status` | `artifact_id` | 查询 `status/stage/error`，状态在 MySQL/SQLite |
+| `get_document_status` | `artifact_id` | 查询 `status/stage/error`，状态在 MySQL |
 | `update_document` | `name` + `content`/`content_base64`，可选 `idempotency_key` | 同步替换并重建索引 |
 | `delete_document` | `name` | 同步逻辑删除 |
 
@@ -627,8 +627,8 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 
 - `go build ./...` 全部通过；`go test -count=1 ./...` 全部通过（包数与用例数随代码演进：迁移闭环时为 24 个有测试的包，含 state/runtime/workers/httpapi/mcp/searchrefs/检索栈等）。
 - `scripts/build-go.ps1` 本机构建 + 冒烟：`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200。POSIX 的 `scripts/build-go.sh`/`make` 未在当前 Windows 验证环境执行。
-- 三个 worker 二进制 `--help`、无 Kafka、错误 backend、非法 `--kind` 的退出码行为；文档 worker 本地模式可启动并创建 SQLite 状态。
-- Go 端 REST/MCP/检索/文档/资产投影/`document.md` 预览/上传事务的单元与集成测试（真实 SQLite + fake Qdrant/model）。
+- 三个 worker 二进制 `--help`、无 Kafka、错误 backend、非法 `--kind` 的退出码行为；文档 worker 本地模式可启动并连接 MySQL 状态。
+- Go 端 REST/MCP/检索/文档/资产投影/`document.md` 预览/上传事务的单元与集成测试（真实 MySQL + fake Qdrant/model）。
 
 **未验证**（不要据此宣称生产就绪）：
 
@@ -644,8 +644,11 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 ```powershell
 gofmt -l internal cmd
 go vet ./...
-go test -count=1 ./...
 go build ./...
+
+# 测试需要一次性 MySQL schema（库名必须含 test），不会回退 SQLite
+$env:RAG_TEST_MYSQL_URL = 'mysql+pymysql://rag:change-me@127.0.0.1:3307/praxis_unit_test?charset=utf8mb4'
+go test -count=1 ./...
 
 # 只跑某一部分
 go test -count=1 ./internal/runtime/...
@@ -672,7 +675,7 @@ Go 服务会在 ingest 阶段以子进程方式调用 `rag_mcp.pdf_worker` / `ra
 - **排队搜索**：`RAG_KAFKA_BOOTSTRAP_SERVERS` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 Kafka。
 - **REST 上传/更新/删除**仍同步执行，大文件索引期间请求会等待；异步只用于 MCP `add_document`。
 - **管理边界**：`/v1/admin/*` 仅本机直连；没有账户体系或细粒度多用户权限；工作区不是权限隔离。
-- **数据**：旧 SQLite 状态用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。
+- **数据**：状态表用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。
 - 具体契约差异（cached read views、静态目录列表等剩余的 P1/P2）见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。
 
 

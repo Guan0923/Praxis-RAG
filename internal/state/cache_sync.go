@@ -131,18 +131,12 @@ func (c *CacheSynchronizer) snapshot(ctx context.Context, kind, scope string, lo
 		return 0, nil, err
 	}
 	defer func() { _ = transaction.Rollback() }()
-	insert := "INSERT OR IGNORE INTO cache_revisions (kind, scope, revision) VALUES (?, ?, 0)"
-	if c.stores.Dialect() == DialectMySQL {
-		insert = "INSERT INTO cache_revisions (kind, scope, revision) VALUES (?, ?, 0) " +
-			"ON DUPLICATE KEY UPDATE revision = revision"
-	}
+	insert := "INSERT INTO cache_revisions (kind, scope, revision) VALUES (?, ?, 0) " +
+		"ON DUPLICATE KEY UPDATE revision = revision"
 	if _, err := transaction.ExecContext(ctx, insert, kind, scope); err != nil {
 		return 0, nil, err
 	}
-	query := "SELECT revision FROM cache_revisions WHERE kind = ? AND scope = ?"
-	if c.stores.Dialect() == DialectMySQL {
-		query += " FOR UPDATE"
-	}
+	query := "SELECT revision FROM cache_revisions WHERE kind = ? AND scope = ? FOR UPDATE"
 	var revision int64
 	if err := transaction.QueryRowContext(ctx, query, kind, scope).Scan(&revision); err != nil {
 		return 0, nil, err

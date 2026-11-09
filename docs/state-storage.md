@@ -3,8 +3,8 @@
 
 
 Praxis-RAG keeps the retrieval index in Qdrant and permanent published data in
-one shared relational database. The production target is MySQL 8.0+; a SQLite
-file is still accepted for local development and the test suite. MySQL is the
+one shared MySQL 8.0+ database. MySQL is the only supported backend: there is
+no SQLite file fallback for development, tests or production. MySQL is the
 single source of truth for asynchronous document ingestion: the complete job
 (file bytes included), its status and the outbox notification commit in one
 transaction. Kafka carries identifiers only for documents; Redis holds
@@ -36,8 +36,9 @@ notification; without it, the in-process relay polls the outbox.
 | Consumer retries and dead-letter publishing | Kafka consumer in the worker processes (in-process retry; explicit RAG_*_DLQ_TOPIC; not SQL task scheduling) |
 | Legacy MCP tasks, dispatch and search results | `document_tasks`, `document_task_outbox`, `search_tasks`, `search_task_outbox`, `search_result_snapshots`; retained, inactive, not migrated |
 
-`RAG_SERVICE_DATA_ROOT` remains the default location only for the local
-`state.sqlite3` fallback; it is no longer the authoritative document store.
+`RAG_SERVICE_DATA_ROOT` only locates local service files such as the upload
+recovery workspace; the database is always reached through `RAG_STATE_URL` or
+the `RAG_MYSQL_*` variables.
 
 ## Configuration
 
@@ -156,7 +157,7 @@ from `document_jobs` and reuses the same upload journal to parse, index and publ
 
 Delivery mode is chosen by `RAG_OUTBOX_BRIDGE` (two mutually exclusive modes):
 
-- `relay` (default; used for SQLite and deployments without a CDC pipeline): the
+- `relay` (default; used for deployments without a CDC pipeline): the
   API process runs `DocumentOutboxRelay`, which makes one best-effort publish
   right after commit, then polls `PENDING` outbox rows every 2 seconds, publishes
   each notification to Kafka and marks the row `PUBLISHED`. Failures leave the
@@ -331,29 +332,15 @@ not a substitute for the journaled HTTP/MCP upload path.
 
 ## Migration
 
-Run the migration on a machine that can still read the old secrets (DPAPI-bound
-keys require the original Windows account):
+There is no SQLite importer any more: the state database is MySQL and
+`rag-state-migrate` only verifies (default) or creates (`--apply`) the state
+schema. Legacy knowledge sources are imported separately by
+`rag-service-migrate --legacy-root <dir>` (preview by default, `--apply` to
+write), which re-uploads the source files instead of copying vectors.
 
-```powershell
-rag-state-migrate --legacy-root ~/.praxis-rag/data
-rag-state-migrate --legacy-root ~/.praxis-rag/data --apply
-```
-
-The first command is a read-only dry run. `--apply` imports:
-
-- `api-keys.sqlite3` (`id`, `digest`, assignments and protected key);
-- `knowledge-bases.sqlite3` (settings JSON, re-encrypted with the new key);
-- `<namespace>/manifest.json` plus `<namespace>/knowledge/*` source files;
-- `<namespace>/knowledge/.pdf-assets/<document_id>` and `.word-assets`;
-- `<namespace>/mcp_catalog.json`.
-
-The command is idempotent and does not delete the legacy files. Use `--force` to
-overwrite document records already present in the target and `--skip-assets` to
-skip artifact copy. Warnings are printed for records that cannot be decrypted or
-whose source file is missing; any warning makes the command exit nonzero.
-
-Keep `api-keys.sqlite3`, `knowledge-bases.sqlite3` and the tenant directories as
-a rollback copy until a MySQL deployment has been verified.
+Existing deployments whose data still lives in `state.sqlite3` must import it
+with the last release that shipped the SQLite importer, then point
+`RAG_STATE_URL` at MySQL before upgrading to this version.
 
 ## Knowledge-base index publication
 
@@ -401,7 +388,9 @@ retry. HTTP response delivery itself is outside the publication transaction.
 go test -count=1 ./internal/state/... ./internal/qdrant/...
 ```
 
-The default tests use SQLite and in-memory Qdrant without inference. Historical
+The Go suite runs against a disposable MySQL schema and in-memory Qdrant without
+inference: export RAG_TEST_MYSQL_URL (the database name must contain 	est) and
+run go test -p 1 ./...; packages serialize through a MySQL advisory lock. Historical
 Python live suites (including `RAG_TEST_MYSQL_URL`/`RAG_TEST_QDRANT_URL` runs) were
 removed with the Python backend; current Kafka/MySQL/Debezium live verification is
 recorded in [GO_MIGRATION](GO_MIGRATION.md) and [VALIDATION](../VALIDATION.md).

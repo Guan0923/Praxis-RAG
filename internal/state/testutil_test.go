@@ -7,9 +7,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
 
 // stateEnvKeys are the environment variables the state layer reads.
@@ -99,16 +100,27 @@ func useTestEncryptionKey(t *testing.T) {
 	t.Setenv(EncryptionKeyEnv, testEncryptionKey)
 }
 
-// newTestStores opens a fresh SQLite store under t.TempDir with portable
-// encryption enabled, mirroring the tests/test_state_store.py fixture.
+// newTestStores opens the shared MySQL test schema with portable encryption
+// enabled, truncating it first. It replaces the SQLite temp-file fixture.
 func newTestStores(t *testing.T) *Stores {
 	t.Helper()
 	isolateStateEnv(t)
 	useTestEncryptionKey(t)
-	stores, err := Create(filepath.Join(t.TempDir(), "state"))
+	url, key := statetest.Connection(t)
+	t.Setenv("RAG_STATE_URL", url)
+	stores, err := New(StateSettings{
+		URL:           url,
+		EncryptionKey: key,
+		AutoSchema:    true,
+		PoolSize:      10,
+		MaxOverflow:   20,
+		PoolRecycle:   1800,
+		PoolTimeout:   30,
+	}, true)
 	if err != nil {
-		t.Fatalf("Create() error = %v", err)
+		t.Fatalf("New(MySQL) error = %v", err)
 	}
+	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return stores
 }
@@ -195,20 +207,10 @@ func mysqlTestURL(t *testing.T) string {
 	return raw
 }
 
-// openMySQLTestStores opens the shared MySQL test database. Cases that need it
-// are skipped unless RAG_TEST_MYSQL_URL is set, matching the Python opt-in.
+// openMySQLTestStores opens the shared MySQL test database.
 func openMySQLTestStores(t *testing.T) *Stores {
 	t.Helper()
-	url := mysqlTestURL(t)
-	isolateStateEnv(t)
-	t.Setenv("RAG_STATE_URL", url)
-	useTestEncryptionKey(t)
-	stores, err := Create(t.TempDir())
-	if err != nil {
-		t.Fatalf("Create(MySQL) error = %v", err)
-	}
-	t.Cleanup(func() { _ = stores.Close() })
-	return stores
+	return newTestStores(t)
 }
 
 // closeRows is a small helper used by tests that scan raw rows.
@@ -216,5 +218,39 @@ func closeRows(t *testing.T, rows *sql.Rows) {
 	t.Helper()
 	if err := rows.Close(); err != nil {
 		t.Fatalf("rows.Close() error = %v", err)
+	}
+}
+
+// dropStateTables removes every base table of the test schema so a test can
+// verify that the store creates them again.
+func dropStateTables(t *testing.T, stores *Stores) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := stores.DB.QueryContext(ctx,
+		"SELECT table_name FROM information_schema.tables "+
+			"WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'")
+	if err != nil {
+		t.Fatalf("listing state tables: %v", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			t.Fatalf("scanning state table name: %v", err)
+		}
+		tables = append(tables, name)
+	}
+	closeRows(t, rows)
+	if _, err := stores.DB.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 0"); err != nil {
+		t.Fatalf("disabling foreign key checks: %v", err)
+	}
+	for _, name := range tables {
+		if _, err := stores.DB.ExecContext(ctx, "DROP TABLE `"+name+"`"); err != nil {
+			t.Fatalf("dropping %s: %v", name, err)
+		}
+	}
+	if _, err := stores.DB.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 1"); err != nil {
+		t.Fatalf("enabling foreign key checks: %v", err)
 	}
 }

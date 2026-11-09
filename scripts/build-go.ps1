@@ -10,7 +10,8 @@ Steps:
      npm run build (vite writes to build/web), copied to dist/web.
   2. Go: every cmd/*/main.go entrypoint is built into dist/bin.
   3. Smoke: rag-service starts on a free loopback port with a temporary config
-     and SQLite state, then the script polls /health and checks that /console
+     and the MySQL URL from -StateURL (default $env:RAG_TEST_MYSQL_URL), then the
+     script polls /health and checks that /console
      and / serve the built Console index. The process is always stopped and the
      temporary directory removed.
   4. Optional -Test runs `go test ./...`.
@@ -37,6 +38,9 @@ param(
     [switch]$Test,
     # Force a fresh `npm ci` even when frontend/node_modules exists.
     [switch]$FreshFrontendDeps,
+    # MySQL URL for the smoke run; it must name a disposable schema (the name
+    # contains "test"). Defaults to $env:RAG_TEST_MYSQL_URL.
+    [string]$StateURL = $env:RAG_TEST_MYSQL_URL,
     # Seconds to wait for /health before failing the smoke check.
     [int]$SmokeTimeoutSeconds = 30
 )
@@ -164,7 +168,7 @@ try {
         $port = Get-FreeLoopbackPort
         # Keep the smoke workspace inside the repository: the Windows agent
         # sandbox lets the spawned service write here, while %TEMP% writes from a
-        # child process can fail with SQLite "unable to open database file".
+        # child process can fail on paths outside the workspace.
         $smokeRoot = Join-Path $root ".test-tmp"
         New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
         $tempDir = Join-Path $smokeRoot ("smoke-" + [guid]::NewGuid().ToString("N"))
@@ -200,6 +204,11 @@ try {
             Set-ProcessEnvironment "RAG_SERVICE_HOST" "127.0.0.1"
             Set-ProcessEnvironment "RAG_SERVICE_PORT" ([string]$port)
             Set-ProcessEnvironment "RAG_SERVICE_DATA_ROOT" $dataRoot
+            if ([string]::IsNullOrWhiteSpace($StateURL)) {
+                throw "Smoke needs MySQL: pass -StateURL or set RAG_TEST_MYSQL_URL to a disposable schema"
+            }
+            Set-ProcessEnvironment "RAG_STATE_URL" $StateURL
+            Set-ProcessEnvironment "RAG_STATE_ENCRYPTION_KEY" "base64:a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s="
             Set-ProcessEnvironment "RAG_WEB_ROOT" $webDir
             Set-ProcessEnvironment "QDRANT_URL" "http://127.0.0.1:6333"
 

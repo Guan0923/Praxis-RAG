@@ -616,7 +616,7 @@ func (s *SearchTasks) Expire(ctx context.Context, limit int) (int, error) {
 		placeholders[index] = "?"
 		updateArguments = append(updateArguments, resultID)
 	}
-	updateArguments = append(updateArguments, now, SearchTaskQueued, SearchTaskProcessing)
+	updateArguments = append(updateArguments, SearchTaskQueued, SearchTaskProcessing)
 	result, err := s.stores.DB.ExecContext(ctx,
 		"UPDATE search_tasks SET status = ?, stage = ?, owner = NULL, lease_until = 0, updated_at = ? "+
 			"WHERE result_id IN ("+strings.Join(placeholders, ", ")+") AND status IN (?, ?)",

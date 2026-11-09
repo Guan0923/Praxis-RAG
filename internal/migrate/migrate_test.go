@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
 
 func TestNamespaceForLegacyUser(t *testing.T) {
@@ -117,10 +118,19 @@ func TestBuildPlanAndApplyIdempotency(t *testing.T) {
 }
 
 func TestStateSchemaStatusAndEnsure(t *testing.T) {
-	settings, err := state.SettingsFromEnv(t.TempDir())
-	if err != nil {
-		t.Fatalf("SettingsFromEnv() error = %v", err)
+	url, key := statetest.Connection(t)
+	settings := state.StateSettings{
+		URL: url, EncryptionKey: key, AutoSchema: true,
+		PoolSize: 10, MaxOverflow: 20, PoolRecycle: 1800, PoolTimeout: 30,
 	}
+	seed, err := state.New(settings, true)
+	if err != nil {
+		t.Fatalf("state.New(MySQL) error = %v", err)
+	}
+	statetest.Prepare(t, seed.DB)
+	dropSchemaTables(t, seed)
+	_ = seed.Close()
+
 	missing, err := StateSchemaStatus(context.Background(), settings)
 	if err != nil {
 		t.Fatalf("StateSchemaStatus() error = %v", err)
@@ -141,16 +151,52 @@ func TestStateSchemaStatusAndEnsure(t *testing.T) {
 	}
 }
 
+// dropSchemaTables removes every state table so the schema-status test can start
+// from an empty database.
+func dropSchemaTables(t *testing.T, stores *state.Stores) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := stores.DB.QueryContext(ctx,
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'")
+	if err != nil {
+		t.Fatalf("listing tables: %v", err)
+	}
+	var tables []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			_ = rows.Close()
+			t.Fatalf("scanning table name: %v", err)
+		}
+		tables = append(tables, name)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("closing rows: %v", err)
+	}
+	if _, err := stores.DB.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 0"); err != nil {
+		t.Fatalf("disabling foreign key checks: %v", err)
+	}
+	for _, name := range tables {
+		if _, err := stores.DB.ExecContext(ctx, "DROP TABLE `"+name+"`"); err != nil {
+			t.Fatalf("dropping %s: %v", name, err)
+		}
+	}
+	if _, err := stores.DB.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 1"); err != nil {
+		t.Fatalf("enabling foreign key checks: %v", err)
+	}
+}
+
 func newMigrateStores(t *testing.T) *state.Stores {
 	t.Helper()
-	settings, err := state.SettingsFromEnv(t.TempDir())
+	url, key := statetest.Connection(t)
+	stores, err := state.New(state.StateSettings{
+		URL: url, EncryptionKey: key, AutoSchema: true,
+		PoolSize: 10, MaxOverflow: 20, PoolRecycle: 1800, PoolTimeout: 30,
+	}, true)
 	if err != nil {
-		t.Fatalf("SettingsFromEnv() error = %v", err)
+		t.Fatalf("state.New(MySQL) error = %v", err)
 	}
-	stores, err := state.New(settings, true)
-	if err != nil {
-		t.Fatalf("state.New() error = %v", err)
-	}
+	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return stores
 }

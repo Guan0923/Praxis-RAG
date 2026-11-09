@@ -19,9 +19,9 @@ Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可
 
 ### 文档导入与管理
 
-支持 Markdown、TXT、PDF、DOCX，以及安装 LibreOffice 后的 DOC。网页/REST 上传与 MCP `update_document`、`delete_document` 为同步请求；MCP `add_document` 为异步：在共享状态数据库（生产 MySQL，本地可 SQLite）的一个事务内写入完整任务与发件箱通知，**提交成功即返回 `artifact_id`**，由 `rag-document-worker` 完成解析与索引。每批最多 10 个文件，单文件最大 10 MiB。
+支持 Markdown、TXT、PDF、DOCX，以及安装 LibreOffice 后的 DOC。网页/REST 上传与 MCP `update_document`、`delete_document` 为同步请求；MCP `add_document` 为异步：在共享状态数据库（MySQL）的一个事务内写入完整任务与发件箱通知，**提交成功即返回 `artifact_id`**，由 `rag-document-worker` 完成解析与索引。每批最多 10 个文件，单文件最大 10 MiB。
 
-相同内容与切分配置的重复上传会跳过；`add_document` 不覆盖同名文档，替换请用 `update_document`。状态用 `get_document_status` 轮询，终态为 `succeeded` / `failed`，状态在 MySQL/SQLite，不依赖 Redis TTL。
+相同内容与切分配置的重复上传会跳过；`add_document` 不覆盖同名文档，替换请用 `update_document`。状态用 `get_document_status` 轮询，终态为 `succeeded` / `failed`，状态在 MySQL，不依赖 Redis TTL。
 
 ### PDF 与 Word 解析
 
@@ -58,7 +58,7 @@ MCP 需要 `Authorization: Bearer <service token 或 API Key>` 与 `X-RAG-Namesp
 
 ### 独立部署与模型状态
 
-Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档任务与发件箱、UploadJournal、文档清单、知识库配置、MCP 配置和 API Key 保存在共享状态数据库（生产 MySQL，本地 SQLite）；排队搜索任务状态也在状态库，结果快照与展示缓存放 Redis；Kafka 传递异步通知和排队搜索请求。Embedding / Reranker 通过模型 API 调用，服务本身不加载模型权重。
+Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档任务与发件箱、UploadJournal、文档清单、知识库配置、MCP 配置和 API Key 保存在共享状态数据库（MySQL）；排队搜索任务状态也在状态库，结果快照与展示缓存放 Redis；Kafka 传递异步通知和排队搜索请求。Embedding / Reranker 通过模型 API 调用，服务本身不加载模型权重。
 
 ## 快速开始（Go 后端）
 
@@ -67,7 +67,7 @@ Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档任�
 - **Go 1.27+**（`go.mod` 要求；构建服务与 worker 必需）
 - **Node.js 20.19+ / 22.12+**（仅构建 Console；不构建前端时可跳过）
 - **Qdrant**（HTTP 模式；Go 不支持 `QDRANT_PATH` 本地文件模式）
-- **共享状态库**：生产 MySQL 8（`utf8mb4`），本地可省略并使用 `~/.praxis-rag/data/state.sqlite3`
+- **共享状态库**：MySQL 8（`utf8mb4`），必须配置 `RAG_STATE_URL` 或 `RAG_MYSQL_*`，不再提供本地文件回退
 - **可选**：Redis（搜索快照/缓存）、Kafka（异步文档通知、排队搜索）、LibreOffice（DOC）、外部 Docling Python 环境（PDF/Word 视觉）
 
 本地依赖可直接用仓库的 `docker-compose.yml`：
@@ -111,7 +111,7 @@ POSIX 构建产物没有 `.exe` 后缀；下文的命令在 Windows 使用 `.exe
 ### 3. 启动服务
 
 ```powershell
-# 可选：用环境变量覆盖默认配置（默认 Qdrant http://127.0.0.1:6333，SQLite 状态库）
+# 可选：用环境变量覆盖默认配置（默认 Qdrant http://127.0.0.1:6333）
 $env:QDRANT_URL = "http://127.0.0.1:6333"
 $env:RAG_SERVICE_PORT = "8011"
 # 生产 MySQL 示例（也可写入 ~/.praxis-rag/config.toml 的 [environment]）
@@ -125,7 +125,7 @@ $env:RAG_STATE_ENCRYPTION_KEY = "base64:<32-byte-key>"
 .\dist\bin\rag-service.exe
 ```
 
-首次启动会创建 `~/.praxis-rag/config.toml`（默认 `RAG_BACKEND=qdrant`、`127.0.0.1:8011`、SQLite 数据目录）；可用 `RAG_CONFIG_FILE` 指定其他 TOML。服务只接受 `RAG_BACKEND=qdrant`，`QDRANT_PATH` 本地文件模式不支持。
+首次启动会创建 `~/.praxis-rag/config.toml`（默认 `RAG_BACKEND=qdrant`、`127.0.0.1:8011`）；可用 `RAG_CONFIG_FILE` 指定其他 TOML。服务只接受 `RAG_BACKEND=qdrant`，`QDRANT_PATH` 本地文件模式不支持。
 
 打开：
 
@@ -147,10 +147,10 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
 ### 4. 启动 worker（按需）
 
 ```powershell
-# 异步 MCP add_document 必需；需要 MySQL/SQLite + Kafka（或本地 outbox 模式）
+# 异步 MCP add_document 必需；需要 MySQL + Kafka（或本地 outbox 模式）
 .\dist\bin\rag-document-worker.exe
 
-# 服务端 MCP 排队搜索必需；需要 Redis + Kafka + MySQL/SQLite
+# 服务端 MCP 排队搜索必需；需要 Redis + Kafka + MySQL
 .\dist\bin\rag-search-worker.exe
 
 # Kafka 死信：两个实例，分别消费显式 DLQ topic（document / search）
@@ -199,7 +199,7 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 
 - **Go 是目标后端**：`rag-service`、三个 worker、Console、OpenAPI、迁移/状态 CLI 与本地批量导入 CLI 均已落地；parity 审计的 P0（搜索资产投影、MCP 排队/同步选择、worker 可执行程序、已保存 `document.md` 预览）与主要 P1 已修复，`go build ./...` 与全量 `go test ./...` 通过。
 - **Python 后端已删除**：原 `src/rag_mcp`、`tests`、`pyproject.toml`、`uv.lock` 已移除；仓库只保留 `python-workers/`（PDF/Word 视觉外部解析进程，可选）与 `benchmarks/`（Docling 评估脚本，可选研究工具）。Go 后端运行不需要安装 Python 包；使用 PDF/DOC/Word 视觉解析时才需要外部 Python/LibreOffice 环境。
-- **数据兼容**：Go 复用既有 MySQL/SQLite 表结构、`enc:v1:` 凭据格式和配置文件位置（`~/.praxis-rag/config.toml`），不需要数据迁移；旧 SQLite 状态用 `rag-state-migrate` 检查/建表，旧知识源用 `rag-service-migrate` 预览/导入（见已知差异）。
+- **数据兼容**：Go 复用既有 MySQL 表结构、`enc:v1:` 凭据格式和配置文件位置（`~/.praxis-rag/config.toml`），不需要数据迁移；状态表用 `rag-state-migrate` 检查/建表，旧知识源用 `rag-service-migrate` 预览/导入（见已知差异）。
 - **已实机验证**：Kafka 3.9.0 + Debezium 3.7.1 + MySQL 8.0 + Redis + Qdrant 上的完整异步链路（debezium 与 relay 两种模式）、显式 DLQ topic、排队 MCP 搜索（search worker + Redis 快照）；脚本见 `scripts/verify-debezium-e2e.py`、`scripts/verify-kafka-dlq.py`、`scripts/verify-kafka-search.py`。
 - **仍待验证**（以 [GO_MIGRATION](docs/GO_MIGRATION.md) 为准）：Kafka SASL/TLS 外部集群、Docker 镜像/Compose `app` profile、systemd、真实 MySQL 多实例并发/故障切换、浏览器 E2E；黑盒 parity 差分改为固定预期（Python 对照已删除）。真实环境冒烟与未验证项见[使用与部署](docs/USAGE.md) 的验证边界。
 
@@ -211,7 +211,7 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 - 工作区用于划分知识库，不是用户级权限系统；`/v1/admin/*` 只允许本机直连，MCP/普通 API 使用 Service Token 或 API Key。
 - 默认只监听 `127.0.0.1`。远程部署必须设置 `RAG_SERVICE_TOKEN` 与 MCP Host/Origin 白名单，并在前面配置 HTTPS 与访问控制。
 - PDF/Word 解析依赖外部进程（Docling + 模型、LibreOffice、Python 视觉环境），不属于 Go 二进制；未配置时相应文件上传会明确报错。
-- Redis 搜索快照有 TTL（`RAG_RESULT_TTL_SECONDS`，默认 3600 秒），丢失或到期后 `result_id` 不可用，无 SQL 回放。异步文档任务状态在 MySQL/SQLite，不受 Redis TTL 影响。
+- Redis 搜索快照有 TTL（`RAG_RESULT_TTL_SECONDS`，默认 3600 秒），丢失或到期后 `result_id` 不可用，无 SQL 回放。异步文档任务状态在 MySQL，不受 Redis TTL 影响。
 - 日志仅记录任务/操作 ID 和安全错误类别，不记录查询、文件内容、消息正文或凭据。
 
 ## 项目文档
@@ -222,7 +222,7 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 | [部署指南](docs/DEPLOYMENT.md) | Docker/Compose 与 systemd 示例、worker 重启策略、DLQ 监控、outbox 模式。 |
 | [Go 迁移总纲](docs/GO_MIGRATION.md) | 目标架构、兼容性硬约束、阶段与进度记录、当前切换状态。 |
 | [Go Parity 审计](docs/GO_PARITY_AUDIT.md) | Go 与 Python/前端契约差异、P0/P1/P2 清单与验证限制。 |
-| [共享状态存储](docs/state-storage.md) | MySQL/SQLite 表结构、密钥加密、迁移与多实例注意事项。 |
+| [共享状态存储](docs/state-storage.md) | MySQL 表结构、密钥加密、迁移与多实例注意事项。 |
 | [状态缓存](docs/state-cache.md) | Redis 读模型缓存、修订与 outbox、缓存一致性边界。 |
 | [UUID 结果与产物引用](docs/result-references.md) | result_id、快照 TTL、artifact 引用与容量限制。 |
 | [验证记录](VALIDATION.md) | 已执行的验证及其覆盖范围。 |

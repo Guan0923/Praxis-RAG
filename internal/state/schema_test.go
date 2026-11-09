@@ -147,9 +147,9 @@ func TestSchemaMatchesPythonDefinition(t *testing.T) {
 func TestMySQLSchemaCompilesWithLongColumns(t *testing.T) {
 	var builder strings.Builder
 	for _, table := range SchemaTables() {
-		builder.WriteString(table.DDL(DialectMySQL))
+		builder.WriteString(table.DDL())
 		builder.WriteString("\n")
-		for _, statement := range table.IndexDDL(DialectMySQL) {
+		for _, statement := range table.IndexDDL() {
 			builder.WriteString(statement)
 			builder.WriteString("\n")
 		}
@@ -167,28 +167,6 @@ func TestMySQLSchemaCompilesWithLongColumns(t *testing.T) {
 		if !strings.Contains(ddl, want) {
 			t.Fatalf("MySQL DDL does not contain %q", want)
 		}
-	}
-}
-
-func TestSQLiteSchemaUsesBooleanAndQuotedIdentifiers(t *testing.T) {
-	table, found := TableByName("documents")
-	if !found {
-		t.Fatal("documents table is missing")
-	}
-	ddl := table.DDL(DialectSQLite)
-	for _, want := range []string{
-		`CREATE TABLE "documents"`,
-		`"del_flag" BOOLEAN NOT NULL DEFAULT 0`,
-		`"diagnostics" TEXT NOT NULL`,
-		`PRIMARY KEY ("namespace", "name")`,
-	} {
-		if !strings.Contains(ddl, want) {
-			t.Fatalf("SQLite DDL does not contain %q:\n%s", want, ddl)
-		}
-	}
-	indexes := table.IndexDDL(DialectSQLite)
-	if len(indexes) != 1 || indexes[0] != `CREATE INDEX "ix_documents_namespace_sha256" ON "documents" ("namespace", "sha256")` {
-		t.Fatalf("unexpected SQLite indexes: %v", indexes)
 	}
 }
 
@@ -213,9 +191,9 @@ func TestCreatedSchemaContainsEveryTableAndIndex(t *testing.T) {
 	}
 
 	rows, err := stores.DB.QueryContext(ctx,
-		"SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'")
+		"SELECT DISTINCT index_name FROM information_schema.statistics WHERE table_schema = DATABASE()")
 	if err != nil {
-		t.Fatalf("sqlite_master query error = %v", err)
+		t.Fatalf("information_schema index query error = %v", err)
 	}
 	defer closeRows(t, rows)
 	created := make(map[string]bool)

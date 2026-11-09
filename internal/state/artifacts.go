@@ -157,7 +157,7 @@ func (r *ArtifactRegistry) Register(
 	identity := sha256Hex(identityJSON)
 	artifactID := uuid5(uuidNamespaceURL, identity)
 
-	statement := artifactUpsertSQL(r.stores.Dialect())
+	statement := artifactUpsertSQL()
 	var versionValue any
 	if version != nil {
 		versionValue = *version
@@ -185,18 +185,12 @@ func (r *ArtifactRegistry) Register(
 }
 
 // artifactUpsertSQL renders the atomic identity upsert. Re-registering a
-// retained identity only extends its lifetime (GREATEST/max with the stored
+// retained identity only extends its lifetime (GREATEST with the stored
 // expiry), preserving the original snapshot and creation time.
-func artifactUpsertSQL(dialect Dialect) string {
-	if dialect == DialectMySQL {
-		return "INSERT INTO artifact_snapshots (id, namespace, identity, document_id, version, kind, name, " +
-			"mime_type, content, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
-			"ON DUPLICATE KEY UPDATE expires_at = GREATEST(artifact_snapshots.expires_at, VALUES(expires_at))"
-	}
+func artifactUpsertSQL() string {
 	return "INSERT INTO artifact_snapshots (id, namespace, identity, document_id, version, kind, name, " +
 		"mime_type, content, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
-		"ON CONFLICT(namespace, identity) DO UPDATE SET " +
-		"expires_at = max(artifact_snapshots.expires_at, excluded.expires_at)"
+		"ON DUPLICATE KEY UPDATE expires_at = GREATEST(artifact_snapshots.expires_at, VALUES(expires_at))"
 }
 
 // rowArtifact is the scanned database shape (content excluded).

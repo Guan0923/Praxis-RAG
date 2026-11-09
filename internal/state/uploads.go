@@ -260,7 +260,7 @@ func (j *UploadJournal) touchCache(ctx context.Context, tx *sql.Tx, namespace st
 	if len(keys) == 0 {
 		return nil
 	}
-	_, err := touch(ctx, tx, j.stores.Dialect(), keys...)
+	_, err := touch(ctx, tx, keys...)
 	return err
 }
 
@@ -271,20 +271,14 @@ func (j *UploadJournal) flushCache(ctx context.Context, namespace string, operat
 	_ = j.stores.CacheSync.FlushPending(ctx, j.cacheKeys(namespace, operationID, heads, leases))
 }
 
-// forUpdate returns the row-locking suffix for the dialect.
+// forUpdate returns the row-locking suffix.
 func (j *UploadJournal) forUpdate() string {
-	if j.stores.Dialect() == DialectMySQL {
-		return " FOR UPDATE"
-	}
-	return ""
+	return " FOR UPDATE"
 }
 
 // dbNow reads the database clock so every writer shares one time base.
 func (j *UploadJournal) dbNow(ctx context.Context, querier viewQuerier) (float64, error) {
-	query := "SELECT (julianday('now') - 2440587.5) * 86400.0"
-	if j.stores.Dialect() == DialectMySQL {
-		query = "SELECT UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6))"
-	}
+	const query = "SELECT UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6))"
 	var value float64
 	if err := querier.QueryRowContext(ctx, query).Scan(&value); err != nil {
 		return 0, err
@@ -577,43 +571,25 @@ func (j *UploadJournal) guard(ctx context.Context, tx *sql.Tx, namespace string)
 
 func (j *UploadJournal) insertIgnoreLease(ctx context.Context, tx *sql.Tx, namespace, resource, owner string, operationID *string, expiresAt float64) error {
 	arguments := []any{namespace, resource, owner, nilIfNil(operationID), expiresAt}
-	if j.stores.Dialect() == DialectMySQL {
-		_, err := tx.ExecContext(ctx,
-			"INSERT INTO document_leases (namespace, resource, owner, operation_id, expires_at) "+
-				"VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE namespace = namespace", arguments...)
-		return err
-	}
 	_, err := tx.ExecContext(ctx,
-		"INSERT OR IGNORE INTO document_leases (namespace, resource, owner, operation_id, expires_at) "+
-			"VALUES (?, ?, ?, ?, ?)", arguments...)
+		"INSERT INTO document_leases (namespace, resource, owner, operation_id, expires_at) "+
+			"VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE namespace = namespace", arguments...)
 	return err
 }
 
 func (j *UploadJournal) insertIgnoreHead(ctx context.Context, tx *sql.Tx, namespace, documentID, version string, updatedAt float64) error {
-	if j.stores.Dialect() == DialectMySQL {
-		_, err := tx.ExecContext(ctx,
-			"INSERT INTO document_heads (namespace, document_id, version, updated_at) VALUES (?, ?, ?, ?) "+
-				"ON DUPLICATE KEY UPDATE namespace = namespace",
-			namespace, documentID, version, updatedAt)
-		return err
-	}
 	_, err := tx.ExecContext(ctx,
-		"INSERT OR IGNORE INTO document_heads (namespace, document_id, version, updated_at) VALUES (?, ?, ?, ?)",
+		"INSERT INTO document_heads (namespace, document_id, version, updated_at) VALUES (?, ?, ?, ?) "+
+			"ON DUPLICATE KEY UPDATE namespace = namespace",
 		namespace, documentID, version, updatedAt)
 	return err
 }
 
 func (j *UploadJournal) insertIgnoreStep(ctx context.Context, tx *sql.Tx, operationID, name, status, details string, startedAt float64) error {
-	if j.stores.Dialect() == DialectMySQL {
-		_, err := tx.ExecContext(ctx,
-			"INSERT INTO upload_steps (operation_id, name, status, details, error, started_at, finished_at) "+
-				"VALUES (?, ?, ?, ?, NULL, ?, NULL) ON DUPLICATE KEY UPDATE operation_id = operation_id",
-			operationID, name, status, details, startedAt)
-		return err
-	}
 	_, err := tx.ExecContext(ctx,
-		"INSERT OR IGNORE INTO upload_steps (operation_id, name, status, details, error, started_at, finished_at) "+
-			"VALUES (?, ?, ?, ?, NULL, ?, NULL)", operationID, name, status, details, startedAt)
+		"INSERT INTO upload_steps (operation_id, name, status, details, error, started_at, finished_at) "+
+			"VALUES (?, ?, ?, ?, NULL, ?, NULL) ON DUPLICATE KEY UPDATE operation_id = operation_id",
+		operationID, name, status, details, startedAt)
 	return err
 }
 
@@ -1447,7 +1423,7 @@ func (j *UploadJournal) PurgeDocumentObjects(ctx context.Context, namespace, doc
 		for _, operationID := range changed {
 			keys = append(keys, CacheKey{Kind: "upload_status", Scope: operationID})
 		}
-		if _, err := touch(ctx, tx, j.stores.Dialect(), keys...); err != nil {
+		if _, err := touch(ctx, tx, keys...); err != nil {
 			return nil, err
 		}
 		arguments := make([]any, 0, len(changed))

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +13,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
 
 func testLogger() *slog.Logger {
@@ -22,14 +22,20 @@ func testLogger() *slog.Logger {
 
 func newTestStores(t *testing.T) *state.Stores {
 	t.Helper()
-	settings := state.StateSettings{
-		SQLitePath: filepath.Join(t.TempDir(), "state.sqlite3"),
-		AutoSchema: true,
-	}
-	stores, err := state.New(settings, true)
+	url, key := statetest.Connection(t)
+	stores, err := state.New(state.StateSettings{
+		URL:           url,
+		EncryptionKey: key,
+		AutoSchema:    true,
+		PoolSize:      10,
+		MaxOverflow:   20,
+		PoolRecycle:   1800,
+		PoolTimeout:   30,
+	}, true)
 	if err != nil {
-		t.Fatalf("state.New: %v", err)
+		t.Fatalf("state.New(MySQL) error = %v", err)
 	}
+	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return stores
 }
@@ -351,7 +357,7 @@ func TestRunOnceAndRunShutdown(t *testing.T) {
 	receiver.add(third)
 	done := make(chan error, 1)
 	go func() { done <- processor.Run(context.Background()) }()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if view, _ := stores.SearchTasks.Get(context.Background(), "manuals", third.ResultID, 1, 10); view != nil &&
 			view.Status == state.SearchTaskSucceeded {
@@ -369,7 +375,7 @@ func TestRunOnceAndRunShutdown(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Run() = %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("Run() did not stop")
 	}
 	processor.Stop() // idempotent
@@ -465,7 +471,7 @@ func TestRunConsumerLifecycle(t *testing.T) {
 	go func() { done <- processor.RunConsumer(ctx, consumer) }()
 
 	consumer.messages <- mq.ReceivedMessage{Body: body}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if view, _ := stores.SearchTasks.Get(context.Background(), "manuals", envelope.ResultID, 1, 10); view != nil &&
 			view.Status == state.SearchTaskSucceeded {
@@ -482,7 +488,7 @@ func TestRunConsumerLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RunConsumer() = %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("RunConsumer did not stop")
 	}
 	started, stopped := consumer.state()

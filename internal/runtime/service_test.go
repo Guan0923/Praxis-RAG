@@ -13,20 +13,25 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
 
 func newTestStores(t *testing.T) *state.Stores {
 	t.Helper()
-	root := t.TempDir()
-	settings := config.StateSettings{
-		URL:        "sqlite+pysqlite:///" + filepath.ToSlash(filepath.Join(root, "state.sqlite3")),
-		SQLitePath: filepath.Join(root, "state.sqlite3"),
-		AutoSchema: true,
-	}
-	stores, err := state.New(settings, true)
+	url, key := statetest.Connection(t)
+	stores, err := state.New(state.StateSettings{
+		URL:           url,
+		EncryptionKey: key,
+		AutoSchema:    true,
+		PoolSize:      10,
+		MaxOverflow:   20,
+		PoolRecycle:   1800,
+		PoolTimeout:   30,
+	}, true)
 	if err != nil {
-		t.Fatalf("state.New() error = %v", err)
+		t.Fatalf("state.New(MySQL) error = %v", err)
 	}
+	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return stores
 }
@@ -67,7 +72,7 @@ func TestNewCreatesDataRootAndReportsStatus(t *testing.T) {
 		t.Fatalf("status = %v", status)
 	}
 	statePayload, ok := status["state"].(map[string]any)
-	if !ok || statePayload["backend"] != "sqlite" {
+	if !ok || statePayload["backend"] != "mysql" {
 		t.Fatalf("state = %v", status["state"])
 	}
 }
@@ -129,7 +134,7 @@ func TestReadDocumentServesVersionedSavedMarkdown(t *testing.T) {
 	}
 	for index, testCase := range cases {
 		documentID := "doc-" + strings.ReplaceAll(testCase.name, ".", "-")
-		version := operationID + string(rune('0'+index))
+		version := operationID[:31] + string(rune('0'+index))
 		insertReadableDocument(t, stores, "alpha", testCase.name, documentID, version, map[string]any{
 			"pdf_parser_version":  document.PDFParserVersion,
 			"word_parser_version": document.WordParserVersion,

@@ -9,7 +9,7 @@
 ```text
                   ┌────────────────────────────┐
 浏览器/MCP/REST ──>│ rag-service :8011          │──> Qdrant（HTTP :6333）
-                  │ REST /v1, MCP /mcp, /console│──> 共享状态库 MySQL/SQLite
+                  │ REST /v1, MCP /mcp, /console│──> 共享状态库 MySQL
                   └────────────┬───────────────┘──> Redis（可选：缓存/快照）
                                │ Kafka（可选：outbox relay + 排队搜索）
              ┌─────────────────┼──────────────────────┐
@@ -37,7 +37,7 @@
 /etc/praxis-rag/
   env                      # 仅 root 可读的密钥/环境文件
   config.toml              # 非敏感默认配置（[environment]）
-/var/lib/praxis-rag/       # RAG_SERVICE_DATA_ROOT（SQLite、上传恢复工作区）
+/var/lib/praxis-rag/       # RAG_SERVICE_DATA_ROOT（上传恢复工作区）
 ```
 
 `rag-service` 当前目录或可执行文件邻居中的 `web` 目录可作为 Console 默认位置；生产建议显式设置 `RAG_WEB_ROOT=/opt/praxis-rag/web`。`config.toml` 里不要写密码；密码、Token、加密密钥放 `env` 文件（权限 `0600`）。
@@ -78,7 +78,7 @@ docker run -d --name praxis-rag-service \
 - 公开到宿主机时加 TLS 反向代理；不要直接把 8011 暴露到公网。
 - 使用 MySQL 时先执行一次 schema 检查/建表（见 §6）：`docker run --rm --entrypoint /app/bin/rag-state-migrate ... --apply`。
 - 镜像不含 Docling/LibreOffice/Python 视觉环境：需要 PDF/DOC/Word 视觉解析时，把外部环境 bind mount 进容器，并设置 `RAG_PDF_PARSER_PYTHON`、`RAG_PDF_MODELS_PATH`、`RAG_WORD_CONVERTER_PATH`；解析进程的路径必须在容器内可见。
-- 数据目录卷保存 SQLite（若不用 MySQL）、上传恢复工作区与 artifact 工作区；不要用匿名卷。
+- 数据目录卷保存上传恢复工作区与 artifact 工作区；不要用匿名卷。
 
 ### 3.3 Compose：app profile
 
@@ -385,7 +385,7 @@ Debezium 模式（`RAG_OUTBOX_BRIDGE=debezium`）要求状态库为 MySQL：启�
 - `/v1/admin/*` 只允许本机直连（loopback + 无代理头 + 同源 Origin）；远程管理请通过 SSH 隧道或受控跳板。
 - MySQL/Redis/Kafka 只监听内网；Kafka 启用 SASL/TLS 时使用 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*`，凭据通过环境文件/密钥管理注入，禁止写入 `config.toml`、镜像或 Git。
 - 运行用户非 root，数据目录 0700；env 文件 0600；日志不要输出查询/文件内容（Go 实现只记录任务 ID 与错误类别）。
-- 定期备份 MySQL；上传恢复工作区与 SQLite（若使用）同样需要备份。Redis 只保存可丢失的缓存/短期快照，不作为真相。
+- 定期备份 MySQL；上传恢复工作区同样需要备份。Redis 只保存可丢失的缓存/短期快照，不作为真相。
 
 ## 10. 验证与已知未验证项
 

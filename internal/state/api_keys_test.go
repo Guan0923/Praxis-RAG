@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 )
@@ -65,15 +64,19 @@ func TestAPIKeyLifecycleAndPortableEncryption(t *testing.T) {
 		t.Fatalf("permission message = %q", permission.Message)
 	}
 
-	database, err := os.ReadFile(stores.Settings.SQLitePath)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error = %v", stores.Settings.SQLitePath, err)
+	var protected *string
+	if err := stores.DB.QueryRowContext(ctx,
+		"SELECT protected_key FROM api_keys WHERE id = ?", created.ID).Scan(&protected); err != nil {
+		t.Fatalf("reading the stored secret: %v", err)
 	}
-	if bytes.Contains(database, []byte(created.Key)) {
-		t.Fatal("the plaintext secret is stored in the database file")
+	if protected == nil {
+		t.Fatal("the protected secret was not stored")
 	}
-	if bytes.Contains(database, []byte("dpapi:")) {
-		t.Fatal("the database file contains a legacy dpapi value")
+	if strings.Contains(*protected, created.Key) {
+		t.Fatal("the plaintext secret is stored in the database")
+	}
+	if strings.Contains(*protected, "dpapi:") {
+		t.Fatal("the database contains a legacy dpapi value")
 	}
 
 	updated, err := stores.APIKeys.Update(ctx, created.ID, "renamed", []string{"beta"}, false)

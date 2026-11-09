@@ -137,29 +137,11 @@ func TestServiceSettingsRejectEmptyAllowlists(t *testing.T) {
 	}
 }
 
-func TestStateSettingsDefaultsToSQLiteUnderDataRoot(t *testing.T) {
+func TestStateSettingsRequiresMySQLConfiguration(t *testing.T) {
 	isolateEnv(t)
 	root := filepath.Join(t.TempDir(), "data")
-	settings, err := StateSettingsFromEnv(root)
-	if err != nil {
-		t.Fatalf("StateSettingsFromEnv() error = %v", err)
-	}
-	if settings.IsMySQL {
-		t.Fatalf("expected sqlite settings")
-	}
-	expected := filepath.Join(root, DefaultSQLiteName)
-	if settings.SQLitePath != expected {
-		t.Fatalf("sqlite path = %q, want %q", settings.SQLitePath, expected)
-	}
-	if info, err := os.Stat(root); err != nil || !info.IsDir() {
-		t.Fatalf("data root was not created: %v", err)
-	}
-	description := settings.Describe()
-	if description["backend"] != "sqlite" || description["host"] != nil {
-		t.Fatalf("unexpected describe payload: %+v", description)
-	}
-	if description["encrypted"] != false {
-		t.Fatalf("encrypted = %v", description["encrypted"])
+	if _, err := StateSettingsFromEnv(root); err == nil {
+		t.Fatal("StateSettingsFromEnv() error = nil, want a configuration error")
 	}
 }
 
@@ -175,7 +157,7 @@ func TestStateSettingsFromMySQLPartsAndURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StateSettingsFromEnv() error = %v", err)
 	}
-	if !settings.IsMySQL || settings.Host != "db.local" || settings.Port != 3307 || settings.Database != "praxis" {
+	if settings.Host != "db.local" || settings.Port != 3307 || settings.Database != "praxis" {
 		t.Fatalf("unexpected mysql settings: %+v", settings)
 	}
 	description := settings.Describe()
@@ -194,7 +176,7 @@ func TestStateSettingsExplicitMySQLURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StateSettingsFromEnv() error = %v", err)
 	}
-	if !settings.IsMySQL || settings.Host != "127.0.0.1" || settings.Database != "praxis_rag" {
+	if settings.Host != "127.0.0.1" || settings.Database != "praxis_rag" {
 		t.Fatalf("unexpected settings: %+v", settings)
 	}
 }

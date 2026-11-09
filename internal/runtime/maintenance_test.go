@@ -26,7 +26,7 @@ func newMaintenanceService(t *testing.T) (*Service, *state.Stores) {
 func TestMaintenanceRecoversStaleUploads(t *testing.T) {
 	service, stores := newMaintenanceService(t)
 	ctx := context.Background()
-	journal, err := state.NewUploadJournal(stores, state.WithLeaseSeconds(0.02), state.WithAutoHeartbeat(false))
+	journal, err := state.NewUploadJournal(stores, state.WithLeaseSeconds(5.0), state.WithAutoHeartbeat(false))
 	if err != nil {
 		t.Fatalf("NewUploadJournal() error = %v", err)
 	}
@@ -42,7 +42,7 @@ func TestMaintenanceRecoversStaleUploads(t *testing.T) {
 	if err := journal.Intent(ctx, operation, "stage_qdrant", map[string]any{"version": operation.ID}); err != nil {
 		t.Fatalf("Intent() error = %v", err)
 	}
-	time.Sleep(120 * time.Millisecond)
+	time.Sleep(6 * time.Second)
 
 	service.maintenancePass(ctx)
 
@@ -211,18 +211,31 @@ func TestStartBackgroundRespectsOutboxBridgeMode(t *testing.T) {
 			t.Fatalf("StartBackground() error = %v", err)
 		}
 		t.Cleanup(service.StopBackground)
-		deadline := time.Now().Add(2 * time.Second)
+		deadline := time.Now().Add(60 * time.Second)
 		for time.Now().Before(deadline) && broker.documentNotificationCount() == 0 {
 			time.Sleep(10 * time.Millisecond)
 		}
 		if broker.documentNotificationCount() == 0 {
 			t.Fatalf("relay mode did not publish the committed outbox row")
 		}
-		if events, err := stores.DocumentJobs.PendingOutbox(ctx, 10); err != nil {
-			t.Fatalf("PendingOutbox() error = %v", err)
-		} else if len(events) != 0 {
-			t.Errorf("pending outbox rows after relay = %d", len(events))
+		// The row is marked PUBLISHED right after the broker accepts it; give the
+		// relay a moment instead of asserting on the same tick.
+		deadline = time.Now().Add(60 * time.Second)
+		for time.Now().Before(deadline) {
+			events, err := stores.DocumentJobs.PendingOutbox(ctx, 10)
+			if err != nil {
+				t.Fatalf("PendingOutbox() error = %v", err)
+			}
+			if len(events) == 0 {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
+		events, err := stores.DocumentJobs.PendingOutbox(ctx, 10)
+		if err != nil {
+			t.Fatalf("PendingOutbox() error = %v", err)
+		}
+		t.Errorf("pending outbox rows after relay = %d", len(events))
 	})
 
 	t.Run("debezium leaves persistence to the CDC bridge", func(t *testing.T) {
@@ -241,7 +254,7 @@ func TestStartBackgroundRespectsOutboxBridgeMode(t *testing.T) {
 			t.Fatalf("StartBackground() error = %v", err)
 		}
 		t.Cleanup(service.StopBackground)
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(6 * time.Second)
 		if broker.documentNotificationCount() != 0 {
 			t.Errorf("debezium mode published %d notification(s) in-process", broker.documentNotificationCount())
 		}
@@ -283,7 +296,7 @@ func TestBackgroundLifecycle(t *testing.T) {
 		t.Fatalf("SearchTasks.Submit() error = %v", err)
 	}
 	clock += 1_000
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	expired := false
 	for time.Now().Before(deadline) {
 		_, err := stores.SearchTasks.Get(ctx, "alpha", envelope.ResultID, 1, 10)

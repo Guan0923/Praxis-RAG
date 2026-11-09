@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -28,11 +27,12 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
 	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
 
 // testEncryptionKey is a deterministic base64-encoded 32-byte AES key used to
 // protect the knowledge-base provider credentials stored in SQLite.
-const testEncryptionKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+var testEncryptionKey = statetest.TestEncryptionKey
 
 // documentText is long enough for several chunks with the seeded character
 // chunking configuration.
@@ -233,19 +233,23 @@ func collectionFromPath(path string) string {
 	return trimmed
 }
 
-// newTestStores opens a real SQLite state store with a fixed encryption key.
+// newTestStores opens the shared MySQL test store with the suite encryption key.
 func newTestStores(t *testing.T) *state.Stores {
 	t.Helper()
-	database := filepath.Join(t.TempDir(), "state.sqlite3")
+	url, key := statetest.Connection(t)
 	stores, err := state.New(state.StateSettings{
-		URL:           "sqlite+pysqlite:///" + filepath.ToSlash(database),
-		SQLitePath:    database,
+		URL:           url,
+		EncryptionKey: key,
 		AutoSchema:    true,
-		EncryptionKey: testEncryptionKey,
+		PoolSize:      10,
+		MaxOverflow:   20,
+		PoolRecycle:   1800,
+		PoolTimeout:   30,
 	}, true)
 	if err != nil {
-		t.Fatalf("state.New() error = %v", err)
+		t.Fatalf("state.New(MySQL) error = %v", err)
 	}
+	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return stores
 }

@@ -10,23 +10,15 @@ import (
 	"log"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
-	sqlite "modernc.org/sqlite"
 
 	"github.com/Guan0923/xinghe_rag/internal/config"
 )
-
-const sqliteDriverName = "sqlite"
-
-// sqliteConstraintCode is SQLITE_CONSTRAINT; the extended result codes for the
-// primary-key (1555) and unique (2067) failures share this low byte.
-const sqliteConstraintCode = 19
 
 // isUniqueViolation reports a constraint failure that Python surfaces as
 // SQLAlchemy IntegrityError, so repositories can map it to StateConflict or
@@ -39,10 +31,6 @@ func isUniqueViolation(err error) bool {
 			return true
 		}
 		return false
-	}
-	var sqliteError *sqlite.Error
-	if errors.As(err, &sqliteError) {
-		return sqliteError.Code()&0xff == sqliteConstraintCode
 	}
 	return false
 }
@@ -83,7 +71,6 @@ type Stores struct {
 	SearchTasks        *SearchTasks
 	SearchDispatcher   *SearchTaskDispatcher
 
-	dialect    Dialect
 	closeOnce  sync.Once
 	closeError error
 }
@@ -141,14 +128,18 @@ func Create(dataRoot string, options ...Option) (*Stores, error) {
 // missing tables and applies the additive migrations. Failures are reported as
 // StateError("状态数据库初始化失败：...") like StateStores.__init__.
 func New(settings StateSettings, createSchema bool) (*Stores, error) {
-	database, dialect, err := openDatabase(settings)
+	resolved, err := resolveSettings(settings)
+	if err != nil {
+		return nil, err
+	}
+	settings = resolved
+	database, err := openDatabase(settings)
 	if err != nil {
 		return nil, err
 	}
 	stores := &Stores{
 		Settings: settings,
 		DB:       database,
-		dialect:  dialect,
 	}
 	if createSchema {
 		if err := stores.ensureSchema(context.Background()); err != nil {
@@ -164,11 +155,11 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 		return nil, err
 	}
 	stores.CacheSync = cacheSync
-	stores.APIKeys = newAPIKeyRepository(database, dialect, settings.EncryptionKey, cacheSync)
-	stores.KnowledgeBases = newKnowledgeBaseRepository(database, dialect, cacheSync)
-	stores.Documents = newDocumentRepository(database, dialect, cacheSync)
-	stores.Catalogs = newCatalogRepository(database, dialect, cacheSync)
-	stores.Blobs = newBlobStore(database, dialect)
+	stores.APIKeys = newAPIKeyRepository(database, settings.EncryptionKey, cacheSync)
+	stores.KnowledgeBases = newKnowledgeBaseRepository(database, cacheSync)
+	stores.Documents = newDocumentRepository(database, cacheSync)
+	stores.Catalogs = newCatalogRepository(database, cacheSync)
+	stores.Blobs = newBlobStore(database)
 	uploads, err := NewUploadJournal(stores)
 	if err != nil {
 		_ = cacheSync.Close()
@@ -230,9 +221,6 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	return stores, nil
 }
 
-// Dialect reports the SQL flavor of the opened database.
-func (s *Stores) Dialect() Dialect { return s.dialect }
-
 // Describe renders the secret-free state summary returned by /health, matching
 // StateStores.describe.
 func (s *Stores) Describe() map[string]any { return Describe(s.Settings) }
@@ -276,56 +264,34 @@ func (s *Stores) Close() error {
 
 // warnIfUnencrypted mirrors store._warn_if_unencrypted.
 func warnIfUnencrypted(settings StateSettings) {
-	if settings.IsMySQL && settings.EncryptionKey == "" {
+	if settings.EncryptionKey == "" {
 		log.Printf("RAG_STATE_ENCRYPTION_KEY is not set: provider and API keys may not be readable on other instances")
 	}
 }
 
-// openDatabase builds the database handle for the configured URL.
-func openDatabase(settings StateSettings) (*sql.DB, Dialect, error) {
-	if settings.IsMySQL || strings.HasPrefix(strings.ToLower(settings.URL), "mysql") {
-		database, err := openMySQL(settings)
-		return database, DialectMySQL, err
-	}
-	database, err := openSQLite(settings)
-	return database, DialectSQLite, err
+// openDatabase builds the MySQL database handle for the configured settings.
+func openDatabase(settings StateSettings) (*sql.DB, error) {
+	return openMySQL(settings)
 }
 
-// openSQLite mirrors store._create_engine's SQLite branch: a file-backed
-// database keeps check_same_thread=False semantics (database/sql pools
-// connections), while ":memory:" uses a single shared connection like
-// SQLAlchemy's StaticPool.
-func openSQLite(settings StateSettings) (*sql.DB, error) {
-	database := settings.SQLitePath
-	if cut, _, found := strings.Cut(database, "?"); found {
-		database = cut
+// resolveSettings fills the connection fields from the URL when a caller passes
+// only RAG_STATE_URL, so Describe and the MySQL DSN see the same values.
+func resolveSettings(settings StateSettings) (StateSettings, error) {
+	if settings.Host != "" || strings.TrimSpace(settings.URL) == "" {
+		return settings, nil
 	}
-	if database == "" || database == ":memory:" || strings.HasPrefix(settings.URL, "sqlite+pysqlite:///:memory:") {
-		handle, err := sql.Open(sqliteDriverName, ":memory:")
-		if err != nil {
-			return nil, err
-		}
-		handle.SetMaxOpenConns(1)
-		return handle, nil
+	parsed, err := config.ParseStateURL(settings.URL)
+	if err != nil {
+		return StateSettings{}, err
 	}
-	database = config.ExpandPath(database)
-	if !strings.HasPrefix(database, "file:") {
-		if err := os.MkdirAll(filepath.Dir(database), 0o755); err != nil {
-			return nil, fmt.Errorf("Cannot create the state database directory: %s", filepath.Dir(database))
-		}
-	}
-	// The pysqlite driver's default connect timeout is 5 seconds; the modernc
-	// driver spells the same setting as _busy_timeout milliseconds.
-	dsn := filepath.ToSlash(database)
-	if strings.HasPrefix(database, "file:") {
-		dsn = database
-	}
-	if !strings.Contains(dsn, "?") {
-		dsn += "?_busy_timeout=5000"
-	} else {
-		dsn += "&_busy_timeout=5000"
-	}
-	return sql.Open(sqliteDriverName, dsn)
+	parsed.EncryptionKey = settings.EncryptionKey
+	parsed.Echo = settings.Echo
+	parsed.AutoSchema = settings.AutoSchema
+	parsed.PoolSize = settings.PoolSize
+	parsed.MaxOverflow = settings.MaxOverflow
+	parsed.PoolRecycle = settings.PoolRecycle
+	parsed.PoolTimeout = settings.PoolTimeout
+	return parsed, nil
 }
 
 // openMySQL mirrors store._create_engine's MySQL branch, including the
@@ -400,18 +366,18 @@ func maxIntValue(a, b int) int {
 // ensureSchema creates missing tables (with their indexes) and then applies the
 // additive migrations, in the same order as the Python constructor.
 func (s *Stores) ensureSchema(ctx context.Context) error {
+	existing, err := s.tableNames(ctx)
+	if err != nil {
+		return err
+	}
 	for _, table := range schemaTables {
-		exists, err := s.hasTable(ctx, table.Name)
-		if err != nil {
-			return err
-		}
-		if exists {
+		if existing[table.Name] {
 			continue
 		}
-		if _, err := s.DB.ExecContext(ctx, table.DDL(s.dialect)); err != nil {
+		if _, err := s.DB.ExecContext(ctx, table.DDL()); err != nil {
 			return err
 		}
-		for _, statement := range table.IndexDDL(s.dialect) {
+		for _, statement := range table.IndexDDL() {
 			if _, err := s.DB.ExecContext(ctx, statement); err != nil {
 				return err
 			}
@@ -423,12 +389,29 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	return s.migrateDocumentOutbox(ctx)
 }
 
+// tableNames lists the current tables in one round trip; checking tables one by
+// one through information_schema costs tens of milliseconds per table on MySQL.
+func (s *Stores) tableNames(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	names := make(map[string]bool, len(schemaTables))
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names[name] = true
+	}
+	return names, rows.Err()
+}
+
 // hasTable reports whether the given table exists in the current database.
 func (s *Stores) hasTable(ctx context.Context, name string) (bool, error) {
-	query := "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1"
-	if s.dialect == DialectMySQL {
-		query = "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1"
-	}
+	const query = "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1"
 	var found int
 	err := s.DB.QueryRowContext(ctx, query, name).Scan(&found)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -442,7 +425,7 @@ func (s *Stores) hasTable(ctx context.Context, name string) (bool, error) {
 
 // tableColumns returns the current column names of one table.
 func (s *Stores) tableColumns(ctx context.Context, table string) ([]string, error) {
-	rows, err := s.DB.QueryContext(ctx, "SELECT * FROM "+quoteIdentifier(s.dialect, table)+" WHERE 1 = 0")
+	rows, err := s.DB.QueryContext(ctx, "SELECT * FROM "+quoteIdentifier(table)+" WHERE 1 = 0")
 	if err != nil {
 		return nil, err
 	}
@@ -457,13 +440,6 @@ func containsString(values []string, target string) bool {
 		}
 	}
 	return false
-}
-
-func (s *Stores) booleanType() string {
-	if s.dialect == DialectMySQL {
-		return "BOOL"
-	}
-	return "BOOLEAN"
 }
 
 // migrateSoftDelete mirrors schema_migrations.migrate_soft_delete: add the
@@ -484,8 +460,8 @@ func (s *Stores) migrateSoftDelete(ctx context.Context) error {
 	if containsString(columns, "del_flag") {
 		return nil
 	}
-	statement := "ALTER TABLE " + quoteIdentifier(s.dialect, "documents") +
-		" ADD COLUMN " + quoteIdentifier(s.dialect, "del_flag") + " " + s.booleanType() + " NOT NULL DEFAULT 0"
+	statement := "ALTER TABLE " + quoteIdentifier("documents") +
+		" ADD COLUMN " + quoteIdentifier("del_flag") + " BOOL NOT NULL DEFAULT 0"
 	if _, err := s.DB.ExecContext(ctx, statement); err != nil {
 		confirmed, confirmErr := s.tableColumns(ctx, "documents")
 		if confirmErr == nil && containsString(confirmed, "del_flag") {
@@ -521,8 +497,8 @@ func (s *Stores) migrateDocumentOutbox(ctx context.Context) error {
 		if containsString(columns, addition.name) {
 			continue
 		}
-		statement := "ALTER TABLE " + quoteIdentifier(s.dialect, table) +
-			" ADD COLUMN " + quoteIdentifier(s.dialect, addition.name) + " " + addition.definition
+		statement := "ALTER TABLE " + quoteIdentifier(table) +
+			" ADD COLUMN " + quoteIdentifier(addition.name) + " " + addition.definition
 		if _, execErr := s.DB.ExecContext(ctx, statement); execErr != nil {
 			confirmed, confirmErr := s.tableColumns(ctx, table)
 			if confirmErr == nil && containsString(confirmed, addition.name) {

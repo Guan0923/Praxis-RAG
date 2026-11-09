@@ -538,15 +538,12 @@ func TestArtifactPurgeIsBoundedAndExpiryInclusive(t *testing.T) {
 }
 
 func TestArtifactMySQLUsesNativeGreatestUpsert(t *testing.T) {
-	statement := artifactUpsertSQL(DialectMySQL)
+	statement := artifactUpsertSQL()
 	if !strings.Contains(statement, "ON DUPLICATE KEY UPDATE") {
 		t.Fatalf("MySQL statement = %q", statement)
 	}
 	if !strings.Contains(statement, "GREATEST(artifact_snapshots.expires_at, VALUES(expires_at))") {
 		t.Fatalf("MySQL statement does not use GREATEST: %q", statement)
-	}
-	if strings.Contains(artifactUpsertSQL(DialectSQLite), "ON DUPLICATE KEY") {
-		t.Fatal("SQLite statement uses MySQL upsert syntax")
 	}
 }
 

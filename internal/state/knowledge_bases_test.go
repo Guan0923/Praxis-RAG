@@ -86,7 +86,11 @@ func TestKnowledgeBaseListSortedByNamespace(t *testing.T) {
 			t.Fatalf("list[%d].namespace = %v, want %q", index, list[index]["namespace"], namespace)
 		}
 	}
-	empty, err := newTestStores(t).KnowledgeBases.List(context.Background())
+}
+
+func TestKnowledgeBaseListEmpty(t *testing.T) {
+	stores := newTestStores(t)
+	empty, err := stores.KnowledgeBases.List(context.Background())
 	if err != nil {
 		t.Fatalf("empty List() error = %v", err)
 	}

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
 
 const testNamespace = "manuals"
@@ -26,14 +26,20 @@ func testLogger() *slog.Logger {
 
 func newTestStores(t *testing.T) *state.Stores {
 	t.Helper()
-	settings := state.StateSettings{
-		SQLitePath: filepath.Join(t.TempDir(), "state.sqlite3"),
-		AutoSchema: true,
-	}
-	stores, err := state.New(settings, true)
+	url, key := statetest.Connection(t)
+	stores, err := state.New(state.StateSettings{
+		URL:           url,
+		EncryptionKey: key,
+		AutoSchema:    true,
+		PoolSize:      10,
+		MaxOverflow:   20,
+		PoolRecycle:   1800,
+		PoolTimeout:   30,
+	}, true)
 	if err != nil {
-		t.Fatalf("state.New: %v", err)
+		t.Fatalf("state.New(MySQL) error = %v", err)
 	}
+	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return stores
 }
@@ -311,7 +317,7 @@ func TestHandleKeepsLeaseAliveDuringSlowIngestion(t *testing.T) {
 	go func() { done <- processor.Handle(context.Background(), notification) }()
 	select {
 	case <-started:
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("ingester did not start")
 	}
 	before := jobStatus(t, stores, notification.ArtifactID).LeaseUntil
@@ -323,7 +329,7 @@ func TestHandleKeepsLeaseAliveDuringSlowIngestion(t *testing.T) {
 	close(release)
 	select {
 	case <-committed:
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("ingester did not commit")
 	}
 	select {
@@ -331,7 +337,7 @@ func TestHandleKeepsLeaseAliveDuringSlowIngestion(t *testing.T) {
 		if !acked {
 			t.Fatalf("slow ingestion must be acknowledged after success: job=%+v logs=%s", jobStatus(t, stores, notification.ArtifactID), logBuffer.String())
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("Handle did not return")
 	}
 	if job := jobStatus(t, stores, notification.ArtifactID); job.Status != state.DocumentJobSucceeded {
@@ -529,7 +535,7 @@ func TestRunLoopShutdownIsIdempotent(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- processor.Run(context.Background()) }()
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if job := jobStatus(t, stores, notification.ArtifactID); job.Status == state.DocumentJobSucceeded {
 			break
@@ -545,7 +551,7 @@ func TestRunLoopShutdownIsIdempotent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Run() = %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("Run did not stop")
 	}
 	processor.Stop()
@@ -657,7 +663,7 @@ func TestRunConsumerLifecycle(t *testing.T) {
 	go func() { done <- processor.RunConsumer(ctx, consumer) }()
 
 	consumer.messages <- mq.ReceivedMessage{Body: body}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if job := jobStatus(t, stores, notification.ArtifactID); job.Status == state.DocumentJobSucceeded {
 			break
@@ -673,7 +679,7 @@ func TestRunConsumerLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RunConsumer() = %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatalf("RunConsumer did not stop")
 	}
 	started, stopped := consumer.state()

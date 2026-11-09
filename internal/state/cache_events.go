@@ -56,7 +56,7 @@ func catalogKeys(namespace string) []CacheKey {
 // de-duplicated acquisition order prevents cross-kind lock inversion. The Redis
 // publication side (CacheSynchronizer.flush_pending) is deferred to a later
 // round, but the transactional rows are written now so revisions stay correct.
-func touch(ctx context.Context, tx *sql.Tx, dialect Dialect, keys ...CacheKey) ([]string, error) {
+func touch(ctx context.Context, tx *sql.Tx, keys ...CacheKey) ([]string, error) {
 	pending := make([]CacheKey, 0, len(keys))
 	seen := make(map[CacheKey]struct{}, len(keys))
 	for _, key := range keys {
@@ -76,11 +76,8 @@ func touch(ctx context.Context, tx *sql.Tx, dialect Dialect, keys ...CacheKey) (
 		return pending[left].Scope < pending[right].Scope
 	})
 
-	insertRevision := "INSERT OR IGNORE INTO cache_revisions (kind, scope, revision) VALUES (?, ?, 0)"
-	if dialect == DialectMySQL {
-		insertRevision = "INSERT INTO cache_revisions (kind, scope, revision) VALUES (?, ?, 0) " +
-			"ON DUPLICATE KEY UPDATE revision = revision"
-	}
+	insertRevision := "INSERT INTO cache_revisions (kind, scope, revision) VALUES (?, ?, 0) " +
+		"ON DUPLICATE KEY UPDATE revision = revision"
 	eventIDs := make([]string, 0, len(pending))
 	for _, key := range pending {
 		if _, err := tx.ExecContext(ctx, insertRevision, key.Kind, key.Scope); err != nil {

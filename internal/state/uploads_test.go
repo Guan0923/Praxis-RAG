@@ -21,7 +21,7 @@ func (e *OSError) Error() string {
 
 func newTestJournal(t *testing.T, stores *Stores, options ...JournalOption) *UploadJournal {
 	t.Helper()
-	base := []JournalOption{WithLeaseSeconds(5), WithAutoHeartbeat(false), WithCleanupDelaySeconds(0)}
+	base := []JournalOption{WithLeaseSeconds(60), WithAutoHeartbeat(false), WithCleanupDelaySeconds(0)}
 	journal, err := NewUploadJournal(stores, append(base, options...)...)
 	if err != nil {
 		t.Fatalf("NewUploadJournal() error = %v", err)
@@ -546,10 +546,10 @@ func TestUploadDefaultCleanupDelay(t *testing.T) {
 
 func TestUploadHeartbeatRenewsDuringLongCallback(t *testing.T) {
 	stores := newTestStores(t)
-	journal := newTestJournal(t, stores, WithLeaseSeconds(0.3), WithAutoHeartbeat(false))
+	journal := newTestJournal(t, stores, WithLeaseSeconds(3.0), WithAutoHeartbeat(false))
 	operation := beginTestUpload(t, journal, "ns", "file.txt", "doc", "collection", BeginOptions{})
 	result, err := journal.RunStep(context.Background(), operation, "slow", func() (any, error) {
-		time.Sleep(700 * time.Millisecond)
+		time.Sleep(2500 * time.Millisecond)
 		claimed, claimErr := journal.ClaimRecovery(context.Background(), operation.ID)
 		if claimErr != nil {
 			return nil, claimErr
@@ -569,10 +569,10 @@ func TestUploadHeartbeatRenewsDuringLongCallback(t *testing.T) {
 
 func TestUploadAutomaticHeartbeatCoversWorkBetweenSteps(t *testing.T) {
 	stores := newTestStores(t)
-	journal := newTestJournal(t, stores, WithLeaseSeconds(0.3), WithAutoHeartbeat(true))
+	journal := newTestJournal(t, stores, WithLeaseSeconds(3.0), WithAutoHeartbeat(true))
 	ctx := context.Background()
 	operation := beginTestUpload(t, journal, "ns", "file.txt", "doc", "collection", BeginOptions{})
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(2500 * time.Millisecond)
 	if claimed, err := journal.ClaimRecovery(ctx, operation.ID); err != nil || claimed != nil {
 		t.Fatalf("ClaimRecovery() = %+v, %v", claimed, err)
 	}

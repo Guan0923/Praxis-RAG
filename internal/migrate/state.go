@@ -50,10 +50,7 @@ func inspectSchema(ctx context.Context, stores *state.Stores) (StateStatus, erro
 		Missing:  make([]string, 0),
 	}
 	for _, table := range state.SchemaTables() {
-		query := "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1"
-		if stores.Dialect() == state.DialectMySQL {
-			query = "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1"
-		}
+		const query = "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1"
 		var found int
 		err := stores.DB.QueryRowContext(ctx, query, table.Name).Scan(&found)
 		if err == sql.ErrNoRows {

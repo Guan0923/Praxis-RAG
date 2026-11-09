@@ -18,11 +18,12 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/modelapi"
 	"github.com/Guan0923/xinghe_rag/internal/qdrant"
 	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
 
 // testEncryptionKey is a deterministic base64-encoded 32-byte AES key used to
 // protect the knowledge-base provider credentials stored in SQLite.
-const testEncryptionKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+var testEncryptionKey = statetest.TestEncryptionKey
 
 // testQueryPoints is the Qdrant query response used by the search tests.
 const testQueryPoints = `[
@@ -162,22 +163,24 @@ func unauthorizedModelHandler(string, map[string]any) (int, string) {
 	return http.StatusUnauthorized, `{"detail":"private upstream error"}`
 }
 
-// newSearchTestStores opens a real SQLite state store with a fixed encryption
-// key.
+// newSearchTestStores opens the shared MySQL test store with a fixed
+// encryption key.
 func newSearchTestStores(t *testing.T) *state.Stores {
 	t.Helper()
-	root := t.TempDir()
-	database := filepath.Join(root, "state.sqlite3")
-	settings := config.StateSettings{
-		URL:           "sqlite+pysqlite:///" + filepath.ToSlash(database),
-		SQLitePath:    database,
+	url, key := statetest.Connection(t)
+	stores, err := state.New(state.StateSettings{
+		URL:           url,
+		EncryptionKey: key,
 		AutoSchema:    true,
-		EncryptionKey: testEncryptionKey,
-	}
-	stores, err := state.New(settings, true)
+		PoolSize:      10,
+		MaxOverflow:   20,
+		PoolRecycle:   1800,
+		PoolTimeout:   30,
+	}, true)
 	if err != nil {
-		t.Fatalf("state.New() error = %v", err)
+		t.Fatalf("state.New(MySQL) error = %v", err)
 	}
+	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return stores
 }

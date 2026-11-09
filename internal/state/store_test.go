@@ -3,7 +3,6 @@ package state
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -13,15 +12,14 @@ func TestDescribePingAndClose(t *testing.T) {
 	ctx := context.Background()
 
 	description := stores.Describe()
-	if description["backend"] != "sqlite" {
+	if description["backend"] != "mysql" {
 		t.Fatalf("backend = %v", description["backend"])
 	}
-	expected := filepath.ToSlash(stores.Settings.SQLitePath)
-	if description["database"] != expected {
-		t.Fatalf("database = %v, want %q", description["database"], expected)
+	if description["database"] != stores.Settings.Database {
+		t.Fatalf("database = %v, want %q", description["database"], stores.Settings.Database)
 	}
-	if description["host"] != nil {
-		t.Fatalf("host = %v, want nil", description["host"])
+	if description["host"] != stores.Settings.Host {
+		t.Fatalf("host = %v, want %q", description["host"], stores.Settings.Host)
 	}
 	if description["encrypted"] != true {
 		t.Fatalf("encrypted = %v", description["encrypted"])
@@ -43,13 +41,14 @@ func TestDescribePingAndClose(t *testing.T) {
 func TestAutoSchemaCanBeDisabled(t *testing.T) {
 	isolateStateEnv(t)
 	useTestEncryptionKey(t)
-	root := filepath.Join(t.TempDir(), "state")
+	seed := newTestStores(t)
+	dropStateTables(t, seed)
+	ctx := context.Background()
 	t.Setenv("RAG_STATE_AUTO_SCHEMA", "0")
-	stores, err := Create(root)
+	stores, err := Create("")
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	ctx := context.Background()
 	exists, err := stores.hasTable(ctx, "api_keys")
 	if err != nil {
 		t.Fatalf("hasTable() error = %v", err)
@@ -65,7 +64,7 @@ func TestAutoSchemaCanBeDisabled(t *testing.T) {
 	}
 
 	t.Setenv("RAG_STATE_AUTO_SCHEMA", "1")
-	reopened, err := Create(root)
+	reopened, err := Create("")
 	if err != nil {
 		t.Fatalf("Create() with auto schema error = %v", err)
 	}
@@ -82,7 +81,9 @@ func TestAutoSchemaCanBeDisabled(t *testing.T) {
 func TestSchemaCreationCanBeForcedOff(t *testing.T) {
 	isolateStateEnv(t)
 	useTestEncryptionKey(t)
-	settings, err := SettingsFromEnv(filepath.Join(t.TempDir(), "state"))
+	seed := newTestStores(t)
+	dropStateTables(t, seed)
+	settings, err := SettingsFromEnv("")
 	if err != nil {
 		t.Fatalf("SettingsFromEnv() error = %v", err)
 	}
@@ -146,10 +147,8 @@ func TestReopenKeepsPersistedState(t *testing.T) {
 
 func TestInitializeFailureIsWrapped(t *testing.T) {
 	isolateStateEnv(t)
-	directory := t.TempDir()
 	settings := StateSettings{
-		URL:        "sqlite+pysqlite:///" + filepath.ToSlash(directory),
-		SQLitePath: directory,
+		URL:        "mysql+pymysql://rag:pw@127.0.0.1:1/praxis_test?charset=utf8mb4",
 		AutoSchema: true,
 	}
 	stores, err := New(settings, true)
@@ -157,7 +156,7 @@ func TestInitializeFailureIsWrapped(t *testing.T) {
 		_ = stores.Close()
 	}
 	if err == nil {
-		t.Fatal("New() over a directory succeeded")
+		t.Fatal("New() against an unreachable server succeeded")
 	}
 	stateError := mustBeError[*StateError](t, err)
 	if !strings.HasPrefix(stateError.Message, "状态数据库初始化失败：") {
@@ -218,18 +217,13 @@ func TestListJSONNeverLeaksSecrets(t *testing.T) {
 	}
 }
 
-func TestOpenDatabaseChoosesDialect(t *testing.T) {
-	isolateStateEnv(t)
-	settings, err := SettingsFromEnv(t.TempDir())
-	if err != nil {
-		t.Fatalf("SettingsFromEnv() error = %v", err)
+func TestOpenDatabaseUsesMySQL(t *testing.T) {
+	stores := newTestStores(t)
+	description := stores.Describe()
+	if description["backend"] != "mysql" {
+		t.Fatalf("backend = %v, want mysql", description["backend"])
 	}
-	stores, err := New(settings, false)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	defer func() { _ = stores.Close() }()
-	if stores.Dialect() != DialectSQLite || stores.Dialect().String() != "sqlite" {
-		t.Fatalf("dialect = %v", stores.Dialect())
+	if err := stores.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping() error = %v", err)
 	}
 }

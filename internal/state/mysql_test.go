@@ -13,9 +13,6 @@ func TestMySQLStoreRoundTrip(t *testing.T) {
 	stores := openMySQLTestStores(t)
 	ctx := context.Background()
 
-	if stores.Dialect() != DialectMySQL || stores.Dialect().String() != "mysql" {
-		t.Fatalf("dialect = %v, want mysql", stores.Dialect())
-	}
 	if description := stores.Describe(); description["backend"] != "mysql" {
 		t.Fatalf("describe = %+v", description)
 	}

@@ -4,16 +4,11 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
-// DefaultSQLiteName is the SQLite file created under the data root.
-const DefaultSQLiteName = "state.sqlite3"
-
-// StateSettings configures the authoritative state database. It mirrors
-// rag_mcp.state.settings.StateSettings but keeps both the raw URL and the
-// parsed parts needed to build Go database/sql DSNs.
+// StateSettings configures the authoritative state database. MySQL is the only
+// supported backend: the service never falls back to a local file database.
 type StateSettings struct {
 	URL           string
 	EncryptionKey string
@@ -24,19 +19,22 @@ type StateSettings struct {
 	Echo          bool
 	AutoSchema    bool
 
-	IsMySQL    bool
-	SQLitePath string
-	Host       string
-	Port       int
-	User       string
-	Password   string
-	Database   string
-	SSLCA      string
+	Host     string
+	Port     int
+	User     string
+	Password string
+	Database string
+	SSLCA    string
 }
 
-// StateSettingsFromEnv resolves the state database selector. The precedence is
-// RAG_STATE_URL, then RAG_MYSQL_HOST parts, then SQLite under the data root.
+// StateSettingsFromEnv resolves the MySQL state database connection. The
+// precedence is an explicit RAG_STATE_URL, then the RAG_MYSQL_* parts; when
+// neither is configured it fails instead of opening a local database.
+//
+// dataRoot is still accepted because callers pass their service data
+// directory, but it never selects the database.
 func StateSettingsFromEnv(dataRoot string) (StateSettings, error) {
+	_ = dataRoot
 	explicit := strings.TrimSpace(os.Getenv("RAG_STATE_URL"))
 	settings := StateSettings{
 		EncryptionKey: strings.TrimSpace(os.Getenv("RAG_STATE_ENCRYPTION_KEY")),
@@ -61,94 +59,63 @@ func StateSettingsFromEnv(dataRoot string) (StateSettings, error) {
 		database := defaultString(strings.TrimSpace(os.Getenv("RAG_MYSQL_DATABASE")), "praxis_rag")
 		port := parseEnvInt("RAG_MYSQL_PORT", 3306)
 		sslCA := strings.TrimSpace(os.Getenv("RAG_MYSQL_SSL_CA"))
-		settings.IsMySQL = true
 		settings.Host, settings.Port = host, port
 		settings.User, settings.Password, settings.Database, settings.SSLCA = user, password, database, sslCA
 		settings.URL = buildMySQLURL(host, port, user, password, database, sslCA)
 	default:
-		root := ExpandPath(dataRoot)
-		if root == "" {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return StateSettings{}, fmt.Errorf("Cannot resolve the home directory for the state database")
-			}
-			root = filepath.Join(home, ".praxis-rag", "data")
-		}
-		if err := os.MkdirAll(root, 0o755); err != nil {
-			return StateSettings{}, fmt.Errorf("Cannot create the state database directory: %s", root)
-		}
-		path := filepath.Join(root, DefaultSQLiteName)
-		settings.SQLitePath = path
-		settings.URL = "sqlite+pysqlite:///" + filepath.ToSlash(path)
+		return StateSettings{}, fmt.Errorf(
+			"the state database is not configured: set RAG_STATE_URL, or RAG_MYSQL_HOST/RAG_MYSQL_USER/RAG_MYSQL_DATABASE/RAG_MYSQL_PASSWORD")
 	}
 	return settings, nil
 }
 
 // Describe returns the secret-free state summary reported by /health.
 func (s StateSettings) Describe() map[string]any {
-	backend := "sqlite"
-	database := any(filepath.ToSlash(s.SQLitePath))
-	host := any(nil)
-	if s.IsMySQL {
-		backend = "mysql"
-		database = s.Database
-		host = s.Host
-	}
 	return map[string]any{
-		"backend":   backend,
-		"database":  database,
-		"host":      host,
+		"backend":   "mysql",
+		"database":  s.Database,
+		"host":      s.Host,
 		"encrypted": s.EncryptionKey != "",
 	}
 }
 
-func (s *StateSettings) parseURL(raw string) error {
-	lowered := strings.ToLower(raw)
-	switch {
-	case strings.HasPrefix(lowered, "mysql"):
-		s.IsMySQL = true
-		parsed, err := url.Parse(raw)
-		if err != nil {
-			return fmt.Errorf("RAG_STATE_URL is not a valid database URL")
-		}
-		s.Host = parsed.Hostname()
-		if parsed.Port() != "" {
-			var port int
-			if _, scanErr := fmt.Sscanf(parsed.Port(), "%d", &port); scanErr == nil {
-				s.Port = port
-			}
-		}
-		if s.Port == 0 {
-			s.Port = 3306
-		}
-		if parsed.User != nil {
-			s.User = parsed.User.Username()
-			if password, ok := parsed.User.Password(); ok {
-				s.Password = password
-			}
-		}
-		s.Database = strings.TrimPrefix(parsed.Path, "/")
-		s.SSLCA = parsed.Query().Get("ssl_ca")
-	case strings.HasPrefix(lowered, "sqlite"):
-		index := strings.Index(raw, ":///")
-		if index < 0 {
-			index = strings.Index(raw, "://")
-			if index < 0 {
-				return fmt.Errorf("RAG_STATE_URL is not a valid SQLite URL")
-			}
-			s.SQLitePath = raw[index+3:]
-		} else {
-			s.SQLitePath = raw[index+4:]
-		}
-		if s.SQLitePath != "" && s.SQLitePath != ":memory:" && !strings.HasPrefix(s.SQLitePath, "file:") {
-			parent := filepath.Dir(ExpandPath(s.SQLitePath))
-			if err := os.MkdirAll(parent, 0o755); err != nil {
-				return fmt.Errorf("Cannot create the state database directory: %s", parent)
-			}
-		}
-	default:
-		return fmt.Errorf("RAG_STATE_URL must be a MySQL or SQLite URL")
+// ParseStateURL parses a MySQL URL into connection settings, so callers that
+// hold only the URL (tests, tooling) get the same host/port/user/database the
+// environment resolution produces.
+func ParseStateURL(raw string) (StateSettings, error) {
+	settings := StateSettings{URL: raw}
+	if err := settings.parseURL(raw); err != nil {
+		return StateSettings{}, err
 	}
+	return settings, nil
+}
+
+func (s *StateSettings) parseURL(raw string) error {
+	if !strings.HasPrefix(strings.ToLower(raw), "mysql") {
+		return fmt.Errorf("RAG_STATE_URL must be a MySQL URL")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("RAG_STATE_URL is not a valid database URL")
+	}
+	s.Host = parsed.Hostname()
+	if parsed.Port() != "" {
+		var port int
+		if _, scanErr := fmt.Sscanf(parsed.Port(), "%d", &port); scanErr == nil {
+			s.Port = port
+		}
+	}
+	if s.Port == 0 {
+		s.Port = 3306
+	}
+	if parsed.User != nil {
+		s.User = parsed.User.Username()
+		if password, ok := parsed.User.Password(); ok {
+			s.Password = password
+		}
+	}
+	s.Database = strings.TrimPrefix(parsed.Path, "/")
+	s.SSLCA = parsed.Query().Get("ssl_ca")
 	return nil
 }
 

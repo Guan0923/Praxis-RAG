@@ -63,20 +63,20 @@ func TestDocumentPipelineEndToEnd(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- worker.RunConsumer(runCtx, consumer) }()
 
-	waitFor(t, 15*time.Second, "document job succeeded", func() bool {
+	waitFor(t, 90*time.Second, "document job succeeded", func() bool {
 		current, readErr := h.Stores.DocumentJobs.Get(context.Background(), artifactID, nil)
 		return readErr == nil && current != nil && current.Status == state.DocumentJobSucceeded
 	})
 	// The durable job becomes succeeded inside Handle; the commit/ack happens
 	// right after it returns, so wait for the delivery to be acknowledged too.
-	waitFor(t, 5*time.Second, "document delivery acked", func() bool { return transport.ackCount() == 1 })
+	waitFor(t, 90*time.Second, "document delivery acked", func() bool { return transport.ackCount() == 1 })
 	cancel()
 	select {
 	case runErr := <-done:
 		if runErr != nil {
 			t.Fatalf("RunConsumer() error = %v", runErr)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(90 * time.Second):
 		t.Fatalf("document consumer did not stop")
 	}
 	if err := worker.Close(); err != nil {
@@ -174,7 +174,7 @@ func TestDocumentWorkerOutboxLocalMode(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- worker.Run(runCtx) }()
 
-	waitFor(t, 15*time.Second, "local-mode document job succeeded", func() bool {
+	waitFor(t, 90*time.Second, "local-mode document job succeeded", func() bool {
 		current, readErr := h.Stores.DocumentJobs.Get(context.Background(), artifactID, nil)
 		return readErr == nil && current != nil && current.Status == state.DocumentJobSucceeded
 	})
@@ -184,7 +184,7 @@ func TestDocumentWorkerOutboxLocalMode(t *testing.T) {
 		if runErr != nil {
 			t.Fatalf("Run() error = %v", runErr)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(90 * time.Second):
 		t.Fatalf("local-mode document worker did not stop")
 	}
 	cancel()

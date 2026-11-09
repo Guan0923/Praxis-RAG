@@ -532,7 +532,7 @@ func TestUploadRecoversInterruptedOperation(t *testing.T) {
 	ctx := context.Background()
 	// Simulate a crashed worker: a short lease with no heartbeat that expires
 	// before the next upload runs recovery.
-	journal, err := state.NewUploadJournal(stores, state.WithLeaseSeconds(0.02), state.WithAutoHeartbeat(false))
+	journal, err := state.NewUploadJournal(stores, state.WithLeaseSeconds(5.0), state.WithAutoHeartbeat(false))
 	if err != nil {
 		t.Fatalf("NewUploadJournal() error = %v", err)
 	}
@@ -548,7 +548,7 @@ func TestUploadRecoversInterruptedOperation(t *testing.T) {
 	if err := journal.Intent(ctx, operation, "stage_qdrant", map[string]any{"version": operation.ID}); err != nil {
 		t.Fatalf("Intent() error = %v", err)
 	}
-	time.Sleep(120 * time.Millisecond)
+	time.Sleep(6 * time.Second)
 
 	if _, err := service.uploadDocuments(ctx, "alpha",
 		[]UploadFile{uploadFile("guide.md", repeatedDocumentText(3))}, ""); err != nil {

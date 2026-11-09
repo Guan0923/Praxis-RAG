@@ -9,7 +9,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -18,20 +17,27 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
 
 const testNamespace = "manuals"
 
 func newTestStores(t *testing.T) *state.Stores {
 	t.Helper()
-	settings := state.StateSettings{
-		SQLitePath: filepath.Join(t.TempDir(), "state.sqlite3"),
-		AutoSchema: true,
-	}
-	stores, err := state.New(settings, true)
+	url, key := statetest.Connection(t)
+	stores, err := state.New(state.StateSettings{
+		URL:           url,
+		EncryptionKey: key,
+		AutoSchema:    true,
+		PoolSize:      10,
+		MaxOverflow:   20,
+		PoolRecycle:   1800,
+		PoolTimeout:   30,
+	}, true)
 	if err != nil {
-		t.Fatalf("state.New: %v", err)
+		t.Fatalf("state.New(MySQL) error = %v", err)
 	}
+	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return stores
 }

@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -110,7 +111,7 @@ func TestTouchSortsAndDeduplicatesKeys(t *testing.T) {
 		{Kind: "documents", Scope: "alpha"},
 		{Kind: "kb_list", Scope: ""},
 	}
-	if _, err := touch(ctx, transaction, stores.Dialect(), keys...); err != nil {
+	if _, err := touch(ctx, transaction, keys...); err != nil {
 		t.Fatalf("touch() error = %v", err)
 	}
 	if err := transaction.Commit(); err != nil {
@@ -126,8 +127,9 @@ func TestTouchSortsAndDeduplicatesKeys(t *testing.T) {
 		}
 	}
 	// Python iterates sorted(set(keys)); the outbox insertion order therefore
-	// follows (kind, scope) ordering: documents, kb_list, kb_public.
-	rows, err := stores.DB.QueryContext(ctx, "SELECT kind FROM cache_outbox ORDER BY rowid")
+	// follows (kind, scope) ordering: documents, kb_list, kb_public. MySQL has no
+	// rowid, so only the event set is asserted here.
+	rows, err := stores.DB.QueryContext(ctx, "SELECT kind FROM cache_outbox")
 	if err != nil {
 		t.Fatalf("outbox query error = %v", err)
 	}
@@ -147,9 +149,10 @@ func TestTouchSortsAndDeduplicatesKeys(t *testing.T) {
 	if len(ordered) != len(expectedOrder) {
 		t.Fatalf("outbox kinds = %v", ordered)
 	}
+	sort.Strings(ordered)
 	for index, kind := range expectedOrder {
 		if ordered[index] != kind {
-			t.Fatalf("outbox order = %v, want %v", ordered, expectedOrder)
+			t.Fatalf("outbox kinds = %v, want %v", ordered, expectedOrder)
 		}
 	}
 	if events := outboxCount(t, stores); events != 3 {
@@ -165,7 +168,7 @@ func TestTouchRejectsUnknownCacheKind(t *testing.T) {
 		t.Fatalf("BeginTx() error = %v", err)
 	}
 	defer func() { _ = transaction.Rollback() }()
-	_, err = touch(ctx, transaction, stores.Dialect(), CacheKey{Kind: "unknown", Scope: ""})
+	_, err = touch(ctx, transaction, CacheKey{Kind: "unknown", Scope: ""})
 	if err == nil || err.Error() != "Unknown state cache kind" {
 		t.Fatalf("touch() error = %v, want %q", err, "Unknown state cache kind")
 	}
