@@ -8,7 +8,7 @@ from .chunking import DocumentChunk, _split_ranges, _stable_id, _title
 from .chunk_strategies import ChunkingConfig, TokenBudget, get_tokenizer, source_metadata, split_content
 from .document_readers import DocumentContent, SourceBlock, SourceSpan, MAX_EXTRACTED_CHARACTERS
 
-PDF_PARSER_VERSION = "docling-formula-ordered-v2"
+PDF_PARSER_VERSION = "docling-formula-remote-v3"
 FORMULA_BLOCK = re.compile(r"(?m)^\$\$[ \t]*\n[\s\S]*?^\$\$[ \t]*(?:\n|$)")
 
 

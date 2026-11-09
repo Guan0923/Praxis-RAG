@@ -55,6 +55,9 @@ type PDFOptions struct {
 	PythonPath string
 	// ModelsPath is passed to the worker as --models when set.
 	ModelsPath string
+	// VLM configures the remote vision-language endpoint used for formula
+	// recognition and picture descriptions.
+	VLM document.VLMSettings
 	// Timeout bounds one worker run (zero means the worker default).
 	Timeout time.Duration
 }
@@ -307,6 +310,7 @@ func preparePDF(ctx context.Context, sourcePath string, options Options) (Result
 			Module:     options.PDF.Module,
 			PythonPath: options.PDF.PythonPath,
 			ModelsPath: options.PDF.ModelsPath,
+			VLM:        options.PDF.VLM,
 			Timeout:    options.PDF.Timeout,
 		}
 	}

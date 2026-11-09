@@ -180,3 +180,47 @@ func TestStateSettingsExplicitMySQLURL(t *testing.T) {
 		t.Fatalf("unexpected settings: %+v", settings)
 	}
 }
+
+func TestRagConfigVLMEndpoint(t *testing.T) {
+	isolateEnv(t)
+	cfg, err := RagConfigFromEnv()
+	if err != nil {
+		t.Fatalf("RagConfigFromEnv() error = %v", err)
+	}
+	if cfg.VLMBaseURL != "" || cfg.VLMModel != "" || cfg.VLMTimeout != 120 || cfg.VLMConcurrency != 4 {
+		t.Fatalf("vlm defaults = %+v", cfg)
+	}
+
+	t.Setenv("RAG_VLM_BASE_URL", "https://llm.internal/v1/")
+	t.Setenv("RAG_VLM_API_KEY", "sk-test")
+	t.Setenv("RAG_VLM_MODEL", "qwen2.5-vl-7b")
+	t.Setenv("RAG_VLM_TIMEOUT", "45")
+	t.Setenv("RAG_VLM_CONCURRENCY", "8")
+	cfg, err = RagConfigFromEnv()
+	if err != nil {
+		t.Fatalf("RagConfigFromEnv() error = %v", err)
+	}
+	if cfg.VLMBaseURL != "https://llm.internal/v1" || cfg.VLMAPIKey != "sk-test" ||
+		cfg.VLMModel != "qwen2.5-vl-7b" || cfg.VLMTimeout != 45 || cfg.VLMConcurrency != 8 {
+		t.Fatalf("vlm config = %+v", cfg)
+	}
+
+	t.Setenv("RAG_VLM_MODEL", "")
+	if _, err := RagConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "RAG_VLM_MODEL is required") {
+		t.Fatalf("missing model error = %v", err)
+	}
+	t.Setenv("RAG_VLM_MODEL", "qwen2.5-vl-7b")
+
+	for _, invalid := range []string{"ftp://llm.internal/v1", "llm.internal/v1", "https://user:pw@llm.internal/v1"} {
+		t.Setenv("RAG_VLM_BASE_URL", invalid)
+		if _, err := RagConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "RAG_VLM_BASE_URL") {
+			t.Fatalf("base URL %q error = %v", invalid, err)
+		}
+	}
+
+	t.Setenv("RAG_VLM_BASE_URL", "http://127.0.0.1:8000/v1")
+	t.Setenv("RAG_VLM_TIMEOUT", "0")
+	if _, err := RagConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "RAG_VLM_TIMEOUT") {
+		t.Fatalf("timeout bound error = %v", err)
+	}
+}

@@ -341,7 +341,7 @@ func TestPrepareWordVisionIntegration(t *testing.T) {
 	body := pictureParagraph("") + paragraphXML("Body text")
 	path := pictureDocxPackage(t, body, false)
 	runner := &fakeVisionRunner{description: "A green pressure indicator on the pump panel."}
-	worker := &document.WordVisionWorker{ModelsPath: "/models", Runner: runner}
+	worker := &document.WordVisionWorker{ModelsPath: "/models", VLM: document.VLMSettings{BaseURL: "http://vlm.test/v1", Model: "test-vlm"}, Runner: runner}
 	result, err := Prepare(t.Context(), path, Options{
 		SourceName: "vision.docx",
 		Word:       WordOptions{Vision: worker},

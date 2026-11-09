@@ -634,6 +634,7 @@ func (s *Service) ingestDocument(
 			PDF: ingest.PDFOptions{
 				Executable: s.config.PDFParserPython,
 				ModelsPath: s.config.PDFModelsPath,
+				VLM:        s.vlmSettings(),
 				Timeout:    time.Duration(s.config.PDFParseTimeout) * time.Second,
 			},
 			Word: ingest.WordOptions{
@@ -641,6 +642,7 @@ func (s *Service) ingestDocument(
 					Executable: s.config.WordConverterPath,
 					Timeout:    time.Duration(s.config.WordConvertTimeout) * time.Second,
 				},
+				Vision: s.wordVisionWorker(),
 			},
 		})
 	}, nil)
@@ -1152,4 +1154,31 @@ func sha256Hex(value string) string { return sha256HexBytes([]byte(value)) }
 func sha256HexBytes(value []byte) string {
 	digest := sha256.Sum256(value)
 	return hex.EncodeToString(digest[:])
+}
+
+// vlmSettings maps the service configuration to the remote VLM endpoint used by
+// formula recognition and picture descriptions.
+func (s *Service) vlmSettings() document.VLMSettings {
+	return document.VLMSettings{
+		BaseURL:     s.config.VLMBaseURL,
+		APIKey:      s.config.VLMAPIKey,
+		Model:       s.config.VLMModel,
+		Timeout:     time.Duration(s.config.VLMTimeout) * time.Second,
+		Concurrency: s.config.VLMConcurrency,
+	}
+}
+
+// wordVisionWorker builds the Word image describer. It returns nil when no
+// remote VLM is configured so uploads keep working without one.
+func (s *Service) wordVisionWorker() *document.WordVisionWorker {
+	vlm := s.vlmSettings()
+	if !vlm.Configured() {
+		return nil
+	}
+	return &document.WordVisionWorker{
+		Executable: s.config.PDFParserPython,
+		ModelsPath: s.config.PDFModelsPath,
+		VLM:        vlm,
+		Timeout:    time.Duration(s.config.PDFParseTimeout) * time.Second,
+	}
 }

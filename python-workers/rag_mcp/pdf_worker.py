@@ -1,19 +1,34 @@
-"""Isolated Docling worker for PDF text, pictures, and tables."""
+"""Isolated Docling worker for PDF text, pictures, and tables.
+
+Formula recognition and picture descriptions call a remote OpenAI-compatible
+vision-language endpoint (base URL + API key + model name). Layout, table
+structure and OCR still run locally through Docling; only the VLM stages leave
+the machine.
+"""
 
 from __future__ import annotations
 
 import argparse
 import gc
 import json
+import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .pdf_content import PDF_PARSER_VERSION
 
 _DOCLING_VERSION = "2.126.0"
-_GRANITE_REVISION = "bf66a8244401a8e26d2ff429aa82df8550a289e5"
 _FORMULA_REVISION = "ecedbe111d15c2dc60bfd4a823cbe80127b58af4"
+_FORMULA_MAX_TOKENS = 1024
+_DESCRIPTION_MAX_TOKENS = 256
+_DESCRIPTION_TIMEOUT_FLOOR = 30.0
+_DESCRIPTION_PROMPT = (
+    "Describe the visible content for document retrieval in 2 to 4 concise sentences. "
+    "Preserve visible names, labels and relationships. For a table, summarize its subject only; "
+    "never invent cell values. End with a complete sentence."
+)
 
 
 def main() -> None:
@@ -28,39 +43,129 @@ def main() -> None:
     args.manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+class VlmSettings:
+    """Remote vision-language endpoint shared by formulas and descriptions."""
+
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: float, concurrency: int) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+        self.concurrency = concurrency
+
+    @property
+    def chat_url(self) -> str:
+        if self.base_url.endswith("/chat/completions"):
+            return self.base_url
+        if self.base_url.endswith("/v1"):
+            return self.base_url + "/chat/completions"
+        return self.base_url + "/v1/chat/completions"
+
+    def headers(self) -> dict[str, str]:
+        if not self.api_key:
+            return {}
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def engine_options(self, *, max_tokens: int | None = None):
+        from docling.datamodel.vlm_engine_options import ApiVlmEngineOptions
+        from docling.models.inference_engines.vlm import VlmEngineType
+
+        params: dict[str, object] = {"model": self.model, "temperature": 0.0}
+        if max_tokens:
+            params["max_tokens"] = max_tokens
+        return ApiVlmEngineOptions(
+            engine_type=VlmEngineType.API,
+            url=self.chat_url,
+            headers=self.headers(),
+            params=params,
+            timeout=self.timeout,
+            concurrency=self.concurrency,
+        )
+
+    def describe(self) -> dict[str, object]:
+        # Record the model and host, never the API key.
+        return {"backend": "remote", "model": self.model, "endpoint": urlsplit(self.base_url).netloc}
+
+
+def vlm_settings() -> VlmSettings:
+    """Read the remote VLM configuration from the environment.
+
+    Fails instead of falling back to a local model: the worker has no local VLM
+    weights, so a missing endpoint must be a configuration error.
+    """
+    base_url = os.environ.get("RAG_VLM_BASE_URL", "").strip()
+    model = os.environ.get("RAG_VLM_MODEL", "").strip()
+    if not base_url:
+        raise RuntimeError("RAG_VLM_BASE_URL is not configured: formula recognition and picture "
+                           "descriptions need a remote OpenAI-compatible VLM endpoint")
+    if not model:
+        raise RuntimeError("RAG_VLM_MODEL is not configured: the remote VLM endpoint needs a model name")
+    try:
+        timeout = float(os.environ.get("RAG_VLM_TIMEOUT", "") or 120.0)
+    except ValueError as error:
+        raise RuntimeError("RAG_VLM_TIMEOUT must be a number of seconds") from error
+    try:
+        concurrency = int(os.environ.get("RAG_VLM_CONCURRENCY", "") or 4)
+    except ValueError as error:
+        raise RuntimeError("RAG_VLM_CONCURRENCY must be an integer") from error
+    return VlmSettings(base_url, os.environ.get("RAG_VLM_API_KEY", "").strip(), model,
+                       max(timeout, _DESCRIPTION_TIMEOUT_FLOOR), max(concurrency, 1))
+
+
+def _local_device():
+    """Layout, table and OCR still run locally; use the GPU when there is one."""
+    import torch
+    from docling.datamodel.accelerator_options import AcceleratorDevice
+
+    if torch.cuda.is_available():
+        return AcceleratorDevice.CUDA, True
+    return AcceleratorDevice.CPU, False
+
+
+def _reset_cuda_stats() -> None:
+    """Peak memory is only meaningful when the local stages run on a GPU."""
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _peak_cuda_bytes() -> int:
+    import torch
+
+    return torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+
+
+
 def convert(source: Path, output: Path, models: Path | None) -> dict[str, object]:
     import docling
-    import torch
     from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
-    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+    from docling.datamodel.accelerator_options import AcceleratorOptions
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import CodeFormulaVlmOptions, EasyOcrOptions, PdfPipelineOptions, TableFormerMode, TableStructureOptions
-    from docling.datamodel.vlm_engine_options import TransformersVlmEngineOptions
     from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling_core.types.doc import ImageRefMode
 
     if docling.__version__ != _DOCLING_VERSION:
         raise RuntimeError(f"Docling {_DOCLING_VERSION} is required, found {docling.__version__}")
-    if not torch.cuda.is_available():
-        raise RuntimeError("Granite Vision and Docling PDF parsing require a CUDA GPU")
+    settings = vlm_settings()
+    device, use_gpu = _local_device()
     started = time.perf_counter()
-    torch.cuda.reset_peak_memory_stats()
+    _reset_cuda_stats()
     formula = CodeFormulaVlmOptions.from_preset("codeformulav2")
     formula.model_spec.revision = _FORMULA_REVISION
     formula.extract_code = False
-    formula.engine_options = TransformersVlmEngineOptions(
-        device=AcceleratorDevice.CUDA, compile_model=False, use_kv_cache=True,
-    )
+    formula.engine_options = settings.engine_options(max_tokens=_FORMULA_MAX_TOKENS)
     options = PdfPipelineOptions(
         artifacts_path=models,
-        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA, num_threads=4),
-        ocr_options=EasyOcrOptions(lang=["ch_sim", "en"], use_gpu=True, download_enabled=False,
+        accelerator_options=AcceleratorOptions(device=device, num_threads=4),
+        ocr_options=EasyOcrOptions(lang=["ch_sim", "en"], use_gpu=use_gpu, download_enabled=False,
                                    model_storage_directory=str(models / "EasyOcr") if models else None,
                                    confidence_threshold=0.0),
         table_structure_options=TableStructureOptions(mode=TableFormerMode.ACCURATE, do_cell_matching=False),
         code_formula_options=formula,
         do_ocr=True, do_table_structure=True, do_formula_enrichment=True, do_code_enrichment=False,
-        do_picture_description=False, do_picture_classification=False, enable_remote_services=False,
+        do_picture_description=False, do_picture_classification=False, enable_remote_services=True,
         generate_page_images=True, generate_picture_images=True, generate_table_images=True, images_scale=2.0,
         generate_parsed_pages=True,
     )
@@ -69,7 +174,7 @@ def convert(source: Path, output: Path, models: Path | None) -> dict[str, object
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=options, backend=PyPdfiumDocumentBackend)},
     )
     converter.initialize_pipeline(InputFormat.PDF)
-    cache = _enable_formula_cache(converter)
+    _tune_formula_stage(converter)
     result = converter.convert(source, raises_on_error=False, max_file_size=100 * 1024 * 1024, max_num_pages=1000)
     if result.status.value != "success" or result.errors:
         raise RuntimeError("; ".join(str(error) for error in result.errors) or f"Docling status: {result.status.value}")
@@ -80,19 +185,16 @@ def convert(source: Path, output: Path, models: Path | None) -> dict[str, object
     manifest["warnings"] = _ocr_diagnostics(result.pages, output)
     manifest["parser"] = {"version": PDF_PARSER_VERSION, "docling": _DOCLING_VERSION,
                           "formula_model": "docling-project/CodeFormulaV2",
-                          "formula_revision": _FORMULA_REVISION, "formula_cache": cache,
+                          "formula_revision": _FORMULA_REVISION, "vlm": settings.describe(),
                           "formula_crop_scale": 3.0, "formula_crop_expansion": 0.0, "formula_batch_size": 1,
                           "ocr_confidence_threshold": 0.0}
     del converter, result, doc
     gc.collect()
-    torch.cuda.empty_cache()
     missing = [asset for asset in manifest["assets"] if not asset["caption"]]
     if missing:
-        if models is None:
-            raise RuntimeError("RAG_PDF_MODELS_PATH is required when a figure or table has no caption")
-        _describe_missing(missing, output, models)
+        _describe_missing(missing, output, settings)
     manifest["metrics"] = {"seconds": round(time.perf_counter() - started, 3),
-                           "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated()}
+                           "peak_cuda_allocated_bytes": _peak_cuda_bytes()}
     return manifest
 
 
@@ -111,31 +213,22 @@ def _ocr_diagnostics(pages, output: Path) -> list[dict]:
     return warnings
 
 
-def _enable_formula_cache(converter) -> bool:
+def _tune_formula_stage(converter) -> None:
+    """Tight high-resolution crops avoid including adjacent prose in formula input."""
     from docling.models.stages.code_formula.code_formula_vlm_model import CodeFormulaVlmModel
-    from docling.models.utils.generation_utils import build_generation_config
 
     stages = [stage for pipeline in converter.initialized_pipelines.values()
               for stage in pipeline.enrichment_pipe if isinstance(stage, CodeFormulaVlmModel)]
     if len(stages) != 1:
         raise RuntimeError("Expected one CodeFormulaV2 stage")
-    engine = stages[0].engine
-    engine.vlm_model.generation_config.use_cache = True
-    engine.generation_config.use_cache = True
-    requested = build_generation_config(engine.generation_config, use_cache=True)
-    effective, _ = engine.vlm_model._prepare_generation_config(requested)
-    if effective.use_cache is not True:
-        raise RuntimeError("Formula generation cache was overridden")
-    # Tight high-resolution crops avoid including adjacent prose in formula input.
     stages[0].images_scale = 3.0
     stages[0].expansion_factor = 0.0
     stages[0].elements_batch_size = 1
-    stages[0].engine = _CheckedFormulaEngine(engine)
-    return True
+    stages[0].engine = _CheckedFormulaEngine(stages[0].engine)
 
 
 class _CheckedFormulaEngine:
-    """Keep truncated model output out of a successful document."""
+    """Keep failed or truncated model output out of a successful document."""
 
     def __init__(self, engine):
         self.engine = engine
@@ -147,6 +240,9 @@ class _CheckedFormulaEngine:
         outputs = []
         for item in inputs:
             output = self.engine.predict_batch([item])[0]
+            if not output.text.strip():
+                raise RuntimeError("The remote VLM returned no text for a formula; check "
+                                   "RAG_VLM_BASE_URL, RAG_VLM_MODEL and the endpoint logs")
             if (output.metadata.get("num_tokens", 0) >= item.max_new_tokens
                     or "</formula>" not in output.text):
                 raise RuntimeError("Formula generation did not finish; document was not indexed")
@@ -293,50 +389,79 @@ def _validate_table(table: dict[str, object], reference: str) -> None:
             raise RuntimeError(f"Wide table structure is unreliable after rotation/OCR: {reference}")
 
 
-def _describe_missing(assets: list[dict[str, object]], output: Path, models: Path, *,
-                      compile_model: bool = True, max_image_edge: int | None = None) -> None:
-    import torch
-    from PIL import Image
-    from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
-    from docling.datamodel.pipeline_options import PictureDescriptionVlmOptions
-    from docling.models.stages.picture_description.picture_description_vlm_model import PictureDescriptionVlmModel
+def _describe_missing(assets: list[dict[str, object]], output: Path, settings: VlmSettings, *,
+                      max_image_edge: int | None = None) -> None:
+    """Describe uncaptioned figures and tables through the remote VLM endpoint."""
+    import base64
+    from io import BytesIO
 
-    model_root = models / "ibm-granite--granite-vision-3.3-2b"
-    metadata = model_root / ".cache" / "huggingface" / "download" / "config.json.metadata"
-    if not metadata.is_file() or metadata.read_text(encoding="utf-8").splitlines()[0].strip() != _GRANITE_REVISION:
-        raise RuntimeError(f"Granite Vision revision {_GRANITE_REVISION} is required")
-    options = PictureDescriptionVlmOptions(
-        repo_id="ibm-granite/granite-vision-3.3-2b",
-        prompt=("Describe the visible content for document retrieval in 2 to 4 concise sentences. "
-                "Preserve visible names, labels and relationships. For a table, summarize its subject only; "
-                "never invent cell values. End with a complete sentence."),
-        generation_config={"max_new_tokens": 256, "do_sample": False},
-    )
-    model = PictureDescriptionVlmModel(
-        enabled=True, enable_remote_services=False, artifacts_path=models, options=options,
-        accelerator_options=AcceleratorOptions(device=AcceleratorDevice.CUDA, num_threads=4),
-    )
-    if not compile_model:
-        model.model = getattr(model.model, "_orig_mod", model.model)
-        model.model.eval()
-    for asset in assets:
-        image_path = output / str(asset.pop("_vision_file"))
-        if not image_path.is_file():
-            raise RuntimeError(f"Vision input is missing: {image_path.name}")
-        with Image.open(image_path) as image:
-            rgb = image.convert("RGB")
-            if max_image_edge is not None:
-                rgb.thumbnail((max_image_edge, max_image_edge))
-            descriptions = list(model._annotate_images([rgb]))
-        if len(descriptions) != 1 or not descriptions[0].strip():
-            raise RuntimeError(f"Granite Vision returned no description for {asset['asset_id']}")
-        asset["generated_description"] = _clean_description(descriptions[0])
-        asset["description_source"] = "granite_vision"
+    import requests
+    from PIL import Image
+
+    session = requests.Session()
+    session.headers.update(settings.headers())
+    try:
+        for asset in assets:
+            image_path = output / str(asset.pop("_vision_file"))
+            if not image_path.is_file():
+                raise RuntimeError(f"Vision input is missing: {image_path.name}")
+            with Image.open(image_path) as image:
+                rgb = image.convert("RGB")
+                if max_image_edge is not None:
+                    rgb.thumbnail((max_image_edge, max_image_edge))
+                buffer = BytesIO()
+                rgb.save(buffer, format="PNG")
+            description = _describe_image(session, settings, base64.b64encode(buffer.getvalue()).decode("ascii"))
+            asset["generated_description"] = _clean_description(description)
+            asset["description_source"] = "remote_vlm"
+    finally:
+        session.close()
     for asset in assets:
         asset.pop("_vision_file", None)
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
+
+
+def _describe_image(session, settings: VlmSettings, image_base64: str) -> str:
+    """One OpenAI-compatible chat completion with the image plus a fixed prompt."""
+    payload = {
+        "model": settings.model,
+        "temperature": 0.0,
+        "max_tokens": _DESCRIPTION_MAX_TOKENS,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_base64}},
+            {"type": "text", "text": _DESCRIPTION_PROMPT},
+        ]}],
+    }
+    headers = {"Content-Type": "application/json"}
+    headers.update(settings.headers())
+    last_error = ""
+    for attempt in range(3):
+        if attempt:
+            time.sleep(0.5 * attempt)
+        try:
+            response = session.post(settings.chat_url, headers=headers, json=payload, timeout=settings.timeout)
+        except Exception as error:  # network errors must fail the document, not hang
+            last_error = f"request failed: {error}"
+            continue
+        if response.status_code in {429, 500, 502, 503, 504}:
+            last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+            continue
+        if response.status_code != 200:
+            raise RuntimeError(f"Remote VLM returned HTTP {response.status_code}: {response.text[:200]}")
+        try:
+            data = response.json()
+        except ValueError as error:
+            raise RuntimeError("Remote VLM returned invalid JSON") from error
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise RuntimeError("Remote VLM response has no choices[0].message.content") from error
+        if isinstance(content, list):
+            content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        text = str(content or "").strip()
+        if not text:
+            raise RuntimeError("Remote VLM returned an empty description")
+        return text
+    raise RuntimeError(f"Remote VLM call failed after 3 attempts: {last_error}")
 
 
 def _clean_description(text: str) -> str:

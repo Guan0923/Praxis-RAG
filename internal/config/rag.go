@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -45,8 +46,16 @@ type RagConfig struct {
 	PDFParserPython       string
 	PDFModelsPath         string
 	PDFParseTimeout       int
-	WordConverterPath     string
-	WordConvertTimeout    int
+	// VLMBaseURL is the OpenAI-compatible endpoint for formula recognition and
+	// picture descriptions. Empty means the parser has no remote VLM and
+	// document parsing fails when it needs one.
+	VLMBaseURL         string
+	VLMAPIKey          string
+	VLMModel           string
+	VLMTimeout         int
+	VLMConcurrency     int
+	WordConverterPath  string
+	WordConvertTimeout int
 }
 
 // RagConfigFromEnv loads configuration without connecting to Qdrant or loading
@@ -139,6 +148,22 @@ func RagConfigFromEnv() (RagConfig, error) {
 	if err != nil {
 		return RagConfig{}, err
 	}
+	vlmBaseURL, err := parseVLMBaseURL(os.Getenv("RAG_VLM_BASE_URL"))
+	if err != nil {
+		return RagConfig{}, err
+	}
+	vlmModel := strings.TrimSpace(os.Getenv("RAG_VLM_MODEL"))
+	if vlmBaseURL != "" && vlmModel == "" {
+		return RagConfig{}, fmt.Errorf("RAG_VLM_MODEL is required when RAG_VLM_BASE_URL is set")
+	}
+	vlmTimeout, err := integerEnv("RAG_VLM_TIMEOUT", 120, 1, 3600)
+	if err != nil {
+		return RagConfig{}, err
+	}
+	vlmConcurrency, err := integerEnv("RAG_VLM_CONCURRENCY", 4, 1, 64)
+	if err != nil {
+		return RagConfig{}, err
+	}
 
 	return RagConfig{
 		Backend:               BackendName(rawBackend),
@@ -161,9 +186,30 @@ func RagConfigFromEnv() (RagConfig, error) {
 		PDFParserPython:       optionalPath("RAG_PDF_PARSER_PYTHON"),
 		PDFModelsPath:         optionalPath("RAG_PDF_MODELS_PATH"),
 		PDFParseTimeout:       pdfTimeout,
+		VLMBaseURL:            vlmBaseURL,
+		VLMAPIKey:             optionalEnv("RAG_VLM_API_KEY"),
+		VLMModel:              vlmModel,
+		VLMTimeout:            vlmTimeout,
+		VLMConcurrency:        vlmConcurrency,
 		WordConverterPath:     optionalPath("RAG_WORD_CONVERTER_PATH"),
 		WordConvertTimeout:    wordTimeout,
 	}, nil
+}
+
+// parseVLMBaseURL validates the remote VLM endpoint shape.
+func parseVLMBaseURL(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("RAG_VLM_BASE_URL must be an http(s) URL, for example https://llm.internal/v1")
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("RAG_VLM_BASE_URL must not embed credentials; set RAG_VLM_API_KEY instead")
+	}
+	return strings.TrimRight(value, "/"), nil
 }
 
 // ExpandPath expands a leading "~" and normalizes the path.

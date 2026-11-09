@@ -109,6 +109,7 @@ func TestVisionDescribeMissingCaptionsSuccess(t *testing.T) {
 		Executable: "test-python",
 		PythonPath: "/package/root",
 		ModelsPath: "/models",
+		VLM:        testVLM,
 		Timeout:    5 * time.Second,
 		Runner:     runner,
 	}
@@ -129,6 +130,10 @@ func TestVisionDescribeMissingCaptionsSuccess(t *testing.T) {
 	}
 	if runner.env["PYTHONUTF8"] != "1" || !strings.HasPrefix(runner.env["PYTHONPATH"], "/package/root") {
 		t.Fatalf("env = %v", runner.env)
+	}
+	if runner.env["RAG_VLM_BASE_URL"] != "http://vlm.test/v1" || runner.env["RAG_VLM_MODEL"] != "test-vlm" ||
+		runner.env["RAG_VLM_API_KEY"] != "test-key" {
+		t.Fatalf("vlm env = %v", runner.env)
 	}
 	if err := pkg.ReloadFromStaging(dir); err != nil {
 		t.Fatalf("ReloadFromStaging() error = %v", err)
@@ -158,7 +163,7 @@ func TestVisionSkipsWorkerWhenNothingMissing(t *testing.T) {
 		t.Fatalf("WriteStaging() error = %v", err)
 	}
 	runner := &fakeVisionRunner{}
-	worker := &WordVisionWorker{ModelsPath: "/models", Runner: runner}
+	worker := &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: runner}
 	if err := worker.DescribeMissingCaptions(context.Background(), dir); err != nil {
 		t.Fatalf("DescribeMissingCaptions() error = %v", err)
 	}
@@ -167,24 +172,33 @@ func TestVisionSkipsWorkerWhenNothingMissing(t *testing.T) {
 	}
 }
 
-func TestVisionRequiresModelsPath(t *testing.T) {
+func TestVisionRequiresRemoteVLM(t *testing.T) {
 	_, dir := prepareVisionStaging(t)
 	runner := &fakeVisionRunner{describe: "unused"}
 	worker := &WordVisionWorker{Runner: runner}
 	err := worker.DescribeMissingCaptions(context.Background(), dir)
-	want := "Word image description failed: ValueError: RAG_PDF_MODELS_PATH is required for uncaptioned Word images"
+	want := "Word image description failed: RAG_VLM_BASE_URL is required for uncaptioned Word images"
 	if err == nil || err.Error() != want {
 		t.Fatalf("error = %v", err)
 	}
 	if runner.calls != 0 {
-		t.Fatalf("runner was called without models")
+		t.Fatalf("runner was called without a remote VLM")
 	}
+}
+
+// testVLM is the remote endpoint every worker test configures.
+var testVLM = VLMSettings{
+	BaseURL:     "http://vlm.test/v1",
+	APIKey:      "test-key",
+	Model:       "test-vlm",
+	Timeout:     30 * time.Second,
+	Concurrency: 2,
 }
 
 func TestVisionRejectsRefusal(t *testing.T) {
 	_, dir := prepareVisionStaging(t)
 	runner := &fakeVisionRunner{describe: "I'm sorry, but I cannot provide a description of this image."}
-	worker := &WordVisionWorker{ModelsPath: "/models", Runner: runner}
+	worker := &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: runner}
 	err := worker.DescribeMissingCaptions(context.Background(), dir)
 	if err == nil || !strings.Contains(err.Error(), "Vision did not describe the image") {
 		t.Fatalf("error = %v", err)
@@ -197,13 +211,13 @@ func TestVisionProcessFailureDetail(t *testing.T) {
 		err:    errors.New("exit status 1"),
 		stderr: []byte("Traceback (most recent call last):\n  File x\nValueError: models are missing\n"),
 	}
-	worker := &WordVisionWorker{ModelsPath: "/models", Runner: runner}
+	worker := &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: runner}
 	err := worker.DescribeMissingCaptions(context.Background(), dir)
 	if err == nil || err.Error() != "Word image description failed: ValueError: models are missing" {
 		t.Fatalf("error = %v", err)
 	}
 	runner = &fakeVisionRunner{err: errors.New("exit status 1"), stdout: []byte("line one\nlast stdout line")}
-	worker = &WordVisionWorker{ModelsPath: "/models", Runner: runner}
+	worker = &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: runner}
 	err = worker.DescribeMissingCaptions(context.Background(), dir)
 	if err == nil || err.Error() != "Word image description failed: last stdout line" {
 		t.Fatalf("stdout detail error = %v", err)
@@ -213,7 +227,7 @@ func TestVisionProcessFailureDetail(t *testing.T) {
 func TestVisionTimeout(t *testing.T) {
 	_, dir := prepareVisionStaging(t)
 	runner := &fakeVisionRunner{blockUntilCancel: true}
-	worker := &WordVisionWorker{ModelsPath: "/models", Runner: runner, Timeout: 20 * time.Millisecond}
+	worker := &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: runner, Timeout: 20 * time.Millisecond}
 	err := worker.DescribeMissingCaptions(context.Background(), dir)
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("error = %v", err)
@@ -221,7 +235,7 @@ func TestVisionTimeout(t *testing.T) {
 }
 
 func TestVisionMissingManifest(t *testing.T) {
-	worker := &WordVisionWorker{ModelsPath: "/models", Runner: &fakeVisionRunner{}}
+	worker := &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: &fakeVisionRunner{}}
 	err := worker.DescribeMissingCaptions(context.Background(), t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "Word image description failed") ||
 		!strings.Contains(err.Error(), "manifest is missing") {

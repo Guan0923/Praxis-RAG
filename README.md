@@ -68,7 +68,7 @@ Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档任�
 - **Node.js 20.19+ / 22.12+**（仅构建 Console；不构建前端时可跳过）
 - **Qdrant**（HTTP 模式；Go 不支持 `QDRANT_PATH` 本地文件模式）
 - **共享状态库**：MySQL 8（`utf8mb4`），必须配置 `RAG_STATE_URL` 或 `RAG_MYSQL_*`，不再提供本地文件回退
-- **可选**：Redis（搜索快照/缓存）、Kafka（异步文档通知、排队搜索）、LibreOffice（DOC）、外部 Docling Python 环境（PDF/Word 视觉）
+- **可选**：Redis（搜索快照/缓存）、Kafka（异步文档通知、排队搜索）、LibreOffice（DOC）、外部 Docling Python 环境（PDF 版面/表格/OCR 与 Word 图片描述，公式与图片描述走远端 VLM）`r`n- **需要配置**：远端 OpenAI 兼容 VLM（`RAG_VLM_BASE_URL`/`RAG_VLM_API_KEY`/`RAG_VLM_MODEL`）才能解析 PDF 公式和无图注图片描述；未配置时 PDF 解析直接失败，不回退本地模型
 
 本地依赖可直接用仓库的 `docker-compose.yml`：
 
@@ -210,7 +210,7 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 - Word 保留内容控件、嵌套表格、合并范围与原生公式；未知公式结构、原生图表等无法可靠读取的内容会明确拒绝入库；图注关联有歧义时跳过并报告原因。
 - 工作区用于划分知识库，不是用户级权限系统；`/v1/admin/*` 只允许本机直连，MCP/普通 API 使用 Service Token 或 API Key。
 - 默认只监听 `127.0.0.1`。远程部署必须设置 `RAG_SERVICE_TOKEN` 与 MCP Host/Origin 白名单，并在前面配置 HTTPS 与访问控制。
-- PDF/Word 解析依赖外部进程（Docling + 模型、LibreOffice、Python 视觉环境），不属于 Go 二进制；未配置时相应文件上传会明确报错。
+- PDF/Word 解析依赖外部进程（Docling + 本地版面/表格/OCR 模型、LibreOffice、Python 环境），不属于 Go 二进制；公式识别与图片描述调用远端 VLM（`RAG_VLM_*`），文档裁图会发送到该端点。未配置时相应文件上传会明确报错。
 - Redis 搜索快照有 TTL（`RAG_RESULT_TTL_SECONDS`，默认 3600 秒），丢失或到期后 `result_id` 不可用，无 SQL 回放。异步文档任务状态在 MySQL，不受 Redis TTL 影响。
 - 日志仅记录任务/操作 ID 和安全错误类别，不记录查询、文件内容、消息正文或凭据。
 

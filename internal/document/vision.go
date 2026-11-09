@@ -111,10 +111,10 @@ type WordVisionRunner interface {
 
 // WordVisionWorker is the Go client of the external word_vision_worker protocol
 // (src/rag_mcp/word_vision_worker.py): it describes uncaptioned Word pictures
-// with the existing Granite Vision model. The Go service never embeds Python;
-// when no vision model is configured the worker is not invoked and pictures
-// stay captioned by placeholders/[Image] text only, or the caller chooses to
-// reject the document. Tests inject a fake runner.
+// with the remote VLM endpoint. The Go service never embeds Python; when no VLM
+// is configured the worker is not invoked and pictures stay captioned by
+// placeholders/[Image] text only, or the caller chooses to reject the document.
+// Tests inject a fake runner.
 type WordVisionWorker struct {
 	// Executable is the Python interpreter. Empty means "python".
 	Executable string
@@ -122,9 +122,11 @@ type WordVisionWorker struct {
 	Module string
 	// PythonPath is prepended to PYTHONPATH so the worker package imports.
 	PythonPath string
-	// ModelsPath is passed as --models; it is required when pictures are
-	// uncaptioned because the model artifacts live there.
+	// ModelsPath is optional: the remote endpoint needs no local VLM weights.
 	ModelsPath string
+	// VLM configures the remote vision-language endpoint. It is required when a
+	// document has uncaptioned pictures.
+	VLM VLMSettings
 	// Timeout bounds one worker run. Zero means 900 seconds.
 	Timeout time.Duration
 	// Runner overrides process execution for tests.
@@ -149,10 +151,10 @@ func (w *WordVisionWorker) DescribeMissingCaptions(ctx context.Context, stagingD
 	if len(missing) == 0 {
 		return nil
 	}
-	if w.ModelsPath == "" {
-		// The Python worker raises ValueError when --models is absent; surface
-		// the same safe failure without spawning a process.
-		return fmt.Errorf("Word image description failed: ValueError: RAG_PDF_MODELS_PATH is required for uncaptioned Word images")
+	if !w.VLM.Configured() {
+		// Without a remote endpoint the worker cannot describe anything; fail
+		// before spawning a process with the same message the caller relies on.
+		return fmt.Errorf("Word image description failed: RAG_VLM_BASE_URL is required for uncaptioned Word images")
 	}
 	executable := w.Executable
 	if executable == "" {
@@ -162,8 +164,12 @@ func (w *WordVisionWorker) DescribeMissingCaptions(ctx context.Context, stagingD
 	if module == "" {
 		module = "rag_mcp.word_vision_worker"
 	}
-	args := []string{"-m", module, "--manifest", manifestPath, "--models", w.ModelsPath}
+	args := []string{"-m", module, "--manifest", manifestPath}
+	if w.ModelsPath != "" {
+		args = append(args, "--models", w.ModelsPath)
+	}
 	env := map[string]string{"PYTHONUTF8": "1"}
+	w.VLM.mergeInto(env)
 	if w.PythonPath != "" {
 		existing := os.Getenv("PYTHONPATH")
 		if existing != "" {

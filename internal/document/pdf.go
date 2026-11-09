@@ -19,7 +19,7 @@ import (
 
 // PDFParserVersion mirrors pdf_content.PDF_PARSER_VERSION. Parsed PDF content
 // is only reusable while the external parser reports this version.
-const PDFParserVersion = "docling-formula-ordered-v2"
+const PDFParserVersion = "docling-formula-remote-v3"
 
 // Page is one PDF page of plain text (1-based page number), the unit produced
 // by document_readers._pdf_pages through pypdf.
@@ -234,8 +234,12 @@ type ExternalPDFParser struct {
 	Module string
 	// PythonPath is prepended to PYTHONPATH so the worker package imports.
 	PythonPath string
-	// ModelsPath is passed as --models when set.
+	// ModelsPath is passed as --models when set. It carries the local layout,
+	// table and OCR weights; the VLM weights are not needed any more.
 	ModelsPath string
+	// VLM configures the remote vision-language endpoint used for formulas and
+	// picture descriptions.
+	VLM VLMSettings
 	// Timeout bounds one worker run. Zero means 120 seconds.
 	Timeout time.Duration
 	// Runner overrides process execution for tests.
@@ -275,6 +279,7 @@ func (p *ExternalPDFParser) ParseInto(ctx context.Context, source, staging strin
 		args = append(args, "--models", p.ModelsPath)
 	}
 	env := map[string]string{"PYTHONUTF8": "1"}
+	p.VLM.mergeInto(env)
 	if p.PythonPath != "" {
 		existing := os.Getenv("PYTHONPATH")
 		if existing != "" {

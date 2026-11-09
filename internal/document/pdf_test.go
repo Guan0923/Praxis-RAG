@@ -174,6 +174,7 @@ func TestExternalPDFParserProtocol(t *testing.T) {
 		Executable: "test-python",
 		PythonPath: "/package/root",
 		ModelsPath: "/models",
+		VLM:        testVLM,
 		Timeout:    5 * time.Second,
 		Runner:     runner,
 	}
@@ -202,6 +203,11 @@ func TestExternalPDFParserProtocol(t *testing.T) {
 	}
 	if runner.env["PYTHONUTF8"] != "1" {
 		t.Fatalf("env = %v", runner.env)
+	}
+	if runner.env["RAG_VLM_BASE_URL"] != "http://vlm.test/v1" || runner.env["RAG_VLM_MODEL"] != "test-vlm" ||
+		runner.env["RAG_VLM_API_KEY"] != "test-key" || runner.env["RAG_VLM_CONCURRENCY"] != "2" ||
+		runner.env["RAG_VLM_TIMEOUT"] != "30" {
+		t.Fatalf("vlm env = %v", runner.env)
 	}
 	if !strings.HasPrefix(runner.env["PYTHONPATH"], "/package/root") {
 		t.Fatalf("PYTHONPATH = %q", runner.env["PYTHONPATH"])
@@ -330,7 +336,7 @@ func TestPagesFromManifestOrdersPagesAndFlattensTables(t *testing.T) {
 }
 
 func TestPDFParserVersionConstant(t *testing.T) {
-	if PDFParserVersion != "docling-formula-ordered-v2" {
+	if PDFParserVersion != "docling-formula-remote-v3" {
 		t.Fatalf("PDFParserVersion = %q", PDFParserVersion)
 	}
 }
