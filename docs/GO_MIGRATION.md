@@ -14,7 +14,7 @@
 - 与 Qdrant、MySQL/SQLite、Redis、RocketMQ 的现有交互格式与既有数据。
 
 前端（`frontend/`，React + Vite）不重写；构建产物仍输出到 Console 静态目录。
-PDF（Docling）与 Word/PDF 视觉解析属于外部 Python 解析进程，不在 Go 服务内重新实现，
+PDF 正文解析已由 Go 内置引擎（`internal/document/pdf_native.go`，纯 Go PDF 阅读器）默认承担，不再依赖外部进程；Docling 仍作为可选的 `RAG_PDF_ENGINE=docling` 外部 Python 解析进程保留（版面/表格/OCR/公式与图片描述），Word 视觉解析仍走外部 Python worker。
 Go 只负责按其现有协议调用并消费解析结果；语义检索和重排本来就是 HTTP 模型 API。
 
 ## 2. 目标架构
@@ -112,8 +112,7 @@ assets/                   可选嵌入资源目录（构建时生成，不入库
 - **Tokenizer 依赖**：Python 用 `transformers` 加载 BGE-M3 tokenizer 做 token 预算切分。
   Go 侧没有等价库，需在 G3 决策：纯 Go SentencePiece/Unigram 实现（推荐，需与
   `AutoTokenizer` 结果对齐验证）或把 tokenizer 作为外部小进程。切分边界必须保持可复现。
-- **PDF/Word 解析**：Docling/视觉模型保持外部 Python 解析进程，Go 通过文件协议调用；
-  这属于「外部解析器」而非后端业务逻辑，需在 README 中明确。
+- **PDF/Word 解析**：PDF 正文默认由 Go 内置解析器完成（`RAG_PDF_ENGINE=go`），Docling 降级为可选的 `RAG_PDF_ENGINE=docling` 外部 Python 解析进程，Go 通过文件协议调用；Word 视觉模型仍保持外部 Python 解析进程。这属于「外部解析器」而非后端业务逻辑，需在 README 中明确。
 - **RocketMQ Go SDK**：官方 Go client 的 gRPC 协议需与 Broker 5.3.3 + Proxy 兼容性实测；
   不通过时降级为自研 gRPC 封装，风险在 G7 处理。
 - **Qdrant 本地路径模式**：Python `qdrant-client` 支持 `QDRANT_PATH` 本地文件模式；Go 版

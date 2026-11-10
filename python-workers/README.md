@@ -1,5 +1,11 @@
 # Python parser workers (external processes)
 
+PDF text extraction is no longer Python-only: the Go backend ships an in-process
+PDF engine (`RAG_PDF_ENGINE=go`, the default) that reads text, line and paragraph
+structure without any Python installation. The optional Docling worker below is
+selected with `RAG_PDF_ENGINE=docling` when layout analysis, table structure,
+OCR, formula recognition and picture descriptions are required.
+
 The Go backend (`rag-service`, workers, CLIs) never imports Python. Two optional
 external parser workers remain Python because their native dependencies
 (Docling / PyTorch) have no Go equivalent here:

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
+	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/sparse"
 	"github.com/Guan0923/xinghe_rag/internal/state"
@@ -584,6 +585,30 @@ func TestSafeUploadErrorTextPdfParseMessage(t *testing.T) {
 	plain := &documentOperationError{Err: errors.New("boom"), OperationID: "op"}
 	if got := safeUploadErrorText(plain); got != "知识库操作失败：RuntimeError" {
 		t.Fatalf("safeUploadErrorText(errors.New) = %q", got)
+	}
+}
+
+// TestUploadPDFOptionsSelectsEngine pins the RAG_PDF_ENGINE wiring: the Go
+// engine injects the in-process parser, while docling keeps the external
+// worker options.
+func TestUploadPDFOptionsSelectsEngine(t *testing.T) {
+	goService := &Service{config: config.RagConfig{PDFEngine: config.PDFEngineGo}}
+	goOptions := goService.uploadPDFOptions(document.VLMSettings{})
+	if _, ok := goOptions.Parser.(*document.NativePDFParser); !ok {
+		t.Fatalf("go engine parser = %T, want *document.NativePDFParser", goOptions.Parser)
+	}
+	doclingService := &Service{config: config.RagConfig{
+		PDFEngine:       config.PDFEngineDocling,
+		PDFParserPython: "python",
+		PDFModelsPath:   "/models",
+		PDFParseTimeout: 120,
+	}}
+	doclingOptions := doclingService.uploadPDFOptions(document.VLMSettings{})
+	if doclingOptions.Parser != nil {
+		t.Fatalf("docling engine parser = %T, want the external worker", doclingOptions.Parser)
+	}
+	if doclingOptions.Executable != "python" || doclingOptions.ModelsPath != "/models" {
+		t.Fatalf("docling options = %+v", doclingOptions)
 	}
 }
 

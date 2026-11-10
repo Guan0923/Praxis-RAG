@@ -19,6 +19,14 @@ const DefaultRerankerModel = "BAAI/bge-reranker-base"
 // tenant-created knowledge bases when RAG_DEFAULT_KB_TEMPLATE is not set.
 const DefaultKBTemplateNamespace = "default"
 
+// PDF engines accepted by RAG_PDF_ENGINE.
+const (
+	// PDFEngineGo parses PDF text in-process with the pure-Go reader.
+	PDFEngineGo = "go"
+	// PDFEngineDocling runs the external Python/Docling worker.
+	PDFEngineDocling = "docling"
+)
+
 // BackendName is the supported retrieval backend selector.
 type BackendName string
 
@@ -53,6 +61,10 @@ type RagConfig struct {
 	PDFParserPython       string
 	PDFModelsPath         string
 	PDFParseTimeout       int
+	// PDFEngine selects the PDF parser: "go" (in-process pure-Go text
+	// extraction, the default) or "docling" (external Python/Docling worker
+	// with layout, table, OCR and remote-VLM formula support).
+	PDFEngine string
 	// VLMBaseURL is the OpenAI-compatible endpoint for formula recognition and
 	// picture descriptions. Empty means the parser has no remote VLM and
 	// document parsing fails when it needs one.
@@ -151,6 +163,11 @@ func RagConfigFromEnv() (RagConfig, error) {
 	if err != nil {
 		return RagConfig{}, err
 	}
+	pdfParserPython := optionalPath("RAG_PDF_PARSER_PYTHON")
+	pdfEngine, err := parsePDFEngine(os.Getenv("RAG_PDF_ENGINE"), pdfParserPython)
+	if err != nil {
+		return RagConfig{}, err
+	}
 	wordTimeout, err := integerEnv("RAG_WORD_CONVERT_TIMEOUT", 120, 1, 7200)
 	if err != nil {
 		return RagConfig{}, err
@@ -195,9 +212,10 @@ func RagConfigFromEnv() (RagConfig, error) {
 		RerankerMaxTextChars:  maxTextChars,
 		PreloadReranker:       preloadReranker,
 		DefaultKBTemplate:     defaultKBTemplate,
-		PDFParserPython:       optionalPath("RAG_PDF_PARSER_PYTHON"),
+		PDFParserPython:       pdfParserPython,
 		PDFModelsPath:         optionalPath("RAG_PDF_MODELS_PATH"),
 		PDFParseTimeout:       pdfTimeout,
+		PDFEngine:             pdfEngine,
 		VLMBaseURL:            vlmBaseURL,
 		VLMAPIKey:             optionalEnv("RAG_VLM_API_KEY"),
 		VLMModel:              vlmModel,
@@ -206,6 +224,23 @@ func RagConfigFromEnv() (RagConfig, error) {
 		WordConverterPath:     optionalPath("RAG_WORD_CONVERTER_PATH"),
 		WordConvertTimeout:    wordTimeout,
 	}, nil
+}
+
+// parsePDFEngine validates RAG_PDF_ENGINE. The in-process Go parser is the
+// default; existing Docling deployments keep the external worker because they
+// set RAG_PDF_PARSER_PYTHON.
+func parsePDFEngine(raw, parserPython string) (string, error) {
+	switch value := strings.ToLower(strings.TrimSpace(raw)); value {
+	case "":
+		if parserPython != "" {
+			return PDFEngineDocling, nil
+		}
+		return PDFEngineGo, nil
+	case PDFEngineGo, PDFEngineDocling:
+		return value, nil
+	default:
+		return "", fmt.Errorf("RAG_PDF_ENGINE must be go or docling")
+	}
 }
 
 // parseVLMBaseURL validates the remote VLM endpoint shape.

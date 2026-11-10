@@ -30,8 +30,9 @@ type Page struct {
 }
 
 // PDFPages extracts bounded per-page plain text for document text extraction
-// and chunk_document parity. Implementations call the external Docling worker
-// (ExternalPDFParser) or a test double. Docling is never reimplemented in Go.
+// and chunk_document parity. Implementations are the in-process native reader
+// (NativePDFParser, the default) or the optional external Docling worker
+// (ExternalPDFParser); tests inject doubles.
 type PDFPages interface {
 	Pages(ctx context.Context, source string) ([]Page, error)
 }
