@@ -6,6 +6,39 @@
 > is recorded immediately below. RocketMQ wording in the historical sections is
 > retained as history.
 
+## In-process Go PDF engine — 2026-11-10
+
+Delivered: PDF upload no longer requires a Python/Docling installation. The new
+`document.NativePDFParser` (`internal/document/pdf_native.go`, reader
+`github.com/ledongthuc/pdf`) implements both `ingest.PDFParser` and
+`document.PDFPages`, walks each page content stream, groups runs into visual
+lines, merges superscripts, removes headers/footers/page numbers and TOC dot
+leaders, normalizes ligatures, repairs hyphenated line breaks, keeps CJK text
+unspaced and only sorts runs by X when the reader exposes glyph widths (so
+zero-width CJK CID fonts keep the content-stream order). It writes the same
+`docling-formula-remote-v3` manifest (no chunk/metadata migration) with
+`parser.engine=go-native` and page/block/character/elapsed metrics.
+
+`RAG_PDF_ENGINE` (`go` default, `docling` optional) selects the engine; when
+unset, an existing `RAG_PDF_PARSER_PYTHON` keeps Docling, so old deployments are
+unchanged. Docling remains the only engine with layout analysis, table
+structure, OCR, formula recognition and picture descriptions.
+
+Automated checks (worktree `go-pdf-parser`, commit `27b1659`):
+
+- `go build ./...`, `go vet ./internal/document ./internal/config ./internal/runtime ./internal/ingest` — clean.
+- `go test ./internal/document ./internal/config ./internal/ingest -count=1` — pass. New cases: generated valid PDF (manifest version/blocks/order/`Pages`/`manifest.json`), broken input → `*PDFParseError`, textless PDF → “没有可索引的内容”, ligature/page-number/dehyphenation/CJK/spacing heuristics, `RAG_PDF_ENGINE` parsing/defaults, and runtime engine selection (`TestUploadPDFOptionsSelectsEngine`).
+- `go test ./internal/runtime -run 'Upload|Pdf|PDF' -count=1` — pass (upload/PDF-related runtime tests, including `TestSafeUploadErrorTextPdfParseMessage`).
+
+Live end-to-end check (service on `127.0.0.1:8011`, MySQL `praxis_rag`, KB `asdjasdajbsc`, embedding `http://aihub-api.goertek.com:30080/v1` + `bge-m3`):
+
+- `POST /v1/documents` (multipart `files=2404.16130v2.pdf`, header `X-RAG-Namespace: asdjasdajbsc`) → `200` in 48.5 s, `failed: []`, `imported[0].chunk_count = 35`, no `pdf_parser` error in the server log.
+- Stored manifest (`blobs` `pdf-assets/doc-850325c2ab92aea47056c511dd37528b/manifest.json`): `version=docling-formula-remote-v3`, `parser={"engine":"go-native","library":"github.com/ledongthuc/pdf"}`, `metrics={pages:26, blocks:349, characters:89856, elapsed_ms:2082}`, `assets=0`, `warnings=0`; first blocks are the paper title/author lines.
+- `upload_operations` row `2c37cfc8ce1846ef67a1b844d0330905` = `COMMITTED`, `error NULL`; steps `receive_source → deduplicate → chunking_tokenizer → stage_mysql → embedding → sparse → stage_qdrant` all `DONE`.
+- `POST /v1/search` (`rerank:"none"`, KB has no reranker configured) returns the PDF chunks (top hit score 0.75, GraphRAG title text), and `GET /v1/documents/2404.16130v2.pdf/content` serves the original PDF bytes. `GET /console` and the Vite dev server (`:5173`) return 200.
+
+Parser quality spot-checks (before the live run): arXiv `2404.16130v2.pdf` → 26 pages / 349 blocks / 89,856 chars, correct title/authors/headings/paragraphs; Chinese `新员工IT手册.pdf` → 23 pages / 28 blocks / 15,718 chars with correct CJK reading order after the width-availability fix. Known gaps: two-column PDFs can interleave columns, tables/figures/formulas become plain text (no assets), scanned pages need OCR and surface as empty-content/no-text warnings — use `RAG_PDF_ENGINE=docling` for those.
+
 ## Per-account API-key ownership and isolation — 2026-11-10
 
 Delivered: every API key now records the Console account that issued it

@@ -530,3 +530,14 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] `internal/runtime`：`safeUploadErrorText` 对 `*document.PDFParseError` 返回其安全消息；其余未知错误保持「按类别」输出，并把 Go 的 `errorString`/`wrapError` 映射成 Python 形状的 `RuntimeError`（不再泄露 Go 标识符）。上传失败时服务端日志新增 `Upload <id> failed category=… detail=…`（含截断后的错误消息，便于排查）。
 - [x] 测试：`internal/document` 覆盖缺失 Python 模块的 stderr 分类与既有失败消息不变（`TestExternalPDFParserErrors/missing_python_module`、`TestMissingPythonModule`）；`internal/runtime` 覆盖 PDF 解析消息透出与 `RuntimeError` 兜底（`TestSafeUploadErrorTextPdfParseMessage`）。详见 VALIDATION.md。
 - 已知限制：错误信息只解决「看不懂」。PDF 上传仍需要外部 Docling/PyTorch 解析环境（本机未安装，`python -m rag_mcp.pdf_worker` 报 `No module named 'rag_mcp'`）以及知识库配置的 VLM 端点；文本/Markdown 上传不受影响。
+
+## 2026-11-10 PDF 解析改为 Go 内置引擎（Docling 改为可选）
+
+本轮把 PDF 上传从「必须安装 Python/Docling」改为默认由 Go 进程内解析，消除用户上传 `2404.16130v2.pdf` 时 `ModuleNotFoundError: No module named 'rag_mcp'` 的根因，同时保留 Docling 作为可选高保真引擎：
+
+- [x] `internal/document/pdf_native.go`：新增 `NativePDFParser`（实现 `ingest.PDFParser` 与 `document.PDFPages`），用纯 Go PDF 阅读器（`github.com/ledongthuc/pdf`）逐页读取内容流：按基线聚类行并合并上标/脚注标记、按字号与行距分段、识别标题、去除页眉页脚与页码、清理目录点引导符、归一化连字（ﬁ/ﬂ/ﬃ）、修复行尾连字符换行、CJK 不插多余空格；按「字宽是否可用」决定按 X 排序还是保留内容流顺序，避免中文 PDF/零宽度字形被排乱。输出仍为 `docling-formula-remote-v3` 清单契约（`parser.engine=go-native`，metrics 记录 pages/blocks/characters/elapsed_ms），切分、元数据与已存文档无需迁移。
+- [x] `RAG_PDF_ENGINE`：`go`（默认）或 `docling`；未设置时若配置了 `RAG_PDF_PARSER_PYTHON` 仍走 docling（兼容既有部署），否则走 go。`internal/runtime` 上传路径按引擎注入 parser，`docling` 分支行为与之前完全一致。
+- [x] 版面/表格/OCR/公式/图片描述仍是 Docling 独有能力；Go 引擎只提取文字，扫描件会返回「PDF 没有可索引的内容」或空页告警，不会静默入库空文本。README、`docs/USAGE.md`、`docs/DEPLOYMENT.md`、`docs/GO_MIGRATION.md`、`python-workers/README.md` 已按引擎拆分更新；`document.PDFPages` 注释不再声称「Docling is never reimplemented in Go」。
+- [x] 测试：`internal/document/pdf_native_test.go`（程序生成的合法 PDF：清单/块顺序/Pages/损坏与空文本错误、连字/页码/连字符/CJK/标点空格启发式）、`internal/config/pdf_engine_test.go`（引擎解析与默认值）、`internal/runtime` 上传引擎选择测试；`go build ./...`、`go vet` 与相关包测试通过。
+- 实机验证：重启 8011 服务后，用默认 Go 引擎通过 `POST /v1/documents` 上传 arXiv `2404.16130v2.pdf`（6.89 MiB）→ 200、35 个 chunk 入库；保存的 manifest 为 26 页 / 349 blocks / 89856 字符 / 解析 2.08s，`parser.engine=go-native`；UploadJournal 步骤全部 DONE、操作 COMMITTED；检索命中该 PDF 正文。详见 VALIDATION.md。
+- 已知限制：Go 引擎不含版面分析（双栏 PDF 可能列间串行）、表格结构、图片/公式资产与 OCR；需要这些能力时设置 `RAG_PDF_ENGINE=docling` 并安装 python-workers 依赖。另：旧调试上传 `2c06005970…`（namespace `debug222146`）仍每 10 秒打印 `recovery failed (ValueError); retry pending`，与本改动无关，待清理。
