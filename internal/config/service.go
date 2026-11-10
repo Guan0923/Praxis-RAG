@@ -38,16 +38,17 @@ var DefaultMCPAllowedOrigins = []string{
 
 // Upload admission modes for POST /v1/documents.
 //
-// sync keeps the historical behaviour: the request parses, chunks, embeds and
-// publishes every file before it answers. async admits the batch durably (one
-// document_jobs row plus one outbox row per file) and answers immediately; the
-// rag-document-worker performs parsing/embedding/indexing afterwards.
+// async is the default: it admits the batch durably (one document_jobs row plus
+// one outbox row per file) and answers as soon as MySQL commits, so the Console
+// stays usable; parsing, chunking, embedding and publication happen afterwards
+// in the document worker. sync is the legacy opt-in mode where the request
+// parses, chunks, embeds and publishes every file before it answers.
 const (
 	UploadModeSync  = "sync"
 	UploadModeAsync = "async"
-	// DefaultUploadMode stays synchronous so an operator must opt in to the
-	// asynchronous pipeline after a document worker is deployed.
-	DefaultUploadMode = UploadModeSync
+	// DefaultUploadMode is asynchronous admission: uploads return after the
+	// durable MySQL commit and a document worker performs the parse afterwards.
+	DefaultUploadMode = UploadModeAsync
 )
 
 // ServiceSettings configures the standalone HTTP service entry point.
@@ -58,7 +59,8 @@ type ServiceSettings struct {
 	Token             string
 	MCPAllowedHosts   []string
 	MCPAllowedOrigins []string
-	// UploadMode selects sync (default) or async POST /v1/documents admission.
+	// UploadMode selects async (default) or sync POST /v1/documents admission.
+	// An empty value follows DefaultUploadMode.
 	UploadMode string
 	// WebRoot is the directory containing the built Console (index.html and
 	// assets). An empty value means "resolve a default location".
@@ -198,7 +200,7 @@ func registrationSetting() (bool, error) {
 	}
 }
 
-// uploadModeSetting parses RAG_UPLOAD_MODE: "sync" (default) or "async".
+// uploadModeSetting parses RAG_UPLOAD_MODE: "async" (default) or "sync".
 func uploadModeSetting() (string, error) {
 	raw := strings.ToLower(strings.TrimSpace(os.Getenv("RAG_UPLOAD_MODE")))
 	switch raw {

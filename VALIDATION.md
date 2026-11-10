@@ -39,6 +39,21 @@ Live end-to-end check (service on `127.0.0.1:8011`, MySQL `praxis_rag`, KB `asdj
 
 Parser quality spot-checks (before the live run): arXiv `2404.16130v2.pdf` → 26 pages / 349 blocks / 89,856 chars, correct title/authors/headings/paragraphs; Chinese `新员工IT手册.pdf` → 23 pages / 28 blocks / 15,718 chars with correct CJK reading order after the width-availability fix. Known gaps: two-column PDFs can interleave columns, tables/figures/formulas become plain text (no assets), scanned pages need OCR and surface as empty-content/no-text warnings — use `RAG_PDF_ENGINE=docling` for those.
 
+## 异步上传默认化与内嵌文档 worker — 2026-11-10
+
+Delivered: `POST /v1/documents`（网页 Console 与 REST）默认改为异步受理：每个文件在状态库单事务写入 `document_jobs` + `document_job_outbox` 后立即返回 `{"mode":"async","jobs":[...],"failed":[...]}`，解析/切分/Embedding/Qdrant 发布由文档 worker 在后台完成；`RAG_UPLOAD_MODE=sync` 保留为显式 opt-in 的旧同步行为。无 Kafka 的单进程部署由 `rag-service` 内嵌文档 worker 直接排空已提交的发件箱（`RAG_DOCUMENT_WORKER_INPROCESS`：未设置/`auto` = 未配置 Kafka 时启用；`1/true/on` = 强制启用，配置 Kafka 时拒绝启动；`0/false/off` = 关闭），轮询间隔 `RAG_DOCUMENT_WORKER_POLL_SECONDS`（默认 0.5 秒）。`documentworker.WithOutboxReceiver` 统一 service 内嵌 worker、独立 worker 本地模式与 REST 异步 e2e 的接线；`scripts/start-stack.ps1` 现在随 `rag-service` 启动/停止 `dist/bin/rag-document-worker.exe`。OpenAPI、`.env.example`、README、USAGE、DEPLOYMENT、PROGRESS 同步更新。
+
+Verification (Windows, Go 1.27.3, MySQL 8 on 127.0.0.1:3307 with the isolated `praxis_cache_test_smoke` schema, Qdrant/Redis from the local stack; `GOCACHE`/`GOTMPDIR` redirected into the worktree because the machine caches are outside the sandbox):
+
+- `go build ./...` → exit 0；`go vet ./internal/... ./cmd/...` → exit 0。
+- 定向测试：`go test ./internal/config ./internal/httpapi ./internal/documentworker ./cmd/rag-service -count=1` → 全部 `ok`（config 0.4 s、httpapi 145.8 s、documentworker 270.2 s、cmd/rag-service 0.3 s；本轮机器负载较高，耗时高于包内基线）。
+- 全量串行套件：`go test ./... -p 1 -count=1 -timeout 40m` → exit 0，25 分 05 秒，所有含测试的包 `ok`，无 `--- FAIL`/`--- SKIP`；重点包 `internal/state` 429.8 s、`internal/runtime` 471.1 s、`internal/e2e` 319.9 s（含 `TestRESTAsyncUploadPipeline`）、`internal/httpapi` 131.1 s、`internal/documentworker` 55.2 s、`internal/access` 20.3 s、`cmd/rag-service` 0.3 s。
+- 前端（本次未改前端，仅回归）：`npm run typecheck` 通过；`npm test` 54/54（5 个文件）；`npm run build` 通过（仅既有 >500 kB chunk 提示）。
+- 实机冒烟（`cmd/rag-service` 新二进制监听 127.0.0.1:18099，`praxis_cache_test_smoke` 状态库，模拟 OpenAI 兼容服务每次 embedding 延迟 2000 ms）：8/8 检查通过 —— `POST /v1/documents` 在 380 ms 内返回 `mode:"async"` 且 job `status:"queued"`（远小于 2000 ms 的解析延迟）；受理后立即读取 job 为 `queued`/`processing`，此时 `GET /v1/documents` 尚未包含该文件、`/health` 与文档列表均在 1 s 内响应；服务日志显示 `document_worker=in-process`、`poll_seconds=0.5`；后台任务最终 `status:"succeeded"`、`stage:"completed"`，随后文档出现在列表中且正文可读。该冒烟同时证明默认值（不设置 `RAG_UPLOAD_MODE` / `RAG_DOCUMENT_WORKER_INPROCESS`，不配置 Kafka）即可得到期望行为。
+- 与 main 的 PDF 内嵌引擎改动（`27b1659`/`bffdcf4`）合并后复验（rebase 到 `bffdcf4`，工作区模块缓存 `GOMODCACHE` 指到 worktree 以便拉取新 PDF 依赖）：`go build ./...` 通过、`go vet ./internal/... ./cmd/...` 通过；`go test ./internal/config ./internal/httpapi ./internal/document ./internal/documentworker ./cmd/rag-service -count=1` 全部 `ok`（config 3.2 s、httpapi 37.0 s、document 1.9 s、documentworker 67.1 s、cmd/rag-service 0.2 s）；`go test ./internal/e2e -run TestRESTAsyncUploadPipeline -count=1` ok（86.6 s）；`go test ./internal/runtime -run 'Upload|Pdf|PDF' -count=1` ok（222.6 s）；用合并后的二进制重跑上节实机冒烟 8/8 通过（上传 389 ms 返回）。
+
+Known limits: `scripts/start-stack.ps1` 的子进程生命周期只做了 PowerShell 语法解析（`[Parser]::ParseFile`），沙箱内无法启动 Docker/Kafka 前台子进程做端到端验证；真实浏览器级 Console 交互仍无自动化（仓库无 Playwright/Cypress），异步轮询 UI 由 Vitest 契约测试与 REST 异步 e2e 覆盖。`rag` MySQL 用户无 `CREATE DATABASE` 权限，新 schema 无法创建，冒烟复用了由测试套件迁移过的 `praxis_cache_test_smoke` 并使用唯一 namespace。行为变更：不再设置 `RAG_UPLOAD_MODE` 的部署从同步变为异步，必须有文档消费者（无 Kafka 自动内嵌；Kafka 需 `rag-document-worker` 或显式 `RAG_UPLOAD_MODE=sync`）。
+
 ## Per-account API-key ownership and isolation — 2026-11-10
 
 Delivered: every API key now records the Console account that issued it

@@ -9,9 +9,13 @@ REST /v1/* --------------------> rag-service ──> 共享状态库（MySQL）
                                              ├─> Redis（读模型缓存、搜索结果快照；可选，排队搜索快照需要）
                                              └─> Kafka（outbox relay / 搜索队列；可选）
 
-MCP add_document -> 状态库单事务（document_jobs + document_job_outbox）
-                 -> relay（rag-service 配置 Kafka 时）或本地 outbox 轮询
-                 -> Kafka 通知 -> rag-document-worker -> 解析/切分/Embedding/Qdrant 发布
+网页/REST 上传（默认异步）与 MCP add_document
+                 -> 状态库单事务（document_jobs + document_job_outbox）
+                 -> 有 Kafka：relay（rag-service 内置）-> Kafka 通知 -> rag-document-worker
+                 -> 无 Kafka：rag-service 内嵌文档 worker 直接轮询发件箱
+                 -> 两种方式都完成解析/切分/Embedding/Qdrant 发布，用
+                    GET /v1/document-jobs/{artifact_id} 轮询状态
+REST 上传（RAG_UPLOAD_MODE=sync）-> 请求内完成解析/切分/Embedding/发布
 MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-worker -> SearchRaw + 快照
 Kafka 死信（显式 DLQ topic）-> rag-dead-letter-worker --kind document|search
 ```
@@ -101,11 +105,11 @@ docker compose up -d
 
 MySQL 默认映射 `127.0.0.1:3307`（避免与本地 3306 冲突），Qdrant 为 `6333/6334`，Redis 为 `6379`，Kafka 宿主监听 `127.0.0.1:9092`（容器内 `kafka:9092`）。停止保留数据：`docker compose down`。
 
-> Kafka 默认自动创建 topic（4 partitions、副本 1）；`scripts/start-stack.ps1` 仍会显式创建 cache/document/search 与两个 DLQ topic、等待 Kafka healthy、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe`；`RAG_OUTBOX_BRIDGE=debezium` 时带 `--profile debezium` 并等待 Debezium 输出 `Starting streaming`。用 `-MigrateOnly` 可只准备依赖与数据库。使用 `RAG_DOCUMENT_WORKER_LOCAL=1` 的单进程文档模式或纯同步 REST 场景可以不配置 Kafka（保持 `RAG_KAFKA_BOOTSTRAP_SERVERS` 为空）。
+> Kafka 默认自动创建 topic（4 partitions、副本 1）；`scripts/start-stack.ps1` 仍会显式创建 cache/document/search 与两个 DLQ topic、等待 Kafka healthy、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe` 与 `dist/bin/rag-document-worker.exe`（收到 Ctrl+C 时一并停止）；`RAG_OUTBOX_BRIDGE=debezium` 时带 `--profile debezium` 并等待 Debezium 输出 `Starting streaming`。用 `-MigrateOnly` 可只准备依赖与数据库。不配置 Kafka 时，默认异步上传由 `rag-service` 内嵌文档 worker 消费（`RAG_DOCUMENT_WORKER_INPROCESS`），纯同步 REST（`RAG_UPLOAD_MODE=sync`）也不需要文档 worker。
 
 ### 手动依赖
 
-只使用同步 REST/Console 时，最小依赖是 Qdrant + 状态库：
+只使用同步 REST/Console（`RAG_UPLOAD_MODE=sync`）时，最小依赖是 Qdrant + 状态库；默认异步受理时解析/索引在文档 worker（无 Kafka 时是 `rag-service` 内嵌 worker），同样不需要 Kafka。
 
 ```powershell
 docker run -d --name praxis-qdrant -p 6333:6333 -p 6334:6334 `
@@ -221,7 +225,7 @@ PDF 解析有两个引擎，由 `RAG_PDF_ENGINE` 选择：默认 `go` 在 Go 进
 | `RAG_STATE_AUTO_SCHEMA` | `true` | 启动时创建缺失表；生产可关闭并由部署账号预建 |
 | `RAG_UPLOAD_LEASE_SECONDS` | `120` | 上传事务业务租约时长 |
 | `RAG_UPLOAD_CLEANUP_DELAY_SECONDS` | `3600` | 已完成上传工作区清理延迟 |
-| `RAG_UPLOAD_MODE` | `sync` | `POST /v1/documents` 受理方式：`sync` 请求内解析/切分/Embedding/发布后返回；`async` 每文件提交 `document_jobs`+发件箱后立即返回 `artifact_id`，需运行 `rag-document-worker` |
+| `RAG_UPLOAD_MODE` | `async` | `POST /v1/documents` 受理方式：`async` 每文件提交 `document_jobs`+发件箱后立即返回 `artifact_id`，由文档 worker 后台处理（无 Kafka 时由 `rag-service` 内嵌 worker，Kafka 部署需 `rag-document-worker`）；`sync` 为旧的请求内解析/切分/Embedding/发布后返回 |
 
 `RAG_SERVICE_DATA_ROOT` 只决定上传恢复工作区等本地文件的位置，不再决定数据库。两项都未配置时启动报错；表结构可用 §7 的 `rag-state-migrate` 检查/建表。
 
@@ -243,7 +247,7 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 
 ### Kafka 与队列
 
-单节点 Compose Kafka 使用 INTERNAL/EXTERNAL 双 listener：宿主机进程用 `127.0.0.1:9092`，同一 compose 网络的容器用 `kafka:9092`；`RAG_KAFKA_BOOTSTRAP_SERVERS` 为空表示 brokerless（异步受理仍可提交，但投递/排队搜索不可用）。
+单节点 Compose Kafka 使用 INTERNAL/EXTERNAL 双 listener：宿主机进程用 `127.0.0.1:9092`，同一 compose 网络的容器用 `kafka:9092`；`RAG_KAFKA_BOOTSTRAP_SERVERS` 为空表示 brokerless：异步受理仍可提交，并由 `rag-service` 内嵌文档 worker 直接消费发件箱（`RAG_DOCUMENT_WORKER_INPROCESS`），Kafka 投递与排队搜索不可用。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -282,8 +286,9 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 | `RAG_DOCUMENT_JOB_SWEEP_SECONDS` | `120` | 滞留/过期任务回收窗口 |
 | `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS` | `604800`（7 天） | 发件箱行保留期 |
 | `RAG_DOCUMENT_JOB_RETENTION_SECONDS` | `2592000`（30 天） | 终态任务保留期 |
-| `RAG_DOCUMENT_WORKER_LOCAL` | `false` | 文档 worker 单进程 outbox 模式；仅在未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时生效 |
-| `RAG_DOCUMENT_WORKER_POLL_SECONDS` | `0.5` | 本地 outbox / 消费轮询间隔 |
+| `RAG_DOCUMENT_WORKER_INPROCESS` | `auto` | `rag-service` 内嵌文档 worker：`auto`（未设置）仅在未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；`1/true/on` 强制启用（已配置 Kafka 时服务拒绝启动）；`0/false/off` 关闭并改跑独立 worker |
+| `RAG_DOCUMENT_WORKER_LOCAL` | `false` | 独立 `rag-document-worker` 的单进程 outbox 模式（通常无需：无 Kafka 时服务已内嵌 worker）；仅在未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时生效 |
+| `RAG_DOCUMENT_WORKER_POLL_SECONDS` | `0.5` | 内嵌/本地 outbox 与消费轮询间隔 |
 | `RAG_DOCUMENT_WORKER_RECOVER_SECONDS` | `30` | 文档 worker 周期性 Recover（恢复中断上传/补偿） |
 | `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_DOCUMENT_MAX_ATTEMPTS` | `5` | 文档 worker 的 Kafka 进程内最大尝试次数（前者优先；名称为兼容旧配置保留） |
 
@@ -300,12 +305,12 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 
 | 命令 | 作用 | 必需 | 退出码 |
 | --- | --- | --- | --- |
-| `rag-service` | REST + MCP + Console + 进程内 relay/维护循环 | Qdrant、状态库；MCP 需要 token；异步/排队需要 Kafka | `0` 正常停止，`1` 运行时失败 |
-| `rag-document-worker` | 消费文档通知，解析/切分/Embedding/发布 | 状态库、Qdrant；Kafka 模式需 `RAG_KAFKA_BOOTSTRAP_SERVERS`，或 `RAG_DOCUMENT_WORKER_LOCAL=1` | `0/1/2` |
+| `rag-service` | REST + MCP + Console + 进程内 relay/维护循环；无 Kafka 时内嵌文档 worker | Qdrant、状态库；MCP 需要 token；排队搜索需要 Kafka | `0` 正常停止，`1` 运行时失败 |
+| `rag-document-worker` | 消费文档通知，解析/切分/Embedding/发布 | Kafka 部署必需（无 Kafka 由 `rag-service` 内嵌 worker 代管）；状态库、Qdrant；Kafka 模式需 `RAG_KAFKA_BOOTSTRAP_SERVERS`，或 `RAG_DOCUMENT_WORKER_LOCAL=1` | `0/1/2` |
 | `rag-search-worker` | 消费 schema 2 搜索请求，执行 `SearchRaw` + 快照 + 终态 | `RAG_KAFKA_BOOTSTRAP_SERVERS`、状态库、Qdrant、Redis（快照） | `0/1/2` |
 | `rag-dead-letter-worker --kind document\|search` | 消费显式 `RAG_DOCUMENT_DLQ_TOPIC` / `RAG_SEARCH_DLQ_TOPIC`，把可确认的失败写入持久终态并 ACK | `RAG_KAFKA_BOOTSTRAP_SERVERS`、对应 `RAG_*_DLQ_GROUP` | `0/1/2` |
 
-退出码约定（worker 与全部 CLI）：`0` = 收到 SIGINT/SIGTERM 正常停止；`1` = 运行时失败（应重启/告警）；`2` = 配置或用法错误（修配置，不要自动重启）。服务本身配置错误也以 `1` 退出。文档 worker 的本地模式适合单进程开发：未配置 Kafka 时它直接轮询 `document_job_outbox`，有 Kafka 时变量被忽略并切换为 Kafka 消费模式。**worker 不在 `rag-service` 进程内运行**；服务只负责受理、relay 和维护循环。
+退出码约定（worker 与全部 CLI）：`0` = 收到 SIGINT/SIGTERM 正常停止；`1` = 运行时失败（应重启/告警）；`2` = 配置或用法错误（修配置，不要自动重启）。服务本身配置错误也以 `1` 退出。文档 worker 的本地模式适合单进程开发/独立 worker 兜底：未配置 Kafka 时它直接轮询 `document_job_outbox`，有 Kafka 时变量被忽略并切换为 Kafka 消费模式。**Kafka 模式下 worker 不在 `rag-service` 进程内运行**；无 Kafka 时 `rag-service` 默认内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS`），服务同时负责受理、relay、维护循环与文档消费。
 
 ## 4. 启动与冒烟
 
@@ -363,7 +368,9 @@ Console 默认启用账号登录（`RAG_AUTH_ENABLED=true`）：
 ### 启动 worker
 
 ```powershell
-# 异步 MCP add_document（Kafka 模式；无 Kafka 可加 $env:RAG_DOCUMENT_WORKER_LOCAL="1"）
+# Kafka 部署必需：消费默认异步上传与 MCP add_document 的通知
+# （无 Kafka 时由 rag-service 内嵌 worker 消费，无需单独启动；
+#  也可用 RAG_DOCUMENT_WORKER_LOCAL=1 让独立 worker 轮询发件箱）
 .\dist\bin\rag-document-worker.exe
 
 # 服务端 MCP 排队搜索
@@ -382,7 +389,7 @@ worker 必须与 `rag-service` 使用**同一** `RAG_CONFIG_FILE`、`RAG_SERVICE
 2. `/console` 返回 Console 页面（构建了 `dist/web` 且 `RAG_WEB_ROOT` 正确时）。
 3. REST `/v1/documents` 需要认证，未认证返回 401。
 4. MCP 初始化成功，`tools/list` 返回 6 个工具。
-5. 异步链路：配置 Kafka 并启动 document worker 后，MCP `add_document` 得到 `artifact_id`，轮询 `get_document_status` 至 `succeeded`。
+5. 异步链路：默认异步上传与 MCP `add_document` 得到 `artifact_id`；Kafka 部署启动 document worker（无 Kafka 的单进程部署依赖 `rag-service` 内嵌 worker）后，轮询 `get_document_status` 至 `succeeded`。
 6. 排队搜索：配置 Kafka/Redis 并启动 search worker 后，MCP `search` 返回结果或 `result_id`，`get_search_result` 可轮询到完成。
 
 ## 5. REST API 示例
@@ -543,14 +550,14 @@ curl.exe -X DELETE http://127.0.0.1:8011/v1/invitations/<invitation_id>
 curl.exe -X POST http://127.0.0.1:8011/v1/documents/check `
   -H $headers -d '{"files":[{"name":"guide.md","sha256":"<64-hex>"}]}'
 
-# 上传（默认同步；multipart，字段名必须为 files；可选 Idempotency-Key）
+# 上传（默认异步受理；multipart，字段名必须为 files；可选 Idempotency-Key）
 curl.exe -X POST http://127.0.0.1:8011/v1/documents `
   -H "Authorization: Bearer <token-or-key>" `
   -H "X-RAG-Namespace: default" `
   -H "Idempotency-Key: batch-20261108-01" `
   -F "files=@guide.md" -F "files=@manual.txt"
 
-# 异步受理模式（RAG_UPLOAD_MODE=async）返回 jobs[].artifact_id，按 id 轮询状态
+# 默认异步受理返回 jobs[].artifact_id，按 id 轮询状态（RAG_UPLOAD_MODE=sync 时为同步响应）
 curl.exe "http://127.0.0.1:8011/v1/document-jobs/<artifact_id>" -H $headers
 
 # 列表、读取正文、删除
@@ -559,7 +566,7 @@ curl.exe "http://127.0.0.1:8011/v1/documents/guide.md/content" -H $headers   # �
 curl.exe -X DELETE "http://127.0.0.1:8011/v1/documents/guide.md" -H $headers
 ```
 
-同步模式（默认）的上传响应包含 `imported`、`skipped`、`failed`、`documents` 与 `mode:"sync"`；`skipped` 条目带 `requested_name`。异步模式（`RAG_UPLOAD_MODE=async`）的响应为 `mode:"async"`、`jobs:[{name, artifact_id, status, reused}]` 与 `failed:[{name, error}]`：每批每个文件独立受理，单个文件冲突只进入 `failed` 不阻塞其它文件；重复提交同一 `Idempotency-Key` 的同一批文件会复用原 `artifact_id`（`reused:true`）。异步任务状态：`GET /v1/document-jobs/{artifact_id}` 返回 `{artifact_id, status, stage, error}`（`queued` / `processing` + `stage` / `succeeded` / `failed`），未知或跨工作区 id 返回 404。单文件 10 MiB、单批 10 个；上传切分参数来自知识库配置，不接受请求级覆盖。PDF 返回原始文件字节（`Content-Type: application/pdf`）；版本化 PDF/Word 的正文读取已保存的 `document.md`。
+默认异步受理的响应为 `mode:"async"`、`jobs:[{name, artifact_id, status, reused}]` 与 `failed:[{name, error}]`：每批每个文件独立受理，单个文件冲突只进入 `failed` 不阻塞其它文件；重复提交同一 `Idempotency-Key` 的同一批文件会复用原 `artifact_id`（`reused:true`）。异步任务状态：`GET /v1/document-jobs/{artifact_id}` 返回 `{artifact_id, status, stage, error}`（`queued` / `processing` + `stage` / `succeeded` / `failed`），未知或跨工作区 id 返回 404。Console 上传对话框受理后立即返回，按 排队中/处理中/已完成/失败 展示轮询结果并显示「已受理 N 个文件，正在后台处理」，解析期间页面可继续操作。设置 `RAG_UPLOAD_MODE=sync` 时回退为同步模式：响应包含 `imported`、`skipped`、`failed`、`documents` 与 `mode:"sync"`，`skipped` 条目带 `requested_name`，解析/切分/Embedding/发布在请求内完成。单文件 10 MiB、单批 10 个；上传切分参数来自知识库配置，不接受请求级覆盖。PDF 返回原始文件字节（`Content-Type: application/pdf`）；版本化 PDF/Word 的正文读取已保存的 `document.md`。
 
 ### 搜索、结果与产物
 
@@ -644,7 +651,7 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 
 `add_document` 在状态库单事务写入完整任务（含文件字节）与发件箱，提交后返回 `{"artifact_id": "<uuid>"}`，不代表已解析/可检索。`get_document_status` 返回 `status`（`queued/processing/succeeded/failed`）、`stage`、`error`；仅 `succeeded` 表示已持久发布。同名文档已存在或已有排队/执行中的新增会被拒绝；不确定提交结果时用同一 `idempotency_key` 重试，不会重复入队。
 
-投递方式：默认 `RAG_OUTBOX_BRIDGE=relay`，服务进程内发布发件箱；设为 `debezium` 时服务不发布，由外部 Debezium 读取 MySQL binlog 投递（`docker compose --profile debezium up -d`，配置见 [deploy/debezium/README.md](../deploy/debezium/README.md)）。未配置 Kafka 时可用 `RAG_DOCUMENT_WORKER_LOCAL=1` 让文档 worker 直接轮询发件箱。**不要把 Debezium 与 relay 同时启用**（重复投递）。
+投递方式：默认 `RAG_OUTBOX_BRIDGE=relay`，服务进程内发布发件箱；设为 `debezium` 时服务不发布，由外部 Debezium 读取 MySQL binlog 投递（`docker compose --profile debezium up -d`，配置见 [deploy/debezium/README.md](../deploy/debezium/README.md)）。未配置 Kafka 时由 `rag-service` 内嵌文档 worker 直接轮询发件箱（`RAG_DOCUMENT_WORKER_INPROCESS`）；也可关闭内嵌 worker 并运行 `RAG_DOCUMENT_WORKER_LOCAL=1` 的独立文档 worker。**不要把 Debezium 与 relay 同时启用**（重复投递）。
 
 ### 资源、提示词与订阅
 
@@ -829,7 +836,7 @@ python -m rag_mcp.pdf_worker --help
 - **外部解析器**：PDF 正文解析默认由 Go 内置引擎完成（文字型 PDF）；版面分析、表格结构、OCR、公式与图片描述需要 `RAG_PDF_ENGINE=docling` 与外部 Docling 环境；DOC（LibreOffice）与 Word 图片描述也不是 Go 内置能力，未配置时相应功能报错。配置了 `RAG_VLM_BASE_URL` 后 Go 会自动启用 `word_vision_worker`，无图注图片由远端 VLM 生成描述。
 - **异步投递**：支持 relay（默认，进程内发件箱发布到 Kafka）、debezium（Debezium Server 读 MySQL binlog，经原生 Kafka sink 写 topic，应用不发布）与本地 worker 模式；Debezium 模式需要 MySQL 状态库。
 - **排队搜索**：`RAG_KAFKA_BOOTSTRAP_SERVERS` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 Kafka。
-- **上传受理**：`POST /v1/documents` 默认同步；`RAG_UPLOAD_MODE=async` 时逐文件异步受理并返回 `artifact_id`，状态由 `GET /v1/document-jobs/{artifact_id}` 读取，需要部署 `rag-document-worker`（配置 Kafka，或 `RAG_DOCUMENT_WORKER_LOCAL=1` 轮询发件箱）。`update_document`/`delete_document` 仍同步执行，与排队中的异步任务靠受理期同名检查与发布事务内的 `ValidatePublication` 互斥。
+- **上传受理**：`POST /v1/documents` 默认异步，逐文件受理并返回 `artifact_id`，状态由 `GET /v1/document-jobs/{artifact_id}` 读取；必须有一个文档消费者：无 Kafka 的单进程部署由 `rag-service` 内嵌 worker 覆盖（`RAG_DOCUMENT_WORKER_INPROCESS` 默认 auto），Kafka 部署需运行 `rag-document-worker`（`scripts/start-stack.ps1` 会自动启动）。设置 `RAG_UPLOAD_MODE=sync` 回退为请求内完成的旧同步模式。`update_document`/`delete_document` 仍同步执行，与排队中的异步任务靠受理期同名检查与发布事务内的 `ValidatePublication` 互斥。
 - **权限与共享**：账号分为管理员 / VIP / 普通用户；知识库默认归创建者私有，共享靠邀请链接完成（权限：可读/可修改；范围：单文件/多文件/全库），只有 VIP 与管理员可发起邀请。邀请消息目前是站内通知（控制台铃铛），不发送邮件/IM；链接只展示一次，库内只存摘要。文件级写授权只能替换已授权的同名文档，不能上传新文件；历史无创建者的知识库仅管理员可用/可授权；受限账号在启用 Kafka 的排队搜索部署下会被拒绝异步检索（同步检索不受影响）。详见 [权限管理](PERMISSIONS.md)。
 - **管理边界**：`/v1/admin/*` 仅本机直连或管理员会话；**例外**是 `/v1/admin/api-keys` 的五条管理路由——任意登录角色的会话都可管理自己的 API Key（管理员管理全部，非管理员只能绑定本人拥有的知识库）。API Key 按创建账号归属隔离，历史无主密钥仅管理员/本机管理可见；管理凭证（Service Token / API Key）在请求时仍不做知识库归属校验，API Key 的 namespace 白名单仍然生效。详见 [权限管理](PERMISSIONS.md) §9。
 - **数据**：状态表用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。

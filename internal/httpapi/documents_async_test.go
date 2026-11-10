@@ -210,11 +210,35 @@ func TestAsyncUploadValidatesBatchBeforeAdmission(t *testing.T) {
 	}
 }
 
-func TestSyncUploadModeRemainsAvailable(t *testing.T) {
+func TestDefaultUploadModeIsAsync(t *testing.T) {
 	runtime := newFakeDocRuntime()
-	// An empty setting keeps the historical synchronous behaviour.
+	// An empty setting follows the asynchronous default: admission only.
 	settings := testSettings("test-token")
 	settings.UploadMode = ""
+	handler := New(settings, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithRuntime(runtime)).Handler()
+
+	body, contentType := multipartBody(t, nil, "notes.md", "hello")
+	code, payload := asyncUpload(t, handler, body, contentType, "")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d payload = %v", code, payload)
+	}
+	if payload["mode"] != config.UploadModeAsync {
+		t.Fatalf("mode = %v", payload["mode"])
+	}
+	if len(runtime.admitted) != 1 || runtime.admitted[0] != "notes.md" {
+		t.Fatalf("async admission did not run: %v", runtime.admitted)
+	}
+	if len(runtime.upoadFiles) != 0 {
+		t.Fatalf("sync Upload called in the default async mode: %v", runtime.upoadFiles)
+	}
+}
+
+func TestExplicitSyncUploadModeRemainsAvailable(t *testing.T) {
+	runtime := newFakeDocRuntime()
+	// Only an explicit "sync" setting keeps the legacy in-request parse.
+	settings := testSettings("test-token")
+	settings.UploadMode = config.UploadModeSync
 	handler := New(settings, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		WithRuntime(runtime)).Handler()
 

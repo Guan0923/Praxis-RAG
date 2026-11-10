@@ -92,8 +92,8 @@ func TestServiceSettingsDefaults(t *testing.T) {
 	if settings.Token != "" {
 		t.Fatalf("token = %q, want empty", settings.Token)
 	}
-	if settings.UploadMode != UploadModeSync {
-		t.Fatalf("upload mode = %q, want %q", settings.UploadMode, UploadModeSync)
+	if settings.UploadMode != UploadModeAsync {
+		t.Fatalf("upload mode = %q, want %q", settings.UploadMode, UploadModeAsync)
 	}
 }
 

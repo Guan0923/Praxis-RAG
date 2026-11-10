@@ -519,6 +519,28 @@ func TestOutboxReceiverLocalMode(t *testing.T) {
 	}
 }
 
+func TestWithOutboxReceiverConfiguresLocalDelivery(t *testing.T) {
+	stores := newTestStores(t)
+	options := WithOutboxReceiver(Options{
+		Jobs:     stores.DocumentJobs,
+		Ingester: &fakeIngester{},
+		Logger:   testLogger(),
+	})
+	if options.Receiver == nil {
+		t.Fatalf("WithOutboxReceiver() left Receiver nil")
+	}
+	if _, ok := options.Receiver.(*OutboxReceiver); !ok {
+		t.Fatalf("Receiver = %T, want *OutboxReceiver", options.Receiver)
+	}
+	processor, err := New(options)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if processor.receiver == nil {
+		t.Fatalf("processor.receiver is nil after WithOutboxReceiver()")
+	}
+}
+
 func TestRunLoopShutdownIsIdempotent(t *testing.T) {
 	stores := newTestStores(t)
 	configureNamespace(t, stores)

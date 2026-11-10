@@ -170,6 +170,16 @@ func New(options Options) (*Processor, error) {
 	}, nil
 }
 
+// WithOutboxReceiver configures broker-less local delivery: it sets
+// options.Receiver to an OutboxReceiver so Run/RunOnce drain committed PENDING
+// document_job_outbox rows directly instead of consuming broker messages. It
+// returns the updated options so callers can build the processor in one
+// expression, and is a no-op for the broker mode where Receiver stays nil.
+func WithOutboxReceiver(options Options) Options {
+	options.Receiver = NewOutboxReceiver(options.Jobs)
+	return options
+}
+
 // defaultTerminalError ports `retry = not isinstance(exc, KnowledgeValidationError)`.
 func defaultTerminalError(err error) bool {
 	var validation *state.DocumentValidationError

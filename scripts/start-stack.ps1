@@ -2,9 +2,10 @@
 # migrate, then run rag-service.
 # Kafka replaces the former RocketMQ stack; topics/consumer groups are created
 # explicitly below (auto-creation is also enabled on the broker).
-# Run rag-document-worker and rag-search-worker separately with the same database,
-# Redis, Qdrant, encryption and Kafka settings. Without a search consumer,
-# MCP searches need a consumer before their task deadline.
+# rag-service is started below, and rag-document-worker is started as its child
+# process with the same database, Redis, Qdrant, encryption and Kafka settings.
+# Run rag-search-worker separately: without a search consumer, MCP searches need a
+# consumer before their task deadline.
 #
 # RAG_OUTBOX_BRIDGE selects how a committed document job reaches Kafka:
 #   relay    (default) in-process outbox publisher inside rag-service
@@ -195,9 +196,9 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
 }
 if (-not $topicsReady) { throw "Kafka topic creation failed. Check docker compose logs kafka." }
 Write-Host "Kafka topics ready: $((& docker exec praxis-rag-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list) -join ', ')"
-Write-Host "Consumers are not started: run rag-search-worker for MCP search and rag-document-worker for MCP add_document separately."
-if ($env:RAG_UPLOAD_MODE -eq "async") {
-    Write-Host "RAG_UPLOAD_MODE=async: REST/Console uploads only queue document jobs; run rag-document-worker (or set RAG_DOCUMENT_WORKER_LOCAL=1) or they stay queued."
+Write-Host "Consumers: rag-document-worker is started automatically with rag-service below; run rag-search-worker for MCP search separately."
+if (-not $env:RAG_UPLOAD_MODE -or $env:RAG_UPLOAD_MODE -eq "async") {
+    Write-Host "RAG_UPLOAD_MODE=async (the default when unset): REST/Console uploads return after the MySQL commit; the started rag-document-worker parses them afterwards."
 }
 Write-Host "Workers retry in-process and publish exhausted messages to RAG_*_DLQ_TOPIC; run rag-dead-letter-worker --kind document|search for them."
 Write-Host "Document uploads are accepted by a MySQL commit; Kafka only carries the identifier notification. Deploy API and workers together; drain schema-2 chunked messages before upgrading."
@@ -240,5 +241,19 @@ if ($MigrateOnly) {
     Write-Host "Dependencies started and migration finished."
     exit 0
 }
+$docWorker = Join-Path $binDir "rag-document-worker.exe"
+if (-not (Test-Path $docWorker)) {
+    throw "Document worker executable not found: $docWorker. Run scripts\build-go.ps1 without -SkipFrontend to build dist\bin, then retry."
+}
+Write-Host "Starting rag-document-worker (inherits the loaded .env settings)..."
+$docWorkerProcess = Start-Process -FilePath $docWorker -NoNewWindow -PassThru
 Write-Host "Starting rag-service on http://$($env:RAG_SERVICE_HOST):$($env:RAG_SERVICE_PORT)/console"
-& $ragService
+try {
+    & $ragService
+}
+finally {
+    if ($docWorkerProcess -and -not $docWorkerProcess.HasExited) {
+        Write-Host "Stopping rag-document-worker (pid $($docWorkerProcess.Id))..."
+        Stop-Process -Id $docWorkerProcess.Id -Force -ErrorAction SilentlyContinue
+    }
+}

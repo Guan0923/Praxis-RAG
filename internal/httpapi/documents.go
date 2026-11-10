@@ -132,13 +132,14 @@ func (s *Server) handleUploadDocuments(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, payload)
 }
 
-// uploadMode reports the configured POST /v1/documents admission mode. An
-// unknown or empty setting keeps the historical synchronous behaviour.
+// uploadMode reports the configured POST /v1/documents admission mode. Async is
+// the default: only an explicit "sync" setting keeps the legacy in-request parse
+// behaviour, so an empty or unrecognised setting stays asynchronous.
 func (s *Server) uploadMode() string {
-	if strings.EqualFold(strings.TrimSpace(s.settings.UploadMode), config.UploadModeAsync) {
-		return config.UploadModeAsync
+	if strings.EqualFold(strings.TrimSpace(s.settings.UploadMode), config.UploadModeSync) {
+		return config.UploadModeSync
 	}
-	return config.UploadModeSync
+	return config.UploadModeAsync
 }
 
 // asyncUploadJob is one admitted file in the async upload response. The Console

@@ -541,3 +541,16 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 测试：`internal/document/pdf_native_test.go`（程序生成的合法 PDF：清单/块顺序/Pages/损坏与空文本错误、连字/页码/连字符/CJK/标点空格启发式）、`internal/config/pdf_engine_test.go`（引擎解析与默认值）、`internal/runtime` 上传引擎选择测试；`go build ./...`、`go vet` 与相关包测试通过。
 - 实机验证：重启 8011 服务后，用默认 Go 引擎通过 `POST /v1/documents` 上传 arXiv `2404.16130v2.pdf`（6.89 MiB）→ 200、35 个 chunk 入库；保存的 manifest 为 26 页 / 349 blocks / 89856 字符 / 解析 2.08s，`parser.engine=go-native`；UploadJournal 步骤全部 DONE、操作 COMMITTED；检索命中该 PDF 正文。详见 VALIDATION.md。
 - 已知限制：Go 引擎不含版面分析（双栏 PDF 可能列间串行）、表格结构、图片/公式资产与 OCR；需要这些能力时设置 `RAG_PDF_ENGINE=docling` 并安装 python-workers 依赖。另：旧调试上传 `2c06005970…`（namespace `debug222146`）仍每 10 秒打印 `recovery failed (ValueError); retry pending`，与本改动无关，待清理。
+
+## 2026-11-10 异步上传默认化与内嵌文档 worker
+
+本轮把文档上传的默认路径改为异步受理，并让无 Kafka 的单进程部署无需再单独运行文档 worker：
+
+- [x] 默认值翻转：`RAG_UPLOAD_MODE` 缺省为 `async`（`internal/config` 的 `DefaultUploadMode` 与注释、`internal/httpapi` 的 OpenAPI 摘要同步更新）；`POST /v1/documents` 每文件在一个 MySQL 事务内写入 `document_jobs` + `document_job_outbox` 后立即返回 `{"mode":"async","jobs":[{"name","artifact_id","status","reused"}],"failed":[{"name","error"}]}`，解析/切分/Embedding/Qdrant 发布由文档 worker 后台完成。`sync` 保留为显式 opt-in，响应仍是请求内完成的 `imported`/`skipped`/`failed`/`documents` + `mode:"sync"`。
+- [x] 内嵌文档 worker：`rag-service` 在无 Kafka 时进程内消费已提交的 outbox 行；新增 `RAG_DOCUMENT_WORKER_INPROCESS`（未设置/`auto` = 仅未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；`1/true/on` = 强制启用，此时配置 Kafka 会拒绝启动；`0/false/off` = 关闭并改跑独立 worker）与轮询间隔 `RAG_DOCUMENT_WORKER_POLL_SECONDS`（默认 `0.5` 秒）。
+- [x] 接收器接线复用：`documentworker.WithOutboxReceiver` 让 worker 用 OutboxReceiver 直接排空已提交的 PENDING `document_job_outbox` 行（broker 模式仍消费 Kafka 消息），`rag-service` 的内嵌 worker、`cmd/rag-document-worker` 的本地 outbox 模式与 e2e 共用该接线；Kafka 部署仍由 `rag-document-worker` 消费同一 consumer group。`scripts/start-stack.ps1` 现在与 `rag-service` 一起启动 `dist\bin\rag-document-worker.exe`，退出时一并停止。
+- [x] Console：上传受理后按 排队中/处理中/已完成/失败 展示每个文件的 `GET /v1/document-jobs/{artifact_id}` 轮询状态，并显示「已受理 N 个文件，正在后台处理」；异步轮询逻辑原本已存在，本轮成为默认路径，上传对话框不再等待整个解析过程。
+- [x] 文档：更新 `.env.example`、`README.md`、`docs/USAGE.md`、`docs/DEPLOYMENT.md`，说明默认异步、内嵌 worker 的三种取值、Kafka 部署仍需 worker，并加入升级提示（默认异步必须有消费者：单进程内嵌、Kafka worker，或显式 `RAG_UPLOAD_MODE=sync`）。
+- [x] 测试：默认值/响应契约/内嵌 worker 接线与 REST 异步上传链路由定向与全量 Go 测试套件覆盖；实际结果由 Lead 复核后记录在 `VALIDATION.md`，本节不预写通过结论。
+
+已知边界：`update_document`/`delete_document` 仍同步执行；MCP `add_document` 始终异步；关闭内嵌 worker 的无 Kafka 部署必须自行运行 `RAG_DOCUMENT_WORKER_LOCAL=1` 的独立文档 worker，否则任务停在 `queued`。

@@ -62,7 +62,7 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "GET", Path: "/v1/artifacts/{artifact_id}", Summary: "Read an artifact", Tag: "search", Response: "200"},
 	{Method: "GET", Path: "/v1/artifacts/{artifact_id}/content", Summary: "Download artifact content", Tag: "search", Response: "200"},
 	{Method: "GET", Path: "/v1/documents", Summary: "List documents", Tag: "documents", Response: "200"},
-	{Method: "POST", Path: "/v1/documents", Summary: "Upload documents (sync parse or async admission by RAG_UPLOAD_MODE)", Tag: "documents", Response: "200", Multipart: true, RequestBody: true},
+	{Method: "POST", Path: "/v1/documents", Summary: "Upload documents (async admission by default; RAG_UPLOAD_MODE=sync parses inside the request)", Tag: "documents", Response: "200", Multipart: true, RequestBody: true},
 	{Method: "POST", Path: "/v1/documents/check", Summary: "Check document names", Tag: "documents", Request: "DocumentsCheckBody", Response: "200"},
 	{Method: "GET", Path: "/v1/document-jobs/{artifact_id}", Summary: "Read an asynchronous document job status", Tag: "documents", Response: "200"},
 	{Method: "GET", Path: "/v1/documents/{name}", Summary: "Read document metadata", Tag: "documents", Response: "200"},
