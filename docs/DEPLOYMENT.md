@@ -18,9 +18,9 @@
   （异步文档队列）        （排队搜索）          （显式 DLQ topic: RAG_*_DLQ_TOPIC）
 ```
 
-- **每个进程独立部署**：`rag-service` 不内嵌消费者；worker 不监听端口。
+- **按部署形态选择进程**：Kafka 模式下 `rag-service` 不内嵌消费者，文档/搜索/死信 worker 独立部署；无 Kafka 的单进程部署由 `rag-service` 内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS`，默认 auto），无需单独的 `rag-document-worker`。worker 不监听端口。
 - 所有进程必须共享同一份基础设施配置：`RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`RAG_BACKEND=qdrant`/`QDRANT_URL`、`RAG_STATE_ENCRYPTION_KEY`、Redis 与 Kafka（bootstrap、topic/group、DLQ）设置。配置不一致会造成 401/找不到任务/重复发布等难以排查的问题。
-- 仅同步 REST/Console 的最小部署是 `rag-service + Qdrant + 状态库`；MCP 异步新增与 `RAG_UPLOAD_MODE=async` 的 REST 上传都需要文档 worker（配合 Kafka，或 `RAG_DOCUMENT_WORKER_LOCAL=1` 的本地发件箱模式）；服务端 MCP 排队搜索需要 search worker + Redis + Kafka。
+- 上传默认异步受理：最小部署是 `rag-service + Qdrant + 状态库`（无 Kafka 时由内嵌文档 worker 完成解析/索引）；Kafka 部署还需 `rag-document-worker`（`scripts/start-stack.ps1` 在开发环境会自动启动），或显式设置 `RAG_UPLOAD_MODE=sync` 回到请求内完成解析的同步模式；服务端 MCP 排队搜索需要 search worker + Redis + Kafka。
 
 ## 2. 二进制与目录布局
 
@@ -161,6 +161,7 @@ docker compose -f docker-compose.yml -f deploy/compose.workers.yml --profile wor
 - Compose 不能按退出码区分重启。`on-failure:5` 会重启所有非 0（包括配置错误 `2`）；生产请同时用监控/日志告警识别 `2`，或改用 systemd（见 §4）精确控制。
 - 共用 `.env` 时 `RAG_CONFIG_FILE` 不要指向宿主机路径（容器内文件不存在）；直接使用环境变量即可。
 - worker 与 `rag-service` 必须共用同一个 `RAG_STATE_URL`、Qdrant、Redis、Kafka（bootstrap/topic/group）；不要给不同进程建不同状态库或队列。
+- 不配置 Kafka 的单进程部署可以省略 `document-worker`：`rag-service` 默认内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS`）；若在无 Kafka 时仍运行该服务，需设置 `RAG_DOCUMENT_WORKER_LOCAL=1`。
 
 ## 4. systemd 部署
 
@@ -180,6 +181,10 @@ QDRANT_URL=http://127.0.0.1:6333
 RAG_REDIS_URL=redis://127.0.0.1:6379/0
 RAG_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
 # 外部 Kafka 可追加 RAG_KAFKA_SECURITY_PROTOCOL / RAG_KAFKA_SASL_* / RAG_KAFKA_TLS_*
+# 上传默认异步受理：Kafka 部署由 rag-document-worker 消费通知；无 Kafka 时
+# 由服务内嵌文档 worker 消费发件箱（auto 仅在未配置 bootstrap 时启用）。
+# RAG_UPLOAD_MODE=async
+# RAG_DOCUMENT_WORKER_INPROCESS=auto
 RAG_CACHE_TOPIC=praxis_state_cache_refresh
 RAG_CACHE_GROUP=praxis_state_cache_refresh_workers
 RAG_DOCUMENT_TOPIC=praxis_document_ingest
@@ -200,7 +205,7 @@ RAG_MCP_ALLOWED_ORIGINS=https://app.example.com
 # RAG_WORD_CONVERTER_PATH=/usr/bin/soffice
 ```
 
-worker 共用同一 env 文件；如果某些 worker 需要独立的最大尝试次数或本地模式，可再叠加 `Environment=` 覆盖。`RAG_DOCUMENT_WORKER_LOCAL=1` 只用于无 Kafka 的单进程部署，生产 Kafka 模式保留默认。
+worker 共用同一 env 文件；如果某些 worker 需要独立的最大尝试次数或本地模式，可再叠加 `Environment=` 覆盖。`RAG_DOCUMENT_WORKER_LOCAL=1` 只用于无 Kafka、且关闭了 `rag-service` 内嵌 worker（`RAG_DOCUMENT_WORKER_INPROCESS=0`）的独立 worker 部署；生产 Kafka 模式保留默认。
 
 ### 4.2 rag-service
 
@@ -253,7 +258,7 @@ TimeoutStopSec=20
 WantedBy=multi-user.target
 ```
 
-无 Kafka 的单进程环境：在 env 中加 `RAG_DOCUMENT_WORKER_LOCAL=1`，并确保 `rag-service` 不配置 `RAG_KAFKA_BOOTSTRAP_SERVERS`（否则 worker 会切换 Kafka 消费模式并报配置错误）。
+本单元用于上方 Kafka 部署：默认异步上传需要 `rag-document-worker` 消费通知（`scripts/start-stack.ps1` 在开发环境会自动启动它）。无 Kafka 的单进程环境无需此单元：`rag-service` 默认内嵌文档 worker 直接消费发件箱；若显式设置 `RAG_DOCUMENT_WORKER_INPROCESS=0`，仍可运行独立 worker 并加 `RAG_DOCUMENT_WORKER_LOCAL=1`，同时确保 `rag-service` 不配置 `RAG_KAFKA_BOOTSTRAP_SERVERS`（否则 worker 会切换 Kafka 消费模式并报配置错误）。
 
 ### 4.4 搜索 worker
 
@@ -321,7 +326,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 1. MySQL/Redis/Kafka/Qdrant 就绪。
 2. `rag-state-migrate --apply`（见 §6）。
 3. `praxis-rag.service`（API 受理、relay、维护循环）。
-4. `praxis-rag-document-worker.service`、`praxis-rag-search-worker.service`。
+4. `praxis-rag-document-worker.service`（Kafka 部署；无 Kafka 的单进程部署由 `rag-service` 内嵌 worker 覆盖，可跳过）、`praxis-rag-search-worker.service`。
 5. `praxis-rag-dead-letter-worker@document/search`。
 6. 打开 `/health`，创建/确认 API Key，做一次上传与检索冒烟。
 
@@ -359,6 +364,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 - 表结构与 `enc:v1:` 凭据格式与旧 Python 版本兼容；从旧部署升级时应先停旧入口并备份数据库（Python 后端代码已从仓库删除）。
 - `rag-service-migrate --apply` 只写状态（blobs + documents），**不生成 Qdrant 向量**；迁移完成后需通过 HTTP/MCP 重新上传文档或等待后续 reindex，才能被检索到。
 - API 与 worker 一起发布：Go 文档通知为 schema 3，旧 Python worker 的 schema 2 不兼容，禁止混跑。
+- 升级注意：本次起 REST/Console 上传默认异步受理，必须有文档消费者。无 Kafka 的单进程部署由 `rag-service` 内嵌 worker 覆盖（`RAG_DOCUMENT_WORKER_INPROCESS` 默认 auto，`RAG_DOCUMENT_WORKER_POLL_SECONDS` 默认 0.5 秒轮询）；Kafka 部署必须运行 `rag-document-worker`（`scripts/start-stack.ps1` 会自动启动），或显式设置 `RAG_UPLOAD_MODE=sync` 保留请求内完成的旧行为。MCP `add_document` 始终异步，同样受益于内嵌 worker；`update_document`/`delete_document` 仍同步。
 - 生产 `RAG_STATE_AUTO_SCHEMA` 可关闭，由迁移步骤预先建表；否则服务启动也会尝试建缺失表。
 
 ## 7. DLQ 监控
@@ -377,7 +383,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 | 模式 | 配置 | 行为 |
 | --- | --- | --- |
 | relay（Go 默认且唯一内建） | `RAG_KAFKA_BOOTSTRAP_SERVERS` 设置 | `rag-service` 进程内轮询 `document_job_outbox` 投递纯通知；搜索请求也由进程内 relay 投递 |
-| 本地单进程 | 不设置 Kafka + `RAG_DOCUMENT_WORKER_LOCAL=1` | 文档 worker 直接轮询 outbox；搜索只能是同步（MCP `search` 无 `wait_seconds`） |
+| 本地单进程 | 不设置 Kafka（`RAG_DOCUMENT_WORKER_INPROCESS` 默认 auto） | `rag-service` 内嵌文档 worker 直接轮询 outbox；搜索只能是同步（MCP `search` 无 `wait_seconds`）。关闭内嵌 worker 时改由独立 worker 加 `RAG_DOCUMENT_WORKER_LOCAL=1` 轮询 |
 | Debezium | `RAG_OUTBOX_BRIDGE=debezium` + 外部 Debezium | 已实现并验证；应用不发布，由 CDC 投递。不要与 relay 同时启用 |
 
 Debezium 模式（`RAG_OUTBOX_BRIDGE=debezium`）要求状态库为 MySQL：启动 compose `debezium` profile（或外部 Debezium Server），应用侧保持该环境变量；应用不会启动进程内 relay，避免双投递。已验证 CDC 部署链路：MySQL 8.0 + Debezium Server 3.7.1.Final + 原生 Kafka sink + Kafka 3.9.0（topic 记录与 outbox PENDING 一致）；Go 服务/worker 消费真实 Kafka 的完整链路也已实机验证（debezium 与 relay 两种模式，脚本 `scripts/verify-debezium-e2e.py`；DLQ 与排队搜索见 `scripts/verify-kafka-dlq.py` / `scripts/verify-kafka-search.py`）。

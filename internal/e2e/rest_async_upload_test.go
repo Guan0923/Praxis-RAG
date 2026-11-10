@@ -113,14 +113,13 @@ func firstRestJobArtifactID(t *testing.T, payload map[string]any) string {
 // holds, then stops the worker.
 func runDocumentWorkerUntil(t *testing.T, h *harness, description string, done func() bool) {
 	t.Helper()
-	worker, err := documentworker.New(documentworker.Options{
+	worker, err := documentworker.New(documentworker.WithOutboxReceiver(documentworker.Options{
 		Jobs:            h.Stores.DocumentJobs,
 		Ingester:        h.Service,
 		JournalRecovery: h.Service,
 		Logger:          testLogger(),
-		Receiver:        documentworker.NewOutboxReceiver(h.Stores.DocumentJobs),
 		PollInterval:    10 * time.Millisecond,
-	})
+	}))
 	if err != nil {
 		t.Fatalf("documentworker.New() error = %v", err)
 	}

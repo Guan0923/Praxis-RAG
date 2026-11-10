@@ -151,7 +151,7 @@ func run() error {
 		PollInterval:    pollInterval,
 	}
 	if localMode {
-		options.Receiver = documentworker.NewOutboxReceiver(stores.DocumentJobs)
+		options = documentworker.WithOutboxReceiver(options)
 	}
 	worker, err := documentworker.New(options)
 	if err != nil {

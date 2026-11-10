@@ -552,3 +552,16 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 测试：新增 `internal/document/vision_test.go`（httptest VLM 成功路径/图片缩放/鉴权/prompt、跳过有图注图片、未配置端点/模型、拒绝回答、503 重试、HTTP 400、超时、坏图片、清单缺失），ingest 集成测试改用 httptest VLM 与真实 JPEG fixture；删除 `ExternalPDFParser`/引擎选择测试，更新 `PDFParserVersion` 断言。`go build ./...`、`go vet ./...` 干净，`internal/document`、`internal/ingest`、`internal/config`、`pdfcontent`、`chunking` 与 runtime 上传/PDF/Word 子集测试通过。
 - 实机验证（新二进制重启 8011）：上传中文 PDF `it-manual-cn.pdf` → 200、9 chunk、`pdf_parser_version=go-native-v1`、`failed: []`；删除该文档成功（404 + 列表消失）；重复上传 `2404.16130v2.pdf` 重新入库为 `go-native-v1`（35 chunks），manifest 存放在 `pdf-assets`，UploadJournal `COMMITTED`、`error NULL`；Console 200。详见 VALIDATION.md。
 - 已知限制：PDF 不支持版面分析、表格结构、OCR、公式/图片资产（双栏可能串行），扫描件需先 OCR；Word 图片描述依赖远端 VLM，仅用 httptest 验证；`.doc` 转换仍需要外部 LibreOffice。旧调试上传 `2c06005970…` 的 recovery 日志仍未清理。
+
+## 2026-11-10 异步上传默认化与内嵌文档 worker
+
+本轮把文档上传的默认路径改为异步受理，并让无 Kafka 的单进程部署无需再单独运行文档 worker：
+
+- [x] 默认值翻转：`RAG_UPLOAD_MODE` 缺省为 `async`（`internal/config` 的 `DefaultUploadMode` 与注释、`internal/httpapi` 的 OpenAPI 摘要同步更新）；`POST /v1/documents` 每文件在一个 MySQL 事务内写入 `document_jobs` + `document_job_outbox` 后立即返回 `{"mode":"async","jobs":[{"name","artifact_id","status","reused"}],"failed":[{"name","error"}]}`，解析/切分/Embedding/Qdrant 发布由文档 worker 后台完成。`sync` 保留为显式 opt-in，响应仍是请求内完成的 `imported`/`skipped`/`failed`/`documents` + `mode:"sync"`。
+- [x] 内嵌文档 worker：`rag-service` 在无 Kafka 时进程内消费已提交的 outbox 行；新增 `RAG_DOCUMENT_WORKER_INPROCESS`（未设置/`auto` = 仅未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；`1/true/on` = 强制启用，此时配置 Kafka 会拒绝启动；`0/false/off` = 关闭并改跑独立 worker）与轮询间隔 `RAG_DOCUMENT_WORKER_POLL_SECONDS`（默认 `0.5` 秒）。
+- [x] 接收器接线复用：`documentworker.WithOutboxReceiver` 让 worker 用 OutboxReceiver 直接排空已提交的 PENDING `document_job_outbox` 行（broker 模式仍消费 Kafka 消息），`rag-service` 的内嵌 worker、`cmd/rag-document-worker` 的本地 outbox 模式与 e2e 共用该接线；Kafka 部署仍由 `rag-document-worker` 消费同一 consumer group。`scripts/start-stack.ps1` 现在与 `rag-service` 一起启动 `dist\bin\rag-document-worker.exe`，退出时一并停止。
+- [x] Console：上传受理后按 排队中/处理中/已完成/失败 展示每个文件的 `GET /v1/document-jobs/{artifact_id}` 轮询状态，并显示「已受理 N 个文件，正在后台处理」；异步轮询逻辑原本已存在，本轮成为默认路径，上传对话框不再等待整个解析过程。
+- [x] 文档：更新 `.env.example`、`README.md`、`docs/USAGE.md`、`docs/DEPLOYMENT.md`，说明默认异步、内嵌 worker 的三种取值、Kafka 部署仍需 worker，并加入升级提示（默认异步必须有消费者：单进程内嵌、Kafka worker，或显式 `RAG_UPLOAD_MODE=sync`）。
+- [x] 测试：默认值/响应契约/内嵌 worker 接线与 REST 异步上传链路由定向与全量 Go 测试套件覆盖；实际结果由 Lead 复核后记录在 `VALIDATION.md`，本节不预写通过结论。
+
+已知边界：`update_document`/`delete_document` 仍同步执行；MCP `add_document` 始终异步；关闭内嵌 worker 的无 Kafka 部署必须自行运行 `RAG_DOCUMENT_WORKER_LOCAL=1` 的独立文档 worker，否则任务停在 `queued`。
