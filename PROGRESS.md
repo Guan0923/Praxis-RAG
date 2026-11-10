@@ -489,3 +489,21 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 文档与验证记录：README、docs/USAGE.md（§10/§11）、VALIDATION.md 更新；全量 `go test ./... -p 1 -count=1 -timeout 25m` 全绿（约 16 分钟，e2e 205s、runtime 462s、state 400s）。
 
 已知边界：仍无浏览器级 E2E（Playwright/Cypress），Console 的点击级交互继续靠前端契约测试与人工核对；CI 依赖 Go 1.27 工具链与 GitHub Actions MySQL service，本机 Windows 未实际执行 CI。
+
+## 2026-11-10 API Key 归属隔离（管理凭证按用户隔离）
+
+本轮让管理凭证（API Key）跟随 Console 账号归属，密钥的可见性与可绑定范围按账号隔离：
+
+- [x] `api_keys` 增加 `owner_user_id` 列（老表补列迁移 + 索引）；创建密钥时记录调用账号，历史密钥保持 `NULL`（无主）。
+- [x] 可见性与管理规则：管理员看到/管理全部密钥（含历史无主），VIP/普通用户只看到自己创建的密钥，触碰他人密钥返回 404 `API Key 不存在`；列表条目新增可选 `owner_user_id` / `owner_username`（`owner_username` 仅展示）。
+- [x] 非管理员创建密钥只能绑定本人拥有的知识库（`knowledge_bases.owner_user_id`），绑定他人知识库返回 403 `只能为本人创建的知识库创建 API Key`；管理员可绑定任意知识库。
+- [x] `/v1/namespaces` 增加附加字段 `owned_namespaces`（会话账号为本人拥有的；管理员为管理员自己拥有的；本机无会话等于全部）；五条管理路由路径保持 `/v1/admin/api-keys` 不变，鉴权改为「任意角色登录会话管理自己的密钥 + 无会话可信本机管理」双通道。
+- [x] 删除账号时级联删除其拥有的 API Key；租户认证（`Authorization: Bearer` + `X-RAG-Namespace`）语义不变。
+- [x] Console 与文档：API Key 页对所有登录角色开放（管理员显示「所有者」列、历史密钥显示「—（未绑定）」；非管理员显示隔离提示并只列出本人知识库）；同步更新 `docs/PERMISSIONS.md`（新增「API Key 归属隔离」）、`docs/api-keys.md`、`docs/USAGE.md`、README；新增前端 `apiKeys.test.ts` 契约测试，前端 typecheck、`npm test` 与生产构建通过。
+
+验证与已知限制：
+
+- [x] Go 回归测试：`internal/state/api_keys_owner_test.go`（归属投影、`ListByOwner` 作用域、历史 NULL 行、更新保留所有者、删除账号级联）、`internal/httpapi/api_keys_owner_test.go`（列表/读取/更新/删除/mcp-config 隔离、404 不可区分、CSRF/Bearer/本机策略、创建与更新绑定规则、no-store、管理员可见性）、`internal/e2e/api_keys_http_test.go`（真实路由 + 会话 + CSRF + auth/access/MySQL 端到端）。
+- [x] `go build ./...`、`go vet ./...` 干净；全量 `go test ./... -p 1 -count=1 -timeout 25m` 全绿（state 421s、httpapi 183s、e2e 253s、runtime 465s，约 24 分钟）；前端 typecheck、32/32 vitest、生产构建通过。详见 VALIDATION.md。
+- [x] 评审修复：更新密钥时只校验新增 Namespace（避免降级管理员无法改名/停用）；AccessControl 缺失时非管理员绑定规则 fail-closed；索引迁移先查 `information_schema` 避免每次启动 DDL；`ListByOwner` 空账号返回空；账号删除级联同时刷新 `api_keys` 读模型版本。
+- 已知限制：禁用账号不会自动停用已签发密钥（需删除账号或手动停用/删除密钥）；密钥按 namespace 名称绑定，删除并重建同名知识库后旧密钥仍生效（删除/重建时应同步清理密钥）。

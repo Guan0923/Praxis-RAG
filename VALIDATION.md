@@ -6,6 +6,68 @@
 > is recorded immediately below. RocketMQ wording in the historical sections is
 > retained as history.
 
+## Per-account API-key ownership and isolation — 2026-11-10
+
+Delivered: every API key now records the Console account that issued it
+(`api_keys.owner_user_id`, nullable for legacy rows; additive migration +
+`ix_api_keys_owner`), and the five existing `/v1/admin/api-keys` routes move to
+the new `authSessionOrLocal` policy: any signed-in role manages only its own
+keys (cookie writes need `X-CSRF-Token`, Bearer sessions are exempt), trusted
+loopback keeps the unowned/break-glass behavior, and foreign keys are
+indistinguishable from missing (404 `API Key 不存在`). Non-administrator
+sessions may bind only knowledge bases they own (`access.Service.OwnedNamespaces`;
+403 `只能为本人创建的知识库创建 API Key`) because API keys bypass
+knowledge-base/document authorization; updates validate only newly added
+namespaces so a demoted administrator can still rename, disable or delete keys.
+`/v1/namespaces` gains the additive `owned_namespaces` field, administrator
+listings join `users` for `owner_username`, account deletion cascades owned keys
+in the same transaction (and bumps the `api_keys` read-model revision). The
+Console API-key page is open to all roles, shows the owner column for
+administrators and limits the namespace picker to owned knowledge bases. Docs
+updated: [PERMISSIONS](docs/PERMISSIONS.md) §9/§10, [api-keys](docs/api-keys.md),
+[USAGE](docs/USAGE.md), README, [DEPLOYMENT](docs/DEPLOYMENT.md),
+[state-cache](docs/state-cache.md), PROGRESS.
+
+Verification (Windows, Go 1.27.3, MySQL 8 + Redis + Qdrant from the local compose
+stack; `GOCACHE` redirected into the worktree because the machine cache is
+outside the sandbox):
+
+- `go build ./...` / `go vet ./...` — clean.
+- New regression tests: `internal/state/api_keys_owner_test.go` (owner
+  projection, `ListByOwner` scoping, legacy NULL rows, update keeps owner,
+  account-delete cascade), `internal/httpapi/api_keys_owner_test.go`
+  (list/read/update/delete/mcp-config isolation, 404 indistinguishability,
+  CSRF/bearer/loopback policy, create/update binding rules, no-store, admin
+  visibility), `internal/e2e/api_keys_http_test.go` (real router + sessions +
+  CSRF + auth/access/MySQL end to end, admin ownership, `owned_namespaces`).
+- Targeted rerun after the review fixes: `go test -p 1 -count=1 -timeout 900s
+  -run 'TestAPIKey|TestUserDeleteCascadesAPIKeys|TestSchemaMatchesPythonDefinition|TestAutoSchemaCanBeDisabled|TestSchemaCreationCanBeForcedOff|TestStoresWiresG7StateMachines|TestDocumentJobReconcileCommittedPublication'
+  ./internal/state ./internal/httpapi ./internal/e2e` → `ok` state 106.2 s,
+  httpapi 23.5 s, e2e 9.6 s.
+- Frontend: `npm run typecheck` clean; `npm test` 32/32 (5 new API-key helper
+  contract tests); `npm run build` green.
+- Full serial suite: `go test ./... -p 1 -count=1 -timeout 25m` → exit 0, every
+  package passes (state 421.0 s, httpapi 182.9 s, e2e 252.9 s, runtime 464.7 s,
+  documentworker 54.5 s; ≈24 minutes wall time on this loaded machine).
+
+Environment note: an earlier full-suite attempt reported only two G7 tests
+failing with `Table 'praxis_gotest.document_task_outbox' doesn't exist` while
+another worktree's Go test process was also using the shared `praxis_gotest`
+schema (observed `state.test` from
+`.agents/worktrees/dsh-200abc8a-f229`). `newTestStores` runs schema
+creation/migration before `statetest.Prepare` takes its `GET_LOCK`, so a
+concurrent process that drops/recreates the schema is visible in that window —
+a pre-existing harness race, not a regression from this change. The green run
+above was executed with no other test process on the schema; a private schema
+could not be created because the `rag` MySQL user has no `CREATE DATABASE`
+grant.
+
+Known limits (also in [PERMISSIONS](docs/PERMISSIONS.md) §10): disabling an
+account revokes its sessions but not its already-issued keys (delete the account
+or disable/delete the keys); the namespace binding stores the knowledge-base
+name, so a deleted-then-recreated knowledge base remains reachable by keys
+previously issued for that namespace.
+
 ## Test workflow hardening — 2026-11-10
 
 Goal: make the repository's test workflow actually reliable, and cover the

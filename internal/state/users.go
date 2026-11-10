@@ -168,9 +168,12 @@ func (r *UserRepository) Update(ctx context.Context, id, role string, enabled bo
 }
 
 // Delete removes one account and reports whether it existed. The transaction
-// also drops the account's sessions, the knowledge-base permissions granted to
-// it, and the invitations it issued or received; knowledge bases it owned become
-// unowned (administrator-only) instead of being deleted with the account.
+// also drops the account's sessions, the API keys it issued, the knowledge-base
+// permissions granted to it, and the invitations it issued or received;
+// knowledge bases it owned become unowned (administrator-only) instead of being
+// deleted with the account. Deleting the account must delete its API keys: an
+// issued credential stays valid for tenant traffic even after the login account
+// is gone.
 func (r *UserRepository) Delete(ctx context.Context, id string) (bool, error) {
 	transaction, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -178,6 +181,12 @@ func (r *UserRepository) Delete(ctx context.Context, id string) (bool, error) {
 	}
 	defer func() { _ = transaction.Rollback() }()
 	if _, err := transaction.ExecContext(ctx, "DELETE FROM user_sessions WHERE user_id = ?", id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := touch(ctx, transaction, apiKeyKeys()...); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM api_keys WHERE owner_user_id = ?", id); err != nil {
 		return false, newStateError("用户无法删除")
 	}
 	if _, err := transaction.ExecContext(ctx, "DELETE FROM kb_permissions WHERE grantee_user_id = ?", id); err != nil {

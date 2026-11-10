@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/Guan0923/xinghe_rag/internal/auth"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
@@ -12,13 +13,17 @@ import (
 type APIKeyStore interface {
 	KeyLookup
 	List(ctx context.Context) ([]state.APIKey, error)
+	ListByOwner(ctx context.Context, ownerUserID string) ([]state.APIKey, error)
+	Get(ctx context.Context, keyID string) (*state.APIKey, error)
 	Create(ctx context.Context, name string, namespaces []string) (state.CreatedAPIKey, error)
+	CreateForOwner(ctx context.Context, name string, namespaces []string, ownerUserID string) (state.CreatedAPIKey, error)
 	Update(ctx context.Context, keyID, name string, namespaces []string, enabled bool) (*state.APIKey, error)
 	Delete(ctx context.Context, keyID string) (bool, error)
 	SecretForNamespace(ctx context.Context, keyID, namespace string) (string, error)
 }
 
-// WithAPIKeyStore enables the stored-credential authentication and admin API.
+// WithAPIKeyStore enables the stored-credential authentication and the per-account
+// API-key management API.
 func WithAPIKeyStore(store APIKeyStore) Option {
 	return func(s *Server) {
 		s.keyStore = store
@@ -26,6 +31,92 @@ func WithAPIKeyStore(store APIKeyStore) Option {
 			s.keys = store
 		}
 	}
+}
+
+// Messages of the per-account credential rules. They stay stable so the Console
+// can show them verbatim.
+const (
+	messageAPIKeyNotFound        = "API Key 不存在"
+	messageAPIKeyNamespaceDenied = "只能为本人创建的知识库创建 API Key"
+)
+
+// apiKeyCaller returns the signed-in account of an authSessionOrLocal request,
+// or nil for the trusted local management surface.
+func apiKeyCaller(r *http.Request) *auth.SessionUser {
+	session, _ := sessionUserFromContext(r.Context())
+	return session
+}
+
+// apiKeyCallerIsAdmin reports whether the caller may manage every account's
+// keys: a session administrator, or the trusted local management surface.
+func apiKeyCallerIsAdmin(r *http.Request) bool {
+	session := apiKeyCaller(r)
+	return session == nil || session.User.IsAdmin()
+}
+
+// apiKeyNewNamespaces returns the requested namespaces the existing key does not
+// already carry. Only an addition needs the ownership check: a key issued while
+// the caller was an administrator may still bind foreign knowledge bases, and
+// its owner must be able to rename, disable or delete it after a demotion.
+func apiKeyNewNamespaces(existing *state.APIKey, requested []string) []string {
+	if existing == nil {
+		return requested
+	}
+	current := make(map[string]struct{}, len(existing.Namespaces))
+	for _, namespace := range existing.Namespaces {
+		current[namespace] = struct{}{}
+	}
+	added := make([]string, 0, len(requested))
+	for _, namespace := range requested {
+		if _, ok := current[namespace]; !ok {
+			added = append(added, namespace)
+		}
+	}
+	return added
+}
+
+// apiKeyCallerOwns reports whether one key belongs to the caller. It is only
+// consulted for non-administrator sessions; existence of a foreign key is
+// indistinguishable from a missing one on purpose.
+func apiKeyCallerOwns(r *http.Request, key *state.APIKey) bool {
+	session := apiKeyCaller(r)
+	if session == nil || session.User.IsAdmin() {
+		return true
+	}
+	return key != nil && key.OwnerUserID != "" && key.OwnerUserID == session.User.ID
+}
+
+// apiKeyNamespacesAllowed enforces the credential binding rule for normal
+// accounts: an API key bypasses knowledge-base/document authorization, so a
+// session account may only bind knowledge bases it owns. Administrators and the
+// local management surface are unrestricted. The rule fails closed when the
+// sharing service is not wired: silently skipping it would turn a missing
+// dependency into a privilege escalation.
+func (s *Server) apiKeyNamespacesAllowed(w http.ResponseWriter, r *http.Request, namespaces []string) bool {
+	session := apiKeyCaller(r)
+	if session == nil || session.User.IsAdmin() {
+		return true
+	}
+	if s.access == nil {
+		writeDetail(w, http.StatusInternalServerError, "知识库权限服务异常")
+		return false
+	}
+	owned, err := s.access.OwnedNamespaces(r.Context(), session.User)
+	if err != nil {
+		writeDetail(w, http.StatusInternalServerError, "知识库权限服务异常")
+		return false
+	}
+	allowed := make(map[string]struct{}, len(owned))
+	for _, namespace := range owned {
+		allowed[namespace] = struct{}{}
+	}
+	for _, namespace := range namespaces {
+		if _, ok := allowed[namespace]; !ok {
+			writeDetail(w, http.StatusForbidden, messageAPIKeyNamespaceDenied)
+			return false
+		}
+	}
+	return true
 }
 
 type apiKeyBody struct {
@@ -105,7 +196,17 @@ func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 		writeDetail(w, http.StatusServiceUnavailable, "API key store is not available")
 		return
 	}
-	keys, err := s.keyStore.List(r.Context())
+	// A normal account only ever lists its own credentials; administrators and
+	// the local management surface see every key (including legacy unowned ones).
+	var (
+		keys []state.APIKey
+		err  error
+	)
+	if session := apiKeyCaller(r); session != nil && !session.User.IsAdmin() {
+		keys, err = s.keyStore.ListByOwner(r.Context(), session.User.ID)
+	} else {
+		keys, err = s.keyStore.List(r.Context())
+	}
 	if err != nil {
 		writeDetail(w, http.StatusInternalServerError, "API Key 读取失败")
 		return
@@ -134,7 +235,16 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeValidation(w, http.StatusUnprocessableEntity, details)
 		return
 	}
-	created, err := s.keyStore.Create(r.Context(), name, namespaces)
+	// The issuer becomes the owner. A session account may only bind knowledge
+	// bases it owns; the local management surface keeps creating unowned keys.
+	ownerUserID := ""
+	if session := apiKeyCaller(r); session != nil {
+		ownerUserID = session.User.ID
+		if !apiKeyCallerIsAdmin(r) && !s.apiKeyNamespacesAllowed(w, r, namespaces) {
+			return
+		}
+	}
+	created, err := s.keyStore.CreateForOwner(r.Context(), name, namespaces, ownerUserID)
 	if err != nil {
 		writeDetail(w, http.StatusConflict, err.Error())
 		return
@@ -175,6 +285,18 @@ func (s *Server) handleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeValidation(w, http.StatusUnprocessableEntity, namespaceDetails)
 		return
 	}
+	existing, err := s.keyStore.Get(r.Context(), keyID)
+	if err != nil {
+		writeDetail(w, http.StatusInternalServerError, "API Key 读取失败")
+		return
+	}
+	if !apiKeyCallerOwns(r, existing) {
+		writeDetail(w, http.StatusNotFound, messageAPIKeyNotFound)
+		return
+	}
+	if !apiKeyCallerIsAdmin(r) && !s.apiKeyNamespacesAllowed(w, r, apiKeyNewNamespaces(existing, namespaces)) {
+		return
+	}
 	item, err := s.keyStore.Update(r.Context(), keyID, name, namespaces, *body.Enabled)
 	if err != nil {
 		writeDetail(w, http.StatusInternalServerError, "API Key 更新失败")
@@ -192,13 +314,23 @@ func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeDetail(w, http.StatusServiceUnavailable, "API key store is not available")
 		return
 	}
-	deleted, err := s.keyStore.Delete(r.Context(), pathParam(r, "key_id"))
+	keyID := pathParam(r, "key_id")
+	existing, err := s.keyStore.Get(r.Context(), keyID)
+	if err != nil {
+		writeDetail(w, http.StatusInternalServerError, "API Key 读取失败")
+		return
+	}
+	if !apiKeyCallerOwns(r, existing) {
+		writeDetail(w, http.StatusNotFound, messageAPIKeyNotFound)
+		return
+	}
+	deleted, err := s.keyStore.Delete(r.Context(), keyID)
 	if err != nil {
 		writeDetail(w, http.StatusInternalServerError, "API Key 删除失败")
 		return
 	}
 	if !deleted {
-		writeDetail(w, http.StatusNotFound, "API Key 不存在")
+		writeDetail(w, http.StatusNotFound, messageAPIKeyNotFound)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -213,7 +345,17 @@ func (s *Server) handleAPIKeyMCPConfig(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	secret, err := s.keyStore.SecretForNamespace(r.Context(), pathParam(r, "key_id"), namespace)
+	keyID := pathParam(r, "key_id")
+	existing, err := s.keyStore.Get(r.Context(), keyID)
+	if err != nil {
+		writeDetail(w, http.StatusInternalServerError, "API Key 读取失败")
+		return
+	}
+	if !apiKeyCallerOwns(r, existing) {
+		writeDetail(w, http.StatusNotFound, messageAPIKeyNotFound)
+		return
+	}
+	secret, err := s.keyStore.SecretForNamespace(r.Context(), keyID, namespace)
 	if err != nil {
 		status, detail := apiKeyConfigError(err)
 		writeDetail(w, status, detail)

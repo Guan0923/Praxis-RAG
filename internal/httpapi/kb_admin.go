@@ -80,7 +80,10 @@ func (s *Server) handleNamespaceList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// A login session only sees knowledge bases it owns or holds grants in;
-	// management credentials keep the full list.
+	// management credentials keep the full list. `owned_namespaces` is the
+	// stricter binding set used by the per-account API-key page (a normal
+	// account may only scope a key to knowledge bases it created).
+	response := map[string]any{"namespaces": namespaces, "owned_namespaces": namespaces}
 	if session, ok := sessionUserFromContext(r.Context()); ok && s.access != nil {
 		visible, err := s.access.VisibleNamespaces(r.Context(), session.User)
 		if err != nil {
@@ -98,9 +101,26 @@ func (s *Server) handleNamespaceList(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		namespaces = filtered
+		owned, err := s.access.OwnedNamespaces(r.Context(), session.User)
+		if err != nil {
+			writeDetail(w, http.StatusInternalServerError, "知识库权限服务异常")
+			return
+		}
+		ownedAllowed := make(map[string]struct{}, len(owned))
+		for _, name := range owned {
+			ownedAllowed[name] = struct{}{}
+		}
+		ownedVisible := make([]string, 0, len(owned))
+		for _, name := range namespaces {
+			if _, ok := ownedAllowed[name]; ok {
+				ownedVisible = append(ownedVisible, name)
+			}
+		}
+		response["namespaces"] = namespaces
+		response["owned_namespaces"] = ownedVisible
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, map[string]any{"namespaces": namespaces})
+	writeJSON(w, http.StatusOK, response)
 }
 
 type createKnowledgeBaseBody struct {

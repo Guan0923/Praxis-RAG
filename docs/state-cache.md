@@ -32,7 +32,7 @@ Redis 有两种不同职责，不能混用其故障语义：
 
 **严格边界**：真实 API Key 鉴权、密钥导出、检索可见版本、租约申请/续期/认领、fencing、提交与回滚仍直接访问 MySQL。缓存中的 enabled、版本、owner 展示值均不能授予执行权。即使缓存故意置旧，也不能导致已停用 Key 被放行或过期节点成功提交。
 
-租约 owner 原始所有权 token 不放 Redis；holder_id 是 token 的短哈希，仅用于区分执行者。操作详情不缓存 idempotency_key、workspace、fingerprint、result 原文、步骤输入 details、文件内容或密钥。upload_status 的返回值再次验证 namespace，UUID 不授予访问权。API Key 列表仍仅允许本机管理员。
+租约 owner 原始所有权 token 不放 Redis；holder_id 是 token 的短哈希，仅用于区分执行者。操作详情不缓存 idempotency_key、workspace、fingerprint、result 原文、步骤输入 details、文件内容或密钥。upload_status 的返回值再次验证 namespace，UUID 不授予访问权。API Key 列表按账号可见（管理员/本机管理为全部，普通账号仅本人；见 [权限管理](PERMISSIONS.md) §9）。
 
 上述**展示读模型**不缓存原始文件、图片、解析产物、查询/重排结果或模型密钥。排队搜索任务与结果快照使用独立 Redis 短期存储（见下节），不套用此限制或 MySQL 回源策略；文档原本文件不写入 Redis，只保留在 MySQL 的 `document_jobs` 与 `blobs` 中。事务/步骤的展示投影可缓存，MySQL 原始 UploadJournal 始终是恢复依据；不迁移发布/恢复日志或业务租约权威到 Redis。文档列表中的 operation_id 也仅为展示元数据。
 

@@ -17,6 +17,11 @@ const (
 	// authSession requires a Console login session (plus CSRF on writes) with no
 	// loopback fallback; it protects the knowledge-base sharing endpoints.
 	authSession
+	// authSessionOrLocal accepts either a Console login session of any role
+	// (plus CSRF on writes) or, when no session is present, the trusted local
+	// management break-glass. It protects the per-account API-key management
+	// routes, which every signed-in account uses for its own credentials.
+	authSessionOrLocal
 )
 
 // route is one method+path registration. Patterns use "{name}" for a single

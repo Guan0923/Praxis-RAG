@@ -65,8 +65,9 @@ const pages = [
   { key: "users", label: "用户管理", icon: <TeamOutlined /> },
 ] as const;
 
-// adminOnlyPages require the admin role once login is enabled.
-const adminOnlyPages = new Set<string>(["api-keys", "knowledge-bases", "users"]);
+// adminOnlyPages require the admin role once login is enabled. The API Key page
+// is not listed: every account manages only its own keys there.
+const adminOnlyPages = new Set<string>(["knowledge-bases", "users"]);
 const inviteBellPollMs = 60_000;
 
 export function Console({
@@ -99,6 +100,7 @@ export function Console({
   const [checking, setChecking] = useState(false);
   const healthRequest = useRef<AbortController | null>(null);
   const [workspaceNames, setWorkspaceNames] = useState<string[]>([]);
+  const [ownedNamespaces, setOwnedNamespaces] = useState<string[]>([]);
   const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
   const [workspaceError, setWorkspaceError] = useState(false);
   const workspaceRequest = useRef<AbortController | null>(null);
@@ -207,11 +209,17 @@ export function Console({
     setLoadingWorkspaces(true);
     setWorkspaceError(false);
     setWorkspaceNames([]);
+    setOwnedNamespaces([]);
     try {
-      const data = await api<{ namespaces: string[] }>(
+      const data = await api<{ namespaces: string[]; owned_namespaces?: string[] }>(
         "/v1/namespaces", connection, { signal: controller.signal, cache: "no-store" },
       );
-      if (!controller.signal.aborted) setWorkspaceNames(data.namespaces);
+      if (!controller.signal.aborted) {
+        setWorkspaceNames(data.namespaces);
+        // Legacy/no-session responses have no owned_namespaces field: there the
+        // caller may bind every namespace, exactly like the namespaces list.
+        setOwnedNamespaces(data.owned_namespaces ?? data.namespaces);
+      }
     } catch (error) {
       if (!controller.signal.aborted) {
         setWorkspaceError(true);
@@ -223,9 +231,11 @@ export function Console({
   }
 
   useEffect(() => {
-    if (view === "api-keys") void loadWorkspaces();
+    // A direct link to #/api-keys can mount before the login state is known:
+    // reload once the account (or legacy no-session mode) is available.
+    if (view === "api-keys" && (!sessionMode || authUser)) void loadWorkspaces();
     return () => workspaceRequest.current?.abort();
-  }, [view]);
+  }, [view, sessionMode, authUser]);
 
   useEffect(() => {
     try {
@@ -512,8 +522,12 @@ export function Console({
               </section>
             )}
           </div>
-          {view === "api-keys" && (!sessionMode || authUser?.role === "admin") && (
-            <ApiKeysPage namespaces={workspaceNames} />
+          {view === "api-keys" && (!sessionMode || authUser) && (
+            <ApiKeysPage
+              namespaces={workspaceNames}
+              ownedNamespaces={ownedNamespaces}
+              role={authUser?.role}
+            />
           )}
           {view === "knowledge-bases" && (!sessionMode || authUser?.role === "admin") && (
             <KnowledgeBasesPage disabled={uploading}

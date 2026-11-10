@@ -14,7 +14,7 @@ var expectedSchema = []struct {
 	name    string
 	columns []string
 }{
-	{"api_keys", []string{"id", "name", "prefix", "digest", "namespaces", "enabled", "created_at", "updated_at", "protected_key"}},
+	{"api_keys", []string{"id", "name", "prefix", "digest", "namespaces", "enabled", "created_at", "updated_at", "protected_key", "owner_user_id"}},
 	{"knowledge_bases", []string{"namespace", "collection", "settings", "version", "created_at", "updated_at", "owner_user_id"}},
 	{"documents", []string{"namespace", "name", "document_id", "size", "sha256", "chunking", "collection", "chunk_count", "modified_at", "indexed_at", "diagnostics", "skipped_object_count", "del_flag"}},
 	{"blobs", []string{"namespace", "bucket", "key", "document_id", "content", "size", "sha256", "created_at"}},
@@ -81,6 +81,7 @@ var expectedUniques = map[string]string{
 }
 
 var expectedIndexes = map[string][]string{
+	"api_keys":                {"ix_api_keys_owner"},
 	"knowledge_bases":         {"ix_knowledge_bases_collection"},
 	"documents":               {"ix_documents_namespace_sha256"},
 	"blobs":                   {"ix_blobs_document"},

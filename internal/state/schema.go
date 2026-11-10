@@ -275,8 +275,13 @@ var schemaTables = []*SchemaTable{
 			varchar("created_at", 40),
 			varchar("updated_at", 40),
 			text("protected_key").Null(),
+			// owner_user_id is the Console account that issued the key. NULL
+			// means a credential created before ownership existed (or by the
+			// trusted local management surface); those stay administrator-only.
+			identifier("owner_user_id", 32).Null(),
 		},
 		Uniques: []SchemaUnique{unique("uq_api_keys_digest", "digest")},
+		Indexes: []SchemaIndex{index("ix_api_keys_owner", "owner_user_id")},
 	},
 	{
 		Name: "knowledge_bases",

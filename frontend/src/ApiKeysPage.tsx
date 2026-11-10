@@ -1,13 +1,34 @@
 import { useEffect, useRef, useState } from "react";
 import { Alert, App, Button, Form, Input, Modal, Select, Switch, Table, Tag, Tooltip } from "antd";
 import { CopyOutlined, DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from "@ant-design/icons";
-import { api, apiResponse, errorText } from "./api";
+import { api, apiResponse, errorText, type Role } from "./api";
+import { apiKeyNamespaceOptions, apiKeyOwnerText, isAdminLike } from "./apiKeys";
 import { namespacePattern } from "./navigation";
 
-type ApiKey = { id: string; name: string; prefix: string; namespaces: string[]; enabled: boolean; exportable: boolean; created_at: string };
+// ApiKey mirrors one key entry of GET /v1/admin/api-keys. The owner fields are
+// optional: legacy keys created before per-account ownership have no owner.
+type ApiKey = {
+  id: string;
+  name: string;
+  prefix: string;
+  namespaces: string[];
+  enabled: boolean;
+  exportable: boolean;
+  created_at: string;
+  owner_user_id?: string;
+  owner_username?: string;
+};
 type KeyValues = { name: string; namespaces: string[]; enabled: boolean };
 
-export function ApiKeysPage({ namespaces }: { namespaces: string[] }) {
+export function ApiKeysPage({
+  namespaces,
+  ownedNamespaces,
+  role,
+}: {
+  namespaces: string[];
+  ownedNamespaces?: string[];
+  role?: Role;
+}) {
   const { message, modal } = App.useApp();
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [error, setError] = useState("");
@@ -100,7 +121,10 @@ export function ApiKeysPage({ namespaces }: { namespaces: string[] }) {
     });
   }
 
-  const options = [...new Set([...namespaces, ...keys.flatMap((key) => key.namespaces)])].map((value) => ({ value, label: value }));
+  // Non-admin accounts may only bind knowledge bases they own, so their picker
+  // stays limited to ownedNamespaces; admins and legacy local mode see all.
+  const options = apiKeyNamespaceOptions(namespaces, ownedNamespaces, role);
+  const showOwner = role === "admin";
   return (
     <section aria-label="API Key 页面">
       <div className="page-heading">
@@ -108,11 +132,19 @@ export function ApiKeysPage({ namespaces }: { namespaces: string[] }) {
         <Button type="primary" icon={<PlusOutlined />} disabled={!authorized || busy || loading} onClick={() => edit()}>创建密钥</Button>
       </div>
       <Button icon={<ReloadOutlined />} loading={loading} disabled={busy} onClick={() => void load()}>刷新</Button>
+      {!isAdminLike(role) && (
+        <Alert className="page-alert" type="info" showIcon
+          description="API Key 只能为本人创建的知识库创建，且只能查看/管理自己的密钥。" />
+      )}
       {error && <Alert className="page-alert" type="error" showIcon title="无法管理密钥" description={error} />}
-      <Table<ApiKey> rowKey="id" dataSource={keys} loading={loading} scroll={{ x: 720 }}
+      <Table<ApiKey> rowKey="id" dataSource={keys} loading={loading} scroll={{ x: showOwner ? 880 : 720 }}
         locale={{ emptyText: authorized ? "暂无 API Key" : "尚未连接" }} pagination={{ pageSize: 10, hideOnSinglePage: true }}
         columns={[
           { title: "名称", dataIndex: "name", width: 180, render: (name: string) => <span className="break-text">{name}</span> },
+          ...(showOwner ? [{
+            title: "所有者", dataIndex: "owner_username", width: 160,
+            render: (owner: string | undefined) => <span className="break-text">{apiKeyOwnerText(owner)}</span>,
+          }] : []),
           { title: "密钥", dataIndex: "prefix", width: 150, render: (prefix: string) => <code>{prefix}…</code> },
           { title: "授权 Namespace", dataIndex: "namespaces", render: (values: string[]) => <div className="key-namespaces">{values.map((value) => <Tag key={value}>{value}</Tag>)}</div> },
           { title: "启用", width: 80, render: (_, key) => <Switch aria-label={"启用 " + key.name} checked={key.enabled} disabled={busy || loading} onChange={(enabled) => void setEnabled(key, enabled)} /> },

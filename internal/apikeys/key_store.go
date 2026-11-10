@@ -32,9 +32,34 @@ func (s *Store) List(ctx context.Context) ([]state.APIKey, error) {
 	return s.repository.List(ctx)
 }
 
+// ListByOwner returns only the keys issued by one Console account.
+func (s *Store) ListByOwner(ctx context.Context, ownerUserID string) ([]state.APIKey, error) {
+	return s.repository.ListByOwner(ctx, ownerUserID)
+}
+
+// Get returns one key (with its owner projection), or nil when it is missing.
+func (s *Store) Get(ctx context.Context, keyID string) (*state.APIKey, error) {
+	return s.repository.Get(ctx, keyID)
+}
+
 // Create issues one new credential. Duplicate digests map to "API Key 已存在".
 func (s *Store) Create(ctx context.Context, name string, namespaces []string) (state.CreatedAPIKey, error) {
 	created, err := s.repository.Create(ctx, name, namespaces)
+	if err != nil {
+		var conflict *state.StateConflict
+		if asStateConflict(err, &conflict) {
+			return state.CreatedAPIKey{}, &Error{Message: "API Key 已存在"}
+		}
+		return state.CreatedAPIKey{}, err
+	}
+	return created, nil
+}
+
+// CreateForOwner issues one new credential owned by the given Console account.
+// An empty ownerUserID creates an unowned (administrator-only) credential, the
+// same as Create.
+func (s *Store) CreateForOwner(ctx context.Context, name string, namespaces []string, ownerUserID string) (state.CreatedAPIKey, error) {
+	created, err := s.repository.CreateForOwner(ctx, name, namespaces, ownerUserID)
 	if err != nil {
 		var conflict *state.StateConflict
 		if asStateConflict(err, &conflict) {

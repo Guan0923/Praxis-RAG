@@ -411,6 +411,9 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	if err := s.migrateKnowledgeBaseOwner(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateAPIKeyOwner(ctx); err != nil {
+		return err
+	}
 	return s.migrateDocumentOutbox(ctx)
 }
 
@@ -527,6 +530,71 @@ func (s *Stores) migrateKnowledgeBaseOwner(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// migrateAPIKeyOwner adds the per-account ownership column (and its index) to an
+// existing api_keys table. Rows created before ownership existed stay NULL, which
+// the HTTP layer treats as administrator-only. Concurrent startup may race the
+// ALTER/CREATE INDEX; only an independently confirmed existing object is
+// accepted.
+func (s *Stores) migrateAPIKeyOwner(ctx context.Context) error {
+	const (
+		table      = "api_keys"
+		column     = "owner_user_id"
+		indexName  = "ix_api_keys_owner"
+		columnType = "VARCHAR(32) COLLATE utf8mb4_bin NULL"
+	)
+	exists, err := s.hasTable(ctx, table)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	columns, err := s.tableColumns(ctx, table)
+	if err != nil {
+		return err
+	}
+	if !containsString(columns, column) {
+		statement := "ALTER TABLE " + quoteIdentifier(table) +
+			" ADD COLUMN " + quoteIdentifier(column) + " " + columnType
+		if _, execErr := s.DB.ExecContext(ctx, statement); execErr != nil {
+			confirmed, confirmErr := s.tableColumns(ctx, table)
+			if confirmErr != nil || !containsString(confirmed, column) {
+				return execErr
+			}
+		}
+	}
+	if exists, err := s.hasIndex(ctx, table, indexName); err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
+	statement := "CREATE INDEX " + quoteIdentifier(indexName) +
+		" ON " + quoteIdentifier(table) + " (" + quoteIdentifier(column) + ")"
+	if _, err := s.DB.ExecContext(ctx, statement); err != nil {
+		confirmed, confirmErr := s.hasIndex(ctx, table, indexName)
+		if confirmErr == nil && confirmed {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// hasIndex reports whether one named secondary index exists on the table.
+func (s *Stores) hasIndex(ctx context.Context, table, index string) (bool, error) {
+	const query = "SELECT 1 FROM information_schema.statistics " +
+		"WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1"
+	var found int
+	err := s.DB.QueryRowContext(ctx, query, table, index).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // migrateDocumentOutbox mirrors schema_migrations.migrate_document_outbox:

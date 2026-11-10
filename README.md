@@ -54,7 +54,7 @@ REST `/v1/search`、Console 与本地调试同步执行。服务端 MCP `search`
 | MCP：`/mcp` | 搜索、添加/更新/删除文档、分页读取正文、提示词模板及订阅变更。 |
 | REST API：`/v1/*` | 知识管理与检索接入现有应用；`/openapi.json` 与 `/docs` 提供 OpenAPI 3.1 契约。 |
 
-MCP 需要 `Authorization: Bearer <service token 或 API Key>` 与 `X-RAG-Namespace`；`/v1/admin/*` 管理接口仅允许本机直连。管理员可以启停已注册的 MCP 工具、调整工具说明和管理提示词模板。
+MCP 需要 `Authorization: Bearer <service token 或 API Key>` 与 `X-RAG-Namespace`；`/v1/admin/*` 管理接口仅允许本机直连或管理员会话，其中 `/v1/admin/api-keys` 是例外：任意已登录账号都可以管理**自己的** API Key（非管理员只能绑定本人创建的知识库，历史无主密钥仅管理员/本机管理可见）。管理员可以启停已注册的 MCP 工具、调整工具说明和管理提示词模板。
 
 ### 独立部署与模型状态
 
@@ -140,7 +140,7 @@ $env:RAG_STATE_ENCRYPTION_KEY = "base64:<32-byte-key>"
 
 知识库默认归创建者私有：VIP 和管理员可以在「权限管理」页通过邀请链接把知识库按「可读 / 可修改」和「单文件 / 多文件 / 全库」范围共享给其他账号，被邀请人登录后接受邀请才生效。详见 [知识库权限管理](docs/PERMISSIONS.md)。详见 [docs/USAGE.md](docs/USAGE.md#用户登录与注册console)。
 
-创建第一批 API Key（管理接口仅本机可访问，或使用管理员登录会话远程访问）：
+创建第一批 API Key（本机直连或管理员登录会话可为任意知识库创建；普通/VIP 账号登录后也可在「API Key」页创建自己的密钥，但只能绑定本人创建的知识库）：
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
@@ -235,7 +235,7 @@ npm run build
 - `RAG_UPLOAD_MODE` 默认 `sync`；改为 `async` 后果索引任务排队执行，必须部署 `rag-document-worker`（或 `RAG_DOCUMENT_WORKER_LOCAL=1`），并用 `GET /v1/document-jobs/{artifact_id}` 观察进度。
 - 每批最多 10 个文件、单文件 10 MiB；暂不支持 Excel、网页抓取和独立图片上传。
 - Word 保留内容控件、嵌套表格、合并范围与原生公式；未知公式结构、原生图表等无法可靠读取的内容会明确拒绝入库；图注关联有歧义时跳过并报告原因。
-- 知识库（namespace）默认归创建者私有，只有创建者和管理员可以使用；共享通过「权限管理」页的邀请链接完成，权限分为可读/可修改、范围分为单文件/多文件/全库，仅 VIP 与管理员可邀请。管理凭证（Service Token / API Key / 本机无会话直连）沿用原有语义，不做知识库归属校验；`/v1/admin/*` 只允许本机直连或管理员会话，MCP/普通 API 使用 Service Token 或 API Key。详见 [知识库权限管理](docs/PERMISSIONS.md)。
+- 知识库（namespace）默认归创建者私有，只有创建者和管理员可以使用；共享通过「权限管理」页的邀请链接完成，权限分为可读/可修改、范围分为单文件/多文件/全库，仅 VIP 与管理员可邀请。管理凭证（Service Token / API Key / 本机无会话直连）沿用原有语义，不做知识库归属校验；`/v1/admin/*` 默认只允许本机直连或管理员会话，其中 `/v1/admin/api-keys` 例外：任意已登录账号都可以管理自己的 API Key（非管理员只能绑定本人知识库，历史无主密钥仅管理员/本机可见）。MCP/普通 API 使用 Service Token 或 API Key。详见 [知识库权限管理](docs/PERMISSIONS.md)。
 - 默认只监听 `127.0.0.1`。远程部署必须设置 `RAG_SERVICE_TOKEN` 与 MCP Host/Origin 白名单，并在前面配置 HTTPS 与访问控制。
 - PDF/Word 解析依赖外部进程（Docling + 本地版面/表格/OCR 模型、LibreOffice、Python 环境），不属于 Go 二进制；公式识别与图片描述调用远端 VLM（`RAG_VLM_*`），文档裁图会发送到该端点。未配置时相应文件上传会明确报错。
 - Redis 搜索快照有 TTL（`RAG_RESULT_TTL_SECONDS`，默认 3600 秒），丢失或到期后 `result_id` 不可用，无 SQL 回放。异步文档任务状态在 MySQL，不受 Redis TTL 影响。

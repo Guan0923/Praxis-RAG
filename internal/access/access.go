@@ -339,6 +339,24 @@ func (s *Service) VisibleNamespaces(ctx context.Context, user state.User) ([]str
 	return names, nil
 }
 
+// OwnedNamespaces lists the knowledge bases one account created. It is the
+// binding set for account-owned credentials: an API key bypasses the
+// knowledge-base/document authorization layer, so a normal account may only
+// scope its keys to knowledge bases it owns.
+func (s *Service) OwnedNamespaces(ctx context.Context, user state.User) ([]string, error) {
+	if !user.Enabled {
+		return []string{}, nil
+	}
+	namespaces, err := s.knowledgeBases.OwnedNamespaces(ctx, user.ID)
+	if err != nil {
+		return nil, err
+	}
+	if namespaces == nil {
+		namespaces = []string{}
+	}
+	return namespaces, nil
+}
+
 // ResolveDocumentIDs maps document names to their indexed document ids inside
 // one knowledge base. Names that have no document row are skipped.
 func (s *Service) ResolveDocumentIDs(ctx context.Context, namespace string, names []string) ([]string, error) {

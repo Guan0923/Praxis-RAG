@@ -15,12 +15,16 @@ import (
 // knowledge base, and it implements the invite-based sharing rules.
 //
 // The concrete implementation is *access.Service. A nil AccessControl disables
-// ownership enforcement so unit tests and the management credentials (API key,
-// service token, session-less loopback) keep their historical behaviour.
+// knowledge-base ownership enforcement for tenant routes so unit tests and the
+// management credentials (API key, service token, session-less loopback) keep
+// their historical behaviour. The per-account API-key binding rule fails closed
+// instead: a non-administrator session cannot mint a credential for any
+// namespace when the sharing service is missing.
 type AccessControl interface {
 	ScopeSet(ctx context.Context, user state.User, namespace string) (access.ScopeSet, error)
 	CanManage(ctx context.Context, user state.User, namespace string) (bool, error)
 	VisibleNamespaces(ctx context.Context, user state.User) ([]string, error)
+	OwnedNamespaces(ctx context.Context, user state.User) ([]string, error)
 	ResolveDocumentIDs(ctx context.Context, namespace string, names []string) ([]string, error)
 	Describe(ctx context.Context, user state.User, namespace string) (access.AccessView, error)
 	ListGrants(ctx context.Context, user state.User, namespace string) ([]access.GrantView, error)

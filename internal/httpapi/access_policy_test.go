@@ -29,6 +29,9 @@ type fakeAccessControl struct {
 	visible    map[string][]string
 	visibleErr error
 
+	owned    map[string][]string
+	ownedErr error
+
 	resolvedNames []string
 	resolvedIDs   []string
 	resolveErr    error
@@ -94,6 +97,13 @@ func (f *fakeAccessControl) VisibleNamespaces(_ context.Context, user state.User
 		return nil, f.visibleErr
 	}
 	return f.visible[user.ID], nil
+}
+
+func (f *fakeAccessControl) OwnedNamespaces(_ context.Context, user state.User) ([]string, error) {
+	if f.ownedErr != nil {
+		return nil, f.ownedErr
+	}
+	return f.owned[user.ID], nil
 }
 
 func (f *fakeAccessControl) ResolveDocumentIDs(_ context.Context, _ string, names []string) ([]string, error) {

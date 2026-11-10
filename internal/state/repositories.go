@@ -19,6 +19,13 @@ type APIKey struct {
 	Enabled    bool     `json:"enabled"`
 	CreatedAt  string   `json:"created_at"`
 	Exportable bool     `json:"exportable"`
+	// OwnerUserID is the Console account that issued the key. It is empty for
+	// credentials created before ownership existed (and for keys issued through
+	// the trusted local management surface), which stay administrator-only.
+	OwnerUserID string `json:"owner_user_id,omitempty"`
+	// OwnerUsername is a display-only join of users.username; it is never used
+	// for authorization.
+	OwnerUsername string `json:"owner_username,omitempty"`
 }
 
 // CreatedAPIKey is the one-time response of ApiKeyRepository.Create: the public
@@ -63,6 +70,15 @@ func (r *APIKeyRepository) flushPending(ctx context.Context) {
 
 const apiKeySelectColumns = "id, name, prefix, namespaces, enabled, created_at, protected_key"
 
+// apiKeyOwnerSelectColumns projects one key together with its owning account.
+// The base column list above is kept for the read-model cache loader, which
+// serialises the whole api_keys table without joins.
+const apiKeyOwnerSelectColumns = "k.id, k.name, k.prefix, k.namespaces, k.enabled, " +
+	"k.created_at, k.protected_key, k.owner_user_id, u.username"
+
+// apiKeyOwnerFrom is the FROM clause shared by every owner-aware read.
+const apiKeyOwnerFrom = " FROM api_keys k LEFT JOIN users u ON u.id = k.owner_user_id"
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -83,17 +99,64 @@ func scanAPIKey(scanner rowScanner) (APIKey, error) {
 	return key, nil
 }
 
-// List returns every key newest-first. Secrets are never included.
+// scanAPIKeyWithOwner scans apiKeyOwnerSelectColumns (key columns + owner id +
+// owner username).
+func scanAPIKeyWithOwner(scanner rowScanner) (APIKey, error) {
+	var key APIKey
+	var namespaces string
+	var protected sql.NullString
+	var ownerUserID sql.NullString
+	var ownerUsername sql.NullString
+	if err := scanner.Scan(&key.ID, &key.Name, &key.Prefix, &namespaces, &key.Enabled,
+		&key.CreatedAt, &protected, &ownerUserID, &ownerUsername); err != nil {
+		return APIKey{}, err
+	}
+	list, err := decodeStringList(namespaces)
+	if err != nil {
+		return APIKey{}, err
+	}
+	key.Namespaces = list
+	if ownerUserID.Valid {
+		key.OwnerUserID = ownerUserID.String
+	}
+	if ownerUsername.Valid {
+		key.OwnerUsername = ownerUsername.String
+	}
+	key.Exportable = protected.Valid && protected.String != ""
+	return key, nil
+}
+
+// List returns every key newest-first, including legacy unowned credentials.
+// Secrets are never included.
 func (r *APIKeyRepository) List(ctx context.Context) ([]APIKey, error) {
-	rows, err := r.db.QueryContext(ctx,
-		"SELECT "+apiKeySelectColumns+" FROM api_keys ORDER BY created_at DESC, id DESC")
+	return r.list(ctx, "")
+}
+
+// ListByOwner returns the keys issued by one Console account, newest-first. An
+// empty owner id returns no keys (List is the explicit all-owners read).
+func (r *APIKeyRepository) ListByOwner(ctx context.Context, ownerUserID string) ([]APIKey, error) {
+	if ownerUserID == "" {
+		return []APIKey{}, nil
+	}
+	return r.list(ctx, ownerUserID)
+}
+
+func (r *APIKeyRepository) list(ctx context.Context, ownerUserID string) ([]APIKey, error) {
+	statement := "SELECT " + apiKeyOwnerSelectColumns + apiKeyOwnerFrom
+	arguments := make([]any, 0, 1)
+	if ownerUserID != "" {
+		statement += " WHERE k.owner_user_id = ?"
+		arguments = append(arguments, ownerUserID)
+	}
+	statement += " ORDER BY k.created_at DESC, k.id DESC"
+	rows, err := r.db.QueryContext(ctx, statement, arguments...)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	keys := make([]APIKey, 0)
 	for rows.Next() {
-		key, err := scanAPIKey(rows)
+		key, err := scanAPIKeyWithOwner(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -102,9 +165,33 @@ func (r *APIKeyRepository) List(ctx context.Context) ([]APIKey, error) {
 	return keys, rows.Err()
 }
 
+// Get returns one key with its owner projection, or nil when it does not exist.
+func (r *APIKeyRepository) Get(ctx context.Context, keyID string) (*APIKey, error) {
+	key, err := scanAPIKeyWithOwner(r.db.QueryRowContext(ctx,
+		"SELECT "+apiKeyOwnerSelectColumns+apiKeyOwnerFrom+" WHERE k.id = ?", keyID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &key, nil
+}
+
 // Create generates a "prk_" secret, stores its digest and protected form, and
-// returns the plaintext exactly once.
+// returns the plaintext exactly once. The legacy/management surface creates an
+// unowned credential, which only administrators can see and manage.
 func (r *APIKeyRepository) Create(ctx context.Context, name string, namespaces []string) (CreatedAPIKey, error) {
+	return r.create(ctx, name, namespaces, "")
+}
+
+// CreateForOwner generates a credential owned by one Console account. An empty
+// ownerUserID is the same as Create.
+func (r *APIKeyRepository) CreateForOwner(ctx context.Context, name string, namespaces []string, ownerUserID string) (CreatedAPIKey, error) {
+	return r.create(ctx, name, namespaces, ownerUserID)
+}
+
+func (r *APIKeyRepository) create(ctx context.Context, name string, namespaces []string, ownerUserID string) (CreatedAPIKey, error) {
 	if namespaces == nil {
 		namespaces = []string{}
 	}
@@ -127,13 +214,18 @@ func (r *APIKeyRepository) Create(ctx context.Context, name string, namespaces [
 	}
 	timestamp := nowISO()
 	values := APIKey{
-		ID:         keyID,
-		Name:       name,
-		Prefix:     secret[:12],
-		Namespaces: namespaces,
-		Enabled:    true,
-		CreatedAt:  timestamp,
-		Exportable: protected != "",
+		ID:          keyID,
+		Name:        name,
+		Prefix:      secret[:12],
+		Namespaces:  namespaces,
+		Enabled:     true,
+		CreatedAt:   timestamp,
+		Exportable:  protected != "",
+		OwnerUserID: ownerUserID,
+	}
+	var ownerValue any
+	if ownerUserID != "" {
+		ownerValue = ownerUserID
 	}
 	database, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -144,9 +236,9 @@ func (r *APIKeyRepository) Create(ctx context.Context, name string, namespaces [
 		return CreatedAPIKey{}, newStateError("API Key 无法保存")
 	}
 	_, err = database.ExecContext(ctx,
-		"INSERT INTO api_keys (id, name, prefix, digest, namespaces, enabled, created_at, updated_at, protected_key) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		keyID, name, values.Prefix, sha256Hex(secret), encodedNamespaces, true, timestamp, timestamp, protected)
+		"INSERT INTO api_keys (id, name, prefix, digest, namespaces, enabled, created_at, updated_at, protected_key, owner_user_id) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		keyID, name, values.Prefix, sha256Hex(secret), encodedNamespaces, true, timestamp, timestamp, protected, ownerValue)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return CreatedAPIKey{}, newStateConflict("API Key 已存在")
@@ -186,8 +278,8 @@ func (r *APIKeyRepository) Update(ctx context.Context, keyID, name string, names
 	}
 	var updated *APIKey
 	if changed > 0 {
-		key, scanErr := scanAPIKey(database.QueryRowContext(ctx,
-			"SELECT "+apiKeySelectColumns+" FROM api_keys WHERE id = ?", keyID))
+		key, scanErr := scanAPIKeyWithOwner(database.QueryRowContext(ctx,
+			"SELECT "+apiKeyOwnerSelectColumns+apiKeyOwnerFrom+" WHERE k.id = ?", keyID))
 		if scanErr != nil {
 			return nil, newStateError("API Key 无法更新")
 		}

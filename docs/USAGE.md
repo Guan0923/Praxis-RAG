@@ -320,15 +320,22 @@ $env:RAG_WEB_ROOT = "$PWD/dist/web"     # 若 Console 已构建
 
 ### 创建 API Key
 
-管理接口仅允许本机直连（loopback、无代理头、同源 Origin）：
+API Key 管理接口接受两种调用方式：本机直连（loopback、无代理头、同源 Origin），或任意已登录账号的 Console 会话（Cookie + `X-CSRF-Token`，或 Bearer 会话 Token）。密钥归创建它的账号所有，规则见[权限管理](PERMISSIONS.md) §9。
 
 ```powershell
+# 本机直连：创建无主密钥（owner 为空，之后仅本机管理或管理员可见）
 curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
   -H "Content-Type: application/json" `
   -d '{"name":"cli","namespaces":["default"]}'
+
+# 登录会话：创建归当前账号所有的密钥；非管理员只能使用自己拥有的知识库
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
+  -H "Content-Type: application/json" -b cookies.txt `
+  -H "X-CSRF-Token: <会话 CSRF Token>" `
+  -d '{"name":"cli","namespaces":["my-kb"]}'
 ```
 
-响应中的 `key` 只出现一次；后续请求带 `Authorization: Bearer <key>` 和 `X-RAG-Namespace: default`。也可直接使用 `RAG_SERVICE_TOKEN`（本地链接可用 Service Token 代替 API Key）。
+响应中的 `key` 只出现一次；后续请求带 `Authorization: Bearer <key>` 和 `X-RAG-Namespace: <知识库>`。也可直接使用 `RAG_SERVICE_TOKEN`（本地链接可用 Service Token 代替 API Key）。非管理员绑定不是本人创建的知识库会返回 403 `只能为本人创建的知识库创建 API Key`。
 
 ### 用户登录与注册（Console）
 
@@ -336,7 +343,7 @@ Console 默认启用账号登录（`RAG_AUTH_ENABLED=true`）：
 
 1. 打开 `/console` 会进入登录页；切到"注册"创建账号，**第一个注册的账号自动成为管理员**。用户名不区分大小写（统一按小写保存）。
 2. 管理员在侧边栏"用户管理"页可以：把账号设为管理员 / VIP / 普通用户、启用/禁用、删除。系统始终保留至少一名启用状态的管理员（最后一个管理员不能被降级、禁用或删除）。
-3. 普通用户只能使用自己创建的知识库以及被邀请授权的知识库；管理员可以使用全部知识库并管理知识库配置、API Key 和用户；VIP 额外可以邀请他人共享自己创建的知识库。
+3. 普通用户只能使用自己创建的知识库以及被邀请授权的知识库；管理员可以使用全部知识库并管理知识库配置、全部 API Key 和用户；VIP 额外可以邀请他人共享自己创建的知识库。所有登录角色都能打开「API Key」页管理自己的密钥，但非管理员只能绑定本人创建的知识库（详见[权限管理](PERMISSIONS.md) §9）。
 4. 共享入口在侧边栏「权限管理」（管理员与 VIP 可见）：选择知识库 → 邀请用户（权限：可读/可修改；范围：全库 / 若干文件）→ 复制邀请链接发给对方。被邀请人会在控制台通知铃铛看到待处理邀请，登录后打开链接即可接受；接受后权限立即生效。详见 [权限管理](PERMISSIONS.md)。
 
 会话使用 HttpOnly Cookie（`rag_session`）保存，默认有效期 7 天（`RAG_AUTH_SESSION_TTL_HOURS`），所有写操作要求 `X-CSRF-Token`（Console 自动带上）。判定规则：
@@ -380,7 +387,7 @@ worker 必须与 `rag-service` 使用**同一** `RAG_CONFIG_FILE`、`RAG_SERVICE
 ### 认证与命名空间
 
 - 普通 `/v1/*`、`/mcp`：`Authorization: Bearer <RAG_SERVICE_TOKEN 或 API Key>`；未设置 Token 时，本机 loopback 可直接使用 Headers 的 `X-RAG-Namespace` 访问普通租户接口。Console 登录后也接受会话 Cookie（或 Bearer 会话 Token）。
-- `/v1/admin/*`：本机直连（loopback/无 Forwarded 代理头/同源 Origin）**或**登录管理员的会话（Cookie 写操作需 `X-CSRF-Token`）。
+- `/v1/admin/*`：本机直连（loopback/无 Forwarded 代理头/同源 Origin）**或**登录管理员的会话（Cookie 写操作需 `X-CSRF-Token`）。**例外**：`/v1/admin/api-keys` 的五条管理路由接受任意角色的登录会话，但只作用于该会话自己的密钥（见[权限管理](PERMISSIONS.md) §9）。
 - 所有租户接口都需要 `X-RAG-Namespace: <知识库>`；MCP 否则无法确定工作区。
 
 ```powershell
@@ -399,7 +406,7 @@ curl.exe http://127.0.0.1:8011/openapi.json   # OpenAPI 3.1
 curl.exe http://127.0.0.1:8011/docs           # 自包含交互文档
 ```
 
-### API Key 管理（本机管理）
+### API Key 管理（本机或登录会话）
 
 ```powershell
 curl.exe http://127.0.0.1:8011/v1/admin/api-keys
@@ -413,6 +420,8 @@ curl.exe -X DELETE http://127.0.0.1:8011/v1/admin/api-keys/<id>
 curl.exe "http://127.0.0.1:8011/v1/admin/api-keys/<id>/mcp-config" `
   -H "X-RAG-Namespace: default"
 ```
+
+本机直连可以看到并管理全部密钥（含历史无主密钥）。改用登录会话（Cookie + 写操作 `X-CSRF-Token`）调用时按账号过滤：管理员看到全部密钥，响应条目带 `owner_user_id` / `owner_username`（历史密钥不带这两个字段，Console 显示「—（未绑定）」）；VIP / 普通用户只看到自己创建的密钥，查看/修改/删除/导出别人的密钥返回 404 `API Key 不存在`。非管理员创建或修改密钥时只能绑定自己拥有的知识库，否则返回 403 `只能为本人创建的知识库创建 API Key`。
 
 `mcp-config` 返回 `{"url":"http://<host>/mcp","headers":{"Authorization":"Bearer <key>","X-RAG-Namespace":"default"}}`，可直接粘贴到 MCP 客户端配置。
 
@@ -750,7 +759,7 @@ npm test                 # Vitest 单元/契约测试（worker threads + jsdom�
 npm run build            # tsc + vite build
 ```
 
-`npm test` 的用例位于 `frontend/src/*.test.ts`：`api.test.ts` 校验 api 客户端的 URL/请求头/CSRF/错误契约与共享接口的请求体，`navigation.test.ts` 校验 hash 路由、邀请 token 解析与 namespace 规则。
+`npm test` 的用例位于 `frontend/src/*.test.ts`：`api.test.ts` 校验 api 客户端的 URL/请求头/CSRF/错误契约与共享接口的请求体，`navigation.test.ts` 校验 hash 路由、邀请 token 解析与 namespace 规则，`apiKeys.test.ts` 校验 API Key 页的 Namespace 选项与所有者展示规则（管理员/本机模式看到全部知识库，非管理员只看到本人拥有的知识库）。
 
 `make check` 一次执行 `vet + Go 测试 + 前端 typecheck/测试/构建`（需要 `RAG_TEST_MYSQL_URL`）。
 
@@ -778,7 +787,7 @@ Go 服务会在 ingest 阶段以子进程方式调用 `rag_mcp.pdf_worker` / `ra
 - **排队搜索**：`RAG_KAFKA_BOOTSTRAP_SERVERS` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 Kafka。
 - **上传受理**：`POST /v1/documents` 默认同步；`RAG_UPLOAD_MODE=async` 时逐文件异步受理并返回 `artifact_id`，状态由 `GET /v1/document-jobs/{artifact_id}` 读取，需要部署 `rag-document-worker`（配置 Kafka，或 `RAG_DOCUMENT_WORKER_LOCAL=1` 轮询发件箱）。`update_document`/`delete_document` 仍同步执行，与排队中的异步任务靠受理期同名检查与发布事务内的 `ValidatePublication` 互斥。
 - **权限与共享**：账号分为管理员 / VIP / 普通用户；知识库默认归创建者私有，共享靠邀请链接完成（权限：可读/可修改；范围：单文件/多文件/全库），只有 VIP 与管理员可发起邀请。邀请消息目前是站内通知（控制台铃铛），不发送邮件/IM；链接只展示一次，库内只存摘要。文件级写授权只能替换已授权的同名文档，不能上传新文件；历史无创建者的知识库仅管理员可用/可授权；受限账号在启用 Kafka 的排队搜索部署下会被拒绝异步检索（同步检索不受影响）。详见 [权限管理](PERMISSIONS.md)。
-- **管理边界**：`/v1/admin/*` 仅本机直连或管理员会话；管理凭证（Service Token / API Key）不做知识库归属校验，API Key 的 namespace 白名单仍然生效。
+- **管理边界**：`/v1/admin/*` 仅本机直连或管理员会话；**例外**是 `/v1/admin/api-keys` 的五条管理路由——任意登录角色的会话都可管理自己的 API Key（管理员管理全部，非管理员只能绑定本人拥有的知识库）。API Key 按创建账号归属隔离，历史无主密钥仅管理员/本机管理可见；管理凭证（Service Token / API Key）在请求时仍不做知识库归属校验，API Key 的 namespace 白名单仍然生效。详见 [权限管理](PERMISSIONS.md) §9。
 - **数据**：状态表用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。
 - 具体契约差异（cached read views、静态目录列表等剩余的 P1/P2）见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。
 

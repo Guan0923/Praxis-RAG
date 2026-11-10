@@ -126,11 +126,11 @@ func (s *Server) registerRoutes() {
 	s.router.add("DELETE", "/v1/admin/prompts/{name}", authAdmin, s.handleDeletePrompt)
 	s.router.add("GET", "/v1/admin/tools", authAdmin, s.handleListTools)
 	s.router.add("PATCH", "/v1/admin/tools/{name}", authAdmin, s.handlePatchTool)
-	s.router.add("GET", "/v1/admin/api-keys", authAdmin, s.handleListAPIKeys)
-	s.router.add("POST", "/v1/admin/api-keys", authAdmin, s.handleCreateAPIKey)
-	s.router.add("PUT", "/v1/admin/api-keys/{key_id}", authAdmin, s.handleUpdateAPIKey)
-	s.router.add("DELETE", "/v1/admin/api-keys/{key_id}", authAdmin, s.handleDeleteAPIKey)
-	s.router.add("GET", "/v1/admin/api-keys/{key_id}/mcp-config", authAdmin, s.handleAPIKeyMCPConfig)
+	s.router.add("GET", "/v1/admin/api-keys", authSessionOrLocal, s.handleListAPIKeys)
+	s.router.add("POST", "/v1/admin/api-keys", authSessionOrLocal, s.handleCreateAPIKey)
+	s.router.add("PUT", "/v1/admin/api-keys/{key_id}", authSessionOrLocal, s.handleUpdateAPIKey)
+	s.router.add("DELETE", "/v1/admin/api-keys/{key_id}", authSessionOrLocal, s.handleDeleteAPIKey)
+	s.router.add("GET", "/v1/admin/api-keys/{key_id}/mcp-config", authSessionOrLocal, s.handleAPIKeyMCPConfig)
 	s.router.add("POST", "/v1/search", authTenant, s.handleSearch)
 	s.router.add("GET", "/v1/search-results/{result_id}", authTenant, s.handleGetSearchResult)
 	s.router.add("GET", "/v1/artifacts/{artifact_id}", authTenant, s.handleDownloadArtifact)
@@ -233,6 +233,24 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, session))
+	case authSessionOrLocal:
+		// API-key management is the one route family every signed-in account
+		// uses for its own credentials. A session of any role is accepted (CSRF
+		// is enforced for cookie-authenticated writes); without a session it
+		// keeps the trusted local management break-glass used by automation.
+		recorder.Header().Set("Cache-Control", "no-store")
+		if session, viaCookie := s.requestSessionUser(r); session != nil {
+			if !s.validateCSRF(r, session, viaCookie) {
+				writeDetail(recorder, http.StatusForbidden, "CSRF 校验失败，请刷新页面后重试")
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, session))
+			break
+		}
+		if !localModelRequest(r) {
+			writeDetail(recorder, http.StatusForbidden, "仅允许本机直接访问或登录后访问")
+			return
+		}
 	case authAdmin:
 		if !s.requireAdmin(recorder, r) {
 			return
