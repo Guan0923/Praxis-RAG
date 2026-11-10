@@ -738,9 +738,75 @@ h3 {
 .knowledge-base-form {
   max-width: 720px;
 }
+/* 创建知识库页面：横向多列布局（模型配置三列、文本切分三列、基础信息两列），
+   窄屏逐级降为两列/一列。编辑知识库的抽屉仍用上面的 720px 纵向布局。 */
+.knowledge-base-form-wide {
+  max-width: 1080px;
+}
+.knowledge-base-form-wide .knowledge-base-namespace {
+  max-width: 460px;
+}
 .knowledge-provider {
   border-top: 1px solid var(--line);
   padding: 20px 0 4px;
+}
+.knowledge-form-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 24px;
+}
+.knowledge-provider-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0 24px;
+  border-top: 1px solid var(--line);
+  padding: 20px 0 4px;
+}
+.knowledge-provider-grid > .knowledge-provider {
+  border-top: 0;
+  padding: 0;
+}
+.knowledge-base-form-wide .knowledge-chunk-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0 24px;
+}
+.knowledge-base-form-wide .knowledge-chunk-row > .chunk-controls {
+  display: contents;
+}
+.knowledge-form-columns > *,
+.knowledge-provider-grid > *,
+.knowledge-chunk-row .ant-form-item {
+  min-width: 0;
+}
+@media (max-width: 1180px) {
+  .knowledge-provider-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 1023px) {
+  .knowledge-base-form-wide .knowledge-chunk-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 767px) {
+  .knowledge-form-columns,
+  .knowledge-provider-grid,
+  .knowledge-base-form-wide .knowledge-chunk-row {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  .knowledge-base-form-wide .knowledge-base-namespace {
+    max-width: none;
+  }
+  .knowledge-provider-grid > .knowledge-provider {
+    border-top: 1px solid var(--line);
+    padding-top: 20px;
+  }
+  .knowledge-provider-grid > .knowledge-provider:first-child {
+    border-top: 0;
+    padding-top: 0;
+  }
 }
 .knowledge-base-summary {
   margin-bottom: 24px;

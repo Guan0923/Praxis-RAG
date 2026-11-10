@@ -565,3 +565,13 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 测试：默认值/响应契约/内嵌 worker 接线与 REST 异步上传链路由定向与全量 Go 测试套件覆盖；实际结果由 Lead 复核后记录在 `VALIDATION.md`，本节不预写通过结论。
 
 已知边界：`update_document`/`delete_document` 仍同步执行；MCP `add_document` 始终异步；关闭内嵌 worker 的无 Kafka 部署必须自行运行 `RAG_DOCUMENT_WORKER_LOCAL=1` 的独立文档 worker，否则任务停在 `queued`。
+
+## 2026-11-10 创建知识库页面改为多列布局（Console）
+
+本轮把 Console「创建知识库」页面从纵向单列表单改为横向多列布局，减少右侧空白、一屏内完成配置：
+
+- [x] 管理员创建表单：知识库标识（Namespace）半宽（≤460px）；Embedding / Reranker / VLM 三张模型卡片并排成三列（≥1180px 三列，768–1179px 两列，≤767px 单列），模型区顶部共用一条分隔线；文本切分（切分方式 / 块长度 / 重叠长度）排成一行（≥1024px 三列，768–1023px 两列，≤767px 单列）。表单宽度由 720px 放宽到 1080px。
+- [x] VIP / 普通用户创建表单：知识库标识、切分方式、块长度、重叠长度按 2×2 两列排布（≤767px 单列）。
+- [x] 编辑知识库抽屉（知识库列表 → 配置，720px 宽）保持原有纵向布局，避免在窄抽屉里挤压模型下拉框；表单字段、校验与提交逻辑均未改，仅把模型卡片与切分字段包进 grid 容器。
+- [x] 验证：`npm run typecheck` 通过；`npm test` 54/54；`npm run build` 通过；无头 Chrome 在 1440 / 1024 / 390 宽度截图核对管理员三列/两列/单列、租户两列表单与编辑抽屉布局（截图保存在未入库的 `.test-tmp/create-kb-layout/`）。详见 VALIDATION.md。
+- 已知边界：多列布局只作用于「创建知识库」页面；编辑抽屉仍为单列；仓库无 Playwright/Cypress，布局用无头 Chrome 截图人工核对，没有自动化浏览器回归。
