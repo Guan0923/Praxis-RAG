@@ -49,14 +49,26 @@ func ModelsFor(
 		}
 		current = resolved
 	}
-	draft, err := DraftConnection(current, values)
+	connection, err := DraftConnection(current, values)
 	if err != nil {
 		return nil, err
 	}
+	return ModelsForConnection(ctx, connection, factory)
+}
+
+// ModelsForConnection lists provider models for one already-resolved connection,
+// with no client overrides. It backs the save-model-configuration flow (the
+// stored connection is decrypted with the service key rather than an environment
+// lookup) and shares ModelsFor's "no /models route means no models" handling.
+func ModelsForConnection(
+	ctx context.Context,
+	connection modelapi.ModelConnection,
+	factory ModelListerFactory,
+) ([]string, error) {
 	if factory == nil {
 		factory = DefaultModelListerFactory
 	}
-	models, err := factory(draft).Models(ctx)
+	models, err := factory(connection).Models(ctx)
 	if err != nil {
 		// A 404 usually means the provider has no /models route (reranker-only
 		// endpoints are common). Model listing is a convenience for the Console,

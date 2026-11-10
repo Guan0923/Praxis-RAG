@@ -7,6 +7,7 @@ export type ConsolePage =
   | "documents"
   | "create"
   | "api-keys"
+  | "model-profiles"
   | "knowledge-bases"
   | "users"
   | "permissions"
@@ -76,6 +77,7 @@ export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRout
     }
     if (
       hash === "#/api-keys" ||
+      hash === "#/model-profiles" ||
       hash === "#/knowledge-bases" ||
       hash === "#/users" ||
       hash === "#/permissions" ||
@@ -102,6 +104,7 @@ export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRout
 export function routeHash(route: ConsoleRoute) {
   if (
     route.page === "api-keys" ||
+    route.page === "model-profiles" ||
     route.page === "knowledge-bases" ||
     route.page === "users" ||
     route.page === "permissions" ||

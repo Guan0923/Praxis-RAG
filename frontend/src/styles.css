@@ -751,6 +751,14 @@ h3 {
   gap: 4px;
   overflow-wrap: anywhere;
 }
+/* 模型配置下拉选项：名称/模型为主，服务地址为次要说明。 */
+.model-profile-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.5;
+  white-space: normal;
+}
 /* Login/registration screen and account controls. */
 .auth-shell {
   min-height: 100vh;

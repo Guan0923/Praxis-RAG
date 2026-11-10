@@ -32,3 +32,36 @@ Management requires direct local access. Omitted keys retain saved credentials
 only for the same URL; an empty key clears them. Keys never enter browser storage.
 Legacy manifest-only namespaces remain listed without an editable configuration;
 they are not automatically migrated or assigned inferred provider credentials.
+
+## Model profiles vs. per-knowledge-base connections (2026-11-10)
+
+The Console no longer types a provider connection into the create/edit
+knowledge-base form. A dedicated 模型配置 page (`#/model-profiles`,
+administrators only) maintains a reusable list of Embedding / Reranker / VLM
+connections in the `model_profiles` table: `id`, `kind`, `name`, `base_url`,
+`model`, `protected_key`, `vector_size`, `created_at`, `updated_at`, with a
+unique `(kind, name)` pair. The key is encrypted with
+`RAG_STATE_ENCRYPTION_KEY`; list and detail responses expose only
+`api_key_set`. Saving an Embedding profile probes the provider once and records
+the dense dimension in `vector_size`; a Reranker profile gets one bounded rerank
+call; VLM is not probed.
+
+A knowledge base still stores its own copy. Creating or editing a knowledge base
+copies the selected profile's `base_url`, decrypted key and `model` into the
+usual per-knowledge-base setting (the REST contract is unchanged and still takes
+inline provider objects). Consequently:
+
+- profile edits or deletes never mutate knowledge bases that already copied the
+  connection — they keep working with the connection they saved;
+- knowledge bases do not reference a profile by id, so a deleted profile simply
+  disappears from future selections;
+- the edit drawer preselects the profile matching the stored connection (same
+  `kind`, `model` and base URL ignoring a trailing slash). When the stored
+  connection is not in the list, it keeps a 当前配置 fallback option that saves
+  the original connection and skips re-embedding;
+- selecting a different Embedding connection still requires the re-embedding
+  confirmation.
+
+Model-profile administration uses `/v1/admin/model-profiles` (list, create,
+details, PATCH, delete, plus `/{id}/key` and `/{id}/models`), restricted to local
+admin access or an administrator Console session.

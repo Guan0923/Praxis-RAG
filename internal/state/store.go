@@ -73,6 +73,7 @@ type Stores struct {
 	Sessions       *UserSessionRepository
 	Permissions    *PermissionRepository
 	Invitations    *InvitationRepository
+	ModelProfiles  *ModelProfileRepository
 	KnowledgeBases *KnowledgeBaseRepository
 	Documents      *DocumentRepository
 	Catalogs       *CatalogRepository
@@ -178,6 +179,7 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.Sessions = newUserSessionRepository(database)
 	stores.Permissions = newPermissionRepository(database)
 	stores.Invitations = newInvitationRepository(database)
+	stores.ModelProfiles = newModelProfileRepository(database)
 	stores.KnowledgeBases = newKnowledgeBaseRepository(database, cacheSync)
 	stores.Documents = newDocumentRepository(database, cacheSync)
 	stores.Catalogs = newCatalogRepository(database, cacheSync)

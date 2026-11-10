@@ -73,16 +73,17 @@ type Server struct {
 	logger       *slog.Logger
 	router       *router
 	webRoot      string
-	catalog      catalog.Store
-	tools        ToolRegistry
-	kbAdmin      KnowledgeBaseAdminRuntime
-	kbSelfCreate KnowledgeBaseSelfCreateRuntime
-	notifier     ChangeNotifier
-	users        UserAuth
-	access       AccessControl
-	limiter      *loginLimiter
-	docNotifier  DocumentChangeNotifier
-	handler      http.Handler
+	catalog       catalog.Store
+	tools         ToolRegistry
+	kbAdmin       KnowledgeBaseAdminRuntime
+	kbSelfCreate  KnowledgeBaseSelfCreateRuntime
+	modelProfiles ModelProfileRuntime
+	notifier      ChangeNotifier
+	users         UserAuth
+	access        AccessControl
+	limiter       *loginLimiter
+	docNotifier   DocumentChangeNotifier
+	handler       http.Handler
 }
 
 // New builds the HTTP server. A nil StatusProvider falls back to a static
@@ -149,6 +150,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/admin/upload-leases", authNone, s.handleUploadLeases)
 	s.registerDocumentationRoutes()
 	s.registerKnowledgeBaseAdminRoutes()
+	s.registerModelProfileRoutes()
 	s.registerUserAuthRoutes()
 	s.registerAccessRoutes()
 	s.router.add("POST", "/mcp", authMCP, s.handleMCP)

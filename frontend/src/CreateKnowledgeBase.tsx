@@ -1,24 +1,90 @@
-import { useEffect, useRef, useState } from "react";
-import { Alert, App, AutoComplete, Button, Descriptions, Form, Input, InputNumber, Select, Switch, Tooltip } from "antd";
-import { DeleteOutlined, PlusOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
-import { api, apiResponse, errorText, type Chunking, type Connection, type KnowledgeBase, type Role, type Strategy } from "./api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Alert, App, Button, Descriptions, Form, Input, InputNumber, Select, Switch, Tooltip } from "antd";
+import { PlusOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
+import {
+  api,
+  apiResponse,
+  errorText,
+  fetchModelProfiles,
+  modelKindLabels,
+  modelKinds,
+  revealModelProfileKey,
+  type Chunking,
+  type Connection,
+  type KnowledgeBase,
+  type ModelKind,
+  type ModelProfile,
+  type Role,
+  type Strategy,
+} from "./api";
 import { namespacePattern } from "./navigation";
 
-type Kind = "embedding" | "reranker" | "vlm";
+type Kind = ModelKind;
 type ProviderValues = { base_url: string; apikey?: string };
-type Values = Chunking & { namespace: string; embedding_model: string; reranker_model?: string; vlm_model?: string;
-  embedding: ProviderValues; reranker: ProviderValues; vlm: ProviderValues };
+type ProfileField = "embedding_profile" | "reranker_profile" | "vlm_profile";
+type Values = Chunking & {
+  namespace: string;
+  embedding_profile: string;
+  reranker_profile?: string;
+  vlm_profile?: string;
+};
 type TenantValues = Chunking & { namespace: string };
 type Defaults = { default: string; strategies: Strategy[] };
-const kinds: Kind[] = ["embedding", "reranker", "vlm"];
+// 创建草稿只保存 Namespace、切分参数、所选模型配置和开关，绝不保存 API Key。
+type Draft = {
+  namespace?: string;
+  strategy?: string;
+  chunk_size?: number;
+  chunk_overlap?: number;
+  embedding_profile?: string;
+  reranker_profile?: string;
+  vlm_profile?: string;
+  reranker_enabled?: boolean;
+  vlm_enabled?: boolean;
+};
+const kinds: Kind[] = modelKinds;
+// currentProfile 是编辑知识库时的兜底选项：沿用知识库已保存的连接。
+const currentProfile = ":current";
+const profileField: Record<Kind, ProfileField> = {
+  embedding: "embedding_profile",
+  reranker: "reranker_profile",
+  vlm: "vlm_profile",
+};
 const cleanUrl = (value: string) => value.trim().replace(/\/+$/, "");
+
+// matchingProfile 找出与知识库当前连接（服务地址 + 模型）完全一致的配置。
+// 比较时忽略服务地址尾部的斜杠。
+export function matchingProfile(
+  profiles: ModelProfile[],
+  kind: Kind,
+  baseUrl: string,
+  model: string,
+): ModelProfile | undefined {
+  const url = cleanUrl(baseUrl);
+  return profiles.find((profile) =>
+    profile.kind === kind &&
+    cleanUrl(profile.base_url) === url &&
+    profile.model === model);
+}
+
+// profileNeedsReembed 判断切换 Embedding 配置后是否需要重新向量化：沿用
+// 「当前配置」或选择与当前连接一致的配置时不需要。
+export function profileNeedsReembed(
+  initial: Pick<KnowledgeBase, "embedding" | "embedding_model"> | undefined,
+  selection: ModelProfile | undefined,
+): boolean {
+  if (!initial || !selection || selection.kind !== "embedding") return false;
+  return cleanUrl(selection.base_url) !== cleanUrl(initial.embedding.base_url) ||
+    selection.model !== initial.embedding_model;
+}
+
 // The create form keeps an unsaved draft (without API keys) so a failed save or
 // an accidental page switch never loses the other inputs.
 const draftKey = "rag.knowledge-base-draft";
 
-export function CreateKnowledgeBase({ active, disabled, onCreated, connection, role }: {
+export function CreateKnowledgeBase({ active, disabled, onCreated, connection, role, onOpenModelProfiles }: {
   active: boolean; disabled: boolean; onCreated: (namespace: string) => void;
-  connection: Connection; role?: Role;
+  connection: Connection; role?: Role; onOpenModelProfiles?: () => void;
 }) {
   // Keep the form mounted after the first visit so switching pages does not
   // discard what was typed.
@@ -27,14 +93,15 @@ export function CreateKnowledgeBase({ active, disabled, onCreated, connection, r
     if (active) setMounted(true);
   }, [active]);
   if (!mounted) return null;
-  // Admins keep the full provider configuration; VIPs and ordinary users only
-  // choose the namespace and chunking because the server clones the model
-  // configuration from the administrator's default knowledge-base template.
+  // Admins pick saved model profiles; VIPs and ordinary users only choose the
+  // namespace and chunking because the server clones the model configuration
+  // from the administrator's default knowledge-base template.
   const simple = role === "vip" || role === "user";
   return <div hidden={!active}>
     {simple
       ? <TenantKnowledgeBaseForm disabled={disabled} onCreated={onCreated} connection={connection} />
-      : <KnowledgeBaseForm disabled={disabled} onSaved={(item) => onCreated(item.namespace)} />}
+      : <KnowledgeBaseForm disabled={disabled} active={active} onOpenModelProfiles={onOpenModelProfiles}
+          onSaved={(item) => onCreated(item.namespace)} />}
   </div>;
 }
 
@@ -171,34 +238,55 @@ function TenantKnowledgeBaseForm({ disabled, onCreated, connection }: {
   </div>;
 }
 
-export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: {
+type ResolvedProvider = { provider: ProviderValues; model: string };
+
+export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, active, onOpenModelProfiles }: {
   initial?: KnowledgeBase; disabled: boolean; onSaved: (item: KnowledgeBase) => void;
   onBusyChange?: (busy: boolean) => void;
+  // active 为 false 时页面被隐藏；重新激活时刷新模型列表，避免使用过期选项。
+  active?: boolean;
+  onOpenModelProfiles?: () => void;
 }) {
   const { message, modal } = App.useApp();
   const [form] = Form.useForm<Values>();
   const [defaults, setDefaults] = useState<Defaults>();
+  const [profiles, setProfiles] = useState<ModelProfile[]>([]);
+  const [profilesLoaded, setProfilesLoaded] = useState(false);
+  const [profilesLoading, setProfilesLoading] = useState(true);
+  const [profilesError, setProfilesError] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const [rerankerEnabled, setRerankerEnabled] = useState(Boolean(initial?.reranker_model));
   const [vlmEnabled, setVlmEnabled] = useState(Boolean(initial?.vlm_model));
-  const [models, setModels] = useState<Record<Kind, string[]>>({ embedding: [], reranker: [], vlm: [] });
-  const [modelsLoaded, setModelsLoaded] = useState<Record<Kind, boolean>>({ embedding: false, reranker: false, vlm: false });
-  const [modelHints, setModelHints] = useState<Record<Kind, string>>({ embedding: "", reranker: "", vlm: "" });
-  const [loading, setLoading] = useState({ embedding: false, reranker: false, vlm: false });
-  const [visibleKeys, setVisibleKeys] = useState({ embedding: false, reranker: false, vlm: false });
-  const [editedKeys, setEditedKeys] = useState({ embedding: false, reranker: false, vlm: false });
-  const modelRequests = useRef<Partial<Record<Kind, AbortController>>>({});
-  const keyRequests = useRef<Partial<Record<Kind, AbortController>>>({});
   const lifetime = useRef(new AbortController());
+  const profilesRequest = useRef<AbortController | null>(null);
   const running = useRef(false);
-  const embeddingModel = Form.useWatch("embedding_model", form);
-  const embeddingUrl = Form.useWatch(["embedding", "base_url"], form);
   const strategy = Form.useWatch("strategy", form);
-  const reembedRequired = !!initial && (embeddingModel !== initial.embedding_model ||
-    cleanUrl(embeddingUrl || "") !== initial.embedding.base_url);
+  const embeddingSelection = Form.useWatch("embedding_profile", form);
   const locked = disabled || saving;
   const unit = defaults?.strategies.find((item) => item.id === strategy)?.unit === "characters" ? "字符" : "token";
+  const embeddingProfile = profiles.find((profile) => profile.id === embeddingSelection);
+  const reembedRequired = profileNeedsReembed(initial, embeddingProfile);
+
+  function currentUrl(kind: Kind) {
+    if (!initial) return "";
+    if (kind === "embedding") return initial.embedding.base_url;
+    if (kind === "reranker") return initial.reranker.base_url;
+    return initial.vlm?.base_url || "";
+  }
+
+  function currentModel(kind: Kind) {
+    if (!initial) return "";
+    if (kind === "embedding") return initial.embedding_model;
+    if (kind === "reranker") return initial.reranker_model;
+    return initial.vlm_model || "";
+  }
+
+  // matchedProfile 找出与知识库当前连接（服务地址 + 模型）完全一致的配置。
+  function matchedProfile(kind: Kind) {
+    if (!initial) return undefined;
+    return matchingProfile(profiles, kind, currentUrl(kind), currentModel(kind));
+  }
 
   async function loadDefaults() {
     setError("");
@@ -216,9 +304,33 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
     void loadDefaults();
     return () => {
       lifetime.current.abort();
-      kinds.forEach((kind) => { modelRequests.current[kind]?.abort(); keyRequests.current[kind]?.abort(); });
+      profilesRequest.current?.abort();
     };
   }, []);
+
+  const loadProfiles = useCallback(async () => {
+    profilesRequest.current?.abort();
+    const controller = new AbortController();
+    profilesRequest.current = controller;
+    setProfilesLoading(true);
+    setProfilesError("");
+    try {
+      const rows = await fetchModelProfiles(controller.signal);
+      if (controller.signal.aborted) return;
+      setProfiles(rows);
+      setProfilesLoaded(true);
+    } catch (reason) {
+      if (!controller.signal.aborted) setProfilesError(errorText(reason));
+    } finally {
+      if (!controller.signal.aborted) setProfilesLoading(false);
+    }
+  }, []);
+  // 创建页会保持挂载：每次重新激活都刷新模型列表，以便立刻看到刚添加的模型。
+  useEffect(() => {
+    if (active === false) return;
+    void loadProfiles();
+    return () => profilesRequest.current?.abort();
+  }, [active, loadProfiles]);
 
   // Restore an unsaved create draft (API keys are never written to storage).
   useEffect(() => {
@@ -226,27 +338,57 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
     try {
       const raw = sessionStorage.getItem(draftKey);
       if (!raw) return;
-      const draft = JSON.parse(raw) as Partial<Values> | null;
+      const draft = JSON.parse(raw) as Draft | null;
       if (!draft || typeof draft !== "object") return;
-      form.setFieldsValue(draft as Values);
-      if (typeof draft.reranker_model === "string" && draft.reranker_model) setRerankerEnabled(true);
-      if (typeof draft.vlm_model === "string" && draft.vlm_model) setVlmEnabled(true);
+      form.setFieldsValue({
+        namespace: draft.namespace,
+        strategy: draft.strategy,
+        chunk_size: draft.chunk_size,
+        chunk_overlap: draft.chunk_overlap,
+        embedding_profile: draft.embedding_profile,
+        reranker_profile: draft.reranker_profile,
+        vlm_profile: draft.vlm_profile,
+      });
+      if (draft.reranker_enabled) setRerankerEnabled(true);
+      if (draft.vlm_enabled) setVlmEnabled(true);
     } catch {
       // An unreadable draft must never block the form.
     }
   }, []);
 
-  // saveDraft persists the create form between navigation and page reloads so a
-  // validation error never discards the other inputs.
-  function saveDraft() {
+  // 模型列表到达后：编辑表单预选匹配配置；创建表单丢弃已不存在的草稿选择。
+  useEffect(() => {
+    if (!profilesLoaded) return;
+    kinds.forEach((kind) => {
+      const field = profileField[kind];
+      const value = form.getFieldValue(field);
+      if (initial) {
+        if (value && value !== currentProfile) return;
+        const match = matchedProfile(kind);
+        if (match) form.setFieldValue(field, match.id);
+        return;
+      }
+      if (value && !profiles.some((profile) => profile.id === value))
+        form.setFieldValue(field, undefined);
+    });
+  }, [profiles, profilesLoaded]);
+
+  // persistDraft 保存除 API Key 以外的创建输入。
+  function persistDraft(overrides: Partial<Draft> = {}) {
     if (initial) return;
     try {
-      const values = form.getFieldsValue(true) as Values;
-      const draft = {
-        ...values,
-        embedding: { base_url: values.embedding?.base_url || "" },
-        reranker: { base_url: values.reranker?.base_url || "" },
-        vlm: { base_url: values.vlm?.base_url || "" },
+      const values = form.getFieldsValue(true) as Partial<Values>;
+      const draft: Draft = {
+        namespace: values.namespace,
+        strategy: values.strategy,
+        chunk_size: values.chunk_size,
+        chunk_overlap: values.chunk_overlap,
+        embedding_profile: values.embedding_profile,
+        reranker_profile: values.reranker_profile,
+        vlm_profile: values.vlm_profile,
+        reranker_enabled: rerankerEnabled,
+        vlm_enabled: vlmEnabled,
+        ...overrides,
       };
       sessionStorage.setItem(draftKey, JSON.stringify(draft));
     } catch {
@@ -254,55 +396,23 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
     }
   }
 
-  function providerValues(kind: Kind): ProviderValues {
-    const value = form.getFieldValue(kind) as ProviderValues;
-    return { base_url: value.base_url.trim(), ...(!initial || editedKeys[kind] ? { apikey: value.apikey || "" } : {}) };
-  }
-
-  async function loadModels(kind: Kind) {
-    if (modelsLoaded[kind] || loading[kind]) return;
-    try { await form.validateFields([[kind, "base_url"]]); } catch { return; }
-    modelRequests.current[kind]?.abort();
-    const controller = new AbortController();
-    modelRequests.current[kind] = controller;
-    setLoading((value) => ({ ...value, [kind]: true }));
-    setModels((value) => ({ ...value, [kind]: [] }));
-    try {
-      const result = await api<{ models: string[] }>(
-        "/v1/admin/knowledge-bases/models/" + kind, undefined,
-        { method: "POST", body: JSON.stringify({ ...providerValues(kind), namespace: initial?.namespace }), signal: controller.signal });
-      if (!controller.signal.aborted) {
-        setModels((value) => ({ ...value, [kind]: result.models }));
-        setModelsLoaded((value) => ({ ...value, [kind]: true }));
-        setModelHints((value) => ({
-          ...value,
-          [kind]: result.models.length > 0 ? "" : "该地址未返回模型列表，可直接输入模型名称",
-        }));
-      }
-    } catch {
-      // A provider without a /models endpoint is normal for rerankers. Model
-      // listing is only a convenience: keep the field editable and show a
-      // neutral hint instead of failing the form.
-      if (!controller.signal.aborted) {
-        setModelsLoaded((value) => ({ ...value, [kind]: true }));
-        setModelHints((value) => ({ ...value, [kind]: "无法从该地址获取模型列表，可直接输入模型名称" }));
-      }
-    } finally { if (!controller.signal.aborted) setLoading((value) => ({ ...value, [kind]: false })); }
-  }
-
-  async function showKey(kind: Kind, visible: boolean) {
-    if (visible && initial?.[kind].api_key_set && !editedKeys[kind] && !form.getFieldValue([kind, "apikey"])) {
-      keyRequests.current[kind]?.abort();
-      const controller = new AbortController();
-      keyRequests.current[kind] = controller;
-      try {
-        const result = await api<{ apikey: string }>("/v1/admin/knowledge-bases/" + initial.namespace + "/key/" + kind,
-          undefined, { signal: controller.signal, cache: "no-store" });
-        if (controller.signal.aborted) return;
-        form.setFieldValue([kind, "apikey"], result.apikey);
-      } catch (reason) { if (!controller.signal.aborted) setError(errorText(reason)); return; }
+  // resolveSelection 把下拉框的配置 id 解析为提交所需的连接信息。当前连接
+  // 兜底选项不发送 apikey，服务端保留已保存的 Key。
+  async function resolveSelection(kind: Kind, profileId: string | undefined): Promise<ResolvedProvider> {
+    const title = modelKindLabels[kind];
+    if (!profileId) throw new Error(`请选择 ${title} 模型`);
+    if (profileId === currentProfile) {
+      if (!initial) throw new Error(`请选择 ${title} 模型`);
+      return { provider: { base_url: currentUrl(kind) }, model: currentModel(kind) };
     }
-    setVisibleKeys((value) => ({ ...value, [kind]: visible }));
+    const profile = profiles.find((item) => item.id === profileId);
+    if (!profile) throw new Error("所选模型配置已不存在，请刷新页面后重新选择");
+    const base_url = cleanUrl(profile.base_url);
+    // 没有保存 Key 的配置不提交 apikey：服务端在服务地址不变时保留知识库已有的
+    // Key，避免把已保存的凭据清空。
+    if (!profile.api_key_set) return { provider: { base_url }, model: profile.model };
+    const apikey = await revealModelProfileKey(profile.id);
+    return { provider: { base_url, apikey }, model: profile.model };
   }
 
   async function save(values: Values, reembed: boolean) {
@@ -311,16 +421,36 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
     setSaving(true);
     onBusyChange?.(true);
     setError("");
-    const body = { embedding: providerValues("embedding"), embedding_model: values.embedding_model,
-      reranker: rerankerEnabled ? providerValues("reranker") : { base_url: "", apikey: "" },
-      reranker_model: rerankerEnabled ? values.reranker_model || "" : "",
-      vlm: vlmEnabled ? providerValues("vlm") : { base_url: "", apikey: "" },
-      vlm_model: vlmEnabled ? values.vlm_model || "" : "" };
+    const blank: ResolvedProvider = { provider: { base_url: "", apikey: "" }, model: "" };
     try {
-      const result = await api<KnowledgeBase>("/v1/admin/knowledge-bases" + (initial ? "/" + initial.namespace : ""), undefined,
-        { method: initial ? "PATCH" : "POST", body: JSON.stringify(initial ? { ...body, reembed } : {
-          ...body, namespace: values.namespace, strategy: values.strategy, chunk_size: values.chunk_size, chunk_overlap: values.chunk_overlap,
-        }) });
+      // 三个模型配置的 Key 并行解析后再一次性提交。
+      const [embedding, reranker, vlm] = await Promise.all([
+        resolveSelection("embedding", values.embedding_profile),
+        rerankerEnabled ? resolveSelection("reranker", values.reranker_profile) : Promise.resolve(blank),
+        vlmEnabled ? resolveSelection("vlm", values.vlm_profile) : Promise.resolve(blank),
+      ]);
+      const body = {
+        embedding: embedding.provider,
+        embedding_model: embedding.model,
+        reranker: rerankerEnabled ? reranker.provider : { base_url: "", apikey: "" },
+        reranker_model: rerankerEnabled ? reranker.model : "",
+        vlm: vlmEnabled ? vlm.provider : { base_url: "", apikey: "" },
+        vlm_model: vlmEnabled ? vlm.model : "",
+      };
+      const result = await api<KnowledgeBase>(
+        "/v1/admin/knowledge-bases" + (initial ? "/" + initial.namespace : ""),
+        undefined,
+        {
+          method: initial ? "PATCH" : "POST",
+          body: JSON.stringify(initial ? { ...body, reembed } : {
+            ...body,
+            namespace: values.namespace,
+            strategy: values.strategy,
+            chunk_size: values.chunk_size,
+            chunk_overlap: values.chunk_overlap,
+          }),
+        },
+      );
       if (!lifetime.current.signal.aborted) {
         void message.success(initial ? reembed ? "重新向量化完成，配置已切换" : "知识库配置已保存" : "知识库已创建");
         if (!initial) {
@@ -328,8 +458,6 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
           form.resetFields();
           setRerankerEnabled(false);
           setVlmEnabled(false);
-          setModelsLoaded({ embedding: false, reranker: false, vlm: false });
-          setModelHints({ embedding: "", reranker: "", vlm: "" });
           void loadDefaults();
         }
         onSaved(result);
@@ -344,83 +472,89 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
     else void save(values, false);
   }
 
+  function toggleKind(kind: Kind, enabled: boolean) {
+    if (kind === "reranker") {
+      setRerankerEnabled(enabled);
+      persistDraft({ reranker_enabled: enabled });
+    } else if (kind === "vlm") {
+      setVlmEnabled(enabled);
+      persistDraft({ vlm_enabled: enabled });
+    }
+  }
+
   return <div className="knowledge-base-form">
     {error && <Alert type="error" showIcon className="page-alert" title="知识库配置失败" description={error}
       action={!defaults ? <Button icon={<ReloadOutlined />} aria-label="重新读取切分配置" onClick={() => void loadDefaults()} /> : undefined} />}
+    {profilesError && <Alert type="error" showIcon className="page-alert" title="模型列表读取失败" description={profilesError}
+      action={<Button icon={<ReloadOutlined />} aria-label="重新读取模型列表" loading={profilesLoading} onClick={() => void loadProfiles()} />} />}
     {initial && <Descriptions column={1} size="small" className="knowledge-base-summary" items={[
       { key: "namespace", label: "知识库", children: initial.namespace },
       { key: "dimension", label: "向量维度", children: initial.vector_size },
       { key: "collection", label: "索引集合", children: <span className="break-text">{initial.collection}</span> },
     ]} />}
     <Form form={form} layout="vertical" disabled={locked} scrollToFirstError onFinish={(values) => submit(values)}
-      initialValues={{ namespace: initial?.namespace || "", embedding_model: initial?.embedding_model || "", reranker_model: initial?.reranker_model || "",
-        vlm_model: initial?.vlm_model || "",
-        embedding: { base_url: initial?.embedding.base_url || "", apikey: "" }, reranker: { base_url: initial?.reranker.base_url || "", apikey: "" },
-        vlm: { base_url: initial?.vlm?.base_url || "", apikey: "" },
+      initialValues={{ namespace: initial?.namespace || "",
+        embedding_profile: initial ? currentProfile : undefined,
+        reranker_profile: initial && initial.reranker_model ? currentProfile : undefined,
+        vlm_profile: initial && initial.vlm_model ? currentProfile : undefined,
         strategy: initial?.strategy, chunk_size: initial?.chunk_size, chunk_overlap: initial?.chunk_overlap }}
-      onValuesChange={(changed) => {
+      onValuesChange={() => {
         setError("");
-        kinds.forEach((kind) => {
-          if (!changed[kind]) return;
-          if ("apikey" in changed[kind]) {
-            keyRequests.current[kind]?.abort();
-            setEditedKeys((value) => ({ ...value, [kind]: true }));
-          }
-          if ("base_url" in changed[kind]) {
-            modelRequests.current[kind]?.abort(); keyRequests.current[kind]?.abort();
-            setLoading((value) => ({ ...value, [kind]: false }));
-            setModels((value) => ({ ...value, [kind]: [] }));
-            setModelsLoaded((value) => ({ ...value, [kind]: false }));
-            setModelHints((value) => ({ ...value, [kind]: "" }));
-            form.setFieldValue([kind, "apikey"], "");
-            setEditedKeys((value) => ({ ...value, [kind]: true }));
-            setVisibleKeys((value) => ({ ...value, [kind]: false }));
-          }
-        });
-        saveDraft();
+        persistDraft();
       }}>
       {!initial && <Form.Item name="namespace" label="知识库标识（Namespace）" rules={[
         { required: true, message: "请输入知识库标识" }, { pattern: namespacePattern, message: "使用字母、数字、点、下划线或横线，首位为字母或数字" },
       ]}><Input maxLength={64} autoComplete="off" /></Form.Item>}
       {kinds.map((kind) => {
-        const title = kind === "embedding" ? "Embedding" : kind === "reranker" ? "Reranker" : "VLM";
+        const title = modelKindLabels[kind];
         const enabled = kind === "embedding" || (kind === "reranker" ? rerankerEnabled : vlmEnabled);
+        const field = profileField[kind];
+        const kindProfiles = profiles.filter((profile) => profile.kind === kind);
+        const options = kindProfiles.map((profile) => ({
+          value: profile.id,
+          label: <div className="model-profile-option">
+            <span className="break-text">{profile.name} · {profile.model}</span>
+            <span className="secondary break-text">{profile.base_url}</span>
+          </div>,
+        }));
+        // 知识库当前连接不在模型列表里时保留「当前配置」选项：保存时沿用原连接，
+        // 不会触发重新向量化。未启用的可选类型没有当前连接，不提供该选项。
+        const showCurrent = Boolean(initial && enabled && currentModel(kind) &&
+          (!profilesLoaded || !matchedProfile(kind)));
+        if (showCurrent) {
+          options.unshift({
+            value: currentProfile,
+            label: <span className="break-text">{`当前配置 · ${currentModel(kind)}（${currentUrl(kind)}）`}</span>,
+          });
+        }
         return <section className="knowledge-provider" aria-label={title + " 配置"} key={kind}>
           <div className="section-heading"><h2>{title}</h2>{kind === "reranker" &&
-            <Switch aria-label="启用 Reranker" checked={rerankerEnabled} disabled={locked} onChange={setRerankerEnabled} />}
+            <Switch aria-label="启用 Reranker" checked={rerankerEnabled} disabled={locked}
+              onChange={(checked) => toggleKind("reranker", checked)} />}
             {kind === "vlm" &&
-            <Switch aria-label="启用 VLM" checked={vlmEnabled} disabled={locked} onChange={setVlmEnabled} />}</div>
-          <Form.Item name={[kind, "base_url"]} label={title + " URL"} rules={enabled ? [{ required: true, whitespace: true, message: "请输入服务 URL" }] : []}>
-            <Input disabled={locked || !enabled} maxLength={2048} autoComplete="off" />
+            <Switch aria-label="启用 VLM" checked={vlmEnabled} disabled={locked}
+              onChange={(checked) => toggleKind("vlm", checked)} />}</div>
+          {enabled && kindProfiles.length === 0 && !profilesLoading && !profilesError &&
+            <Alert className="page-alert" type="warning" showIcon title={`暂无 ${title} 模型`}
+              description={initial
+                ? `当前知识库使用的 ${title} 连接不在模型列表中，保存时沿用当前配置；可在「模型配置」页面添加后再切换。`
+                : `创建知识库时只能选择已保存的 ${title} 模型，请先在「模型配置」页面添加。`}
+              action={!initial && onOpenModelProfiles
+                ? <Button type="link" size="small" onClick={onOpenModelProfiles}>前往模型配置</Button>
+                : undefined} />}
+          <Form.Item name={field} label={title + " 模型"}
+            rules={enabled ? [{ required: true, message: `请选择 ${title} 模型` }] : []}>
+            <Select
+              virtual={false}
+              disabled={locked || !enabled || !profilesLoaded}
+              placeholder={profilesLoading
+                ? "正在读取模型列表…"
+                : profilesError
+                  ? "模型列表读取失败"
+                  : kindProfiles.length === 0 ? `暂无可用 ${title} 模型` : `请选择 ${title} 模型`}
+              options={options}
+            />
           </Form.Item>
-          <div className="model-key-row">
-            <Form.Item name={[kind, "apikey"]} label={title + " Key"}>
-              <Input.Password disabled={locked || !enabled} autoComplete="new-password"
-                placeholder={initial?.[kind].api_key_set && !editedKeys[kind] ? "已保存" : "可留空"}
-                visibilityToggle={{ visible: visibleKeys[kind], onVisibleChange: (visible) => void showKey(kind, visible) }} />
-            </Form.Item>
-            {initial?.[kind].api_key_set && <Tooltip title="清除已保存的 Key"><Button aria-label={"清除 " + title + " Key"}
-              disabled={locked || !enabled} icon={<DeleteOutlined />} onClick={() => {
-                keyRequests.current[kind]?.abort(); form.setFieldValue([kind, "apikey"], "");
-                setEditedKeys((value) => ({ ...value, [kind]: true }));
-              }} /></Tooltip>}
-          </div>
-          {kind === "vlm"
-            ? <Form.Item name="vlm_model" label={title + " 模型"} rules={enabled ? [{ required: true, whitespace: true, message: "请输入 VLM 模型名称" }] : []}>
-                <Input disabled={locked || !enabled} maxLength={512} autoComplete="off" placeholder="例如 qwen2.5-vl-7b，可直接输入" />
-              </Form.Item>
-            : <Form.Item name={kind + "_model"} label={title + " 模型"}
-                rules={enabled ? [{ required: true, whitespace: true, message: "请输入或选择模型" }] : []}
-                extra={enabled && modelHints[kind] ? modelHints[kind] : undefined}>
-                <AutoComplete
-                  disabled={locked || !enabled}
-                  options={models[kind].map((value) => ({ value }))}
-                  placeholder={loading[kind] ? "正在获取模型列表…" : "选择或手动输入模型名称"}
-                  allowClear
-                  onFocus={() => { if (enabled) void loadModels(kind); }}
-                  filterOption={(input, option) => String(option?.value ?? "").toLowerCase().includes(input.toLowerCase())}
-                />
-              </Form.Item>}
         </section>;
       })}
       <section className="knowledge-provider" aria-label="切分配置"><h2>文本切分</h2>
@@ -428,7 +562,8 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange }: 
           <Select disabled={locked || !!initial || !defaults} virtual={false}
             options={defaults?.strategies.map((item) => ({ value: item.id, label: item.label }))}
             onChange={(id) => { const selected = defaults?.strategies.find((item) => item.id === id);
-              form.setFieldsValue({ chunk_size: selected?.chunk_size, chunk_overlap: selected?.chunk_overlap }); }} />
+              form.setFieldsValue({ chunk_size: selected?.chunk_size, chunk_overlap: selected?.chunk_overlap });
+              persistDraft(); }} />
         </Form.Item>
         <div className="chunk-controls">
           <Form.Item name="chunk_size" label={"块长度（" + unit + "）"} rules={[{ required: true, type: "integer", min: strategy === "character" ? 100 : 1, max: 100000 }]}>

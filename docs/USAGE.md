@@ -199,7 +199,9 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_WORD_CONVERTER_PATH` | 空 | LibreOffice `soffice` 路径（DOC 转换） |
 | `RAG_WORD_CONVERT_TIMEOUT` | `120` 秒（1..7200） | DOC 转换超时 |
 
-外部解析器的实际调用发生在 ingest 阶段：Go 进程启动外部 Python/soffice 子进程，通过文件协议交换解析产物。PDF 解析仍需要 Python/Docling 环境与本地模型目录（版面、表格、OCR 在本地跑）；**公式识别与图片描述改为调用远端 VLM**，由 `RAG_VLM_BASE_URL`/`RAG_VLM_API_KEY`/`RAG_VLM_MODEL` 配置，未配置时 PDF 解析会明确失败而不是回退到本地模型。Word 无图注图片同样走该远端端点；配置了 VLM 后 Go 会自动启用 `word_vision_worker`。这些外部依赖未在本仓库的 Go 测试环境中实机验证。`r`n`r`n**VLM 优先取知识库配置**：Console 的知识库设置页在 Embedding/Reranker 之外提供 VLM 区块（URL / Key / 模型，可开关），保存后该知识库随后的上传与 worker 解析立即使用它；未配置或关闭时回退到 `RAG_VLM_*` 环境变量。API Key 与其他 provider 一样加密存储，前端只显示"已保存"。
+外部解析器的实际调用发生在 ingest 阶段：Go 进程启动外部 Python/soffice 子进程，通过文件协议交换解析产物。PDF 解析仍需要 Python/Docling 环境与本地模型目录（版面、表格、OCR 在本地跑）；**公式识别与图片描述改为调用远端 VLM**，由 `RAG_VLM_BASE_URL`/`RAG_VLM_API_KEY`/`RAG_VLM_MODEL` 配置，未配置时 PDF 解析会明确失败而不是回退到本地模型。Word 无图注图片同样走该远端端点；配置了 VLM 后 Go 会自动启用 `word_vision_worker`。这些外部依赖未在本仓库的 Go 测试环境中实机验证。
+
+**VLM 优先取知识库配置**：Console 的知识库设置页在 Embedding/Reranker 之外提供 VLM 区块（从「模型配置」列表选择，可开关），保存后该知识库随后的上传与 worker 解析立即使用它；未配置或关闭时回退到 `RAG_VLM_*` 环境变量。API Key 与其他 provider 一样加密存储，前端只显示"已保存"。
 
 ### 共享状态库
 
@@ -425,6 +427,47 @@ curl.exe "http://127.0.0.1:8011/v1/admin/api-keys/<id>/mcp-config" `
 
 `mcp-config` 返回 `{"url":"http://<host>/mcp","headers":{"Authorization":"Bearer <key>","X-RAG-Namespace":"default"}}`，可直接粘贴到 MCP 客户端配置。
 
+### 模型配置（模型列表）
+
+管理员在 Console 侧边栏「模型配置」（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM 列表，不再在创建知识库时手工填写服务地址、Key 和模型名。页面按模型类型分页签，表格展示 名称 / 模型 / 服务地址 / Key / 向量维度（仅 Embedding）/ 更新时间 / 操作，支持「添加模型」抽屉、编辑和删除。API Key 只在服务端用 `RAG_STATE_ENCRYPTION_KEY` 加密保存，列表与详情只返回 `api_key_set`；编辑时留空表示沿用已保存的 Key，显式提交空字符串会清除。`(kind, name)` 唯一，重名返回 409。
+
+保存时会先探测 provider：
+
+- Embedding：真实执行一次 Embedding 调用，把返回的稠密向量维度记录到 `vector_size`；探测失败则不写入。
+- Reranker：执行一次有界的 rerank 调用，只验证服务可达与鉴权。
+- VLM：不做探测，因此半配置的 VLM 端点也可以先保存。
+
+`PATCH` 只在服务地址、模型或 Key 实际变化时重新探测；只改名称或原样保存不会调用 provider，已记录的 Embedding 维度保持不变。修改服务地址但未提交新 Key 时保存的 Key 会被清除（与知识库连接表单的 `DraftConnection` 语义一致）。
+
+管理员的创建知识库表单现在只从该列表选择模型（Embedding 必填；Reranker、VLM 通过开关启用），编辑知识库的抽屉（知识库列表 → 配置）同样选择模型：保存时 Console 读取所选条目的 Key，并把该配置的服务地址、模型名和 Key 复制进原有的知识库请求；**切换 Embedding 到不同连接仍要求「重新向量化并保存」确认**。知识库已有连接不在列表中时，编辑抽屉保留「当前配置」选项，保存时沿用原连接、不触发重新向量化。删除或编辑模型配置不会修改已保存到知识库里的连接。知识库 REST 契约不变（仍接受内联 `embedding`/`reranker`/`vlm` 连接），模型列表只服务于 Console 管理员表单。
+
+以下接口都属于 `/v1/admin/*`，仅本机直连或管理员会话可访问：
+
+```powershell
+# 列表（按 kind、名称排序；每个条目含 id/kind/name/base_url/model/api_key_set/vector_size/created_at/updated_at，不含 Key 明文）
+curl.exe http://127.0.0.1:8011/v1/admin/model-profiles
+
+# 新建：kind 为 embedding / reranker / vlm；Embedding 会真实探测并记录向量维度
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/model-profiles `
+  -H "Content-Type: application/json" `
+  -d '{"kind":"embedding","name":"生产 Embedding","base_url":"http://127.0.0.1:8032/v1","apikey":"<provider-key>","model":"bge-m3"}'
+
+# 详情 / 修改（字段均可选，kind 不可修改；省略 apikey 且服务地址不变时沿用已保存的 Key）
+curl.exe http://127.0.0.1:8011/v1/admin/model-profiles/<profile_id>
+curl.exe -X PATCH http://127.0.0.1:8011/v1/admin/model-profiles/<profile_id> `
+  -H "Content-Type: application/json" `
+  -d '{"name":"生产 Embedding（主）","model":"bge-m3"}'
+
+# 删除（成功 204；不存在 404）
+curl.exe -X DELETE http://127.0.0.1:8011/v1/admin/model-profiles/<profile_id>
+
+# 读取 Key（仅本机/管理员会话；列表、详情接口从不返回明文）
+curl.exe http://127.0.0.1:8011/v1/admin/model-profiles/<profile_id>/key
+
+# 通过已保存的连接列出 provider 模型（无请求体；端点没有 /models 时返回空数组）
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/model-profiles/<profile_id>/models
+```
+
 ### 知识库管理（本机管理）
 
 ```powershell
@@ -458,7 +501,7 @@ curl.exe http://127.0.0.1:8011/v1/admin/knowledge-bases/defaults
 curl.exe http://127.0.0.1:8011/v1/admin/knowledge-bases/default/key/embedding
 ```
 
-公开配置：`GET /v1/knowledge-base`（返回 `public_settings + strategies`，缺少知识库时 404）。创建/修改的请求体与 Python 实现一致，`embedding` 必填，`embedding_model` 长度 1..512。
+公开配置：`GET /v1/knowledge-base`（返回 `public_settings + strategies`，缺少知识库时 404）。创建/修改的请求体与 Python 实现一致，`embedding` 必填，`embedding_model` 长度 1..512。Console 管理员表单改为从「模型配置」模型列表选择（见上一节），但 REST 契约不变：仍提交内联的 `embedding`/`reranker`/`vlm` 连接。
 
 ### 知识库归属、权限与邀请（Console 会话）
 

@@ -4,6 +4,7 @@ import {
 } from "antd";
 import {
   ApiOutlined,
+  AppstoreOutlined,
   ArrowLeftOutlined,
   BellOutlined,
   BookOutlined,
@@ -42,6 +43,7 @@ import { SearchPage } from "./SearchPage";
 import { DocumentsPage } from "./DocumentsPage";
 import { DocumentPreview } from "./DocumentPreview";
 import { KnowledgeBasesPage } from "./KnowledgeBasesPage";
+import { ModelProfilesPage } from "./ModelProfilesPage";
 import { ApiKeysPage } from "./ApiKeysPage";
 import { CreateKnowledgeBase } from "./CreateKnowledgeBase";
 import { LoginPage } from "./LoginPage";
@@ -61,13 +63,14 @@ const pages = [
   { key: "create", label: "创建知识库", icon: <ApiOutlined /> },
   { key: "permissions", label: "权限管理", icon: <SafetyOutlined /> },
   { key: "api-keys", label: "API Key", icon: <KeyOutlined /> },
+  { key: "model-profiles", label: "模型配置", icon: <AppstoreOutlined /> },
   { key: "knowledge-bases", label: "知识库", icon: <SettingOutlined /> },
   { key: "users", label: "用户管理", icon: <TeamOutlined /> },
 ] as const;
 
 // adminOnlyPages require the admin role once login is enabled. The API Key page
 // is not listed: every account manages only its own keys there.
-const adminOnlyPages = new Set<string>(["knowledge-bases", "users"]);
+const adminOnlyPages = new Set<string>(["model-profiles", "knowledge-bases", "users"]);
 const inviteBellPollMs = 60_000;
 
 export function Console({
@@ -529,6 +532,9 @@ export function Console({
               role={authUser?.role}
             />
           )}
+          {view === "model-profiles" && (!sessionMode || authUser?.role === "admin") && (
+            <ModelProfilesPage disabled={uploading} />
+          )}
           {view === "knowledge-bases" && (!sessionMode || authUser?.role === "admin") && (
             <KnowledgeBasesPage disabled={uploading}
               onCreate={() => navigate({ namespace, page: "create" })}
@@ -566,7 +572,9 @@ export function Console({
               <h1>创建知识库</h1>
             </div>
             <CreateKnowledgeBase active={view === "create"} disabled={uploading}
-              connection={connection} role={authUser?.role} onCreated={(namespace) => {
+              connection={connection} role={authUser?.role}
+              onOpenModelProfiles={() => navigate({ namespace, page: "model-profiles" })}
+              onCreated={(namespace) => {
                 if (saveConnection({ ...connection, namespace }, "已切换到新知识库")) {
                   navigate({ namespace, page: "documents" });
                 }

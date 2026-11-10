@@ -440,6 +440,103 @@ export async function deleteUser(id: string): Promise<void> {
   await apiResponse(`/v1/admin/users/${encodeURIComponent(id)}`, undefined, { method: "DELETE" });
 }
 
+// --- Model profiles (模型配置) ----------------------------------------------
+// A model profile is a reusable Embedding / Reranker / VLM connection stored by
+// an administrator; knowledge bases reference one profile per kind instead of
+// carrying their own base URL, key and model id.
+export type ModelKind = "embedding" | "reranker" | "vlm";
+export type ModelProfile = {
+  id: string;
+  kind: ModelKind;
+  name: string;
+  base_url: string;
+  model: string;
+  api_key_set: boolean;
+  vector_size: number | null;
+  created_at?: string;
+  updated_at?: string;
+};
+export type ModelProfileInput = {
+  kind: ModelKind;
+  name: string;
+  base_url: string;
+  apikey: string;
+  model: string;
+};
+// ModelProfileUpdate omits kind: an existing profile cannot change its kind.
+export type ModelProfileUpdate = Partial<Omit<ModelProfileInput, "kind">>;
+export const modelKinds: ModelKind[] = ["embedding", "reranker", "vlm"];
+export const modelKindLabels: Record<ModelKind, string> = {
+  embedding: "Embedding",
+  reranker: "Reranker",
+  vlm: "VLM",
+};
+
+// normalizeModelProfile keeps a nullable vector_size stable for the table and
+// profile pickers.
+function normalizeModelProfile(profile: ModelProfile): ModelProfile {
+  return { ...profile, vector_size: profile.vector_size ?? null };
+}
+
+export async function fetchModelProfiles(signal?: AbortSignal): Promise<ModelProfile[]> {
+  const payload = await api<{ model_profiles: ModelProfile[] }>(
+    "/v1/admin/model-profiles",
+    undefined,
+    { signal, cache: "no-store" },
+  );
+  return (payload.model_profiles || []).map(normalizeModelProfile);
+}
+
+export async function createModelProfile(input: ModelProfileInput): Promise<ModelProfile> {
+  const payload = await api<{ profile: ModelProfile }>("/v1/admin/model-profiles", undefined, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return normalizeModelProfile(payload.profile);
+}
+
+export async function updateModelProfile(
+  id: string,
+  update: ModelProfileUpdate,
+): Promise<ModelProfile> {
+  const payload = await api<{ profile: ModelProfile }>(
+    `/v1/admin/model-profiles/${encodeURIComponent(id)}`,
+    undefined,
+    { method: "PATCH", body: JSON.stringify(update) },
+  );
+  return normalizeModelProfile(payload.profile);
+}
+
+export async function deleteModelProfile(id: string): Promise<void> {
+  await apiResponse(`/v1/admin/model-profiles/${encodeURIComponent(id)}`, undefined, {
+    method: "DELETE",
+  });
+}
+
+export async function revealModelProfileKey(
+  id: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const payload = await api<{ apikey: string }>(
+    `/v1/admin/model-profiles/${encodeURIComponent(id)}/key`,
+    undefined,
+    { signal, cache: "no-store" },
+  );
+  return payload.apikey || "";
+}
+
+export async function fetchModelProfileModels(
+  id: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const payload = await api<{ models: string[] }>(
+    `/v1/admin/model-profiles/${encodeURIComponent(id)}/models`,
+    undefined,
+    { method: "POST", signal },
+  );
+  return payload.models || [];
+}
+
 // --- Knowledge-base permissions and invitations -----------------------------
 
 // fetchAccess returns the caller's effective access view for one knowledge

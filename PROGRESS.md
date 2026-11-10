@@ -507,3 +507,16 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] `go build ./...`、`go vet ./...` 干净；全量 `go test ./... -p 1 -count=1 -timeout 25m` 全绿（state 421s、httpapi 183s、e2e 253s、runtime 465s，约 24 分钟）；前端 typecheck、32/32 vitest、生产构建通过。详见 VALIDATION.md。
 - [x] 评审修复：更新密钥时只校验新增 Namespace（避免降级管理员无法改名/停用）；AccessControl 缺失时非管理员绑定规则 fail-closed；索引迁移先查 `information_schema` 避免每次启动 DDL；`ListByOwner` 空账号返回空；账号删除级联同时刷新 `api_keys` 读模型版本。
 - 已知限制：禁用账号不会自动停用已签发密钥（需删除账号或手动停用/删除密钥）；密钥按 namespace 名称绑定，删除并重建同名知识库后旧密钥仍生效（删除/重建时应同步清理密钥）。
+## 2026-11-10 模型配置页面与模型列表（Console）
+
+本轮把 Console 里的 Embedding / Reranker / VLM 连接从「创建知识库」表单中拆出来，改为管理员独立维护、可复用的模型列表：
+
+- [x] 新增侧边栏「模型配置」页（管理员可见，`#/model-profiles`）：Embedding / Reranker / VLM 三个页签，表格展示 名称 / 模型 / 服务地址 / Key / 向量维度（仅 Embedding）/ 更新时间 / 操作，支持「添加模型」抽屉、编辑和删除；空列表时提示先添加模型并可直接跳转。
+- [x] 新增 MySQL 表 `model_profiles`（`id`、`kind`、`name`、`base_url`、`model`、`protected_key`、`vector_size`、`created_at`、`updated_at`，`(kind, name)` 唯一，`kind` 建索引）；API Key 用 `RAG_STATE_ENCRYPTION_KEY` 加密，列表与详情只返回 `api_key_set`，明文仅由本机/管理员会话的 `/key` 接口读取。
+- [x] 新增 `/v1/admin/model-profiles` 管理接口：列表、创建、详情、PATCH、删除、`/{id}/key`、`/{id}/models`（共 7 条，OpenAPI 打上 `model-profiles` 标签），仅本机直连或管理员会话；创建时探测 provider（Embedding 真实调用一次并记录向量维度、Reranker 验证一次有界重排、VLM 不探测），PATCH 仅在服务地址/模型/Key 实际变化时重新探测，重名返回 409。
+- [x] 创建知识库（管理员表单）改为快速选择已保存的 Embedding（必填）/ Reranker（开关，可选）/ VLM（开关，可选）模型；编辑抽屉（知识库列表 → 配置）同样选择模型，并为不在列表中的旧连接保留「当前配置」兜底选项，保存时不触发重新向量化。
+- [x] 切换 Embedding 到不同连接仍走「重新向量化并保存」确认；编辑或删除模型配置不会修改已保存连接的知识库；VIP/普通用户建库表单保持不变，仍从 `RAG_DEFAULT_KB_TEMPLATE` 克隆模型配置。
+- [x] 测试：新增 `internal/state`、`internal/kbconfig`、`internal/runtime`、`internal/httpapi` 四个包的 model profile 覆盖（仓储生命周期与重名冲突、表结构、草稿校验与 Key 保留/清除、探测路由、公开投影不泄露 Key、错误映射、HTTP 增删改查与 422/404/409/权限），前端新增 `ModelProfilesPage.test.tsx`、`CreateKnowledgeBase.test.ts` 并扩展 `api.test.ts`；完整结果见 VALIDATION.md。
+- [x] 文档：README（Console 能力、主要功能、状态库）、docs/USAGE.md（新增「模型配置（模型列表）」与 7 个接口示例，VLM/知识库管理说明同步）、docs/knowledge-base-settings.md（模型配置与知识库连接的关系）、VALIDATION.md 更新。
+
+已知边界：模型配置与知识库是保存时复制的引用关系（无外键），因此重命名/删除配置不会回填历史知识库；模型列表只服务 Console 管理员表单，知识库 REST 契约不变；保存探测会真实调用 provider（VLM 除外），离线环境无法新增 Embedding/Reranker 配置。

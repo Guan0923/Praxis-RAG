@@ -40,6 +40,30 @@ const (
 	// MessageVLMModelRequired is raised when a VLM service URL is configured
 	// without a model name.
 	MessageVLMModelRequired = "请填写 VLM 模型名称"
+
+	// MessageModelKindInvalid is raised when a saved model configuration names
+	// an unsupported provider kind.
+	MessageModelKindInvalid = "模型类型无效"
+	// MessageModelProfileNameRequired is raised when a model configuration has
+	// no display name.
+	MessageModelProfileNameRequired = "请填写模型配置名称"
+	// MessageModelProfileNameTooLong is raised when a model configuration name
+	// exceeds 80 characters.
+	MessageModelProfileNameTooLong = "模型配置名称最多 80 个字符"
+	// MessageModelModelRequired is raised when a model configuration has no
+	// provider model id.
+	MessageModelModelRequired = "请填写模型名称"
+	// MessageModelModelTooLong is raised when a model id exceeds 512 characters.
+	MessageModelModelTooLong = "模型名称最多 512 个字符"
+	// MessageModelServiceURLRequired is raised when a model configuration has no
+	// service URL.
+	MessageModelServiceURLRequired = "请填写服务地址"
+	// MessageModelProfileExists is raised when another saved model configuration
+	// already uses the same (kind, name) pair.
+	MessageModelProfileExists = "该模型配置名称已存在"
+	// MessageModelProfileMissing is raised when the requested model
+	// configuration does not exist.
+	MessageModelProfileMissing = "该模型配置不存在"
 )
 
 // Error mirrors KnowledgeError: a safe knowledge-base error that may occur after

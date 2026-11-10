@@ -120,6 +120,7 @@ func run() error {
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseSelfCreateRuntime(wire.HTTPRuntime{Service: service}),
+		httpapi.WithModelProfileRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithAccessControl(accessService),
 		httpapi.WithAPIKeyStore(apikeys.New(stores.APIKeys)),
 		httpapi.WithCatalogStore(catalogStore),

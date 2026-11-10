@@ -50,15 +50,19 @@ REST `/v1/search`、Console 与本地调试同步执行。服务端 MCP `search`
 
 | 入口 | 能力 |
 | --- | --- |
-| Web Console：`/console` | 账号登录/注册、角色与知识库权限管理、文档管理、检索调试、工作区切换和模型连接配置。 |
+| Web Console：`/console` | 账号登录/注册、角色与知识库权限管理、文档管理、检索调试、工作区切换，以及「模型配置」模型列表与知识库配置中的模型快速选择。 |
 | MCP：`/mcp` | 搜索、添加/更新/删除文档、分页读取正文、提示词模板及订阅变更。 |
 | REST API：`/v1/*` | 知识管理与检索接入现有应用；`/openapi.json` 与 `/docs` 提供 OpenAPI 3.1 契约。 |
 
 MCP 需要 `Authorization: Bearer <service token 或 API Key>` 与 `X-RAG-Namespace`；`/v1/admin/*` 管理接口仅允许本机直连或管理员会话，其中 `/v1/admin/api-keys` 是例外：任意已登录账号都可以管理**自己的** API Key（非管理员只能绑定本人创建的知识库，历史无主密钥仅管理员/本机管理可见）。管理员可以启停已注册的 MCP 工具、调整工具说明和管理提示词模板。
 
+### 模型配置与知识库模型选择
+
+管理员在侧边栏「模型配置」页（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM 模型列表：每个条目保存名称、服务地址、模型标识和加密后的 API Key，Embedding 条目还记录保存时探测到的向量维度。创建或修改知识库时，管理员表单只从这个列表快速选择模型，不再手工输入 Base URL / API Key / 模型名；切换 Embedding 到不同连接仍要求重新向量化。模型配置与知识库之间是保存时复制的引用关系，之后编辑或删除模型配置不会改动已保存连接的知识库。VIP/普通用户建库表单不变，仍从 `RAG_DEFAULT_KB_TEMPLATE` 克隆模型配置。
+
 ### 独立部署与模型状态
 
-Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档任务与发件箱、UploadJournal、文档清单、知识库配置、MCP 配置和 API Key 保存在共享状态数据库（MySQL）；排队搜索任务状态也在状态库，结果快照与展示缓存放 Redis；Kafka 传递异步通知和排队搜索请求。Embedding / Reranker 通过模型 API 调用，服务本身不加载模型权重。
+Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档任务与发件箱、UploadJournal、文档清单、知识库配置、Console 模型列表（`model_profiles`）、MCP 配置和 API Key 保存在共享状态数据库（MySQL）；排队搜索任务状态也在状态库，结果快照与展示缓存放 Redis；Kafka 传递异步通知和排队搜索请求。Embedding / Reranker 通过模型 API 调用，服务本身不加载模型权重。
 
 ## 快速开始（Go 后端）
 

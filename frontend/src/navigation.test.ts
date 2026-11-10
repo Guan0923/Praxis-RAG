@@ -36,9 +36,17 @@ describe("parseRoute", () => {
   });
 
   it("parses the static Console pages", () => {
-    for (const page of ["api-keys", "knowledge-bases", "users", "permissions", "invitations"]) {
+    for (const page of ["api-keys", "model-profiles", "knowledge-bases", "users", "permissions", "invitations"]) {
       expect(parseRoute("#/" + page, "default")).toEqual({ namespace: "default", page });
     }
+  });
+
+  it("parses the model configuration page as a top-level route", () => {
+    expect(parseRoute("#/model-profiles", "team")).toEqual({
+      namespace: "team",
+      page: "model-profiles",
+    });
+    expect(routeHash({ namespace: "team", page: "model-profiles" })).toBe("#/model-profiles");
   });
 
   it("parses workspace pages and one document name", () => {
@@ -74,6 +82,7 @@ describe("routeHash", () => {
       { namespace: "team", page: "documents" as const },
       { namespace: "team", page: "documents" as const, documentName: "a b.md" },
       { namespace: "team", page: "permissions" as const },
+      { namespace: "team", page: "model-profiles" as const },
       { namespace: "team", page: "invitations" as const },
       { namespace: "team", page: "invite" as const, token: "abc" },
       { namespace: "team", page: "invite" as const },

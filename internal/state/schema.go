@@ -671,6 +671,27 @@ var schemaTables = []*SchemaTable{
 			index("ix_kb_invitations_namespace", "namespace"),
 		},
 	},
+	// model_profiles is a Console-only registry of reusable Embedding/Reranker/VLM
+	// provider configurations. A knowledge base still stores its own copy of the
+	// selected connection, so editing or deleting a profile never mutates an
+	// existing knowledge base. The API key is protected like every other provider
+	// secret; it is appended last so a migrated database keeps the same shape.
+	{
+		Name: "model_profiles",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("kind", 16),
+			varchar("name", 120),
+			varchar("base_url", 2048),
+			varchar("model", 512),
+			longText("protected_key").Null(),
+			integer("vector_size").Null(),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_model_profiles_kind_name", "kind", "name")},
+		Indexes: []SchemaIndex{index("ix_model_profiles_kind", "kind")},
+	},
 }
 
 // SchemaTables returns the schema tables in creation order. The returned slice

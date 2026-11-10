@@ -68,6 +68,138 @@ or disable/delete the keys); the namespace binding stores the knowledge-base
 name, so a deleted-then-recreated knowledge base remains reachable by keys
 previously issued for that namespace.
 
+## Model configuration page and model list — 2026-11-10
+
+Delivered: a Console-only 模型配置 page (`#/model-profiles`, administrators
+only) that maintains reusable Embedding / Reranker / VLM connections; the MySQL
+`model_profiles` table (`kind` + `name` unique, `base_url`, `model`, encrypted
+`protected_key`, probed `vector_size`) with keys protected by
+`RAG_STATE_ENCRYPTION_KEY`; the seven `/v1/admin/model-profiles` routes (list,
+create, details, PATCH, delete, `/key`, `/models`, local admin or administrator
+session only); and a create/edit knowledge-base form that quick-selects a saved
+model instead of typing the base URL, key and model id. The knowledge-base REST
+contract is unchanged — the Console copies the selected profile's connection
+into the existing inline provider objects. Profiles and knowledge bases are
+decoupled: editing or deleting a profile never mutates a knowledge base that
+already copied its connection, and an Embedding selection change still requires
+the re-embedding confirmation.
+
+Environment: Windows 11 host, Go 1.27.3 windows/amd64, Node v26.13.0 / npm
+12.2.2, MySQL 8 on 127.0.0.1:3307 (isolated schema `praxis_cache_test_smoke`),
+Qdrant/Redis from the local compose stack. Two workspace-sandbox accommodations:
+`GOCACHE`/`GOTMPDIR` redirected inside the worktree, and Vite/Vitest run with a
+`child_process.exec` preload shim because the sandbox refuses Vite's piped
+`net use` probe. All Go test output below is from the isolated schema; a
+concurrent DSH session on the same machine was running its own Go tests against
+the shared `praxis_gotest` schema (leftover `state.test.exe` processes), which
+caused DDL races in unrelated schema tests — see the note at the end.
+
+Go verification (cwd worktree):
+
+```
+$ go build ./...
+exit 0 (only the pre-existing sandbox warning "writing stat cache: ... D:\go-work\pkg\mod\cache ... Access is denied")
+
+$ go vet ./internal/...
+exit 0, no output
+
+$ go test ./internal/kbconfig ./internal/httpapi -count=1 -timeout 600s
+ok   github.com/Guan0923/xinghe_rag/internal/kbconfig   0.343s
+ok   github.com/Guan0923/xinghe_rag/internal/httpapi    11.340s
+
+$ go test ./internal/state -run 'TestModelProfile' -count=1 -timeout 600s
+ok   github.com/Guan0923/xinghe_rag/internal/state      35.485s
+
+$ go test ./internal/runtime -run 'TestModelProfile' -count=1 -timeout 600s
+ok   github.com/Guan0923/xinghe_rag/internal/runtime    79.162s
+
+$ go test ./internal/e2e -count=1 -timeout 1200s
+ok   github.com/Guan0923/xinghe_rag/internal/e2e        306.471s
+
+$ go test ./internal/state -count=1 -timeout 1800s        # full package, isolated schema
+ok   github.com/Guan0923/xinghe_rag/internal/state      426.978s
+```
+
+Console verification (cwd frontend, NODE_OPTIONS shim set):
+
+```
+$ npm run typecheck
+exit 0, no diagnostics
+
+$ npm test
+Test Files  4 passed (4)
+Tests  49 passed (49)
+     src/navigation.test.ts (11 tests)
+     src/api.test.ts (24 tests)
+     src/CreateKnowledgeBase.test.ts (7 tests)
+     src/ModelProfilesPage.test.tsx (7 tests)
+
+$ npm run build
+../build/web/assets/index-CW9lPsz8.js   1,250.64 kB │ gzip: 395.07 kB
+../build/web/assets/index-CsXgnAdA.css     13.51 kB │ gzip:   3.38 kB
+✓ built in 808ms
+exit 0 (only the pre-existing >500 kB chunk advisory)
+```
+
+Live HTTP smoke (built `cmd/rag-service` from this worktree on 127.0.0.1:18099,
+isolated MySQL schema, loopback admin calls without a session, mock
+OpenAI-compatible provider on 127.0.0.1:18077; 14 checks, all PASS):
+
+```
+GET  /v1/admin/model-profiles empty list
+POST embedding profile -> probes provider, records vector_size=4, api_key_set=true, key absent from payload
+GET  list -> no key leaked;  GET /{id}/key -> returns sk-smoke
+POST /{id}/models with no request body -> provider models (3)
+PATCH rename -> 200, no re-probe, vector_size kept
+duplicate (kind,name) -> 409;  missing base_url -> 400;  unknown kind -> 422 literal_error
+POST /v1/admin/knowledge-bases using the saved connection -> 201, vector_size=4, embedding_model=mock-embedding
+PATCH knowledge base with the same connection, reembed=false -> 200 (no re-embedding required)
+DELETE -> 204;  DELETE unknown id -> 404
+GET /openapi.json exposes /v1/admin/model-profiles, /{profile_id}, /{profile_id}/key, /{profile_id}/models
+SMOKE OK (14 checks)
+```
+
+Coverage added:
+
+- `internal/state`: repository lifecycle (create / list / list-by-kind / get /
+  update / delete, generated id and timestamps), duplicate `(kind, name)` →
+  conflict, table shape.
+- `internal/kbconfig`: draft validation (kind, name/model length limits, service
+  URL required, trimming), key preservation (an omitted key keeps the stored one
+  while the base URL is unchanged; changing the URL without a key or an explicit
+  empty key clears it), probe routing (embedding records the dimension, reranker
+  gets one bounded call, VLM is not probed), credential-free public projection,
+  encryption round-trip.
+- `internal/runtime`: profile lifecycle through the service, error mapping
+  (409 conflict, 404-shaped missing profile, 503 state failure).
+- `internal/httpapi`: list/details/key/models, create (201), PATCH/delete
+  (200/204), FastAPI-shaped 422 validation bodies, 404/409 mapping, admin-only
+  and runtime-unavailable guards, OpenAPI route table.
+- Console: 49 tests total. `ModelProfilesPage.test.tsx` (7 tests: per-kind
+  counts/rows/saved-key state, kind filtering and per-kind empty hints,
+  informative empty state, add-drawer required-field validation, create with
+  the default kind, explicit empty `apikey` on PATCH clears the saved key,
+  untouched key field omits `apikey` on PATCH), `CreateKnowledgeBase.test.ts`
+  (7 tests for `matchingProfile` / `profileNeedsReembed`), `api.test.ts` (24
+  tests; model-profile client contract: frozen kind vocabulary, list
+  normalization, create body, PATCH by encoded id, DELETE empty-body path,
+  key/model routes, duplicate conflict detail) and `navigation.test.ts` (11
+  tests; `#/model-profiles` parse and hash round-trip).
+
+Not verified live: browser E2E of the new page was not run (no
+Playwright/Cypress in this repository); provider probes were exercised against
+a mock OpenAI-compatible endpoint plus the unit-test fakes, not a real model
+service.
+
+Shared-schema caveat: the first full `go test ./internal/state` attempts on the
+shared `praxis_gotest` schema failed in `TestAutoSchemaCanBeDisabled`,
+`TestSchemaCreationCanBeForcedOff` and `TestMigrationsAddMissingLegacyColumns`
+because a concurrent DSH session on the same machine was running its own Go
+tests against the same schema (observed leftover `state.test.exe` processes
+performing DROP/ALTER). The same three tests pass when run alone, and the full
+package is green on the isolated schema above; none of them exercise
+model-profile code.
+
 ## Test workflow hardening — 2026-11-10
 
 Goal: make the repository's test workflow actually reliable, and cover the

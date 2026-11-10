@@ -3,22 +3,29 @@ import {
   api,
   apiResponse,
   createInvitation,
+  createModelProfile,
   currentCSRFToken,
+  deleteModelProfile,
   errorText,
   fetchAccess,
   fetchGrants,
   fetchInvitationInbox,
+  fetchModelProfileModels,
+  fetchModelProfiles,
   formatBytes,
   formatDateTime,
   formatScore,
   invitationLink,
   invitationStatus,
   invitationStatusLabels,
+  modelKindLabels,
   permissionLabels,
+  revealModelProfileKey,
   roleLabel,
   scopeLabels,
   setCSRFToken,
   setUnauthorizedHandler,
+  updateModelProfile,
   type Connection,
   type InvitationView,
 } from "./api";
@@ -257,5 +264,118 @@ describe("sharing API paths and payloads", () => {
   it("returns decoded JSON through api()", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ users: [{ id: "u1" }] }));
     await expect(api("/v1/users")).resolves.toEqual({ users: [{ id: "u1" }] });
+  });
+});
+
+describe("model-profile API contract", () => {
+  const profile = {
+    id: "mp-1",
+    kind: "embedding" as const,
+    name: "默认 Embedding",
+    base_url: "https://api.example.com/v1",
+    model: "bge-m3",
+    api_key_set: true,
+    vector_size: 1024,
+    created_at: "2026-11-09T10:00:00Z",
+    updated_at: "2026-11-09T10:00:00Z",
+  };
+
+  it("exposes the frozen model-kind vocabulary", () => {
+    expect(modelKindLabels).toEqual({
+      embedding: "Embedding",
+      reranker: "Reranker",
+      vlm: "VLM",
+    });
+  });
+
+  it("lists profiles and normalizes a null vector size / missing list", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ model_profiles: [{ ...profile, vector_size: null }] }),
+    );
+    const rows = await fetchModelProfiles();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].vector_size).toBeNull();
+    expect(requestArgs(0)[0]).toBe("/v1/admin/model-profiles");
+    expect(requestArgs(0)[1].cache).toBe("no-store");
+
+    fetchMock.mockResolvedValue(jsonResponse({ model_profiles: null }));
+    await expect(fetchModelProfiles()).resolves.toEqual([]);
+  });
+
+  it("creates a profile with the documented body", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ profile }, 201));
+    const created = await createModelProfile({
+      kind: "embedding",
+      name: "默认 Embedding",
+      base_url: "https://api.example.com/v1",
+      apikey: "sk-secret",
+      model: "bge-m3",
+    });
+    expect(created.id).toBe("mp-1");
+    expect(created.vector_size).toBe(1024);
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/admin/model-profiles");
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(String(options.body))).toEqual({
+      kind: "embedding",
+      name: "默认 Embedding",
+      base_url: "https://api.example.com/v1",
+      apikey: "sk-secret",
+      model: "bge-m3",
+    });
+  });
+
+  it("patches a profile by encoded id and normalizes the response", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ profile: { ...profile, vector_size: null, name: "生产 Embedding" } }),
+    );
+    const updated = await updateModelProfile("mp/1", { name: "生产 Embedding", model: "bge-large" });
+    expect(updated.name).toBe("生产 Embedding");
+    expect(updated.vector_size).toBeNull();
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/admin/model-profiles/mp%2F1");
+    expect(options.method).toBe("PATCH");
+    expect(JSON.parse(String(options.body))).toEqual({
+      name: "生产 Embedding",
+      model: "bge-large",
+    });
+  });
+
+  it("deletes a profile through the empty-body apiResponse path", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({}, 204));
+    await expect(deleteModelProfile("mp-1")).resolves.toBeUndefined();
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/admin/model-profiles/mp-1");
+    expect(options.method).toBe("DELETE");
+  });
+
+  it("reveals a saved key and lists models of a saved profile", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ apikey: "sk-secret" }));
+    await expect(revealModelProfileKey("mp-1")).resolves.toBe("sk-secret");
+    expect(requestArgs(0)[0]).toBe("/v1/admin/model-profiles/mp-1/key");
+    expect(requestArgs(0)[1].cache).toBe("no-store");
+
+    fetchMock.mockResolvedValue(jsonResponse({ models: ["bge-m3", "bge-large"] }));
+    await expect(fetchModelProfileModels("mp-1")).resolves.toEqual(["bge-m3", "bge-large"]);
+    expect(requestArgs(1)[0]).toBe("/v1/admin/model-profiles/mp-1/models");
+    expect(requestArgs(1)[1].method).toBe("POST");
+
+    fetchMock.mockResolvedValue(jsonResponse({ models: null }));
+    await expect(fetchModelProfileModels("mp-1")).resolves.toEqual([]);
+  });
+
+  it("surfaces duplicate-name conflicts with the server detail", async () => {
+    fetchMock.mockResolvedValueOnce(
+      textResponse('{"detail":"同名模型配置已存在"}', 409),
+    );
+    await expect(createModelProfile({
+      kind: "vlm",
+      name: "重复名称",
+      base_url: "https://api.example.com/v1",
+      apikey: "",
+      model: "qwen-vl",
+    })).rejects.toThrow(
+      "POST /v1/admin/model-profiles\nHTTP 409：同名模型配置已存在",
+    );
   });
 });

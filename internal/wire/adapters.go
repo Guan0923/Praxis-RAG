@@ -22,6 +22,7 @@ type HTTPRuntime struct{ Service *runtime.Service }
 // endpoint needs the document visibility mapping.
 var (
 	_ httpapi.KnowledgeBaseSelfCreateRuntime = HTTPRuntime{}
+	_ httpapi.ModelProfileRuntime            = HTTPRuntime{}
 	_ mcp.Runtime                            = MCPRuntime{}
 )
 
@@ -281,4 +282,51 @@ func (a HTTPRuntime) KnowledgeBaseKey(ctx context.Context, namespace, kind strin
 // KnowledgeBaseModels implements httpapi.KnowledgeBaseAdminRuntime.
 func (a HTTPRuntime) KnowledgeBaseModels(ctx context.Context, kind string, values map[string]any, namespace *string) ([]string, error) {
 	return a.Service.KnowledgeBaseModels(ctx, kind, values, namespace)
+}
+
+// ListModelProfiles implements httpapi.ModelProfileRuntime.
+func (a HTTPRuntime) ListModelProfiles(ctx context.Context) ([]map[string]any, error) {
+	return a.Service.ListModelProfiles(ctx)
+}
+
+// ModelProfile implements httpapi.ModelProfileRuntime.
+func (a HTTPRuntime) ModelProfile(ctx context.Context, id string) (map[string]any, error) {
+	return a.Service.ModelProfile(ctx, id)
+}
+
+// CreateModelProfile implements httpapi.ModelProfileRuntime.
+func (a HTTPRuntime) CreateModelProfile(ctx context.Context, input httpapi.ModelProfileInput) (map[string]any, error) {
+	return a.Service.CreateModelProfile(ctx, modelProfileDraft(input))
+}
+
+// UpdateModelProfile implements httpapi.ModelProfileRuntime.
+func (a HTTPRuntime) UpdateModelProfile(ctx context.Context, id string, input httpapi.ModelProfileInput) (map[string]any, error) {
+	return a.Service.UpdateModelProfile(ctx, id, modelProfileDraft(input))
+}
+
+// DeleteModelProfile implements httpapi.ModelProfileRuntime.
+func (a HTTPRuntime) DeleteModelProfile(ctx context.Context, id string) (bool, error) {
+	return a.Service.DeleteModelProfile(ctx, id)
+}
+
+// ModelProfileKey implements httpapi.ModelProfileRuntime.
+func (a HTTPRuntime) ModelProfileKey(ctx context.Context, id string) (string, error) {
+	return a.Service.ModelProfileKey(ctx, id)
+}
+
+// ModelProfileModels implements httpapi.ModelProfileRuntime.
+func (a HTTPRuntime) ModelProfileModels(ctx context.Context, id string) ([]string, error) {
+	return a.Service.ModelProfileModels(ctx, id)
+}
+
+// modelProfileDraft converts the transport-neutral input to the runtime draft.
+func modelProfileDraft(input httpapi.ModelProfileInput) kbconfig.ModelProfileDraft {
+	return kbconfig.ModelProfileDraft{
+		Kind:      input.Kind,
+		Name:      input.Name,
+		BaseURL:   input.BaseURL,
+		Model:     input.Model,
+		APIKey:    input.APIKey,
+		HasAPIKey: input.HasAPIKey,
+	}
 }

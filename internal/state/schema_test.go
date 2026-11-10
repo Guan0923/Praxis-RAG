@@ -8,8 +8,9 @@ import (
 
 // expectedSchema is the literal port of src/rag_mcp/state/schema.py: the table
 // order and every column name must stay identical for existing databases. The
-// users/user_sessions tables are Go-only additions (Console login) and must stay
-// after the ported tables so shared databases keep the Python order.
+// users/user_sessions (Console login) and model_profiles (Console saved model
+// configurations) tables are Go-only additions and must stay after the ported
+// tables so shared databases keep the Python order.
 var expectedSchema = []struct {
 	name    string
 	columns []string
@@ -38,6 +39,7 @@ var expectedSchema = []struct {
 	{"user_sessions", []string{"id", "user_id", "token_digest", "csrf_token", "expires_at", "created_at", "last_seen_at", "revoked"}},
 	{"kb_permissions", []string{"id", "namespace", "grantee_user_id", "document_name", "permission", "granted_by", "created_at", "updated_at"}},
 	{"kb_invitations", []string{"id", "namespace", "inviter_user_id", "invitee_user_id", "permission", "scope", "document_names", "token_digest", "status", "created_at", "expires_at", "accepted_at", "updated_at"}},
+	{"model_profiles", []string{"id", "kind", "name", "base_url", "model", "protected_key", "vector_size", "created_at", "updated_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -65,6 +67,7 @@ var expectedPrimaryKeys = map[string][]string{
 	"user_sessions":           {"id"},
 	"kb_permissions":          {"id"},
 	"kb_invitations":          {"id"},
+	"model_profiles":          {"id"},
 }
 
 var expectedUniques = map[string]string{
@@ -78,6 +81,7 @@ var expectedUniques = map[string]string{
 	"user_sessions":      "uq_user_sessions_token_digest",
 	"kb_permissions":     "uq_kb_permissions_scope",
 	"kb_invitations":     "uq_kb_invitations_token_digest",
+	"model_profiles":     "uq_model_profiles_kind_name",
 }
 
 var expectedIndexes = map[string][]string{
@@ -98,6 +102,7 @@ var expectedIndexes = map[string][]string{
 	"user_sessions":           {"ix_user_sessions_user_id"},
 	"kb_permissions":          {"ix_kb_permissions_grantee"},
 	"kb_invitations":          {"ix_kb_invitations_invitee", "ix_kb_invitations_namespace"},
+	"model_profiles":          {"ix_model_profiles_kind"},
 }
 
 // expectedTableNames returns the schema table names in Python declaration order.
