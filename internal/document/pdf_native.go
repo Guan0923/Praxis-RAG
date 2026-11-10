@@ -18,16 +18,14 @@ import (
 )
 
 // NativePDFParser parses PDF text in-process with a pure-Go PDF reader. It is
-// the default "go" PDF engine: no Python or Docling installation is required.
-// The output is the same manifest contract the external Docling worker writes
-// (docling-formula-remote-v3), restricted to ordered text blocks: layout
-// models, table structure, OCR and remote-VLM formulas/pictures are only
-// available through the optional Docling engine.
+// the only PDF engine: no Python, Docling or external process is involved.
+// The output is the manifest contract defined in pdf.go, restricted to ordered
+// text blocks. Layout models, table structure, OCR and formula/picture assets
+// are not produced by this engine.
 type NativePDFParser struct{}
 
-// PDFNativeEngine tags manifests produced by the in-process parser. The
-// manifest version stays PDFParserVersion because the JSON contract and the
-// chunk metadata are unchanged; Parser["engine"] records the implementation.
+// PDFNativeEngine tags manifests produced by the in-process parser.
+// Parser["engine"] records the implementation.
 const PDFNativeEngine = "go-native"
 
 // pdfLine is one visual line of a page: a baseline, the dominant font size and
@@ -110,7 +108,7 @@ func (p *NativePDFParser) ParseInto(ctx context.Context, source, staging string)
 	}
 	if len(blocks) == 0 {
 		return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf(
-			"PDF 没有可索引的内容：%s（未提取到文本，扫描件需要 OCR 或 Docling 引擎）", name)}
+			"PDF 没有可索引的内容：%s（未提取到文本，扫描件需要 OCR 后再导入）", name)}
 	}
 	if characters > MaxExtractedCharacters {
 		return PDFManifest{}, &PDFParseError{Message: "Parsed PDF exceeds the extracted text limit"}

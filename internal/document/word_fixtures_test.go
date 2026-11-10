@@ -2,14 +2,30 @@ package document
 
 import (
 	"archive/zip"
+	"bytes"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
-// testJPEGBytes is the "original image bytes" payload used by the Word asset
-// tests (no image decoding happens in the reader).
-var testJPEGBytes = []byte("\xff\xd8\xff\xe0test-jpeg-payload\xff\xd9")
+// testJPEGBytes is a real decodable JPEG used by the Word asset tests and the
+// vision describer tests (the reader itself does not decode images).
+var testJPEGBytes = func() []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 640, 480))
+	for y := 0; y < 480; y++ {
+		for x := 0; x < 640; x++ {
+			img.Set(x, y, color.RGBA{R: 200, G: 60, B: 60, A: 255})
+		}
+	}
+	var buffer bytes.Buffer
+	if err := jpeg.Encode(&buffer, img, nil); err != nil {
+		panic(err)
+	}
+	return buffer.Bytes()
+}()
 
 func pictureRun(relID, title string) string {
 	label := ""

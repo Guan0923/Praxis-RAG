@@ -6,6 +6,55 @@
 > is recorded immediately below. RocketMQ wording in the historical sections is
 > retained as history.
 
+## Go-only parser workers (Python/Docling removed) — 2026-11-10
+
+Delivered: the compatibility layer is gone. PDF text extraction, DOCX reading
+and Word picture descriptions all run in the Go process; `RAG_PDF_ENGINE`,
+`RAG_PDF_PARSER_PYTHON`, `RAG_PDF_MODELS_PATH` and `RAG_PDF_PARSE_TIMEOUT` were
+removed, `ExternalPDFParser`/`CommandRunner` were deleted, `ingest.PDFOptions`
+now only carries an optional `Parser` (default `document.NativePDFParser`), and
+the manifest version written by new imports is `go-native-v1` (stored manifests
+are still readable because readers do not re-check the version).
+
+The Word vision worker became a Go HTTP client: `document.WordVisionWorker`
+decodes the picture (png/jpeg/gif/bmp/tiff via `golang.org/x/image`), scales it
+to a 384-pixel edge cap, re-encodes PNG and calls the knowledge base's
+OpenAI-compatible `/chat/completions` endpoint with the fixed description
+prompt (max_tokens 256). Transient 429/5xx responses are retried three times,
+refusal/generic answers are rejected by the existing filter, and descriptions
+are cleaned and persisted into the manifest. Without a configured VLM the
+pictures keep placeholder descriptions and the upload still succeeds; request
+timeout comes from the VLM settings (120 s default, 30 s floor).
+
+Also deleted: `python-workers/` (Docling PDF worker, Word vision worker, Python
+package) and `benchmarks/` (Docling evaluation scripts). README, USAGE,
+DEPLOYMENT, GO_MIGRATION, `.env.example`, `deploy/config.container.toml` and the
+startup config template were updated to the Go-only pipeline. `scripts/verify-*.py`
+remain as optional infrastructure test tooling, not runtime code.
+
+Automated checks (worktree `go-only-parsers`, uncommitted at verification time):
+
+- `go build ./...` and `go vet ./...` — clean.
+- `go test ./internal/document ./internal/ingest ./internal/config ./internal/document/pdfcontent ./internal/chunking -count=1` — pass. New `internal/document/vision_test.go` covers the httptest VLM success path (image data URL, bearer auth, prompt, 384-px scaling), captioned-picture skip, missing endpoint/model, refusal rejection, 503 retry (3 attempts), HTTP 400 failure, request timeout, undecodable image and manifest handling. The ingest Word-vision integration test now uses an httptest VLM server and a real JPEG fixture.
+- `go test ./internal/runtime -run 'Upload|Pdf|PDF|Word|Vision' -count=1` — pass (231 s), including the byte-identical replay and PDF chunking paths.
+
+Live end-to-end check (service on `127.0.0.1:8011`, MySQL `praxis_rag`, KB `asdjasdajbsc`, real embedding endpoint `http://aihub-api.goertek.com:30080/v1` + `bge-m3`):
+
+- `POST /v1/documents` with Chinese `it-manual-cn.pdf` → `200` in 70.6 s, `failed: []`, 9 chunks, `pdf_parser_version = go-native-v1`; no Python/Docling error in the log.
+- `DELETE /v1/documents/it-manual-cn.pdf` → `200` (9 chunks deleted); follow-up `GET /v1/documents` no longer lists it and `GET .../content` returns `404 Document does not exist`.
+- Re-uploading `2404.16130v2.pdf` → `200`, `COMMITTED`, 35 chunks, stored manifest `pdf-assets/doc-850325c2ab92aea47056c511dd37528b/manifest.json` now contains `go-native` (26 pages / 349 blocks / 89,856 characters), `upload_operations.error = NULL`; Console `:8011/console` still returns 200.
+
+Known gaps: the Go PDF engine does not produce layout analysis, table structure,
+OCR, formula or picture assets (two-column PDFs can interleave columns; scans
+need OCR first). Word picture descriptions depend on the remote VLM and were only
+tested against httptest servers, not a real endpoint. `.doc` conversion still
+needs external LibreOffice.
+
+> **Superseded design note:** the section below (“In-process Go PDF engine”) was
+> written earlier the same day when `RAG_PDF_ENGINE=docling` was still an
+> optional fallback; the compatibility layer described there was removed by this
+> change.
+
 ## In-process Go PDF engine — 2026-11-10
 
 Delivered: PDF upload no longer requires a Python/Docling installation. The new

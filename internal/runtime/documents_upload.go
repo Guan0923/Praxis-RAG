@@ -17,7 +17,6 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
-	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/ingest"
 	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
@@ -638,7 +637,7 @@ func (s *Service) ingestDocument(
 			Chunking:       resources.chunking,
 			TokenizerModel: resources.tokenizerModel,
 			StagingDir:     filepath.Join(workspace, "parsed"),
-			PDF:            s.uploadPDFOptions(resources.vlm),
+			PDF:            ingest.PDFOptions{},
 			Word: ingest.WordOptions{
 				Converter: &document.SofficeConverter{
 					Executable: s.config.WordConverterPath,
@@ -831,23 +830,6 @@ func (s *Service) failDocumentOperation(
 	log.Printf("Upload %s failed category=%s detail=%q",
 		operation.ID, errorTypeName(cause), truncateText(cause.Error(), 500))
 	return nil, &documentOperationError{Err: cause, OperationID: operation.ID}
-}
-
-// uploadPDFOptions selects the PDF parser for one upload. The default engine
-// parses PDF text in-process, so a PDF upload no longer requires a
-// Python/Docling installation; RAG_PDF_ENGINE=docling keeps the external
-// worker (layout, tables, OCR and remote-VLM formulas).
-func (s *Service) uploadPDFOptions(vlm document.VLMSettings) ingest.PDFOptions {
-	options := ingest.PDFOptions{
-		Executable: s.config.PDFParserPython,
-		ModelsPath: s.config.PDFModelsPath,
-		VLM:        vlm,
-		Timeout:    time.Duration(s.config.PDFParseTimeout) * time.Second,
-	}
-	if s.config.PDFEngine != config.PDFEngineDocling {
-		options.Parser = &document.NativePDFParser{}
-	}
-	return options
 }
 
 // replayCommittedUpload validates the bytes of an idempotent replay without
@@ -1207,12 +1189,7 @@ func (s *Service) wordVisionWorker(vlm document.VLMSettings) *document.WordVisio
 	if !vlm.Configured() {
 		return nil
 	}
-	return &document.WordVisionWorker{
-		Executable: s.config.PDFParserPython,
-		ModelsPath: s.config.PDFModelsPath,
-		VLM:        vlm,
-		Timeout:    time.Duration(s.config.PDFParseTimeout) * time.Second,
-	}
+	return &document.WordVisionWorker{VLM: vlm}
 }
 
 // uploadVLM prefers the knowledge base's own VLM provider and falls back to the

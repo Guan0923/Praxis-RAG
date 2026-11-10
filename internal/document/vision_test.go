@@ -1,66 +1,21 @@
 package document
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
-	"errors"
+	"image"
+	"image/png"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
-
-// fakeVisionRunner mutates the manifest like word_vision_worker.py would.
-type fakeVisionRunner struct {
-	calls            int
-	args             []string
-	env              map[string]string
-	stdout, stderr   []byte
-	err              error
-	blockUntilCancel bool
-	describe         string
-}
-
-func (f *fakeVisionRunner) Run(ctx context.Context, name string, args []string, env map[string]string) ([]byte, []byte, error) {
-	f.calls++
-	f.args = args
-	f.env = env
-	if f.blockUntilCancel {
-		<-ctx.Done()
-		return nil, nil, ctx.Err()
-	}
-	if f.err != nil {
-		return f.stdout, f.stderr, f.err
-	}
-	if f.describe != "" {
-		manifestPath := argumentValue(args, "--manifest")
-		raw, err := os.ReadFile(manifestPath)
-		if err != nil {
-			return nil, []byte(err.Error()), err
-		}
-		var manifest map[string]any
-		if err := json.Unmarshal(raw, &manifest); err != nil {
-			return nil, nil, err
-		}
-		assets, _ := manifest["assets"].([]any)
-		for _, item := range assets {
-			asset, _ := item.(map[string]any)
-			if asset["kind"] != "picture" || asset["caption"] != "" {
-				continue
-			}
-			asset["generated_description"] = f.describe
-		}
-		updated, err := json.Marshal(manifest)
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := os.WriteFile(manifestPath, updated, 0o644); err != nil {
-			return nil, nil, err
-		}
-	}
-	return f.stdout, f.stderr, nil
-}
 
 func prepareVisionStaging(t *testing.T) (*WordPackage, string) {
 	t.Helper()
@@ -99,54 +54,112 @@ func TestValidateVisionDescription(t *testing.T) {
 	}
 }
 
+// visionCall captures one decoded vision request for assertions.
+type visionCall struct {
+	model  string
+	prompt string
+	image  image.Image
+	auth   string
+}
+
+func decodeVisionCall(t *testing.T, request *http.Request) visionCall {
+	t.Helper()
+	var payload struct {
+		Model    string `json:"model"`
+		Messages []struct {
+			Content []struct {
+				Type     string `json:"type"`
+				Text     string `json:"text"`
+				ImageURL struct {
+					URL string `json:"url"`
+				} `json:"image_url"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+		t.Fatalf("vision request is not valid JSON: %v", err)
+	}
+	call := visionCall{model: payload.Model, auth: request.Header.Get("Authorization")}
+	for _, message := range payload.Messages {
+		for _, part := range message.Content {
+			switch part.Type {
+			case "text":
+				call.prompt = part.Text
+			case "image_url":
+				const prefix = "data:image/png;base64,"
+				if !strings.HasPrefix(part.ImageURL.URL, prefix) {
+					t.Fatalf("image url prefix = %q", part.ImageURL.URL)
+				}
+				raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(part.ImageURL.URL, prefix))
+				if err != nil {
+					t.Fatalf("image base64 = %v", err)
+				}
+				decoded, err := png.Decode(bytes.NewReader(raw))
+				if err != nil {
+					t.Fatalf("image is not PNG: %v", err)
+				}
+				call.image = decoded
+			}
+		}
+	}
+	return call
+}
+
+func writeVisionResponse(w http.ResponseWriter, content string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"choices": []map[string]any{{"message": map[string]any{"content": content}}},
+	})
+}
+
 func TestVisionDescribeMissingCaptionsSuccess(t *testing.T) {
 	pkg, dir := prepareVisionStaging(t)
 	if missing := MissingPictureCaptions(pkg.Manifest); len(missing) != 1 || missing[0] != "picture-1" {
 		t.Fatalf("missing = %v", missing)
 	}
-	runner := &fakeVisionRunner{describe: "A red indicator is lit on the control panel."}
-	worker := &WordVisionWorker{
-		Executable: "test-python",
-		PythonPath: "/package/root",
-		ModelsPath: "/models",
-		VLM:        testVLM,
-		Timeout:    5 * time.Second,
-		Runner:     runner,
-	}
+	var call visionCall
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		call = decodeVisionCall(t, r)
+		writeVisionResponse(w, "A red indicator is lit on the control panel")
+	}))
+	defer server.Close()
+	worker := &WordVisionWorker{VLM: VLMSettings{
+		BaseURL: server.URL + "/v1",
+		APIKey:  "test-key",
+		Model:   "test-vlm",
+		Timeout: 5 * time.Second,
+	}}
 	if err := worker.DescribeMissingCaptions(context.Background(), dir); err != nil {
 		t.Fatalf("DescribeMissingCaptions() error = %v", err)
 	}
-	if runner.calls != 1 {
-		t.Fatalf("runner calls = %d", runner.calls)
+	if call.auth != "Bearer test-key" || call.model != "test-vlm" {
+		t.Fatalf("call = %+v", call)
 	}
-	if argumentValue(runner.args, "-m") != "rag_mcp.word_vision_worker" {
-		t.Fatalf("args = %v", runner.args)
+	if call.prompt == "" || !strings.Contains(call.prompt, "Describe the visible content") {
+		t.Fatalf("prompt = %q", call.prompt)
 	}
-	if argumentValue(runner.args, "--manifest") != filepath.Join(dir, "manifest.json") {
-		t.Fatalf("manifest arg = %q", argumentValue(runner.args, "--manifest"))
+	if call.image == nil {
+		t.Fatalf("image was not sent")
 	}
-	if argumentValue(runner.args, "--models") != "/models" {
-		t.Fatalf("models arg = %q", argumentValue(runner.args, "--models"))
-	}
-	if runner.env["PYTHONUTF8"] != "1" || !strings.HasPrefix(runner.env["PYTHONPATH"], "/package/root") {
-		t.Fatalf("env = %v", runner.env)
-	}
-	if runner.env["RAG_VLM_BASE_URL"] != "http://vlm.test/v1" || runner.env["RAG_VLM_MODEL"] != "test-vlm" ||
-		runner.env["RAG_VLM_API_KEY"] != "test-key" {
-		t.Fatalf("vlm env = %v", runner.env)
+	if bounds := call.image.Bounds(); bounds.Dx() > 384 || bounds.Dy() > 384 {
+		t.Fatalf("image size = %v, want max edge <= 384", bounds)
 	}
 	if err := pkg.ReloadFromStaging(dir); err != nil {
 		t.Fatalf("ReloadFromStaging() error = %v", err)
 	}
-	if pkg.Manifest.Assets[0].GeneratedDescription != "A red indicator is lit on the control panel." {
-		t.Fatalf("description = %q", pkg.Manifest.Assets[0].GeneratedDescription)
+	want := "A red indicator is lit on the control panel."
+	if pkg.Manifest.Assets[0].GeneratedDescription != want {
+		t.Fatalf("description = %q, want %q", pkg.Manifest.Assets[0].GeneratedDescription, want)
 	}
 	content, err := BuildWordContent("doc-v", pkg)
 	if err != nil {
 		t.Fatalf("BuildWordContent() error = %v", err)
 	}
 	payload := content.Assets[0].Payload("vision.docx")
-	if payload["generated_description"] != "A red indicator is lit on the control panel." {
+	if payload["generated_description"] != want {
 		t.Fatalf("payload generated_description = %v", payload["generated_description"])
 	}
 }
@@ -162,83 +175,156 @@ func TestVisionSkipsWorkerWhenNothingMissing(t *testing.T) {
 	if err := pkg.WriteStaging(dir); err != nil {
 		t.Fatalf("WriteStaging() error = %v", err)
 	}
-	runner := &fakeVisionRunner{}
-	worker := &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: runner}
+	calls := int32(0)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		writeVisionResponse(w, "unused")
+	}))
+	defer server.Close()
+	worker := &WordVisionWorker{VLM: VLMSettings{BaseURL: server.URL + "/v1", Model: "test-vlm"}}
 	if err := worker.DescribeMissingCaptions(context.Background(), dir); err != nil {
 		t.Fatalf("DescribeMissingCaptions() error = %v", err)
 	}
-	if runner.calls != 0 {
-		t.Fatalf("runner calls = %d", runner.calls)
+	if atomic.LoadInt32(&calls) != 0 {
+		t.Fatalf("vision endpoint was called for a captioned picture")
 	}
 }
 
 func TestVisionRequiresRemoteVLM(t *testing.T) {
 	_, dir := prepareVisionStaging(t)
-	runner := &fakeVisionRunner{describe: "unused"}
-	worker := &WordVisionWorker{Runner: runner}
+	worker := &WordVisionWorker{}
 	err := worker.DescribeMissingCaptions(context.Background(), dir)
 	want := "Word image description failed: RAG_VLM_BASE_URL is required for uncaptioned Word images"
 	if err == nil || err.Error() != want {
 		t.Fatalf("error = %v", err)
 	}
-	if runner.calls != 0 {
-		t.Fatalf("runner was called without a remote VLM")
+	missingModel := &WordVisionWorker{VLM: VLMSettings{BaseURL: "http://vlm.test/v1"}}
+	err = missingModel.DescribeMissingCaptions(context.Background(), dir)
+	if err == nil || !strings.Contains(err.Error(), "RAG_VLM_MODEL is required") {
+		t.Fatalf("missing model error = %v", err)
 	}
-}
-
-// testVLM is the remote endpoint every worker test configures.
-var testVLM = VLMSettings{
-	BaseURL:     "http://vlm.test/v1",
-	APIKey:      "test-key",
-	Model:       "test-vlm",
-	Timeout:     30 * time.Second,
-	Concurrency: 2,
 }
 
 func TestVisionRejectsRefusal(t *testing.T) {
 	_, dir := prepareVisionStaging(t)
-	runner := &fakeVisionRunner{describe: "I'm sorry, but I cannot provide a description of this image."}
-	worker := &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: runner}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeVisionResponse(w, "I'm sorry, but I cannot provide a description of this image.")
+	}))
+	defer server.Close()
+	worker := &WordVisionWorker{VLM: VLMSettings{BaseURL: server.URL + "/v1", Model: "test-vlm"}}
 	err := worker.DescribeMissingCaptions(context.Background(), dir)
 	if err == nil || !strings.Contains(err.Error(), "Vision did not describe the image") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
-func TestVisionProcessFailureDetail(t *testing.T) {
+func TestVisionRetriesTransientStatus(t *testing.T) {
+	previousDelay := visionRequestRetryDelay
+	visionRequestRetryDelay = 5 * time.Millisecond
+	defer func() { visionRequestRetryDelay = previousDelay }()
 	_, dir := prepareVisionStaging(t)
-	runner := &fakeVisionRunner{
-		err:    errors.New("exit status 1"),
-		stderr: []byte("Traceback (most recent call last):\n  File x\nValueError: models are missing\n"),
+	attempts := int32(0)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := atomic.AddInt32(&attempts, 1)
+		if attempt < 3 {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writeVisionResponse(w, "A green pump panel.")
+	}))
+	defer server.Close()
+	worker := &WordVisionWorker{VLM: VLMSettings{BaseURL: server.URL + "/v1", Model: "test-vlm"}}
+	if err := worker.DescribeMissingCaptions(context.Background(), dir); err != nil {
+		t.Fatalf("DescribeMissingCaptions() error = %v", err)
 	}
-	worker := &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: runner}
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("attempts = %d, want 3", got)
+	}
+}
+
+func TestVisionHTTPFailure(t *testing.T) {
+	_, dir := prepareVisionStaging(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer server.Close()
+	worker := &WordVisionWorker{VLM: VLMSettings{BaseURL: server.URL + "/v1", Model: "test-vlm"}}
 	err := worker.DescribeMissingCaptions(context.Background(), dir)
-	if err == nil || err.Error() != "Word image description failed: ValueError: models are missing" {
+	if err == nil || !strings.Contains(err.Error(), "Remote VLM returned HTTP 400") {
 		t.Fatalf("error = %v", err)
-	}
-	runner = &fakeVisionRunner{err: errors.New("exit status 1"), stdout: []byte("line one\nlast stdout line")}
-	worker = &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: runner}
-	err = worker.DescribeMissingCaptions(context.Background(), dir)
-	if err == nil || err.Error() != "Word image description failed: last stdout line" {
-		t.Fatalf("stdout detail error = %v", err)
 	}
 }
 
 func TestVisionTimeout(t *testing.T) {
+	previousDelay := visionRequestRetryDelay
+	previousMinimum := visionMinimumRequestTimeout
+	visionRequestRetryDelay = time.Millisecond
+	visionMinimumRequestTimeout = 20 * time.Millisecond
+	defer func() {
+		visionRequestRetryDelay = previousDelay
+		visionMinimumRequestTimeout = previousMinimum
+	}()
 	_, dir := prepareVisionStaging(t)
-	runner := &fakeVisionRunner{blockUntilCancel: true}
-	worker := &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: runner, Timeout: 20 * time.Millisecond}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(150 * time.Millisecond)
+		writeVisionResponse(w, "too late")
+	}))
+	defer server.Close()
+	worker := &WordVisionWorker{VLM: VLMSettings{BaseURL: server.URL + "/v1", Model: "test-vlm", Timeout: 20 * time.Millisecond}}
 	err := worker.DescribeMissingCaptions(context.Background(), dir)
-	if err == nil || !strings.Contains(err.Error(), "timed out") {
+	if err == nil || !strings.Contains(err.Error(), "Remote VLM call failed after 3 attempts") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestVisionUndecodableImage(t *testing.T) {
+	_, dir := prepareVisionStaging(t)
+	manifest, err := ReadWordManifestFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("ReadWordManifestFile() error = %v", err)
+	}
+	if len(manifest.Assets) == 0 || manifest.Assets[0].ImageFile == nil {
+		t.Fatalf("manifest has no picture asset")
+	}
+	imagePath := filepath.Join(dir, filepath.FromSlash(*manifest.Assets[0].ImageFile))
+	if err := os.WriteFile(imagePath, []byte("not an image"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	worker := &WordVisionWorker{VLM: VLMSettings{BaseURL: "http://vlm.test/v1", Model: "test-vlm"}}
+	err = worker.DescribeMissingCaptions(context.Background(), dir)
+	if err == nil || !strings.Contains(err.Error(), "not a decodable image") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestVisionMissingManifest(t *testing.T) {
-	worker := &WordVisionWorker{ModelsPath: "/models", VLM: testVLM, Runner: &fakeVisionRunner{}}
+	worker := &WordVisionWorker{VLM: VLMSettings{BaseURL: "http://vlm.test/v1", Model: "test-vlm"}}
 	err := worker.DescribeMissingCaptions(context.Background(), t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "Word image description failed") ||
 		!strings.Contains(err.Error(), "manifest is missing") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestVisionChatURLAndCleanDescription(t *testing.T) {
+	cases := map[string]string{
+		"http://vlm.test":                   "http://vlm.test/v1/chat/completions",
+		"http://vlm.test/v1":                "http://vlm.test/v1/chat/completions",
+		"http://vlm.test/v1/chat/completions": "http://vlm.test/v1/chat/completions",
+		"http://vlm.test/v1/":               "http://vlm.test/v1/chat/completions",
+	}
+	for base, want := range cases {
+		if got := vlmChatURL(base); got != want {
+			t.Fatalf("vlmChatURL(%q) = %q, want %q", base, got, want)
+		}
+	}
+	if got := cleanVisionDescription(" A pump. <end_of_utterance>"); got != "A pump." {
+		t.Fatalf("cleanVisionDescription() = %q", got)
+	}
+	if got := cleanVisionDescription("A red lamp"); got != "A red lamp." {
+		t.Fatalf("cleanVisionDescription() = %q", got)
+	}
+	if got := cleanVisionDescription("已经完成描述"); got != "已经完成描述." {
+		t.Fatalf("cleanVisionDescription(CJK) = %q", got)
 	}
 }

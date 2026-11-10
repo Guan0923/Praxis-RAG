@@ -4,11 +4,11 @@
 // Qdrant, embedding or queue dependencies and performs no persistence.
 //
 // Dispatch (mirrors DenseDocumentIngester.ingest_and_publish):
-//   - .pdf: the injected PDFParser (or the built-in external Docling worker
-//     options) produces a manifest, then BuildPDFContent + pdfcontent.ContentChunks.
+//   - .pdf: the injected PDFParser (default: in-process NativePDFParser)
+//     produces a manifest, then BuildPDFContent + pdfcontent.ContentChunks.
 //   - .doc/.docx: ParseWordPackage (legacy .doc converted first), optional
-//     external vision descriptions, BuildWordContent, then the Word chunk
-//     builder (word_assets.word_chunks port).
+//     in-process VLM picture descriptions, BuildWordContent, then the Word
+//     chunk builder (word_assets.word_chunks port).
 //   - .md/.txt (and any other suffix, which fails in the reader): the
 //     rag_mcp.chunking.chunk_document port (chunking.ChunkDocument).
 //
@@ -26,7 +26,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
 	"github.com/Guan0923/xinghe_rag/internal/document"
@@ -35,31 +34,18 @@ import (
 
 const defaultTokenizerModel = "BAAI/bge-m3"
 
-// PDFParser parses one PDF into a Docling manifest and writes the worker
-// artifacts (manifest.json, page/picture/table images) into stagingDir.
-// document.ExternalPDFParser satisfies it; tests inject fakes.
+// PDFParser parses one PDF into a document manifest and writes the parser
+// artifacts (manifest.json, document.md) into stagingDir.
+// document.NativePDFParser satisfies it; tests inject fakes.
 type PDFParser interface {
 	ParseInto(ctx context.Context, source, stagingDir string) (document.PDFManifest, error)
 }
 
-// PDFOptions selects how PDFs are parsed. When Parser is nil, an
-// document.ExternalPDFParser is built from the command fields below.
+// PDFOptions selects how PDFs are parsed. When Parser is nil the in-process
+// document.NativePDFParser is used.
 type PDFOptions struct {
-	// Parser overrides external process execution (tests or custom workers).
+	// Parser overrides the in-process parser (tests or custom engines).
 	Parser PDFParser
-	// Executable is the Python interpreter (empty means "python").
-	Executable string
-	// Module is the external worker module (empty means "rag_mcp.pdf_worker").
-	Module string
-	// PythonPath is prepended to PYTHONPATH for the worker process.
-	PythonPath string
-	// ModelsPath is passed to the worker as --models when set.
-	ModelsPath string
-	// VLM configures the remote vision-language endpoint used for formula
-	// recognition and picture descriptions.
-	VLM document.VLMSettings
-	// Timeout bounds one worker run (zero means the worker default).
-	Timeout time.Duration
 }
 
 // WordOptions selects Word parsing dependencies.
@@ -67,8 +53,8 @@ type WordOptions struct {
 	// Converter converts legacy .doc files before OOXML parsing. nil means a
 	// document.SofficeConverter (environment auto-detection) is used.
 	Converter document.DOCConverter
-	// Vision describes uncaptioned pictures through the external
-	// word_vision_worker before chunking. nil keeps generated_description empty.
+	// Vision describes uncaptioned pictures through the remote VLM before
+	// chunking. nil keeps generated_description empty.
 	Vision *document.WordVisionWorker
 }
 
@@ -305,14 +291,7 @@ func preparePDF(ctx context.Context, sourcePath string, options Options) (Result
 	}
 	parser := options.PDF.Parser
 	if parser == nil {
-		parser = &document.ExternalPDFParser{
-			Executable: options.PDF.Executable,
-			Module:     options.PDF.Module,
-			PythonPath: options.PDF.PythonPath,
-			ModelsPath: options.PDF.ModelsPath,
-			VLM:        options.PDF.VLM,
-			Timeout:    options.PDF.Timeout,
-		}
+		parser = &document.NativePDFParser{}
 	}
 	manifest, err := parser.ParseInto(ctx, sourcePath, staging)
 	if err != nil {

@@ -14,7 +14,7 @@
 - 与 Qdrant、MySQL/SQLite、Redis、RocketMQ 的现有交互格式与既有数据。
 
 前端（`frontend/`，React + Vite）不重写；构建产物仍输出到 Console 静态目录。
-PDF 正文解析已由 Go 内置引擎（`internal/document/pdf_native.go`，纯 Go PDF 阅读器）默认承担，不再依赖外部进程；Docling 仍作为可选的 `RAG_PDF_ENGINE=docling` 外部 Python 解析进程保留（版面/表格/OCR/公式与图片描述），Word 视觉解析仍走外部 Python worker。
+PDF 正文解析、DOCX 读取与 Word 图片描述已全部由 Go 进程内完成（PDF 使用纯 Go 阅读器，图片描述由 Go 直接调用远端 OpenAI 兼容 VLM）；`python-workers/` 与 `benchmarks/` 已从仓库删除，运行时不依赖 Python。仅 .doc 转换仍使用外部 LibreOffice。
 Go 只负责按其现有协议调用并消费解析结果；语义检索和重排本来就是 HTTP 模型 API。
 
 ## 2. 目标架构
@@ -112,7 +112,7 @@ assets/                   可选嵌入资源目录（构建时生成，不入库
 - **Tokenizer 依赖**：Python 用 `transformers` 加载 BGE-M3 tokenizer 做 token 预算切分。
   Go 侧没有等价库，需在 G3 决策：纯 Go SentencePiece/Unigram 实现（推荐，需与
   `AutoTokenizer` 结果对齐验证）或把 tokenizer 作为外部小进程。切分边界必须保持可复现。
-- **PDF/Word 解析**：PDF 正文默认由 Go 内置解析器完成（`RAG_PDF_ENGINE=go`），Docling 降级为可选的 `RAG_PDF_ENGINE=docling` 外部 Python 解析进程，Go 通过文件协议调用；Word 视觉模型仍保持外部 Python 解析进程。这属于「外部解析器」而非后端业务逻辑，需在 README 中明确。
+- **PDF/Word 解析**：在 Go 进程内完成——PDF 由纯 Go 阅读器抽取正文，DOCX 由内置 OOXML 读取器解析，Word 无图注图片由 Go 直接调用远端 VLM。只有 .doc 转换使用外部 LibreOffice。不保留 Python 解析进程。
 - **RocketMQ Go SDK**：官方 Go client 的 gRPC 协议需与 Broker 5.3.3 + Proxy 兼容性实测；
   不通过时降级为自研 gRPC 封装，风险在 G7 处理。
 - **Qdrant 本地路径模式**：Python `qdrant-client` 支持 `QDRANT_PATH` 本地文件模式；Go 版
@@ -333,8 +333,8 @@ REST /v1/admin/tools -> 6 tools
 ### Python 后端的定位（已删除）
 
 - 原 Python 后端（`src/rag_mcp/` 的 HTTP/MCP/状态/检索/文档/测试、`tests/`、`pyproject.toml`、`uv.lock`）**已从仓库删除**。
-- 仅保留 `python-workers/rag_mcp/`：PDF（Docling）与 Word 视觉解析两个**外部进程 worker** 及其最小依赖闭包（`document_readers`/`chunk_strategies`/`chunking`/`pdf_content`），由 Go 以 `python -m rag_mcp.<worker>` 子进程协议调用；`python-workers/README.md` 记录依赖与 `PYTHONPATH` 约定。
-- `benchmarks/`（Docling 评估脚本）保留为可选研究工具；`examples/` 保留示例知识库文件。
+- **Python 解析 worker 已删除（2026-11-10）**：`python-workers/`（PDF Docling worker 与 Word 视觉 worker）与 `benchmarks/` 评估脚本一并删除；PDF/DOCX 解析与 Word 图片描述全部由 Go 实现，仓库不再包含 Python 代码或 Python 运行依赖。
+- `examples/` 保留示例知识库文件。
 - 数据层兼容：Go 复用既有 MySQL/SQLite schema、`enc:v1:` 凭据与 `~/.praxis-rag/` 配置/数据目录；`rag-state-migrate` 可检查/幂等建表，`rag-service-migrate --apply` 只导入状态、**不重建向量**（需重新上传或等待 reindex）。
 - 已删除 Python 旧路径专用项：`RAG_OUTBOX_BRIDGE=debezium`（Go 未实现，配置 broker 时 Go 总是进程内 relay）、Python worker 命令、`scripts/start-stack.ps1` 的 Python 入口（已改写为 Go 流程）、`scripts/start-debezium-stack.ps1`。
 
@@ -342,7 +342,7 @@ REST /v1/admin/tools -> 6 tools
 
 1. **真实依赖 e2e**：异步链路已由 `internal/e2e`（fake Qdrant/模型 + 内存 broker/Redis + 真实 SQLite/runtime）覆盖并通过；MySQL/Redis/RocketMQ/Qdrant 实机回归与 Go RocketMQ SDK 对 Broker 5.3.3 + Proxy 的兼容性仍需在具备环境的主机验证。
 2. **parity 收尾**：P0 全部关闭，主要 P1 已修复；剩余 P2（casefold 排序近似、API key 列表 read-view 来源、少量错误形状）与同步上传 notifier 的权威快照细节见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。Python 对照实现已删除，因此黑盒差分改为“固定预期/契约测试”。
-3. **已知迁移差异需持续标注**：Go tokenizer 是确定性近似；PDF/DOC/Word 视觉解析仍依赖外部 Python/LibreOffice 进程；Docker/systemd 实机验证与浏览器 E2E 仍未执行；Word 视觉描述 worker 尚未接入 Go。
+3. **已知迁移差异需持续标注**：Go tokenizer 是确定性近似；只有 .doc 转换依赖外部 LibreOffice；Docker/systemd 实机验证与浏览器 E2E 仍未执行；真实 VLM 端点尚未实机联调。
 4. **打包切换**：`scripts/build-go.ps1`（含冒烟）与 Dockerfile/Compose `app` profile 已切到 Go；管理命令与迁移 CLI 全部为 Go 二进制。
 
 ### 下一步（按依赖顺序）

@@ -30,10 +30,8 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 # RAG_MYSQL_USER = "rag"
 # RAG_MYSQL_DATABASE = "praxis_rag"
 
-# Set actual local paths to enable DOC conversion and local PDF stages.
+# Set actual local paths to enable DOC conversion.
 # RAG_WORD_CONVERTER_PATH = 'C:/Program Files/LibreOffice/program/soffice.exe'
-# RAG_PDF_PARSER_PYTHON = 'C:/path/to/parser/python.exe'
-# RAG_PDF_MODELS_PATH = 'C:/path/to/docling/models'
 
 # Formula recognition and picture descriptions call a remote OpenAI-compatible
 # vision-language endpoint. RAG_VLM_API_KEY belongs in the environment.
@@ -71,7 +69,6 @@ var observedKeys = []string{
 	"RAG_DENSE_VECTOR_SIZE", "RAG_PRELOAD_MODEL", "RAG_NAMESPACE", "RAG_RERANKER_MODEL",
 	"RAG_RERANKER_DEVICE", "RAG_RERANKER_BATCH_SIZE", "RAG_RERANKER_MAX_CANDIDATES",
 	"RAG_RERANKER_MAX_LENGTH", "RAG_RERANKER_MAX_TEXT_CHARS", "RAG_PRELOAD_RERANKER",
-	"RAG_PDF_PARSER_PYTHON", "RAG_PDF_MODELS_PATH", "RAG_PDF_PARSE_TIMEOUT",
 	"RAG_VLM_BASE_URL", "RAG_VLM_API_KEY", "RAG_VLM_MODEL", "RAG_VLM_TIMEOUT",
 	"RAG_VLM_CONCURRENCY",
 	"RAG_WORD_CONVERTER_PATH", "RAG_WORD_CONVERT_TIMEOUT",

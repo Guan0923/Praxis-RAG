@@ -2,13 +2,8 @@ package document
 
 import (
 	"context"
-	"errors"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 const minimalPDF = "%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
@@ -121,167 +116,9 @@ func TestPDFCharacterLimit(t *testing.T) {
 func TestPDFParserUnavailable(t *testing.T) {
 	path := writeValidPDF(t, "manual.pdf")
 	_, err := ReadText(path)
-	if err == nil || !strings.Contains(err.Error(), "PDF 文本解析需要外部 Docling 解析器") {
+	if err == nil || !strings.Contains(err.Error(), "PDF 文本解析未配置解析器") {
 		t.Fatalf("error = %v", err)
 	}
-}
-
-type fakeCommandRunner struct {
-	name             string
-	args             []string
-	env              map[string]string
-	err              error
-	manifest         string
-	blockUntilCancel bool
-}
-
-func (r *fakeCommandRunner) Run(ctx context.Context, name string, args []string, env map[string]string) error {
-	r.name, r.args, r.env = name, args, env
-	if r.blockUntilCancel {
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	if r.err != nil {
-		return r.err
-	}
-	if r.manifest != "" {
-		manifestPath := argumentValue(args, "--manifest")
-		if manifestPath == "" {
-			return errors.New("no manifest argument")
-		}
-		return os.WriteFile(manifestPath, []byte(r.manifest), 0o644)
-	}
-	return nil
-}
-
-func argumentValue(args []string, flag string) string {
-	for index := 0; index+1 < len(args); index++ {
-		if args[index] == flag {
-			return args[index+1]
-		}
-	}
-	return ""
-}
-
-func TestExternalPDFParserProtocol(t *testing.T) {
-	pdfPath := writeValidPDF(t, "sample.pdf")
-	manifestJSON := `{"version":"` + PDFParserVersion + `","blocks":[` +
-		`{"ref":"p1","kind":"text","page":1,"order":0,"text":"First page paragraph."},` +
-		`{"ref":"t1","kind":"table","page":2,"order":1,"asset_id":"table-1","text":""}],` +
-		`"assets":[{"asset_id":"table-1","kind":"table","page":2,"table":{"rows":[["A","B"],["1","2"]]}}]}`
-	runner := &fakeCommandRunner{manifest: manifestJSON}
-	parser := &ExternalPDFParser{
-		Executable: "test-python",
-		PythonPath: "/package/root",
-		ModelsPath: "/models",
-		VLM:        testVLM,
-		Timeout:    5 * time.Second,
-		Runner:     runner,
-	}
-	manifest, err := parser.Parse(context.Background(), pdfPath)
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-	if manifest.Version != PDFParserVersion || len(manifest.Blocks) != 2 || manifest.Blocks[0].Text != "First page paragraph." {
-		t.Fatalf("manifest = %+v", manifest)
-	}
-	if runner.name != "test-python" {
-		t.Fatalf("executable = %q", runner.name)
-	}
-	if argumentValue(runner.args, "-m") != "rag_mcp.pdf_worker" {
-		t.Fatalf("module args = %v", runner.args)
-	}
-	if argumentValue(runner.args, "--input") != pdfPath {
-		t.Fatalf("input arg = %q", argumentValue(runner.args, "--input"))
-	}
-	if argumentValue(runner.args, "--models") != "/models" {
-		t.Fatalf("models arg = %q", argumentValue(runner.args, "--models"))
-	}
-	staging := argumentValue(runner.args, "--output")
-	if staging == "" || argumentValue(runner.args, "--manifest") != filepath.Join(staging, "manifest.json") {
-		t.Fatalf("staging args = %v", runner.args)
-	}
-	if runner.env["PYTHONUTF8"] != "1" {
-		t.Fatalf("env = %v", runner.env)
-	}
-	if runner.env["RAG_VLM_BASE_URL"] != "http://vlm.test/v1" || runner.env["RAG_VLM_MODEL"] != "test-vlm" ||
-		runner.env["RAG_VLM_API_KEY"] != "test-key" || runner.env["RAG_VLM_CONCURRENCY"] != "2" ||
-		runner.env["RAG_VLM_TIMEOUT"] != "30" {
-		t.Fatalf("vlm env = %v", runner.env)
-	}
-	if !strings.HasPrefix(runner.env["PYTHONPATH"], "/package/root") {
-		t.Fatalf("PYTHONPATH = %q", runner.env["PYTHONPATH"])
-	}
-
-	pages, err := parser.Pages(context.Background(), pdfPath)
-	if err != nil {
-		t.Fatalf("Pages() error = %v", err)
-	}
-	if len(pages) != 2 || pages[0].Text != "First page paragraph." || pages[1].Text != "A | B\n1 | 2" {
-		t.Fatalf("pages = %+v", pages)
-	}
-}
-
-func TestExternalPDFParserErrors(t *testing.T) {
-	pdfPath := writeValidPDF(t, "sample.pdf")
-	t.Run("process failure", func(t *testing.T) {
-		parser := &ExternalPDFParser{Runner: &fakeCommandRunner{err: errors.New("boom")}}
-		_, err := parser.Parse(context.Background(), pdfPath)
-		if err == nil || err.Error() != "PDF 解析失败：sample.pdf" {
-			t.Fatalf("error = %v", err)
-		}
-	})
-	t.Run("missing python module", func(t *testing.T) {
-		runner := &fakeCommandRunner{err: &commandFailure{
-			err:    errors.New("exit status 1"),
-			stderr: "Traceback (most recent call last):\nModuleNotFoundError: No module named 'rag_mcp'\n",
-		}}
-		parser := &ExternalPDFParser{Runner: runner}
-		_, err := parser.Parse(context.Background(), pdfPath)
-		var parseErr *PDFParseError
-		if !errors.As(err, &parseErr) {
-			t.Fatalf("error = %v, want *PDFParseError", err)
-		}
-		if !strings.Contains(parseErr.Message, "rag_mcp") ||
-			!strings.Contains(parseErr.Message, "RAG_PDF_PARSER_PYTHON") {
-			t.Fatalf("message = %q", parseErr.Message)
-		}
-	})
-	t.Run("missing manifest", func(t *testing.T) {
-		parser := &ExternalPDFParser{Runner: &fakeCommandRunner{}}
-		_, err := parser.Parse(context.Background(), pdfPath)
-		if err == nil || err.Error() != "PDF 解析失败：sample.pdf" {
-			t.Fatalf("error = %v", err)
-		}
-	})
-	t.Run("invalid manifest json", func(t *testing.T) {
-		parser := &ExternalPDFParser{Runner: &fakeCommandRunner{manifest: "{not json"}}
-		_, err := parser.Parse(context.Background(), pdfPath)
-		if err == nil || err.Error() != "PDF 解析失败：sample.pdf" {
-			t.Fatalf("error = %v", err)
-		}
-	})
-	t.Run("version mismatch", func(t *testing.T) {
-		parser := &ExternalPDFParser{Runner: &fakeCommandRunner{manifest: `{"version":"old-parser"}`}}
-		_, err := parser.Parse(context.Background(), pdfPath)
-		if err == nil || err.Error() != "PDF parser version mismatch; reimport this document" {
-			t.Fatalf("error = %v", err)
-		}
-	})
-	t.Run("cannot start", func(t *testing.T) {
-		parser := &ExternalPDFParser{Runner: &fakeCommandRunner{err: &exec.Error{Name: "python", Err: exec.ErrNotFound}}}
-		_, err := parser.Parse(context.Background(), pdfPath)
-		if err == nil || err.Error() != "PDF parser could not start: exec.Error" {
-			t.Fatalf("error = %v", err)
-		}
-	})
-	t.Run("timeout", func(t *testing.T) {
-		parser := &ExternalPDFParser{Runner: &fakeCommandRunner{blockUntilCancel: true}, Timeout: 20 * time.Millisecond}
-		_, err := parser.Parse(context.Background(), pdfPath)
-		if err == nil || !strings.Contains(err.Error(), "PDF 解析超过") {
-			t.Fatalf("error = %v", err)
-		}
-	})
 }
 
 func TestRenderContentAndTableRowText(t *testing.T) {
@@ -352,25 +189,7 @@ func TestPagesFromManifestOrdersPagesAndFlattensTables(t *testing.T) {
 }
 
 func TestPDFParserVersionConstant(t *testing.T) {
-	if PDFParserVersion != "docling-formula-remote-v3" {
+	if PDFParserVersion != "go-native-v1" {
 		t.Fatalf("PDFParserVersion = %q", PDFParserVersion)
-	}
-}
-
-// TestMissingPythonModule covers the stderr shapes Python emits for an
-// incomplete Docling environment.
-func TestMissingPythonModule(t *testing.T) {
-	quoted := &commandFailure{err: errors.New("exit status 1"),
-		stderr: "ModuleNotFoundError: No module named 'docling'\n"}
-	if got := missingPythonModule(quoted); got != "docling" {
-		t.Fatalf("missingPythonModule() = %q", got)
-	}
-	bare := &commandFailure{err: errors.New("exit status 1"),
-		stderr: "ModuleNotFoundError: No module named rag_mcp\n"}
-	if got := missingPythonModule(bare); got != "rag_mcp" {
-		t.Fatalf("missingPythonModule(bare) = %q", got)
-	}
-	if got := missingPythonModule(errors.New("plain")); got != "" {
-		t.Fatalf("missingPythonModule(plain) = %q", got)
 	}
 }

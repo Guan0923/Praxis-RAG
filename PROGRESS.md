@@ -541,3 +541,14 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 测试：`internal/document/pdf_native_test.go`（程序生成的合法 PDF：清单/块顺序/Pages/损坏与空文本错误、连字/页码/连字符/CJK/标点空格启发式）、`internal/config/pdf_engine_test.go`（引擎解析与默认值）、`internal/runtime` 上传引擎选择测试；`go build ./...`、`go vet` 与相关包测试通过。
 - 实机验证：重启 8011 服务后，用默认 Go 引擎通过 `POST /v1/documents` 上传 arXiv `2404.16130v2.pdf`（6.89 MiB）→ 200、35 个 chunk 入库；保存的 manifest 为 26 页 / 349 blocks / 89856 字符 / 解析 2.08s，`parser.engine=go-native`；UploadJournal 步骤全部 DONE、操作 COMMITTED；检索命中该 PDF 正文。详见 VALIDATION.md。
 - 已知限制：Go 引擎不含版面分析（双栏 PDF 可能列间串行）、表格结构、图片/公式资产与 OCR；需要这些能力时设置 `RAG_PDF_ENGINE=docling` 并安装 python-workers 依赖。另：旧调试上传 `2c06005970…`（namespace `debug222146`）仍每 10 秒打印 `recovery failed (ValueError); retry pending`，与本改动无关，待清理。
+
+## 2026-11-10 解析 worker 全部改为 Go（删除 Python/Docling 兼容层）
+
+按「不再兼容老项目、全部用 Go 实现」的要求，删除了上一节保留的 Docling 回退路径和残留 Python worker：
+
+- [x] 删除 PDF 外部引擎：`document.ExternalPDFParser`、`CommandRunner`/`execCommandRunner`、缺失 Python 模块诊断，以及 `RAG_PDF_ENGINE`、`RAG_PDF_PARSER_PYTHON`、`RAG_PDF_MODELS_PATH`、`RAG_PDF_PARSE_TIMEOUT` 配置、启动模板、`deploy/config.container.toml` 与 `.env.example` 条目；`ingest.PDFOptions` 只保留可选的 `Parser`（默认 `NativePDFParser`），运行时不启动任何解析子进程。新导入的清单版本改为 `go-native-v1`；旧清单不校验版本，所以已存文档仍可读取。
+- [x] Word 视觉 worker 从 Python 迁到 Go：`document.WordVisionWorker` 在进程内解码图片（png/jpeg/gif/bmp/tiff，缩放到最长边 384 后转 PNG），直接调用知识库的 OpenAI 兼容 `/chat/completions`（图片 data URL + 固定描述 prompt、max_tokens 256、429/5xx 重试 3 次、拒绝/空回答过滤、`<end_of_utterance>` 清理与句末标点）；未配置 VLM 时图片保留占位描述、上传不失败。`internal/runtime` 的 `wordVisionWorker` 不再传 Python/模型路径。
+- [x] 删除 `python-workers/`（Docling PDF worker、Word 视觉 worker 及其 Python 包）与 `benchmarks/`（Docling 评估脚本）；README、`docs/USAGE.md`、`docs/DEPLOYMENT.md`、`docs/GO_MIGRATION.md`、`.env.example`、启动配置模板同步改为 Go-only。`scripts/verify-*.py` 是可选运维测试脚本，不属于运行时。
+- [x] 测试：新增 `internal/document/vision_test.go`（httptest VLM 成功路径/图片缩放/鉴权/prompt、跳过有图注图片、未配置端点/模型、拒绝回答、503 重试、HTTP 400、超时、坏图片、清单缺失），ingest 集成测试改用 httptest VLM 与真实 JPEG fixture；删除 `ExternalPDFParser`/引擎选择测试，更新 `PDFParserVersion` 断言。`go build ./...`、`go vet ./...` 干净，`internal/document`、`internal/ingest`、`internal/config`、`pdfcontent`、`chunking` 与 runtime 上传/PDF/Word 子集测试通过。
+- 实机验证（新二进制重启 8011）：上传中文 PDF `it-manual-cn.pdf` → 200、9 chunk、`pdf_parser_version=go-native-v1`、`failed: []`；删除该文档成功（404 + 列表消失）；重复上传 `2404.16130v2.pdf` 重新入库为 `go-native-v1`（35 chunks），manifest 存放在 `pdf-assets`，UploadJournal `COMMITTED`、`error NULL`；Console 200。详见 VALIDATION.md。
+- 已知限制：PDF 不支持版面分析、表格结构、OCR、公式/图片资产（双栏可能串行），扫描件需先 OCR；Word 图片描述依赖远端 VLM，仅用 httptest 验证；`.doc` 转换仍需要外部 LibreOffice。旧调试上传 `2c06005970…` 的 recovery 日志仍未清理。

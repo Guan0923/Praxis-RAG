@@ -1,5 +1,5 @@
-// Package pdfcontent ports rag_mcp.pdf_content: it turns one external Docling
-// manifest into index chunks with formula/table boundaries preserved, and
+// Package pdfcontent ports rag_mcp.pdf_content: it turns one PDF manifest
+// into index chunks with formula/table boundaries preserved, and
 // provides the FORMULA_BLOCK-aware content pagination used by document
 // resources.
 //

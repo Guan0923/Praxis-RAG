@@ -1,34 +1,15 @@
 package document
 
-import (
-	"testing"
-	"time"
-)
+import "testing"
 
-func TestVLMSettingsEnv(t *testing.T) {
-	if env := (VLMSettings{}).Env(); env != nil {
-		t.Fatalf("unconfigured Env() = %v", env)
+func TestVLMSettingsConfigured(t *testing.T) {
+	if (VLMSettings{}).Configured() {
+		t.Fatalf("unconfigured endpoint reported as configured")
 	}
-	env := VLMSettings{
-		BaseURL:     "http://vlm.test/v1",
-		APIKey:      "secret",
-		Model:       "test-vlm",
-		Timeout:     45 * time.Second,
-		Concurrency: 3,
-	}.Env()
-	want := map[string]string{
-		"RAG_VLM_BASE_URL":    "http://vlm.test/v1",
-		"RAG_VLM_API_KEY":     "secret",
-		"RAG_VLM_MODEL":       "test-vlm",
-		"RAG_VLM_TIMEOUT":     "45",
-		"RAG_VLM_CONCURRENCY": "3",
+	if (VLMSettings{BaseURL: "   "}).Configured() {
+		t.Fatalf("blank endpoint reported as configured")
 	}
-	if len(env) != len(want) {
-		t.Fatalf("Env() = %v", env)
-	}
-	for key, value := range want {
-		if env[key] != value {
-			t.Fatalf("Env()[%q] = %q, want %q", key, env[key], value)
-		}
+	if !(VLMSettings{BaseURL: "http://vlm.test/v1"}).Configured() {
+		t.Fatalf("configured endpoint reported as unconfigured")
 	}
 }

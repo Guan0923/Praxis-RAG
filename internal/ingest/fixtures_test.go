@@ -2,8 +2,12 @@ package ingest
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,7 +25,21 @@ const testWordNamespaces = `xmlns:w="http://schemas.openxmlformats.org/wordproce
 	` xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"` +
 	` xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"`
 
-var testJPEGBytes = []byte("\xff\xd8\xff\xe0test-ingest-jpeg\xff\xd9")
+// testJPEGBytes is a real decodable JPEG embedded in the Word fixtures (the
+// vision describer decodes it).
+var testJPEGBytes = func() []byte {
+	img := image.NewRGBA(image.Rect(0, 0, 320, 240))
+	for y := 0; y < 240; y++ {
+		for x := 0; x < 320; x++ {
+			img.Set(x, y, color.RGBA{R: 20, G: 160, B: 90, A: 255})
+		}
+	}
+	var buffer bytes.Buffer
+	if err := jpeg.Encode(&buffer, img, nil); err != nil {
+		panic(err)
+	}
+	return buffer.Bytes()
+}()
 
 type docxEntry struct {
 	name string
@@ -219,42 +237,6 @@ func pdfManifestFixture() document.PDFManifest {
 				}},
 		},
 	}
-}
-
-// fakeVisionRunner describes uncaptioned pictures by rewriting manifest.json.
-type fakeVisionRunner struct {
-	description string
-	calls       int
-}
-
-func (f *fakeVisionRunner) Run(_ context.Context, _ string, args []string, _ map[string]string) ([]byte, []byte, error) {
-	f.calls++
-	manifestPath := ""
-	for index := 0; index+1 < len(args); index++ {
-		if args[index] == "--manifest" {
-			manifestPath = args[index+1]
-		}
-	}
-	raw, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return nil, []byte(err.Error()), err
-	}
-	var manifest map[string]any
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return nil, nil, err
-	}
-	assets, _ := manifest["assets"].([]any)
-	for _, item := range assets {
-		asset, _ := item.(map[string]any)
-		if asset["kind"] == "picture" && asset["caption"] == "" {
-			asset["generated_description"] = f.description
-		}
-	}
-	updated, err := json.Marshal(manifest)
-	if err != nil {
-		return nil, nil, err
-	}
-	return nil, nil, os.WriteFile(manifestPath, updated, 0o644)
 }
 
 // fakeDOCConverter returns a prepared .docx path for a .doc source.

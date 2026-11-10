@@ -2,7 +2,10 @@ package ingest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -340,17 +343,25 @@ func TestPreparePDFEmptyVersionMismatchAndParserError(t *testing.T) {
 func TestPrepareWordVisionIntegration(t *testing.T) {
 	body := pictureParagraph("") + paragraphXML("Body text")
 	path := pictureDocxPackage(t, body, false)
-	runner := &fakeVisionRunner{description: "A green pressure indicator on the pump panel."}
-	worker := &document.WordVisionWorker{ModelsPath: "/models", VLM: document.VLMSettings{BaseURL: "http://vlm.test/v1", Model: "test-vlm"}, Runner: runner}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{
+				"content": "A green pressure indicator on the pump panel.",
+			}}},
+		})
+	}))
+	defer server.Close()
+	worker := &document.WordVisionWorker{VLM: document.VLMSettings{
+		BaseURL: server.URL + "/v1",
+		Model:   "test-vlm",
+	}}
 	result, err := Prepare(t.Context(), path, Options{
 		SourceName: "vision.docx",
 		Word:       WordOptions{Vision: worker},
 	})
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
-	}
-	if runner.calls != 1 {
-		t.Fatalf("vision calls = %d", runner.calls)
 	}
 	pictures := chunksWithMetadata(result.Chunks, "asset_kind", "picture")
 	if len(pictures) != 1 ||

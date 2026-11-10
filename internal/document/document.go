@@ -5,18 +5,17 @@
 //
 // Markdown/TXT are read in process; DOCX is parsed from the OOXML zip package
 // in process (including full caption/note association and skipped-object
-// diagnostics); PDF text extraction is delegated to the external Docling parser
-// process through the protocol defined in pdf.go (Docling itself is never
-// reimplemented here). Legacy .doc files additionally require an external
-// LibreOffice based converter, see docconvert.go; uncaptioned Word pictures can
-// be described by the external word_vision_worker through vision.go.
+// diagnostics); PDF text is extracted in process by NativePDFParser. Legacy .doc
+// files additionally require an external LibreOffice based converter, see
+// docconvert.go; uncaptioned Word pictures can be described by the remote VLM
+// endpoint through vision.go.
 //
 // Pipeline API (all storage decoupled; the runtime persists what these return):
 //   - ParseWordPackage -> BuildWordContent: qualified manifest, document.md text
 //     and typed Asset records (bytes, mime, document-relative identity,
 //     checksum, size, order).
-//   - ExternalPDFParser -> BuildPDFContent: the same for PDF manifests produced
-//     by the Docling worker, plus RenderContent for the document.md text.
+//   - NativePDFParser -> BuildPDFContent: the same for PDF manifests, plus
+//     RenderContent for the document.md text.
 //   - WordManifest.DocumentBlocks / ReadDocument / ReadText: the reader view
 //     used by chunking.
 //   - The PDF chunk port lives in internal/document/pdfcontent to avoid an

@@ -16,7 +16,7 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 Kafka 死信（显式 DLQ topic）-> rag-dead-letter-worker --kind document|search
 ```
 
-RAG 只返回证据，不生成最终回答。后端为 Go 实现；PDF 正文解析默认由 Go 内置引擎完成，Python 仅作为可选的 Docling PDF worker（`RAG_PDF_ENGINE=docling`）与 Word 视觉解析外部子进程存在于 `python-workers/`，不是运行 Go 后端的前置条件。
+RAG 只返回证据，不生成最终回答。后端为 Go 实现；PDF 正文解析、DOCX 读取与 Word 图片描述全部由 Go 进程内完成（图片描述调用远端 VLM），仓库不含 Python 代码，运行时不依赖 Python。
 
 ## 1. 安装与构建
 
@@ -30,7 +30,7 @@ RAG 只返回证据，不生成最终回答。后端为 Go 实现；PDF 正文�
 | 共享状态库 | MySQL 8.0+（`utf8mb4`） | 文档、KB、API Key、任务、发件箱、UploadJournal |
 | Redis | 可选，7.x | 搜索结果快照、读模型缓存；排队 MCP 搜索的快照读取必需（搜索任务状态在共享状态库） |
 | Kafka | 可选，单节点 KRaft（Compose `kafka`）或外部集群 | 异步文档通知、排队搜索；可用 SASL/TLS 环境变量连接外部集群，Compose 本身只提供 PLAINTEXT |
-| 外部解析器 | 可选 | DOC（LibreOffice）；PDF 正文解析已内置 Go 引擎，只有 `RAG_PDF_ENGINE=docling` 才需要 Docling Python 环境/模型（**不包含在 Go 二进制或镜像中**） |
+| 外部解析器 | 可选 | 仅 DOC（LibreOffice）转换需要外部程序；PDF/DOCX 解析内置在 Go 二进制中 |
 
 ### 构建命令
 
@@ -169,7 +169,7 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 
 角色分管理员（`admin`）、VIP（`vip`）和普通用户（`user`），只有管理员可以改角色。知识库默认归创建者私有，共享通过邀请链接完成：仅 VIP 与管理员可邀请（VIP 只能邀请自己创建的知识库，管理员可邀请任意知识库），权限分「可读 / 可修改」、范围分「单文件 / 多文件 / 全库」；被邀请人登录后接受邀请才生效。完整流程见 [权限管理](PERMISSIONS.md)。
 
-### 检索、模型与外部解析器
+### 检索、模型与解析配置
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -188,19 +188,15 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_RERANKER_MAX_TEXT_CHARS` | `4000` | 重排文本字符上限 |
 | `RAG_PRELOAD_MODEL` / `RAG_PRELOAD_RERANKER` | `false` | Go 通过 HTTP 调用模型，不加载本地权重 |
 | `RAG_NAMESPACE` | 空 | 可选的 Qdrant 物理 namespace 过滤 |
-| `RAG_PDF_ENGINE` | 自动 | PDF 解析引擎：`go`（内置纯 Go 文本抽取，默认）或 `docling`（外部 Docling worker）。留空时：配置了 `RAG_PDF_PARSER_PYTHON` 用 `docling`，否则用 `go` |
-| `RAG_PDF_PARSER_PYTHON` | 空 | 仅 `docling` 引擎：Docling 解析进程的 Python 可执行文件 |
-| `RAG_PDF_MODELS_PATH` | 空 | 仅 `docling` 引擎：Docling 本地版面/表格/OCR 模型目录 |
-| `RAG_PDF_PARSE_TIMEOUT` | `900` 秒（30..7200） | 仅 `docling` 引擎：PDF 解析外部进程超时 |
-| `RAG_VLM_BASE_URL` | 空 | 远端 OpenAI 兼容 VLM 端点的**环境回退值**；Console 知识库设置优先 |
+| `RAG_VLM_BASE_URL` | 空 | 远端 OpenAI 兼容 VLM 端点的**环境回退值**，用于描述 Word 无图注图片；Console 知识库设置优先 |
 | `RAG_VLM_API_KEY` | 空 | VLM 端点密钥，作为 `Authorization: Bearer` 发送 |
 | `RAG_VLM_MODEL` | 空 | 端点上的模型名，如 `qwen2.5-vl-7b`（环境回退值） |
 | `RAG_VLM_TIMEOUT` | `120` 秒（1..3600） | 单次 VLM 请求超时 |
 | `RAG_VLM_CONCURRENCY` | `4`（1..64） | 并发 VLM 请求数 |
-| `RAG_WORD_CONVERTER_PATH` | 空 | LibreOffice `soffice` 路径（DOC 转换） |
+| `RAG_WORD_CONVERTER_PATH` | 空 | LibreOffice `soffice` 路径（仅 DOC 转换） |
 | `RAG_WORD_CONVERT_TIMEOUT` | `120` 秒（1..7200） | DOC 转换超时 |
 
-PDF 解析有两个引擎，由 `RAG_PDF_ENGINE` 选择：默认 `go` 在 Go 进程内用纯 Go PDF 阅读器按页抽取正文（按基线分行、按字号与行距分段、去掉页眉页脚与页码、合并连字符换行），不需要 Python/Docling，适用于文字型 PDF（扫描件会返回“没有可索引的内容”或空页告警，不会静默入库垃圾文本）；`docling` 则启动外部 Python/Docling 子进程，提供版面分析、表格结构、OCR 与公式/图片描述，但需要 Docling 环境与本地模型目录，且**公式识别与图片描述调用远端 VLM**，由 `RAG_VLM_BASE_URL`/`RAG_VLM_API_KEY`/`RAG_VLM_MODEL` 配置，未配置时该引擎的 PDF 解析会明确失败而不是回退到本地模型。Word 无图注图片同样走该远端端点；配置了 VLM 后 Go 会自动启用 `word_vision_worker`。DOC 转换与 Word 视觉依赖外部 LibreOffice/Python 环境。
+PDF 与 Word 解析全部在 Go 进程内完成，没有外部解析器子进程，也没有 Python 安装步骤：PDF 用纯 Go PDF 阅读器按页抽取正文（按基线分行、按字号与行距分段、去掉页眉页脚与页码、合并连字符换行），适用于文字型 PDF，扫描件会返回“没有可索引的内容”或空页告警，不会静默入库垃圾文本；PDF 的版面分析、表格结构、OCR 与公式/图片资产不再支持。Word 无图注图片会调用远端 OpenAI 兼容 VLM（`RAG_VLM_BASE_URL`/`RAG_VLM_API_KEY`/`RAG_VLM_MODEL`，或 Console 知识库设置），未配置时图片保留占位描述、上传不失败；DOC 转换仍需要外部 LibreOffice。
 
 **VLM 优先取知识库配置**：Console 的知识库设置页在 Embedding/Reranker 之外提供 VLM 区块（从「模型配置」列表选择，可开关），保存后该知识库随后的上传与 worker 解析立即使用它；未配置或关闭时回退到 `RAG_VLM_*` 环境变量。API Key 与其他 provider 一样加密存储，前端只显示"已保存"。
 
@@ -691,7 +687,7 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 - 目录内文档按相对 POSIX 路径命名（与 Python 一致）；单文件按 basename。
 - 同名已存在文档默认覆盖；内容未变时输出 `SKIP ... unchanged content`，不重复 embedding（Python 会无条件重跑）。
 - 退出码：`0` 全部成功；`1` 至少一个文档失败或运行时不可用；`2` 参数/配置错误（缺 `RAG_BACKEND=qdrant`、`QDRANT_PATH`、namespace 或知识库不存在）。
-- PDF/DOCX/DOC 与 HTTP 上传使用同一解析配置（PDF 默认 Go 内置引擎，`RAG_PDF_ENGINE=docling` 时为外部 worker）；解析器不可用时按上传同规则失败。`--dry-run` 不打开运行时/状态库。
+- PDF/DOCX/DOC 与 HTTP 上传使用同一解析配置（PDF/DOCX 由 Go 进程内解析，DOC 需 LibreOffice）；解析器不可用时按上传同规则失败。`--dry-run` 不打开运行时/状态库。
 - 兼容性说明：该命令在本仓库验证环境中未连接真实 Qdrant/模型 API 实跑，上线前先用 `--dry-run` 和一个小目录验证。
 
 `rag-mcp-debug`：无 Qdrant/模型的 mock 检索调试：
@@ -726,7 +722,7 @@ docker compose --profile app up -d --build
 - `/app/bin/` 包含全部命令（含三个 worker）；`ENTRYPOINT` 为 `/app/bin/rag-service`。
 - `/app/web` 为 Console，`RAG_WEB_ROOT=/app/web`；`/app/config.toml` 为非敏感默认配置（`RAG_SERVICE_HOST=0.0.0.0`、端口 8011、`/app/data`、Qdrant 服务名、loopback MCP 白名单）。
 - 非 root 用户 `rag`，`/app/data` 为数据卷；健康检查调用 `/health`。
-- 镜像**不含** Python、Docling、LibreOffice 或本地模型：PDF 正文解析由 Go 内置引擎完成；只有 `RAG_PDF_ENGINE=docling`、DOC 与 Word 视觉解析才需要把外部环境挂载到容器并设置 `RAG_PDF_PARSER_PYTHON`、`RAG_PDF_MODELS_PATH`、`RAG_WORD_CONVERTER_PATH` 等变量；`docling` 引擎的公式与图片描述改用远端 VLM，另外需要 `RAG_VLM_BASE_URL`/`RAG_VLM_MODEL`。否则相应上传会明确失败。
+- 镜像**不含** Python、Docling 或 LibreOffice：PDF 与 DOCX 解析、Word 图片描述均内置在 Go 二进制中；只有 .doc 转换需要把 LibreOffice 挂载到容器并设置 `RAG_WORD_CONVERTER_PATH`。Word 无图注图片需要 `RAG_VLM_BASE_URL`/`RAG_VLM_MODEL`（或 Console 知识库设置）才会生成描述；未配置时保留占位描述，上传不会失败。
 - Compose `app` 服务只运行 `rag-service`；worker 没有内置 compose 服务，可用一次性容器（把入口覆盖为 worker 二进制、连接到同一网络并复用同一环境）或参考 [DEPLOYMENT](DEPLOYMENT.md) 的 systemd/override 示例。
 - **已验证/未验证**：本机 Docker 已实机拉起 Kafka + Debezium 基础设施，并用 host 模式 Go 服务/worker 跑通 debezium/relay 两种异步链路、排队搜索与 DLQ（见 §10；脚本 `scripts/verify-debezium-e2e.py`、`scripts/verify-kafka-search.py`、`scripts/verify-kafka-dlq.py`）；镜像构建、compose `app` profile 与 worker 容器仍未经实机验证。
 
@@ -758,7 +754,7 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 
 - Docker 镜像构建、Compose `app` profile、systemd 单元未实际执行（本环境无 Docker/systemd）。
 - 已实机验证 Kafka 3.9.0 + Debezium Server 3.7.1 + MySQL 8.0 + Redis + Qdrant：CDC 投递（Kafka healthy、`Starting streaming`、topic 记录与 outbox 一致），以及 Go 服务/worker 的完整异步链路（debezium 与 relay 两种模式）、显式 DLQ topic、排队 MCP 搜索与 Redis 快照。仍未验证 SASL/TLS 外部 Kafka、MySQL 多实例锁与 systemd 部署。
-- Docling/LibreOffice 链路未在 Go 环境实机验证（PDF 默认引擎为 Go 内置解析，已在中文/英文 PDF 上实测文本抽取质量）；`docling` 引擎的 DOC/Word 解析依赖外部 Python 环境，远端 VLM 端点只做了配置/协议单测，未做实机联调。
+- PDF/DOCX/Word 解析链路为纯 Go（DOC 转换依赖外部 LibreOffice）；远端 VLM 端点只做了配置/协议单测与 httptest 集成测试，未与真实 VLM 端点做实机联调。
 - Console 有前端单元与契约测试（`frontend/src/*.test.ts`，Vitest：角色/权限文案、邀请过期计算、api 客户端的路径/CSRF/错误契约、路由与邀请 token 解析）与构建检查；但**没有浏览器级 E2E**，页面交互/样式仍由人工核对。
 - Tokenizer 是确定性近似，不保证与 Python/BGE-M3 的 token 计数一致（句子/段落/结构边界一致）。
 - 异步 e2e（API 受理 → fake Kafka transport → worker → 发布）已由 `internal/e2e` 覆盖；真实 Kafka/MySQL/Redis/Qdrant 上由 Go worker 完成整条链路的黑盒回归已执行并通过：`scripts/verify-debezium-e2e.py`（debezium/relay）、`scripts/verify-kafka-search.py`（排队搜索）、`scripts/verify-kafka-dlq.py`（DLQ）。
@@ -811,22 +807,13 @@ npm run build            # tsc + vite build
 
 `.github/workflows/test.yml` 提供两条流水线：`go vet + go build + go test -p 1`（GitHub Actions 的 MySQL 8 service，库名 `praxis_unit_test`）和前端 `typecheck + npm test + build`。CI 与本地命令一致，唯一区别是 Linux 上不需要 `-p 1` 以外的额外处理。
 
-外部解析器 worker（可选，用于 `RAG_PDF_ENGINE=docling` 与 Word 视觉解析；PDF 正文默认由 Go 内置引擎解析，无需安装）：
-
-```powershell
-# 安装 Docling 等依赖（只影响 docling 引擎与 Word 视觉，不影响默认 PDF 解析）
-python -m pip install -r python-workers/requirements.txt
-$env:PYTHONPATH = (Resolve-Path .\python-workers).Path
-python -m rag_mcp.pdf_worker --help
-```
-
-设置 `RAG_PDF_ENGINE=docling` 时，Go 服务会在 ingest 阶段以子进程方式调用 `rag_mcp.pdf_worker`；Word 无图注图片可调用 `rag_mcp.word_vision_worker`。其余后端能力全部在 Go 二进制内；详见 [python-workers/README.md](../python-workers/README.md)。
+解析器全部内置（无需安装外部解析器）：PDF 由纯 Go 阅读器解析，DOCX 由内置 OOXML 读取器解析，Word 无图注图片由 Go 直接调用远端 OpenAI 兼容 VLM；只有 .doc 转换需要外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）。
 
 ## 12. 当前限制
 
 - **Qdrant**：仅支持 HTTP 模式；`QDRANT_PATH` 会在启动时被拒绝。
 - **Tokenizer**：见 §10；token 预算切分位置可能与 Python 不同。
-- **外部解析器**：PDF 正文解析默认由 Go 内置引擎完成（文字型 PDF）；版面分析、表格结构、OCR、公式与图片描述需要 `RAG_PDF_ENGINE=docling` 与外部 Docling 环境；DOC（LibreOffice）与 Word 图片描述也不是 Go 内置能力，未配置时相应功能报错。配置了 `RAG_VLM_BASE_URL` 后 Go 会自动启用 `word_vision_worker`，无图注图片由远端 VLM 生成描述。
+- **解析器**：PDF 与 DOCX 解析全部在 Go 进程内完成（文字型 PDF；扫描件、PDF 表格/公式/图片资产不支持，需要时请先 OCR 或用其他工具预处理）；Word 无图注图片需要 VLM 端点才会生成描述，未配置时保留占位描述、上传不失败；.doc 转换仍需要外部 LibreOffice。
 - **异步投递**：支持 relay（默认，进程内发件箱发布到 Kafka）、debezium（Debezium Server 读 MySQL binlog，经原生 Kafka sink 写 topic，应用不发布）与本地 worker 模式；Debezium 模式需要 MySQL 状态库。
 - **排队搜索**：`RAG_KAFKA_BOOTSTRAP_SERVERS` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 Kafka。
 - **上传受理**：`POST /v1/documents` 默认同步；`RAG_UPLOAD_MODE=async` 时逐文件异步受理并返回 `artifact_id`，状态由 `GET /v1/document-jobs/{artifact_id}` 读取，需要部署 `rag-document-worker`（配置 Kafka，或 `RAG_DOCUMENT_WORKER_LOCAL=1` 轮询发件箱）。`update_document`/`delete_document` 仍同步执行，与排队中的异步任务靠受理期同名检查与发布事务内的 `ValidatePublication` 互斥。
