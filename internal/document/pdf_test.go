@@ -231,6 +231,22 @@ func TestExternalPDFParserErrors(t *testing.T) {
 			t.Fatalf("error = %v", err)
 		}
 	})
+	t.Run("missing python module", func(t *testing.T) {
+		runner := &fakeCommandRunner{err: &commandFailure{
+			err:    errors.New("exit status 1"),
+			stderr: "Traceback (most recent call last):\nModuleNotFoundError: No module named 'rag_mcp'\n",
+		}}
+		parser := &ExternalPDFParser{Runner: runner}
+		_, err := parser.Parse(context.Background(), pdfPath)
+		var parseErr *PDFParseError
+		if !errors.As(err, &parseErr) {
+			t.Fatalf("error = %v, want *PDFParseError", err)
+		}
+		if !strings.Contains(parseErr.Message, "rag_mcp") ||
+			!strings.Contains(parseErr.Message, "RAG_PDF_PARSER_PYTHON") {
+			t.Fatalf("message = %q", parseErr.Message)
+		}
+	})
 	t.Run("missing manifest", func(t *testing.T) {
 		parser := &ExternalPDFParser{Runner: &fakeCommandRunner{}}
 		_, err := parser.Parse(context.Background(), pdfPath)
@@ -338,5 +354,23 @@ func TestPagesFromManifestOrdersPagesAndFlattensTables(t *testing.T) {
 func TestPDFParserVersionConstant(t *testing.T) {
 	if PDFParserVersion != "docling-formula-remote-v3" {
 		t.Fatalf("PDFParserVersion = %q", PDFParserVersion)
+	}
+}
+
+// TestMissingPythonModule covers the stderr shapes Python emits for an
+// incomplete Docling environment.
+func TestMissingPythonModule(t *testing.T) {
+	quoted := &commandFailure{err: errors.New("exit status 1"),
+		stderr: "ModuleNotFoundError: No module named 'docling'\n"}
+	if got := missingPythonModule(quoted); got != "docling" {
+		t.Fatalf("missingPythonModule() = %q", got)
+	}
+	bare := &commandFailure{err: errors.New("exit status 1"),
+		stderr: "ModuleNotFoundError: No module named rag_mcp\n"}
+	if got := missingPythonModule(bare); got != "rag_mcp" {
+		t.Fatalf("missingPythonModule(bare) = %q", got)
+	}
+	if got := missingPythonModule(errors.New("plain")); got != "" {
+		t.Fatalf("missingPythonModule(plain) = %q", got)
 	}
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
+	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/sparse"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -565,6 +566,24 @@ func TestUploadRecoversInterruptedOperation(t *testing.T) {
 	// The crashed operation's workspace is reclaimed by compensation.
 	if _, statErr := os.Stat(workspace); !os.IsNotExist(statErr) {
 		t.Errorf("recovered operation left its workspace: %v", statErr)
+	}
+}
+
+// TestSafeUploadErrorTextPdfParseMessage pins that a PDF parse failure reaches
+// the caller with its actionable message instead of a Go type name, and that
+// plain Go errors still fall back to a Python-shaped category.
+func TestSafeUploadErrorTextPdfParseMessage(t *testing.T) {
+	message := "PDF 解析不可用：Python 解析环境缺少模块 rag_mcp；请安装 python-workers/requirements.txt 的依赖"
+	wrapped := &documentOperationError{
+		Err:         &document.PDFParseError{Message: message},
+		OperationID: "op",
+	}
+	if got := safeUploadErrorText(wrapped); got != message {
+		t.Fatalf("safeUploadErrorText(PDFParseError) = %q, want %q", got, message)
+	}
+	plain := &documentOperationError{Err: errors.New("boom"), OperationID: "op"}
+	if got := safeUploadErrorText(plain); got != "知识库操作失败：RuntimeError" {
+		t.Fatalf("safeUploadErrorText(errors.New) = %q", got)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -219,6 +220,27 @@ type CommandRunner interface {
 	Run(ctx context.Context, name string, args []string, env map[string]string) error
 }
 
+// PDFParseError is a PDF parse failure whose message is safe to return to
+// callers: it never quotes worker output, document text or credentials, so the
+// upload API can show it instead of a bare error category.
+type PDFParseError struct{ Message string }
+
+// Error implements error.
+func (e *PDFParseError) Error() string { return e.Message }
+
+// commandFailure keeps the worker's stderr so ParseInto can classify a failure
+// (for example a missing Python module) without exposing the raw output.
+type commandFailure struct {
+	err    error
+	stderr string
+}
+
+// Error implements error.
+func (e *commandFailure) Error() string { return e.err.Error() }
+
+// Unwrap exposes the underlying process error.
+func (e *commandFailure) Unwrap() error { return e.err }
+
 // ExternalPDFParser is the Go client of the external Docling worker protocol
 // defined by src/rag_mcp/pdf_assets.parse_pdf and src/rag_mcp/pdf_worker.py:
 //
@@ -251,7 +273,7 @@ type ExternalPDFParser struct {
 func (p *ExternalPDFParser) Parse(ctx context.Context, source string) (PDFManifest, error) {
 	staging, err := os.MkdirTemp("", "rag-pdf-*")
 	if err != nil {
-		return PDFManifest{}, fmt.Errorf("PDF parser could not start: %v", err)
+		return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf("PDF parser could not start: %v", err)}
 	}
 	defer os.RemoveAll(staging)
 	return p.ParseInto(ctx, source, staging)
@@ -264,7 +286,7 @@ func (p *ExternalPDFParser) ParseInto(ctx context.Context, source, staging strin
 	name := filepath.Base(source)
 	manifestPath := filepath.Join(staging, "manifest.json")
 	if err := os.MkdirAll(staging, 0o755); err != nil {
-		return PDFManifest{}, fmt.Errorf("PDF parser could not start: %v", err)
+		return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf("PDF parser could not start: %v", err)}
 	}
 	executable := p.Executable
 	if executable == "" {
@@ -301,23 +323,27 @@ func (p *ExternalPDFParser) ParseInto(ctx context.Context, source, staging strin
 	if err := runner.Run(runCtx, executable, args, env); err != nil {
 		switch {
 		case errors.Is(runCtx.Err(), context.DeadlineExceeded):
-			return PDFManifest{}, fmt.Errorf("PDF 解析超过 %d 秒：%s", int(timeout/time.Second), name)
+			return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf("PDF 解析超过 %d 秒：%s", int(timeout/time.Second), name)}
 		case isExecStartError(err):
-			return PDFManifest{}, fmt.Errorf("PDF parser could not start: %s", "exec.Error")
+			return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf("PDF parser could not start: %s", "exec.Error")}
 		default:
-			return PDFManifest{}, fmt.Errorf("PDF 解析失败：%s", name)
+			if module := missingPythonModule(err); module != "" {
+				return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf(
+					"PDF 解析不可用：Python 解析环境缺少模块 %s；请安装 python-workers/requirements.txt 的依赖，并用 RAG_PDF_PARSER_PYTHON 与 PYTHONPATH 指向该环境（见 docs/USAGE.md）", module)}
+			}
+			return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf("PDF 解析失败：%s", name)}
 		}
 	}
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return PDFManifest{}, fmt.Errorf("PDF 解析失败：%s", name)
+		return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf("PDF 解析失败：%s", name)}
 	}
 	var manifest PDFManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return PDFManifest{}, fmt.Errorf("PDF 解析失败：%s", name)
+		return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf("PDF 解析失败：%s", name)}
 	}
 	if manifest.Version != PDFParserVersion {
-		return PDFManifest{}, fmt.Errorf("PDF parser version mismatch; reimport this document")
+		return PDFManifest{}, &PDFParseError{Message: "PDF parser version mismatch; reimport this document"}
 	}
 	return manifest, nil
 }
@@ -429,7 +455,54 @@ func (execCommandRunner) Run(ctx context.Context, name string, args []string, en
 	command.Stdout = io.Discard
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
-	return command.Run()
+	if err := command.Run(); err != nil {
+		logExternalFailure(name, stderr.String())
+		return &commandFailure{err: err, stderr: stderr.String()}
+	}
+	return nil
+}
+
+// logExternalFailure writes the parser's stderr tail to the service log. The
+// text stays server-side: callers only ever observe PDFParseError messages.
+func logExternalFailure(name, stderr string) {
+	stderr = strings.TrimSpace(stderr)
+	if stderr == "" {
+		return
+	}
+	const limit = 2000
+	if len(stderr) > limit {
+		stderr = stderr[len(stderr)-limit:]
+	}
+	log.Printf("PDF parser %s failed: %s", name, stderr)
+}
+
+// missingPythonModule extracts the module name from a Python
+// "ModuleNotFoundError: No module named 'x'" traceback line, so a missing
+// Docling environment can be reported as a configuration problem.
+func missingPythonModule(err error) string {
+	var failure *commandFailure
+	if !errors.As(err, &failure) {
+		return ""
+	}
+	const marker = "No module named "
+	index := strings.Index(failure.stderr, marker)
+	if index < 0 {
+		return ""
+	}
+	rest := failure.stderr[index+len(marker):]
+	for _, quote := range []byte{'\'', '"'} {
+		if len(rest) > 0 && rest[0] == quote {
+			rest = rest[1:]
+			if end := strings.IndexByte(rest, quote); end >= 0 {
+				return rest[:end]
+			}
+			return ""
+		}
+	}
+	if end := strings.IndexAny(rest, " \r\n\t"); end >= 0 {
+		return rest[:end]
+	}
+	return rest
 }
 
 // mergeEnvironment overlays extra variables on the process environment without

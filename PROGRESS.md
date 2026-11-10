@@ -520,3 +520,13 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 文档：README（Console 能力、主要功能、状态库）、docs/USAGE.md（新增「模型配置（模型列表）」与 7 个接口示例，VLM/知识库管理说明同步）、docs/knowledge-base-settings.md（模型配置与知识库连接的关系）、VALIDATION.md 更新。
 
 已知边界：模型配置与知识库是保存时复制的引用关系（无外键），因此重命名/删除配置不会回填历史知识库；模型列表只服务 Console 管理员表单，知识库 REST 契约不变；保存探测会真实调用 provider（VLM 除外），离线环境无法新增 Embedding/Reranker 配置。
+
+## 2026-11-10 PDF 解析错误信息（上传失败可读化）
+
+本轮修复 PDF 上传失败时只显示 Go 类型名（`知识库操作失败：errorString`）的问题，并让缺失 Docling 环境的情况返回可操作的提示：
+
+- [x] `internal/document` 新增 `PDFParseError`（消息只由本仓库代码生成，可安全展示）；外部解析进程失败不再返回裸 `fmt.Errorf`，避免被安全错误文本归类成 Go 类型名。
+- [x] `execCommandRunner` 保留子进程 stderr 并识别 Python `ModuleNotFoundError: No module named '…'`，返回「PDF 解析不可用：Python 解析环境缺少模块 …；请安装 python-workers/requirements.txt 的依赖，并用 RAG_PDF_PARSER_PYTHON 与 PYTHONPATH 指向该环境」；stderr 尾部（≤2000 字节）只写入服务端日志。
+- [x] `internal/runtime`：`safeUploadErrorText` 对 `*document.PDFParseError` 返回其安全消息；其余未知错误保持「按类别」输出，并把 Go 的 `errorString`/`wrapError` 映射成 Python 形状的 `RuntimeError`（不再泄露 Go 标识符）。上传失败时服务端日志新增 `Upload <id> failed category=… detail=…`（含截断后的错误消息，便于排查）。
+- [x] 测试：`internal/document` 覆盖缺失 Python 模块的 stderr 分类与既有失败消息不变（`TestExternalPDFParserErrors/missing_python_module`、`TestMissingPythonModule`）；`internal/runtime` 覆盖 PDF 解析消息透出与 `RuntimeError` 兜底（`TestSafeUploadErrorTextPdfParseMessage`）。详见 VALIDATION.md。
+- 已知限制：错误信息只解决「看不懂」。PDF 上传仍需要外部 Docling/PyTorch 解析环境（本机未安装，`python -m rag_mcp.pdf_worker` 报 `No module named 'rag_mcp'`）以及知识库配置的 VLM 端点；文本/Markdown 上传不受影响。

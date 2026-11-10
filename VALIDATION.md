@@ -637,3 +637,29 @@ $env:RAG_MODEL_PROVIDER_URL = "http://127.0.0.1:8032/v1"
 $env:RAG_REAL_SMOKE = "1"
 .venv\Scripts\python -m pytest tests/test_document_tools.py -k real_mcp -q -s
 ```
+
+## PDF 解析错误信息 — 2026-11-10
+
+现场：Console 批量上传 `2404.16130v2.pdf` 返回「知识库操作失败：errorString」，服务端日志无错误详情。
+
+排查结论（MySQL `upload_operations` / `upload_steps`）：
+
+- 失败操作 `cfbb8f8f5058fdb869a58a2deb2a7fec`（namespace `asdjasdajbsc`）状态 `ROLLED_BACK`，失败步骤 `chunking_tokenizer`，`error` 列只存了脱敏类别 `errorString`；`receive_source`、`deduplicate` 已完成，`rollback` 完成，没有残留文档。
+- 根因是 PDF 解析依赖外部 Docling Python worker 而本机没有该环境：`python -m rag_mcp.pdf_worker --help` 直接报 `ModuleNotFoundError: No module named 'rag_mcp'`（系统 Python 3.11；`.venv` 里也没有 `docling`），`.env` 未设置 `RAG_PDF_PARSER_PYTHON`/`PYTHONPATH`；同库的 `.txt` 上传在 13:51 成功。
+- `errorString` 来自 `safeUploadErrorText` 的兜底分支：`shortTypeName` 输出 Go 类型名，而 `fmt.Errorf`（无 `%w`）产生的就是 `*errors.errorString`。Python 原实现 `_safe_error` 用的是 `type(exc).__name__`，所以这是移植后丢掉可读性的缺陷。
+
+修复与验证：
+
+```powershell
+$env:GOCACHE = ".test-tmp\gocache"
+$env:RAG_TEST_MYSQL_URL = "mysql://rag:praxis-dev-pw@127.0.0.1:3307/praxis_gotest"
+go vet ./internal/document ./internal/runtime ./internal/ingest
+go test ./internal/document ./internal/ingest -count=1
+go test ./internal/runtime -run "TestSafeUploadErrorTextPdfParseMessage" -count=1 -v
+go test ./internal/runtime -run "Upload|Pdf|PDF|StopIndex|Recover" -count=1 -timeout 20m
+```
+
+- `internal/document`：`TestExternalPDFParserErrors/missing_python_module`（stderr 含 `No module named 'rag_mcp'` 时返回 `*PDFParseError`，消息含模块名与 `RAG_PDF_PARSER_PYTHON`）、`TestMissingPythonModule`（带引号/不带引号/无标记三种 stderr）通过；原有失败/超时/manifest 错误消息保持不变。
+- `internal/runtime`：`TestSafeUploadErrorTextPdfParseMessage` 通过；上传相关子集（`Upload|Pdf|PDF|StopIndex|Recover`）223.4s 全绿。
+- 重建 `dist/bin/rag-service.exe` 并以同样生产配置重启 8011，`/health` 200；再次上传 PDF 时响应应为「PDF 解析不可用：Python 解析环境缺少模块 rag_mcp…」而不是 `errorString`。
+- 已知未处理：旧 debug 上传 `2c060059701b999a604c3d42863e3982`（namespace `debug222146`）的历史工作区不在当前数据根下，回收循环每 10 秒打一条 `Unsafe upload workspace`（ValueError）日志，与本问题无关，待单独清理。

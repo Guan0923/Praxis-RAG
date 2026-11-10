@@ -832,6 +832,8 @@ func (s *Service) failDocumentOperation(
 		return result, nil
 	}
 	s.compensateUpload(ctx, coordinator, operation, cause)
+	log.Printf("Upload %s failed category=%s detail=%q",
+		operation.ID, errorTypeName(cause), truncateText(cause.Error(), 500))
 	return nil, &documentOperationError{Err: cause, OperationID: operation.ID}
 }
 
@@ -1118,6 +1120,10 @@ func safeUploadErrorText(err error) string {
 	if errors.As(err, &modelError) {
 		return truncateText(modelError.Message, 500)
 	}
+	var pdfParse *document.PDFParseError
+	if errors.As(err, &pdfParse) {
+		return truncateText(pdfParse.Message, 500)
+	}
 	var operationError *documentOperationError
 	if errors.As(err, &operationError) {
 		return "知识库操作失败：" + shortTypeName(operationError.Err)
@@ -1143,6 +1149,13 @@ func shortTypeName(err error) string {
 	name = strings.TrimPrefix(name, "*")
 	if index := strings.LastIndex(name, "."); index >= 0 {
 		name = name[index+1:]
+	}
+	// Go has no Python exception classes; errors.New and fmt.Errorf without
+	// %w are the port's RuntimeError. Without this mapping callers would see
+	// the exported Go identifier ("errorString") instead of an error category.
+	switch name {
+	case "errorString", "wrapError":
+		return "RuntimeError"
 	}
 	return name
 }
