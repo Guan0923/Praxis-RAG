@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "build": "npm run typecheck && vite build"
   },
   "dependencies": {
@@ -16,12 +18,16 @@
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
     "@types/node": "26.5.0",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.7",
     "@vitejs/plugin-react": "6.1.1",
+    "jsdom": "^31.0.0",
     "typescript": "7.0.2",
     "vite": "8.2.2",
-    "vite-plugin-static-copy": "4.1.1"
+    "vite-plugin-static-copy": "4.1.1",
+    "vitest": "^5.1.0"
   }
 }

@@ -296,6 +296,9 @@ type harness struct {
 	Model   *httpRecorder
 	Cache   *redisstate.Client
 	Broker  *fakeBroker
+	// ModelURL is the fake embedding/reranker endpoint used by knowledge-base
+	// creation and upload tests.
+	ModelURL string
 }
 
 // newHarness builds the real runtime over fake model/Qdrant servers, a real
@@ -327,12 +330,13 @@ func newHarness(t *testing.T, queryPoints string) *harness {
 		t.Fatalf("runtime.New() error = %v", err)
 	}
 	h := &harness{
-		Service: service,
-		Stores:  stores,
-		Qdrant:  qdrant,
-		Model:   modelRecorder,
-		Cache:   cache,
-		Broker:  &fakeBroker{},
+		Service:  service,
+		Stores:   stores,
+		Qdrant:   qdrant,
+		Model:    modelRecorder,
+		Cache:    cache,
+		Broker:   &fakeBroker{},
+		ModelURL: modelURL,
 	}
 	t.Cleanup(func() {
 		service.StopBackground()

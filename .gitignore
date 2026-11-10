@@ -30,6 +30,7 @@ qdrant_storage/
 # Frontend dependencies and generated build output.
 frontend/node_modules/
 frontend/*.tsbuildinfo
+frontend/coverage/
 /build/
 # pytest temp root when the system temp dir is unavailable (sandboxed shells)
 pytest-of-*/

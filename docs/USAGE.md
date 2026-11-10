@@ -695,21 +695,24 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 
 已在仓库内验证：
 
-- `go build ./...` 全部通过；`go test -count=1 ./...` 全部通过（包数与用例数随代码演进：迁移闭环时为 24 个有测试的包，含 state/runtime/workers/httpapi/mcp/searchrefs/检索栈等）。
-- `scripts/build-go.ps1` 本机构建 + 冒烟：`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200。POSIX 的 `scripts/build-go.sh`/`make` 未在当前 Windows 验证环境执行。
+- `go build ./...` 全部通过；`go test -p 1 -count=1 -timeout 25m ./...` 全部通过（串行是必须的：所有包共用同一个 MySQL 测试 schema，靠 advisory lock 互斥）。测试覆盖 state/runtime/workers/httpapi/mcp/searchrefs/检索栈，以及 `internal/e2e` 的真实 HTTP 全栈链路。
+- `scripts/build-go.ps1` 本机构建 + 冒烟：`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200。POSIX 的 `scripts/build-go.sh`/`make check` 未在当前 Windows 验证环境执行。
 - 三个 worker 二进制 `--help`、无 Kafka、错误 backend、非法 `--kind` 的退出码行为；文档 worker 本地模式可启动并连接 MySQL 状态。
 - Go 端 REST/MCP/检索/文档/资产投影/`document.md` 预览/上传事务的单元与集成测试（真实 MySQL + fake Qdrant/model）。
+- Console 角色/知识库归属/邀请共享的**全栈 HTTP E2E**（真实登录会话与 CSRF、真实 access 服务、真实 MySQL）：`internal/e2e/permissions_http_test.go` 覆盖角色变更、归属可见性、邀请创建→收件箱→预览→接受、只读/读写闸门、模板建库、撤销授权。异步上传发布后读模型刷新的回归也由 `internal/e2e` 覆盖。
 
 **未验证**（不要据此宣称生产就绪）：
 
 - Docker 镜像构建、Compose `app` profile、systemd 单元未实际执行（本环境无 Docker/systemd）。
 - 已实机验证 Kafka 3.9.0 + Debezium Server 3.7.1 + MySQL 8.0 + Redis + Qdrant：CDC 投递（Kafka healthy、`Starting streaming`、topic 记录与 outbox 一致），以及 Go 服务/worker 的完整异步链路（debezium 与 relay 两种模式）、显式 DLQ topic、排队 MCP 搜索与 Redis 快照。仍未验证 SASL/TLS 外部 Kafka、MySQL 多实例锁与 systemd 部署。
 - Docling/LibreOffice 链路未在 Go 环境实机验证；PDF/DOC/Word 解析依赖外部 Python 环境，远端 VLM 端点只做了配置/协议单测，未做实机联调。
-- 没有浏览器 E2E：Console 只验证构建与静态冒烟，交互/字段联动由人工核对与前端源码检查。
+- Console 有前端单元与契约测试（`frontend/src/*.test.ts`，Vitest：角色/权限文案、邀请过期计算、api 客户端的路径/CSRF/错误契约、路由与邀请 token 解析）与构建检查；但**没有浏览器级 E2E**，页面交互/样式仍由人工核对。
 - Tokenizer 是确定性近似，不保证与 Python/BGE-M3 的 token 计数一致（句子/段落/结构边界一致）。
 - 异步 e2e（API 受理 → fake Kafka transport → worker → 发布）已由 `internal/e2e` 覆盖；真实 Kafka/MySQL/Redis/Qdrant 上由 Go worker 完成整条链路的黑盒回归已执行并通过：`scripts/verify-debezium-e2e.py`（debezium/relay）、`scripts/verify-kafka-search.py`（排队搜索）、`scripts/verify-kafka-dlq.py`（DLQ）。
 
 ## 11. 开发与测试
+
+### 后端（Go）
 
 ```powershell
 gofmt -l internal cmd
@@ -718,12 +721,42 @@ go build ./...
 
 # 测试需要一次性 MySQL schema（库名必须含 test），不会回退 SQLite
 $env:RAG_TEST_MYSQL_URL = 'mysql+pymysql://rag:change-me@127.0.0.1:3307/praxis_unit_test?charset=utf8mb4'
-go test -count=1 ./...
 
-# 只跑某一部分
-go test -count=1 ./internal/runtime/...
-go test -count=1 ./internal/httpapi/... ./internal/mcp/...
+# 必须串行：所有包共用同一个 MySQL 测试 schema，靠 GET_LOCK 互斥；
+# 并行运行会排队甚至撞上默认 10 分钟包超时。
+go test -p 1 -count=1 -timeout 25m ./...
+
+# 只跑某一部分（同一时间仍然只跑一个包，避免抢锁）
+go test -p 1 -count=1 -timeout 10m ./internal/runtime/
+go test -p 1 -count=1 -timeout 10m ./internal/httpapi/ ./internal/mcp/
 ```
+
+`internal/e2e` 是真实 HTTP 接口的全栈测试：真实 MySQL 状态库、真实 `httpapi`/`runtime`/`access`/`auth`，模型、Qdrant、Redis（miniredis）与 broker 用进程内 fake。新增的 `permissions_http_test.go` 覆盖角色、知识库归属、邀请链接生命周期与文档读写闸门，约 45 秒。
+
+也可以用脚本/Make 目标（会带上 `-p 1` 和超时）：
+
+```powershell
+pwsh -File scripts/build-go.ps1 -Test          # 构建 + 串行 Go 测试 + 冒烟
+make test                                      # go test -p 1 ...
+```
+
+### 前端（Console）
+
+```powershell
+cd frontend
+npm ci
+npm run typecheck        # 含测试文件
+npm test                 # Vitest 单元/契约测试（worker threads + jsdom）
+npm run build            # tsc + vite build
+```
+
+`npm test` 的用例位于 `frontend/src/*.test.ts`：`api.test.ts` 校验 api 客户端的 URL/请求头/CSRF/错误契约与共享接口的请求体，`navigation.test.ts` 校验 hash 路由、邀请 token 解析与 namespace 规则。
+
+`make check` 一次执行 `vet + Go 测试 + 前端 typecheck/测试/构建`（需要 `RAG_TEST_MYSQL_URL`）。
+
+### 持续集成
+
+`.github/workflows/test.yml` 提供两条流水线：`go vet + go build + go test -p 1`（GitHub Actions 的 MySQL 8 service，库名 `praxis_unit_test`）和前端 `typecheck + npm test + build`。CI 与本地命令一致，唯一区别是 Linux 上不需要 `-p 1` 以外的额外处理。
 
 外部解析器 worker（可选，Python 仅用于 PDF/Word 视觉解析）：
 

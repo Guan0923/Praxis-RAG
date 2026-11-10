@@ -212,6 +212,23 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 - **已实机验证**：Kafka 3.9.0 + Debezium 3.7.1 + MySQL 8.0 + Redis + Qdrant 上的完整异步链路（debezium 与 relay 两种模式）、显式 DLQ topic、排队 MCP 搜索（search worker + Redis 快照）；脚本见 `scripts/verify-debezium-e2e.py`、`scripts/verify-kafka-dlq.py`、`scripts/verify-kafka-search.py`。
 - **仍待验证**（以 [GO_MIGRATION](docs/GO_MIGRATION.md) 为准）：Kafka SASL/TLS 外部集群、Docker 镜像/Compose `app` profile、systemd、真实 MySQL 多实例并发/故障切换、浏览器 E2E；黑盒 parity 差分改为固定预期（Python 对照已删除）。真实环境冒烟与未验证项见[使用与部署](docs/USAGE.md) 的验证边界。
 
+## 测试
+
+```powershell
+# 后端：一次性 MySQL schema（库名必须含 test），所有包共用 schema，必须串行
+$env:RAG_TEST_MYSQL_URL = 'mysql+pymysql://rag:change-me@127.0.0.1:3307/praxis_unit_test?charset=utf8mb4'
+go vet ./...
+go test -p 1 -count=1 -timeout 25m ./...
+
+# 前端：类型检查 + 单元/契约测试 + 构建
+cd frontend
+npm ci
+npm test
+npm run build
+```
+
+也可以 `pwsh -File scripts/build-go.ps1 -Test`（构建 + 串行测试 + 冒烟）或 `make check`（vet + Go 测试 + 前端 typecheck/测试/构建）。CI 工作流见 `.github/workflows/test.yml`，详细说明见[使用与部署](docs/USAGE.md)的「开发与测试」。
+
 ## 使用边界
 
 - 异步受理（MCP `add_document` 与 `RAG_UPLOAD_MODE=async` 的网页/REST 上传）的受理点是状态库单事务提交（任务 + 发件箱），不是 Kafka 确认；MCP 更新/删除与同步模式的上传仍在请求内完成，索引期间会等待。

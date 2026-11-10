@@ -152,7 +152,14 @@ func (s *Service) publishDocument(
 	if _, err := s.stores.Uploads.Commit(ctx, operation, metadata, transaction); err != nil {
 		return err
 	}
-	return transaction.Commit()
+	if err := transaction.Commit(); err != nil {
+		return err
+	}
+	// The publish transaction touched the documents/kb_list read models through
+	// UpsertTx (which never flushes on its own). Refresh them now so cached
+	// document lists and search snapshots see the published head immediately.
+	s.stores.Documents.FlushViews(ctx, operation.Namespace)
+	return nil
 }
 
 // errorTypeName renders a safe error category for logs, mirroring Python's

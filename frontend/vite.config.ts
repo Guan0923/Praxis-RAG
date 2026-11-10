@@ -18,6 +18,9 @@ export default defineConfig({
     assetsDir: "assets",
   },
   server: {
+    // Vitest bundles its config through a temporary ".vitest.config.ts.*.tmpdir"
+    // directory in this folder; the dev server must not watch those files.
+    watch: { ignored: ["**/.vitest.config.ts.*", "**/coverage/**"] },
     proxy: Object.fromEntries(
       ["/health", "/v1", "/mcp"].map((path) => [
         path,

@@ -6,6 +6,51 @@
 > is recorded immediately below. RocketMQ wording in the historical sections is
 > retained as history.
 
+## Test workflow hardening — 2026-11-10
+
+Goal: make the repository's test workflow actually reliable, and cover the
+Console-facing roles/ownership/sharing feature end to end.
+
+- **Fixed a real bug the suite had been hiding.** `TestRESTAsyncUploadPipeline`
+  was already red on the untouched `8df52da` baseline: the asynchronous publish
+  path committed the document row plus the upload journal in one transaction but
+  refreshed only the upload read models. With the Redis cache attached the
+  `documents`/`kb_list` revisions stayed stale, so `GET /v1/documents` answered
+  from an empty cached snapshot right after the worker published. The publish
+  path now calls the new `state.DocumentRepository.FlushViews` after commit
+  (`internal/runtime/documents_publish.go`); the e2e test and the full suite are
+  green.
+- **New full-stack HTTP e2e**: `internal/e2e/permissions_http_test.go` (≈46 s)
+  runs the real `httpapi` router with real cookie sessions + CSRF, the real
+  `auth` and `access` services and the real MySQL state over the harness' fake
+  model/Qdrant servers. It covers: role management (only admins; normal users
+  cannot open the picker), ownership visibility before/after a grant, invitation
+  create → inbox → preview (wrong account 403) → accept, read-only list/delete/
+  upload gates, non-owner and non-VIP invite refusals, the write grant +
+  upload + document-list path, template-based self-creation with recorded
+  ownership, grant listing and revocation.
+- **Console unit/contract tests**: Vitest + jsdom with a worker-thread pool
+  (`pool: "threads"`; forked workers are unavailable in this sandbox and are not
+  needed). `frontend/src/api.test.ts` (17 tests) pins the api client contract —
+  namespace/bearer headers, CSRF on writes only, the 401 handler scoping, error
+  detail formatting, sharing endpoint URLs/bodies and null-list normalization.
+  `frontend/src/navigation.test.ts` (10 tests) pins hash-route parsing, invite
+  token parsing and namespace validation. `npm test` → **27/27 pass**;
+  `npm run typecheck` and `npm run build` stay green.
+- **Runner reliability**: `-p 1 -count=1 -timeout 25m` is now baked into
+  `scripts/build-go.ps1 -Test` and `scripts/build-go.sh test` and documented in
+  README/USAGE; `make test`, `make test-frontend` and `make check` added.
+  Every package truncates the same MySQL schema behind `GET_LOCK(...,600)`, so
+  parallel packages queue past the default 10 m package timeout — serial is not
+  a preference, it is required.
+- **CI**: `.github/workflows/test.yml` runs `go vet`/`go build`/`go test -p 1`
+  with a MySQL 8 service container and a separate frontend
+  `typecheck + npm test + build` job.
+- **Full serial suite**: `go test ./... -p 1 -count=1 -timeout 25m` → every
+  package passes, exit 0, ≈16 minutes total (`internal/e2e` 205.4 s,
+  `internal/runtime` 462.5 s, `internal/state` 400.6 s, `documentworker` 53.3 s).
+  The previously failing e2e case is part of that green run.
+
 ## Roles, knowledge-base ownership and invitation permissions — 2026-11-09
 
 Delivered: `admin` / `vip` / `user` roles (only administrators change roles),

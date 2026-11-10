@@ -69,8 +69,14 @@ build_go() {
 
 run_tests() {
     need go "Install Go 1.27+ and rerun."
-    say "[run] go test ./..."
-    go test ./...
+    if [ -z "${RAG_TEST_MYSQL_URL:-}" ]; then
+        say "[warn] RAG_TEST_MYSQL_URL is not set; the Go suite fails fast without a disposable MySQL schema."
+    fi
+    # Every package shares one MySQL test schema behind an advisory lock, so the
+    # packages must run one at a time; -p 1 also keeps the log readable and stays
+    # inside the per-package -timeout budget.
+    say "[run] go test -p 1 -count=1 -timeout 25m ./..."
+    go test -p 1 -count=1 -timeout 25m ./...
 }
 
 smoke() {

@@ -476,3 +476,16 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 文档与验证：新增 `docs/PERMISSIONS.md`，更新 README/USAGE/DEPLOYMENT/.env.example；Go 全包测试（除既有 e2e 失败）、前端 typecheck/build、35 项真实 HTTP 冒烟通过，详见 VALIDATION.md。
 
 已知限制：邀请消息仅站内通知（无邮件/IM）；文件级写授权只能替换已授权文件，不能新建；受限账号在 Kafka 排队搜索部署下会被拒绝异步检索；历史无主知识库需管理员显式授权。
+
+## 2026-11-10 测试工作流完善
+
+本轮把"能不能放心跑测试"补成可复用的工作流，而不只是散落在会话里的命令：
+
+- [x] 修复被红灯掩盖的真实缺陷：异步发布提交 documents/upload journal 后只刷新上传读模型，`documents`/`kb_list` 缓存停在旧版本；`runtime.publishDocument` 在提交后新增 `DocumentRepository.FlushViews`，`TestRESTAsyncUploadPipeline` 由红转绿。
+- [x] 新增 `internal/e2e/permissions_http_test.go`：真实会话 Cookie + CSRF、真实 auth/access/MySQL + 假 model/Qdrant 的全栈 HTTP E2E，覆盖角色变更、归属可见性、邀请创建→收件箱→预览→接受、只读/读写文档闸门、模板自建库、授权列表与撤销。
+- [x] 前端引入 Vitest + jsdom（threads pool）：`api.test.ts` 固定 API 客户端契约（路径、请求头、CSRF 仅写请求、401 处理、错误格式、共享接口请求体与 null 归一化），`navigation.test.ts` 固定 hash 路由、邀请 token 解析与 namespace 规则；`npm test` 27/27 通过，typecheck/build 保持绿色。
+- [x] 测试命令可靠化：`-p 1 -count=1 -timeout 25m` 写入 `scripts/build-go.ps1 -Test` 与 `scripts/build-go.sh test`，README/USAGE 同步；新增 `make test` / `make test-frontend` / `make check`。
+- [x] 新增 `.github/workflows/test.yml`：MySQL 8 service + `go vet/build/test -p 1`，以及前端 typecheck/test/build 两条 CI。
+- [x] 文档与验证记录：README、docs/USAGE.md（§10/§11）、VALIDATION.md 更新；全量 `go test ./... -p 1 -count=1 -timeout 25m` 全绿（约 16 分钟，e2e 205s、runtime 462s、state 400s）。
+
+已知边界：仍无浏览器级 E2E（Playwright/Cypress），Console 的点击级交互继续靠前端契约测试与人工核对；CI 依赖 Go 1.27 工具链与 GitHub Actions MySQL service，本机 Windows 未实际执行 CI。

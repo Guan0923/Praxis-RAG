@@ -697,6 +697,14 @@ func (r *DocumentRepository) flushPending(ctx context.Context, namespace string)
 	}
 }
 
+// FlushViews refreshes the cached document and knowledge-base display views
+// after the caller's transaction committed document changes made through
+// UpsertTx/DeleteTx. The caller must invoke it only after commit; failures are
+// best-effort and stay queued for the relay.
+func (r *DocumentRepository) FlushViews(ctx context.Context, namespace string) {
+	r.flushPending(ctx, namespace)
+}
+
 const (
 	documentSelectColumns = "d.name, d.document_id, d.size, d.sha256, d.chunking, d.collection, " +
 		"d.chunk_count, d.modified_at, d.indexed_at, d.diagnostics, d.skipped_object_count, h.version"

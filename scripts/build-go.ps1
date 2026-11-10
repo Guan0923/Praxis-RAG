@@ -133,7 +133,13 @@ try {
 
     function Invoke-GoTests {
         Assert-Tool "go" "Install Go 1.27+ and rerun."
-        Invoke-Native "go" @("test", "./...") "go test ./..."
+        if (-not $env:RAG_TEST_MYSQL_URL) {
+            Write-Host "[warn] RAG_TEST_MYSQL_URL is not set; the Go suite fails fast without a disposable MySQL schema."
+        }
+        # Every package shares one MySQL test schema behind an advisory lock, so
+        # the packages must run one at a time; -p 1 also keeps the log readable
+        # and stays inside the per-package -timeout budget.
+        Invoke-Native "go" @("test", "-p", "1", "-count=1", "-timeout", "25m", "./...") "go test -p 1 -count=1 -timeout 25m ./..."
     }
 
     function Get-FreeLoopbackPort {

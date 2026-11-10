@@ -1,0 +1,75 @@
+name: test
+
+# The Go suite runs against a real disposable MySQL schema (see internal/statetest);
+# every package truncates that schema behind a cross-process advisory lock, so the
+# packages must run serially (-p 1). Qdrant/Redis/Kafka and the model providers are
+# replaced by in-process fakes, so no other service is required.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: go vet + serial tests
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: praxis_unit_test
+          MYSQL_USER: rag
+          MYSQL_PASSWORD: rag
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -u root -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+    env:
+      # The database name must contain "test"; statetest refuses anything else.
+      RAG_TEST_MYSQL_URL: mysql+pymysql://rag:rag@127.0.0.1:3306/praxis_unit_test?charset=utf8mb4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # go.mod pins the toolchain the backend requires.
+          go-version-file: go.mod
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
+      - name: Test (serial, one shared MySQL schema)
+        run: go test -p 1 -count=1 -timeout 25m ./...
+
+  frontend:
+    name: frontend typecheck + unit tests + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit and contract tests
+        run: npm test
+      - name: Build Console
+        run: npm run build
