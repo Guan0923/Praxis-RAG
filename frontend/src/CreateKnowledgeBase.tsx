@@ -176,7 +176,7 @@ function TenantKnowledgeBaseForm({ disabled, onCreated, connection }: {
     }
   }
 
-  return <div className="knowledge-base-form">
+  return <div className="knowledge-base-form knowledge-base-form-wide">
     <Alert
       className="page-alert"
       type="info"
@@ -194,24 +194,24 @@ function TenantKnowledgeBaseForm({ disabled, onCreated, connection }: {
       onFinish={(values) => void save(values)}
       initialValues={{ namespace: "", strategy: undefined, chunk_size: undefined, chunk_overlap: undefined }}
     >
-      <Form.Item name="namespace" label="知识库标识（Namespace）" rules={[
-        { required: true, whitespace: true, message: "请输入知识库标识" },
-        { pattern: namespacePattern, message: "使用字母、数字、点、下划线或横线，首位为字母或数字" },
-      ]}>
-        <Input maxLength={64} autoComplete="off" />
-      </Form.Item>
-      <Form.Item name="strategy" label="切分方式" rules={[{ required: true, message: "请选择切分方式" }]}>
-        <Select
-          disabled={locked || !catalog}
-          virtual={false}
-          options={catalog?.strategies.map((item) => ({ value: item.id, label: item.label }))}
-          onChange={(id) => {
-            const selected = catalog?.strategies.find((item) => item.id === id);
-            form.setFieldsValue({ chunk_size: selected?.chunk_size, chunk_overlap: selected?.chunk_overlap });
-          }}
-        />
-      </Form.Item>
-      <div className="chunk-controls">
+      <div className="knowledge-form-columns">
+        <Form.Item name="namespace" label="知识库标识（Namespace）" rules={[
+          { required: true, whitespace: true, message: "请输入知识库标识" },
+          { pattern: namespacePattern, message: "使用字母、数字、点、下划线或横线，首位为字母或数字" },
+        ]}>
+          <Input maxLength={64} autoComplete="off" />
+        </Form.Item>
+        <Form.Item name="strategy" label="切分方式" rules={[{ required: true, message: "请选择切分方式" }]}>
+          <Select
+            disabled={locked || !catalog}
+            virtual={false}
+            options={catalog?.strategies.map((item) => ({ value: item.id, label: item.label }))}
+            onChange={(id) => {
+              const selected = catalog?.strategies.find((item) => item.id === id);
+              form.setFieldsValue({ chunk_size: selected?.chunk_size, chunk_overlap: selected?.chunk_overlap });
+            }}
+          />
+        </Form.Item>
         <Form.Item name="chunk_size" label={"块长度（" + unit + "）"} rules={[
           { required: true, type: "integer", min: strategy === "character" ? 100 : 1, max: 100000 },
         ]}>
@@ -482,7 +482,62 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
     }
   }
 
-  return <div className="knowledge-base-form">
+  // 创建知识库页面把 Embedding / Reranker / VLM 并排成三列（窄屏自动降为两列
+  // 或一列），文本切分排成一行；编辑知识库的抽屉仍保持纵向布局。
+  const providerSections = kinds.map((kind) => {
+    const title = modelKindLabels[kind];
+    const enabled = kind === "embedding" || (kind === "reranker" ? rerankerEnabled : vlmEnabled);
+    const field = profileField[kind];
+    const kindProfiles = profiles.filter((profile) => profile.kind === kind);
+    const options = kindProfiles.map((profile) => ({
+      value: profile.id,
+      label: <div className="model-profile-option">
+        <span className="break-text">{profile.name} · {profile.model}</span>
+        <span className="secondary break-text">{profile.base_url}</span>
+      </div>,
+    }));
+    // 知识库当前连接不在模型列表里时保留「当前配置」选项：保存时沿用原连接，
+    // 不会触发重新向量化。未启用的可选类型没有当前连接，不提供该选项。
+    const showCurrent = Boolean(initial && enabled && currentModel(kind) &&
+      (!profilesLoaded || !matchedProfile(kind)));
+    if (showCurrent) {
+      options.unshift({
+        value: currentProfile,
+        label: <span className="break-text">{`当前配置 · ${currentModel(kind)}（${currentUrl(kind)}）`}</span>,
+      });
+    }
+    return <section className="knowledge-provider" aria-label={title + " 配置"} key={kind}>
+      <div className="section-heading"><h2>{title}</h2>{kind === "reranker" &&
+        <Switch aria-label="启用 Reranker" checked={rerankerEnabled} disabled={locked}
+          onChange={(checked) => toggleKind("reranker", checked)} />}
+        {kind === "vlm" &&
+        <Switch aria-label="启用 VLM" checked={vlmEnabled} disabled={locked}
+          onChange={(checked) => toggleKind("vlm", checked)} />}</div>
+      {enabled && kindProfiles.length === 0 && !profilesLoading && !profilesError &&
+        <Alert className="page-alert" type="warning" showIcon title={`暂无 ${title} 模型`}
+          description={initial
+            ? `当前知识库使用的 ${title} 连接不在模型列表中，保存时沿用当前配置；可在「模型配置」页面添加后再切换。`
+            : `创建知识库时只能选择已保存的 ${title} 模型，请先在「模型配置」页面添加。`}
+          action={!initial && onOpenModelProfiles
+            ? <Button type="link" size="small" onClick={onOpenModelProfiles}>前往模型配置</Button>
+            : undefined} />}
+      <Form.Item name={field} label={title + " 模型"}
+        rules={enabled ? [{ required: true, message: `请选择 ${title} 模型` }] : []}>
+        <Select
+          virtual={false}
+          disabled={locked || !enabled || !profilesLoaded}
+          placeholder={profilesLoading
+            ? "正在读取模型列表…"
+            : profilesError
+              ? "模型列表读取失败"
+              : kindProfiles.length === 0 ? `暂无可用 ${title} 模型` : `请选择 ${title} 模型`}
+          options={options}
+        />
+      </Form.Item>
+    </section>;
+  });
+
+  return <div className={"knowledge-base-form" + (initial ? "" : " knowledge-base-form-wide")}>
     {error && <Alert type="error" showIcon className="page-alert" title="知识库配置失败" description={error}
       action={!defaults ? <Button icon={<ReloadOutlined />} aria-label="重新读取切分配置" onClick={() => void loadDefaults()} /> : undefined} />}
     {profilesError && <Alert type="error" showIcon className="page-alert" title="模型列表读取失败" description={profilesError}
@@ -502,76 +557,29 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         setError("");
         persistDraft();
       }}>
-      {!initial && <Form.Item name="namespace" label="知识库标识（Namespace）" rules={[
+      {!initial && <Form.Item className="knowledge-base-namespace" name="namespace" label="知识库标识（Namespace）" rules={[
         { required: true, message: "请输入知识库标识" }, { pattern: namespacePattern, message: "使用字母、数字、点、下划线或横线，首位为字母或数字" },
       ]}><Input maxLength={64} autoComplete="off" /></Form.Item>}
-      {kinds.map((kind) => {
-        const title = modelKindLabels[kind];
-        const enabled = kind === "embedding" || (kind === "reranker" ? rerankerEnabled : vlmEnabled);
-        const field = profileField[kind];
-        const kindProfiles = profiles.filter((profile) => profile.kind === kind);
-        const options = kindProfiles.map((profile) => ({
-          value: profile.id,
-          label: <div className="model-profile-option">
-            <span className="break-text">{profile.name} · {profile.model}</span>
-            <span className="secondary break-text">{profile.base_url}</span>
-          </div>,
-        }));
-        // 知识库当前连接不在模型列表里时保留「当前配置」选项：保存时沿用原连接，
-        // 不会触发重新向量化。未启用的可选类型没有当前连接，不提供该选项。
-        const showCurrent = Boolean(initial && enabled && currentModel(kind) &&
-          (!profilesLoaded || !matchedProfile(kind)));
-        if (showCurrent) {
-          options.unshift({
-            value: currentProfile,
-            label: <span className="break-text">{`当前配置 · ${currentModel(kind)}（${currentUrl(kind)}）`}</span>,
-          });
-        }
-        return <section className="knowledge-provider" aria-label={title + " 配置"} key={kind}>
-          <div className="section-heading"><h2>{title}</h2>{kind === "reranker" &&
-            <Switch aria-label="启用 Reranker" checked={rerankerEnabled} disabled={locked}
-              onChange={(checked) => toggleKind("reranker", checked)} />}
-            {kind === "vlm" &&
-            <Switch aria-label="启用 VLM" checked={vlmEnabled} disabled={locked}
-              onChange={(checked) => toggleKind("vlm", checked)} />}</div>
-          {enabled && kindProfiles.length === 0 && !profilesLoading && !profilesError &&
-            <Alert className="page-alert" type="warning" showIcon title={`暂无 ${title} 模型`}
-              description={initial
-                ? `当前知识库使用的 ${title} 连接不在模型列表中，保存时沿用当前配置；可在「模型配置」页面添加后再切换。`
-                : `创建知识库时只能选择已保存的 ${title} 模型，请先在「模型配置」页面添加。`}
-              action={!initial && onOpenModelProfiles
-                ? <Button type="link" size="small" onClick={onOpenModelProfiles}>前往模型配置</Button>
-                : undefined} />}
-          <Form.Item name={field} label={title + " 模型"}
-            rules={enabled ? [{ required: true, message: `请选择 ${title} 模型` }] : []}>
-            <Select
-              virtual={false}
-              disabled={locked || !enabled || !profilesLoaded}
-              placeholder={profilesLoading
-                ? "正在读取模型列表…"
-                : profilesError
-                  ? "模型列表读取失败"
-                  : kindProfiles.length === 0 ? `暂无可用 ${title} 模型` : `请选择 ${title} 模型`}
-              options={options}
-            />
-          </Form.Item>
-        </section>;
-      })}
+      {initial
+        ? providerSections
+        : <div className="knowledge-provider-grid" role="group" aria-label="模型配置">{providerSections}</div>}
       <section className="knowledge-provider" aria-label="切分配置"><h2>文本切分</h2>
-        <Form.Item name="strategy" label="切分方式" rules={[{ required: true }]}>
-          <Select disabled={locked || !!initial || !defaults} virtual={false}
-            options={defaults?.strategies.map((item) => ({ value: item.id, label: item.label }))}
-            onChange={(id) => { const selected = defaults?.strategies.find((item) => item.id === id);
-              form.setFieldsValue({ chunk_size: selected?.chunk_size, chunk_overlap: selected?.chunk_overlap });
-              persistDraft(); }} />
-        </Form.Item>
-        <div className="chunk-controls">
-          <Form.Item name="chunk_size" label={"块长度（" + unit + "）"} rules={[{ required: true, type: "integer", min: strategy === "character" ? 100 : 1, max: 100000 }]}>
-            <InputNumber disabled={locked || !!initial} min={strategy === "character" ? 100 : 1} max={100000} />
+        <div className="knowledge-chunk-row">
+          <Form.Item name="strategy" label="切分方式" rules={[{ required: true }]}>
+            <Select disabled={locked || !!initial || !defaults} virtual={false}
+              options={defaults?.strategies.map((item) => ({ value: item.id, label: item.label }))}
+              onChange={(id) => { const selected = defaults?.strategies.find((item) => item.id === id);
+                form.setFieldsValue({ chunk_size: selected?.chunk_size, chunk_overlap: selected?.chunk_overlap });
+                persistDraft(); }} />
           </Form.Item>
-          <Form.Item name="chunk_overlap" label={"重叠长度（" + unit + "）"} dependencies={["chunk_size"]} rules={[
-            { required: true, type: "integer", min: 0 }, ({ getFieldValue }) => ({ validator: (_, value) => value < getFieldValue("chunk_size") ? Promise.resolve() : Promise.reject(new Error("重叠长度必须小于块长度")) }),
-          ]}><InputNumber disabled={locked || !!initial} min={0} /></Form.Item>
+          <div className="chunk-controls">
+            <Form.Item name="chunk_size" label={"块长度（" + unit + "）"} rules={[{ required: true, type: "integer", min: strategy === "character" ? 100 : 1, max: 100000 }]}>
+              <InputNumber disabled={locked || !!initial} min={strategy === "character" ? 100 : 1} max={100000} />
+            </Form.Item>
+            <Form.Item name="chunk_overlap" label={"重叠长度（" + unit + "）"} dependencies={["chunk_size"]} rules={[
+              { required: true, type: "integer", min: 0 }, ({ getFieldValue }) => ({ validator: (_, value) => value < getFieldValue("chunk_size") ? Promise.resolve() : Promise.reject(new Error("重叠长度必须小于块长度")) }),
+            ]}><InputNumber disabled={locked || !!initial} min={0} /></Form.Item>
+          </div>
         </div>
       </section>
       <div className="toolbar">

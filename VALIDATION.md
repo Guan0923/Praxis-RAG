@@ -6,6 +6,69 @@
 > is recorded immediately below. RocketMQ wording in the historical sections is
 > retained as history.
 
+## Console create-knowledge-base multi-column layout — 2026-11-10
+
+Delivered: the Console「创建知识库」page no longer stacks every field vertically.
+The widest form grows from 720 px to 1080 px and arranges fields in rows:
+
+- Admin form: namespace input capped at 460 px; Embedding / Reranker / VLM cards
+  share a three-column grid (three columns ≥1180 px, two 768–1179 px, one
+  ≤767 px) under a single top rule; the text-chunking fields
+  (切分方式 / 块长度 / 重叠长度) share a three-column row (three ≥1024 px, two
+  768–1023 px, one ≤767 px).
+- VIP/user form: namespace, strategy, chunk size and chunk overlap form a 2×2
+  two-column grid (single column ≤767 px).
+- The edit-knowledge-base drawer (720 px, 知识库列表 → 配置) keeps the original
+  vertical layout so selects are not squeezed; field set, validation and submit
+  payloads are unchanged (only layout wrappers were added).
+
+Frontend verification (worktree `dsh-f2edde66-add5`, Windows 11, Node v26.13.0 /
+npm 12.2.2):
+
+```
+$ npm run typecheck
+exit 0, no diagnostics
+
+$ npm test
+Test Files  5 passed (5)
+Tests       54 passed (54)
+
+$ npm run build
+../build/web/assets/index-BTOMzEre.css      14.84 kB │ gzip:   3.54 kB
+../build/web/assets/index-DBnJ_9e6.js    1,251.47 kB │ gzip: 395.34 kB
+✓ built in 2.67s   (only the pre-existing >500 kB chunk advisory)
+```
+
+Vite 8's Windows mapped-drive probe (`child_process.exec("net use")`) is rejected
+by this shell sandbox (pipe EPERM), so the checks above ran with a temporary
+`NODE_OPTIONS` shim that only makes that probe fail cleanly; the shim and the
+local preview scripts were deleted afterwards and are not part of the change.
+
+Visual check with headless Chrome 145 (CDP `Emulation.setDeviceMetricsOverride`
+for exact viewports; the production bundle was served by a temporary local proxy
+in front of the running `127.0.0.1:8011` service):
+
+- 1440 px, admin form, draft pre-selected with the saved `default` profiles:
+  provider grid = 3 × 344 px, chunk row = 3 × 344 px, form = 1080 px,
+  `documentElement.scrollWidth` = 1440 (no overflow). All three model cards keep
+  the same height although the selected option labels wrap to two lines.
+- 1024 px, admin form: provider grid = 2 × 374 px (VLM wraps to the second row),
+  chunk row stays 3 columns.
+- 390 px, admin form: single column, form = 358 px,
+  `documentElement.scrollWidth` = 390 (no horizontal overflow).
+- 1440 px, VIP/user form (temporary registered `user` account): four fields in a
+  2×2 grid, model-template alert spanning the form width.
+- 720 px drawer with the existing knowledge base `asdjasdajbsc`: unchanged
+  vertical Embedding / Reranker / VLM sections and 2-column chunk controls.
+
+Screenshots: `.test-tmp/create-kb-layout/` (git-ignored, not part of the change).
+The temporary preview account used for the VIP/user screenshot was removed after
+the check (`DELETE /v1/admin/users/{id}` → 204); no persistent data was changed.
+
+Known limits: the repository has no Playwright/Cypress, so this is a manual
+headless-Chrome review rather than an automated browser regression; only the
+create page was changed, the edit drawer is intentionally still single-column.
+
 ## Go-only parser workers (Python/Docling removed) — 2026-11-10
 
 Delivered: the compatibility layer is gone. PDF text extraction, DOCX reading
