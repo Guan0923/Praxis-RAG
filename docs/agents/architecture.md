@@ -84,6 +84,7 @@ examples/knowledge/         示例知识文档（可直接上传试用）
 | `mcp` | MCP 端点、工具、资源、提示词、权限 scope |
 | `migrate` | 旧知识源导入与状态迁移 |
 | `modelapi` | Embedding / Reranker HTTP 客户端 |
+| `monitor` | 只读监控快照：状态库聚合（任务/发件箱/检索任务/上传/资料库计数）与 MySQL/Redis/Qdrant/Kafka/pdf-service 依赖探测，供 Console「系统监控」页与 `GET /v1/admin/monitor/overview` 使用 |
 | `mq` | Kafka 生产/消费、进程内重试、DLQ 发布 |
 | `qdrant` | Qdrant HTTP 客户端（collection、向量、过滤、RRF 查询） |
 | `redisstate` | Redis 读模型缓存与搜索任务/快照 |

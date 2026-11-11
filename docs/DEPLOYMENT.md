@@ -455,6 +455,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
   - 死信 worker 进程退出码/重启次数（`2` 表示配置错，`1` 表示依赖不可用）。
   - `/v1/uploads` 的失败操作、`document_jobs`/`search_tasks` 的 `failed` 计数。
   - Kafka consumer group lag：文档 worker、搜索 worker 分别观察各自组。
+  - Console「系统监控」页（`#/monitor`）汇总上述队列与依赖状态，对应只读接口 `GET /v1/admin/monitor/overview`（本机直连或管理员会话），适合作值班快速定位入口。
 - 告警处理顺序：先看死信 worker 是否在跑且配置正确，再查对应正常组是否有堆积，再按 `stage/error` 定位解析/模型/发布失败；不要直接清空 DLQ topic（会丢失持久终态）。
 
 ## 8. outbox 与投递模式

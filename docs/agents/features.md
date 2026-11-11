@@ -108,6 +108,7 @@
 | 管理：模型配置 | `GET|POST /v1/admin/model-profiles`、`GET|PATCH|DELETE /v1/admin/model-profiles/{profile_id}`、`GET /v1/admin/model-profiles/{profile_id}/key`、`POST /v1/admin/model-profiles/{profile_id}/models` |
 | 管理：MCP 配置 | `GET /v1/admin/tools`、`PATCH /v1/admin/tools/{name}`、`GET /v1/admin/prompts`、`PUT|DELETE /v1/admin/prompts/{name}` |
 | 管理：展示/只读 | `GET /v1/admin/published-versions`、`GET /v1/admin/upload-leases`（注册为无认证，但 handler 内二次校验管理员+本机边界） |
+| 管理：监控 | `GET /v1/admin/monitor/overview`（只读聚合：服务信息、依赖探测、队列积压、资料库计数、24 小时活动；本机直连或管理员会话） |
 | 每账号 API Key | `GET|POST /v1/admin/api-keys`、`PUT|DELETE /v1/admin/api-keys/{key_id}`、`GET /v1/admin/api-keys/{key_id}/mcp-config` |
 | MCP | `POST|GET|DELETE /mcp` |
 
@@ -132,6 +133,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | `#/model-profiles` | 模型配置 | 管理员 | Embedding/Reranker/VLM/OCR 分页签，新增/编辑/删除、模型探测、Key 只写不读 |
 | `#/api-keys` | API Key | 所有登录账号 | 自己的密钥 CRUD/启停、一次性明文、复制 MCP 配置 |
 | `#/users` | 用户管理 | 管理员 | 角色（admin/vip/user）、启用/禁用、删除；服务端保证至少保留一名启用的管理员 |
+| `#/monitor` | 系统监控 | 管理员 | 只读监控快照：服务信息、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态、`document_jobs`/outbox/`search_tasks` 积压、资料库计数、24 小时活动；15 秒自动刷新 |
 | `#/permissions` | 权限管理 | 管理员 / VIP | 选择知识库、按用户聚合授权、创建邀请（可读/可修改 × 全库/若干文件）、复制链接、撤销授权/邀请 |
 | `#/invitations` | 邀请中心 | 登录账号 | 待处理邀请、粘贴邀请链接、接受/拒绝（顶部铃铛轮询） |
 | `#/invite?token=` | 受邀预览 | 登录账号 | 预览邀请并接受/拒绝，随后切换到该知识库 |

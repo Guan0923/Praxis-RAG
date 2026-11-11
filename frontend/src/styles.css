@@ -1011,3 +1011,24 @@ body.drag-selecting * {
   margin-bottom: 12px;
   flex-wrap: wrap;
 }
+
+/* System monitor (系统监控): read-only snapshot cards. */
+.monitor-auto-refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.monitor-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.monitor-tags .ant-tag {
+  margin: 0;
+}
+.monitor-error-list {
+  margin: 0;
+  padding-left: 18px;
+}

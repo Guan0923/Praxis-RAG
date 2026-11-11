@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { readStorage } from "./api";
+import { readStorage, type Role } from "./api";
 
 export const namespacePattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 export type ConsolePage =
@@ -10,6 +10,7 @@ export type ConsolePage =
   | "model-profiles"
   | "knowledge-bases"
   | "users"
+  | "monitor"
   | "permissions"
   | "invitations"
   | "invite";
@@ -19,6 +20,25 @@ export type ConsoleRoute = {
   documentName?: string;
   token?: string;
 };
+
+// adminOnlyPages require an administrator once Console login is enabled. The
+// API Key page is not listed: every account manages only its own keys there.
+export const adminOnlyPages = new Set<ConsolePage>([
+  "model-profiles",
+  "knowledge-bases",
+  "users",
+  "monitor",
+]);
+
+// canViewConsolePage is the single visibility rule for both the sidebar and a
+// direct #/<page> link, so a non-admin cannot open an admin-only page by URL.
+// With login disabled (legacy local mode) there is no account identity, so
+// management pages stay visible exactly as before.
+export function canViewConsolePage(page: ConsolePage, sessionMode: boolean, role?: Role) {
+  if (page === "permissions") return sessionMode && (role === "admin" || role === "vip");
+  if (adminOnlyPages.has(page)) return !sessionMode || role === "admin";
+  return true;
+}
 
 const inviteTokenKey = "rag.invite-token";
 
@@ -80,6 +100,7 @@ export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRout
       hash === "#/model-profiles" ||
       hash === "#/knowledge-bases" ||
       hash === "#/users" ||
+      hash === "#/monitor" ||
       hash === "#/permissions" ||
       hash === "#/invitations"
     ) {
@@ -107,6 +128,7 @@ export function routeHash(route: ConsoleRoute) {
     route.page === "model-profiles" ||
     route.page === "knowledge-bases" ||
     route.page === "users" ||
+    route.page === "monitor" ||
     route.page === "permissions" ||
     route.page === "invitations"
   )

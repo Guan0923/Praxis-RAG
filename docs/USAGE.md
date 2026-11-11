@@ -448,6 +448,21 @@ curl.exe http://127.0.0.1:8011/openapi.json   # OpenAPI 3.1
 curl.exe http://127.0.0.1:8011/docs           # 自包含交互文档
 ```
 
+### 系统监控（Console 页面与只读接口）
+
+管理员（或本机直连）可在 Console 侧边栏打开「系统监控」（`#/monitor`），页面每 15 秒自动刷新，全部为只读数据：
+
+- **服务信息**：版本、运行时长、后端、默认集合、上传模式（`RAG_UPLOAD_MODE`）、outbox 投递模式（relay/debezium）、文档 worker 模式（进程内/独立）、PDF 引擎。
+- **依赖探测**：MySQL（含连接池 in_use/wait）、Redis（PING）、Qdrant（集合数与目标集合点数）、Kafka（TCP 可达，不验证认证/授权）、pdf-service（`/healthz`）；未启用的依赖标记为「未启用」。
+- **队列与积压**：`document_jobs` 按状态/阶段计数、最老排队时长、租约过期的卡死任务数、24 小时失败数；`document_job_outbox` 按状态计数与最老待投递时长；`search_tasks` 按状态计数；未完成的上传操作数。
+- **资料库与活动**：文档数、知识库数、搜索结果快照数、artifact 快照数；最近 24 小时成功/失败入库与检索次数。
+
+页面对应的只读接口是 `GET /v1/admin/monitor/overview`（仅本机直连或管理员会话，响应 `Cache-Control: no-store`）。依赖降级时接口仍返回 200，用 `dependencies[].status`（`ok`/`degraded`/`error`/`disabled`/`unknown`）区分；状态库不可读时 `queues`/`library`/`activity` 为 `null` 并附带 `errors` 中文说明。该接口只做聚合查询，不读取任务/文档正文，也不记录查询内容：
+
+```powershell
+curl.exe http://127.0.0.1:8011/v1/admin/monitor/overview
+```
+
 ### API Key 管理（本机或登录会话）
 
 ```powershell

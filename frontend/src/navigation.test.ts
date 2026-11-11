@@ -1,5 +1,35 @@
 import { describe, expect, it } from "vitest";
-import { namespacePattern, parseInviteToken, parseRoute, routeHash } from "./navigation";
+import {
+  canViewConsolePage,
+  namespacePattern,
+  parseInviteToken,
+  parseRoute,
+  routeHash,
+} from "./navigation";
+
+describe("canViewConsolePage", () => {
+  it("shows the monitor page to administrators only", () => {
+    expect(canViewConsolePage("monitor", true, "admin")).toBe(true);
+    expect(canViewConsolePage("monitor", true, "vip")).toBe(false);
+    expect(canViewConsolePage("monitor", true, "user")).toBe(false);
+  });
+
+  it("keeps management pages visible in legacy no-session mode", () => {
+    expect(canViewConsolePage("monitor", false, undefined)).toBe(true);
+    expect(canViewConsolePage("model-profiles", false, undefined)).toBe(true);
+  });
+
+  it("keeps permissions to administrators and VIPs", () => {
+    expect(canViewConsolePage("permissions", true, "vip")).toBe(true);
+    expect(canViewConsolePage("permissions", true, "user")).toBe(false);
+    expect(canViewConsolePage("permissions", false, undefined)).toBe(false);
+  });
+
+  it("leaves ordinary pages visible to every account", () => {
+    expect(canViewConsolePage("search", true, "user")).toBe(true);
+    expect(canViewConsolePage("documents", true, "user")).toBe(true);
+  });
+});
 
 describe("parseInviteToken", () => {
   it("accepts a raw token", () => {
@@ -36,9 +66,17 @@ describe("parseRoute", () => {
   });
 
   it("parses the static Console pages", () => {
-    for (const page of ["api-keys", "model-profiles", "knowledge-bases", "users", "permissions", "invitations"]) {
+    for (const page of ["api-keys", "model-profiles", "knowledge-bases", "users", "monitor", "permissions", "invitations"]) {
       expect(parseRoute("#/" + page, "default")).toEqual({ namespace: "default", page });
     }
+  });
+
+  it("parses the system monitor page as a top-level route", () => {
+    expect(parseRoute("#/monitor", "team")).toEqual({
+      namespace: "team",
+      page: "monitor",
+    });
+    expect(routeHash({ namespace: "team", page: "monitor" })).toBe("#/monitor");
   });
 
   it("parses the model configuration page as a top-level route", () => {
@@ -82,6 +120,7 @@ describe("routeHash", () => {
       { namespace: "team", page: "documents" as const },
       { namespace: "team", page: "documents" as const, documentName: "a b.md" },
       { namespace: "team", page: "permissions" as const },
+      { namespace: "team", page: "monitor" as const },
       { namespace: "team", page: "model-profiles" as const },
       { namespace: "team", page: "invitations" as const },
       { namespace: "team", page: "invite" as const, token: "abc" },

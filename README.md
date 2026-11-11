@@ -65,7 +65,7 @@ REST `/v1/search`、Console 与本地调试同步执行。服务端 MCP `search`
 
 | 入口 | 能力 |
 | --- | --- |
-| Web Console：`/console` | 账号登录/注册、角色与知识库权限管理、文档管理、检索调试、工作区切换，「模型配置」模型列表（Embedding / Reranker / VLM / OCR / JEV）与知识库配置中的模型快速选择，以及知识库 / API Key 的批量删除（复选或鼠标框选）。 |
+| Web Console：`/console` | 账号登录/注册、角色与知识库权限管理、文档管理、检索调试、工作区切换、管理员「系统监控」只读页面，「模型配置」模型列表（Embedding / Reranker / VLM / OCR / JEV）与知识库配置中的模型快速选择，以及知识库 / API Key 的批量删除（复选或鼠标框选）。 |
 | MCP：`/mcp` | 搜索、添加/更新/删除文档、分页读取正文、提示词模板及订阅变更。 |
 | REST API：`/v1/*` | 知识管理与检索接入现有应用；`/openapi.json` 与 `/docs` 提供 OpenAPI 3.1 契约。 |
 

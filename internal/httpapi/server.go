@@ -78,6 +78,7 @@ type Server struct {
 	kbAdmin       KnowledgeBaseAdminRuntime
 	kbSelfCreate  KnowledgeBaseSelfCreateRuntime
 	modelProfiles ModelProfileRuntime
+	monitor       MonitorRuntime
 	notifier      ChangeNotifier
 	users         UserAuth
 	access        AccessControl
@@ -149,6 +150,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/uploads/{operation_id}", authTenant, s.handleUploadStatusDetail)
 	s.router.add("GET", "/v1/admin/published-versions", authNone, s.handlePublishedVersions)
 	s.router.add("GET", "/v1/admin/upload-leases", authNone, s.handleUploadLeases)
+	s.router.add("GET", "/v1/admin/monitor/overview", authAdmin, s.handleMonitorOverview)
 	s.registerDocumentationRoutes()
 	s.registerKnowledgeBaseAdminRoutes()
 	s.registerModelProfileRoutes()

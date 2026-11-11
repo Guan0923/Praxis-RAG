@@ -8,6 +8,7 @@ import {
   ArrowLeftOutlined,
   BellOutlined,
   BookOutlined,
+  DashboardOutlined,
   DatabaseOutlined,
   DownOutlined,
   LogoutOutlined,
@@ -44,6 +45,7 @@ import { DocumentsPage } from "./DocumentsPage";
 import { DocumentPreview } from "./DocumentPreview";
 import { KnowledgeBasesPage } from "./KnowledgeBasesPage";
 import { ModelProfilesPage } from "./ModelProfilesPage";
+import { MonitorPage } from "./MonitorPage";
 import { ApiKeysPage } from "./ApiKeysPage";
 import { CreateKnowledgeBase } from "./CreateKnowledgeBase";
 import { LoginPage } from "./LoginPage";
@@ -51,6 +53,7 @@ import { UsersPage } from "./UsersPage";
 import { InvitationsPage, InvitePage } from "./InvitationsPage";
 import { PermissionsPage } from "./PermissionsPage";
 import {
+  canViewConsolePage,
   readStoredInviteToken,
   storeInviteToken,
   useConsoleRoute,
@@ -66,11 +69,10 @@ const pages = [
   { key: "model-profiles", label: "模型配置", icon: <AppstoreOutlined /> },
   { key: "knowledge-bases", label: "知识库", icon: <SettingOutlined /> },
   { key: "users", label: "用户管理", icon: <TeamOutlined /> },
+  { key: "monitor", label: "系统监控", icon: <DashboardOutlined /> },
 ] as const;
 
-// adminOnlyPages require the admin role once login is enabled. The API Key page
-// is not listed: every account manages only its own keys there.
-const adminOnlyPages = new Set<string>(["model-profiles", "knowledge-bases", "users"]);
+// adminOnlyPages (navigation.ts) gate the sidebar and direct #/<page> links.
 const inviteBellPollMs = 60_000;
 
 export function Console({
@@ -187,13 +189,11 @@ export function Console({
     if (token) navigate({ namespace, page: "invite", token }, true);
   }, [sessionMode, authUser, route.page, route.token, namespace, navigate]);
 
-  // Non-admins cannot stay on an admin-only page, ordinary users cannot manage
-  // permissions, and the invitation pages require a console session.
+  // A page this account may not view redirects to the search page; the rule is
+  // shared with the sidebar filter, so a direct #/<page> link cannot bypass it.
   useEffect(() => {
     if (!auth?.auth_enabled || !authUser) return;
-    const adminOnly = adminOnlyPages.has(view) && authUser.role !== "admin";
-    const permissionsBlocked = view === "permissions" && authUser.role === "user";
-    if (adminOnly || permissionsBlocked) {
+    if (!canViewConsolePage(view, true, authUser.role)) {
       navigate({ namespace, page: "search" }, true);
     }
   }, [auth, authUser, view, namespace, navigate]);
@@ -349,13 +349,8 @@ export function Console({
     { type: "divider" },
     { key: "all", label: pendingInvitations.length ? "查看全部邀请" : "邀请中心" },
   ];
-  const visiblePages = pages.filter((page) => {
-    if (page.key === "permissions")
-      return sessionMode && (authUser?.role === "admin" || authUser?.role === "vip");
-    if (adminOnlyPages.has(page.key))
-      return !sessionMode || authUser?.role === "admin";
-    return true;
-  });
+  const visiblePages = pages.filter((page) =>
+    canViewConsolePage(page.key, sessionMode, authUser?.role));
 
   return (
     <div className="console-shell">
@@ -542,6 +537,9 @@ export function Console({
           )}
           {view === "users" && authUser?.role === "admin" && (
             <UsersPage currentUserId={authUser.id} />
+          )}
+          {view === "monitor" && canViewConsolePage("monitor", sessionMode, authUser?.role) && (
+            <MonitorPage />
           )}
           {view === "permissions" && authUser && (authUser.role === "admin" || authUser.role === "vip") && (
             <PermissionsPage

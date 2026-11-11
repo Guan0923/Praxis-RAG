@@ -551,6 +551,125 @@ export async function fetchModelProfileModels(
   return payload.models || [];
 }
 
+// --- System monitor (系统监控) ----------------------------------------------
+// MonitorOverview is the read-only snapshot served by
+// GET /v1/admin/monitor/overview. dependencies always lists the five built-in
+// dependencies in backend order (mysql / redis / qdrant / kafka / pdf-service);
+// queues, library and activity are null when the backend could not read the
+// state database, and errors carries the backend's Chinese diagnostics.
+export type MonitorDependencyStatus = "ok" | "degraded" | "error" | "disabled" | "unknown";
+export type MonitorDependency = {
+  name: string;
+  label: string;
+  status: MonitorDependencyStatus;
+  latency_ms: number;
+  detail: string;
+  // points only exists for vector stores (Qdrant) that can count stored points.
+  points?: number;
+};
+export type MonitorDocumentJobs = {
+  by_status: Record<string, number>;
+  by_stage: Record<string, number>;
+  oldest_queued_seconds: number;
+  stuck_processing: number;
+  failed_recent: number;
+};
+export type MonitorDocumentOutbox = {
+  by_status: Record<string, number>;
+  oldest_pending_seconds: number;
+};
+export type MonitorSearchTasks = {
+  by_status: Record<string, number>;
+  oldest_active_seconds: number;
+};
+export type MonitorUploads = { unfinished: number };
+export type MonitorQueues = {
+  document_jobs: MonitorDocumentJobs;
+  document_outbox: MonitorDocumentOutbox;
+  search_tasks: MonitorSearchTasks;
+  uploads: MonitorUploads;
+};
+// MonitorQueueState addresses one queue of the snapshot without naming the
+// whole MonitorQueues object.
+export type MonitorQueueState =
+  | MonitorDocumentJobs
+  | MonitorDocumentOutbox
+  | MonitorSearchTasks
+  | MonitorUploads;
+export type MonitorLibrary = {
+  documents: number;
+  knowledge_bases: number;
+  result_snapshots: number;
+  artifact_snapshots: number;
+};
+export type MonitorActivity = {
+  window_hours: number;
+  jobs_succeeded: number;
+  jobs_failed: number;
+  searches: number;
+};
+export type MonitorService = {
+  name: string;
+  version: string;
+  backend: string;
+  collection: string;
+  started_at: string;
+  uptime_seconds: number;
+  upload_mode: string;
+  outbox_bridge: string;
+  document_worker: string;
+  pdf_engine: string;
+};
+export type MonitorOverview = {
+  generated_at: string;
+  ok: boolean;
+  service: MonitorService;
+  dependencies: MonitorDependency[];
+  queues: MonitorQueues | null;
+  library: MonitorLibrary | null;
+  activity: MonitorActivity | null;
+  errors: string[];
+};
+
+export const monitorDependencyStatusLabels: Record<MonitorDependencyStatus, string> = {
+  ok: "正常",
+  degraded: "降级",
+  error: "异常",
+  disabled: "未启用",
+  unknown: "未知",
+};
+// monitorDependencyStatusColors reuses the antd Tag palette that the existing
+// pages use for statuses; disabled/unknown stay neutral on purpose.
+export const monitorDependencyStatusColors: Record<MonitorDependencyStatus, string> = {
+  ok: "success",
+  degraded: "warning",
+  error: "error",
+  disabled: "default",
+  unknown: "default",
+};
+
+// formatDuration renders a second count as a short Chinese duration. The
+// monitor page shows uptimes and queue ages, so raw float seconds never reach
+// the screen.
+export function formatDuration(seconds?: number) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "—";
+  const total = Math.floor(seconds);
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (days > 0) return `${days} 天 ${hours} 小时 ${minutes} 分`;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分`;
+  if (minutes > 0) return `${minutes} 分 ${total % 60} 秒`;
+  return `${total} 秒`;
+}
+
+export async function fetchMonitorOverview(signal?: AbortSignal): Promise<MonitorOverview> {
+  return await api<MonitorOverview>("/v1/admin/monitor/overview", undefined, {
+    signal,
+    cache: "no-store",
+  });
+}
+
 // --- Knowledge-base permissions and invitations -----------------------------
 
 // fetchAccess returns the caller's effective access view for one knowledge

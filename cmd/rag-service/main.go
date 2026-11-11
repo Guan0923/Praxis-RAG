@@ -23,6 +23,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
 	"github.com/Guan0923/xinghe_rag/internal/mcp"
+	"github.com/Guan0923/xinghe_rag/internal/monitor"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
@@ -107,6 +108,27 @@ func run() error {
 		logger.Warn("RAG_UPLOAD_MODE=async without an in-process document worker: REST/Console uploads stay queued until rag-document-worker runs",
 			"hint", "start rag-document-worker, or leave RAG_KAFKA_BOOTSTRAP_SERVERS empty to parse in-process")
 	}
+	// The Console monitoring page is read-only: one state aggregate plus five
+	// bounded dependency probes, assembled per request by internal/monitor.
+	outboxBridge := "relay"
+	if stores.DocumentDispatcher != nil && stores.DocumentDispatcher.Mode != "" {
+		outboxBridge = stores.DocumentDispatcher.Mode
+	}
+	monitorService := monitor.New(monitor.Options{
+		Stats:                 stores,
+		MySQL:                 stores,
+		DBStats:               stores.DB.Stats,
+		Redis:                 cache,
+		QdrantURL:             ragConfig.QdrantURL,
+		Collection:            ragConfig.Collection,
+		KafkaBootstrapServers: mqSettings.BootstrapServers,
+		OutboxBridge:          outboxBridge,
+		UploadMode:            serviceSettings.UploadMode,
+		DocumentWorker:        documentWorkerMode,
+		PDFEngine:             ragConfig.PDFEngine,
+		PDFServiceURL:         ragConfig.PDFServiceURL,
+		StartedAt:             time.Now(),
+	})
 	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{
 		Runtime:      wire.MCPRuntime{Service: service},
@@ -147,6 +169,7 @@ func run() error {
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseSelfCreateRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithModelProfileRuntime(wire.HTTPRuntime{Service: service}),
+		httpapi.WithMonitorRuntime(monitorService),
 		httpapi.WithAccessControl(accessService),
 		httpapi.WithAPIKeyStore(apikeys.New(stores.APIKeys)),
 		httpapi.WithCatalogStore(catalogStore),
