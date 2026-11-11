@@ -129,6 +129,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("PATCH", "/v1/admin/tools/{name}", authAdmin, s.handlePatchTool)
 	s.router.add("GET", "/v1/admin/api-keys", authSessionOrLocal, s.handleListAPIKeys)
 	s.router.add("POST", "/v1/admin/api-keys", authSessionOrLocal, s.handleCreateAPIKey)
+	s.router.add("POST", "/v1/admin/api-keys/batch-delete", authSessionOrLocal, s.handleBatchDeleteAPIKeys)
 	s.router.add("PUT", "/v1/admin/api-keys/{key_id}", authSessionOrLocal, s.handleUpdateAPIKey)
 	s.router.add("DELETE", "/v1/admin/api-keys/{key_id}", authSessionOrLocal, s.handleDeleteAPIKey)
 	s.router.add("GET", "/v1/admin/api-keys/{key_id}/mcp-config", authSessionOrLocal, s.handleAPIKeyMCPConfig)

@@ -976,3 +976,34 @@ h3 {
     width: 100%;
   }
 }
+/* Mouse drag (marquee) selection for the admin tables. The band is a fixed,
+   pointer-events:none rectangle so it can follow the pointer over any row
+   without stealing the mousedown/mouseup of the gesture itself. */
+.drag-band {
+  position: fixed;
+  z-index: 1000;
+  pointer-events: none;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: rgba(37, 99, 235, 0.08);
+}
+:root[data-theme="dark"] .drag-band {
+  background: rgba(121, 166, 255, 0.12);
+}
+body.drag-selecting {
+  cursor: crosshair;
+  user-select: none;
+  -webkit-user-select: none;
+}
+body.drag-selecting * {
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* Toolbar row for a batch selection, shared by the table pages. */
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}

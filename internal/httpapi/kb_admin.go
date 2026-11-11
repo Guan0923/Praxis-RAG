@@ -60,6 +60,20 @@ type KnowledgeBaseAdminRuntime interface {
 	UpdateKnowledgeBase(ctx context.Context, namespace string, input KnowledgeBaseUpdateInput) (map[string]any, error)
 	KnowledgeBaseKey(ctx context.Context, namespace, kind string) (string, error)
 	KnowledgeBaseModels(ctx context.Context, kind string, values map[string]any, namespace *string) ([]string, error)
+	// PurgeKnowledgeBase deletes every document logically and then the
+	// configuration row, so the merged Console list no longer shows the
+	// namespace. FailedDocuments reports per-document failures; when it is
+	// non-empty the configuration row is intentionally kept.
+	PurgeKnowledgeBase(ctx context.Context, namespace string) (KnowledgeBasePurgeResult, error)
+}
+
+// KnowledgeBasePurgeResult is the transport-neutral outcome of purging one
+// knowledge base. Documents are removed before the configuration row.
+type KnowledgeBasePurgeResult struct {
+	Namespace            string
+	DocumentsDeleted     int
+	FailedDocuments      []map[string]string
+	ConfigurationDeleted bool
 }
 
 // WithKnowledgeBaseAdminRuntime wires the knowledge-base admin handlers.
@@ -188,9 +202,14 @@ func (s *Server) registerKnowledgeBaseAdminRoutes() {
 	s.router.add("GET", "/v1/admin/knowledge-bases", authAdmin, s.handleListKnowledgeBases)
 	s.router.add("POST", "/v1/admin/knowledge-bases", authAdmin, s.handleCreateKnowledgeBase)
 	s.router.add("POST", "/v1/admin/knowledge-bases/models/{kind}", authAdmin, s.handleKnowledgeBaseModels)
+	// The literal batch path must be registered before the {namespace} routes:
+	// the router takes the first matching route, so a later literal registration
+	// would be swallowed by DELETE /v1/admin/knowledge-bases/{namespace}.
+	s.router.add("POST", "/v1/admin/knowledge-bases/batch-delete", authAdmin, s.handleBatchDeleteKnowledgeBases)
 	s.router.add("GET", "/v1/admin/knowledge-bases/{namespace}", authAdmin, s.handleKnowledgeBaseDetails)
 	s.router.add("GET", "/v1/admin/knowledge-bases/{namespace}/key/{kind}", authAdmin, s.handleKnowledgeBaseKey)
 	s.router.add("PATCH", "/v1/admin/knowledge-bases/{namespace}", authAdmin, s.handleUpdateKnowledgeBase)
+	s.router.add("DELETE", "/v1/admin/knowledge-bases/{namespace}", authAdmin, s.handlePurgeKnowledgeBase)
 }
 
 func (s *Server) requireKBAdmin(w http.ResponseWriter) bool {
@@ -495,6 +514,147 @@ func writeUpdateKnowledgeBaseError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeRuntimeError(w, err, true)
+}
+
+// messageKnowledgeBasePurgeMissing is the stable 404 detail of the purge routes.
+const messageKnowledgeBasePurgeMissing = "知识库不存在"
+
+// messageKnowledgeBasePurgePartial is the detail used when some documents could
+// not be deleted; the configuration row is kept so the knowledge base remains
+// listed and can be retried.
+const messageKnowledgeBasePurgePartial = "部分文档删除失败，知识库未删除"
+
+// batchDeleteKnowledgeBasesBody is the Console multi-select delete request.
+type batchDeleteKnowledgeBasesBody struct {
+	Namespaces *[]string `json:"namespaces"`
+}
+
+// cleanKnowledgeBaseNamespaces validates the batch list the way FastAPI
+// validates a constrained list: required, 1..100 items, each matching the
+// namespace pattern, deduplicated in request order.
+func cleanKnowledgeBaseNamespaces(namespaces *[]string) ([]string, []validationDetail) {
+	if namespaces == nil {
+		return nil, []validationDetail{{
+			Type: "missing", Loc: []any{"body", "namespaces"}, Msg: "Field required",
+		}}
+	}
+	values := *namespaces
+	if len(values) == 0 {
+		return nil, []validationDetail{{
+			Type: "too_short", Loc: []any{"body", "namespaces"},
+			Msg: "List should have at least 1 item after validation, not 0",
+		}}
+	}
+	if len(values) > 100 {
+		return nil, []validationDetail{{
+			Type: "too_long", Loc: []any{"body", "namespaces"},
+			Msg: "List should have at most 100 items after validation",
+		}}
+	}
+	seen := make(map[string]struct{}, len(values))
+	cleaned := make([]string, 0, len(values))
+	for index, namespace := range values {
+		if !namespacePattern.MatchString(namespace) {
+			return nil, []validationDetail{{
+				Type: "string_pattern_mismatch", Loc: []any{"body", "namespaces", index},
+				Msg: "String should match pattern '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'",
+			}}
+		}
+		if _, duplicate := seen[namespace]; duplicate {
+			continue
+		}
+		seen[namespace] = struct{}{}
+		cleaned = append(cleaned, namespace)
+	}
+	return cleaned, nil
+}
+
+// handlePurgeKnowledgeBase implements DELETE /v1/admin/knowledge-bases/{namespace}.
+// It removes every document logically and then the configuration row; 204 means
+// the namespace is gone from the merged list. A partially failed purge keeps the
+// configuration row and answers 409 with the per-document failures.
+func (s *Server) handlePurgeKnowledgeBase(w http.ResponseWriter, r *http.Request) {
+	if !s.requireKBAdmin(w) {
+		return
+	}
+	result, err := s.kbAdmin.PurgeKnowledgeBase(r.Context(), pathParam(r, "namespace"))
+	if err != nil {
+		writeRuntimeError(w, err, true)
+		return
+	}
+	if len(result.FailedDocuments) > 0 {
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"detail":           messageKnowledgeBasePurgePartial,
+			"namespace":        result.Namespace,
+			"failed_documents": result.FailedDocuments,
+		})
+		return
+	}
+	if result.DocumentsDeleted == 0 && !result.ConfigurationDeleted {
+		writeDetail(w, http.StatusNotFound, messageKnowledgeBasePurgeMissing)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleBatchDeleteKnowledgeBases implements POST /v1/admin/knowledge-bases/batch-delete.
+// Every namespace is purged independently; the response separates deleted,
+// already-missing and failed namespaces so the Console can keep only the failed
+// rows selected.
+func (s *Server) handleBatchDeleteKnowledgeBases(w http.ResponseWriter, r *http.Request) {
+	if !s.requireKBAdmin(w) {
+		return
+	}
+	var body batchDeleteKnowledgeBasesBody
+	if details := decodeJSONBody(r, &body); details != nil {
+		writeValidation(w, http.StatusUnprocessableEntity, details)
+		return
+	}
+	namespaces, details := cleanKnowledgeBaseNamespaces(body.Namespaces)
+	if details != nil {
+		writeValidation(w, http.StatusUnprocessableEntity, details)
+		return
+	}
+	deleted := make([]string, 0, len(namespaces))
+	missing := make([]string, 0)
+	failed := make([]map[string]any, 0)
+	documentsDeleted := 0
+	configurationsDeleted := 0
+	for _, namespace := range namespaces {
+		result, err := s.kbAdmin.PurgeKnowledgeBase(r.Context(), namespace)
+		if err != nil {
+			_, detail := runtimeErrorStatus(err)
+			failed = append(failed, map[string]any{"namespace": namespace, "error": detail})
+			continue
+		}
+		if len(result.FailedDocuments) > 0 {
+			failed = append(failed, map[string]any{
+				"namespace":        namespace,
+				"error":            messageKnowledgeBasePurgePartial,
+				"failed_documents": result.FailedDocuments,
+			})
+			continue
+		}
+		if result.DocumentsDeleted == 0 && !result.ConfigurationDeleted {
+			missing = append(missing, namespace)
+			continue
+		}
+		deleted = append(deleted, namespace)
+		documentsDeleted += result.DocumentsDeleted
+		if result.ConfigurationDeleted {
+			configurationsDeleted++
+		}
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deleted":                deleted,
+		"missing":                missing,
+		"failed":                 failed,
+		"documents_deleted":      documentsDeleted,
+		"configurations_deleted": configurationsDeleted,
+	})
 }
 
 func validateNamespaceField(namespace string) []validationDetail {

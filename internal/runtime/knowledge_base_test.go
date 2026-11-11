@@ -706,6 +706,113 @@ func TestDeleteKnowledgeBaseKeepsDocumentsAndInvalidates(t *testing.T) {
 	}
 }
 
+func TestPurgeKnowledgeBaseDeletesDocumentsThenConfiguration(t *testing.T) {
+	modelURL, _ := newFakeModelAPI(t, kbModelHandler(nil))
+	service, stores := newKBService(t, "http://127.0.0.1:1")
+	ctx := context.Background()
+	if _, err := service.CreateKnowledgeBase(ctx, testCreateInput("alpha", modelURL)); err != nil {
+		t.Fatalf("CreateKnowledgeBase() error = %v", err)
+	}
+	for _, name := range []string{"a.txt", "b.txt"} {
+		record := state.DocumentRecord{
+			Name: name, DocumentID: "doc-" + name, ChunkCount: 1, Chunking: map[string]any{},
+		}
+		if err := stores.Documents.Upsert(ctx, "alpha", record); err != nil {
+			t.Fatalf("Documents.Upsert(%s) error = %v", name, err)
+		}
+	}
+	if _, err := service.search.tenant(ctx, "alpha"); err != nil {
+		t.Fatalf("tenant() error = %v", err)
+	}
+
+	result, err := service.PurgeKnowledgeBase(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("PurgeKnowledgeBase() error = %v", err)
+	}
+	if result.Namespace != "alpha" || result.DocumentsDeleted != 2 || !result.ConfigurationDeleted {
+		t.Fatalf("PurgeKnowledgeBase() = %+v", result)
+	}
+	if len(result.FailedDocuments) != 0 {
+		t.Fatalf("failed documents = %v", result.FailedDocuments)
+	}
+	if stored, _ := stores.KnowledgeBases.Get(ctx, "alpha"); stored != nil {
+		t.Fatalf("configuration row still exists: %v", stored)
+	}
+	documents, err := stores.Documents.List(ctx, "alpha")
+	if err != nil || len(documents) != 0 {
+		t.Fatalf("documents after purge = %v, %v", documents, err)
+	}
+	if _, err := service.search.tenant(ctx, "alpha"); err == nil {
+		t.Fatalf("tenant cache was not invalidated after purge")
+	}
+	// The merged Console list must no longer expose the workspace.
+	listed, err := service.ListKnowledgeBases(ctx)
+	if err != nil {
+		t.Fatalf("ListKnowledgeBases() error = %v", err)
+	}
+	for _, item := range listed {
+		if item["namespace"] == "alpha" {
+			t.Fatalf("purged namespace still listed: %v", item)
+		}
+	}
+}
+
+func TestPurgeKnowledgeBaseKeepsConfigurationWhenDocumentDeleteFails(t *testing.T) {
+	modelURL, _ := newFakeModelAPI(t, kbModelHandler(nil))
+	service, stores := newKBService(t, "http://127.0.0.1:1")
+	ctx := context.Background()
+	if _, err := service.CreateKnowledgeBase(ctx, testCreateInput("alpha", modelURL)); err != nil {
+		t.Fatalf("CreateKnowledgeBase() error = %v", err)
+	}
+	// A record without a document id cannot be deleted through the journal, so
+	// the purge must report it and keep the configuration row for a retry.
+	broken := state.DocumentRecord{Name: "broken.txt", ChunkCount: 0, Chunking: map[string]any{}}
+	if err := stores.Documents.Upsert(ctx, "alpha", broken); err != nil {
+		t.Fatalf("Documents.Upsert() error = %v", err)
+	}
+
+	result, err := service.PurgeKnowledgeBase(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("PurgeKnowledgeBase() error = %v", err)
+	}
+	if result.ConfigurationDeleted {
+		t.Fatalf("configuration row was deleted despite a failed document: %+v", result)
+	}
+	if len(result.FailedDocuments) != 1 || result.FailedDocuments[0]["name"] != "broken.txt" {
+		t.Fatalf("failed documents = %v", result.FailedDocuments)
+	}
+	if stored, _ := stores.KnowledgeBases.Get(ctx, "alpha"); stored == nil {
+		t.Fatalf("configuration row was removed; the purge must stay retryable")
+	}
+}
+
+func TestPurgeKnowledgeBaseUnconfiguredWorkspaceAndMissingNamespace(t *testing.T) {
+	service, stores := newKBService(t, "http://127.0.0.1:1")
+	ctx := context.Background()
+	record := state.DocumentRecord{
+		Name: "orphan.txt", DocumentID: "doc-orphan", ChunkCount: 1, Chunking: map[string]any{},
+	}
+	if err := stores.Documents.Upsert(ctx, "orphan", record); err != nil {
+		t.Fatalf("Documents.Upsert() error = %v", err)
+	}
+
+	result, err := service.PurgeKnowledgeBase(ctx, "orphan")
+	if err != nil {
+		t.Fatalf("PurgeKnowledgeBase(orphan) error = %v", err)
+	}
+	if result.DocumentsDeleted != 1 || result.ConfigurationDeleted {
+		t.Fatalf("PurgeKnowledgeBase(orphan) = %+v", result)
+	}
+
+	missing, err := service.PurgeKnowledgeBase(ctx, "missing")
+	if err != nil {
+		t.Fatalf("PurgeKnowledgeBase(missing) error = %v", err)
+	}
+	if missing.DocumentsDeleted != 0 || missing.ConfigurationDeleted || len(missing.FailedDocuments) != 0 {
+		t.Fatalf("PurgeKnowledgeBase(missing) = %+v", missing)
+	}
+}
+
 func TestKnowledgeBaseKeyRevealAndErrors(t *testing.T) {
 	modelURL, _ := newFakeModelAPI(t, kbModelHandler(nil))
 	service, _ := newKBService(t, "http://127.0.0.1:1")

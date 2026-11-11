@@ -19,6 +19,10 @@ type APIKeyStore interface {
 	CreateForOwner(ctx context.Context, name string, namespaces []string, ownerUserID string) (state.CreatedAPIKey, error)
 	Update(ctx context.Context, keyID, name string, namespaces []string, enabled bool) (*state.APIKey, error)
 	Delete(ctx context.Context, keyID string) (bool, error)
+	// DeleteMany removes several credentials inside one transaction. When
+	// ownerUserID is non-empty the batch only affects that account, and ids it
+	// may not delete land in the missing bucket.
+	DeleteMany(ctx context.Context, keyIDs []string, ownerUserID string) ([]string, []string, error)
 	SecretForNamespace(ctx context.Context, keyID, namespace string) (string, error)
 }
 
@@ -334,6 +338,107 @@ func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// apiKeyBatchDeleteBody is the request body of the batch-delete endpoint. A nil
+// pointer means the field was absent (or null), which the existing handlers
+// report as a missing required field.
+type apiKeyBatchDeleteBody struct {
+	IDs *[]string `json:"ids"`
+}
+
+// apiKeyBatchDeleteFailure is the per-id failure shape of the batch response.
+// The atomic implementation reports database errors as a whole-batch 500, so
+// the list stays empty; it is kept so the published response shape (and the
+// Console contract) does not change.
+type apiKeyBatchDeleteFailure struct {
+	ID    string `json:"id"`
+	Error string `json:"error"`
+}
+
+// apiKeyBatchDeleteResponse is the 200 payload: every submitted id lands in
+// exactly one bucket, and deleted_count mirrors len(deleted). failed only
+// carries entries when a caller keeps the legacy per-id error list.
+type apiKeyBatchDeleteResponse struct {
+	Deleted      []string                   `json:"deleted"`
+	NotFound     []string                   `json:"not_found"`
+	Failed       []apiKeyBatchDeleteFailure `json:"failed"`
+	DeletedCount int                        `json:"deleted_count"`
+}
+
+// cleanAPIKeyBatchIDs validates the batch id list the way the sibling handlers
+// validate names and namespaces. Duplicates collapse to their first occurrence
+// so one key is never processed twice inside the same batch.
+func cleanAPIKeyBatchIDs(ids *[]string) ([]string, []validationDetail) {
+	if ids == nil {
+		return nil, []validationDetail{{Type: "missing", Loc: []any{"body", "ids"}, Msg: "Field required"}}
+	}
+	values := *ids
+	if len(values) < 1 {
+		return nil, []validationDetail{{Type: "too_short", Loc: []any{"body", "ids"}, Msg: "List should have at least 1 item after validation, not 0"}}
+	}
+	if len(values) > 100 {
+		return nil, []validationDetail{{Type: "too_long", Loc: []any{"body", "ids"}, Msg: "List should have at most 100 items after validation"}}
+	}
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	var details []validationDetail
+	for index, value := range values {
+		if value == "" {
+			details = append(details, validationDetail{
+				Type: "string_too_short",
+				Loc:  []any{"body", "ids", index},
+				Msg:  "String should have at least 1 character",
+			})
+			continue
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	if len(details) > 0 {
+		return nil, details
+	}
+	return result, nil
+}
+
+// handleBatchDeleteAPIKeys deletes several credentials in one transaction.
+// A single SELECT classifies the ids (missing or not owned by the caller become
+// not_found), one multi-row DELETE removes the rest, and one commit applies the
+// whole batch atomically; any database error fails the batch as a whole.
+func (s *Server) handleBatchDeleteAPIKeys(w http.ResponseWriter, r *http.Request) {
+	if s.keyStore == nil {
+		writeDetail(w, http.StatusServiceUnavailable, "API key store is not available")
+		return
+	}
+	var body apiKeyBatchDeleteBody
+	if details := decodeJSONBody(r, &body); details != nil {
+		writeValidation(w, http.StatusUnprocessableEntity, details)
+		return
+	}
+	ids, details := cleanAPIKeyBatchIDs(body.IDs)
+	if details != nil {
+		writeValidation(w, http.StatusUnprocessableEntity, details)
+		return
+	}
+	ownerUserID := ""
+	if session := apiKeyCaller(r); session != nil && !session.User.IsAdmin() {
+		ownerUserID = session.User.ID
+	}
+	deleted, notFound, err := s.keyStore.DeleteMany(r.Context(), ids, ownerUserID)
+	if err != nil {
+		writeDetail(w, http.StatusInternalServerError, "API Key 删除失败")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, apiKeyBatchDeleteResponse{
+		Deleted:      deleted,
+		NotFound:     notFound,
+		Failed:       make([]apiKeyBatchDeleteFailure, 0),
+		DeletedCount: len(deleted),
+	})
 }
 
 func (s *Server) handleAPIKeyMCPConfig(w http.ResponseWriter, r *http.Request) {

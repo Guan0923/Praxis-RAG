@@ -88,6 +88,29 @@ func TestOpenAPIAndDocsRoutes(t *testing.T) {
 			t.Fatalf("paths missing %s", path)
 		}
 	}
+	// Console batch delete: one literal batch path per resource plus the
+	// single-knowledge-base purge route.
+	for _, path := range []string{
+		"/v1/admin/knowledge-bases/batch-delete",
+		"/v1/admin/api-keys/batch-delete",
+	} {
+		if _, present := paths[path]; !present {
+			t.Fatalf("paths missing %s", path)
+		}
+	}
+	purgePath, _ := paths["/v1/admin/knowledge-bases/{namespace}"].(map[string]any)
+	if _, present := purgePath["delete"]; !present {
+		t.Fatalf("DELETE /v1/admin/knowledge-bases/{namespace} is not documented: %v", purgePath)
+	}
+	batchKnowledgeBases, _ := schemas["BatchDeleteKnowledgeBasesBody"].(map[string]any)
+	if required, _ := batchKnowledgeBases["required"].([]any); len(required) != 1 || required[0] != "namespaces" {
+		t.Fatalf("BatchDeleteKnowledgeBasesBody.required = %v", batchKnowledgeBases["required"])
+	}
+	batchAPIKeys, _ := schemas["BatchDeleteAPIKeysBody"].(map[string]any)
+	if required, _ := batchAPIKeys["required"].([]any); len(required) != 1 || required[0] != "ids" {
+		t.Fatalf("BatchDeleteAPIKeysBody.required = %v", batchAPIKeys["required"])
+	}
+
 	invitationBody, _ := schemas["CreateInvitationBody"].(map[string]any)
 	invitationProperties, _ := invitationBody["properties"].(map[string]any)
 	permission, _ := invitationProperties["permission"].(map[string]any)

@@ -467,6 +467,74 @@ func (s *Service) DeleteKnowledgeBase(ctx context.Context, namespace string) (bo
 	return deleted, nil
 }
 
+// KnowledgeBasePurgeResult reports what one knowledge-base purge removed.
+//
+// Every document is logically deleted through the regular document-deletion
+// path before the configuration row is removed, because the Console list merges
+// configuration rows with document workspaces: deleting only the configuration
+// would leave the namespace visible as an unconfigured workspace.
+type KnowledgeBasePurgeResult struct {
+	Namespace            string
+	DocumentsDeleted     int
+	FailedDocuments      []map[string]string
+	ConfigurationDeleted bool
+}
+
+// PurgeKnowledgeBase removes one knowledge base from the Console list: every
+// document is logically deleted and then the configuration row is removed.
+//
+// Document deletion stays logical (del_flag) exactly like the single-document
+// REST/MCP delete, so Qdrant payload bytes and the collection are intentionally
+// retained; the tenant cache entry is invalidated once the purge ran. When one
+// document cannot be deleted (for example an upload still holds its lock), the
+// configuration row is kept so the knowledge base is not left half-deleted and
+// the per-document failures are reported to the caller.
+func (s *Service) PurgeKnowledgeBase(ctx context.Context, namespace string) (KnowledgeBasePurgeResult, error) {
+	result := KnowledgeBasePurgeResult{Namespace: namespace}
+	documents, err := s.ListDocuments(ctx, namespace)
+	if err != nil {
+		return result, err
+	}
+	for _, document := range documents {
+		name, _ := document["name"].(string)
+		if name == "" {
+			continue
+		}
+		if _, err := s.deleteDocumentByName(ctx, namespace, name); err != nil {
+			result.FailedDocuments = append(result.FailedDocuments, map[string]string{
+				"name":  name,
+				"error": purgeDocumentFailureText(err),
+			})
+			continue
+		}
+		result.DocumentsDeleted++
+	}
+	if len(result.FailedDocuments) == 0 {
+		deleted, err := s.DeleteKnowledgeBase(ctx, namespace)
+		if err != nil {
+			return result, err
+		}
+		result.ConfigurationDeleted = deleted
+	}
+	s.Invalidate(namespace)
+	return result, nil
+}
+
+// purgeDocumentFailureText renders one document-deletion failure for the purge
+// report. Safe runtime messages are passed through; anything else falls back to
+// a generic sentence so internal details never reach the Console.
+func purgeDocumentFailureText(err error) string {
+	var validation *apierrors.KnowledgeValidationError
+	if errors.As(err, &validation) {
+		return validation.Message
+	}
+	var knowledge *apierrors.KnowledgeError
+	if errors.As(err, &knowledge) {
+		return knowledge.Message
+	}
+	return "文档删除失败"
+}
+
 // KnowledgeBaseKey reveals the decrypted provider API key for the local admin
 // UI (knowledge_base_key). Errors stay safe: a missing row is a service error
 // (Python's KnowledgeValidationError is rendered through the KnowledgeError

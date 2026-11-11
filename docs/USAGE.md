@@ -383,6 +383,7 @@ Console 默认启用账号登录（`RAG_AUTH_ENABLED=true`）：
 2. 管理员在侧边栏"用户管理"页可以：把账号设为管理员 / VIP / 普通用户、启用/禁用、删除。系统始终保留至少一名启用状态的管理员（最后一个管理员不能被降级、禁用或删除）。
 3. 普通用户只能使用自己创建的知识库以及被邀请授权的知识库；管理员可以使用全部知识库并管理知识库配置、全部 API Key 和用户；VIP 额外可以邀请他人共享自己创建的知识库。所有登录角色都能打开「API Key」页管理自己的密钥，但非管理员只能绑定本人创建的知识库（详见[权限管理](PERMISSIONS.md) §9）。
 4. 共享入口在侧边栏「权限管理」（管理员与 VIP 可见）：选择知识库 → 邀请用户（权限：可读/可修改；范围：全库 / 若干文件）→ 复制邀请链接发给对方。被邀请人会在控制台通知铃铛看到待处理邀请，登录后打开链接即可接受；接受后权限立即生效。详见 [权限管理](PERMISSIONS.md)。
+5. 知识库与 API Key 页面支持批量删除：勾选行首复选框，或按住鼠标左键在表格上拖出框选。框选只增不减：拖动或缩小框选区域、开始新一轮框选、上下滚动页面都不会取消已选中的行；要取消某一行请点它的行首复选框（Esc 只取消本次拖动并恢复拖动前的选中）。工具栏「批量删除」按钮会显示已选数量。知识库批量删除会删除所选知识库的全部文档并移除配置记录，**删除后无法恢复**；只要有一个文档删除失败，该知识库就保留并列出失败原因，可重试。API Key 批量删除对已不存在的 id 视为已删除，失败项保留选中。
 
 会话使用 HttpOnly Cookie（`rag_session`）保存，默认有效期 7 天（`RAG_AUTH_SESSION_TTL_HOURS`），所有写操作要求 `X-CSRF-Token`（Console 自动带上）。判定规则：
 
@@ -460,7 +461,14 @@ curl.exe -X PUT http://127.0.0.1:8011/v1/admin/api-keys/<id> `
 curl.exe -X DELETE http://127.0.0.1:8011/v1/admin/api-keys/<id>
 curl.exe "http://127.0.0.1:8011/v1/admin/api-keys/<id>/mcp-config" `
   -H "X-RAG-Namespace: default"
+
+# 批量删除（Console「批量删除」走这条接口；1..100 个 id，重复 id 自动去重）
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys/batch-delete `
+  -H "Content-Type: application/json" `
+  -d '{"ids":["<id-a>","<id-b>","<id-missing>"]}'
 ```
+
+`batch-delete` 在一个事务里完成整批删除：1 条 `SELECT ... WHERE id IN (...)` 分类（不存在或无权访问的 id 进入 `not_found`，与单条删除同语义、不视为错误），1 条 `DELETE ... WHERE id IN (...)` 删除，整批只提交 1 次、缓存修订与事件也只写 1 次。返回 `{"deleted":["<id>"],"not_found":["<id>"],"failed":[],"deleted_count":N}`：`failed` 恒为空数组（保留字段以兼容旧客户端）；整批数据库错误返回 500 `API Key 删除失败` 并整批回滚，可重试。请求体校验失败（缺失、空数组、空字符串、超过 100 项、未知字段）返回 FastAPI 形状的 422。
 
 本机直连可以看到并管理全部密钥（含历史无主密钥）。改用登录会话（Cookie + 写操作 `X-CSRF-Token`）调用时按账号过滤：管理员看到全部密钥，响应条目带 `owner_user_id` / `owner_username`（历史密钥不带这两个字段，Console 显示「—（未绑定）」）；VIP / 普通用户只看到自己创建的密钥，查看/修改/删除/导出别人的密钥返回 404 `API Key 不存在`。非管理员创建或修改密钥时只能绑定自己拥有的知识库，否则返回 403 `只能为本人创建的知识库创建 API Key`。
 
@@ -538,7 +546,20 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/knowledge-bases/models/embedding
   -H "Content-Type: application/json" -d '{"base_url":"http://127.0.0.1:8032/v1"}'
 curl.exe http://127.0.0.1:8011/v1/admin/knowledge-bases/defaults
 curl.exe http://127.0.0.1:8011/v1/admin/knowledge-bases/default/key/embedding
+
+# 删除单个知识库：逐个删除（逻辑删除 del_flag）该命名空间全部文档后移除配置记录
+# 成功 204；配置和文档都不存在 404；有文档删除失败时保留配置并返回 409
+curl.exe -X DELETE http://127.0.0.1:8011/v1/admin/knowledge-bases/default
+
+# 批量删除（Console 知识库页「批量删除」走这条接口；1..100 个命名空间，重复自动去重）
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/knowledge-bases/batch-delete `
+  -H "Content-Type: application/json" `
+  -d '{"namespaces":["team-kb","old-kb"]}'
 ```
+
+知识库的列表是「配置记录 ∪ 文档工作区」的合并视图，所以只删配置记录会留下一个「缺少配置记录」的条目。`DELETE /v1/admin/knowledge-bases/{namespace}` 因此先删除该命名空间下的全部文档、再删除配置记录：文档走与单文档删除相同的逻辑删除（`del_flag`，Qdrant 向量按现有语义保留，不删 collection）；任一文档删除失败（例如正在上传/更新）时保留配置记录，返回 409 `{"detail":"部分文档删除失败，知识库未删除","namespace":"...","failed_documents":[{"name":"...","error":"..."}]}`，可修复后重试。
+
+`batch-delete` 逐条执行同样的删除，返回 `{"deleted":["<namespace>"],"missing":["<namespace>"],"failed":[{"namespace":"...","error":"...","failed_documents":[...]}],"documents_deleted":N,"configurations_deleted":N}`：`deleted` 为已删除，`missing` 为配置和文档都不存在的命名空间，`failed` 为部分文档删除失败或运行时报错（该命名空间保留，Console 保持选中以便重试）；请求体校验失败（缺失、空数组、非法命名空间、超过 100 项、未知字段）返回 422。
 
 公开配置：`GET /v1/knowledge-base`（返回 `public_settings + strategies`，缺少知识库时 404）。创建/修改的请求体与 Python 实现一致，`embedding` 必填，`embedding_model` 长度 1..512。Console 管理员表单改为从「模型配置」模型列表选择（见上一节），但 REST 契约不变：仍提交内联的 `embedding`/`reranker`/`vlm` 连接。
 

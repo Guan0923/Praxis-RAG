@@ -286,6 +286,20 @@ func (a HTTPRuntime) KnowledgeBaseModels(ctx context.Context, kind string, value
 	return a.Service.KnowledgeBaseModels(ctx, kind, values, namespace)
 }
 
+// PurgeKnowledgeBase implements httpapi.KnowledgeBaseAdminRuntime.
+func (a HTTPRuntime) PurgeKnowledgeBase(ctx context.Context, namespace string) (httpapi.KnowledgeBasePurgeResult, error) {
+	result, err := a.Service.PurgeKnowledgeBase(ctx, namespace)
+	if err != nil {
+		return httpapi.KnowledgeBasePurgeResult{}, err
+	}
+	return httpapi.KnowledgeBasePurgeResult{
+		Namespace:            result.Namespace,
+		DocumentsDeleted:     result.DocumentsDeleted,
+		FailedDocuments:      result.FailedDocuments,
+		ConfigurationDeleted: result.ConfigurationDeleted,
+	}, nil
+}
+
 // ListModelProfiles implements httpapi.ModelProfileRuntime.
 func (a HTTPRuntime) ListModelProfiles(ctx context.Context) ([]map[string]any, error) {
 	return a.Service.ListModelProfiles(ctx)

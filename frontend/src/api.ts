@@ -679,3 +679,84 @@ export function chunkLabel(
   const strategy = strategies.find((item) => item.id === config.strategy);
   return `${strategy?.label || config.strategy} · ${config.chunk_size}/${config.chunk_overlap} ${strategy?.unit === "characters" || config.strategy === "character" ? "字符" : "token"}`;
 }
+
+// --- Batch delete (批量删除) ------------------------------------------------
+// Both batch-delete endpoints answer with the same envelope so the Console can
+// reuse one result shape: successful items, items that were already gone and
+// items the server refused are reported in separate buckets.
+export type BatchDeleteFailure = { id: string; error: string };
+export type BatchDeleteResult = {
+  deleted: string[];
+  missing: string[];
+  failed: BatchDeleteFailure[];
+};
+
+function normalizeStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+// normalizeBatchFailure accepts both transports: the API-key endpoint reports a
+// failed id as {id, error}, while the knowledge-base endpoint reports the
+// namespace as {namespace, error, failed_documents}. The extra document detail
+// is intentionally folded into the caller-visible error text.
+function normalizeBatchFailure(value: unknown): BatchDeleteFailure | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const id = typeof record.id === "string"
+    ? record.id
+    : typeof record.namespace === "string" ? record.namespace : "";
+  if (!id) return null;
+  let error = typeof record.error === "string" ? record.error : "";
+  if (!error && Array.isArray(record.failed_documents)) {
+    const details = record.failed_documents
+      .map((item) => {
+        if (!item || typeof item !== "object") return "";
+        const entry = item as Record<string, unknown>;
+        const name = typeof entry.name === "string" ? entry.name : "";
+        const reason = typeof entry.error === "string" ? entry.error : "";
+        return name || reason ? `${name}：${reason}` : "";
+      })
+      .filter(Boolean);
+    if (details.length) error = details.join("；");
+  }
+  return { id, error };
+}
+
+// normalizeBatchDeleteResult tolerates omitted or renamed buckets: `not_found`
+// is the API-key spelling of `missing`, and a partial JSON body must not crash
+// the page after the deletions already happened on the server.
+function normalizeBatchDeleteResult(payload: unknown): BatchDeleteResult {
+  const record = payload && typeof payload === "object"
+    ? payload as Record<string, unknown>
+    : {};
+  return {
+    deleted: normalizeStringList(record.deleted),
+    missing: normalizeStringList(record.missing ?? record.not_found),
+    failed: Array.isArray(record.failed)
+      ? record.failed
+        .map(normalizeBatchFailure)
+        .filter((item): item is BatchDeleteFailure => item !== null)
+      : [],
+  };
+}
+
+// deleteKnowledgeBases purges the selected knowledge bases (every document plus
+// the configuration row) in one request.
+export async function deleteKnowledgeBases(namespaces: string[]): Promise<BatchDeleteResult> {
+  const payload = await api<unknown>("/v1/admin/knowledge-bases/batch-delete", undefined, {
+    method: "POST",
+    body: JSON.stringify({ namespaces }),
+  });
+  return normalizeBatchDeleteResult(payload);
+}
+
+// deleteApiKeys removes the selected API keys in one request.
+export async function deleteApiKeys(ids: string[]): Promise<BatchDeleteResult> {
+  const payload = await api<unknown>("/v1/admin/api-keys/batch-delete", undefined, {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
+  return normalizeBatchDeleteResult(payload);
+}

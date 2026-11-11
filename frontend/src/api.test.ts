@@ -5,6 +5,8 @@ import {
   createInvitation,
   createModelProfile,
   currentCSRFToken,
+  deleteApiKeys,
+  deleteKnowledgeBases,
   deleteModelProfile,
   errorText,
   fetchAccess,
@@ -409,6 +411,91 @@ describe("model-profile API contract", () => {
       model: "qwen-vl",
     })).rejects.toThrow(
       "POST /v1/admin/model-profiles\nHTTP 409：同名模型配置已存在",
+    );
+  });
+});
+
+describe("batch-delete API contract", () => {
+  it("posts knowledge-base namespaces and normalizes the purge response", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({
+      deleted: ["kb-a"],
+      failed: [{
+        namespace: "kb-b",
+        error: "文档删除失败",
+        failed_documents: [{ name: "a.pdf", error: "上传锁冲突" }],
+      }],
+      documents_deleted: 3,
+      configurations_deleted: 1,
+    }));
+
+    const result = await deleteKnowledgeBases(["kb-a", "kb-b"]);
+
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/admin/knowledge-bases/batch-delete");
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(String(options.body))).toEqual({ namespaces: ["kb-a", "kb-b"] });
+    expect(result).toEqual({
+      deleted: ["kb-a"],
+      missing: [],
+      failed: [{ id: "kb-b", error: "文档删除失败" }],
+    });
+  });
+
+  it("posts api-key ids and maps the not_found bucket to missing", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({
+      deleted: ["key-1"],
+      not_found: ["key-2"],
+      failed: [{ id: "key-3", error: "删除失败，请稍后重试" }],
+      deleted_count: 1,
+    }));
+
+    const result = await deleteApiKeys(["key-1", "key-2", "key-3"]);
+
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/admin/api-keys/batch-delete");
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(String(options.body))).toEqual({ ids: ["key-1", "key-2", "key-3"] });
+    expect(result).toEqual({
+      deleted: ["key-1"],
+      missing: ["key-2"],
+      failed: [{ id: "key-3", error: "删除失败，请稍后重试" }],
+    });
+  });
+
+  it("normalizes omitted buckets and malformed failure entries", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ failed: [{ id: "key-1" }, "junk", null] }));
+    await expect(deleteApiKeys(["key-1", "key-2"])).resolves.toEqual({
+      deleted: [],
+      missing: [],
+      failed: [{ id: "key-1", error: "" }],
+    });
+
+    fetchMock.mockResolvedValue(jsonResponse({}));
+    await expect(deleteKnowledgeBases(["kb-a"])).resolves.toEqual({
+      deleted: [],
+      missing: [],
+      failed: [],
+    });
+  });
+
+  it("merges failed-document detail into the namespace error text", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({
+      failed: [{
+        namespace: "kb-b",
+        failed_documents: [
+          { name: "a.pdf", error: "锁冲突" },
+          { name: "b.pdf", error: "删除失败" },
+        ],
+      }],
+    }));
+    const result = await deleteKnowledgeBases(["kb-b"]);
+    expect(result.failed).toEqual([{ id: "kb-b", error: "a.pdf：锁冲突；b.pdf：删除失败" }]);
+  });
+
+  it("surfaces request-level failures through the apiResponse error", async () => {
+    fetchMock.mockResolvedValueOnce(textResponse('{"detail":"namespace 不存在"}', 404));
+    await expect(deleteKnowledgeBases(["kb-x"])).rejects.toThrow(
+      "POST /v1/admin/knowledge-bases/batch-delete\nHTTP 404：namespace 不存在",
     );
   });
 });

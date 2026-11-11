@@ -31,6 +31,8 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "POST", Path: "/v1/admin/knowledge-bases/models/{kind}", Summary: "List provider models", Tag: "knowledge-bases", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/knowledge-bases/{namespace}", Summary: "Knowledge-base details", Tag: "knowledge-bases", Response: "200"},
 	{Method: "PATCH", Path: "/v1/admin/knowledge-bases/{namespace}", Summary: "Update a knowledge base", Tag: "knowledge-bases", Request: "UpdateKnowledgeBaseBody", Response: "200"},
+	{Method: "DELETE", Path: "/v1/admin/knowledge-bases/{namespace}", Summary: "Delete a knowledge base and its documents", Tag: "knowledge-bases", Response: "204"},
+	{Method: "POST", Path: "/v1/admin/knowledge-bases/batch-delete", Summary: "Delete knowledge bases in bulk", Tag: "knowledge-bases", Request: "BatchDeleteKnowledgeBasesBody", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/knowledge-bases/{namespace}/key/{kind}", Summary: "Reveal a provider key", Tag: "knowledge-bases", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/model-profiles", Summary: "List saved model configurations", Tag: "model-profiles", Response: "200"},
 	{Method: "POST", Path: "/v1/admin/model-profiles", Summary: "Create a saved model configuration", Tag: "model-profiles", Request: "CreateModelProfileBody", Response: "201"},
@@ -48,6 +50,7 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "POST", Path: "/v1/admin/api-keys", Summary: "Create an API key", Tag: "api-keys", Response: "200"},
 	{Method: "PUT", Path: "/v1/admin/api-keys/{key_id}", Summary: "Update an API key", Tag: "api-keys", Response: "200"},
 	{Method: "DELETE", Path: "/v1/admin/api-keys/{key_id}", Summary: "Delete an API key", Tag: "api-keys", Response: "200"},
+	{Method: "POST", Path: "/v1/admin/api-keys/batch-delete", Summary: "Delete API keys in bulk", Tag: "api-keys", Request: "BatchDeleteAPIKeysBody", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/api-keys/{key_id}/mcp-config", Summary: "MCP client configuration", Tag: "api-keys", Response: "200"},
 	{Method: "GET", Path: "/v1/auth/status", Summary: "Console authentication status", Tag: "auth", Response: "200"},
 	{Method: "POST", Path: "/v1/auth/register", Summary: "Register an account", Tag: "auth", Request: "AuthBody", Response: "201"},
@@ -102,6 +105,28 @@ func openAPISchemas() map[string]any {
 				"candidate_k": map[string]any{"type": "integer", "title": "Candidate K"},
 				"top_k":       map[string]any{"type": "integer", "title": "Top K"},
 				"filters":     map[string]any{"type": "object", "title": "Filters"},
+			},
+		},
+		"BatchDeleteKnowledgeBasesBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"namespaces"},
+			"properties": map[string]any{
+				"namespaces": map[string]any{
+					"type": "array", "items": map[string]any{"type": "string"},
+					"title": "Namespaces",
+				},
+			},
+		},
+		"BatchDeleteAPIKeysBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"ids"},
+			"properties": map[string]any{
+				"ids": map[string]any{
+					"type": "array", "items": map[string]any{"type": "string"},
+					"title": "Ids",
+				},
 			},
 		},
 		"DocumentsCheckBody": map[string]any{

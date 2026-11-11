@@ -80,6 +80,13 @@ func (s *Store) Delete(ctx context.Context, keyID string) (bool, error) {
 	return s.repository.Delete(ctx, keyID)
 }
 
+// DeleteMany removes a batch of keys in one transaction. A non-empty
+// ownerUserID restricts the batch to that account, and ids it may not delete
+// are reported as missing, exactly like Delete's 404 semantics.
+func (s *Store) DeleteMany(ctx context.Context, keyIDs []string, ownerUserID string) ([]string, []string, error) {
+	return s.repository.DeleteMany(ctx, keyIDs, ownerUserID)
+}
+
 // NamespacesForKey authenticates one secret. It mirrors
 // ApiKeyStore.namespaces_for_key: malformed secrets are rejected before the
 // digest lookup and repository errors become safe credential errors.

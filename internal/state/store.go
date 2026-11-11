@@ -342,6 +342,13 @@ func openMySQL(settings StateSettings) (*sql.DB, error) {
 	// by default; passing "charset" through Params makes the driver run
 	// `SET charset=...`, which MySQL rejects with error 1193.
 	config.ParseTime = false
+	// The Go MySQL driver otherwise sends every parameterised statement through
+	// COM_STMT_PREPARE/EXECUTE. Each server-side prepared statement pays an extra
+	// round trip, which on Windows/Docker Desktop MySQL links costs ~40ms per
+	// statement (measured: text protocol ~0.5ms, prepared ~44ms), and the state
+	// layer issues several statements per write. Interpolating parameters keeps
+	// the same escaping guarantees while using a single COM_QUERY packet.
+	config.InterpolateParams = true
 	if strings.TrimSpace(settings.SSLCA) != "" {
 		tlsConfig, err := mysqlTLSConfig(settings)
 		if err != nil {

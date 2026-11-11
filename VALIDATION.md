@@ -936,3 +936,141 @@ HTTP: 带 options（vlm+ocr=tesseract）                 -> 200 application/zip 
 - 上传校验只作用于“受理上传”路径；重新解析既有文档仍走原 queue/reparse 路径，不改其失败语义。
 - OCR 语言按引擎默认（EasyOCR `ch_sim,en`、Tesseract `chi_sim,eng`），暂未提供按知识库自定义语言列表的入口；模型配置页与知识库表单只做 jsdom 组件测试，未做浏览器视觉回归。
 
+## Console 批量删除（知识库 / API Key）— 2026-11-11
+
+在 worktree/branch `dsh-3f6b8955-e922`（基线 commit `13befbe`）实现 Console 知识库页与 API Key 页的批量删除：行首复选框多选 + 鼠标左键框选（框选只增不减：拖动/缩小框、开始新一轮框选或滚动页面都不会取消已选中的行，取消选中点击行首复选框，Esc 取消本次拖动并恢复拖动前的选中），工具栏「批量删除」按钮显示已选数量；部分失败的行保持选中并显示告警，直到下一次刷新。
+
+接口/数据契约：
+
+```
+DELETE /v1/admin/knowledge-bases/{namespace}     # 204 删除成功；404 配置和文档都不存在；409 部分文档删除失败（保留配置）
+POST   /v1/admin/knowledge-bases/batch-delete    # {"namespaces":[...]} 1..100
+     -> {"deleted":[ns],"missing":[ns],"failed":[{"namespace","error","failed_documents":[{"name","error"}]}],
+         "documents_deleted":N,"configurations_deleted":N}
+POST   /v1/admin/api-keys/batch-delete           # {"ids":[...]} 1..100
+     -> {"deleted":[id],"not_found":[id],"failed":[{"id","error"}],"deleted_count":N}
+```
+
+- 知识库删除语义：Console 的知识库列表是「配置记录 ∪ 文档工作区」的合并视图，只删配置记录会留下「缺少配置记录」的条目。因此删除先逐个走既有单文档逻辑删除（`Service.deleteDocumentByName`，`del_flag`；Qdrant 向量按现有语义保留，不删除 collection），再删除配置记录并失效租户缓存；任一文档删除失败（例如上传/更新占用锁）时保留配置并返回 409 + `failed_documents`，可修复后重试。批量删除逐条执行同样的流程，`missing` 表示配置和文档都不存在，`failed` 保留该命名空间。
+- API Key 删除语义：与单条 `DELETE /v1/admin/api-keys/{id}` 完全一致（`Get` → `apiKeyCallerOwns` → `Delete`），非管理员访问他人/不存在的 id 归入 `not_found`，存储层错误进入 `failed`；单个 id 失败不中断整批。空 ID、空数组、超过 100 项、未知字段返回 FastAPI 形状 422；未配置 keyStore 返回 503。
+- 路由顺序：两条 batch 路由按字面路径注册在 `{namespace}` / `{key_id}` 参数路由之前（router 先匹配者生效），`DELETE /v1/admin/knowledge-bases/{namespace}` 注册在 KB 管理路由表末尾。
+- Console：新增 `dragSelect.ts`（`bandRect`/`intersects`/`keysInBand`/`mergeSelection` 纯函数，正面积相交、贴边不选中）与 `useDragSelection`（左键拖拽超过 4px 才接管手势；忽略 button/input/textarea/select/label/th/分页/复选框等交互元素；window 级 move/up/Escape；`document.body` 的 `drag-selecting` 类与内联样式在结束/卸载时清理；不自行插入 DOM）。两个页面渲染返回的 `{dragging, band}` 为 `.drag-band` 固定覆盖层；失败行保持选中并显示告警。框选选择集只增不减：`mergeSelection` 只做并集，拖动/缩小框、开始新一轮框选或滚动页面都不会取消已选中的行，取消选中依靠行首复选框（Esc 只撤销本次拖动）。
+- OpenAPI 3.1：`/openapi.json` 新增上述 3 条路由与 `BatchDeleteKnowledgeBasesBody` / `BatchDeleteAPIKeysBody` schema；`openapi_test.go` 断言路由存在、DELETE 方法与 required 字段。
+
+验证命令与结果（worktree 根目录，MySQL `praxis_gotest`）：
+
+```powershell
+$env:RAG_TEST_MYSQL_URL = "mysql://rag:praxis-dev-pw@127.0.0.1:3307/praxis_gotest"
+
+go build ./...                 # exit 0
+go vet ./...                   # exit 0
+go test -p 1 ./internal/... -count=1 -timeout 3600s
+# exit 0，全绿；关键包：
+#   ok internal/httpapi   20.172s
+#   ok internal/runtime  485.411s
+#   ok internal/state    422.598s
+#   ok internal/e2e      215.808s
+#   ...（access/auth/catalog/chunking/config/contracts/document/documentworker/ingest/kbconfig/
+#        mcp/migrate/modelapi/mq/qdrant/redisstate/resources/retrieval/searchrefs/searchworker/
+#        sparse 等其余包全部 ok）
+
+cd frontend
+.\node_modules\.bin\tsc.cmd --noEmit -p tsconfig.json
+# exit 0，无诊断
+.\node_modules\.bin\vitest.cmd run
+# Test Files 9 passed (9) / Tests 129 passed (129)，exit 0
+npm run build
+# exit 0：vite v8.2.2，3112 modules transformed，build/web 资源生成（chunk >500 kB 为既有告警）
+```
+
+新增/扩展测试：
+
+- `internal/httpapi/kb_purge_test.go`（新增，7 个用例）：单条删除 204/404/409、运行时报 503、批量 deleted/missing/failed 分桶与计数、422 校验集合（缺失/空数组/非法命名空间 loc/超长/未知字段）、非本机 403。
+- `internal/runtime/knowledge_base_test.go`（扩展，3 个用例）：文档逐个逻辑删除 + 配置删除 + 缓存失效 + 合并列表消失；文档删除失败时保留配置并报告；未配置工作区删除文档、以及不存在的命名空间返回零结果。
+- `internal/httpapi/api_keys_batch_test.go`（新增）：批量删除已存在/未知 id、删除后旧 key 鉴权失效而剩余 key 仍可用、重复 id 去重、重复删除归入 not_found、422 校验、503。
+- `frontend/src/dragSelect.test.ts`（34）、`useDragSelection.test.tsx`（13）、`KnowledgeBasesPage.test.tsx`（7）、`ApiKeysPage.test.tsx`（7）、`api.test.ts` 批量删除契约（新增 5，文件共 30）。其中框选用例覆盖：框移开/缩小后已选中行保留、滚动改变行位置后不取消选中、Ctrl/Shift/Meta 不再改变只增不减语义、复选框选中行在后续框选中保留。
+- `internal/httpapi/openapi_test.go`：新增 3 条路由与两个 batch schema 的断言。
+
+环境说明：本会话在 DSH `workspace-write` 下 `ops_bash` 的 Niubash 私有副本持续 `EXECUTOR_UNAVAILABLE`（link UNKNOWN），改在 `danger-full-access` 下用 `pwsh` 运行全部命令；这属于执行器环境问题，与代码无关。
+
+已知限制/未验证：
+
+- 未做浏览器级 E2E：框选与确认弹窗在 jsdom 中以桩 `getBoundingClientRect` 验证，真实浏览器里的指针手感与覆盖层层级只做人工核对。
+- 框选采用「正面积相交」：恰好零高度/零宽度的拖拽，或只贴边不重叠的行不会被选中（避免相邻行同时命中）；真实指针抖动会产生非零面积。
+- 框选只增不减：已选中行只能通过行首复选框取消（Esc 取消当前这次拖动）；拖动、缩小框选、开始新一轮框选与页面滚动都不会清空已有选择，这是按使用习惯刻意选择的语义。
+- 文档删除仍是逻辑删除：Qdrant 向量与 collection 按现有单文档删除语义保留，不随批量删除清理；需要物理清理时要另行走既有 Qdrant 删除路径。
+- 知识库批量删除是同步逐文档删除：超大知识库（数千文档）会拉长请求时间，接口上限 100 个命名空间，未做后台任务化。
+- 批量删除沿用现有删除路径，没有新增独立的审计日志事件。
+
+## API Key 批量删除性能修复（单事务 + 文本协议）— 2026-11-11
+
+线上手感「批量删除很慢」的根因定位与修复。测量环境：Windows + Docker Desktop，MySQL 8.0.46（`innodb_flush_log_at_trx_commit=1`、`sync_binlog=1`、binlog 开启），宿主通过 `127.0.0.1:3307` 访问。
+
+根因（测量结论，非猜测）：
+
+- 旧实现每个 key 一次 HTTP 循环内处理：`Get`（1 条）+ `Delete`（独立事务：缓存修订 INSERT/UPDATE/SELECT、`cache_outbox` INSERT、`DELETE`、COMMIT），即约 6 条带参数 SQL + 1 次 commit/key，且串行。
+- 同一 SQL 用 Python 直连执行整套 touch+delete+commit 只需 **7.4ms/key**，MySQL 执行本身不是瓶颈。
+- 隔离实验：go-sql-driver 带参数语句默认走**服务端预处理**（`COM_STMT_PREPARE/EXECUTE`），在该链路上每条约 **43–48ms**；文本协议（`interpolateParams=true`，`COM_QUERY`）同一语句约 **0.3–1ms**；复用同一个 prepared stmt 约 0.7ms。于是旧实现 ≈ 6×44ms ≈ 260ms/key（与实测 272ms/key 吻合）。
+- 因此慢在「每条语句一次往返、每次往返固定多约 40ms」，不在 SQL、不在 MySQL、也不在删除逻辑。
+
+交付（原子批量删除 + 连接器协议）：
+
+1. `APIKeyRepository.DeleteMany(ctx, keyIDs, ownerUserID)`：一个事务内 1 条 `SELECT id FROM api_keys WHERE id IN (...) [AND owner_user_id = ?]` 分类、1 条 `DELETE ... WHERE id IN (...)` 删除、整批只调用 1 次 `touch(apiKeyKeys())`（1 条修订 + 1 条 outbox 事件）、1 次 commit；重复 id 去重，空 id 忽略；`RowsAffected` 与已存在数量不一致时整批回滚并返回 `API Key 批量删除冲突，请重试`。
+2. `httpapi.handleBatchDeleteAPIKeys`：不再逐 id 调用 `Get`/`Delete`；非管理员会话把 `ownerUserID` 传给仓储（他人/不存在的 id 归入 `not_found`）；响应结构不变（`deleted`/`not_found`/`failed`/`deleted_count`，`failed` 恒为空数组保留兼容）；整批数据库错误返回 500 `API Key 删除失败`（整批回滚）。
+3. `internal/state/store.go`：`config.InterpolateParams = true`，带参数语句改走文本协议，全站所有查询受益（含登录会话每次请求的认证查询）。
+
+实测对比（同一台机器、同一 MySQL 容器）：
+
+```text
+旧实现（2026-11-11 20:49 测量，praxis_gotest 临时实例）：
+  batch-delete 60 个真实 key : 16,349ms  (272ms/key)
+  batch-delete 60 个不存在 id: 16,406ms  (Delete 事务照样执行)
+  单个 DELETE                : 275ms
+  单个 Create                : 230ms
+
+新实现（2026-11-11 22:47 测量）：
+  GET  /v1/admin/api-keys        : 2–4ms（预热后）
+  batch-delete 60 个不存在 id    : 8ms   （正式实例 8011）
+  batch-delete 60 个真实 key     : 15ms  （praxis_gotest 临时实例，deleted=60 not_found=0 failed=0）
+  重复删除同一批 60 个 id        : 6ms   （deleted=0 not_found=60）
+  单个 DELETE                    : 12ms
+  单个 Create                    : 23ms/key（含 PowerShell 客户端每次请求开销）
+```
+
+验证命令与结果（worktree 根目录，MySQL `praxis_gotest`）：
+
+```powershell
+$env:RAG_TEST_MYSQL_URL = "mysql://rag:praxis-dev-pw@127.0.0.1:3307/praxis_gotest"
+
+go build ./...                                   # exit 0
+go vet ./...                                     # exit 0
+go test -p 1 ./internal/... -count=1 -timeout 3600s
+# exit 0，全绿；关键包（同一台机器，修复前 → 修复后）：
+#   internal/state        422.598s → 29.810s
+#   internal/e2e          215.808s →  8.821s
+#   internal/runtime      485.411s → 43.675s
+#   internal/httpapi       20.172s →  2.029s
+#   internal/documentworker 54.741s → 7.446s
+#   internal/access        20.102s → 1.754s
+
+cd frontend
+.\node_modules\.bin\tsc.cmd --noEmit -p tsconfig.json   # exit 0
+.\node_modules\.bin\vitest.cmd run                      # 9 files / 137 tests passed, exit 0
+```
+
+覆盖新增/更新：
+
+- `internal/state/api_keys_batch_test.go`（新增）：混合存在/不存在/重复/空 id 的一次事务批量删除；校验 `deleted` 顺序、`missing` 分桶、整批只 bump 1 次 revision、只写 1 条 outbox 事件、已删除 id 再次提交不写修订/事件；owner 限定批删只删本人 key，他人 key 归入 missing 且保留。
+- `internal/httpapi/api_keys_batch_owner_test.go`（新增）：普通账号会话批量删除「本人 + 他人 + 不存在」三个 id，`deleted` 只有本人 key、`not_found` 含他人与不存在 id，他人 key 仍存在；管理员会话可删剩余 key。
+- 既有 `internal/httpapi/api_keys_batch_test.go`（生命周期/去重/not_found/422/503）在原子实现下保持通过。
+
+环境 / 运维：修复后已停止并按新二进制重启正式实例（`rag-service` PID 58080、`rag-document-worker` PID 42492，`http://127.0.0.1:8011/console`），测量后临时实例与临时探针目录均已清理。
+
+已知限制/未验证：
+
+- 批量删除语义从「逐条尽力而为、部分失败」改为「整批原子」：并发冲突或数据库错误时整批回滚并返回 500，客户端重试即可；`failed` 字段保留但恒为空数组。
+- 未做浏览器级性能回归：数值来自服务端日志/HTTP 计时与 Go/MySQL 隔离测量，Console 只验证了响应结构不变。
+- 未做并发压测（同时多个管理员对同一批 id 操作时，`RowsAffected` 不一致会整批回滚，预期行为但未专门压测）。
+- 知识库批量删除仍是逐文档逻辑删除（`purge` 循环），本次只优化了 API Key 批量删除；如同样慢可按相同思路改造。
+
+

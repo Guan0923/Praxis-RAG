@@ -317,6 +317,103 @@ func (r *APIKeyRepository) Delete(ctx context.Context, keyID string) (bool, erro
 	return changed > 0, nil
 }
 
+// DeleteMany removes a batch of credentials in one transaction: one SELECT
+// classifies the requested ids, one multi-row DELETE removes them, and one
+// read-model revision bump covers the whole batch. A non-empty ownerUserID
+// applies Delete's ownership rule to every id, and ids owned by another account
+// are reported as missing (the 404 semantics of the single-key endpoint).
+func (r *APIKeyRepository) DeleteMany(ctx context.Context, keyIDs []string, ownerUserID string) ([]string, []string, error) {
+	requested := make([]string, 0, len(keyIDs))
+	seen := make(map[string]struct{}, len(keyIDs))
+	for _, keyID := range keyIDs {
+		if keyID == "" {
+			continue
+		}
+		if _, duplicate := seen[keyID]; duplicate {
+			continue
+		}
+		seen[keyID] = struct{}{}
+		requested = append(requested, keyID)
+	}
+	deleted := make([]string, 0, len(requested))
+	missing := make([]string, 0, len(requested))
+	if len(requested) == 0 {
+		return deleted, missing, nil
+	}
+	selectPlaceholders := make([]string, len(requested))
+	selectArgs := make([]any, 0, len(requested)+1)
+	for index, keyID := range requested {
+		selectPlaceholders[index] = "?"
+		selectArgs = append(selectArgs, keyID)
+	}
+	selectSQL := "SELECT id FROM api_keys WHERE id IN (" + strings.Join(selectPlaceholders, ",") + ")"
+	if ownerUserID != "" {
+		selectSQL += " AND owner_user_id = ?"
+		selectArgs = append(selectArgs, ownerUserID)
+	}
+	database, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = database.Rollback() }()
+	rows, err := database.QueryContext(ctx, selectSQL, selectArgs...)
+	if err != nil {
+		return nil, nil, err
+	}
+	found := make(map[string]struct{}, len(requested))
+	for rows.Next() {
+		var keyID string
+		if scanErr := rows.Scan(&keyID); scanErr != nil {
+			_ = rows.Close()
+			return nil, nil, scanErr
+		}
+		found[keyID] = struct{}{}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	existing := make([]string, 0, len(found))
+	for _, keyID := range requested {
+		if _, ok := found[keyID]; ok {
+			existing = append(existing, keyID)
+			continue
+		}
+		missing = append(missing, keyID)
+	}
+	if len(existing) > 0 {
+		deletePlaceholders := make([]string, len(existing))
+		deleteArgs := make([]any, 0, len(existing))
+		for index, keyID := range existing {
+			deletePlaceholders[index] = "?"
+			deleteArgs = append(deleteArgs, keyID)
+		}
+		result, err := database.ExecContext(ctx,
+			"DELETE FROM api_keys WHERE id IN ("+strings.Join(deletePlaceholders, ",")+")", deleteArgs...)
+		if err != nil {
+			return nil, nil, err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return nil, nil, err
+		}
+		if int(changed) != len(existing) {
+			return nil, nil, newStateError("API Key 批量删除冲突，请重试")
+		}
+		if _, err := touch(ctx, database, apiKeyKeys()...); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := database.Commit(); err != nil {
+		return nil, nil, err
+	}
+	r.flushPending(ctx)
+	deleted = append(deleted, existing...)
+	return deleted, missing, nil
+}
+
 // NamespacesForKey resolves the granted namespaces of a presented secret.
 func (r *APIKeyRepository) NamespacesForKey(ctx context.Context, secret string) ([]string, error) {
 	var namespaces string

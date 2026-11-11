@@ -34,6 +34,10 @@ type fakeKBAdminRuntime struct {
 	modelsNamespace *string
 	modelsPayload   []string
 	modelsErr       error
+
+	purgeResults map[string]KnowledgeBasePurgeResult
+	purgeErrors  map[string]error
+	purgeCalls   []string
 }
 
 func (f *fakeKBAdminRuntime) ListKnowledgeBases(context.Context) ([]map[string]any, error) {
@@ -60,6 +64,16 @@ func (f *fakeKBAdminRuntime) KnowledgeBaseModels(_ context.Context, kind string,
 	f.modelsValues = values
 	f.modelsNamespace = namespace
 	return f.modelsPayload, f.modelsErr
+}
+
+func (f *fakeKBAdminRuntime) PurgeKnowledgeBase(_ context.Context, namespace string) (KnowledgeBasePurgeResult, error) {
+	f.purgeCalls = append(f.purgeCalls, namespace)
+	if err := f.purgeErrors[namespace]; err != nil {
+		return KnowledgeBasePurgeResult{}, err
+	}
+	result := f.purgeResults[namespace]
+	result.Namespace = namespace
+	return result, nil
 }
 
 func newKBAdminServer(t *testing.T, runtime *fakeKBAdminRuntime) http.Handler {
