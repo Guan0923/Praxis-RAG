@@ -1,0 +1,19 @@
+# Runtime dependencies for the Praxis-RAG Docling PDF parsing microservice.
+#
+# docling is pinned exactly: the pipeline options in app/parser.py and the
+# CodeFormulaV2 preset are validated against this release (the service refuses
+# to start a conversion with a different version).
+#
+# torch: install the CPU build first so the image does not pull the CUDA
+# runtime here:
+#   pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple "torch>=2.0"
+# then install this file. requirements-dev.txt is the lighter test-only set
+# (no docling, no torch) used by pytest and the HTTP fake mode.
+docling==2.126.0
+docling-core>=2.0
+torch>=2.0
+pillow>=10.0
+requests>=2.28
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9

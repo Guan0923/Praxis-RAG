@@ -20,9 +20,6 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/document"
 )
 
-// ParserVersion mirrors document.PDFParserVersion (pdf_content.PDF_PARSER_VERSION).
-const ParserVersion = document.PDFParserVersion
-
 // PageCharacters mirrors resources.PAGE_CHARACTERS.
 const PageCharacters = 8000
 
@@ -85,9 +82,11 @@ func ContentChunks(manifest document.PDFManifest, options Options) ([]chunking.C
 		maximum:    maximum,
 		title:      chunking.Title(manifestTitleText(manifest), options.FallbackTitle),
 		base: map[string]any{
-			"document_suffix":    document.SuffixPDF,
-			"chunking":           config.Metadata(options.TokenizerModel),
-			"pdf_parser_version": ParserVersion,
+			"document_suffix": document.SuffixPDF,
+			"chunking":        config.Metadata(options.TokenizerModel),
+			// The version comes from the parsed manifest so chunks record the
+			// engine that produced the content (Go native or Docling service).
+			"pdf_parser_version": manifest.Version,
 		},
 		result: make([]chunking.Chunk, 0, 16),
 	}

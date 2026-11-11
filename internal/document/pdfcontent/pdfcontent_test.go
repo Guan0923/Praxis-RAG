@@ -248,6 +248,29 @@ func TestContentChunksMetadataAndWarnings(t *testing.T) {
 	}
 }
 
+func TestContentChunksRecordsManifestParserVersion(t *testing.T) {
+	// Chunk metadata must follow the manifest that produced the content, not a
+	// package constant, so Docling content records its own parser version.
+	for _, version := range []string{
+		document.PDFParserVersionDocling, "docling-formula-remote-v3", document.PDFParserVersion,
+	} {
+		manifest := manifestFixture()
+		manifest.Version = version
+		chunks, err := ContentChunks(manifest, contentOptions(t, mustConfig(t, "recursive", 512, 64)))
+		if err != nil {
+			t.Fatalf("ContentChunks(%q) error = %v", version, err)
+		}
+		if len(chunks) == 0 {
+			t.Fatalf("ContentChunks(%q) returned no chunks", version)
+		}
+		for index, chunk := range chunks {
+			if got := chunk.Metadata["pdf_parser_version"]; got != version {
+				t.Fatalf("chunk %d pdf_parser_version = %v, want %q", index, got, version)
+			}
+		}
+	}
+}
+
 func TestContentChunksMetadataPagesAndOrder(t *testing.T) {
 	manifest := manifestFixture()
 	manifest.Blocks[4].Page = 2

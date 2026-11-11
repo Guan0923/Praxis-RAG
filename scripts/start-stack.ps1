@@ -1,5 +1,9 @@
 # Start dependencies (MySQL, Qdrant, Redis, Kafka), optionally provision topics,
 # migrate, then run rag-service.
+# Also starts the Docling PDF parser microservice (pdf-parser, :8091) because the
+# default PDF engine in .env.example is RAG_PDF_ENGINE=docling. The first run
+# builds a large Python image (CPU torch + docling); use RAG_PDF_ENGINE=go, or
+# `docker compose up -d mysql qdrant redis kafka`, to skip it.
 # Kafka replaces the former RocketMQ stack; topics/consumer groups are created
 # explicitly below (auto-creation is also enabled on the broker).
 # rag-service is started below, and rag-document-worker is started as its child
@@ -147,7 +151,7 @@ if ($env:RAG_OUTBOX_BRIDGE -eq "debezium") {
     Write-Host "Debezium bridge enabled: tailing MySQL binlog for $($env:RAG_DOCUMENT_TOPIC)"
 }
 
-Write-Host "Starting MySQL, Qdrant, Redis and Kafka..."
+Write-Host "Starting MySQL, Qdrant, Redis, Kafka and the Docling PDF parser (pdf-parser)..."
 Invoke-Compose (@($composeProfiles) + @("up", "-d"))
 if ($LASTEXITCODE -ne 0) {
     throw "docker compose up failed. Is Docker Desktop running and this shell allowed to access it?"
@@ -179,6 +183,31 @@ for ($attempt = 0; $attempt -lt 60; $attempt++) {
 }
 if (-not $kafkaReady) {
     throw "Kafka did not become healthy. Run: docker compose logs kafka"
+}
+
+# The default PDF engine (docling) needs the pdf-parser container. Wait softly:
+# a cold model start is slow, and RAG_PDF_ENGINE=go deployments do not need it.
+$pdfEngine = $env:RAG_PDF_ENGINE
+if (-not $pdfEngine) {
+    if ($env:RAG_PDF_SERVICE_URL) { $pdfEngine = "docling" } else { $pdfEngine = "go" }
+}
+if ($pdfEngine -eq "docling") {
+    Write-Host "Waiting for pdf-parser to become healthy (first build/start can take minutes)..."
+    $pdfReady = $false
+    for ($attempt = 0; $attempt -lt 150; $attempt++) {
+        $pdfHealth = docker inspect --format "{{.State.Health.Status}}" praxis-rag-pdf-parser 2>$null
+        if ($pdfHealth -eq "healthy") {
+            $pdfReady = $true
+            break
+        }
+        Start-Sleep -Seconds 2
+    }
+    if ($pdfReady) {
+        Write-Host "pdf-parser is healthy."
+    }
+    else {
+        Write-Warning "pdf-parser is not healthy yet; PDF uploads with RAG_PDF_ENGINE=docling fail until it is. Check: docker compose logs pdf-parser"
+    }
 }
 
 Write-Host "Ensuring Kafka topics exist (partitions=4, replication-factor=1): $($normalTopics -join ', ')"

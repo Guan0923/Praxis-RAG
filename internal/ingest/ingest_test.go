@@ -293,6 +293,30 @@ func TestPreparePDFInjectedParserAssetsAndArtifacts(t *testing.T) {
 	}
 }
 
+func TestPreparePDFRecordsManifestParserVersion(t *testing.T) {
+	for _, version := range []string{document.PDFParserVersionDocling, "docling-formula-remote-v3"} {
+		t.Run(version, func(t *testing.T) {
+			manifest := pdfManifestFixture()
+			manifest.Version = version
+			result, err := Prepare(t.Context(), writeText(t, "paper.pdf", "%PDF-1.7"), Options{
+				SourceName: "paper.pdf",
+				PDF:        PDFOptions{Parser: &fakePDFParser{manifest: manifest}},
+			})
+			if err != nil {
+				t.Fatalf("Prepare() error = %v", err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(result.StagingDir) })
+			if result.Metadata["parser_version"] != version {
+				t.Fatalf("parser_version = %v, want %q", result.Metadata["parser_version"], version)
+			}
+			chunkingMetadata := result.Metadata["chunking"].(map[string]any)
+			if chunkingMetadata["pdf_parser_version"] != version {
+				t.Fatalf("pdf_parser_version = %v, want %q", chunkingMetadata["pdf_parser_version"], version)
+			}
+		})
+	}
+}
+
 func TestPreparePDFDefaultStagingIsReturned(t *testing.T) {
 	parser := &fakePDFParser{manifest: pdfManifestFixture()}
 	result, err := Prepare(t.Context(), writeText(t, "paper.pdf", "%PDF-1.7"), Options{

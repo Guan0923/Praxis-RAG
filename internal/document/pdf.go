@@ -13,11 +13,43 @@ import (
 	"unicode/utf8"
 )
 
-// PDFParserVersion identifies the manifest contract produced by
-// NativePDFParser. Manifests written by the former external Docling worker
-// carry an older identifier; readers do not re-check this value, so stored
-// artifacts stay readable, while new imports record the Go-native version.
-const PDFParserVersion = "go-native-v1"
+// PDF parser versions. PDFParserVersion identifies manifests written by the
+// in-process NativePDFParser; PDFParserVersionDocling identifies manifests
+// written by the remote Docling parse service. Readers accept both so imports
+// from either engine stay ingestible.
+const (
+	// PDFParserVersion is the manifest contract of NativePDFParser.
+	PDFParserVersion = "go-native-v1"
+	// PDFParserVersionDocling is the manifest contract of the remote Docling
+	// parse service (DoclingServiceParser).
+	PDFParserVersionDocling = "docling-service-v1"
+	// legacyPDFParserVersionDocling is the manifest version written by the
+	// former external Docling worker. It is no longer produced but stays
+	// readable so stored artifacts remain usable.
+	legacyPDFParserVersionDocling = "docling-formula-remote-v3"
+)
+
+// IsSupportedPDFParserVersion reports whether version is a manifest contract
+// this build can ingest. Foreign or future versions are rejected so callers
+// reimport with a compatible parser.
+func IsSupportedPDFParserVersion(version string) bool {
+	switch version {
+	case PDFParserVersion, PDFParserVersionDocling, legacyPDFParserVersionDocling:
+		return true
+	default:
+		return false
+	}
+}
+
+// PDFParserVersionForEngine maps a configured PDF engine name to the manifest
+// version that engine writes. Empty and unknown engine names map to the
+// in-process Go parser.
+func PDFParserVersionForEngine(engine string) string {
+	if strings.EqualFold(strings.TrimSpace(engine), "docling") {
+		return PDFParserVersionDocling
+	}
+	return PDFParserVersion
+}
 
 // Page is one PDF page of plain text (1-based page number).
 type Page struct {
@@ -26,8 +58,8 @@ type Page struct {
 }
 
 // PDFPages extracts bounded per-page plain text for document text extraction
-// and chunk_document parity. NativePDFParser is the in-process implementation;
-// tests inject doubles.
+// and chunk_document parity. NativePDFParser is the in-process implementation,
+// DoclingServiceParser calls the remote parse service; tests inject doubles.
 type PDFPages interface {
 	Pages(ctx context.Context, source string) ([]Page, error)
 }
@@ -211,10 +243,20 @@ func ValidatePDFFile(path, name string) error {
 // PDFParseError is a PDF parse failure whose message is safe to return to
 // callers: it never quotes document text or credentials, so the upload API can
 // show it instead of a bare error category.
-type PDFParseError struct{ Message string }
+type PDFParseError struct {
+	Message string
+	// cause keeps the classified underlying error (a context deadline or
+	// cancel reason, or a transport failure) discoverable through errors.Is
+	// without changing or extending the displayed message.
+	cause error
+}
 
 // Error implements error.
 func (e *PDFParseError) Error() string { return e.Message }
+
+// Unwrap exposes the classified cause to errors.Is/errors.As. It never
+// contributes to the message returned by Error.
+func (e *PDFParseError) Unwrap() error { return e.cause }
 
 // PagesFromManifest groups manifest text blocks into per-page plain text.
 // Tables are flattened into their page and picture placeholders are skipped

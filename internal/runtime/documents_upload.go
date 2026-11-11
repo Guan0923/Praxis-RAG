@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
+	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/ingest"
 	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
@@ -361,13 +363,15 @@ type storeIndexOptions struct {
 }
 
 // indexConfiguration mirrors _index_configuration + ChunkingConfig.metadata +
-// the embedding model suffix used for deduplication and stored metadata.
-func indexConfiguration(name string, configuration chunking.Config, tokenizerModel, embeddingModel string) map[string]any {
+// the embedding model suffix used for deduplication and stored metadata. The
+// PDF parser version comes from the configured engine so stored documents
+// record the parser that actually produced their content.
+func indexConfiguration(name string, configuration chunking.Config, tokenizerModel, embeddingModel, pdfParserVersion string) map[string]any {
 	metadata := configuration.Metadata(tokenizerModel)
 	suffix := strings.ToLower(filepath.Ext(name))
 	switch suffix {
 	case document.SuffixPDF:
-		metadata["pdf_parser_version"] = document.PDFParserVersion
+		metadata["pdf_parser_version"] = pdfParserVersion
 	case document.SuffixDOC, document.SuffixDOCX:
 		metadata["word_parser_version"] = document.WordParserVersion
 	}
@@ -390,7 +394,8 @@ func (s *Service) storeAndIndex(
 	if options.IdempotencyKey != "" && len(options.IdempotencyKey) > 200 {
 		return nil, &apierrors.KnowledgeValidationError{Message: "Invalid idempotency key"}
 	}
-	configuration := indexConfiguration(name, resources.chunking, resources.tokenizerModel, options.EmbeddingModel)
+	configuration := indexConfiguration(name, resources.chunking, resources.tokenizerModel,
+		options.EmbeddingModel, document.PDFParserVersionForEngine(s.config.PDFEngine))
 	journal := s.stores.Uploads
 	if journal == nil {
 		return nil, &apierrors.KnowledgeError{Message: "上传事务存储不可用"}
@@ -637,7 +642,7 @@ func (s *Service) ingestDocument(
 			Chunking:       resources.chunking,
 			TokenizerModel: resources.tokenizerModel,
 			StagingDir:     filepath.Join(workspace, "parsed"),
-			PDF:            ingest.PDFOptions{},
+			PDF:            s.pdfOptions(),
 			Word: ingest.WordOptions{
 				Converter: &document.SofficeConverter{
 					Executable: s.config.WordConverterPath,
@@ -693,6 +698,21 @@ func (s *Service) ingestDocument(
 		qdrantChunks:   qdrantChunks,
 		artifactBucket: artifactBucket,
 	}, nil
+}
+
+// pdfOptions selects the PDF parser for the ingest step. The in-process pure-Go
+// engine stays the default (PDF.Parser nil); RAG_PDF_ENGINE=docling delegates to
+// the Docling microservice, whose base URL and timeout config already resolved.
+func (s *Service) pdfOptions() ingest.PDFOptions {
+	if s.config.PDFEngine != config.PDFEngineDocling {
+		return ingest.PDFOptions{}
+	}
+	return ingest.PDFOptions{Parser: &document.DoclingServiceParser{
+		BaseURL: s.config.PDFServiceURL,
+		Client: &http.Client{
+			Timeout: time.Duration(s.config.PDFServiceTimeout) * time.Second,
+		},
+	}}
 }
 
 // stageArtifacts persists the chunk manifest and parser artifacts in the

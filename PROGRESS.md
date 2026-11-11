@@ -1,6 +1,6 @@
 # RAG MCP 开发进展
 
-最后更新：2026-08-26
+最后更新：2026-11-10
 
 ## 总体目标
 
@@ -565,6 +565,18 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 测试：默认值/响应契约/内嵌 worker 接线与 REST 异步上传链路由定向与全量 Go 测试套件覆盖；实际结果由 Lead 复核后记录在 `VALIDATION.md`，本节不预写通过结论。
 
 已知边界：`update_document`/`delete_document` 仍同步执行；MCP `add_document` 始终异步；关闭内嵌 worker 的无 Kafka 部署必须自行运行 `RAG_DOCUMENT_WORKER_LOCAL=1` 的独立文档 worker，否则任务停在 `queued`。
+
+## 2026-11-10 恢复 Docling PDF 解析为独立微服务
+
+本轮把上一轮删除的 Docling 解析以**独立 HTTP 微服务**形式恢复：Go 主服务/镜像仍无 Python 依赖，PDF 默认走 docling 引擎，需要时可切回 Go 内置纯文本引擎。
+
+- [x] 服务：`python-workers/pdf-service/`（FastAPI + `docling==2.126.0` + CodeFormulaV2，CPU torch）；`GET /healthz`、`POST /v1/parse`（multipart 字段 `file` → `application/zip`，含 `manifest.json` 与 `pictures/*` 资产），清单版本 `docling-service-v1`；Docling 惰性导入，`RAG_PDF_SERVICE_CONVERTER=fake` 仅用于测试/联调。
+- [x] Go 客户端：`internal/document/docling_service.go`（`DoclingServiceParser` 实现 `ingest.PDFParser` 与 `document.PDFPages`：multipart 调用、状态码/content-type 校验、拒绝路径穿越/符号链接/重复条目的安全解压、条目与解压大小上限、失败返回 `*PDFParseError` 安全消息）；新增 `PDFParserVersionDocling`、`IsSupportedPDFParserVersion`、`PDFParserVersionForEngine`。
+- [x] 配置：`RAG_PDF_ENGINE`（`go|docling|空`，空 = 有 URL 则 docling 否则 go）、`RAG_PDF_SERVICE_URL`（宿主默认 `http://127.0.0.1:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900，1..7200 秒）；服务端 `RAG_PDF_MODELS_PATH`、`RAG_PDF_SERVICE_CONCURRENCY`、`RAG_PDF_SERVICE_PORT`，VLM 复用现有 `RAG_VLM_*`。
+- [x] 运行时接线（由 Lead 完成）：上传路径按引擎注入 `DoclingServiceParser`，PDF 元数据记录实际清单版本。
+- [x] 部署：compose 新增默认启动的 `pdf-parser`（独立镜像 `praxis-rag-pdf-parser:local`、`pdf_parser_models` 卷、`127.0.0.1:8091`、`/healthz` 健康检查），`app` 增加 `depends_on` 与三个 `RAG_PDF_*` 默认值（compose 内默认 `http://pdf-parser:8091`）；`.env.example` 增补 PDF 引擎、模型卷与 VLM 共用说明。
+- [x] 文档：README、`docs/USAGE.md`、`docs/DEPLOYMENT.md`（新增 §3.5 pdf-parser 部署章节）、`docs/GO_MIGRATION.md` 同步为「默认 docling + 可切回 go」；修正此前「PDF 解析不需要 Python/Docling」「仓库不再包含 Python 代码」等已过期表述。
+- 已知限制：docling 引擎需要 pdf-parser 服务与已预置的 Docling/CodeFormula 模型（CPU torch 镜像较大，首次使用前需联网下载模型到卷）；pdf-parser 不可用或超时时 docling 上传会失败（错误安全可读），显式 `RAG_PDF_ENGINE=go` 可回退纯文本；公式识别依赖 `RAG_VLM_*` 远端 VLM 或本地 CodeFormula 模型，两者都缺失时 `/v1/parse` 返回 503、解析失败；版面/表格/OCR 只有 Docling 提供；pdf-parser 无认证，只发布 loopback。真实 Docling 推理、镜像构建与模型下载尚未在本环境实机验证（联调使用 fake converter），上线前需在预发环境验证。
 
 ## 2026-11-10 创建知识库页面改为多列布局（Console）
 
