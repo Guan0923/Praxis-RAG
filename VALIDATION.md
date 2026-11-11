@@ -1064,7 +1064,7 @@ cd frontend
 - `internal/httpapi/api_keys_batch_owner_test.go`（新增）：普通账号会话批量删除「本人 + 他人 + 不存在」三个 id，`deleted` 只有本人 key、`not_found` 含他人与不存在 id，他人 key 仍存在；管理员会话可删剩余 key。
 - 既有 `internal/httpapi/api_keys_batch_test.go`（生命周期/去重/not_found/422/503）在原子实现下保持通过。
 
-环境 / 运维：修复后已停止并按新二进制重启正式实例（`rag-service` PID 58080、`rag-document-worker` PID 42492，`http://127.0.0.1:8011/console`），测量后临时实例与临时探针目录均已清理。
+环境 / 运维：修复后已停止并按新二进制重启正式实例（`rag-service` + `rag-document-worker`，`http://127.0.0.1:8011/console`），测量后临时实例与临时探针目录均已清理。
 
 已知限制/未验证：
 
