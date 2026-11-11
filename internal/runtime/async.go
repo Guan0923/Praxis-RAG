@@ -34,6 +34,12 @@ func (s *Service) admitDocument(
 	if dispatcher == nil {
 		return state.DocumentAdmission{}, &apierrors.KnowledgeError{Message: asyncSubmissionFailedMessage}
 	}
+	// Docling PDF parsing needs the knowledge-base VLM/OCR configuration; reject
+	// the job while it is admitted rather than letting it fail later in the
+	// worker with a generic message.
+	if err := s.validateDoclingPDFAdmission(ctx, namespace, name); err != nil {
+		return state.DocumentAdmission{}, err
+	}
 	var key *string
 	if idempotencyKey != "" {
 		key = &idempotencyKey

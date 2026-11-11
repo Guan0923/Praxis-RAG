@@ -70,6 +70,36 @@ func TestModelConnectionForRoundTrip(t *testing.T) {
 	}
 }
 
+func TestModelConnectionForOCREngine(t *testing.T) {
+	// The OCR kind has no provider object: it carries the engine id only and a
+	// knowledge base created before OCR existed has no ocr_model at all.
+	connection, err := ModelConnectionForKey(map[string]any{"ocr_model": "easyocr"}, "ocr", testEncryptionKey)
+	if err != nil {
+		t.Fatalf("ModelConnectionForKey(ocr) error: %v", err)
+	}
+	if connection.BaseURL != "" || connection.APIKey != "" || connection.Model != "easyocr" {
+		t.Errorf("ocr connection = %+v", connection)
+	}
+	empty, err := ModelConnectionForKey(map[string]any{}, "ocr", testEncryptionKey)
+	if err != nil {
+		t.Fatalf("ModelConnectionForKey(missing ocr_model) error: %v", err)
+	}
+	if empty.Configured() || empty.Model != "" {
+		t.Errorf("missing ocr_model connection = %+v", empty)
+	}
+	// A half-populated provider object is tolerated: base_url and protected_key
+	// are read as empty instead of corrupting the engine configuration.
+	tolerant, err := ModelConnectionForKey(map[string]any{
+		"ocr_model": "rapidocr", "ocr": map[string]any{},
+	}, "ocr", testEncryptionKey)
+	if err != nil {
+		t.Fatalf("ModelConnectionForKey(empty provider) error: %v", err)
+	}
+	if tolerant.Model != "rapidocr" || tolerant.BaseURL != "" || tolerant.APIKey != "" {
+		t.Errorf("tolerant ocr connection = %+v", tolerant)
+	}
+}
+
 func TestModelConnectionForEncryptedWithoutKeyFails(t *testing.T) {
 	t.Setenv("RAG_STATE_ENCRYPTION_KEY", "")
 	settings := testStoredSettings(t, "http://host", "secret-key")
@@ -201,13 +231,18 @@ func TestDraftConnectionRejectsInvalidCurrentURL(t *testing.T) {
 }
 
 func TestIsKind(t *testing.T) {
-	if !IsKind("embedding") || !IsKind("reranker") || !IsKind("vlm") {
-		t.Errorf("expected embedding/reranker kinds")
+	if !IsKind("embedding") || !IsKind("reranker") || !IsKind("vlm") || !IsKind("ocr") {
+		t.Errorf("expected embedding/reranker/vlm/ocr kinds")
 	}
 	if IsKind("") || IsKind("Embedding") || IsKind("bm25") {
 		t.Errorf("unexpected kind accepted")
 	}
-	if !reflect.DeepEqual(Kinds, []string{"embedding", "reranker", "vlm"}) {
+	if !reflect.DeepEqual(Kinds, []string{"embedding", "reranker", "vlm", "ocr"}) {
 		t.Errorf("Kinds = %v", Kinds)
+	}
+	// The public projection only replaces the kinds that own a provider
+	// connection; OCR has no base_url/credential to redact.
+	if !reflect.DeepEqual(CredentialKinds, []string{"embedding", "reranker", "vlm"}) {
+		t.Errorf("CredentialKinds = %v", CredentialKinds)
 	}
 }

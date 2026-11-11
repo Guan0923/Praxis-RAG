@@ -300,3 +300,54 @@ func TestModelProfileErrorMapping(t *testing.T) {
 		t.Fatalf("DeleteModelProfile(missing) = %v, %v", deleted, err)
 	}
 }
+
+// TestModelProfileOCREngine pins the OCR model-configuration path: the engine id
+// is stored as the model, no provider probe happens (OCR runs inside the parsing
+// service) and updates keep base_url/API key empty.
+func TestModelProfileOCREngine(t *testing.T) {
+	// The knowledge-base service points at an unreachable Qdrant URL and has no
+	// fake model API: OCR create/update must not call any provider.
+	service, stores := newKBService(t, "http://127.0.0.1:1")
+	ctx := context.Background()
+
+	created, err := service.CreateModelProfile(ctx, kbconfig.ModelProfileDraft{
+		Kind: "ocr", Name: "easyocr", Model: " EasyOCR ",
+	})
+	if err != nil {
+		t.Fatalf("CreateModelProfile(ocr) error = %v", err)
+	}
+	if created["kind"] != "ocr" || created["model"] != "easyocr" ||
+		created["base_url"] != "" || created["api_key_set"] != false || created["vector_size"] != nil {
+		t.Fatalf("ocr projection = %v", created)
+	}
+	id, _ := created["id"].(string)
+	if !modelProfileIDPattern.MatchString(id) {
+		t.Fatalf("ocr id = %q", id)
+	}
+
+	updated, err := service.UpdateModelProfile(ctx, id, kbconfig.ModelProfileDraft{Model: "tesseract"})
+	if err != nil {
+		t.Fatalf("UpdateModelProfile(ocr) error = %v", err)
+	}
+	if updated["model"] != "tesseract" || updated["base_url"] != "" || updated["name"] != "easyocr" {
+		t.Fatalf("updated ocr projection = %v", updated)
+	}
+
+	stored, err := stores.ModelProfiles.Get(ctx, id)
+	if err != nil || stored == nil {
+		t.Fatalf("ModelProfiles.Get() = %v, %v", stored, err)
+	}
+	if stored.Kind != "ocr" || stored.Model != "tesseract" || stored.BaseURL != "" ||
+		stored.ProtectedKey != "" || stored.VectorSize != nil {
+		t.Fatalf("stored ocr row = %+v", stored)
+	}
+
+	// The engine whitelist is enforced with a Chinese validation error.
+	_, err = service.CreateModelProfile(ctx, kbconfig.ModelProfileDraft{
+		Kind: "ocr", Name: "bad", Model: "paddleocr",
+	})
+	var validation *apierrors.KnowledgeValidationError
+	if !errors.As(err, &validation) || validation.Message != kbconfig.MessageOCREngineInvalid {
+		t.Fatalf("invalid engine error = %v", err)
+	}
+}

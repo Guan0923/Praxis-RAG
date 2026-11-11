@@ -42,6 +42,9 @@ func TestCreateKnowledgeBaseForUserClonesDefaultTemplate(t *testing.T) {
 	service, stores := newKBService(t, templateURL)
 	ctx := context.Background()
 	template := testKnowledgeBaseSettings(t, "default", templateURL, "knowledge_template")
+	// The OCR engine is a plain knowledge-base setting and must be cloned with
+	// the provider connections.
+	template["ocr_model"] = "tesseract"
 	if err := stores.KnowledgeBases.Create(ctx, template); err != nil {
 		t.Fatalf("KnowledgeBases.Create(template) error = %v", err)
 	}
@@ -73,6 +76,9 @@ func TestCreateKnowledgeBaseForUserClonesDefaultTemplate(t *testing.T) {
 	}
 	if created["strategy"] != "character" || created["chunk_size"] != 200 || created["chunk_overlap"] != 25 {
 		t.Errorf("request chunking was not kept: %v", created)
+	}
+	if created["ocr_model"] != "tesseract" {
+		t.Errorf("cloned ocr_model = %v", created["ocr_model"])
 	}
 	embedding, _ := created["embedding"].(map[string]any)
 	if embedding["base_url"] != templateURL || embedding["api_key_set"] != true {

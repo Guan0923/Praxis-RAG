@@ -25,7 +25,9 @@ Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可
 
 ### PDF 与 Word 解析
 
-PDF 默认交给 **Docling 解析微服务**（`python-workers/pdf-service`，默认 `RAG_PDF_ENGINE=docling`）：版面分析、表格结构（行列/表头/合并单元格）、OCR 与公式 LaTeX 都在该服务内完成，Go 服务通过 HTTP 取回 zip（`manifest.json` + 图片资产）后再切分入库。该服务是独立镜像，需要单独构建/启动（`docker compose up -d pdf-parser`）并把 Docling/CodeFormula 模型准备到模型卷；公式识别优先使用现有 `RAG_VLM_*`（OpenAI 兼容远端 VLM），未配置时使用模型卷内的本地 CodeFormula 模型。两者都没有时公式识别会失败、该次 PDF 上传报解析错误，因此 docling 引擎至少要配置其中一种。
+PDF 默认交给 **Docling 解析微服务**（`python-workers/pdf-service`，默认 `RAG_PDF_ENGINE=docling`）：版面分析、表格结构（行列/表头/合并单元格）、OCR 与公式 LaTeX 都在该服务内完成，Go 服务通过 HTTP 取回 zip（`manifest.json` + 图片资产）后再切分入库。该服务是独立镜像，需要单独构建/启动（`docker compose up -d pdf-parser`），并把版面/表格/OCR 模型准备到模型卷。
+
+docling 引擎使用**知识库在 Console 中配置的 VLM 与 OCR 模型**：在「模型配置」页添加 VLM（OpenAI 兼容端点）和 OCR（引擎 `auto`/`easyocr`/`tesseract`/`rapidocr`，只需选择引擎），创建或编辑知识库时选择它们；上传 PDF 时 Go 服务把这两个配置随解析请求一并发给 pdf-parser（multipart 的 `options` 字段），因此不同知识库可以使用不同模型。知识库未配置 VLM 或 OCR 时，docling 引擎下的 PDF 上传会在**受理阶段**被拒绝，并提示先到「模型配置」页添加模型、在知识库配置中选择；VLM 仍支持 `RAG_VLM_*` 环境变量作为回退，OCR 没有环境回退。公式识别的本地 CodeFormula 权重只在知识库/环境都未配置 VLM 时才用到。
 
 Go 服务保留**内置纯文本引擎**（`RAG_PDF_ENGINE=go`）：按页抽取正文、按基线分行、合并上标、去页眉页脚与页码、修复连字符换行，适合不需要版面/表格/公式的文字型 PDF，扫描件会明确报“没有可索引的内容”；切回纯文本不需要 Python 或任何外部服务。
 
@@ -71,7 +73,7 @@ MCP 需要 `Authorization: Bearer <service token 或 API Key>` 与 `X-RAG-Namesp
 
 ### 模型配置与知识库模型选择
 
-管理员在侧边栏「模型配置」页（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM 模型列表：每个条目保存名称、服务地址、模型标识和加密后的 API Key，Embedding 条目还记录保存时探测到的向量维度。创建或修改知识库时，管理员表单只从这个列表快速选择模型，不再手工输入 Base URL / API Key / 模型名；切换 Embedding 到不同连接仍要求重新向量化。模型配置与知识库之间是保存时复制的引用关系，之后编辑或删除模型配置不会改动已保存连接的知识库。VIP/普通用户建库表单不变，仍从 `RAG_DEFAULT_KB_TEMPLATE` 克隆模型配置。
+管理员在侧边栏「模型配置」页（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM / OCR 模型列表：Embedding / Reranker / VLM 条目保存名称、服务地址、模型标识和加密后的 API Key，Embedding 条目还记录保存时探测到的向量维度；OCR 条目只选择引擎（`auto` 自动、`easyocr`、`tesseract`、`rapidocr`），没有服务地址与 Key，推理由 pdf-parser 在本地执行。创建或修改知识库时，管理员表单只从这个列表快速选择模型，不再手工输入 Base URL / API Key / 模型名；切换 Embedding 到不同连接仍要求重新向量化。docling 引擎上传 PDF 要求知识库同时选中 VLM 与 OCR，否则上传会被拒绝并提示配置。模型配置与知识库之间是保存时复制的引用关系，之后编辑或删除模型配置不会改动已保存连接的知识库。VIP/普通用户建库表单不变，仍从 `RAG_DEFAULT_KB_TEMPLATE` 克隆模型配置（含 OCR 引擎）。
 
 ### 独立部署与模型状态
 
@@ -86,8 +88,8 @@ Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档任�
 - **Qdrant**（HTTP 模式；Go 不支持 `QDRANT_PATH` 本地文件模式）
 - **共享状态库**：MySQL 8（`utf8mb4`），必须配置 `RAG_STATE_URL` 或 `RAG_MYSQL_*`，不再提供本地文件回退
 - **可选**：Redis（搜索快照/缓存）、Kafka（异步文档通知、排队搜索）、LibreOffice（仅 .doc 转换）
-- **可选（PDF 高保真解析）**：Docling 解析微服务（`python-workers/pdf-service`，独立镜像，容器端口 8091）。默认 `docker compose up -d` 会随基础设施一起启动；首次使用前需要把 Docling/CodeFormula 模型准备到 `pdf_parser_models` 卷（先 `docling-tools models download --output-dir /models`，CodeFormulaV2 权重按 `python-workers/pdf-service/README.md` 单独准备），或配置 `RAG_VLM_BASE_URL` + `RAG_VLM_MODEL` 使用远端 VLM 做公式识别。只用纯文本引擎时可以不启动它（`RAG_PDF_ENGINE=go`）
-- **可选**：远端 OpenAI 兼容 VLM（`RAG_VLM_BASE_URL`/`RAG_VLM_API_KEY`/`RAG_VLM_MODEL`）用于描述 Word 无图注图片，并在 `RAG_PDF_ENGINE=docling` 时用于公式识别；未配置 VLM 时 Word 图片保留占位描述（上传不会失败）、Docling 公式回退到本地 CodeFormula 模型（需在 `pdf_parser_models` 卷内；VLM 与本地模型都缺失时 docling 公式解析失败）
+- **可选（PDF 高保真解析）**：Docling 解析微服务（`python-workers/pdf-service`，独立镜像，容器端口 8091）。默认 `docker compose up -d` 会随基础设施一起启动；首次使用前需要把 Docling/CodeFormula 模型准备到 `pdf_parser_models` 卷（先 `docling-tools models download --output-dir /models`，CodeFormulaV2 权重按 `python-workers/pdf-service/README.md` 单独准备），或配置 `RAG_VLM_BASE_URL` + `RAG_VLM_MODEL` 使用远端 VLM 做公式识别。docling 引擎下每个知识库还需在 Console「模型配置」页添加 VLM 与 OCR 模型，并在建库/编辑知识库时选中，否则 PDF 上传会被拒绝并提示配置。只用纯文本引擎时可以不启动它（`RAG_PDF_ENGINE=go`）
+- **可选**：远端 OpenAI 兼容 VLM（`RAG_VLM_BASE_URL`/`RAG_VLM_API_KEY`/`RAG_VLM_MODEL`）用于描述 Word 无图注图片，并在 `RAG_PDF_ENGINE=docling` 时作为公式识别的环境回退（Console 知识库 VLM 设置优先）；未配置 VLM 时 Word 图片保留占位描述（上传不会失败），docling 引擎则因知识库/环境都没有 VLM 而在上传受理阶段被拒绝；配置了远端 VLM 后无需本地 CodeFormula 权重
 
 本地依赖可直接用仓库的 `docker-compose.yml`：
 
@@ -228,7 +230,7 @@ PDF 解析（默认 RAG_PDF_ENGINE=docling）-> pdf-parser :8091（HTTP，返回
 MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-worker -> SearchRaw + Redis 快照
 ```
 
-- PDF 解析引擎可切换：默认 `docling` 走独立的 `pdf-parser` 微服务（版面/表格/OCR/公式），`go` 使用 Go 进程内纯文本引擎；`docling` 引擎下 pdf-parser 不可用或超时会让该次上传失败，可显式设 `RAG_PDF_ENGINE=go` 回退。
+- PDF 解析引擎可切换：默认 `docling` 走独立的 `pdf-parser` 微服务（版面/表格/OCR/公式），`go` 使用 Go 进程内纯文本引擎；`docling` 引擎下知识库未配置 VLM/OCR 时，PDF 上传会在受理阶段被拒绝并提示去「模型配置」页面配置（不进入队列）；pdf-parser 不可用或超时同样会让该次上传失败，可显式设 `RAG_PDF_ENGINE=go` 回退。
 - 搜索 worker、死信 worker 与 Kafka 模式的文档 worker 是**独立进程**；`rag-service` 只在无 Kafka 时内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS`，默认 auto），Kafka 模式不内嵌消费者。
 - `rag-service` 在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用 in-process outbox relay 和排队搜索；未配置时 MCP 搜索同步，默认由内嵌文档 worker 直接消费发件箱（`RAG_DOCUMENT_WORKER_INPROCESS=0` 可关闭并改跑独立 worker），没有消费者时任务保持 `queued`。
 - **`RAG_OUTBOX_BRIDGE` 支持 `relay`（默认）与 `debezium`**：`relay` 由服务进程内发布发件箱；`debezium` 时服务**不发布**，由外部 Debezium Server 读取 MySQL binlog 投递。Debezium 部署链路已在真实 MySQL 8.0 + Debezium 3.7.1 + Kafka 3.9.0 上验证；Go 服务/worker 的完整异步链路也已实机跑通（debezium 与 relay 两种模式；脚本 `scripts/verify-debezium-e2e.py`），死信与排队搜索分别由 `scripts/verify-kafka-dlq.py`、`scripts/verify-kafka-search.py` 实机验证。两种模式不能同时启用，否则会重复投递。

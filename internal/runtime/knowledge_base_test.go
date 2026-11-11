@@ -218,6 +218,7 @@ func testCreateInput(namespace, modelURL string) kbconfig.CreateInput {
 		EmbeddingValues: map[string]any{
 			"base_url": modelURL, "apikey": "private-key",
 		},
+		OCRModel:  "easyocr",
 		CreatedAt: time.Date(2026, 11, 8, 10, 0, 0, 0, time.UTC),
 	}
 }
@@ -250,6 +251,9 @@ func TestCreateKnowledgeBase(t *testing.T) {
 	embedding, _ := public["embedding"].(map[string]any)
 	if embedding["base_url"] != modelURL || embedding["api_key_set"] != true {
 		t.Errorf("public embedding = %v", embedding)
+	}
+	if public["ocr_model"] != "easyocr" {
+		t.Errorf("public ocr_model = %v", public["ocr_model"])
 	}
 	if _, leaked := public["protected_key"]; leaked {
 		t.Errorf("public settings leaked protected_key")
@@ -419,6 +423,9 @@ func TestListKnowledgeBasesReturnsPublicProjection(t *testing.T) {
 	if embedding["api_key_set"] != true {
 		t.Errorf("public embedding = %v", embedding)
 	}
+	if first["ocr_model"] != "easyocr" {
+		t.Errorf("public ocr_model = %v", first["ocr_model"])
+	}
 	encoded, _ := json.Marshal(items)
 	if strings.Contains(string(encoded), "enc:v1:") || strings.Contains(string(encoded), "private-key") {
 		t.Errorf("listing leaked credentials: %s", encoded)
@@ -444,6 +451,26 @@ func TestUpdateKnowledgeBaseKeyOnlyDoesNotReembed(t *testing.T) {
 	}
 	if _, present := updated["reembedded_at"]; present {
 		t.Errorf("key-only update recorded reembedded_at")
+	}
+	// The OCR engine is kept when the update omits it.
+	if updated["ocr_model"] != "easyocr" {
+		t.Errorf("omitted ocr_model = %v", updated["ocr_model"])
+	}
+	tesseract := "tesseract"
+	changed, err := service.UpdateKnowledgeBase(ctx, "alpha", kbconfig.UpdateInput{OCRModel: &tesseract})
+	if err != nil {
+		t.Fatalf("UpdateKnowledgeBase(ocr_model) error = %v", err)
+	}
+	if changed["ocr_model"] != "tesseract" {
+		t.Errorf("changed ocr_model = %v", changed["ocr_model"])
+	}
+	blank := ""
+	cleared, err := service.UpdateKnowledgeBase(ctx, "alpha", kbconfig.UpdateInput{OCRModel: &blank})
+	if err != nil {
+		t.Fatalf("UpdateKnowledgeBase(clear ocr_model) error = %v", err)
+	}
+	if cleared["ocr_model"] != "" {
+		t.Errorf("cleared ocr_model = %v", cleared["ocr_model"])
 	}
 	key, err := service.KnowledgeBaseKey(ctx, "alpha", "embedding")
 	if err != nil {

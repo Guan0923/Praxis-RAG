@@ -148,6 +148,9 @@ export type KnowledgeBase = Chunking & {
   embedding_model: string;
   reranker_model: string;
   vlm_model?: string;
+  // ocr_model 是所选 OCR 引擎 id（auto|easyocr|tesseract|rapidocr），空串表示未启用
+  // OCR；它和 embedding/reranker/vlm 不同，没有服务地址与 Key。
+  ocr_model?: string;
   collection: string;
   tokenizer: string;
   created_at: string;
@@ -441,10 +444,12 @@ export async function deleteUser(id: string): Promise<void> {
 }
 
 // --- Model profiles (模型配置) ----------------------------------------------
-// A model profile is a reusable Embedding / Reranker / VLM connection stored by
-// an administrator; knowledge bases reference one profile per kind instead of
-// carrying their own base URL, key and model id.
-export type ModelKind = "embedding" | "reranker" | "vlm";
+// A model profile is a reusable Embedding / Reranker / VLM / OCR connection stored
+// by an administrator; knowledge bases reference one profile per kind instead of
+// carrying their own base URL, key and model id. OCR profiles are special: they
+// keep the engine id (auto|easyocr|tesseract|rapidocr) in model and use an empty
+// base_url/apikey because OCR runs in the local parsing service.
+export type ModelKind = "embedding" | "reranker" | "vlm" | "ocr";
 export type ModelProfile = {
   id: string;
   kind: ModelKind;
@@ -465,11 +470,12 @@ export type ModelProfileInput = {
 };
 // ModelProfileUpdate omits kind: an existing profile cannot change its kind.
 export type ModelProfileUpdate = Partial<Omit<ModelProfileInput, "kind">>;
-export const modelKinds: ModelKind[] = ["embedding", "reranker", "vlm"];
+export const modelKinds: ModelKind[] = ["embedding", "reranker", "vlm", "ocr"];
 export const modelKindLabels: Record<ModelKind, string> = {
   embedding: "Embedding",
   reranker: "Reranker",
   vlm: "VLM",
+  ocr: "OCR",
 };
 
 // normalizeModelProfile keeps a nullable vector_size stable for the table and

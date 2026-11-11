@@ -7,9 +7,10 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
+	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
 )
 
-var knowledgeBaseKinds = map[string]struct{}{"embedding": {}, "reranker": {}, "vlm": {}}
+var knowledgeBaseKinds = map[string]struct{}{"embedding": {}, "reranker": {}, "vlm": {}, "ocr": {}}
 
 // providerSettings mirrors http_service.ProviderSettingsBody.
 type providerSettings struct {
@@ -38,12 +39,18 @@ type KnowledgeBaseCreateInput struct {
 	RerankerValues  map[string]any
 	VLMModel        string
 	VLMValues       map[string]any
+	// OCRModel is the OCR engine id (auto/easyocr/tesseract/rapidocr) used by
+	// the Docling PDF parser; an empty value means "not configured".
+	OCRModel string
 }
 
 // KnowledgeBaseUpdateInput is the transport-neutral patch request.
 type KnowledgeBaseUpdateInput struct {
 	Values  map[string]any
 	Reembed bool
+	// OCRModel changes the OCR engine; nil keeps the stored value and an
+	// explicit empty string clears it.
+	OCRModel *string
 }
 
 // KnowledgeBaseAdminRuntime is the knowledge-base administration surface.
@@ -131,6 +138,7 @@ type createKnowledgeBaseBody struct {
 	RerankerModel  string            `json:"reranker_model"`
 	VLM            *providerSettings `json:"vlm"`
 	VLMModel       string            `json:"vlm_model"`
+	OCRModel       string            `json:"ocr_model"`
 	Strategy       string            `json:"strategy"`
 	ChunkSize      *int              `json:"chunk_size"`
 	ChunkOverlap   *int              `json:"chunk_overlap"`
@@ -143,6 +151,7 @@ type updateKnowledgeBaseBody struct {
 	RerankerModel  *string           `json:"reranker_model"`
 	VLM            *providerSettings `json:"vlm"`
 	VLMModel       *string           `json:"vlm_model"`
+	OCRModel       *string           `json:"ocr_model"`
 	Reembed        bool              `json:"reembed"`
 }
 
@@ -265,6 +274,10 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		}})
 		return
 	}
+	if details := validateOCRModelField(body.OCRModel); details != nil {
+		writeValidation(w, http.StatusUnprocessableEntity, details)
+		return
+	}
 	strategy := body.Strategy
 	if strategy == "" {
 		strategy = chunking.DefaultStrategy
@@ -292,6 +305,7 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		RerankerValues:  rerankerValues,
 		VLMModel:        body.VLMModel,
 		VLMValues:       vlmValues,
+		OCRModel:        body.OCRModel,
 	})
 	if err != nil {
 		writeCreateKnowledgeBaseError(w, err)
@@ -336,7 +350,7 @@ func (s *Server) handleKnowledgeBaseKey(w http.ResponseWriter, r *http.Request) 
 	if _, ok := knowledgeBaseKinds[kind]; !ok {
 		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
 			Type: "literal_error", Loc: []any{"path", "kind"},
-			Msg: "Input should be 'embedding', 'reranker' or 'vlm'",
+			Msg: "Input should be 'embedding', 'reranker', 'vlm' or 'ocr'",
 		}})
 		return
 	}
@@ -362,7 +376,7 @@ func (s *Server) handleKnowledgeBaseModels(w http.ResponseWriter, r *http.Reques
 	if _, ok := knowledgeBaseKinds[kind]; !ok {
 		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
 			Type: "literal_error", Loc: []any{"path", "kind"},
-			Msg: "Input should be 'embedding', 'reranker' or 'vlm'",
+			Msg: "Input should be 'embedding', 'reranker', 'vlm' or 'ocr'",
 		}})
 		return
 	}
@@ -450,9 +464,16 @@ func (s *Server) handleUpdateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		}})
 		return
 	}
+	if body.OCRModel != nil {
+		if details := validateOCRModelField(*body.OCRModel); details != nil {
+			writeValidation(w, http.StatusUnprocessableEntity, details)
+			return
+		}
+	}
 	payload, err := s.kbAdmin.UpdateKnowledgeBase(r.Context(), pathParam(r, "namespace"), KnowledgeBaseUpdateInput{
-		Values:  body.values(),
-		Reembed: body.Reembed,
+		Values:   body.values(),
+		Reembed:  body.Reembed,
+		OCRModel: body.OCRModel,
 	})
 	if err != nil {
 		writeUpdateKnowledgeBaseError(w, err)
@@ -484,4 +505,23 @@ func validateNamespaceField(namespace string) []validationDetail {
 		Type: "string_pattern_mismatch", Loc: []any{"body", "namespace"},
 		Msg: "String should match pattern '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'",
 	}}
+}
+
+// validateOCRModelField reproduces the FastAPI validation of the optional
+// ocr_model field: max_length=512 plus the OCR engine Literal. An empty string
+// means "not configured" and is always accepted.
+func validateOCRModelField(value string) []validationDetail {
+	if len([]rune(value)) > kbconfig.ModelProfileModelMaxLength {
+		return []validationDetail{{
+			Type: "string_too_long", Loc: []any{"body", "ocr_model"},
+			Msg: "String should have at most 512 characters",
+		}}
+	}
+	if value != "" && !kbconfig.IsOCREngine(value) {
+		return []validationDetail{{
+			Type: "literal_error", Loc: []any{"body", "ocr_model"},
+			Msg: "Input should be 'auto', 'easyocr', 'tesseract' or 'rapidocr'",
+		}}
+	}
+	return nil
 }

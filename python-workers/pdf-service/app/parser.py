@@ -25,9 +25,11 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -40,6 +42,19 @@ SERVICE_PARSER_VERSION = "docling-service-v1"
 
 #: Exact Docling release the pipeline options were validated against.
 DOCLING_VERSION = "2.126.0"
+
+#: OCR engines accepted in the per-request ``options.ocr.engine`` field;
+#: :data:`DEFAULT_OCR_ENGINE` is used when the field is absent or empty.
+OCR_ENGINES = ("auto", "easyocr", "tesseract", "rapidocr")
+DEFAULT_OCR_ENGINE = "easyocr"
+
+#: Language lists from the former worker; kept identical for index parity.
+EASYOCR_LANGUAGES = ("ch_sim", "en")
+TESSERACT_LANGUAGES = ("chi_sim", "eng")
+
+#: Per-request VLM defaults when ``options.vlm`` omits timeout/concurrency.
+VLM_DEFAULT_TIMEOUT = 120.0
+VLM_DEFAULT_CONCURRENCY = 4
 
 #: Pinned CodeFormulaV2 revision used by the former worker.
 FORMULA_REVISION = "ecedbe111d15c2dc60bfd4a823cbe80127b58af4"
@@ -118,6 +133,15 @@ class ParserConfigError(ParserError):
 
 class ParserConversionError(ParserError):
     """The document could not be converted into a valid manifest."""
+
+
+class ParserOptionsError(ParserError):
+    """The per-request ``options`` payload is invalid (HTTP 422).
+
+    Messages are Chinese, name the offending field only and never echo request
+    values: the Go backend shows ``detail`` to users, and ``options`` may carry
+    a VLM API key.
+    """
 
 
 class VlmSettings:
@@ -201,13 +225,204 @@ def vlm_settings_from_env() -> VlmSettings | None:
         concurrency = int(concurrency_raw or 4)
     except ValueError as error:
         raise ParserConfigError("RAG_VLM_CONCURRENCY must be an integer") from error
-    return VlmSettings(
+    return _build_vlm(
         base_url,
         os.environ.get("RAG_VLM_API_KEY", "").strip(),
         model,
-        max(timeout, DESCRIPTION_TIMEOUT_FLOOR),
-        max(concurrency, 1),
+        timeout,
+        concurrency,
     )
+
+
+def _build_vlm(
+    base_url: str, api_key: str, model: str, timeout: float, concurrency: int
+) -> VlmSettings:
+    """Build a VLM client, applying the same floors as :func:`vlm_settings_from_env`."""
+    return VlmSettings(
+        base_url,
+        api_key,
+        model,
+        max(float(timeout), DESCRIPTION_TIMEOUT_FLOOR),
+        max(int(concurrency), 1),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-request options (multipart field ``options``, JSON)
+# ---------------------------------------------------------------------------
+#
+# The Go backend sends an optional text field ``options`` next to ``file``::
+#
+#     {"vlm": {"base_url": "https://host:8443/v1", "api_key": "sk-...",
+#              "model": "qwen2.5-vl-72b", "timeout": 120, "concurrency": 4},
+#      "ocr": {"engine": "easyocr"}}
+#
+# When the field is absent, empty or ``{}`` the server configuration
+# (``RAG_VLM_*`` plus the default EasyOCR engine) is used unchanged, so existing
+# callers keep working. Invalid JSON/types/engines raise
+# :class:`ParserOptionsError`, which the HTTP layer maps to 422 with a safe
+# Chinese message (request values, especially the API key, are never echoed).
+
+_OPTIONS_KEYS = {"vlm", "ocr"}
+_VLM_OPTION_KEYS = {"base_url", "api_key", "model", "timeout", "concurrency"}
+_OCR_OPTION_KEYS = {"engine"}
+
+
+@dataclass(frozen=True)
+class OcrSettings:
+    """OCR engine requested for one document.
+
+    ``engine`` is one of :data:`OCR_ENGINES`; ``auto`` keeps the legacy EasyOCR
+    behaviour (Docling 2.126.0 offers ``OcrAutoOptions``, but it may pick any
+    installed engine, so the contract pins ``auto`` to EasyOCR).
+    """
+
+    engine: str = DEFAULT_OCR_ENGINE
+
+    def __post_init__(self) -> None:
+        # Normalize direct construction the same way the JSON payload is
+        # normalized: whitespace/case never changes the effective engine.
+        engine = (self.engine or "").strip().lower()
+        object.__setattr__(self, "engine", engine or DEFAULT_OCR_ENGINE)
+
+    @property
+    def effective_engine(self) -> str:
+        """Engine that actually runs (``auto`` resolves to ``easyocr``)."""
+        return "easyocr" if self.engine == "auto" else self.engine
+
+
+@dataclass(frozen=True)
+class ParseOptions:
+    """Validated per-request options for one ``/v1/parse`` call.
+
+    An empty instance means "use the server configuration": no VLM override and
+    the default OCR engine.
+    """
+
+    vlm: VlmSettings | None = None
+    ocr: OcrSettings = field(default_factory=OcrSettings)
+
+    def vlm_or(self, fallback: VlmSettings | None) -> VlmSettings | None:
+        """Request VLM wins over the process ``RAG_VLM_*`` fallback."""
+        return self.vlm if self.vlm is not None else fallback
+
+
+def parse_options_payload(raw: str | None) -> ParseOptions:
+    """Parse the multipart ``options`` text field into :class:`ParseOptions`.
+
+    ``None`` (field absent), an empty string and the JSON literal ``null`` all
+    mean "no per-request overrides". Any malformed payload raises
+    :class:`ParserOptionsError`; messages never include the submitted values.
+    """
+    if raw is None:
+        return ParseOptions()
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = bytes(raw).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ParserOptionsError("options 必须是 UTF-8 编码的 JSON 文本") from error
+    if not isinstance(raw, str):
+        raise ParserOptionsError("options 必须是文本字段")
+    text = raw.strip()
+    if not text:
+        return ParseOptions()
+    try:
+        payload = json.loads(text)
+    except ValueError as error:
+        raise ParserOptionsError("options 不是合法的 JSON 对象") from error
+    if payload is None:
+        return ParseOptions()
+    if not isinstance(payload, dict):
+        raise ParserOptionsError("options 必须是 JSON 对象")
+    _reject_unknown_keys(payload, _OPTIONS_KEYS, "options", "vlm 与 ocr")
+    return ParseOptions(
+        vlm=_parse_vlm_options(payload.get("vlm")),
+        ocr=_parse_ocr_options(payload.get("ocr")),
+    )
+
+
+def _parse_vlm_options(value: Any) -> VlmSettings | None:
+    """Build the request VLM override; an empty object means "no override"."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ParserOptionsError("options.vlm 必须是 JSON 对象")
+    _reject_unknown_keys(
+        value, _VLM_OPTION_KEYS, "options.vlm", "base_url、api_key、model、timeout、concurrency"
+    )
+    base_url = _option_text(value, "base_url", "options.vlm.base_url")
+    model = _option_text(value, "model", "options.vlm.model")
+    api_key = _option_text(value, "api_key", "options.vlm.api_key")
+    if not base_url and not model and not api_key:
+        return None
+    if not base_url or not model:
+        raise ParserOptionsError(
+            "options.vlm.base_url 与 options.vlm.model 必须同时提供且为非空字符串"
+        )
+    timeout = _option_timeout(value, "timeout", "options.vlm.timeout", VLM_DEFAULT_TIMEOUT)
+    concurrency = _option_concurrency(
+        value, "concurrency", "options.vlm.concurrency", VLM_DEFAULT_CONCURRENCY
+    )
+    return _build_vlm(base_url, api_key, model, timeout, concurrency)
+
+
+def _parse_ocr_options(value: Any) -> OcrSettings:
+    """Build the request OCR engine; absent/empty engine keeps EasyOCR."""
+    if value is None:
+        return OcrSettings()
+    if not isinstance(value, dict):
+        raise ParserOptionsError("options.ocr 必须是 JSON 对象")
+    _reject_unknown_keys(value, _OCR_OPTION_KEYS, "options.ocr", "engine")
+    engine = _option_text(value, "engine", "options.ocr.engine").strip().lower()
+    if not engine:
+        return OcrSettings()
+    if engine not in OCR_ENGINES:
+        raise ParserOptionsError(
+            "options.ocr.engine 不受支持；可选值：auto、easyocr、tesseract、rapidocr"
+        )
+    return OcrSettings(engine=engine)
+
+
+def _reject_unknown_keys(value: dict[str, Any], allowed: set[str], label: str, names: str) -> None:
+    if set(value) - allowed:
+        raise ParserOptionsError(f"{label} 包含不支持的字段；仅支持 {names}")
+
+
+def _option_text(value: dict[str, Any], key: str, label: str) -> str:
+    raw = value.get(key)
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise ParserOptionsError(f"{label} 必须是字符串")
+    return raw.strip()
+
+
+def _option_timeout(value: dict[str, Any], key: str, label: str, default: float) -> float:
+    raw = value.get(key)
+    if raw is None:
+        return default
+    # bool is an int subclass; JSON ``true`` must not become ``timeout=1``.
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ParserOptionsError(f"{label} 必须是数字")
+    number = float(raw)
+    if not math.isfinite(number) or number <= 0:
+        raise ParserOptionsError(f"{label} 必须是大于 0 的数字")
+    return number
+
+
+def _option_concurrency(value: dict[str, Any], key: str, label: str, default: int) -> int:
+    raw = value.get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ParserOptionsError(f"{label} 必须是整数")
+    if isinstance(raw, float):
+        if not math.isfinite(raw) or not raw.is_integer():
+            raise ParserOptionsError(f"{label} 必须是整数")
+        raw = int(raw)
+    if raw < 1:
+        raise ParserOptionsError(f"{label} 必须是大于等于 1 的整数")
+    return int(raw)
 
 
 class PdfConverter(Protocol):
@@ -215,11 +430,20 @@ class PdfConverter(Protocol):
 
     name: str
 
-    def convert(self, source: Path, output_dir: Path, scratch_dir: Path) -> dict[str, Any]:
+    def convert(
+        self,
+        source: Path,
+        output_dir: Path,
+        scratch_dir: Path,
+        *,
+        options: ParseOptions | None = None,
+    ) -> dict[str, Any]:
         """Write ``manifest.json``-ready artifacts into ``output_dir``.
 
         ``scratch_dir`` is for intermediate files that must not be published
-        (table crops used for descriptions, OCR diagnostics).
+        (table crops used for descriptions, OCR diagnostics). ``options`` are
+        the per-request overrides; ``None`` means "use the server
+        configuration" (fake mode ignores them by design).
         """
 
 
@@ -363,7 +587,11 @@ def _describe_image(session: Any, vlm: VlmSettings, image_base64: str) -> str:
 
 
 class DoclingConverter:
-    """Real Docling conversion using CodeFormulaV2 (local weights or remote VLM)."""
+    """Real Docling conversion using CodeFormulaV2 (local weights or remote VLM).
+
+    ``vlm`` is the process-level ``RAG_VLM_*`` fallback; a per-request
+    ``options.vlm`` overrides it for that document only.
+    """
 
     name = "docling"
 
@@ -371,9 +599,22 @@ class DoclingConverter:
         self.models_path = models_path
         self.vlm = vlm
 
-    def convert(self, source: Path, output_dir: Path, scratch_dir: Path) -> dict[str, Any]:
+    def convert(
+        self,
+        source: Path,
+        output_dir: Path,
+        scratch_dir: Path,
+        *,
+        options: ParseOptions | None = None,
+    ) -> dict[str, Any]:
+        requested = options if options is not None else ParseOptions()
         return convert_pdf(
-            source, output_dir, scratch_dir, models=self.models_path, vlm=self.vlm
+            source,
+            output_dir,
+            scratch_dir,
+            models=self.models_path,
+            vlm=requested.vlm_or(self.vlm),
+            ocr=requested.ocr,
         )
 
 
@@ -382,15 +623,27 @@ class FakeConverter:
 
     Produces one text block, one formula block and one picture asset backed by a
     real 8x8 PNG, so the zip/manifest contract can be exercised end to end on a
-    machine without docling or torch.
+    machine without docling or torch. Fake mode ignores per-request options
+    (there is no Docling pipeline to configure) but keeps the last payload in
+    :attr:`last_options` so tests can assert the HTTP layer parsed and forwarded
+    it.
     """
 
     name = "fake"
 
     def __init__(self, *, picture_size: int = 8) -> None:
         self.picture_size = picture_size
+        self.last_options: ParseOptions | None = None
 
-    def convert(self, source: Path, output_dir: Path, scratch_dir: Path) -> dict[str, Any]:
+    def convert(
+        self,
+        source: Path,
+        output_dir: Path,
+        scratch_dir: Path,
+        *,
+        options: ParseOptions | None = None,
+    ) -> dict[str, Any]:
+        self.last_options = options
         started = time.perf_counter()
         picture_dir = output_dir / "pictures"
         picture_dir.mkdir(parents=True, exist_ok=True)
@@ -521,6 +774,7 @@ def fake_manifest() -> dict[str, Any]:
             "formula_crop_expansion": 0.0,
             "formula_batch_size": 1,
             "ocr_confidence_threshold": 0.0,
+            "ocr_engine": None,
         },
         "metrics": {"seconds": 0.0, "pages": 1, "peak_cuda_allocated_bytes": 0},
     }
@@ -533,12 +787,16 @@ def convert_pdf(
     *,
     models: Path | None = None,
     vlm: VlmSettings | None = None,
+    ocr: OcrSettings | None = None,
 ) -> dict[str, Any]:
     """Convert one PDF into the Go ``PDFManifest`` contract.
 
-    Docling and torch are imported lazily here, so merely importing the service
-    never requires the deep-learning stack.
+    ``vlm``/``ocr`` are already resolved by the caller (per-request ``options``
+    win over the ``RAG_VLM_*`` environment). Docling and torch are imported
+    lazily here, so merely importing the service never requires the
+    deep-learning stack.
     """
+    ocr_settings = ocr if ocr is not None else OcrSettings()
     modules = _load_docling_modules()
     _validate_local_models(models, vlm)
     device, use_gpu = _local_device()
@@ -552,13 +810,7 @@ def convert_pdf(
     options = modules.PdfPipelineOptions(
         artifacts_path=str(models) if models else None,
         accelerator_options=modules.AcceleratorOptions(device=device, num_threads=4),
-        ocr_options=modules.EasyOcrOptions(
-            lang=["ch_sim", "en"],
-            use_gpu=use_gpu,
-            download_enabled=False,
-            model_storage_directory=str(models / "EasyOcr") if models else None,
-            confidence_threshold=0.0,
-        ),
+        ocr_options=_ocr_options(modules, ocr_settings, models, use_gpu),
         table_structure_options=modules.TableStructureOptions(
             mode=modules.TableFormerMode.ACCURATE, do_cell_matching=False
         ),
@@ -607,7 +859,7 @@ def convert_pdf(
     pages = list(result.pages)
     manifest = export_manifest(doc, output_dir, scratch_dir, vlm=vlm)
     manifest["warnings"] = _ocr_diagnostics(pages, scratch_dir / "ocr.json")
-    manifest["parser"] = _parser_metadata(vlm)
+    manifest["parser"] = _parser_metadata(vlm, ocr_settings)
     missing = [asset for asset in manifest["assets"] if not asset["caption"]]
     if missing and vlm is not None:
         describe_missing_assets(missing, vlm)
@@ -622,7 +874,12 @@ def convert_pdf(
 
 
 def _load_docling_modules():
-    """Import Docling lazily and check the pinned release."""
+    """Import Docling lazily and check the pinned release.
+
+    ``TesseractOcrOptions``/``RapidOcrOptions`` are imported here (not at module
+    import time) so that ``import app.parser`` keeps working without docling and
+    so an unsupported engine is only a problem when it is actually requested.
+    """
     try:
         import docling
         from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
@@ -632,8 +889,10 @@ def _load_docling_modules():
             CodeFormulaVlmOptions,
             EasyOcrOptions,
             PdfPipelineOptions,
+            RapidOcrOptions,
             TableFormerMode,
             TableStructureOptions,
+            TesseractOcrOptions,
         )
         from docling.document_converter import DocumentConverter, PdfFormatOption
     except ImportError as error:
@@ -655,8 +914,10 @@ def _load_docling_modules():
         PdfFormatOption=PdfFormatOption,
         PdfPipelineOptions=PdfPipelineOptions,
         PyPdfiumDocumentBackend=PyPdfiumDocumentBackend,
+        RapidOcrOptions=RapidOcrOptions,
         TableFormerMode=TableFormerMode,
         TableStructureOptions=TableStructureOptions,
+        TesseractOcrOptions=TesseractOcrOptions,
     )
 
 
@@ -665,6 +926,48 @@ class _Modules:
 
     def __init__(self, **symbols: Any) -> None:
         self.__dict__.update(symbols)
+
+
+def _ocr_options(
+    modules: Any,
+    ocr: OcrSettings | None,
+    models: Path | None,
+    use_gpu: bool,
+) -> Any:
+    """Map the requested OCR engine onto Docling 2.126.0 pipeline options.
+
+    Pure function over a ``modules`` namespace, so the mapping is unit-tested
+    with stub option classes and never needs docling installed.
+    """
+    engine = (ocr or OcrSettings()).effective_engine
+    if engine == "easyocr":
+        kwargs: dict[str, Any] = {
+            "lang": list(EASYOCR_LANGUAGES),
+            "use_gpu": use_gpu,
+            "download_enabled": False,
+            "model_storage_directory": str(models / "EasyOcr") if models else None,
+            "confidence_threshold": 0.0,
+        }
+        return _ocr_option_class(modules, "EasyOcrOptions", engine)(**kwargs)
+    if engine == "tesseract":
+        return _ocr_option_class(modules, "TesseractOcrOptions", engine)(
+            lang=list(TESSERACT_LANGUAGES)
+        )
+    if engine == "rapidocr":
+        return _ocr_option_class(modules, "RapidOcrOptions", engine)()
+    raise ParserOptionsError(
+        "options.ocr.engine 不受支持；可选值：auto、easyocr、tesseract、rapidocr"
+    )
+
+
+def _ocr_option_class(modules: Any, name: str, engine: str) -> Any:
+    try:
+        return getattr(modules, name)
+    except AttributeError as error:
+        raise ParserConfigError(
+            f"Docling {DOCLING_VERSION} does not provide {name}; the {engine!r} OCR engine "
+            "cannot be used with this Docling installation"
+        ) from error
 
 
 def _validate_local_models(models: Path | None, vlm: VlmSettings | None) -> None:
@@ -1037,7 +1340,13 @@ def _ocr_diagnostics(pages: list[Any], ocr_path: Path) -> list[dict[str, Any]]:
     return warnings
 
 
-def _parser_metadata(vlm: VlmSettings | None) -> dict[str, Any]:
+def _parser_metadata(vlm: VlmSettings | None, ocr: OcrSettings | None = None) -> dict[str, Any]:
+    """Provenance recorded in ``manifest.parser``.
+
+    ``ocr_engine`` is the engine that actually ran (``auto`` resolves to
+    ``easyocr``); the VLM description carries host+model only, never the key.
+    """
+    ocr_settings = ocr if ocr is not None else OcrSettings()
     return {
         "version": SERVICE_PARSER_VERSION,
         "service_version": __version__,
@@ -1051,6 +1360,7 @@ def _parser_metadata(vlm: VlmSettings | None) -> dict[str, Any]:
         "formula_crop_expansion": 0.0,
         "formula_batch_size": 1,
         "ocr_confidence_threshold": 0.0,
+        "ocr_engine": ocr_settings.effective_engine,
     }
 
 

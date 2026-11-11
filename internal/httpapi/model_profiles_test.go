@@ -214,6 +214,20 @@ func TestModelProfileAdminCreate(t *testing.T) {
 		t.Fatalf("create without key input = %+v", input)
 	}
 
+	// OCR configurations store an engine id as the model; base_url and apikey
+	// may be empty because OCR runs inside the parsing service.
+	ocr := performRequest(handler, testRequest{
+		method: "POST", target: "/v1/admin/model-profiles", remote: "127.0.0.1:5000",
+		body: `{"kind":"ocr","name":"easyocr","base_url":"","apikey":"","model":"easyocr"}`,
+	})
+	if ocr.Code != http.StatusCreated {
+		t.Fatalf("ocr create status = %d body = %s", ocr.Code, ocr.Body.String())
+	}
+	if input := runtime.createInput; input.Kind != "ocr" || input.BaseURL != "" ||
+		input.Model != "easyocr" || !input.HasAPIKey || input.APIKey != "" {
+		t.Fatalf("ocr create input = %+v", input)
+	}
+
 	runtime.createErr = &apierrors.KnowledgeConflictError{Message: kbconfig.MessageModelProfileExists}
 	conflict := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/admin/model-profiles", remote: "127.0.0.1:5000",

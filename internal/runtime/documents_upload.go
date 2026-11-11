@@ -49,6 +49,12 @@ type documentOperationError struct {
 	OperationID string
 }
 
+// doclingPDFModelsRequiredMessage is the fixed Chinese rejection shown when a
+// PDF is uploaded under the Docling engine without the VLM/OCR configuration it
+// needs. It is raised while the upload is accepted, before any journal/queue
+// work, so users are sent to 模型配置 instead of seeing a parse failure later.
+const doclingPDFModelsRequiredMessage = "PDF 解析需要先在「模型配置」页添加 VLM 和 OCR 模型，并在知识库配置中选择后再上传。"
+
 // Error implements error.
 func (e *documentOperationError) Error() string { return e.Err.Error() }
 
@@ -62,6 +68,7 @@ type uploadResources struct {
 	tokenizerModel string
 	embeddingModel string
 	vlm            document.VLMSettings
+	ocr            document.OCRSettings
 	collection     string
 	vectorSize     int
 	embedder       *modelapi.HTTPEmbedder
@@ -108,6 +115,10 @@ func (s *Service) resolveUploadResources(ctx context.Context, namespace string) 
 	if err != nil {
 		return nil, err
 	}
+	ocr, err := s.uploadOCR(settings)
+	if err != nil {
+		return nil, err
+	}
 	store, err := s.newDocumentStore(ctx, namespace, collection)
 	if err != nil {
 		return nil, &apierrors.KnowledgeError{Message: "Qdrant 索引不可用，请检查 Qdrant 服务配置"}
@@ -118,6 +129,7 @@ func (s *Service) resolveUploadResources(ctx context.Context, namespace string) 
 		tokenizerModel: tokenizerModel,
 		embeddingModel: embeddingModel,
 		vlm:            vlm,
+		ocr:            ocr,
 		collection:     collection,
 		vectorSize:     vectorSize,
 		embedder:       modelapi.NewHTTPEmbedder(embeddingConnection, modelapi.DefaultTimeout),
@@ -148,6 +160,66 @@ func (s *Service) validateUploads(files []UploadFile) error {
 	return nil
 }
 
+// validateDoclingPDFUpload rejects a PDF upload under the Docling engine before
+// any journal/queue work when the knowledge base has no VLM (Console knowledge
+// base setting or RAG_VLM_* environment) or no OCR engine configured. The
+// message sends the user to 模型配置 instead of failing later at parse time.
+func (s *Service) validateDoclingPDFUpload(files []UploadFile, resources *uploadResources) error {
+	if s.config.PDFEngine != config.PDFEngineDocling || resources == nil {
+		return nil
+	}
+	hasPDF := false
+	for _, file := range files {
+		name, err := SanitizeName(file.Name)
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(filepath.Ext(name), document.SuffixPDF) {
+			hasPDF = true
+			break
+		}
+	}
+	if !hasPDF {
+		return nil
+	}
+	if resources.vlm.Configured() && strings.TrimSpace(resources.vlm.Model) != "" && resources.ocr.Configured() {
+		return nil
+	}
+	return &apierrors.KnowledgeValidationError{Message: doclingPDFModelsRequiredMessage}
+}
+
+// validateDoclingPDFAdmission is the asynchronous counterpart of
+// validateDoclingPDFUpload: a PDF admitted to the document-job queue under the
+// Docling engine is rejected while the upload is admitted when the knowledge
+// base has no VLM or OCR configuration. The Console therefore shows the
+// actionable Chinese message instead of a generic failed job after parsing.
+func (s *Service) validateDoclingPDFAdmission(ctx context.Context, namespace, name string) error {
+	if s.config.PDFEngine != config.PDFEngineDocling {
+		return nil
+	}
+	safeName, err := SanitizeName(name)
+	if err != nil || !strings.EqualFold(filepath.Ext(safeName), document.SuffixPDF) {
+		return nil
+	}
+	settings, err := s.stores.KnowledgeBases.Get(ctx, namespace)
+	if err != nil {
+		return &apierrors.KnowledgeError{Message: "知识库配置无法读取"}
+	}
+	if settings == nil {
+		return &apierrors.KnowledgeValidationError{Message: kbconfig.MessageKnowledgeBaseMissing}
+	}
+	vlm, err := s.uploadVLM(settings)
+	if err != nil {
+		return err
+	}
+	ocr, err := s.uploadOCR(settings)
+	if err != nil {
+		return err
+	}
+	return s.validateDoclingPDFUpload(
+		[]UploadFile{{Name: safeName}}, &uploadResources{vlm: vlm, ocr: ocr})
+}
+
 // uploadDocuments is the real implementation behind Service.Upload: a batch of
 // synchronous uploads, one journaled transaction per file, with per-file error
 // isolation and the post-write document list.
@@ -162,6 +234,9 @@ func (s *Service) uploadDocuments(
 		return nil, err
 	}
 	if err := s.validateUploads(files); err != nil {
+		return nil, err
+	}
+	if err := s.validateDoclingPDFUpload(files, resources); err != nil {
 		return nil, err
 	}
 	imported := make([]map[string]any, 0, len(files))
@@ -255,6 +330,9 @@ func (s *Service) writeDocumentContent(
 		}
 	}
 	if err := s.validateUploads([]UploadFile{{Name: name, Content: content}}); err != nil {
+		return nil, err
+	}
+	if err := s.validateDoclingPDFUpload([]UploadFile{{Name: name, Content: content}}, resources); err != nil {
 		return nil, err
 	}
 	record, err := s.storeAndIndex(ctx, namespace, resources, storeIndexOptions{
@@ -642,7 +720,7 @@ func (s *Service) ingestDocument(
 			Chunking:       resources.chunking,
 			TokenizerModel: resources.tokenizerModel,
 			StagingDir:     filepath.Join(workspace, "parsed"),
-			PDF:            s.pdfOptions(),
+			PDF:            s.pdfOptions(resources),
 			Word: ingest.WordOptions{
 				Converter: &document.SofficeConverter{
 					Executable: s.config.WordConverterPath,
@@ -703,16 +781,23 @@ func (s *Service) ingestDocument(
 // pdfOptions selects the PDF parser for the ingest step. The in-process pure-Go
 // engine stays the default (PDF.Parser nil); RAG_PDF_ENGINE=docling delegates to
 // the Docling microservice, whose base URL and timeout config already resolved.
-func (s *Service) pdfOptions() ingest.PDFOptions {
+// The knowledge base's VLM and OCR configuration is forwarded with every parse
+// request so one service can serve deployments with different models.
+func (s *Service) pdfOptions(resources *uploadResources) ingest.PDFOptions {
 	if s.config.PDFEngine != config.PDFEngineDocling {
 		return ingest.PDFOptions{}
 	}
-	return ingest.PDFOptions{Parser: &document.DoclingServiceParser{
+	parser := &document.DoclingServiceParser{
 		BaseURL: s.config.PDFServiceURL,
 		Client: &http.Client{
 			Timeout: time.Duration(s.config.PDFServiceTimeout) * time.Second,
 		},
-	}}
+	}
+	if resources != nil {
+		parser.VLM = resources.vlm
+		parser.OCR = resources.ocr
+	}
+	return ingest.PDFOptions{Parser: parser}
 }
 
 // stageArtifacts persists the chunk manifest and parser artifacts in the
@@ -1210,6 +1295,26 @@ func (s *Service) wordVisionWorker(vlm document.VLMSettings) *document.WordVisio
 		return nil
 	}
 	return &document.WordVisionWorker{VLM: vlm}
+}
+
+// uploadOCR resolves the OCR engine configured for one knowledge base. An empty
+// or absent "ocr_model" means "not configured" and yields an empty OCRSettings;
+// a stored value outside the engine whitelist is corrupt configuration rather
+// than a user-recoverable validation failure.
+func (s *Service) uploadOCR(settings map[string]any) (document.OCRSettings, error) {
+	raw, ok := settings["ocr_model"]
+	if !ok || raw == nil {
+		return document.OCRSettings{}, nil
+	}
+	text, ok := raw.(string)
+	if !ok {
+		return document.OCRSettings{}, &apierrors.KnowledgeError{Message: "知识库配置无效"}
+	}
+	engine, err := kbconfig.NormalizeOCREngine(text)
+	if err != nil {
+		return document.OCRSettings{}, &apierrors.KnowledgeError{Message: "知识库配置无效"}
+	}
+	return document.OCRSettings{Engine: engine}, nil
 }
 
 // uploadVLM prefers the knowledge base's own VLM provider and falls back to the

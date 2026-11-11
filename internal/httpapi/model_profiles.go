@@ -244,7 +244,7 @@ func validateModelProfileBody(kind string, name, baseURL, model *string) []valid
 	if _, ok := knowledgeBaseKinds[kind]; !ok {
 		return []validationDetail{{
 			Type: "literal_error", Loc: []any{"body", "kind"},
-			Msg: "Input should be 'embedding', 'reranker' or 'vlm'",
+			Msg: "Input should be 'embedding', 'reranker', 'vlm' or 'ocr'",
 		}}
 	}
 	if name == nil {

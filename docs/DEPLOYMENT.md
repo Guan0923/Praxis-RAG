@@ -86,7 +86,7 @@ docker run -d --name praxis-rag-service \
 - 使用 MySQL 时先执行一次 schema 检查/建表（见 §6）：`docker run --rm --entrypoint /app/bin/rag-state-migrate ... --apply`。
 - 镜像不含 Python、Docling 或 LibreOffice：DOCX 解析与 Word 图片描述（HTTP VLM）由 Go 进程内完成；PDF 高保真解析调用独立的 `pdf-parser`（见 §3.5），使用 `RAG_PDF_ENGINE=go` 时不需要它；只有 .doc 转换需要把 LibreOffice bind mount 进容器并设置 `RAG_WORD_CONVERTER_PATH`；转换进程的路径必须在容器内可见。
 - PDF 高保真解析：设置 `RAG_PDF_ENGINE=docling` 并把 `RAG_PDF_SERVICE_URL` 指向 pdf-parser（同一 compose 网络用 `http://pdf-parser:8091`；单独 `docker run` 时用从容器内可达的地址，如 `http://host.docker.internal:8091`）；超时用 `RAG_PDF_SERVICE_TIMEOUT`（默认 900 秒）。pdf-parser 不可用时 docling 上传会失败，可切回 `RAG_PDF_ENGINE=go`。
-- Word 无图注图片的描述调用远端 OpenAI 兼容 VLM：优先在 Console 的知识库设置页配置（URL/Key/模型），也可用 `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`（可选 `RAG_VLM_TIMEOUT`/`RAG_VLM_CONCURRENCY`）作为未配置知识库时的环境回退。图片内容会离开本机到该端点，选型时确认合规；未配置时这些图片保留占位描述，上传不会失败。该 VLM 端点同时用于 docling 引擎的公式识别（未配置时公式回退到 pdf-parser 模型卷内的本地 CodeFormula 模型）。
+- Word 无图注图片的描述调用远端 OpenAI 兼容 VLM：优先在 Console 的知识库设置页配置（URL/Key/模型），也可用 `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`（可选 `RAG_VLM_TIMEOUT`/`RAG_VLM_CONCURRENCY`）作为未配置知识库时的环境回退。图片内容会离开本机到该端点，选型时确认合规；未配置时这些图片保留占位描述，上传不会失败。该 VLM 端点同时用于 docling 引擎的公式识别；但 docling 引擎要求知识库**同时**配置 VLM 与 OCR 引擎（Console「模型配置」页添加并在知识库表单选择），否则 PDF 上传会在受理阶段被拒绝并提示配置。
 - 数据目录卷保存上传恢复工作区与 artifact 工作区；不要用匿名卷。
 
 ### 3.3 Compose：app profile
@@ -177,6 +177,8 @@ docker compose -f docker-compose.yml -f deploy/compose.workers.yml --profile wor
 
 `pdf-parser` 是独立容器/进程（`python-workers/pdf-service`：FastAPI + docling + CPU torch），负责 PDF 的版面、表格、OCR 与公式解析。Go 服务只通过 HTTP 调用它，Python/Docling 不会进入 app 镜像。接口固定：`GET /healthz`、`POST /v1/parse`（multipart 字段 `file`，成功返回 `application/zip`，根目录含 `manifest.json` 与图片资产，清单版本 `docling-service-v1`）。使用 `RAG_PDF_ENGINE=go` 时无需部署。
 
+VLM 与 OCR 按知识库下发：Go 服务在 `POST /v1/parse` 的 multipart 中附带文本字段 `options`（`{"vlm":{"base_url","api_key","model","timeout","concurrency"},"ocr":{"engine":"easyocr|tesseract|rapidocr|auto"}}`），值为该知识库在 Console 选中的配置，`api_key` 不会写入日志；未带 `options` 的请求回退到下表的 `RAG_VLM_*` 环境变量与默认 EasyOCR。docling 引擎下知识库未配置 VLM/OCR 时，Go 服务在受理上传时即返回中文提示并拒绝，不会调用本服务。
+
 Compose 部署（`pdf-parser` 没有 profile，默认 `docker compose up -d` 就会启动）：
 
 ```bash
@@ -212,7 +214,7 @@ docker run -d --name praxis-rag-pdf-parser \
 | `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 并发解析请求数；Docling 模型占内存，建议保持 1，靠副本扩容 |
 | `RAG_PDF_SERVICE_TIMEOUT` | `900` 秒 | 单请求超时；排队等待与转换各自不超过该值（超时 504），与 Go 端同名变量取同一值 |
 | `RAG_PDF_SERVICE_MAX_BYTES` | `104857600` | 单次上传上限（字节），超限 413 |
-| `RAG_VLM_BASE_URL` / `RAG_VLM_API_KEY` / `RAG_VLM_MODEL` | 空 | 公式识别与图片描述的 OpenAI 兼容 VLM；`RAG_VLM_BASE_URL` 与 `RAG_VLM_MODEL` 必须**同时**配置，否则按未配置处理 |
+| `RAG_VLM_BASE_URL` / `RAG_VLM_API_KEY` / `RAG_VLM_MODEL` | 空 | 公式识别与图片描述的 OpenAI 兼容 VLM **环境回退**（请求 `options` 与 Console 知识库配置优先）；`RAG_VLM_BASE_URL` 与 `RAG_VLM_MODEL` 必须**同时**配置，否则按未配置处理。OCR 引擎只来自请求 `options`，缺省为 `easyocr` |
 | `RAG_VLM_TIMEOUT` / `RAG_VLM_CONCURRENCY` | `120` 秒 / `4` | VLM 请求超时与并发 |
 | `RAG_PDF_SERVICE_CONVERTER` | `docling` | 生产实现；`fake` 仅在测试/联调时返回固定清单，不要用于生产 |
 

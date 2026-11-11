@@ -28,6 +28,7 @@ import (
 const (
 	doclingParsePath    = "/v1/parse"
 	doclingFileField    = "file"
+	doclingOptionsField = "options"
 	doclingManifestFile = "manifest.json"
 )
 
@@ -60,6 +61,12 @@ var errDoclingResponseTooLarge = errors.New("docling service response exceeds th
 // directory (manifest.json plus the picture files referenced by image_file) and
 // returns the validated manifest. Every failure is a *PDFParseError with a
 // message that is safe to show to callers: it never quotes the response body.
+//
+// VLM and OCR are the per-knowledge-base parsing configuration. When either is
+// configured ParseInto adds a text field "options" to the multipart request so
+// the service uses those values instead of its own RAG_VLM_* environment. The
+// options body carries the VLM API key, so it is never logged or quoted in an
+// error message.
 type DoclingServiceParser struct {
 	// BaseURL is the service base URL, for example http://127.0.0.1:8091.
 	BaseURL string
@@ -67,6 +74,12 @@ type DoclingServiceParser struct {
 	// timeout; the context (or the default safety deadline) still bounds the
 	// call.
 	Client *http.Client
+	// VLM is the vision-language endpoint used for formula recognition and
+	// picture descriptions; Timeout/Concurrency come from the service-level
+	// RAG_VLM_* parsing values.
+	VLM VLMSettings
+	// OCR selects the OCR engine the parse service runs.
+	OCR OCRSettings
 }
 
 // ParseInto implements ingest.PDFParser against the Docling service.
@@ -90,7 +103,11 @@ func (p *DoclingServiceParser) ParseInto(ctx context.Context, source, staging st
 	if err := os.MkdirAll(staging, 0o755); err != nil {
 		return PDFManifest{}, &PDFParseError{Message: "PDF 解析失败：无法创建解析结果目录"}
 	}
-	body, contentType, closeBody, err := doclingMultipartBody(source, name)
+	options, err := p.optionsJSON()
+	if err != nil {
+		return PDFManifest{}, &PDFParseError{Message: "PDF 解析失败：解析选项无效"}
+	}
+	body, contentType, closeBody, err := doclingMultipartBody(source, name, options)
 	if err != nil {
 		return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf("PDF 解析失败：无法读取 PDF 文件：%s", name)}
 	}
@@ -185,10 +202,64 @@ func doclingRequestError(ctx context.Context, cause error, name string) error {
 	return &PDFParseError{Message: fmt.Sprintf("PDF 解析服务不可用：%s", name), cause: cause}
 }
 
+// doclingParseOptions is the JSON document sent in the multipart "options" text
+// field. Its shape is shared with the parse service contract
+// (python-workers/pdf-service parser.parse_options_payload): only the sections
+// actually configured are emitted.
+type doclingParseOptions struct {
+	VLM *doclingVLMOptions `json:"vlm,omitempty"`
+	OCR *doclingOCROptions `json:"ocr,omitempty"`
+}
+
+// doclingVLMOptions mirrors a configured remote VLM endpoint. Timeout is in
+// seconds and omitted when the caller did not set one; the service applies its
+// own default then.
+type doclingVLMOptions struct {
+	BaseURL     string `json:"base_url"`
+	APIKey      string `json:"api_key"`
+	Model       string `json:"model"`
+	Timeout     int    `json:"timeout,omitempty"`
+	Concurrency int    `json:"concurrency,omitempty"`
+}
+
+// doclingOCROptions is the requested OCR engine (auto/easyocr/tesseract/rapidocr).
+type doclingOCROptions struct {
+	Engine string `json:"engine"`
+}
+
+// optionsJSON renders the multipart "options" payload. It returns nil when
+// neither a VLM nor an OCR engine is configured so the field is not sent at all
+// (the service keeps its RAG_VLM_* environment defaults).
+func (p *DoclingServiceParser) optionsJSON() ([]byte, error) {
+	options := doclingParseOptions{}
+	if p.VLM.Configured() {
+		options.VLM = &doclingVLMOptions{
+			BaseURL:     strings.TrimSpace(p.VLM.BaseURL),
+			APIKey:      p.VLM.APIKey,
+			Model:       strings.TrimSpace(p.VLM.Model),
+			Timeout:     int(p.VLM.Timeout / time.Second),
+			Concurrency: p.VLM.Concurrency,
+		}
+	}
+	if p.OCR.Configured() {
+		options.OCR = &doclingOCROptions{Engine: p.OCR.NormalizedEngine()}
+	}
+	if options.VLM == nil && options.OCR == nil {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(options)
+	if err != nil {
+		return nil, err
+	}
+	return encoded, nil
+}
+
 // doclingMultipartBody streams the PDF as multipart/form-data without buffering
-// the whole file. The returned close function stops the writer goroutine and
-// releases the file; it is safe to call once after the request finishes.
-func doclingMultipartBody(source, name string) (io.ReadCloser, string, func(), error) {
+// the whole file. A non-empty options payload is written as the "options" text
+// part before the file part. The returned close function stops the writer
+// goroutine and releases the file; it is safe to call once after the request
+// finishes.
+func doclingMultipartBody(source, name string, options []byte) (io.ReadCloser, string, func(), error) {
 	file, err := os.Open(source)
 	if err != nil {
 		return nil, "", func() {}, err
@@ -201,6 +272,11 @@ func doclingMultipartBody(source, name string) (io.ReadCloser, string, func(), e
 		defer close(done)
 		defer file.Close()
 		writeErr := func() error {
+			if len(options) > 0 {
+				if err := form.WriteField(doclingOptionsField, string(options)); err != nil {
+					return err
+				}
+			}
 			part, err := form.CreateFormFile(doclingFileField, name)
 			if err != nil {
 				return err

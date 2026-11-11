@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
@@ -198,6 +199,34 @@ func TestAddDocumentAsyncAdmissionReplayAndConflicts(t *testing.T) {
 		t.Fatalf("published-name admission succeeded")
 	} else if !errors.As(err, &validation) || validation.Message != asyncUploadConflictMessage {
 		t.Fatalf("published-name conflict = %v", err)
+	}
+}
+
+// TestAddDocumentAsyncRejectsPDFWithoutDoclingModels pins that the asynchronous
+// Console upload path also rejects a PDF while the job is admitted: the
+// knowledge base has no VLM/OCR configuration, so no document job is queued and
+// the caller gets the actionable Chinese message instead of a failed job later.
+func TestAddDocumentAsyncRejectsPDFWithoutDoclingModels(t *testing.T) {
+	service, stores, _ := newAsyncService(t)
+	service.config.PDFEngine = config.PDFEngineDocling
+	service.config.PDFServiceURL = "http://127.0.0.1:1"
+	ctx := context.Background()
+
+	_, err := service.addDocumentAsync(ctx, "alpha", "manual.pdf", []byte("%PDF-1.4\n"), "pdf-1")
+	assertKnowledgeValidation(t, err, doclingPDFModelsRequiredMessage)
+
+	var jobs int
+	if err := stores.DB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM document_jobs WHERE namespace = ?", "alpha").Scan(&jobs); err != nil {
+		t.Fatalf("count document_jobs error = %v", err)
+	}
+	if jobs != 0 {
+		t.Fatalf("document_jobs has %d rows after a rejected PDF admission", jobs)
+	}
+
+	// Non-PDF admissions still work; the restriction only applies to PDFs.
+	if _, err := service.addDocumentAsync(ctx, "alpha", "manual.md", []byte("# ok"), "md-1"); err != nil {
+		t.Fatalf("markdown admission was rejected: %v", err)
 	}
 }
 

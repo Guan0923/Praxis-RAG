@@ -8,11 +8,12 @@ Endpoints
     reports ``status``, the selected converter and any ``config_error``.
 
 ``POST /v1/parse``
-    ``multipart/form-data`` field ``file`` carrying one PDF. On success the
-    response is ``application/zip`` with ``manifest.json`` at the archive root
-    and every picture asset at its manifest-relative path (for example
+    ``multipart/form-data`` field ``file`` carrying one PDF plus the optional
+    text field ``options`` (JSON) with per-request VLM/OCR overrides. On success
+    the response is ``application/zip`` with ``manifest.json`` at the archive
+    root and every picture asset at its manifest-relative path (for example
     ``pictures/picture-0.png``). Failures are JSON ``{"detail": "<safe text>"}``
-    that never quotes document content.
+    that never quotes document content or request secrets.
 
 The Go backend downloads the zip into its parser staging directory and feeds
 ``manifest.json`` to ``document.BuildPDFContent``; the zip layout is therefore
@@ -33,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
@@ -43,9 +44,12 @@ from .parser import (
     ParserConfigError,
     ParserConversionError,
     ParserError,
+    ParserOptionsError,
+    ParseOptions,
     PdfConverter,
     VlmSettings,
     build_converter,
+    parse_options_payload,
     validate_manifest,
     vlm_settings_from_env,
 )
@@ -80,6 +84,13 @@ class Settings:
     converter: str = "docling"
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
     vlm: VlmSettings | None = None
+    #: ``RAG_VLM_*`` configuration problem (partial/invalid VLM settings). A
+    #: complete per-request ``options.vlm`` overrides it, so it is reported
+    #: separately from :attr:`non_vlm_config_error`.
+    vlm_error: str | None = None
+    #: Deployment problems a request cannot fix (converter, port, ...).
+    non_vlm_config_error: str | None = None
+    #: Union of every configuration problem; shown by ``/healthz``.
     config_error: str | None = None
 
     @classmethod
@@ -105,11 +116,14 @@ class Settings:
         models_path = Path(models_raw).expanduser() if models_raw else None
 
         vlm: VlmSettings | None = None
+        vlm_error: str | None = None
         try:
             vlm = vlm_settings_from_env()
         except ParserConfigError as error:
-            errors.append(str(error))
+            vlm_error = str(error)
 
+        non_vlm_error = "; ".join(errors) or None
+        config_errors = errors + ([vlm_error] if vlm_error else [])
         return cls(
             host=host,
             port=port,
@@ -119,7 +133,9 @@ class Settings:
             converter=converter,
             max_upload_bytes=max_upload_bytes,
             vlm=vlm,
-            config_error="; ".join(errors) or None,
+            vlm_error=vlm_error,
+            non_vlm_config_error=non_vlm_error,
+            config_error="; ".join(config_errors) or None,
         )
 
 
@@ -161,7 +177,14 @@ class _UnavailableConverter:
     def __init__(self, message: str) -> None:
         self.message = message
 
-    def convert(self, source: Path, output_dir: Path, scratch_dir: Path) -> dict[str, Any]:
+    def convert(
+        self,
+        source: Path,
+        output_dir: Path,
+        scratch_dir: Path,
+        *,
+        options: ParseOptions | None = None,
+    ) -> dict[str, Any]:
         raise ParserConfigError(self.message)
 
 
@@ -203,8 +226,12 @@ def create_app(
         return _health(app)
 
     @app.post("/v1/parse")
-    async def parse(request: Request, file: UploadFile = File(...)) -> Response:
-        return await _handle_parse(request, file)
+    async def parse(
+        request: Request,
+        file: UploadFile = File(...),
+        options: str | None = Form(None),
+    ) -> Response:
+        return await _handle_parse(request, file, options)
 
     @app.exception_handler(RequestValidationError)
     async def on_validation_error(
@@ -213,7 +240,10 @@ def create_app(
         LOGGER.warning("Rejected invalid /v1/parse request: %s", exc.errors())
         return JSONResponse(
             status_code=422,
-            content={"detail": "请求无效：必须以 multipart/form-data 提交一个名为 file 的 PDF 文件"},
+            content={
+                "detail": "请求无效：必须以 multipart/form-data 提交一个名为 file 的 PDF 文件，"
+                "options 必须是文本字段"
+            },
         )
 
     @app.exception_handler(Exception)
@@ -267,11 +297,29 @@ def _health(app: FastAPI) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def _handle_parse(request: Request, file: UploadFile) -> Response:
+async def _handle_parse(
+    request: Request, file: UploadFile, raw_options: str | None = None
+) -> Response:
     app = request.app
     settings: Settings = app.state.settings
-    if settings.config_error and getattr(app.state.converter, "name", "") != "fake":
-        raise HTTPException(status_code=503, detail=f"{UNKNOWN_CONVERTER_MESSAGE}: {settings.config_error}")
+    # Parse options before touching the upload: a bad payload is a cheap 422 and
+    # the raw text (which may carry an API key) is never logged or echoed.
+    try:
+        options = parse_options_payload(raw_options)
+    except ParserOptionsError as error:
+        LOGGER.warning("Rejected /v1/parse options: %s", error)
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+    if getattr(app.state.converter, "name", "") != "fake":
+        # A complete per-request VLM overrides a broken RAG_VLM_* configuration;
+        # deployment problems (bad converter name, invalid PORT, ...) always 503.
+        blocker = settings.config_error
+        if blocker and settings.vlm_error and options.vlm is not None:
+            blocker = settings.non_vlm_config_error
+        if blocker:
+            raise HTTPException(
+                status_code=503, detail=f"{UNKNOWN_CONVERTER_MESSAGE}: {blocker}"
+            )
 
     workdir = Path(tempfile.mkdtemp(prefix="rag-pdf-service-"))
     try:
@@ -282,7 +330,7 @@ async def _handle_parse(request: Request, file: UploadFile) -> Response:
         if not _looks_like_pdf(source):
             raise HTTPException(status_code=400, detail=INVALID_PDF_MESSAGE)
 
-        payload = await _run_conversion(app, source, workdir)
+        payload = await _run_conversion(app, source, workdir, options)
         return Response(
             content=payload,
             media_type="application/zip",
@@ -323,7 +371,12 @@ def _looks_like_pdf(source: Path) -> bool:
     return b"%PDF-" in header
 
 
-async def _run_conversion(app: FastAPI, source: Path, workdir: Path) -> bytes:
+async def _run_conversion(
+    app: FastAPI,
+    source: Path,
+    workdir: Path,
+    options: ParseOptions | None = None,
+) -> bytes:
     """Queue and run one conversion in a worker thread.
 
     The semaphore bounds concurrent Docling conversions and the request timeout
@@ -339,6 +392,7 @@ async def _run_conversion(app: FastAPI, source: Path, workdir: Path) -> bytes:
     converter: PdfConverter = app.state.converter
     scratch = workdir / "scratch"
     artifacts = workdir / "artifacts"
+    requested = options if options is not None else ParseOptions()
 
     try:
         await asyncio.wait_for(semaphore.acquire(), timeout=settings.timeout)
@@ -358,7 +412,7 @@ async def _run_conversion(app: FastAPI, source: Path, workdir: Path) -> bytes:
 
     def work() -> bytes:
         try:
-            manifest = converter.convert(source, artifacts, scratch)
+            manifest = converter.convert(source, artifacts, scratch, options=requested)
             validate_manifest(manifest, artifacts)
             (artifacts / "manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -375,6 +429,8 @@ async def _run_conversion(app: FastAPI, source: Path, workdir: Path) -> bytes:
             status_code=504,
             detail="PDF 解析超时，请稍后重试或拆分文档",
         ) from error
+    except ParserOptionsError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     except ParserConfigError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except ParserConversionError as error:

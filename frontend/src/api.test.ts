@@ -19,6 +19,7 @@ import {
   invitationStatus,
   invitationStatusLabels,
   modelKindLabels,
+  modelKinds,
   permissionLabels,
   revealModelProfileKey,
   roleLabel,
@@ -281,10 +282,12 @@ describe("model-profile API contract", () => {
   };
 
   it("exposes the frozen model-kind vocabulary", () => {
+    expect(modelKinds).toEqual(["embedding", "reranker", "vlm", "ocr"]);
     expect(modelKindLabels).toEqual({
       embedding: "Embedding",
       reranker: "Reranker",
       vlm: "VLM",
+      ocr: "OCR",
     });
   });
 
@@ -322,6 +325,36 @@ describe("model-profile API contract", () => {
       base_url: "https://api.example.com/v1",
       apikey: "sk-secret",
       model: "bge-m3",
+    });
+  });
+
+  it("creates an OCR profile whose model is the engine id and whose connection is empty", async () => {
+    const ocrProfile = {
+      ...profile,
+      kind: "ocr" as const,
+      name: "本地 OCR",
+      base_url: "",
+      model: "easyocr",
+      api_key_set: false,
+      vector_size: null,
+    };
+    fetchMock.mockResolvedValue(jsonResponse({ profile: ocrProfile }, 201));
+    const created = await createModelProfile({
+      kind: "ocr",
+      name: "本地 OCR",
+      base_url: "",
+      apikey: "",
+      model: "easyocr",
+    });
+    expect(created.kind).toBe("ocr");
+    expect(created.model).toBe("easyocr");
+    expect(created.vector_size).toBeNull();
+    expect(JSON.parse(String(requestArgs(0)[1].body))).toEqual({
+      kind: "ocr",
+      name: "本地 OCR",
+      base_url: "",
+      apikey: "",
+      model: "easyocr",
     });
   });
 
