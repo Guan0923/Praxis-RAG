@@ -109,6 +109,7 @@ describe("ModelProfilesPage", () => {
     expect(screen.getByRole("tab", { name: "Reranker（1）" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "VLM（0）" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "OCR（0）" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "JEV（0）" })).toBeTruthy();
     // Only the active kind's rows are rendered.
     expect(screen.queryByText("默认 Reranker")).toBeNull();
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/admin/model-profiles");
@@ -134,7 +135,7 @@ describe("ModelProfilesPage", () => {
     renderPage();
 
     expect(
-      await screen.findByText("还没有模型配置，请先添加 Embedding / Reranker / VLM / OCR 模型；创建知识库时只能从该列表选择"),
+      await screen.findByText("还没有模型配置，请先添加 Embedding / Reranker / VLM / OCR / JEV 模型；创建知识库时只能从其中的 Embedding / Reranker / VLM / OCR 选择"),
     ).toBeTruthy();
     expect(screen.getAllByRole("button", { name: /添加模型/ })[0]).toBeTruthy();
   });
@@ -185,6 +186,57 @@ describe("ModelProfilesPage", () => {
       model: "bge-m3",
       apikey: "",
     });
+  });
+
+  it("creates a configuration-only JEV profile without probing a model list", async () => {
+    fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
+      if (path === "/v1/admin/model-profiles" && options.method === "POST")
+        return jsonResponse({
+          profile: {
+            ...embeddingProfile,
+            id: "mp-jev",
+            kind: "jev",
+            name: "JEV 默认",
+            base_url: "https://api.typesafe.ai/v1",
+            model: "jev-latest",
+            api_key_set: false,
+            vector_size: null,
+          },
+        }, 201);
+      return jsonResponse({ model_profiles: [] });
+    });
+    const { onChanged } = renderPage();
+    await screen.findByText(/还没有模型配置/);
+
+    fireEvent.click(screen.getByRole("tab", { name: "JEV（0）" }));
+    fireEvent.click(screen.getAllByRole("button", { name: /添加模型/ })[0]);
+    const dialog = await screen.findByRole("dialog");
+    // JEV 只保存连接配置：有服务地址与 Key，但没有 /models 探测按钮。
+    expect(within(dialog).getByText("服务地址")).toBeTruthy();
+    expect(within(dialog).getByText("API Key")).toBeTruthy();
+    expect(within(dialog).queryByText("获取模型列表")).toBeNull();
+
+    fireEvent.change(within(dialog).getByLabelText("配置名称"), { target: { value: "JEV 默认" } });
+    fireEvent.change(within(dialog).getByLabelText("服务地址"), {
+      target: { value: "https://api.typesafe.ai/v1" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("模型名称"), { target: { value: "jev-latest" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    const post = fetchMock.mock.calls.find(
+      ([path, options]) => path === "/v1/admin/model-profiles" && (options as RequestInit | undefined)?.method === "POST",
+    );
+    expect(post).toBeTruthy();
+    expect(JSON.parse(String((post![1] as RequestInit).body))).toEqual({
+      kind: "jev",
+      name: "JEV 默认",
+      base_url: "https://api.typesafe.ai/v1",
+      model: "jev-latest",
+      apikey: "",
+    });
+    // JEV 没有 OpenAI /models 路由：页面绝不发起模型列表探测。
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/models"))).toBe(false);
   });
 
   it("clears a saved key with an explicit empty apikey on PATCH", async () => {

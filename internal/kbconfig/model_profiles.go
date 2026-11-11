@@ -133,9 +133,10 @@ func DraftModelProfile(
 
 // ProbeModelProfile validates a saved model configuration against its provider
 // before it is persisted. An embedding probe records the produced dense
-// dimension; a reranker probe only checks accessibility; VLM endpoints have no
-// cheap probe, and the OCR engine runs inside the parsing service, so both are
-// stored as entered. A nil prober uses HTTPProber.
+// dimension; a reranker probe only checks accessibility; VLM and JEV endpoints
+// have no cheap probe (JEV is stored for Console configuration only), and the
+// OCR engine runs inside the parsing service, so all three are stored as
+// entered. A nil prober uses HTTPProber.
 func ProbeModelProfile(
 	ctx context.Context,
 	connection modelapi.ModelConnection,
@@ -157,7 +158,7 @@ func ProbeModelProfile(
 			return nil, err
 		}
 		return nil, nil
-	case "vlm", "ocr":
+	case "vlm", "ocr", "jev":
 		return nil, nil
 	default:
 		return nil, NewValidationError(MessageModelKindInvalid)

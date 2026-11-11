@@ -234,15 +234,19 @@ func TestProbeModelProfile(t *testing.T) {
 		t.Fatalf("reranker probe calls = %d", prober.rerankerCalls)
 	}
 
-	// VLM and OCR configurations are never probed: no provider call may happen.
+	// VLM, OCR and JEV configurations are never probed: no provider call may
+	// happen.
 	if vectorSize, err := ProbeModelProfile(ctx, connection, "vlm", prober); err != nil || vectorSize != nil {
 		t.Fatalf("vlm probe = %v, %v", vectorSize, err)
 	}
 	if vectorSize, err := ProbeModelProfile(ctx, connection, "ocr", prober); err != nil || vectorSize != nil {
 		t.Fatalf("ocr probe = %v, %v", vectorSize, err)
 	}
+	if vectorSize, err := ProbeModelProfile(ctx, connection, "jev", prober); err != nil || vectorSize != nil {
+		t.Fatalf("jev probe = %v, %v", vectorSize, err)
+	}
 	if prober.embeddingCalls != 1 || prober.rerankerCalls != 1 {
-		t.Fatalf("vlm/ocr probe called the provider: %d/%d", prober.embeddingCalls, prober.rerankerCalls)
+		t.Fatalf("vlm/ocr/jev probe called the provider: %d/%d", prober.embeddingCalls, prober.rerankerCalls)
 	}
 
 	if _, err := ProbeModelProfile(ctx, connection, "sql", prober); err == nil {

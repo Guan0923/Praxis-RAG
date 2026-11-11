@@ -444,12 +444,16 @@ export async function deleteUser(id: string): Promise<void> {
 }
 
 // --- Model profiles (模型配置) ----------------------------------------------
-// A model profile is a reusable Embedding / Reranker / VLM / OCR connection stored
-// by an administrator; knowledge bases reference one profile per kind instead of
-// carrying their own base URL, key and model id. OCR profiles are special: they
-// keep the engine id (auto|easyocr|tesseract|rapidocr) in model and use an empty
-// base_url/apikey because OCR runs in the local parsing service.
-export type ModelKind = "embedding" | "reranker" | "vlm" | "ocr";
+// A model profile is a reusable Embedding / Reranker / VLM / OCR / JEV connection
+// stored by an administrator; knowledge bases reference one profile per
+// knowledge-base-selectable kind instead of carrying their own base URL, key and
+// model id. OCR profiles are special: they keep the engine id
+// (auto|easyocr|tesseract|rapidocr) in model and use an empty base_url/apikey
+// because OCR runs in the local parsing service. JEV (TypeSafe System One decision
+// model) is a Console-only kind: it is configured for later use, is never offered
+// by the knowledge-base forms, and has no OpenAI /models route.
+export type KnowledgeBaseModelKind = "embedding" | "reranker" | "vlm" | "ocr";
+export type ModelKind = KnowledgeBaseModelKind | "jev";
 export type ModelProfile = {
   id: string;
   kind: ModelKind;
@@ -470,12 +474,16 @@ export type ModelProfileInput = {
 };
 // ModelProfileUpdate omits kind: an existing profile cannot change its kind.
 export type ModelProfileUpdate = Partial<Omit<ModelProfileInput, "kind">>;
-export const modelKinds: ModelKind[] = ["embedding", "reranker", "vlm", "ocr"];
+// knowledgeBaseModelKinds are the kinds a knowledge base can reference; JEV stays
+// Console-only and is therefore appended to modelKinds instead.
+export const knowledgeBaseModelKinds: KnowledgeBaseModelKind[] = ["embedding", "reranker", "vlm", "ocr"];
+export const modelKinds: ModelKind[] = [...knowledgeBaseModelKinds, "jev"];
 export const modelKindLabels: Record<ModelKind, string> = {
   embedding: "Embedding",
   reranker: "Reranker",
   vlm: "VLM",
   ocr: "OCR",
+  jev: "JEV",
 };
 
 // normalizeModelProfile keeps a nullable vector_size stable for the table and

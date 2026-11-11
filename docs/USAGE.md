@@ -468,13 +468,16 @@ curl.exe "http://127.0.0.1:8011/v1/admin/api-keys/<id>/mcp-config" `
 
 ### 模型配置（模型列表）
 
-管理员在 Console 侧边栏「模型配置」（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM 列表，不再在创建知识库时手工填写服务地址、Key 和模型名。页面按模型类型分页签，表格展示 名称 / 模型 / 服务地址 / Key / 向量维度（仅 Embedding）/ 更新时间 / 操作，支持「添加模型」抽屉、编辑和删除。API Key 只在服务端用 `RAG_STATE_ENCRYPTION_KEY` 加密保存，列表与详情只返回 `api_key_set`；编辑时留空表示沿用已保存的 Key，显式提交空字符串会清除。`(kind, name)` 唯一，重名返回 409。
+管理员在 Console 侧边栏「模型配置」（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM / OCR / JEV 列表，不再在创建知识库时手工填写服务地址、Key 和模型名。页面按模型类型分页签，表格展示 名称 / 模型 / 服务地址 / Key / 向量维度（仅 Embedding）/ 更新时间 / 操作，支持「添加模型」抽屉、编辑和删除。API Key 只在服务端用 `RAG_STATE_ENCRYPTION_KEY` 加密保存，列表与详情只返回 `api_key_set`；编辑时留空表示沿用已保存的 Key，显式提交空字符串会清除。`(kind, name)` 唯一，重名返回 409。
+
+JEV 条目（TypeSafe System One 决策模型）保存名称、服务地址、模型标识和加密 Key；创建与修改都不探测 provider，`/{id}/models` 对 JEV 直接返回空数组。JEV 不是知识库模型，创建/编辑知识库时不会出现该选项，当前仅保存配置，尚未接入检索或决策调用。常见取值：TypeSafe 服务地址 `https://api.typesafe.ai/v1`（模型 `jev-latest` / `jev-preview` / `jev-1.13.0`），OpenRouter 服务地址 `https://openrouter.ai/api/alpha`（模型 `typesafe/jev-1.13`）。
 
 保存时会先探测 provider：
 
 - Embedding：真实执行一次 Embedding 调用，把返回的稠密向量维度记录到 `vector_size`；探测失败则不写入。
 - Reranker：执行一次有界的 rerank 调用，只验证服务可达与鉴权。
 - VLM：不做探测，因此半配置的 VLM 端点也可以先保存。
+- JEV：不做探测，直接保存配置（只保存连接，供后续决策能力使用）。
 
 `PATCH` 只在服务地址、模型或 Key 实际变化时重新探测；只改名称或原样保存不会调用 provider，已记录的 Embedding 维度保持不变。修改服务地址但未提交新 Key 时保存的 Key 会被清除（与知识库连接表单的 `DraftConnection` 语义一致）。
 
@@ -486,10 +489,15 @@ curl.exe "http://127.0.0.1:8011/v1/admin/api-keys/<id>/mcp-config" `
 # 列表（按 kind、名称排序；每个条目含 id/kind/name/base_url/model/api_key_set/vector_size/created_at/updated_at，不含 Key 明文）
 curl.exe http://127.0.0.1:8011/v1/admin/model-profiles
 
-# 新建：kind 为 embedding / reranker / vlm；Embedding 会真实探测并记录向量维度
+# 新建：kind 为 embedding / reranker / vlm / ocr / jev；Embedding 会真实探测并记录向量维度
 curl.exe -X POST http://127.0.0.1:8011/v1/admin/model-profiles `
   -H "Content-Type: application/json" `
   -d '{"kind":"embedding","name":"生产 Embedding","base_url":"http://127.0.0.1:8032/v1","apikey":"<provider-key>","model":"bge-m3"}'
+
+# 新建 JEV 配置：不探测 provider，保存后即可在列表中编辑；模型名也可填 jev-preview / jev-1.13.0
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/model-profiles `
+  -H "Content-Type: application/json" `
+  -d '{"kind":"jev","name":"生产 JEV","base_url":"https://api.typesafe.ai/v1","apikey":"<jev-key>","model":"jev-latest"}'
 
 # 详情 / 修改（字段均可选，kind 不可修改；省略 apikey 且服务地址不变时沿用已保存的 Key）
 curl.exe http://127.0.0.1:8011/v1/admin/model-profiles/<profile_id>
@@ -503,7 +511,7 @@ curl.exe -X DELETE http://127.0.0.1:8011/v1/admin/model-profiles/<profile_id>
 # 读取 Key（仅本机/管理员会话；列表、详情接口从不返回明文）
 curl.exe http://127.0.0.1:8011/v1/admin/model-profiles/<profile_id>/key
 
-# 通过已保存的连接列出 provider 模型（无请求体；端点没有 /models 时返回空数组）
+# 通过已保存的连接列出 provider 模型（无请求体；端点没有 /models 时返回空数组，JEV 直接返回空数组）
 curl.exe -X POST http://127.0.0.1:8011/v1/admin/model-profiles/<profile_id>/models
 ```
 

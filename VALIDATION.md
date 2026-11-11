@@ -936,3 +936,70 @@ HTTP: 带 options（vlm+ocr=tesseract）                 -> 200 application/zip 
 - 上传校验只作用于“受理上传”路径；重新解析既有文档仍走原 queue/reparse 路径，不改其失败语义。
 - OCR 语言按引擎默认（EasyOCR `ch_sim,en`、Tesseract `chi_sim,eng`），暂未提供按知识库自定义语言列表的入口；模型配置页与知识库表单只做 jsdom 组件测试，未做浏览器视觉回归。
 
+## JEV model configuration — 2026-11-11
+
+Delivered: a Console-only `jev` saved-model kind (TypeSafe JEV / System One
+decision endpoint) on the 模型配置 page. It stores name / base_url / model /
+encrypted API key like VLM, is never probed, has no provider `/models` route
+(the listing endpoint returns `[]`), and is intentionally excluded from the
+knowledge-base model vocabulary (`knowledgeBaseKinds` stays
+embedding/reranker/vlm/ocr; the Console create/edit knowledge-base form uses
+`knowledgeBaseModelKinds`).
+
+Verification performed (2026-11-11, this worktree, Go 1.27.3 / Node v26.13.0 /
+npm 12.2.2). The session's `ops_bash` executor is intermittently unavailable
+(dsh-ops 0.5.1 exec-tree hardlink/link-count concurrency bug:
+`EXECUTOR_UNAVAILABLE: Niubash preparation failed`), so commands were retried
+across steps; everything below actually ran:
+
+```
+$ git status --short
+                                                    # 23 modified files, exactly the
+                                                    # intended scopes; no stray files
+$ go build ./...
+                                                    # exit 0
+$ go vet ./internal/kbconfig ./internal/httpapi ./internal/runtime ./internal/state
+                                                    # exit 0 (test files compile too)
+$ go test ./internal/kbconfig
+                                                    # ok
+$ go test -p 1 -timeout 480s ./internal/httpapi
+                                                    # ok, 17.5 s
+$ go test -p 1 -timeout 480s ./internal/runtime ./internal/state
+                                                    # ok: runtime 475.0 s, state 422.5 s
+$ RAG_TEST_MYSQL_URL=... go test ./internal/runtime -run 'TestModelProfile' -v
+                                                    # PASS: lifecycle, error mapping,
+                                                    # OCR engine, and the new
+                                                    # TestModelProfileJEVConfiguration
+$ go test ./internal/httpapi -run 'TestModelProfile' -v
+                                                    # PASS: list/details/key/models,
+                                                    # create (incl. new kind=jev -> 201),
+                                                    # patch/delete, validation parity,
+                                                    # runtime/admin guards
+$ cd frontend && npm run typecheck
+                                                    # exit 0, no diagnostics
+$ cd frontend && npm test
+                                                    # Test Files 5 passed (5)
+                                                    # Tests 64 passed (64) — was 63,
+                                                    # +1 JEV console test
+```
+
+Notes: the MySQL suite ran against the local `praxis-rag-mysql` container on
+127.0.0.1:3307 with the disposable `praxis_unit_test` schema
+(`RAG_TEST_MYSQL_URL=mysql://rag:<password>@127.0.0.1:3307/praxis_unit_test`; the
+`rag` user lacks CREATE DATABASE, so the schema and grant were created with the
+container's root password). Packages must stay serial (`-p 1`): every package
+truncates the same schema behind `GET_LOCK(...,600)`, so parallel packages queue
+past the 10-minute package timeout — an initial parallel run reproduced exactly
+that (`internal/state` FAIL after 600.458 s), and the serial rerun passed.
+Frontend commands used a temporary `frontend/node_modules` junction to the main
+checkout because this worktree has no installed dependencies; the junction was
+removed afterwards and the main checkout stays intact. `go test ./...` for
+unrelated packages (e2e, documentworker, cmd) was not rerun.
+
+Behavior/limits confirmed by the run: `Kinds`/`IsKind` include `jev`;
+`ProbeModelProfile("jev")` issues no provider call; `POST
+/v1/admin/model-profiles` with kind `jev` returns 201 and never probes; `POST
+/v1/admin/knowledge-bases/models/jev` still returns 422; JEV is absent from
+`knowledgeBaseModelKinds`; the Console JEV test posts
+`{kind:"jev",name,base_url,model,apikey}` and never calls `/models`.
+

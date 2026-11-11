@@ -205,7 +205,7 @@ func openAPISchemas() map[string]any {
 			"additionalProperties": false,
 			"required":             []any{"kind", "name", "base_url", "model"},
 			"properties": map[string]any{
-				"kind":     map[string]any{"type": "string", "enum": []any{"embedding", "reranker", "vlm", "ocr"}, "title": "Kind"},
+				"kind":     map[string]any{"type": "string", "enum": []any{"embedding", "reranker", "vlm", "ocr", "jev"}, "title": "Kind"},
 				"name":     map[string]any{"type": "string", "minLength": 1, "maxLength": 80, "title": "Name"},
 				"base_url": map[string]any{"type": "string", "maxLength": 2048, "title": "Base Url"},
 				"apikey":   map[string]any{"type": "string", "title": "Apikey"},

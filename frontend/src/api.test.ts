@@ -18,6 +18,7 @@ import {
   invitationLink,
   invitationStatus,
   invitationStatusLabels,
+  knowledgeBaseModelKinds,
   modelKindLabels,
   modelKinds,
   permissionLabels,
@@ -282,12 +283,15 @@ describe("model-profile API contract", () => {
   };
 
   it("exposes the frozen model-kind vocabulary", () => {
-    expect(modelKinds).toEqual(["embedding", "reranker", "vlm", "ocr"]);
+    // 知识库只能引用前四种；JEV 是 Console 专属的第五种配置类型。
+    expect(knowledgeBaseModelKinds).toEqual(["embedding", "reranker", "vlm", "ocr"]);
+    expect(modelKinds).toEqual(["embedding", "reranker", "vlm", "ocr", "jev"]);
     expect(modelKindLabels).toEqual({
       embedding: "Embedding",
       reranker: "Reranker",
       vlm: "VLM",
       ocr: "OCR",
+      jev: "JEV",
     });
   });
 
