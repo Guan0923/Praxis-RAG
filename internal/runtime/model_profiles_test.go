@@ -351,3 +351,69 @@ func TestModelProfileOCREngine(t *testing.T) {
 		t.Fatalf("invalid engine error = %v", err)
 	}
 }
+
+// TestModelProfileJEVConfiguration pins the JEV model-configuration path: a
+// TypeSafe System One decision model is stored for later Console use, so no
+// provider probe happens, no vector size is recorded and the provider model
+// listing stays empty without contacting the provider.
+func TestModelProfileJEVConfiguration(t *testing.T) {
+	modelURL, calls := newFakeModelAPI(t, kbModelHandler(nil))
+	service, stores := newKBService(t, "http://127.0.0.1:1")
+	ctx := context.Background()
+
+	created, err := service.CreateModelProfile(ctx, modelProfileDraft(
+		"jev", "system-one", modelURL, "jev-latest", "jev-key"))
+	if err != nil {
+		t.Fatalf("CreateModelProfile(jev) error = %v", err)
+	}
+	if created["kind"] != "jev" || created["name"] != "system-one" ||
+		created["base_url"] != modelURL || created["model"] != "jev-latest" ||
+		created["api_key_set"] != true || created["vector_size"] != nil {
+		t.Fatalf("jev projection = %v", created)
+	}
+	if len(calls.all()) != 0 {
+		t.Fatalf("jev creation probed the provider: %+v", calls.all())
+	}
+	id, _ := created["id"].(string)
+	if !modelProfileIDPattern.MatchString(id) {
+		t.Fatalf("jev id = %q", id)
+	}
+
+	// The configuration persists with the protected key and a NULL dimension.
+	stored, err := stores.ModelProfiles.Get(ctx, id)
+	if err != nil || stored == nil {
+		t.Fatalf("ModelProfiles.Get() = %v, %v", stored, err)
+	}
+	if stored.Kind != "jev" || stored.Name != "system-one" ||
+		stored.BaseURL != modelURL || stored.Model != "jev-latest" || stored.VectorSize != nil {
+		t.Fatalf("stored jev row = %+v", stored)
+	}
+	if !strings.HasPrefix(stored.ProtectedKey, state.EncryptionPrefix) ||
+		strings.Contains(stored.ProtectedKey, "jev-key") {
+		t.Fatalf("stored protected_key = %q", stored.ProtectedKey)
+	}
+	if key, err := service.ModelProfileKey(ctx, id); err != nil || key != "jev-key" {
+		t.Fatalf("ModelProfileKey(jev) = %q, %v", key, err)
+	}
+
+	// JEV has no OpenAI-compatible /models route: the listing is empty and the
+	// provider is never contacted.
+	models, err := service.ModelProfileModels(ctx, id)
+	if err != nil {
+		t.Fatalf("ModelProfileModels(jev) error = %v", err)
+	}
+	if models == nil || len(models) != 0 {
+		t.Fatalf("jev models = %v, want an empty slice", models)
+	}
+	if len(calls.all()) != 0 {
+		t.Fatalf("jev model listing probed the provider: %+v", calls.all())
+	}
+
+	// Renaming keeps the stored connection and still never probes.
+	if _, err := service.UpdateModelProfile(ctx, id, kbconfig.ModelProfileDraft{Name: "system-one-renamed"}); err != nil {
+		t.Fatalf("UpdateModelProfile(jev rename) error = %v", err)
+	}
+	if len(calls.all()) != 0 {
+		t.Fatalf("jev update probed the provider: %+v", calls.all())
+	}
+}

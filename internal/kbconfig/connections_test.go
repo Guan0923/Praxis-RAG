@@ -231,17 +231,18 @@ func TestDraftConnectionRejectsInvalidCurrentURL(t *testing.T) {
 }
 
 func TestIsKind(t *testing.T) {
-	if !IsKind("embedding") || !IsKind("reranker") || !IsKind("vlm") || !IsKind("ocr") {
-		t.Errorf("expected embedding/reranker/vlm/ocr kinds")
+	if !IsKind("embedding") || !IsKind("reranker") || !IsKind("vlm") || !IsKind("ocr") || !IsKind("jev") {
+		t.Errorf("expected embedding/reranker/vlm/ocr/jev kinds")
 	}
 	if IsKind("") || IsKind("Embedding") || IsKind("bm25") {
 		t.Errorf("unexpected kind accepted")
 	}
-	if !reflect.DeepEqual(Kinds, []string{"embedding", "reranker", "vlm", "ocr"}) {
+	if !reflect.DeepEqual(Kinds, []string{"embedding", "reranker", "vlm", "ocr", "jev"}) {
 		t.Errorf("Kinds = %v", Kinds)
 	}
-	// The public projection only replaces the kinds that own a provider
-	// connection; OCR has no base_url/credential to redact.
+	// The public projection only replaces the kinds that own a knowledge-base
+	// provider connection; OCR runs inside the parsing service and JEV is a
+	// Console-only configuration.
 	if !reflect.DeepEqual(CredentialKinds, []string{"embedding", "reranker", "vlm"}) {
 		t.Errorf("CredentialKinds = %v", CredentialKinds)
 	}

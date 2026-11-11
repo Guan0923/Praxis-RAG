@@ -42,8 +42,21 @@ const ocrEngines = [
 const defaultOcrEngine = "easyocr";
 const isOcrEngine = (value: unknown) => ocrEngines.some((engine) => engine.value === value);
 
-// ModelProfilesPage 维护可复用的 Embedding / Reranker / VLM / OCR 连接：创建和
-// 修改知识库时只从这里选择，页面本身不保存任何明文 Key。
+// JEV 是 TypeSafe System One 决策模型，没有 OpenAI /models 接口：这里只给出固定
+// 建议值，AutoComplete 仍允许直接输入其他模型名。
+const jevModelSuggestions = [
+  { value: "jev-latest" },
+  { value: "jev-preview" },
+  { value: "jev-1.13.0" },
+  { value: "typesafe/jev-1.13" },
+];
+const jevModelHint =
+  "JEV 是 TypeSafe System One 决策模型，没有 /models 接口，可直接输入模型名且仅保存配置供后续使用";
+
+// ModelProfilesPage 维护可复用的 Embedding / Reranker / VLM / OCR / JEV 连接：
+// 创建和修改知识库时只能从知识库模型类型中选择，页面本身不保存任何明文 Key。
+// JEV（TypeSafe System One 决策模型）仅保存 Console 配置供后续使用，不会出现在
+// 知识库表单中，也没有 OpenAI /models 模型列表接口。
 export function ModelProfilesPage({ disabled, onChanged }: {
   disabled: boolean;
   onChanged?: () => void;
@@ -101,7 +114,7 @@ export function ModelProfilesPage({ disabled, onChanged }: {
   }, [load]);
 
   const counts = useMemo(() => {
-    const result: Record<ModelKind, number> = { embedding: 0, reranker: 0, vlm: 0, ocr: 0 };
+    const result: Record<ModelKind, number> = { embedding: 0, reranker: 0, vlm: 0, ocr: 0, jev: 0 };
     for (const profile of profiles) {
       if (profile.kind in result) result[profile.kind] += 1;
     }
@@ -197,8 +210,8 @@ export function ModelProfilesPage({ disabled, onChanged }: {
 
   async function loadModels() {
     const values = form.getFieldsValue();
-    // OCR 引擎是固定列表，不存在远端 /models 探测。
-    if (values.kind === "ocr") return;
+    // OCR 引擎是固定列表；JEV 没有 OpenAI /models 接口。两者都不做远端探测。
+    if (values.kind === "ocr" || values.kind === "jev") return;
     const baseUrl = cleanUrl(values.base_url || "");
     if (!baseUrl) {
       setModelHint("请先填写服务地址，再获取模型列表");
@@ -359,7 +372,7 @@ export function ModelProfilesPage({ disabled, onChanged }: {
 
   const emptyText = loading ? undefined : profiles.length === 0
     ? (
-      <Empty description="还没有模型配置，请先添加 Embedding / Reranker / VLM / OCR 模型；创建知识库时只能从该列表选择">
+      <Empty description="还没有模型配置，请先添加 Embedding / Reranker / VLM / OCR / JEV 模型；创建知识库时只能从其中的 Embedding / Reranker / VLM / OCR 选择">
         <Button type="primary" icon={<PlusOutlined />} disabled={disabled} onClick={openCreate}>
           添加模型
         </Button>
@@ -389,7 +402,7 @@ export function ModelProfilesPage({ disabled, onChanged }: {
       type="info"
       showIcon
       title="模型列表说明"
-      description="创建或修改知识库时只能从该列表选择 Embedding / Reranker / VLM / OCR 模型；API Key 仅保存在服务端，表格只显示是否已设置。OCR 配置只需选择引擎，无需服务地址与 Key。"
+      description="创建或修改知识库时只能从该列表选择 Embedding / Reranker / VLM / OCR 模型；JEV 仅用于 Console 配置（TypeSafe System One 决策模型），不会出现在知识库表单中，也没有 /models 模型列表接口。API Key 仅保存在服务端，表格只显示是否已设置。OCR 配置只需选择引擎，无需服务地址与 Key。"
     />
     {error && (
       <Alert
@@ -495,7 +508,13 @@ export function ModelProfilesPage({ disabled, onChanged }: {
               { pattern: /^https?:\/\/\S+$/i, message: "服务地址需以 http:// 或 https:// 开头" },
             ]}
           >
-            <Input maxLength={2048} autoComplete="off" placeholder="https://api.example.com/v1" />
+            <Input
+              maxLength={2048}
+              autoComplete="off"
+              placeholder={formKind === "jev"
+                ? "https://api.typesafe.ai/v1（TypeSafe）或 https://openrouter.ai/api/alpha（OpenRouter）"
+                : "https://api.example.com/v1"}
+            />
           </Form.Item>
         )}
         {!isOcrForm && (
@@ -543,24 +562,26 @@ export function ModelProfilesPage({ disabled, onChanged }: {
               name="model"
               label="模型名称"
               rules={[{ required: true, whitespace: true, message: "请输入或获取模型名称" }]}
-              extra={modelHint || undefined}
+              extra={formKind === "jev" ? jevModelHint : modelHint || undefined}
             >
               <AutoComplete
-                options={models.map((value) => ({ value }))}
+                options={formKind === "jev" ? jevModelSuggestions : models.map((value) => ({ value }))}
                 placeholder={modelsLoading ? "正在获取模型列表…" : "输入或从模型列表中选取"}
                 allowClear
                 filterOption={(input, option) =>
                   String(option?.value ?? "").toLowerCase().includes(input.toLowerCase())}
               />
             </Form.Item>
-            <Button
-              icon={<ReloadOutlined />}
-              loading={modelsLoading}
-              disabled={saving}
-              onClick={() => void loadModels()}
-            >
-              获取模型列表
-            </Button>
+            {formKind !== "jev" && (
+              <Button
+                icon={<ReloadOutlined />}
+                loading={modelsLoading}
+                disabled={saving}
+                onClick={() => void loadModels()}
+              >
+                获取模型列表
+              </Button>
+            )}
           </div>
         )}
       </Form>

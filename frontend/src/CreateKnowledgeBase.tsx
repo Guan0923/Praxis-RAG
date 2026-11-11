@@ -6,20 +6,20 @@ import {
   apiResponse,
   errorText,
   fetchModelProfiles,
+  knowledgeBaseModelKinds,
   modelKindLabels,
-  modelKinds,
   revealModelProfileKey,
   type Chunking,
   type Connection,
   type KnowledgeBase,
-  type ModelKind,
+  type KnowledgeBaseModelKind,
   type ModelProfile,
   type Role,
   type Strategy,
 } from "./api";
 import { namespacePattern } from "./navigation";
 
-type Kind = ModelKind;
+type Kind = KnowledgeBaseModelKind;
 type ProviderValues = { base_url: string; apikey?: string };
 type ProfileField = "embedding_profile" | "reranker_profile" | "vlm_profile" | "ocr_profile";
 type Values = Chunking & {
@@ -45,7 +45,8 @@ type Draft = {
   vlm_enabled?: boolean;
   ocr_enabled?: boolean;
 };
-const kinds: Kind[] = modelKinds;
+// 知识库表单只支持知识库模型类型：JEV 仅用于 Console 配置，绝不出现在这里。
+const kinds: Kind[] = knowledgeBaseModelKinds;
 // currentProfile 是编辑知识库时的兜底选项：沿用知识库已保存的连接。
 const currentProfile = ":current";
 const profileField: Record<Kind, ProfileField> = {

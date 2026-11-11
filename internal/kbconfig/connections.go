@@ -18,8 +18,10 @@ import (
 // and picture descriptions; it is optional per knowledge base and falls back to
 // the service environment (RAG_VLM_*) when unset. "ocr" is the OCR engine the
 // Docling parse service runs; it has no service URL or credential and stores
-// its engine id in the knowledge-base setting "ocr_model".
-var Kinds = []string{"embedding", "reranker", "vlm", "ocr"}
+// its engine id in the knowledge-base setting "ocr_model". "jev" is the
+// TypeSafe System One decision-model configuration kept for later use by the
+// Console; it is not a knowledge-base model.
+var Kinds = []string{"embedding", "reranker", "vlm", "ocr", "jev"}
 
 // CredentialKinds lists the kinds whose settings are stored as
 // {base_url, protected_key} pairs and replaced by the credential-free public

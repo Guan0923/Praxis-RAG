@@ -228,6 +228,23 @@ func TestModelProfileAdminCreate(t *testing.T) {
 		t.Fatalf("ocr create input = %+v", input)
 	}
 
+	// JEV (TypeSafe System One) configurations are saved like VLM profiles: the
+	// endpoint and model id are entered by hand, and the kind is not selectable
+	// for knowledge bases.
+	jev := performRequest(handler, testRequest{
+		method: "POST", target: "/v1/admin/model-profiles", remote: "127.0.0.1:5000",
+		body: `{"kind":"jev","name":"system-one","base_url":"https://api.typesafe.ai/v1",` +
+			`"apikey":"jev-key","model":"jev-latest"}`,
+	})
+	if jev.Code != http.StatusCreated {
+		t.Fatalf("jev create status = %d body = %s", jev.Code, jev.Body.String())
+	}
+	if input := runtime.createInput; input.Kind != "jev" || input.Name != "system-one" ||
+		input.BaseURL != "https://api.typesafe.ai/v1" || input.Model != "jev-latest" ||
+		input.APIKey != "jev-key" || !input.HasAPIKey {
+		t.Fatalf("jev create input = %+v", input)
+	}
+
 	runtime.createErr = &apierrors.KnowledgeConflictError{Message: kbconfig.MessageModelProfileExists}
 	conflict := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/admin/model-profiles", remote: "127.0.0.1:5000",

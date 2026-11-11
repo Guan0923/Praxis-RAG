@@ -6,9 +6,9 @@ import (
 	"errors"
 )
 
-// ModelProfile is one saved Console model configuration (Embedding, Reranker or
-// VLM). Only the protected form of the API key is stored; decrypting it stays in
-// the kbconfig layer like knowledge-base provider credentials.
+// ModelProfile is one saved Console model configuration (Embedding, Reranker,
+// VLM, OCR or JEV). Only the protected form of the API key is stored; decrypting
+// it stays in the kbconfig layer like knowledge-base provider credentials.
 type ModelProfile struct {
 	ID           string
 	Kind         string

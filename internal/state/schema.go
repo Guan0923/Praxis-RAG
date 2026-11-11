@@ -671,8 +671,9 @@ var schemaTables = []*SchemaTable{
 			index("ix_kb_invitations_namespace", "namespace"),
 		},
 	},
-	// model_profiles is a Console-only registry of reusable Embedding/Reranker/VLM
-	// provider configurations. A knowledge base still stores its own copy of the
+	// model_profiles is a Console-only registry of reusable model
+	// configurations (Embedding / Reranker / VLM / OCR / JEV). A knowledge base
+	// still stores its own copy of the
 	// selected connection, so editing or deleting a profile never mutates an
 	// existing knowledge base. The API key is protected like every other provider
 	// secret; it is appended last so a migrated database keeps the same shape.
