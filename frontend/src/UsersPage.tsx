@@ -79,19 +79,12 @@ export function UsersPage({ currentUserId }: { currentUserId?: string }) {
           </Tooltip>
         </Space>
       </div>
-      <Alert
-        className="page-alert"
-        type="info"
-        showIcon
-        title="权限说明"
-        description="管理员可管理全部知识库、用户、API Key 与授权；VIP 可创建知识库，并为自己创建的知识库创建邀请与授权；普通用户可创建知识库，并使用自己创建或被邀请的知识库。系统始终保留至少一名启用状态的管理员。"
-      />
       {error && (
         <Alert className="page-alert" type="error" showIcon title="用户列表加载失败" description={error} />
       )}
       <Table<AuthUser>
         rowKey="id"
-        size="middle"
+        size="small"
         loading={loading}
         dataSource={users}
         pagination={false}
@@ -109,12 +102,12 @@ export function UsersPage({ currentUserId }: { currentUserId?: string }) {
           {
             title: "角色",
             dataIndex: "role",
-            width: 160,
+            width: 130,
             render: (role: AuthUser["role"], user) => (
               <Select
                 size="small"
                 value={role}
-                style={{ width: 130 }}
+                style={{ width: 110 }}
                 loading={savingId === user.id}
                 options={roleOptions}
                 onChange={(value) => void change(user, { role: value as AuthUser["role"] })}
@@ -124,7 +117,7 @@ export function UsersPage({ currentUserId }: { currentUserId?: string }) {
           {
             title: "状态",
             dataIndex: "enabled",
-            width: 120,
+            width: 100,
             render: (enabled: boolean, user) => (
               <Switch
                 size="small"
@@ -139,18 +132,18 @@ export function UsersPage({ currentUserId }: { currentUserId?: string }) {
           {
             title: "最后登录",
             dataIndex: "last_login_at",
-            width: 200,
+            width: 170,
             render: (value?: string) => value ? new Date(value).toLocaleString() : "—",
           },
           {
             title: "创建时间",
             dataIndex: "created_at",
-            width: 200,
+            width: 170,
             render: (value?: string) => value ? new Date(value).toLocaleString() : "—",
           },
           {
             title: "操作",
-            width: 90,
+            width: 70,
             render: (_, user) => (
               <Popconfirm
                 title="删除用户"

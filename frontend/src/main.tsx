@@ -31,11 +31,25 @@ function Root() {
           colorBgBase: dark ? "#191919" : "#ffffff",
           colorTextBase: dark ? "#eeeeee" : "#202124",
           fontFamily: '"Segoe UI", "Microsoft YaHei", sans-serif',
-          fontSize: 14,
+          // 管理台以密度优先：13px 正文与 30px 控件高度让表格和表单在
+          // 1080p 及以下分辨率也能一屏看到更多条目。
+          fontSize: 13,
+          controlHeight: 30,
         },
         components: {
           Button: { primaryShadow: "none" },
-          Table: { headerBg: dark ? "#242424" : "#f7f7f8" },
+          Table: {
+            headerBg: dark ? "#242424" : "#f7f7f8",
+            // 三档表格尺寸统一收紧行内边距，条目更紧凑但不贴边。
+            cellPaddingBlock: 10,
+            cellPaddingInline: 14,
+            cellPaddingBlockMD: 8,
+            cellPaddingInlineMD: 10,
+            cellPaddingBlockSM: 6,
+            cellPaddingInlineSM: 10,
+          },
+          Tabs: { horizontalItemPadding: "8px 0", horizontalMargin: "0 0 8px" },
+          Pagination: { itemSize: 28 },
         },
       }}
     >

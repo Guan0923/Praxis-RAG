@@ -292,13 +292,13 @@ export function ModelProfilesPage({ disabled, onChanged }: {
     {
       title: "名称",
       dataIndex: "name",
-      width: 180,
+      width: 160,
       render: (name: string) => <span className="break-text">{name}</span>,
     },
     {
       title: kind === "ocr" ? "OCR 引擎" : "模型",
       dataIndex: "model",
-      width: 200,
+      width: 180,
       render: (model: string) => <span className="break-text">{model}</span>,
     },
     ...(kind === "ocr" ? [] : [
@@ -310,7 +310,7 @@ export function ModelProfilesPage({ disabled, onChanged }: {
       {
         title: "Key",
         dataIndex: "api_key_set",
-        width: 90,
+        width: 80,
         render: (saved: boolean) => saved ? <Tag color="green">已保存</Tag> : <Tag>未设置</Tag>,
       },
     ]),
@@ -318,20 +318,20 @@ export function ModelProfilesPage({ disabled, onChanged }: {
       ? [{
           title: "向量维度",
           dataIndex: "vector_size",
-          width: 100,
+          width: 90,
           render: (value: ModelProfile["vector_size"]) => value ?? "—",
         }]
       : []),
     {
       title: "更新时间",
       dataIndex: "updated_at",
-      width: 180,
+      width: 160,
       render: (value: string | undefined, profile: ModelProfile) =>
         formatDateTime(value || profile.created_at),
     },
     {
       title: "操作",
-      width: 100,
+      width: 80,
       render: (_: unknown, profile: ModelProfile) => (
         <div className="toolbar">
           <Tooltip title="编辑模型配置">
@@ -397,13 +397,6 @@ export function ModelProfilesPage({ disabled, onChanged }: {
         </Button>
       </div>
     </div>
-    <Alert
-      className="page-alert"
-      type="info"
-      showIcon
-      title="模型列表说明"
-      description="创建或修改知识库时只能从该列表选择 Embedding / Reranker / VLM / OCR 模型；JEV 仅用于 Console 配置（TypeSafe System One 决策模型），不会出现在知识库表单中，也没有 /models 模型列表接口。API Key 仅保存在服务端，表格只显示是否已设置。OCR 配置只需选择引擎，无需服务地址与 Key。"
-    />
     {error && (
       <Alert
         className="page-alert"
@@ -426,9 +419,10 @@ export function ModelProfilesPage({ disabled, onChanged }: {
       rowKey="id"
       dataSource={visible}
       loading={loading}
-      scroll={{ x: 820 }}
+      size="small"
+      scroll={{ x: 780 }}
       locale={{ emptyText }}
-      pagination={{ pageSize: 10, hideOnSinglePage: true }}
+      pagination={{ pageSize: 10, hideOnSinglePage: true, size: "small" }}
       columns={columns}
     />
     <Drawer

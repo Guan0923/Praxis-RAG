@@ -128,25 +128,26 @@ export function KnowledgeBasesPage({ disabled, onCreate, onChanged }: {
         </ul>} />
     )}
     <div ref={listRef} className="knowledge-bases-table">
-      <Table<Item> rowKey="namespace" dataSource={items} loading={loading} scroll={{ x: 880 }} pagination={{ pageSize: 10, hideOnSinglePage: true }}
+      <Table<Item> rowKey="namespace" dataSource={items} loading={loading} size="small" scroll={{ x: 820 }}
+        pagination={{ pageSize: 10, hideOnSinglePage: true, size: "small" }}
         rowSelection={{
           selectedRowKeys: selectedKeys,
           onChange: (next) => setSelectedKeys(next.map(String)),
           getCheckboxProps: (item) => ({ "aria-label": "选择 " + item.namespace, disabled: disabled || saving || loading || deleting }),
         }}
         columns={[
-          { title: "知识库", dataIndex: "namespace", width: 170, render: (name) => <span className="break-text">{name}</span> },
-          { title: "Embedding", width: 250, render: (_, item) => item.configured ? <div className="knowledge-provider-summary">
-            <span>{item.embedding_model}</span><span className="secondary break-text">{item.embedding?.base_url || "未配置 URL"}</span>
-            <span className="secondary">Key：{item.embedding?.api_key_set ? "已保存" : "未设置"}</span>
+          { title: "知识库", dataIndex: "namespace", width: 150, render: (name) => <span className="break-text">{name}</span> },
+          { title: "Embedding", width: 220, render: (_, item) => item.configured ? <div className="knowledge-provider-summary">
+            <span>{item.embedding_model}</span>
+            <span className="secondary break-text">{item.embedding?.base_url || "未配置 URL"} · Key：{item.embedding?.api_key_set ? "已保存" : "未设置"}</span>
           </div> : <Tag>缺少配置记录</Tag> },
-          { title: "Reranker", width: 230, render: (_, item) => item.reranker_model ? <div className="knowledge-provider-summary">
-            <span>{item.reranker_model}</span><span className="secondary break-text">{item.reranker?.base_url}</span>
-            <span className="secondary">Key：{item.reranker?.api_key_set ? "已保存" : "未设置"}</span>
+          { title: "Reranker", width: 200, render: (_, item) => item.reranker_model ? <div className="knowledge-provider-summary">
+            <span>{item.reranker_model}</span>
+            <span className="secondary break-text">{item.reranker?.base_url ? item.reranker.base_url + " · " : ""}Key：{item.reranker?.api_key_set ? "已保存" : "未设置"}</span>
           </div> : "未启用" },
-          { title: "向量维度", dataIndex: "vector_size", width: 90, render: (value) => value ?? "—" },
-          { title: "文档", dataIndex: "document_count", width: 70 },
-          { title: "配置", width: 70, render: (_, item) => <Tooltip title="查看与修改配置"><Button
+          { title: "向量维度", dataIndex: "vector_size", width: 80, render: (value) => value ?? "—" },
+          { title: "文档", dataIndex: "document_count", width: 60 },
+          { title: "配置", width: 60, render: (_, item) => <Tooltip title="查看与修改配置"><Button
             aria-label={"配置 " + item.namespace} icon={<EditOutlined />} disabled={disabled || saving || !item.configured}
             onClick={() => setSelected(item.namespace)} /></Tooltip> },
         ]} />

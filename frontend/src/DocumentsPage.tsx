@@ -546,11 +546,12 @@ export function DocumentsPage({
         rowKey="name"
         dataSource={documents}
         loading={loading}
-        size="middle"
+        size="small"
         pagination={{
           defaultPageSize: 10,
           hideOnSinglePage: true,
           showSizeChanger: false,
+          size: "small",
         }}
         locale={{
           emptyText: (

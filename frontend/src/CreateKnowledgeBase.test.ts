@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { App, ConfigProvider } from "antd";
 import { createElement } from "react";
 import { KnowledgeBaseForm, matchingProfile, profileNeedsReembed } from "./CreateKnowledgeBase";
@@ -214,6 +214,17 @@ describe("OCR settings in the knowledge-base form", () => {
     sessionStorage.clear();
   });
 
+  it("keeps unconfigured optional models disabled on the edit form", async () => {
+    const initialKb = editInitial();
+    mockApi([profile({ api_key_set: false })], initialKb);
+    renderForm({ initial: initialKb });
+    await waitForAdminDefaults();
+
+    for (const name of ["启用 Reranker", "启用 VLM", "启用 OCR"]) {
+      expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("false");
+    }
+  });
+
   it("submits the selected OCR engine as ocr_model", async () => {
     mockApi([profile({ api_key_set: false }), ocrProfile()]);
     const { onSaved } = renderForm();
@@ -223,7 +234,9 @@ describe("OCR settings in the knowledge-base form", () => {
       target: { value: "ocr-kb" },
     });
     await selectProfile("Embedding 模型", /默认 Embedding · bge-m3/);
-    fireEvent.click(screen.getByRole("switch", { name: "启用 OCR" }));
+    // Reranker / VLM 在创建页默认开启，本用例只验证 OCR，先关闭这两个可选模型。
+    fireEvent.click(screen.getByRole("switch", { name: "启用 Reranker" }));
+    fireEvent.click(screen.getByRole("switch", { name: "启用 VLM" }));
     await selectProfile("OCR 模型", /本地 OCR · easyocr/);
     fireEvent.click(screen.getByRole("button", { name: /创建知识库/ }));
 
@@ -240,6 +253,51 @@ describe("OCR settings in the knowledge-base form", () => {
     expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/models"))).toBe(false);
   });
 
+  it("enables reranker, VLM and OCR by default on the create form", async () => {
+    mockApi([profile({ api_key_set: false }), ocrProfile()]);
+    renderForm();
+    await waitForAdminDefaults();
+
+    for (const name of ["启用 Reranker", "启用 VLM", "启用 OCR"]) {
+      expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("true");
+    }
+  });
+
+  it("restores explicitly disabled models from the create draft", async () => {
+    sessionStorage.setItem("rag.knowledge-base-draft", JSON.stringify({
+      draft_version: 2,
+      reranker_enabled: false,
+      vlm_enabled: false,
+      ocr_enabled: false,
+    }));
+    mockApi([profile({ api_key_set: false }), ocrProfile()]);
+    renderForm();
+    await waitForAdminDefaults();
+
+    for (const name of ["启用 Reranker", "启用 VLM", "启用 OCR"]) {
+      expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("false");
+    }
+  });
+
+  it("keeps the new default-on switches for a draft saved before the default change", async () => {
+    // 旧草稿没有 draft_version，其开关状态来自「默认关闭」时代，不能覆盖新默认值。
+    sessionStorage.setItem("rag.knowledge-base-draft", JSON.stringify({
+      namespace: "legacy-draft",
+      reranker_enabled: false,
+      vlm_enabled: false,
+      ocr_enabled: false,
+    }));
+    mockApi([profile({ api_key_set: false }), ocrProfile()]);
+    renderForm();
+    await waitForAdminDefaults();
+
+    expect((screen.getByLabelText("知识库标识（Namespace）") as HTMLInputElement).value)
+      .toBe("legacy-draft");
+    for (const name of ["启用 Reranker", "启用 VLM", "启用 OCR"]) {
+      expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("true");
+    }
+  });
+
   it("submits an empty ocr_model while OCR stays disabled", async () => {
     mockApi([profile({ api_key_set: false })]);
     const { onSaved } = renderForm();
@@ -249,6 +307,10 @@ describe("OCR settings in the knowledge-base form", () => {
       target: { value: "plain-kb" },
     });
     await selectProfile("Embedding 模型", /默认 Embedding · bge-m3/);
+    // 三个可选模型默认开启；本用例验证关闭后提交空值。
+    fireEvent.click(screen.getByRole("switch", { name: "启用 Reranker" }));
+    fireEvent.click(screen.getByRole("switch", { name: "启用 VLM" }));
+    fireEvent.click(screen.getByRole("switch", { name: "启用 OCR" }));
     fireEvent.click(screen.getByRole("button", { name: /创建知识库/ }));
 
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
@@ -262,10 +324,13 @@ describe("OCR settings in the knowledge-base form", () => {
     const { onOpenModelProfiles } = renderForm();
     await waitForAdminDefaults();
 
-    fireEvent.click(screen.getByRole("switch", { name: "启用 OCR" }));
+    // OCR 默认开启；没有 OCR 模型时表单直接给出提示。
+    expect(screen.getByRole("switch", { name: "启用 OCR" }).getAttribute("aria-checked")).toBe("true");
     expect(await screen.findByText("暂无 OCR 模型")).toBeTruthy();
     expect(screen.getByText(/创建知识库时只能选择已保存的 OCR 模型/)).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "前往模型配置" }));
+    // Reranker / VLM / OCR 默认开启且都没有模型时，各自都有「前往模型配置」入口。
+    const ocrSection = screen.getByRole("region", { name: "OCR 配置" });
+    fireEvent.click(within(ocrSection).getByRole("button", { name: "前往模型配置" }));
     expect(onOpenModelProfiles).toHaveBeenCalledTimes(1);
   });
 

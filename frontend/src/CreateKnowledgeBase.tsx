@@ -44,6 +44,9 @@ type Draft = {
   reranker_enabled?: boolean;
   vlm_enabled?: boolean;
   ocr_enabled?: boolean;
+  // 旧版草稿没有版本号：其开关状态来自「默认关闭」时代，恢复时忽略，
+  // 统一按当前的默认开启处理。
+  draft_version?: number;
 };
 // 知识库表单只支持知识库模型类型：JEV 仅用于 Console 配置，绝不出现在这里。
 const kinds: Kind[] = knowledgeBaseModelKinds;
@@ -86,6 +89,8 @@ export function profileNeedsReembed(
 // The create form keeps an unsaved draft (without API keys) so a failed save or
 // an accidental page switch never loses the other inputs.
 const draftKey = "rag.knowledge-base-draft";
+// 草稿版本：2 起记录「默认全部开启」时代的显式开关状态。
+const draftVersion = 2;
 
 export function CreateKnowledgeBase({ active, disabled, onCreated, connection, role, onOpenModelProfiles }: {
   active: boolean; disabled: boolean; onCreated: (namespace: string) => void;
@@ -261,9 +266,11 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
   const [profilesError, setProfilesError] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
-  const [rerankerEnabled, setRerankerEnabled] = useState(Boolean(initial?.reranker_model));
-  const [vlmEnabled, setVlmEnabled] = useState(Boolean(initial?.vlm_model));
-  const [ocrEnabled, setOcrEnabled] = useState(Boolean(initial?.ocr_model));
+  // 创建页默认开启全部可选模型（Reranker / VLM / OCR 开关默认打开，模型仍需
+  // 逐个选择）；编辑页沿用知识库当前是否配置了该类模型。
+  const [rerankerEnabled, setRerankerEnabled] = useState(initial ? Boolean(initial.reranker_model) : true);
+  const [vlmEnabled, setVlmEnabled] = useState(initial ? Boolean(initial.vlm_model) : true);
+  const [ocrEnabled, setOcrEnabled] = useState(initial ? Boolean(initial.ocr_model) : true);
   const lifetime = useRef(new AbortController());
   const profilesRequest = useRef<AbortController | null>(null);
   const running = useRef(false);
@@ -359,9 +366,11 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         vlm_profile: draft.vlm_profile,
         ocr_profile: draft.ocr_profile,
       });
-      if (draft.reranker_enabled) setRerankerEnabled(true);
-      if (draft.vlm_enabled) setVlmEnabled(true);
-      if (draft.ocr_enabled) setOcrEnabled(true);
+      if (draft.draft_version === draftVersion) {
+        if (draft.reranker_enabled !== undefined) setRerankerEnabled(draft.reranker_enabled);
+        if (draft.vlm_enabled !== undefined) setVlmEnabled(draft.vlm_enabled);
+        if (draft.ocr_enabled !== undefined) setOcrEnabled(draft.ocr_enabled);
+      }
     } catch {
       // An unreadable draft must never block the form.
     }
@@ -401,6 +410,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         reranker_enabled: rerankerEnabled,
         vlm_enabled: vlmEnabled,
         ocr_enabled: ocrEnabled,
+        draft_version: draftVersion,
         ...overrides,
       };
       sessionStorage.setItem(draftKey, JSON.stringify(draft));
@@ -475,9 +485,10 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         if (!initial) {
           try { sessionStorage.removeItem(draftKey); } catch { /* Draft cleanup is best effort. */ }
           form.resetFields();
-          setRerankerEnabled(false);
-          setVlmEnabled(false);
-          setOcrEnabled(false);
+          // 创建成功后回到「全部模型默认开启」的初始状态。
+          setRerankerEnabled(true);
+          setVlmEnabled(true);
+          setOcrEnabled(true);
           void loadDefaults();
         }
         onSaved(result);
