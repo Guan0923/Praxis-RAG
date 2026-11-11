@@ -19,6 +19,19 @@ const DefaultRerankerModel = "BAAI/bge-reranker-base"
 // tenant-created knowledge bases when RAG_DEFAULT_KB_TEMPLATE is not set.
 const DefaultKBTemplateNamespace = "default"
 
+// PDF engines accepted by RAG_PDF_ENGINE.
+const (
+	// PDFEngineGo parses PDF text in-process with the pure-Go reader.
+	PDFEngineGo = "go"
+	// PDFEngineDocling parses PDFs through the remote Docling service.
+	PDFEngineDocling = "docling"
+)
+
+// DefaultPDFServiceURL is used when the Docling engine is selected without an
+// explicit RAG_PDF_SERVICE_URL, so host-local deployments start without extra
+// configuration.
+const DefaultPDFServiceURL = "http://127.0.0.1:8091"
+
 // BackendName is the supported retrieval backend selector.
 type BackendName string
 
@@ -52,13 +65,23 @@ type RagConfig struct {
 	DefaultKBTemplate string
 	// VLMBaseURL is the OpenAI-compatible endpoint for Word picture
 	// descriptions. Empty means uncaptioned pictures stay placeholders.
-	VLMBaseURL string
+	VLMBaseURL         string
 	VLMAPIKey          string
 	VLMModel           string
 	VLMTimeout         int
 	VLMConcurrency     int
 	WordConverterPath  string
 	WordConvertTimeout int
+	// PDFEngine selects the PDF parser: "go" (in-process pure-Go text
+	// extraction) or "docling" (remote Docling parse service).
+	PDFEngine string
+	// PDFServiceURL is the base URL of the remote Docling parse service
+	// (RAG_PDF_SERVICE_URL). When the Docling engine is selected without an
+	// explicit URL it defaults to DefaultPDFServiceURL.
+	PDFServiceURL string
+	// PDFServiceTimeout bounds one remote parse call in seconds
+	// (RAG_PDF_SERVICE_TIMEOUT, default 900).
+	PDFServiceTimeout int
 }
 
 // RagConfigFromEnv loads configuration without connecting to Qdrant or loading
@@ -147,6 +170,21 @@ func RagConfigFromEnv() (RagConfig, error) {
 	if err != nil {
 		return RagConfig{}, err
 	}
+	pdfServiceURL, err := parsePDFServiceURL(os.Getenv("RAG_PDF_SERVICE_URL"))
+	if err != nil {
+		return RagConfig{}, err
+	}
+	pdfEngine, err := parsePDFEngine(os.Getenv("RAG_PDF_ENGINE"), pdfServiceURL)
+	if err != nil {
+		return RagConfig{}, err
+	}
+	if pdfEngine == PDFEngineDocling && pdfServiceURL == "" {
+		pdfServiceURL = DefaultPDFServiceURL
+	}
+	pdfServiceTimeout, err := integerEnv("RAG_PDF_SERVICE_TIMEOUT", 900, 1, 7200)
+	if err != nil {
+		return RagConfig{}, err
+	}
 	vlmBaseURL, err := parseVLMBaseURL(os.Getenv("RAG_VLM_BASE_URL"))
 	if err != nil {
 		return RagConfig{}, err
@@ -194,6 +232,9 @@ func RagConfigFromEnv() (RagConfig, error) {
 		VLMConcurrency:        vlmConcurrency,
 		WordConverterPath:     optionalPath("RAG_WORD_CONVERTER_PATH"),
 		WordConvertTimeout:    wordTimeout,
+		PDFEngine:             pdfEngine,
+		PDFServiceURL:         pdfServiceURL,
+		PDFServiceTimeout:     pdfServiceTimeout,
 	}, nil
 }
 
@@ -211,6 +252,40 @@ func parseVLMBaseURL(raw string) (string, error) {
 		return "", fmt.Errorf("RAG_VLM_BASE_URL must not embed credentials; set RAG_VLM_API_KEY instead")
 	}
 	return strings.TrimRight(value, "/"), nil
+}
+
+// parsePDFServiceURL validates the remote Docling parse service base URL. It
+// must be an absolute http(s) URL without a query or fragment because the
+// client appends the fixed /v1/parse path. Empty means "not configured".
+func parsePDFServiceURL(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("RAG_PDF_SERVICE_URL must be an http(s) URL, for example http://127.0.0.1:8091")
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", fmt.Errorf("RAG_PDF_SERVICE_URL must not include a query or fragment")
+	}
+	return strings.TrimRight(value, "/"), nil
+}
+
+// parsePDFEngine validates RAG_PDF_ENGINE. An empty value selects the Docling
+// service when a service URL is configured and the in-process parser otherwise.
+func parsePDFEngine(raw, serviceURL string) (string, error) {
+	switch value := strings.ToLower(strings.TrimSpace(raw)); value {
+	case "":
+		if serviceURL != "" {
+			return PDFEngineDocling, nil
+		}
+		return PDFEngineGo, nil
+	case PDFEngineGo, PDFEngineDocling:
+		return value, nil
+	default:
+		return "", fmt.Errorf("RAG_PDF_ENGINE must be go or docling")
+	}
 }
 
 // ExpandPath expands a leading "~" and normalizes the path.

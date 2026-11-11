@@ -824,3 +824,54 @@ go test ./internal/runtime -run "Upload|Pdf|PDF|StopIndex|Recover" -count=1 -tim
 - `internal/runtime`：`TestSafeUploadErrorTextPdfParseMessage` 通过；上传相关子集（`Upload|Pdf|PDF|StopIndex|Recover`）223.4s 全绿。
 - 重建 `dist/bin/rag-service.exe` 并以同样生产配置重启 8011，`/health` 200；再次上传 PDF 时响应应为「PDF 解析不可用：Python 解析环境缺少模块 rag_mcp…」而不是 `errorString`。
 - 已知未处理：旧 debug 上传 `2c060059701b999a604c3d42863e3982`（namespace `debug222146`）的历史工作区不在当前数据根下，回收循环每 10 秒打一条 `Unsafe upload workspace`（ValueError）日志，与本问题无关，待单独清理。
+
+## PDF 解析恢复为 Docling 微服务 — 2026-11-10
+
+背景：commit `f778504` 删除 Python worker 后，PDF 改由纯 Go 引擎抽取文本，版面/表格/公式全部丢失；公式符号还被 TJ 换行注入与 TeX CM 字体解码成 `Ω`/`⊗`（见上一节）。本轮把 Docling 解析恢复为**独立 Python HTTP 微服务**，Go 主服务不引入 Python 依赖。
+
+交付：
+
+- 服务 `python-workers/pdf-service`（FastAPI + `docling==2.126.0`）：`GET /healthz`、`POST /v1/parse`（multipart 字段 `file` → `application/zip`：`manifest.json` + `pictures/*.png`）；清单版本 `docling-service-v1`；公式 block 带 `latex`/`original_text`/`equation_number`；进程内并发上限与单请求超时；docling/torch 惰性导入（测试与 fake 模式无需安装）；`RAG_PDF_SERVICE_CONVERTER=fake` 仅用于测试联调。
+- Go 端：`internal/document/docling_service.go`（`DoclingServiceParser`：流式 multipart → 512 MiB 响应上限 → 安全解压（拒绝绝对路径/`..`/symlink/重复条目，条目/单文件/总大小上限）→ manifest 版本与 `image_file` 存在性校验 → `*PDFParseError` 安全消息）；版本兼容 `go-native-v1`/`docling-service-v1`/历史 `docling-formula-remote-v3`；config 新增 `RAG_PDF_ENGINE`/`RAG_PDF_SERVICE_URL`/`RAG_PDF_SERVICE_TIMEOUT`；runtime 按引擎注入解析器，并把实际清单版本写入文档与 chunk 元数据；`pdfcontent` 的 `pdf_parser_version` 改为 `manifest.Version`。
+- 部署/文档：docker compose 新增默认启动的 `pdf-parser`（8091、`pdf_parser_models` 卷、`/healthz` healthcheck）；`.env.example`、README/USAGE/DEPLOYMENT/GO_MIGRATION/PROGRESS 同步；`scripts/start-stack.ps1` 默认拉起并软等待 pdf-parser。
+
+验证（Windows 11，Go 1.x + `.venv` Python 3.11.7）：
+
+```powershell
+cd python-workers/pdf-service
+..\..\.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider
+# 57 passed in 0.88s（无 docling/torch）
+
+# fake 模式启动服务
+$env:RAG_PDF_SERVICE_CONVERTER = "fake"
+..\..\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8091
+# GET /healthz -> 200 {"status":"ok","converter":"fake","parser_version":"docling-service-v1"}
+# POST /v1/parse（10 MB 真实 PDF）-> 200，zip 1208 B；
+# manifest.json version=docling-service-v1，blocks=[text, formula($$\nG = X_{basis}^{T} X_{basis}\n$$\n\n(1)), picture]，
+# pictures/picture-0.png 存在且 PNG 魔数正确
+
+$env:RAG_PDF_SERVICE_URL = "http://127.0.0.1:8091"
+go test ./internal/document -run TestDoclingServiceParserLiveService -count=1 -v
+# PASS：真实 HTTP -> zip -> staging -> manifest 校验
+go test ./internal/ingest -run TestDoclingServiceLivePrepare -count=1 -v
+# chunks=3 formula=1（临时 E2E 测试，验证后已删除）：
+# Result.Metadata["parser_version"]=docling-service-v1；每个 chunk 的 pdf_parser_version=docling-service-v1；
+# 公式 chunk 的 latex 非空；staging 内含 manifest.json、pictures/picture-0.png、document.md（含 $$ 公式）
+
+go build ./...                        # OK
+go vet ./...                          # OK
+go test ./internal/runtime -count=1   # 469s 全绿（RAG_TEST_MYSQL_URL=praxis_gotest）
+go test ./internal/runtime -run 'TestPDFOptionsSelectsConfiguredEngine|TestIndexConfigurationRecordsPDFParserEngine' -count=1
+# PASS：默认引擎 Parser=nil；docling 引擎按 URL/超时构造 DoclingServiceParser；元数据版本随引擎变化
+go test ./internal/document ./internal/config ./internal/ingest -count=1   # 全绿
+go test -p 1 ./internal/... -count=1   # 全绿（runtime 469s / state 426s / e2e 216s 等；RAG_TEST_MYSQL_URL=praxis_gotest）
+# 注意必须 -p 1：多个包并发时 statetest 的 MySQL advisory lock 会让后到的包等 600s 超时。
+docker compose --env-file .env.example config --quiet                       # exit 0
+```
+
+已知限制/未验证：
+
+- 本机未安装 docling/torch，也未构建 Docker 镜像：真实 Docling 转换（CodeFormulaV2/VLM、EasyOCR、TableFormer）未在本机实测，只有移植代码与 fake 契约测试覆盖；真机首次部署需预置 Docling 模型或配置 `RAG_VLM_*`。
+- 服务端超时只能快速返回 504，无法中断已启动的 Docling 线程；并发槽在后台任务结束后才释放。
+- `/healthz` 恒 200（配置 degraded 时 `/v1/parse` 返回 503），compose healthcheck 只反映进程可用性。
+- zip 不再包含旧 worker 的 `document.json`/`ocr.json`，OCR 明细只保留在 manifest 的 `warnings` 中。

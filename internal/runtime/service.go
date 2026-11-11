@@ -210,8 +210,15 @@ func (s *Service) ReadDocument(ctx context.Context, namespace, name string) (str
 		}
 	}
 	if suffix == document.SuffixPDF {
+		// Stored PDFs record the engine that produced their document.md
+		// (go-native-v1 or docling-service-v1), so validate the recorded value
+		// against the supported set instead of one fixed constant.
+		recorded := parserVersionValue(record.Chunking, "pdf_parser_version")
+		if !document.IsSupportedPDFParserVersion(recorded) {
+			return "", "", &apierrors.KnowledgeValidationError{Message: pdfParserChangedMessage}
+		}
 		text, readErr := s.readSavedArtifactText(ctx, namespace, name, record,
-			state.PDFAssetBucket, "pdf_parser_version", document.PDFParserVersion,
+			state.PDFAssetBucket, "pdf_parser_version", recorded,
 			pdfParserChangedMessage, savedPDFContentUnavailableMessage)
 		if readErr != nil {
 			return "", "", readErr

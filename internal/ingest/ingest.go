@@ -297,7 +297,7 @@ func preparePDF(ctx context.Context, sourcePath string, options Options) (Result
 	if err != nil {
 		return fail(err)
 	}
-	if manifest.Version != document.PDFParserVersion {
+	if !document.IsSupportedPDFParserVersion(manifest.Version) {
 		return fail(fmt.Errorf("PDF parser version mismatch; reimport this document"))
 	}
 	documentID := chunking.DocumentID(options.SourceName)
@@ -325,18 +325,21 @@ func preparePDF(ctx context.Context, sourcePath string, options Options) (Result
 	return Result{
 		Chunks:      chunks,
 		Title:       chunks[0].Title,
-		Metadata:    pdfMetadata(options),
+		Metadata:    pdfMetadata(options, manifest.Version),
 		Assets:      content.Assets,
 		Diagnostics: []document.Diagnostic{},
 		StagingDir:  staging,
 	}, nil
 }
 
-func pdfMetadata(options Options) map[string]any {
+// pdfMetadata records the parser version carried by the parsed manifest, so
+// documents imported through the Docling engine keep their own version instead
+// of the in-process default.
+func pdfMetadata(options Options, parserVersion string) map[string]any {
 	return map[string]any{
 		"document_suffix":      document.SuffixPDF,
-		"chunking":             documentConfiguration(options.Chunking, options.TokenizerModel, "pdf_parser_version", document.PDFParserVersion),
-		"parser_version":       document.PDFParserVersion,
+		"chunking":             documentConfiguration(options.Chunking, options.TokenizerModel, "pdf_parser_version", parserVersion),
+		"parser_version":       parserVersion,
 		"diagnostics":          []document.Diagnostic{},
 		"skipped_object_count": 0,
 	}

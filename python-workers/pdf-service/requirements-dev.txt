@@ -1,0 +1,14 @@
+# Test-only dependencies for the PDF service.
+#
+# Deliberately excludes docling and torch: the pytest suite and the HTTP
+# RAG_PDF_SERVICE_CONVERTER=fake mode must run on a machine without the
+# deep-learning stack (hash check, zip/manifest contract, fake converter).
+# requests is optional at test time but required by the remote-VLM description
+# path, so it is included for parity with the runtime image.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+httpx>=0.27
+python-multipart>=0.0.9
+pillow>=10.0
+requests>=2.28
+pytest>=8.0

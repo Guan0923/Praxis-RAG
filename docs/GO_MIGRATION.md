@@ -1,6 +1,6 @@
 # 后端 Go 重构总纲
 
-最后更新：2026-11-08
+最后更新：2026-11-10
 
 ## 1. 目标
 
@@ -14,7 +14,7 @@
 - 与 Qdrant、MySQL/SQLite、Redis、RocketMQ 的现有交互格式与既有数据。
 
 前端（`frontend/`，React + Vite）不重写；构建产物仍输出到 Console 静态目录。
-PDF 正文解析、DOCX 读取与 Word 图片描述已全部由 Go 进程内完成（PDF 使用纯 Go 阅读器，图片描述由 Go 直接调用远端 OpenAI 兼容 VLM）；`python-workers/` 与 `benchmarks/` 已从仓库删除，运行时不依赖 Python。仅 .doc 转换仍使用外部 LibreOffice。
+DOCX 读取与 Word 图片描述由 Go 进程内完成（图片描述由 Go 直接调用远端 OpenAI 兼容 VLM）；PDF 默认由独立 Docling 解析微服务（`python-workers/pdf-service`，HTTP + zip 清单）处理，Go 端可用 `RAG_PDF_ENGINE=go` 切回内置纯文本引擎；Go 主服务与镜像不依赖 Python。仅 .doc 转换仍使用外部 LibreOffice。
 Go 只负责按其现有协议调用并消费解析结果；语义检索和重排本来就是 HTTP 模型 API。
 
 ## 2. 目标架构
@@ -333,7 +333,7 @@ REST /v1/admin/tools -> 6 tools
 ### Python 后端的定位（已删除）
 
 - 原 Python 后端（`src/rag_mcp/` 的 HTTP/MCP/状态/检索/文档/测试、`tests/`、`pyproject.toml`、`uv.lock`）**已从仓库删除**。
-- **Python 解析 worker 已删除（2026-11-10）**：`python-workers/`（PDF Docling worker 与 Word 视觉 worker）与 `benchmarks/` 评估脚本一并删除；PDF/DOCX 解析与 Word 图片描述全部由 Go 实现，仓库不再包含 Python 代码或 Python 运行依赖。
+- **Python 解析 worker 已删除（2026-11-10）**：`python-workers/`（PDF Docling worker 与 Word 视觉 worker）与 `benchmarks/` 评估脚本当日一并删除；随后又以**独立 Docling PDF 解析微服务**（`python-workers/pdf-service`）的形式恢复了 PDF 高保真解析——它只在 `RAG_PDF_ENGINE=docling` 时被 HTTP 调用，不进入 Go 构建/镜像/测试依赖，Go 主服务仍无 Python 运行时依赖。PDF 的 Go 内置纯文本引擎（`RAG_PDF_ENGINE=go`）继续可用；DOCX 解析与 Word 图片描述仍由 Go 实现。详见文末「2026-11-10 恢复 Docling 外部解析为独立微服务」。
 - `examples/` 保留示例知识库文件。
 - 数据层兼容：Go 复用既有 MySQL/SQLite schema、`enc:v1:` 凭据与 `~/.praxis-rag/` 配置/数据目录；`rag-state-migrate` 可检查/幂等建表，`rag-service-migrate --apply` 只导入状态、**不重建向量**（需重新上传或等待 reindex）。
 - 已删除 Python 旧路径专用项：`RAG_OUTBOX_BRIDGE=debezium`（Go 未实现，配置 broker 时 Go 总是进程内 relay）、Python worker 命令、`scripts/start-stack.ps1` 的 Python 入口（已改写为 Go 流程）、`scripts/start-debezium-stack.ps1`。
@@ -381,3 +381,18 @@ REST /v1/admin/tools -> 6 tools
 - **实机验证（Windows + Docker Desktop）**：MySQL 8.0 + Debezium Server 3.7.1.Final + Kafka 3.9.0。Kafka healthy、日志 `log.dirs=/var/lib/kafka/data`、`num.partitions=4`；Debezium `Snapshot completed` + `Starting streaming`，原生 sink ProducerConfig 为 `bootstrap.servers=[kafka:9092]`、`acks=-1`、idempotence true、String serializer；`praxis_document_ingest` 自动创建（4 partitions/RF1），消费到与 MySQL `document_job_outbox` 一致的记录，outbox 行保持 `PENDING`（应用未发布）；保留 MySQL/Qdrant/Redis 数据卷，旧 RocketMQ 容器与卷已清理。`go build ./...`、全量 `go test -count=1 ./...` 通过。
 - **文档**：README/USAGE/DEPLOYMENT/state-cache/state-storage/result-references/GO_PARITY_AUDIT/VALIDATION 更新为 Kafka 传输与显式 DLQ 语义；GO_PARITY_AUDIT 的 RocketMQ 字样标注为历史；本文件历史轮次保留原样。
 - **验证补充（2026-11-09）**：Go worker 消费真实 Kafka 的完整 async 链路已实机跑通（`scripts/verify-debezium-e2e.py`：debezium 模式 14/14、relay 模式 13/0；发件箱分别保持 PENDING / 标记 PUBLISHED），排队搜索（`scripts/verify-kafka-search.py`，含 Redis 快照）与 poison→显式 DLQ topic（`scripts/verify-kafka-dlq.py`）也已验证。仍未验证：Kafka SASL/TLS 集群、Docker `app` profile/镜像、systemd、MySQL 多实例故障切换。
+
+### 2026-11-10 恢复 Docling 外部解析为独立微服务（Go 端不引入 Python 依赖）
+
+- **背景**：2026-11-10 删除 `python-workers/` 后，PDF 只走 Go 内置纯文本引擎；公式被当作普通文本处理，实测出现 Ω/⊗ 等符号乱码，上标、分式、公式编号等结构全部丢失。本轮把 Docling 恢复为**独立 HTTP 微服务**，而不是回到 Go 进程内拉起 Python 子进程：PDF 高保真解析需要 Python/Docling 与模型，但这不应成为 Go 服务的构建或运行依赖。
+- **服务端**：新增 `python-workers/pdf-service/`（FastAPI + `docling==2.126.0` + CodeFormulaV2，CPU torch）：
+  - `GET /healthz` 健康检查；`POST /v1/parse`（multipart 字段 `file`）返回 `application/zip`，zip 根目录含 `manifest.json` 与 `assets` 引用的图片（如 `pictures/picture-0.png`）；错误返回 `{"detail": <安全消息>}`，不回显文档正文。
+  - Docling 惰性导入（`import app.main` 不要求已安装 docling），实测/联调可用 `RAG_PDF_SERVICE_CONVERTER=fake` 返回固定清单。
+  - 公式识别：配置了 `RAG_VLM_*` 时使用远端 OpenAI 兼容 VLM，否则使用本地 CodeFormula 模型；模型目录由 `RAG_PDF_MODELS_PATH` 指定（compose 卷 `pdf_parser_models` 挂到 `/models`）。
+  - 其余环境变量：`RAG_PDF_SERVICE_HOST`/`RAG_PDF_SERVICE_PORT`（默认 `0.0.0.0:8091`）、`RAG_PDF_SERVICE_CONCURRENCY`（默认 1）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900 秒）。
+- **与旧 subprocess worker 的区别**：旧实现由 Go 通过 `exec` 拉起 `python -m rag_mcp.pdf_worker`，依赖本机 Python 环境与 `PYTHONPATH`、用 stdout JSON 清单 + 共享临时目录传资产、stderr 混在进程输出里，缺失模块时只能靠 stderr 文本诊断；新实现是网络服务——Go 只发 HTTP multipart、收 zip 后安全解压，不再需要本机 Python，也不需要解析子进程退出码/stdout/stderr。清单版本从 `docling-formula-remote-v3` 改为 **`docling-service-v1`**；Go 端 `IsSupportedPDFParserVersion` 同时接受 `go-native-v1`、`docling-service-v1` 与历史 `docling-formula-remote-v3`，已存文档不需要迁移。
+- **Go 端**：`internal/document/docling_service.go` 的 `DoclingServiceParser` 实现 `ingest.PDFParser` 与 `document.PDFPages`：`ValidatePDFFile` → multipart `POST {BaseURL}/v1/parse` → 校验 200 与 `application/zip`（兼容 `octet-stream`）→ 安全解压到 staging（拒绝绝对路径/`..`/symlink/重复条目，限制条目数与解压大小）→ 解析 `manifest.json` 并按支持版本校验；失败统一返回 `*document.PDFParseError`（安全消息）。`internal/config` 新增 `RAG_PDF_ENGINE`（`go|docling|空`；空 = 配置了 `RAG_PDF_SERVICE_URL` 则 docling，否则 go）、`RAG_PDF_SERVICE_URL`（默认 `http://127.0.0.1:8091`，校验为绝对 `http(s)` URL）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900，1..7200 秒）；运行时按引擎注入解析器，并用 `PDFParserVersionForEngine` 记录 `pdf_parser_version`（docling → `docling-service-v1`，go → `go-native-v1`）。
+- **部署**：`docker-compose.yml` 新增默认启动的 `pdf-parser`（独立镜像 `praxis-rag-pdf-parser:local`，容器名 `praxis-rag-pdf-parser`，容器内 8091 / 健康检查 `/healthz` / 卷 `pdf_parser_models`，无 profile）；`app` 增加 `depends_on: pdf-parser: service_started` 与 `RAG_PDF_ENGINE`（默认 `docling`）、`RAG_PDF_SERVICE_URL`（默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）。`.env.example` 增加 `RAG_PDF_ENGINE`/`RAG_PDF_SERVICE_URL`/`RAG_PDF_SERVICE_TIMEOUT`/`RAG_PDF_PARSER_IMAGE`/`RAG_PDF_SERVICE_PORT`/`RAG_PDF_MODELS_PATH`/`RAG_PDF_SERVICE_CONCURRENCY` 与 VLM 共用说明。纯 Go 引擎部署可 `docker compose up -d mysql qdrant redis kafka` 跳过 pdf-parser。
+- **文档**：README、USAGE、DEPLOYMENT 按「默认 docling + 可切回 go」重写 PDF 解析章节；本文件补充本节；PROGRESS 追加同日记录。
+- **限制**：`docling` 引擎需要 pdf-parser 服务与已预置的 Docling/CodeFormula 模型（CPU torch 镜像较大，首次使用前需联网下载模型并放入模型卷）；服务不可用或超时时 docling 上传会失败（安全可读错误），可显式 `RAG_PDF_ENGINE=go` 回退纯文本。公式识别需要远端 VLM（`RAG_VLM_*`）或本地 CodeFormula 模型，两者都没有时 `/v1/parse` 返回 503、解析失败；版面/表格/OCR 仍只有 Docling 提供。pdf-parser 未加认证，只应发布在 loopback/内网。`RAG_PDF_SERVICE_CONVERTER=fake` 仅用于联调测试。真实 Docling 推理、镜像构建与模型下载尚未在本仓库验证环境实机执行。
+- 本节之前的轮次记录保持原样；上方 G8 快照中「仓库不再包含 Python 代码」的表述由本节取代。

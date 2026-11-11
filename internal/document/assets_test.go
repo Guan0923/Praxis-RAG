@@ -412,6 +412,9 @@ func TestParserVersionGuards(t *testing.T) {
 	if err := ValidatePDFParserVersion(PDFParserVersion); err != nil {
 		t.Fatalf("pdf version guard error = %v", err)
 	}
+	if err := ValidatePDFParserVersion(PDFParserVersionDocling); err != nil {
+		t.Fatalf("docling pdf version guard error = %v", err)
+	}
 	if err := ValidatePDFParserVersion("old"); err == nil ||
 		err.Error() != "PDF parser version changed; explicitly reimport this PDF" {
 		t.Fatalf("pdf version error = %v", err)

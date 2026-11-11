@@ -11,6 +11,7 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
+	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/sparse"
 	"github.com/Guan0923/xinghe_rag/internal/state"
@@ -610,5 +611,54 @@ func TestUploadStagedVersionIDs(t *testing.T) {
 	}
 	if len(operationID) == 0 {
 		t.Errorf("operation id missing")
+	}
+}
+
+// TestPDFOptionsSelectsConfiguredEngine pins the runtime parser selection: the
+// in-process pure-Go engine stays the default (nil Parser) and RAG_PDF_ENGINE
+// docling builds the remote client from the configured URL and timeout.
+func TestPDFOptionsSelectsConfiguredEngine(t *testing.T) {
+	if options := (&Service{}).pdfOptions(); options.Parser != nil {
+		t.Fatalf("default pdfOptions().Parser = %T, want nil for the in-process engine", options.Parser)
+	}
+	service := &Service{config: config.RagConfig{
+		PDFEngine:         config.PDFEngineDocling,
+		PDFServiceURL:     "http://127.0.0.1:8091",
+		PDFServiceTimeout: 900,
+	}}
+	parser, ok := service.pdfOptions().Parser.(*document.DoclingServiceParser)
+	if !ok || parser == nil {
+		t.Fatalf("pdfOptions().Parser = %T, want *document.DoclingServiceParser", service.pdfOptions().Parser)
+	}
+	if parser.BaseURL != "http://127.0.0.1:8091" {
+		t.Fatalf("DoclingServiceParser.BaseURL = %q", parser.BaseURL)
+	}
+	if parser.Client == nil || parser.Client.Timeout != 900*time.Second {
+		t.Fatalf("DoclingServiceParser.Client = %+v, want a 900s timeout", parser.Client)
+	}
+}
+
+// TestIndexConfigurationRecordsPDFParserEngine pins the stored metadata version
+// to the configured engine instead of one fixed constant.
+func TestIndexConfigurationRecordsPDFParserEngine(t *testing.T) {
+	cfg, err := chunking.NewConfig("character", 700, 100)
+	if err != nil {
+		t.Fatalf("chunking.NewConfig() error = %v", err)
+	}
+	for _, testCase := range []struct {
+		engine string
+		want   string
+	}{
+		{config.PDFEngineGo, document.PDFParserVersion},
+		{config.PDFEngineDocling, document.PDFParserVersionDocling},
+	} {
+		metadata := indexConfiguration("paper.pdf", cfg, "BAAI/bge-m3", "bge-m3",
+			document.PDFParserVersionForEngine(testCase.engine))
+		if got := metadata["pdf_parser_version"]; got != testCase.want {
+			t.Fatalf("engine %q pdf_parser_version = %v, want %q", testCase.engine, got, testCase.want)
+		}
+		if got := metadata["embedding_model"]; got != "bge-m3" {
+			t.Fatalf("embedding_model = %v", got)
+		}
 	}
 }
