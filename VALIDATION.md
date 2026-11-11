@@ -1140,3 +1140,59 @@ Behavior/limits confirmed by the run: `Kinds`/`IsKind` include `jev`;
 `knowledgeBaseModelKinds`; the Console JEV test posts
 `{kind:"jev",name,base_url,model,apikey}` and never calls `/models`.
 
+
+## Console 系统监控 page (admin-only) and read-only overview API — 2026-11-11
+
+Delivered in worktree `add-console-monitor-page` (one commit, rebased onto
+`main`@`009f97f` after the batch-delete and JEV merges):
+
+- `GET /v1/admin/monitor/overview` (`authAdmin`, `Cache-Control: no-store`):
+  service identity, five parallel dependency probes (MySQL / Redis / Qdrant /
+  Kafka / pdf-service, 1.5 s each), queue aggregates (`document_jobs` by status
+  and stage, `document_job_outbox`, `search_tasks`, unfinished uploads),
+  library counts and 24 h activity. Only COUNT/MIN/GROUP BY queries; no
+  document content, query text or credentials are read or logged.
+- Console「系统监控」page (`#/monitor`): service card, dependency status table,
+  queue/backlog blocks, library counters, 24 h activity; 15 s auto-refresh with
+  a switch, manual refresh, AbortController for stale responses, degraded cards
+  when the state store is unavailable.
+- Admin-only on all three layers: the shared `canViewConsolePage` rule hides the
+  sidebar entry and redirects a direct `#/monitor` link for non-admins, and the
+  REST route rejects a non-admin login session with 403「需要管理员权限」even
+  from loopback. Legacy no-session local mode keeps management pages visible,
+  matching the existing model-profiles / knowledge-bases / users behaviour.
+- `internal/state/monitor.go` (+ test), `internal/monitor/` (+ test),
+  `internal/httpapi/monitor.go` (+ test), one OpenAPI row, and doc updates in
+  `README.md`, `docs/USAGE.md`, `docs/DEPLOYMENT.md`, `docs/agents/features.md`,
+  `docs/agents/architecture.md`.
+
+Verification (Windows 11, Go 1.27.3, Node v26.13.0 / npm 12.2.2; MySQL container
+on 127.0.0.1:3307 with the disposable `praxis_gotest` schema):
+
+```
+$ go build ./... ; go vet ./...                              # exit 0
+$ go test -p 1 -count=1 -timeout 20m ./internal/monitor/
+  # ok 2.0 s — healthy, degraded/disabled, dependency error, Stats failure, timeout
+$ go test -p 1 -count=5 -timeout 10m ./internal/state/ -run 'Monitor'
+  # ok 1.5 s — aggregates / empty / query-failure, repeated to prove row ids unique
+$ go test -p 1 -count=1 -timeout 20m ./internal/httpapi/
+  # ok — 200 + no-store, 503 without runtime, non-loopback 403,
+  # non-admin session 403 (runtime not called), admin 200
+$ cd frontend && npm run typecheck                            # exit 0
+$ cd frontend && npm test                                     # 10 files / 141 tests passed
+$ cd frontend && npm run build                                # exit 0, >500 kB chunk advisory only
+```
+
+Isolated smoke (worktree binary on 127.0.0.1:18012 against `praxis_gotest`; the
+production `praxis_rag` schema was not touched and no second long-running
+service was started): `GET /v1/admin/monitor/overview` returned 200 with
+`Cache-Control: no-store` and `ok:true`; mysql / redis / pdf-service reported
+`ok`, qdrant `degraded` (collection absent in the empty test schema), kafka
+`disabled` (unconfigured); `GET /console` returned 200.
+
+Notes: rebasing onto `main` conflicted only in `README.md` and
+`frontend/src/styles.css`, both resolved additively. The state test originally
+derived every row id from one shared suffix, which could collide on the
+`document_jobs` primary key (~1/3 of runs); it now uses a fresh random id per row
+and passed `-count=5`. `go test ./...` for unrelated packages (e2e, cmd, workers)
+was not rerun.
