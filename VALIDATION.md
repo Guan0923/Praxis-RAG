@@ -1143,8 +1143,9 @@ Behavior/limits confirmed by the run: `Kinds`/`IsKind` include `jev`;
 
 ## Console 系统监控 page (admin-only) and read-only overview API — 2026-11-11
 
-Delivered in worktree `add-console-monitor-page` (one commit, rebased onto
-`main`@`009f97f` after the batch-delete and JEV merges):
+Delivered in worktree `add-console-monitor-page` (feature commit `b7d9a34`,
+rebased onto `main`@`9d55b6e` after the batch-delete, JEV and compact-admin
+commits):
 
 - `GET /v1/admin/monitor/overview` (`authAdmin`, `Cache-Control: no-store`):
   service identity, five parallel dependency probes (MySQL / Redis / Qdrant /
@@ -1179,7 +1180,7 @@ $ go test -p 1 -count=1 -timeout 20m ./internal/httpapi/
   # ok — 200 + no-store, 503 without runtime, non-loopback 403,
   # non-admin session 403 (runtime not called), admin 200
 $ cd frontend && npm run typecheck                            # exit 0
-$ cd frontend && npm test                                     # 10 files / 141 tests passed
+$ cd frontend && npm test                                     # 10 files / 145 tests passed
 $ cd frontend && npm run build                                # exit 0, >500 kB chunk advisory only
 ```
 
