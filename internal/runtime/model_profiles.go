@@ -67,8 +67,9 @@ func (s *Service) ModelProfile(ctx context.Context, id string) (map[string]any, 
 
 // CreateModelProfile validates one saved model configuration, probes the
 // provider (embedding records the dense dimension, reranker validates access,
-// VLM is not probed), then persists it. Duplicate (kind, name) pairs are a
-// conflict; the key is stored protected with the shared state encryption key.
+// VLM, OCR and JEV are not probed), then persists it. Duplicate (kind, name)
+// pairs are a conflict; the key is stored protected with the shared state
+// encryption key.
 func (s *Service) CreateModelProfile(ctx context.Context, draft kbconfig.ModelProfileDraft) (map[string]any, error) {
 	connection, name, err := kbconfig.DraftModelProfile(modelapi.ModelConnection{}, draft.Kind, draft.Name, draft)
 	if err != nil {
@@ -188,7 +189,8 @@ func (s *Service) ModelProfileKey(ctx context.Context, id string) (string, error
 
 // ModelProfileModels lists the provider models of one saved model configuration
 // through its stored connection, with no client overrides. A provider without a
-// /models route yields an empty list, exactly like the knowledge-base form.
+// /models route yields an empty list, exactly like the knowledge-base form; JEV
+// configurations never call the provider because they have no such route.
 func (s *Service) ModelProfileModels(ctx context.Context, id string) ([]string, error) {
 	record, err := s.stores.ModelProfiles.Get(ctx, id)
 	if err != nil {
@@ -196,6 +198,11 @@ func (s *Service) ModelProfileModels(ctx context.Context, id string) ([]string, 
 	}
 	if record == nil {
 		return nil, &apierrors.KnowledgeValidationError{Message: kbconfig.MessageModelProfileMissing}
+	}
+	if record.Kind == "jev" {
+		// JEV has no OpenAI-compatible /models route; the model id is entered
+		// by hand in the Console.
+		return []string{}, nil
 	}
 	connection, err := kbconfig.ModelProfileConnection(modelProfileStored(*record), s.stores.Settings.EncryptionKey)
 	if err != nil {

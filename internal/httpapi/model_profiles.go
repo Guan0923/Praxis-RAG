@@ -234,6 +234,12 @@ func (s *Server) handleModelProfileModels(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"models": models})
 }
 
+// modelProfileKinds lists the kinds the 模型配置 (saved model configuration)
+// surface accepts. It is intentionally separate from knowledgeBaseKinds: "jev"
+// (TypeSafe System One decision model) is a Console-only configuration and is
+// not selectable as a knowledge-base model.
+var modelProfileKinds = map[string]struct{}{"embedding": {}, "reranker": {}, "vlm": {}, "ocr": {}, "jev": {}}
+
 // validateModelProfileBody reproduces the FastAPI validation order of the create
 // body: kind (required Literal), name (required, 1..80), model (required,
 // 1..512), then the optional base_url length bound.
@@ -241,10 +247,10 @@ func validateModelProfileBody(kind string, name, baseURL, model *string) []valid
 	if kind == "" {
 		return []validationDetail{{Type: "missing", Loc: []any{"body", "kind"}, Msg: "Field required"}}
 	}
-	if _, ok := knowledgeBaseKinds[kind]; !ok {
+	if _, ok := modelProfileKinds[kind]; !ok {
 		return []validationDetail{{
 			Type: "literal_error", Loc: []any{"body", "kind"},
-			Msg: "Input should be 'embedding', 'reranker', 'vlm' or 'ocr'",
+			Msg: "Input should be 'embedding', 'reranker', 'vlm', 'ocr' or 'jev'",
 		}}
 	}
 	if name == nil {

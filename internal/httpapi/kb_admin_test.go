@@ -250,6 +250,14 @@ func TestKnowledgeBaseAdminModels(t *testing.T) {
 	if badKind.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("bad kind status = %d", badKind.Code)
 	}
+	// "jev" is a saved-model kind only and stays rejected for knowledge bases.
+	jevKind := performRequest(handler, testRequest{
+		method: "POST", target: "/v1/admin/knowledge-bases/models/jev", remote: "127.0.0.1:5000",
+		body: `{}`,
+	})
+	if jevKind.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("jev kind status = %d", jevKind.Code)
+	}
 }
 
 func TestKnowledgeBaseAdminUpdate(t *testing.T) {

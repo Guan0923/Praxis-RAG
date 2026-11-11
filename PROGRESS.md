@@ -599,3 +599,14 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] Console：模型配置页新增 OCR 页签（只显示「OCR 引擎」下拉、隐藏地址/Key/探测，表格按类型调整列）；创建/编辑知识库表单新增 OCR 卡片（启用开关 + 必选，无 OCR 模型时引导去「模型配置」），`ocr_model` 随创建/更新提交并在编辑时回填；创建页模型区改为 2×2。
 - [x] 测试：Go `go build ./...`/`go vet ./...` 干净，`go test -p 1 ./internal/...` 全绿（`RAG_TEST_MYSQL_URL=praxis_gotest`）；Python `pytest` 140 passed；Console `npx vitest run` 63 passed + `npm run typecheck`；Go 客户端→fake pdf-parser 真实 HTTP 的 `options` E2E（带配置 200、非法 options 422）通过。详见 `VALIDATION.md`。
 - 已知边界：真实 Docling pipeline 仍未在本机运行（未装 docling/torch，tesseract 需要镜像/系统语言包，`auto` 固定映射 EasyOCR）；历史知识库没有 `ocr_model`，在 docling 引擎下需先在 Console 补配 OCR 才能上传 PDF；校验只在受理路径，重新解析既有文档仍走原队列路径；OCR 引擎/语言未逐知识库开放语言列表配置（当前按引擎默认语言）。
+
+## 2026-11-11 JEV（TypeSafe System One）模型配置
+
+本轮按需求在 Console「模型配置」页新增 `kind=jev`，用于保存 TypeSafe JEV（System One 决策模型）的连接；当前只做配置，尚未接入检索或决策调用。
+
+- [x] 模型配置：`Kinds` 追加 `jev`，复用 `model_profiles` 表（不做 DB schema 迁移，也不加入知识库 `CredentialKinds`）；`DraftModelProfile` 按普通远端模型校验 配置名称 / 服务地址 / 模型标识，`ProbeModelProfile` 对 JEV 不探测（与 VLM / OCR 同一分支），`/{id}/models` 对 JEV 直接返回空数组（没有 OpenAI 兼容 `/models` 路由）；HTTP 校验新增独立的 `modelProfileKinds`，知识库 `/v1/admin/knowledge-bases/models/{kind}` 仍只接受 embedding / reranker / vlm / ocr；`CreateModelProfileBody` 的 kind 枚举同步为 5 类。
+- [x] Console：模型配置页新增 JEV 页签（配置名称 / 服务地址 / API Key / 模型名称），隐藏「获取模型列表」，模型名提供 `jev-latest` / `jev-preview` / `jev-1.13.0` / `typesafe/jev-1.13` 快捷建议（仍可自由输入），服务地址占位提示 TypeSafe 与 OpenRouter 两种模板；知识库创建/编辑表单改用 `knowledgeBaseModelKinds`，JEV 不会出现。
+- [x] 测试：Go 覆盖 `Kinds` / `IsKind`、JEV 不探测、HTTP 创建接受 `kind=jev`、知识库模型路由拒绝 jev、OpenAPI 枚举 5 类、runtime 创建/重命名/模型列表短路；Console 覆盖 `modelKinds` / `knowledgeBaseModelKinds` 词汇与 JEV 表单创建（不请求 `/models`）。
+- [x] 文档：README、docs/USAGE.md（JEV 说明与 curl 示例）、docs/knowledge-base-settings.md 同步。
+- [x] 验证：`go build ./...`、`go vet ./internal/kbconfig ./internal/httpapi ./internal/runtime ./internal/state`、`go test ./internal/kbconfig`、`go test -p 1 ./internal/httpapi`（17.5s）、`go test -p 1 ./internal/runtime ./internal/state`（475.0s / 422.5s）全部通过；runtime 的 `TestModelProfileJEVConfiguration` 与 httpapi 的 `TestModelProfile*` 定向用例通过；Console `npm run typecheck` 通过、`npm test` 5 文件 64 用例全绿（新增 1 个 JEV 用例）。详见 VALIDATION.md。
+- 已知边界：JEV 仅保存配置，未实现 TypeSafe `/systemone` 或 OpenRouter `/decisions` 调用；Key 与模型目前不会被检索或 Agent 流程读取。

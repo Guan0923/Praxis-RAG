@@ -37,14 +37,21 @@ they are not automatically migrated or assigned inferred provider credentials.
 
 The Console no longer types a provider connection into the create/edit
 knowledge-base form. A dedicated 模型配置 page (`#/model-profiles`,
-administrators only) maintains a reusable list of Embedding / Reranker / VLM
-connections in the `model_profiles` table: `id`, `kind`, `name`, `base_url`,
+administrators only) maintains a reusable list of Embedding / Reranker / VLM /
+OCR / JEV connections in the `model_profiles` table: `id`, `kind`, `name`, `base_url`,
 `model`, `protected_key`, `vector_size`, `created_at`, `updated_at`, with a
 unique `(kind, name)` pair. The key is encrypted with
 `RAG_STATE_ENCRYPTION_KEY`; list and detail responses expose only
 `api_key_set`. Saving an Embedding profile probes the provider once and records
 the dense dimension in `vector_size`; a Reranker profile gets one bounded rerank
 call; VLM is not probed.
+
+The saved-model vocabulary also includes `jev` (TypeSafe JEV / System One
+decision-model endpoint). A JEV profile stores name, base URL, model and the
+encrypted key like a VLM profile, is never probed, has no provider `/models`
+listing, and is not offered when creating or editing a knowledge base;
+knowledge bases still copy only embedding/reranker/vlm/ocr connections. It is a
+Console-only configuration today, kept for later decision-model use.
 
 A knowledge base still stores its own copy. Creating or editing a knowledge base
 copies the selected profile's `base_url`, decrypted key and `model` into the

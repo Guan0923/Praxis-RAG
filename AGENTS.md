@@ -1,0 +1,59 @@
+# AGENTS.md
+
+> 本文件会作为**常驻系统提示词**注入，只保留跨任务都必须知道的最小事实与硬性约束；细节按需读 `docs/agents/`，不要往本文件里堆长篇说明。
+> 校对基准：仓库代码 + `docs/`（2026-11-11）。`PROGRESS.md`、`docs/GO_MIGRATION.md` 是历史记录，当前功能以 `docs/agents/`、`README.md`、`docs/USAGE.md` 为准。
+
+## 1. 这是什么
+
+Praxis-RAG：面向 AI 助手与业务应用的**独立知识库与检索服务**。文档切分、向量化并索引后，通过 REST / MCP / Web Console 返回带出处（文档、片段、页码、图片、表格）的**证据**，不生成最终回答。
+
+- 后端：**Go 1.27**（`cmd/` 入口 + `internal/` 实现）；`rag-service` + 3 个 worker + 若干 CLI。
+- 前端：`frontend/`（React 19 + TypeScript + Ant Design 6 + Vite），Go 服务在 `/console` 托管。
+- 状态：**MySQL 8**（唯一状态库）；向量：**Qdrant HTTP**；缓存/快照：Redis（可选）；消息：Kafka（可选）。
+- PDF 高保真：可选独立微服务 `python-workers/pdf-service`（FastAPI + Docling，HTTP :8091）；除此之外无 Python 依赖。
+
+## 2. 硬性约束（任何改动都适用）
+
+1. **契约稳定**：MCP 工具名与 schema、REST 路径与响应、环境变量名、`enc:v1:` 凭据格式、MySQL 表结构、PDF 清单版本（`go-native-v1` / `docling-service-v1`）。改契约必须同时做迁移并更新文档。
+2. **不要重新引入**：Python 主后端、SQLite、RocketMQ、Qdrant 本地文件模式（`QDRANT_PATH`）。当前是 Kafka + MySQL。
+3. **Go 不依赖 Python**：`go build ./...` 与 `go test ./...` 不涉及 Python；PDF 版面/表格/OCR/公式能力只放在 pdf-service 或纯 Go 实现。
+4. **MySQL 是事实来源**：Kafka 只传通知。上传默认**异步受理**（`document_jobs` + `document_job_outbox` 单事务）；`artifact_id` 不代表已索引，只有状态 `succeeded` 才可检索。
+5. **测试必须串行**：`RAG_TEST_MYSQL_URL` 指向库名含 `test` 的一次性 MySQL，并用 `go test -p 1 -count=1 -timeout 25m ./...`；并行会抢同一 schema 的 advisory lock。
+6. **不提交生成物**：`dist/`、`build/`、`frontend/node_modules/`、`.test-tmp/`、`.env*`（除 `.env.example`）、模型/向量数据、根目录 worker 二进制。
+7. **安全默认**：默认只监听 loopback；非 loopback 必须 `RAG_SERVICE_TOKEN` + MCP Host/Origin 白名单；`/v1/admin/*` 仅本机直连或管理员会话；日志不记录查询、正文与凭据。
+8. **中文优先**：Console 文案、`README.md`、`docs/` 均为中文；功能/配置变化至少同步 `README.md` 或 `docs/USAGE.md`。
+
+## 3. 常用命令
+
+```powershell
+pwsh -File scripts/build-go.ps1            # Console + Go 二进制 + 本机冒烟
+make build | make test | make check | make smoke
+
+$env:RAG_TEST_MYSQL_URL = 'mysql+pymysql://rag:change-me@127.0.0.1:3307/praxis_unit_test?charset=utf8mb4'
+go vet ./...; go test -p 1 -count=1 -timeout 25m ./...
+
+cd frontend; npm ci; npm run typecheck; npm test; npm run build
+```
+
+产物在 `dist/bin/` 与 `dist/web/`；服务入口 `dist/bin/rag-service`（`/console`、`/mcp`、`/v1/*`、`/docs`、`/health`）。
+
+## 4. 阅读地图
+
+| 需要什么 | 读这里 |
+| --- | --- |
+| 架构、进程、目录结构、`internal` 包职责 | [`docs/agents/architecture.md`](docs/agents/architecture.md) |
+| 功能清单：导入/解析/切分/检索/MCP/REST/Console/权限/队列/CLI | [`docs/agents/features.md`](docs/agents/features.md) |
+| 配置项、构建测试、改动约束细项、限制与未验证项 | [`docs/agents/development.md`](docs/agents/development.md) |
+| 用户视角、快速开始、部署 | [`README.md`](README.md)、[`docs/USAGE.md`](docs/USAGE.md)、[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) |
+| 权限与共享 | [`docs/PERMISSIONS.md`](docs/PERMISSIONS.md) |
+| 迁移历史与契约差异 | [`docs/GO_MIGRATION.md`](docs/GO_MIGRATION.md)、[`docs/GO_PARITY_AUDIT.md`](docs/GO_PARITY_AUDIT.md) |
+| 状态库 / 缓存 / 结果引用 | [`docs/state-storage.md`](docs/state-storage.md)、[`docs/state-cache.md`](docs/state-cache.md)、[`docs/result-references.md`](docs/result-references.md) |
+| 已做过的验证 | [`VALIDATION.md`](VALIDATION.md) |
+
+## 5. 代码速查
+
+- 服务入口与路由：`cmd/rag-service/main.go`、`internal/httpapi/server.go`
+- MCP：`internal/mcp/`（工具 `tools.go`、资源 `resources.go`、提示词 `prompts.go`）
+- 状态库与 schema：`internal/state/`；入库管线：`internal/ingest/`；解析：`internal/document/`
+- 检索：`internal/retrieval/` + `internal/qdrant/` + `internal/sparse/`
+- 配置：`internal/config/`；Console：`frontend/src/`
