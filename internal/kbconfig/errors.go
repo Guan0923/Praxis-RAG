@@ -40,6 +40,12 @@ const (
 	// MessageVLMModelRequired is raised when a VLM service URL is configured
 	// without a model name.
 	MessageVLMModelRequired = "请填写 VLM 模型名称"
+	// MessageOCREngineRequired is raised when a saved OCR model configuration
+	// has no engine id.
+	MessageOCREngineRequired = "请选择 OCR 引擎"
+	// MessageOCREngineInvalid is raised when the OCR engine is not one of
+	// auto/easyocr/tesseract/rapidocr.
+	MessageOCREngineInvalid = "OCR 引擎无效，请选择 auto、easyocr、tesseract 或 rapidocr"
 
 	// MessageModelKindInvalid is raised when a saved model configuration names
 	// an unsupported provider kind.

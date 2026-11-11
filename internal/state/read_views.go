@@ -10,7 +10,10 @@ import (
 )
 
 // CredentialKinds are the provider settings replaced by redacted public views
-// (model_settings.KINDS in Python).
+// (the provider half of model_settings.KINDS in Python): each one owns a
+// base_url/protected_key pair. The OCR model kind has no provider connection, so
+// "ocr" is not listed here and ocr_model stays a plain knowledge-base setting
+// in the projection.
 var CredentialKinds = []string{"embedding", "reranker", "vlm"}
 
 // PublicSettings mirrors rag_mcp.knowledge_bases.public_settings: provider

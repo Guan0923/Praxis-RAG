@@ -738,8 +738,8 @@ h3 {
 .knowledge-base-form {
   max-width: 720px;
 }
-/* 创建知识库页面：横向多列布局（模型配置三列、文本切分三列、基础信息两列），
-   窄屏逐级降为两列/一列。编辑知识库的抽屉仍用上面的 720px 纵向布局。 */
+/* 创建知识库页面：横向多列布局（模型配置 2×2、文本切分三列、基础信息两列），
+   窄屏逐级降为一列。编辑知识库的抽屉仍用上面的 720px 纵向布局。 */
 .knowledge-base-form-wide {
   max-width: 1080px;
 }
@@ -757,7 +757,8 @@ h3 {
 }
 .knowledge-provider-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Embedding / Reranker / VLM / OCR 四张卡片按 2×2 排列。 */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0 24px;
   border-top: 1px solid var(--line);
   padding: 20px 0 4px;
@@ -765,6 +766,11 @@ h3 {
 .knowledge-provider-grid > .knowledge-provider {
   border-top: 0;
   padding: 0;
+}
+/* 2×2 网格的第二行卡片需要自己的分隔线与上内边距。 */
+.knowledge-provider-grid > .knowledge-provider:nth-child(n + 3) {
+  border-top: 1px solid var(--line);
+  padding-top: 20px;
 }
 .knowledge-base-form-wide .knowledge-chunk-row {
   display: grid;
@@ -778,11 +784,6 @@ h3 {
 .knowledge-provider-grid > *,
 .knowledge-chunk-row .ant-form-item {
   min-width: 0;
-}
-@media (max-width: 1180px) {
-  .knowledge-provider-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 @media (max-width: 1023px) {
   .knowledge-base-form-wide .knowledge-chunk-row {

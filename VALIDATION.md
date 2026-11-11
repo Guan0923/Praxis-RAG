@@ -875,3 +875,64 @@ docker compose --env-file .env.example config --quiet                       # ex
 - 服务端超时只能快速返回 504，无法中断已启动的 Docling 线程；并发槽在后台任务结束后才释放。
 - `/healthz` 恒 200（配置 degraded 时 `/v1/parse` 返回 503），compose healthcheck 只反映进程可用性。
 - zip 不再包含旧 worker 的 `document.json`/`ocr.json`，OCR 明细只保留在 manifest 的 `warnings` 中。
+
+## Console OCR 模型配置 + Docling 按知识库下发 VLM/OCR — 2026-11-11
+
+在独立 worktree/branch `docling-kb-ocr-vlm`（基线 commit `2e17c0f`，已含 Docling PDF 微服务）实现：Console「模型配置」新增 OCR 类型，知识库设置新增 `ocr_model`；docling 引擎上传 PDF 时按知识库把 VLM/OCR 配置随 `POST /v1/parse` 的 multipart `options` 下发给 pdf-parser；未配置时在受理阶段提示用户去配置，不进入队列。
+
+接口/数据契约：
+
+```
+POST /v1/parse  multipart: file=<PDF>  options=<JSON>
+options = {"vlm":{"base_url":"https://.../v1","api_key":"sk-...","model":"qwen2.5-vl-7b",
+                  "timeout":120,"concurrency":4},
+           "ocr":{"engine":"easyocr"}}        # engine: auto|easyocr|tesseract|rapidocr
+```
+
+- 模型配置：`kind=ocr` 复用 `model_profiles` 列，`model` 为引擎 id、`base_url` 可空、apikey 不存、不探测；`POST/PATCH /v1/admin/model-profiles` 与 openapi kind enum 同步。
+- 知识库：创建/更新 API 新增 `ocr_model`（更新缺省保留、空串清除，白名单校验 422）；列表/详情投影与 `RAG_DEFAULT_KB_TEMPLATE` 克隆保留该字段。
+- 上传：`RAG_PDF_ENGINE=docling` 且有 `.pdf` 时，同步 `Upload` 与异步受理都要求 VLM（KB 优先，`RAG_VLM_*` 回退，model 非空）与 OCR 均已配置，否则返回 `PDF 解析需要先在「模型配置」页添加 VLM 和 OCR 模型，并在知识库配置中选择后再上传。`，不写 `upload_operations`/`document_jobs`；非 PDF、`go` 引擎不受影响。
+- 传输：`DoclingServiceParser` 增加 `VLM`/`OCR`；`options` 仅在已配置时发送，api_key 不落日志/错误文案；python 侧按请求覆盖环境变量，`manifest.parser.ocr_engine` 记录实际引擎。
+
+验证命令与结果（worktree 根目录，MySQL `praxis_gotest`）：
+
+```
+$ go build ./...                                      # exit 0
+$ go vet ./...                                        # exit 0
+$ go test -p 1 ./internal/... -count=1                # exit 0，全绿
+  ok internal/document 0.891s   ok internal/kbconfig 0.278s   ok internal/httpapi 17.514s
+  ok internal/ingest 0.284s     ok internal/runtime 474.244s  ok internal/state 423.301s
+  ok internal/e2e 215.467s      ...（其余包全 ok）
+
+$ cd python-workers/pdf-service
+$ D:\Project\Praxis-RAG\.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider
+140 passed in 0.85s                                   # 基线 57 + 新增 83；无需 docling/torch
+
+$ cd frontend
+$ npx vitest run     # 5 files / 63 tests passed（基线 54 + 新增 9，OCR 用例含请求体与 /key、/models 不调用断言）
+$ npm run typecheck  # exit 0
+# 注：本沙箱 Vite 8 的 `net use` 管道探测报 spawn EPERM（基线同样），按既有做法用临时 NODE_OPTIONS
+#     child_process preload shim 运行；shim 在 %TEMP%，未入库。
+
+$ docker compose --env-file .env.example config --quiet   # exit 0（仅注释变更）
+```
+
+Go 客户端 → 真实 HTTP fake pdf-parser 的 `options` 端到端（服务用 `RAG_PDF_SERVICE_CONVERTER=fake` 起在 127.0.0.1:8097）：
+
+```
+Go: DoclingServiceParser{VLM:{BaseURL:vlm.internal:8443, Model:qwen2.5-vl-7b, Timeout:120s, Concurrency:2},
+                         OCR:{Engine:easyocr}, BaseURL:http://127.0.0.1:8097}
+    -> ParseInto 成功，staging 含 manifest.json + pictures/picture-0.png（PASS，临时 E2E 测试已删除）
+HTTP: 带 options（vlm+ocr=tesseract）                 -> 200 application/zip 1216 B
+      options 非法 JSON                                -> 422 "options 不是合法的 JSON 对象"
+      options.ocr.engine=nope                          -> 422 "options.ocr.engine 不受支持；可选值：auto、easyocr、tesseract、rapidocr"
+      不带 options                                     -> 200 application/zip 1215 B（向后兼容）
+```
+
+已知限制/未验证：
+
+- 本机仍未安装 docling/torch：真实 Docling pipeline 未运行，OCR 引擎映射（EasyOCR/Tesseract/RapidOCR）只有不依赖 docling 的单元测试与 fake 契约测试；tesseract 还需要镜像/系统安装 tesseract 与 `chi_sim`/`eng` 语言包，`auto` 当前固定映射 EasyOCR。
+- 历史知识库没有 `ocr_model`：在 `RAG_PDF_ENGINE=docling` 下上传 PDF 会被提示先配置（符合需求），需要管理员在 Console 补配 OCR 后才可继续；`go` 引擎不受影响。
+- 上传校验只作用于“受理上传”路径；重新解析既有文档仍走原 queue/reparse 路径，不改其失败语义。
+- OCR 语言按引擎默认（EasyOCR `ch_sim,en`、Tesseract `chi_sim,eng`），暂未提供按知识库自定义语言列表的入口；模型配置页与知识库表单只做 jsdom 组件测试，未做浏览器视觉回归。
+

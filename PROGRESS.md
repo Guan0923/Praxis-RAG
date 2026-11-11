@@ -1,6 +1,6 @@
 # RAG MCP 开发进展
 
-最后更新：2026-11-10
+最后更新：2026-11-11
 
 ## 总体目标
 
@@ -587,3 +587,15 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 编辑知识库抽屉（知识库列表 → 配置，720px 宽）保持原有纵向布局，避免在窄抽屉里挤压模型下拉框；表单字段、校验与提交逻辑均未改，仅把模型卡片与切分字段包进 grid 容器。
 - [x] 验证：`npm run typecheck` 通过；`npm test` 54/54；`npm run build` 通过；无头 Chrome 在 1440 / 1024 / 390 宽度截图核对管理员三列/两列/单列、租户两列表单与编辑抽屉布局（截图保存在未入库的 `.test-tmp/create-kb-layout/`）。详见 VALIDATION.md。
 - 已知边界：多列布局只作用于「创建知识库」页面；编辑抽屉仍为单列；仓库无 Playwright/Cypress，布局用无头 Chrome 截图人工核对，没有自动化浏览器回归。
+
+## 2026-11-11 Console OCR 模型配置与 Docling 按知识库下发 VLM+OCR
+
+本轮把 Docling 的 OCR 与 VLM 从服务级环境变量改为**按知识库的用户配置**：Console「模型配置」新增 OCR 类型，知识库设置新增 `ocr_model`，上传时 Go 服务把 VLM/OCR 随解析请求下发给 pdf-parser；缺失配置在受理阶段提示用户去配置。
+
+- [x] 模型配置：新增 `kind=ocr`（与 embedding/reranker/vlm 并列），条目只保存 OCR 引擎 `auto|easyocr|tesseract|rapidocr`（默认 easyocr），无服务地址/API Key/探测；`DraftModelProfile`/`ProbeModelProfile`/HTTP 校验/openapi kind 枚举同步；不做 DB schema 迁移。
+- [x] 知识库设置：创建/更新 API 接受 `ocr_model`（更新缺省保留、空串清除），存入 KB settings 并出现在知识库公开投影；`RAG_DEFAULT_KB_TEMPLATE` 克隆保留 OCR 引擎。
+- [x] 运行时：`uploadResources` 解析 VLM+OCR；docling 引擎下 PDF 上传在受理阶段（同步 `Upload` 与异步 `AdmitDocument`）校验 VLM 已配置且 model 非空（KB 优先，`RAG_VLM_*` 回退）+ OCR 已配置，缺失返回中文 `KnowledgeValidationError` 且不写 journal/`document_jobs`；`DoclingServiceParser` 新增 `VLM`/`OCR` 字段，multipart 新增 `options`（`{"vlm":{"base_url","api_key","model","timeout","concurrency"},"ocr":{"engine"}}`，api_key 不写日志），timeout/concurrency 取服务级 `RAG_VLM_*`。
+- [x] Python 服务：`/v1/parse` 接受可选 `options` 文本字段，按请求覆盖 VLM 与 OCR 引擎（`easyocr`/`auto`→EasyOCR 默认 `ch_sim,en`、`tesseract`→`chi_sim,eng`、`rapidocr`→RapidOCR），非法 options 返回 422 安全消息，`manifest.parser.ocr_engine` 记录实际引擎；无 options 时保持环境变量行为。
+- [x] Console：模型配置页新增 OCR 页签（只显示「OCR 引擎」下拉、隐藏地址/Key/探测，表格按类型调整列）；创建/编辑知识库表单新增 OCR 卡片（启用开关 + 必选，无 OCR 模型时引导去「模型配置」），`ocr_model` 随创建/更新提交并在编辑时回填；创建页模型区改为 2×2。
+- [x] 测试：Go `go build ./...`/`go vet ./...` 干净，`go test -p 1 ./internal/...` 全绿（`RAG_TEST_MYSQL_URL=praxis_gotest`）；Python `pytest` 140 passed；Console `npx vitest run` 63 passed + `npm run typecheck`；Go 客户端→fake pdf-parser 真实 HTTP 的 `options` E2E（带配置 200、非法 options 422）通过。详见 `VALIDATION.md`。
+- 已知边界：真实 Docling pipeline 仍未在本机运行（未装 docling/torch，tesseract 需要镜像/系统语言包，`auto` 固定映射 EasyOCR）；历史知识库没有 `ocr_model`，在 docling 引擎下需先在 Console 补配 OCR 才能上传 PDF；校验只在受理路径，重新解析既有文档仍走原队列路径；OCR 引擎/语言未逐知识库开放语言列表配置（当前按引擎默认语言）。

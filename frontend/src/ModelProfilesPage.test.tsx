@@ -40,6 +40,18 @@ const rerankerProfile: ModelProfile = {
   updated_at: "2026-11-09T10:00:00Z",
 };
 
+// OCR 配置把引擎 id 保存在 model 里，没有服务地址与 Key。
+const ocrProfile: ModelProfile = {
+  id: "mp-ocr",
+  kind: "ocr",
+  name: "本地 OCR",
+  base_url: "",
+  model: "easyocr",
+  api_key_set: false,
+  vector_size: null,
+  updated_at: "2026-11-09T10:00:00Z",
+};
+
 function renderPage(onChanged = vi.fn()) {
   return {
     onChanged,
@@ -96,6 +108,7 @@ describe("ModelProfilesPage", () => {
     expect(screen.getByRole("tab", { name: "Embedding（1）" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "Reranker（1）" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "VLM（0）" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "OCR（0）" })).toBeTruthy();
     // Only the active kind's rows are rendered.
     expect(screen.queryByText("默认 Reranker")).toBeNull();
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/admin/model-profiles");
@@ -109,6 +122,9 @@ describe("ModelProfilesPage", () => {
     fireEvent.click(screen.getByRole("tab", { name: "VLM（0）" }));
     expect(await screen.findByText("还没有 VLM 模型，点击「添加模型」创建")).toBeTruthy();
 
+    fireEvent.click(screen.getByRole("tab", { name: "OCR（0）" }));
+    expect(await screen.findByText("还没有 OCR 模型，点击「添加模型」创建")).toBeTruthy();
+
     fireEvent.click(screen.getByRole("tab", { name: "Reranker（1）" }));
     expect(await screen.findByText("默认 Reranker")).toBeTruthy();
   });
@@ -118,7 +134,7 @@ describe("ModelProfilesPage", () => {
     renderPage();
 
     expect(
-      await screen.findByText("还没有模型配置，请先添加 Embedding / Reranker / VLM 模型；创建知识库时只能从该列表选择"),
+      await screen.findByText("还没有模型配置，请先添加 Embedding / Reranker / VLM / OCR 模型；创建知识库时只能从该列表选择"),
     ).toBeTruthy();
     expect(screen.getAllByRole("button", { name: /添加模型/ })[0]).toBeTruthy();
   });
@@ -226,5 +242,107 @@ describe("ModelProfilesPage", () => {
       base_url: "https://embed.example.com/v1",
       model: "bge-m3",
     });
+  });
+
+  it("offers OCR in the model-type picker and switches the form to the engine-only field", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ model_profiles: [embeddingProfile] }));
+    renderPage();
+    await screen.findByText("默认 Embedding");
+
+    fireEvent.click(screen.getAllByRole("button", { name: /添加模型/ })[0]);
+    const dialog = await screen.findByRole("dialog");
+    // 默认是 Embedding：保留服务地址 / Key / 模型名称。
+    expect(within(dialog).getByText("服务地址")).toBeTruthy();
+    expect(within(dialog).getByText("API Key")).toBeTruthy();
+    expect(within(dialog).queryByText("OCR 引擎")).toBeNull();
+
+    fireEvent.mouseDown(within(dialog).getByLabelText("模型类型"));
+    fireEvent.click(await screen.findByTitle("OCR"));
+
+    // 切到 OCR 后只剩引擎下拉框，默认选择 EasyOCR。
+    expect(await within(dialog).findByText("OCR 引擎")).toBeTruthy();
+    expect(within(dialog).getByText("EasyOCR")).toBeTruthy();
+    expect(within(dialog).queryByText("服务地址")).toBeNull();
+    expect(within(dialog).queryByText("API Key")).toBeNull();
+    expect(within(dialog).queryByText("获取模型列表")).toBeNull();
+  });
+
+  it("keeps OCR profiles to the engine column and creates them with an empty connection", async () => {
+    fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
+      if (path === "/v1/admin/model-profiles" && options.method === "POST")
+        return jsonResponse({ profile: { ...ocrProfile, id: "mp-ocr-new", name: "新 OCR" } }, 201);
+      return jsonResponse({ model_profiles: [embeddingProfile, ocrProfile] });
+    });
+    const { onChanged } = renderPage();
+    await screen.findByText("默认 Embedding");
+    fireEvent.click(screen.getByRole("tab", { name: "OCR（1）" }));
+
+    expect(await screen.findByText("本地 OCR")).toBeTruthy();
+    expect(screen.getByRole("columnheader", { name: "OCR 引擎" })).toBeTruthy();
+    expect(screen.getByText("easyocr")).toBeTruthy();
+    // OCR 不使用服务地址、Key 与向量维度列。
+    expect(screen.queryByText("服务地址")).toBeNull();
+    expect(screen.queryByText("Key")).toBeNull();
+    expect(screen.queryByText("1024")).toBeNull();
+
+    fireEvent.click(screen.getAllByRole("button", { name: /添加模型/ })[0]);
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("OCR 引擎")).toBeTruthy();
+    expect(within(dialog).queryByText("服务地址")).toBeNull();
+    expect(within(dialog).queryByText("API Key")).toBeNull();
+    expect(within(dialog).queryByText("获取模型列表")).toBeNull();
+
+    fireEvent.change(within(dialog).getByLabelText("配置名称"), { target: { value: "新 OCR" } });
+    fireEvent.mouseDown(within(dialog).getByLabelText("OCR 引擎"));
+    fireEvent.click(await screen.findByTitle("Tesseract"));
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    const post = fetchMock.mock.calls.find(
+      ([path, options]) => path === "/v1/admin/model-profiles" && (options as RequestInit | undefined)?.method === "POST",
+    );
+    expect(post).toBeTruthy();
+    expect(JSON.parse(String((post![1] as RequestInit).body))).toEqual({
+      kind: "ocr",
+      name: "新 OCR",
+      base_url: "",
+      model: "tesseract",
+      apikey: "",
+    });
+  });
+
+  it("edits an OCR profile without revealing a key or probing a model list", async () => {
+    fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
+      if (path === "/v1/admin/model-profiles/mp-ocr" && options.method === "PATCH")
+        return jsonResponse({ profile: ocrProfile });
+      return jsonResponse({ model_profiles: [ocrProfile] });
+    });
+    const { onChanged } = renderPage();
+    fireEvent.click(await screen.findByRole("tab", { name: "OCR（1）" }));
+    fireEvent.click(await screen.findByRole("button", { name: "编辑 本地 OCR" }));
+
+    const dialog = await screen.findByRole("dialog");
+    // 编辑时从 profile.model 回填引擎，只显示引擎下拉框。
+    expect(within(dialog).getByText("EasyOCR")).toBeTruthy();
+    expect(within(dialog).getByText("OCR 引擎")).toBeTruthy();
+    expect(within(dialog).queryByText("API Key")).toBeNull();
+    expect(within(dialog).queryByText("获取模型列表")).toBeNull();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    const patch = fetchMock.mock.calls.find(
+      ([path, options]) =>
+        path === "/v1/admin/model-profiles/mp-ocr" && (options as RequestInit | undefined)?.method === "PATCH",
+    );
+    expect(patch).toBeTruthy();
+    expect(JSON.parse(String((patch![1] as RequestInit).body))).toEqual({
+      name: "本地 OCR",
+      base_url: "",
+      model: "easyocr",
+      apikey: "",
+    });
+    // OCR 配置既没有 Key 可读取，也没有远端模型列表可探测。
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/key"))).toBe(false);
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/models"))).toBe(false);
   });
 });

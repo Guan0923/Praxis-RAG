@@ -228,6 +228,14 @@ func (s *Service) cloneDefaultKnowledgeBase(
 	cloned.RerankerValues = connectionValues(reranker)
 	cloned.VLMModel = vlm.Model
 	cloned.VLMValues = connectionValues(vlm)
+	// The OCR engine is a knowledge-base setting rather than a provider
+	// connection. A clone inherits the template's engine so Docling uploads keep
+	// working for tenant-created knowledge bases.
+	if strings.TrimSpace(cloned.OCRModel) == "" {
+		if engine, ok := settings["ocr_model"].(string); ok {
+			cloned.OCRModel = engine
+		}
+	}
 	if strings.TrimSpace(cloned.TokenizerModel) == "" {
 		if tokenizer, ok := settings["tokenizer"].(string); ok {
 			cloned.TokenizerModel = tokenizer

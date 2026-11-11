@@ -31,8 +31,19 @@ type ProfileValues = {
 const cleanUrl = (value: string) => value.trim().replace(/\/+$/, "");
 const cleanText = (value: string) => value.trim();
 
-// ModelProfilesPage 维护可复用的 Embedding / Reranker / VLM 连接：创建和修改
-// 知识库时只从这里选择，页面本身不保存任何明文 Key。
+// OCR 引擎在模型配置里保存为 model 字段；它没有服务地址与 API Key，实际推理由
+// 解析服务执行，因此这里只提供固定引擎列表而不是自由输入。
+const ocrEngines = [
+  { value: "auto", label: "自动" },
+  { value: "easyocr", label: "EasyOCR" },
+  { value: "tesseract", label: "Tesseract" },
+  { value: "rapidocr", label: "RapidOCR" },
+];
+const defaultOcrEngine = "easyocr";
+const isOcrEngine = (value: unknown) => ocrEngines.some((engine) => engine.value === value);
+
+// ModelProfilesPage 维护可复用的 Embedding / Reranker / VLM / OCR 连接：创建和
+// 修改知识库时只从这里选择，页面本身不保存任何明文 Key。
 export function ModelProfilesPage({ disabled, onChanged }: {
   disabled: boolean;
   onChanged?: () => void;
@@ -55,6 +66,10 @@ export function ModelProfilesPage({ disabled, onChanged }: {
   // clearKey 标记编辑时「保存后清除已保存的 Key」：PATCH 需要显式发送 apikey: ""。
   const [clearKey, setClearKey] = useState(false);
   const [form] = Form.useForm<ProfileValues>();
+  // 表单内当前选择的模型类型：OCR 需要隐藏服务地址/Key 并换成引擎下拉框。
+  const watchedKind = Form.useWatch("kind", form) as ModelKind | undefined;
+  const formKind: ModelKind = watchedKind || editing?.kind || kind;
+  const isOcrForm = formKind === "ocr";
   const listRequest = useRef<AbortController | null>(null);
   const modelsRequest = useRef<AbortController | null>(null);
   const keyRequest = useRef<AbortController | null>(null);
@@ -86,7 +101,7 @@ export function ModelProfilesPage({ disabled, onChanged }: {
   }, [load]);
 
   const counts = useMemo(() => {
-    const result: Record<ModelKind, number> = { embedding: 0, reranker: 0, vlm: 0 };
+    const result: Record<ModelKind, number> = { embedding: 0, reranker: 0, vlm: 0, ocr: 0 };
     for (const profile of profiles) {
       if (profile.kind in result) result[profile.kind] += 1;
     }
@@ -131,17 +146,22 @@ export function ModelProfilesPage({ disabled, onChanged }: {
     savingRef.current = true;
     setSaving(true);
     setFormError("");
+    const ocr = values.kind === "ocr";
     const payload = {
       name: cleanText(values.name),
-      base_url: cleanUrl(values.base_url),
+      // OCR 不访问远端服务：base_url 与 apikey 固定提交空串。
+      base_url: ocr ? "" : cleanUrl(values.base_url || ""),
       model: cleanText(values.model),
-      apikey: values.apikey?.trim() || "",
+      apikey: ocr ? "" : values.apikey?.trim() || "",
     };
     try {
       if (editing) {
         const { apikey, ...rest } = payload;
         // 留空表示沿用服务端已保存的 Key；标记清除时必须显式发送空字符串。
-        const update = clearKey ? { ...rest, apikey: "" } : apikey ? { ...rest, apikey } : rest;
+        // OCR 没有 Key，PATCH 时同样显式发送空串。
+        const update = ocr || clearKey
+          ? { ...rest, apikey: "" }
+          : apikey ? { ...rest, apikey } : rest;
         await updateModelProfile(editing.id, update);
         void message.success("模型配置已更新");
       } else {
@@ -177,6 +197,8 @@ export function ModelProfilesPage({ disabled, onChanged }: {
 
   async function loadModels() {
     const values = form.getFieldsValue();
+    // OCR 引擎是固定列表，不存在远端 /models 探测。
+    if (values.kind === "ocr") return;
     const baseUrl = cleanUrl(values.base_url || "");
     if (!baseUrl) {
       setModelHint("请先填写服务地址，再获取模型列表");
@@ -221,7 +243,8 @@ export function ModelProfilesPage({ disabled, onChanged }: {
 
   async function showKey(visible: boolean) {
     // 新建配置没有已保存的 Key；编辑时首次点开才向服务端读取。已标记清除时
-    // 不再回读已保存的 Key。
+    // 不再回读已保存的 Key。OCR 没有 Key，任何情况下都不读取。
+    if (editing?.kind === "ocr") return;
     if (!visible || !editing?.api_key_set || form.getFieldValue("apikey") || clearKey) {
       setKeyVisible(visible);
       return;
@@ -260,22 +283,24 @@ export function ModelProfilesPage({ disabled, onChanged }: {
       render: (name: string) => <span className="break-text">{name}</span>,
     },
     {
-      title: "模型",
+      title: kind === "ocr" ? "OCR 引擎" : "模型",
       dataIndex: "model",
       width: 200,
       render: (model: string) => <span className="break-text">{model}</span>,
     },
-    {
-      title: "服务地址",
-      dataIndex: "base_url",
-      render: (url: string) => <span className="break-text">{url}</span>,
-    },
-    {
-      title: "Key",
-      dataIndex: "api_key_set",
-      width: 90,
-      render: (saved: boolean) => saved ? <Tag color="green">已保存</Tag> : <Tag>未设置</Tag>,
-    },
+    ...(kind === "ocr" ? [] : [
+      {
+        title: "服务地址",
+        dataIndex: "base_url",
+        render: (url: string) => <span className="break-text">{url}</span>,
+      },
+      {
+        title: "Key",
+        dataIndex: "api_key_set",
+        width: 90,
+        render: (saved: boolean) => saved ? <Tag color="green">已保存</Tag> : <Tag>未设置</Tag>,
+      },
+    ]),
     ...(kind === "embedding"
       ? [{
           title: "向量维度",
@@ -334,7 +359,7 @@ export function ModelProfilesPage({ disabled, onChanged }: {
 
   const emptyText = loading ? undefined : profiles.length === 0
     ? (
-      <Empty description="还没有模型配置，请先添加 Embedding / Reranker / VLM 模型；创建知识库时只能从该列表选择">
+      <Empty description="还没有模型配置，请先添加 Embedding / Reranker / VLM / OCR 模型；创建知识库时只能从该列表选择">
         <Button type="primary" icon={<PlusOutlined />} disabled={disabled} onClick={openCreate}>
           添加模型
         </Button>
@@ -364,7 +389,7 @@ export function ModelProfilesPage({ disabled, onChanged }: {
       type="info"
       showIcon
       title="模型列表说明"
-      description="创建或修改知识库时只能从该列表选择 Embedding / Reranker / VLM 模型；API Key 仅保存在服务端，表格只显示是否已设置。"
+      description="创建或修改知识库时只能从该列表选择 Embedding / Reranker / VLM / OCR 模型；API Key 仅保存在服务端，表格只显示是否已设置。OCR 配置只需选择引擎，无需服务地址与 Key。"
     />
     {error && (
       <Alert
@@ -422,13 +447,21 @@ export function ModelProfilesPage({ disabled, onChanged }: {
           base_url: editing.base_url,
           model: editing.model,
           apikey: "",
-        } : { kind }}
+        } : { kind, model: kind === "ocr" ? defaultOcrEngine : "" }}
         onFinish={(values) => void save(values)}
         onValuesChange={(changed) => {
           setFormError("");
           // 重新输入 Key 会取消「保存后清除」标记，新 Key 优先生效。
           if ("apikey" in changed && changed.apikey) setClearKey(false);
-          if ("base_url" in changed || "apikey" in changed) {
+          if ("kind" in changed) {
+            const next = changed.kind as ModelKind;
+            const model = form.getFieldValue("model");
+            // 切到 OCR 默认选择 EasyOCR；切回远端模型时清掉残留的引擎 id。
+            if (next === "ocr" && !isOcrEngine(model))
+              form.setFieldsValue({ model: defaultOcrEngine });
+            if (next !== "ocr" && isOcrEngine(model)) form.setFieldsValue({ model: "" });
+          }
+          if ("kind" in changed || "base_url" in changed || "apikey" in changed) {
             modelsRequest.current?.abort();
             setModels([]);
             setModelsLoading(false);
@@ -453,68 +486,83 @@ export function ModelProfilesPage({ disabled, onChanged }: {
         >
           <Input maxLength={80} autoComplete="off" placeholder="例如 生产环境 Embedding" />
         </Form.Item>
-        <Form.Item
-          name="base_url"
-          label="服务地址"
-          rules={[
-            { required: true, whitespace: true, message: "请输入服务地址" },
-            { pattern: /^https?:\/\/\S+$/i, message: "服务地址需以 http:// 或 https:// 开头" },
-          ]}
-        >
-          <Input maxLength={2048} autoComplete="off" placeholder="https://api.example.com/v1" />
-        </Form.Item>
-        <div className="model-key-row">
+        {!isOcrForm && (
           <Form.Item
-            name="apikey"
-            label="API Key"
-            extra={clearKey
-              ? "保存后将清除已保存的 Key"
-              : editing?.api_key_set ? "已保存 Key，留空保持不变" : "无鉴权服务可留空"}
+            name="base_url"
+            label="服务地址"
+            rules={[
+              { required: true, whitespace: true, message: "请输入服务地址" },
+              { pattern: /^https?:\/\/\S+$/i, message: "服务地址需以 http:// 或 https:// 开头" },
+            ]}
           >
-            <Input.Password
-              autoComplete="new-password"
-              disabled={revealing}
-              placeholder={clearKey
-                ? "保存后清除已保存的 Key"
-                : editing?.api_key_set ? "已保存（留空保持不变）" : "可留空"}
-              visibilityToggle={{ visible: keyVisible, onVisibleChange: (next) => void showKey(next) }}
-            />
+            <Input maxLength={2048} autoComplete="off" placeholder="https://api.example.com/v1" />
           </Form.Item>
-          {editing?.api_key_set && (
-            <Tooltip title={clearKey ? "保存后将清除已保存的 Key" : "清除已保存的 Key"}>
-              <Button
-                aria-label="清除已保存的 Key"
-                icon={<DeleteOutlined />}
-                disabled={saving || revealing || clearKey}
-                onClick={markKeyForRemoval}
+        )}
+        {!isOcrForm && (
+          <div className="model-key-row">
+            <Form.Item
+              name="apikey"
+              label="API Key"
+              extra={clearKey
+                ? "保存后将清除已保存的 Key"
+                : editing?.api_key_set ? "已保存 Key，留空保持不变" : "无鉴权服务可留空"}
+            >
+              <Input.Password
+                autoComplete="new-password"
+                disabled={revealing}
+                placeholder={clearKey
+                  ? "保存后清除已保存的 Key"
+                  : editing?.api_key_set ? "已保存（留空保持不变）" : "可留空"}
+                visibilityToggle={{ visible: keyVisible, onVisibleChange: (next) => void showKey(next) }}
               />
-            </Tooltip>
-          )}
-        </div>
-        <div className="model-key-row">
+            </Form.Item>
+            {editing?.api_key_set && (
+              <Tooltip title={clearKey ? "保存后将清除已保存的 Key" : "清除已保存的 Key"}>
+                <Button
+                  aria-label="清除已保存的 Key"
+                  icon={<DeleteOutlined />}
+                  disabled={saving || revealing || clearKey}
+                  onClick={markKeyForRemoval}
+                />
+              </Tooltip>
+            )}
+          </div>
+        )}
+        {isOcrForm ? (
           <Form.Item
             name="model"
-            label="模型名称"
-            rules={[{ required: true, whitespace: true, message: "请输入或获取模型名称" }]}
-            extra={modelHint || undefined}
+            label="OCR 引擎"
+            rules={[{ required: true, message: "请选择 OCR 引擎" }]}
+            extra="OCR 由解析服务在本地执行，无需服务地址与 API Key"
           >
-            <AutoComplete
-              options={models.map((value) => ({ value }))}
-              placeholder={modelsLoading ? "正在获取模型列表…" : "输入或从模型列表中选取"}
-              allowClear
-              filterOption={(input, option) =>
-                String(option?.value ?? "").toLowerCase().includes(input.toLowerCase())}
-            />
+            <Select virtual={false} options={ocrEngines} placeholder="请选择 OCR 引擎" />
           </Form.Item>
-          <Button
-            icon={<ReloadOutlined />}
-            loading={modelsLoading}
-            disabled={saving}
-            onClick={() => void loadModels()}
-          >
-            获取模型列表
-          </Button>
-        </div>
+        ) : (
+          <div className="model-key-row">
+            <Form.Item
+              name="model"
+              label="模型名称"
+              rules={[{ required: true, whitespace: true, message: "请输入或获取模型名称" }]}
+              extra={modelHint || undefined}
+            >
+              <AutoComplete
+                options={models.map((value) => ({ value }))}
+                placeholder={modelsLoading ? "正在获取模型列表…" : "输入或从模型列表中选取"}
+                allowClear
+                filterOption={(input, option) =>
+                  String(option?.value ?? "").toLowerCase().includes(input.toLowerCase())}
+              />
+            </Form.Item>
+            <Button
+              icon={<ReloadOutlined />}
+              loading={modelsLoading}
+              disabled={saving}
+              onClick={() => void loadModels()}
+            >
+              获取模型列表
+            </Button>
+          </div>
+        )}
       </Form>
     </Drawer>
   </section>;

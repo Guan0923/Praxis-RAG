@@ -20,21 +20,21 @@ from app.parser import ParserConversionError, fake_manifest
 class FailingConverter:
     name = "failing"
 
-    def convert(self, source, output_dir, scratch_dir):
+    def convert(self, source, output_dir, scratch_dir, *, options=None):
         raise RuntimeError("internal boom: SECRET-DOC-TEXT")
 
 
 class RaisingParserConverter:
     name = "raising"
 
-    def convert(self, source, output_dir, scratch_dir):
+    def convert(self, source, output_dir, scratch_dir, *, options=None):
         raise ParserConversionError("公式为空，文档未索引")
 
 
 class SlowConverter:
     name = "slow"
 
-    def convert(self, source, output_dir, scratch_dir):
+    def convert(self, source, output_dir, scratch_dir, *, options=None):
         time.sleep(0.3)
         return fake_manifest()
 

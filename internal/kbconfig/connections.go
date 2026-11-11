@@ -12,13 +12,20 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
-// Kinds lists the provider settings replaced by public views and
-// stored as {base_url, protected_key} pairs (rag_mcp.model_settings.KINDS).
+// Kinds lists the supported saved-model kinds (rag_mcp.model_settings.KINDS).
 //
 // "vlm" is the remote vision-language endpoint used for PDF formula recognition
 // and picture descriptions; it is optional per knowledge base and falls back to
-// the service environment (RAG_VLM_*) when unset.
-var Kinds = []string{"embedding", "reranker", "vlm"}
+// the service environment (RAG_VLM_*) when unset. "ocr" is the OCR engine the
+// Docling parse service runs; it has no service URL or credential and stores
+// its engine id in the knowledge-base setting "ocr_model".
+var Kinds = []string{"embedding", "reranker", "vlm", "ocr"}
+
+// CredentialKinds lists the kinds whose settings are stored as
+// {base_url, protected_key} pairs and replaced by the credential-free public
+// view. The OCR engine runs inside the parsing service, so "ocr" is a model
+// kind without a provider connection and is not projected here.
+var CredentialKinds = []string{"embedding", "reranker", "vlm"}
 
 // IsKind reports whether kind is one of Kinds.
 func IsKind(kind string) bool {
@@ -41,7 +48,9 @@ func ModelConnectionFor(settings map[string]any, kind string) (modelapi.ModelCon
 }
 
 // ModelConnectionForKey is ModelConnectionFor with an explicit encryption key.
-// An empty key falls back to RAG_STATE_ENCRYPTION_KEY, matching Python.
+// An empty key falls back to RAG_STATE_ENCRYPTION_KEY, matching Python. A
+// kind "ocr" connection carries only the configured engine id: the provider
+// object (base_url/protected_key) is absent by design and stays empty.
 func ModelConnectionForKey(settings map[string]any, kind, encryptionKey string) (modelapi.ModelConnection, error) {
 	if !IsKind(kind) {
 		return modelapi.ModelConnection{}, fmt.Errorf("unknown model kind %q", kind)
@@ -72,9 +81,10 @@ func ModelConnectionForKey(settings map[string]any, kind, encryptionKey string) 
 	}
 	model, err := requiredString(settings, kind+"_model")
 	if err != nil {
-		// Knowledge bases created before the remote VLM existed have no
-		// vlm_model; treat that as "not configured" instead of corrupt settings.
-		if kind != "vlm" {
+		// Knowledge bases created before the remote VLM/OCR settings existed
+		// have no vlm_model/ocr_model; treat that as "not configured" instead of
+		// corrupt settings.
+		if kind != "vlm" && kind != "ocr" {
 			return modelapi.ModelConnection{}, err
 		}
 		model = ""

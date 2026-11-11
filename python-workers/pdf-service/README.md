@@ -57,10 +57,11 @@ python-workers/pdf-service/
 
 ### `POST /v1/parse`
 
-- 请求：`multipart/form-data`，字段名 **`file`**，内容为一个 PDF（服务端检查前 1024 字节含 `%PDF-`）。
+- 请求：`multipart/form-data`，字段名 **`file`**，内容为一个 PDF（服务端检查前 1024 字节含 `%PDF-`）；
+  可选文本字段 **`options`**（JSON），用于**按请求**覆盖 VLM 与 OCR 引擎配置（见下一节）。
 - 成功：`200`，`Content-Type: application/zip`，响应头
   `X-PDF-Parser-Version: docling-service-v1`、`X-PDF-Converter: docling|fake`。
-- 失败：JSON `{"detail": "<安全消息>"}`，`detail` 不会包含文档正文。
+- 失败：JSON `{"detail": "<安全消息>"}`，`detail` 不会包含文档正文；`options` 中的 API Key 不会被回显。
 
 zip 结构：
 
@@ -82,10 +83,71 @@ pictures/picture-1.png
 | 200 | 解析成功，返回 zip |
 | 400 | 缺少文件内容 / 不是 PDF（`%PDF-` 头校验失败）|
 | 413 | 文件超过 `RAG_PDF_SERVICE_MAX_BYTES`（默认 100 MiB）|
-| 422 | multipart 字段缺失或不是 `file`（FastAPI 校验）|
+| 422 | multipart 字段缺失/不是 `file`（FastAPI 校验），或 `options` 不是合法 JSON / 字段类型错误 / OCR 引擎不在白名单 |
 | 500 | 转换失败（Docling 报错、公式为空、表格结构不可靠等）|
 | 503 | 配置错误（converter/模型/VLM 未配置好）或队列等待超时 |
 | 504 | 解析超时（`RAG_PDF_SERVICE_TIMEOUT`）|
+
+### `options`：每请求 VLM / OCR 覆盖
+
+`options` 是可选文本字段，内容为 JSON 对象。**不传 / 空字符串 / `{}` / `null` 时完全保持原有行为**
+（使用进程环境变量 `RAG_VLM_*` + 默认 EasyOCR），保证向后兼容。
+
+```json
+{
+  "vlm": {
+    "base_url": "http://vlm-host:8000/v1",
+    "api_key": "sk-...",
+    "model": "qwen2.5-vl-72b",
+    "timeout": 120,
+    "concurrency": 4
+  },
+  "ocr": {"engine": "easyocr"}
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `vlm.base_url` | string | OpenAI 兼容 VLM 的 base URL，可带自定义端口（如 `https://vlm.internal:8443/v1`）|
+| `vlm.api_key` | string | 可选；只放进请求头 `Authorization: Bearer ...`，不写日志、不写 manifest |
+| `vlm.model` | string | VLM 模型名 |
+| `vlm.timeout` | number | 可选，默认 `120` 秒；下限 `30`（与 `RAG_VLM_TIMEOUT` 一致）|
+| `vlm.concurrency` | integer | 可选，默认 `4`；下限 `1` |
+| `ocr.engine` | string | 可选，默认 `easyocr`；可选值 `auto` / `easyocr` / `tesseract` / `rapidocr` |
+
+规则：
+
+- **`options` 优先于环境变量**：给了 `options.vlm` 就用它（整篇文档），否则用 `RAG_VLM_*`；
+  因此部署侧 `RAG_VLM_*` 只配置了一半（缺 `RAG_VLM_MODEL`）时，**带上完整 `options.vlm` 的请求仍可正常解析**，
+  不带 `options.vlm` 的请求仍按原行为返回 503。
+- `options.vlm` 必须同时给出非空的 `base_url` 与 `model`；`api_key` 可省略（不带鉴权头）。
+  空的 `{"vlm": {}}` 视为“不覆盖”，回落到环境变量。
+- OCR 引擎映射（Docling 2.126.0）：
+  - `easyocr`（默认）：`EasyOcrOptions(lang=["ch_sim","en"], download_enabled=False, confidence_threshold=0.0)`，
+    有 `RAG_PDF_MODELS_PATH` 时模型目录为 `<models>/EasyOcr`；
+  - `auto`：与 `easyocr` 相同（契约固定为 EasyOCR，避免 Docling 自动选择到未安装的引擎）；
+  - `tesseract`：`TesseractOcrOptions(lang=["chi_sim","eng"])`；
+  - `rapidocr`：`RapidOcrOptions()`。
+  `TesseractOcrOptions`/`RapidOcrOptions` 在 Docling 惰性导入时才导入，不影响无 docling 的测试环境。
+- 实际使用的 OCR 引擎写入 `manifest.parser.ocr_engine`（`auto` 记录为 `easyocr`）；VLM 只记录 host+model。
+- 非法 `options` 返回 `422`，`detail` 为安全中文消息（指明字段与可选值，**不回显提交值，尤其不回显 API key**）。
+
+示例（自定义端口 VLM + Tesseract）：
+
+```bash
+curl -sS -F file=@sample.pdf \
+  -F 'options={"vlm":{"base_url":"https://vlm.internal:8443/v1","api_key":"sk-...","model":"qwen2.5-vl-72b","timeout":180,"concurrency":2},"ocr":{"engine":"tesseract"}}' \
+  http://127.0.0.1:8091/v1/parse -o out.zip
+```
+
+示例（仅切换 OCR 引擎，VLM 继续用 `RAG_VLM_*`）：
+
+```bash
+curl -sS -F file=@sample.pdf -F 'options={"ocr":{"engine":"rapidocr"}}' \
+  http://127.0.0.1:8091/v1/parse -o out.zip
+```
+
+`RAG_PDF_SERVICE_CONVERTER=fake` 时 `options` 会被接受并忽略（fake 清单固定），便于 Go 端联调链路。
 
 ## 2. 清单契约（与 Go 端 `internal/document/pdf.go` 严格对齐）
 
@@ -149,7 +211,11 @@ pictures/picture-1.png
 不丢文本。
 
 `parser`：`{version, service_version, service, converter, docling, formula_model, formula_revision, vlm,
-formula_crop_scale, formula_crop_expansion, formula_batch_size, ocr_confidence_threshold}`。
+formula_crop_scale, formula_crop_expansion, formula_batch_size, ocr_confidence_threshold, ocr_engine}`。
+
+- `vlm`：实际使用的远端 VLM 描述 `{backend, model, endpoint}`（`endpoint` 只含 host:port，不含 API Key）；
+  本地 CodeFormulaV2 模式为 `null`。
+- `ocr_engine`：实际运行的 OCR 引擎（`auto` 记录为 `easyocr`）；`fake` 模式为 `null`。
 
 `metrics`：`{seconds, pages, peak_cuda_allocated_bytes}`。
 
@@ -183,7 +249,8 @@ table 的 `image_file` 为 null、`image_file` 是安全相对路径等），避
 - **两者都没有** → 转换前给出可读配置错误（503）：“Formula recognition is not configured …”，
   不会静默输出空公式。
 - 只配置一半（例如只有 `RAG_VLM_BASE_URL`）→ `config_error` 明确指出缺少 `RAG_VLM_MODEL`，
-  `/v1/parse` 返回 503。
+  不带 `options.vlm` 的 `/v1/parse` 请求返回 503（带完整 `options.vlm` 的请求不受影响，见第 1 节）。
+- 以上环境变量是**进程级默认值**；`/v1/parse` 的 `options` 字段可按请求覆盖 VLM 与 OCR（优先于环境变量）。
 
 ## 4. 模型下载（本地 CodeFormula 模式）
 
@@ -256,7 +323,8 @@ cd python-workers/pdf-service
 # 只装测试依赖（不需要 docling/torch）
 ..\..\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 
-# 57 个测试：healthz、/v1/parse zip/manifest 契约、公式 latex、错误码、清单校验
+# 140 个测试：healthz、/v1/parse zip/manifest 契约、公式 latex、错误码、清单校验、
+# options（VLM/OCR 覆盖、引擎映射、422 安全消息）
 ..\..\.venv\Scripts\python.exe -m pytest tests -q
 ```
 
@@ -310,7 +378,13 @@ Go 端（由后端同事实现）只需：
   重复超时请提高 `RAG_PDF_SERVICE_TIMEOUT` 或拆分文档/扩容副本。
 - **内存**：单进程加载 Docling 模型约数 GB（CPU/GPU 视模型而定），上传文件先落临时文件（默认上限
   100 MiB），zip 在内存中组装；并发保持 1 时最稳。
-- **VLM 描述**仅在配置 `RAG_VLM_*` 时启用；本地 CodeFormula 模式下无 caption 的图片/表格保持空描述。
+- **VLM 描述**仅在配置了 VLM（`RAG_VLM_*` 或请求 `options.vlm`）时启用；本地 CodeFormula 模式下无 caption
+  的图片/表格保持空描述。
+- **OCR 引擎**：`tesseract` 需要镜像内安装系统 Tesseract 与 `chi_sim`/`eng` 语言包（当前 Dockerfile 未装，
+  选用前需自行扩展镜像）；`rapidocr` 使用 Docling 自带的 RapidOCR 依赖。`auto` 固定映射为 `easyocr`，
+  不使用 Docling 的 `OcrAutoOptions`（避免自动选中未安装引擎导致运行期失败）。
+- **每请求 `options` 只影响当前文档**：VLM 客户端按请求构造，不缓存、不复用；并发仍受
+  `RAG_PDF_SERVICE_CONCURRENCY`（进程内）与 `options.vlm.concurrency`（单个 VLM 引擎内部并发）两层约束。
 - **公式质量**依赖 Docling + CodeFormulaV2/VLM；`_CheckedFormulaEngine` 会把空输出、被截断（缺少
   `</formula>`）的输出当作硬失败，整篇文档 500，避免把错误公式写进索引。
 - 本地模式下 EasyOCR 关闭了自动下载（`download_enabled=False`），OCR 模型必须在 `RAG_PDF_MODELS_PATH/EasyOcr`。

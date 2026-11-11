@@ -21,12 +21,13 @@ import { namespacePattern } from "./navigation";
 
 type Kind = ModelKind;
 type ProviderValues = { base_url: string; apikey?: string };
-type ProfileField = "embedding_profile" | "reranker_profile" | "vlm_profile";
+type ProfileField = "embedding_profile" | "reranker_profile" | "vlm_profile" | "ocr_profile";
 type Values = Chunking & {
   namespace: string;
   embedding_profile: string;
   reranker_profile?: string;
   vlm_profile?: string;
+  ocr_profile?: string;
 };
 type TenantValues = Chunking & { namespace: string };
 type Defaults = { default: string; strategies: Strategy[] };
@@ -39,8 +40,10 @@ type Draft = {
   embedding_profile?: string;
   reranker_profile?: string;
   vlm_profile?: string;
+  ocr_profile?: string;
   reranker_enabled?: boolean;
   vlm_enabled?: boolean;
+  ocr_enabled?: boolean;
 };
 const kinds: Kind[] = modelKinds;
 // currentProfile 是编辑知识库时的兜底选项：沿用知识库已保存的连接。
@@ -49,6 +52,7 @@ const profileField: Record<Kind, ProfileField> = {
   embedding: "embedding_profile",
   reranker: "reranker_profile",
   vlm: "vlm_profile",
+  ocr: "ocr_profile",
 };
 const cleanUrl = (value: string) => value.trim().replace(/\/+$/, "");
 
@@ -182,7 +186,7 @@ function TenantKnowledgeBaseForm({ disabled, onCreated, connection }: {
       type="info"
       showIcon
       title="模型配置沿用管理员模板"
-      description="无需填写 Embedding / Reranker / VLM 配置：服务端会从管理员配置的默认知识库模板克隆模型、服务地址与向量维度。"
+      description="无需填写 Embedding / Reranker / VLM / OCR 配置：服务端会从管理员配置的默认知识库模板克隆模型、服务地址与向量维度。"
     />
     {error && <Alert type="error" showIcon className="page-alert" title="知识库创建失败" description={error}
       action={!catalog ? <Button icon={<ReloadOutlined />} aria-label="重新读取切分配置" loading={loading} onClick={() => void loadCatalog()} /> : undefined} />}
@@ -258,6 +262,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
   const [saving, setSaving] = useState(false);
   const [rerankerEnabled, setRerankerEnabled] = useState(Boolean(initial?.reranker_model));
   const [vlmEnabled, setVlmEnabled] = useState(Boolean(initial?.vlm_model));
+  const [ocrEnabled, setOcrEnabled] = useState(Boolean(initial?.ocr_model));
   const lifetime = useRef(new AbortController());
   const profilesRequest = useRef<AbortController | null>(null);
   const running = useRef(false);
@@ -272,14 +277,17 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
     if (!initial) return "";
     if (kind === "embedding") return initial.embedding.base_url;
     if (kind === "reranker") return initial.reranker.base_url;
-    return initial.vlm?.base_url || "";
+    if (kind === "vlm") return initial.vlm?.base_url || "";
+    // OCR 没有服务地址：matchingProfile 用空 base_url 比较引擎 id。
+    return "";
   }
 
   function currentModel(kind: Kind) {
     if (!initial) return "";
     if (kind === "embedding") return initial.embedding_model;
     if (kind === "reranker") return initial.reranker_model;
-    return initial.vlm_model || "";
+    if (kind === "vlm") return initial.vlm_model || "";
+    return initial.ocr_model || "";
   }
 
   // matchedProfile 找出与知识库当前连接（服务地址 + 模型）完全一致的配置。
@@ -348,9 +356,11 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         embedding_profile: draft.embedding_profile,
         reranker_profile: draft.reranker_profile,
         vlm_profile: draft.vlm_profile,
+        ocr_profile: draft.ocr_profile,
       });
       if (draft.reranker_enabled) setRerankerEnabled(true);
       if (draft.vlm_enabled) setVlmEnabled(true);
+      if (draft.ocr_enabled) setOcrEnabled(true);
     } catch {
       // An unreadable draft must never block the form.
     }
@@ -386,8 +396,10 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         embedding_profile: values.embedding_profile,
         reranker_profile: values.reranker_profile,
         vlm_profile: values.vlm_profile,
+        ocr_profile: values.ocr_profile,
         reranker_enabled: rerankerEnabled,
         vlm_enabled: vlmEnabled,
+        ocr_enabled: ocrEnabled,
         ...overrides,
       };
       sessionStorage.setItem(draftKey, JSON.stringify(draft));
@@ -397,16 +409,19 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
   }
 
   // resolveSelection 把下拉框的配置 id 解析为提交所需的连接信息。当前连接
-  // 兜底选项不发送 apikey，服务端保留已保存的 Key。
+  // 兜底选项不发送 apikey，服务端保留已保存的 Key。OCR 没有服务地址与 Key，
+  // 只返回引擎 id，且绝不读取已保存的 Key。
   async function resolveSelection(kind: Kind, profileId: string | undefined): Promise<ResolvedProvider> {
     const title = modelKindLabels[kind];
     if (!profileId) throw new Error(`请选择 ${title} 模型`);
     if (profileId === currentProfile) {
       if (!initial) throw new Error(`请选择 ${title} 模型`);
+      if (kind === "ocr") return { provider: { base_url: "" }, model: currentModel("ocr") };
       return { provider: { base_url: currentUrl(kind) }, model: currentModel(kind) };
     }
     const profile = profiles.find((item) => item.id === profileId);
     if (!profile) throw new Error("所选模型配置已不存在，请刷新页面后重新选择");
+    if (kind === "ocr") return { provider: { base_url: "" }, model: profile.model };
     const base_url = cleanUrl(profile.base_url);
     // 没有保存 Key 的配置不提交 apikey：服务端在服务地址不变时保留知识库已有的
     // Key，避免把已保存的凭据清空。
@@ -423,11 +438,12 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
     setError("");
     const blank: ResolvedProvider = { provider: { base_url: "", apikey: "" }, model: "" };
     try {
-      // 三个模型配置的 Key 并行解析后再一次性提交。
-      const [embedding, reranker, vlm] = await Promise.all([
+      // 四个模型配置的 Key / 引擎并行解析后再一次性提交。
+      const [embedding, reranker, vlm, ocr] = await Promise.all([
         resolveSelection("embedding", values.embedding_profile),
         rerankerEnabled ? resolveSelection("reranker", values.reranker_profile) : Promise.resolve(blank),
         vlmEnabled ? resolveSelection("vlm", values.vlm_profile) : Promise.resolve(blank),
+        ocrEnabled ? resolveSelection("ocr", values.ocr_profile) : Promise.resolve(blank),
       ]);
       const body = {
         embedding: embedding.provider,
@@ -436,6 +452,8 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         reranker_model: rerankerEnabled ? reranker.model : "",
         vlm: vlmEnabled ? vlm.provider : { base_url: "", apikey: "" },
         vlm_model: vlmEnabled ? vlm.model : "",
+        // 后端只接收所选 OCR 引擎 id；空串表示未启用（更新时清除已保存的 OCR）。
+        ocr_model: ocrEnabled ? ocr.model : "",
       };
       const result = await api<KnowledgeBase>(
         "/v1/admin/knowledge-bases" + (initial ? "/" + initial.namespace : ""),
@@ -458,6 +476,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
           form.resetFields();
           setRerankerEnabled(false);
           setVlmEnabled(false);
+          setOcrEnabled(false);
           void loadDefaults();
         }
         onSaved(result);
@@ -479,21 +498,25 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
     } else if (kind === "vlm") {
       setVlmEnabled(enabled);
       persistDraft({ vlm_enabled: enabled });
+    } else if (kind === "ocr") {
+      setOcrEnabled(enabled);
+      persistDraft({ ocr_enabled: enabled });
     }
   }
 
-  // 创建知识库页面把 Embedding / Reranker / VLM 并排成三列（窄屏自动降为两列
-  // 或一列），文本切分排成一行；编辑知识库的抽屉仍保持纵向布局。
+  // 创建知识库页面把 Embedding / Reranker / VLM / OCR 排成 2×2 网格（窄屏自动
+  // 降为一列），文本切分排成一行；编辑知识库的抽屉仍保持纵向布局。
   const providerSections = kinds.map((kind) => {
     const title = modelKindLabels[kind];
-    const enabled = kind === "embedding" || (kind === "reranker" ? rerankerEnabled : vlmEnabled);
+    const enabled = kind === "embedding"
+      || (kind === "reranker" ? rerankerEnabled : kind === "vlm" ? vlmEnabled : ocrEnabled);
     const field = profileField[kind];
     const kindProfiles = profiles.filter((profile) => profile.kind === kind);
     const options = kindProfiles.map((profile) => ({
       value: profile.id,
       label: <div className="model-profile-option">
         <span className="break-text">{profile.name} · {profile.model}</span>
-        <span className="secondary break-text">{profile.base_url}</span>
+        {profile.base_url && <span className="secondary break-text">{profile.base_url}</span>}
       </div>,
     }));
     // 知识库当前连接不在模型列表里时保留「当前配置」选项：保存时沿用原连接，
@@ -501,9 +524,12 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
     const showCurrent = Boolean(initial && enabled && currentModel(kind) &&
       (!profilesLoaded || !matchedProfile(kind)));
     if (showCurrent) {
+      const currentLabel = kind === "ocr"
+        ? `当前配置 · ${currentModel(kind)}`
+        : `当前配置 · ${currentModel(kind)}（${currentUrl(kind)}）`;
       options.unshift({
         value: currentProfile,
-        label: <span className="break-text">{`当前配置 · ${currentModel(kind)}（${currentUrl(kind)}）`}</span>,
+        label: <span className="break-text">{currentLabel}</span>,
       });
     }
     return <section className="knowledge-provider" aria-label={title + " 配置"} key={kind}>
@@ -512,7 +538,10 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
           onChange={(checked) => toggleKind("reranker", checked)} />}
         {kind === "vlm" &&
         <Switch aria-label="启用 VLM" checked={vlmEnabled} disabled={locked}
-          onChange={(checked) => toggleKind("vlm", checked)} />}</div>
+          onChange={(checked) => toggleKind("vlm", checked)} />}
+        {kind === "ocr" &&
+        <Switch aria-label="启用 OCR" checked={ocrEnabled} disabled={locked}
+          onChange={(checked) => toggleKind("ocr", checked)} />}</div>
       {enabled && kindProfiles.length === 0 && !profilesLoading && !profilesError &&
         <Alert className="page-alert" type="warning" showIcon title={`暂无 ${title} 模型`}
           description={initial
@@ -552,6 +581,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         embedding_profile: initial ? currentProfile : undefined,
         reranker_profile: initial && initial.reranker_model ? currentProfile : undefined,
         vlm_profile: initial && initial.vlm_model ? currentProfile : undefined,
+        ocr_profile: initial && initial.ocr_model ? currentProfile : undefined,
         strategy: initial?.strategy, chunk_size: initial?.chunk_size, chunk_overlap: initial?.chunk_overlap }}
       onValuesChange={() => {
         setError("");

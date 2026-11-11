@@ -7,6 +7,7 @@ through its ``fake`` converter or through injected converter doubles.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -62,3 +63,13 @@ def sample_pdf() -> bytes:
 def parse_files(content: bytes = MINIMAL_PDF, *, name: str = "sample.pdf", content_type: str = "application/pdf"):
     """Build the multipart ``files=`` mapping for ``/v1/parse``."""
     return {"file": (name, content, content_type)}
+
+
+def parse_options(**payload) -> dict[str, str]:
+    """Build the multipart ``data=`` mapping carrying the ``options`` JSON."""
+    return {"options": json.dumps(payload, ensure_ascii=False)}
+
+
+def raw_options(text: str) -> dict[str, str]:
+    """Build ``data=`` for a deliberately malformed ``options`` value."""
+    return {"options": text}

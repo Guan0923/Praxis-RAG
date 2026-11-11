@@ -527,6 +527,109 @@ func TestCreateSettingsRejectsIncompleteVLM(t *testing.T) {
 	}
 }
 
+func TestCreateSettingsStoresOCREngine(t *testing.T) {
+	input := newTestCreateInput("http://host:8080/v1/")
+	input.OCRModel = " EasyOCR "
+	settings, err := CreateSettings(context.Background(), input, &fakeProber{vectorSize: 3})
+	if err != nil {
+		t.Fatalf("CreateSettings() error: %v", err)
+	}
+	connection, err := ModelConnectionForKey(settings, "ocr", testEncryptionKey)
+	if err != nil {
+		t.Fatalf("ModelConnectionForKey(ocr) error: %v", err)
+	}
+	if connection.Model != "easyocr" || connection.BaseURL != "" || connection.APIKey != "" {
+		t.Fatalf("ocr connection = %+v", connection)
+	}
+	public := PublicSettings(settings)
+	if public["ocr_model"] != "easyocr" {
+		t.Fatalf("public ocr_model = %v", public["ocr_model"])
+	}
+	// OCR has no provider connection: the projection must not fabricate one.
+	if _, projected := public["ocr"]; projected {
+		t.Fatalf("public projection exposed an OCR provider: %v", public["ocr"])
+	}
+
+	// A blank OCR engine is stored as "not configured".
+	unconfigured := newTestCreateInput("http://host:8080/v1/")
+	settings, err = CreateSettings(context.Background(), unconfigured, &fakeProber{vectorSize: 3})
+	if err != nil {
+		t.Fatalf("CreateSettings(blank OCR) error: %v", err)
+	}
+	if settings["ocr_model"] != "" {
+		t.Fatalf("blank ocr_model = %v", settings["ocr_model"])
+	}
+}
+
+func TestCreateSettingsRejectsInvalidOCREngine(t *testing.T) {
+	input := newTestCreateInput("http://host:8080/v1/")
+	input.OCRModel = "paddleocr"
+	_, err := CreateSettings(context.Background(), input, &fakeProber{vectorSize: 3})
+	assertValidationMessage(t, err, MessageOCREngineInvalid)
+}
+
+func TestUpdateSettingsSetsAndClearsOCREngine(t *testing.T) {
+	current := testStoredSettings(t, "http://host", "private-key")
+	current["ocr_model"] = "easyocr"
+	omitted, err := UpdateSettings(context.Background(), current, UpdateInput{
+		Values:        map[string]any{"embedding_model": "embed-a"},
+		EncryptionKey: testEncryptionKey,
+	}, &fakeProber{vectorSize: 3})
+	if err != nil {
+		t.Fatalf("UpdateSettings(omit) error: %v", err)
+	}
+	if omitted.Settings["ocr_model"] != "easyocr" {
+		t.Fatalf("omitted ocr_model = %v", omitted.Settings["ocr_model"])
+	}
+
+	replaced := "Tesseract"
+	updated, err := UpdateSettings(context.Background(), current, UpdateInput{
+		Values:        map[string]any{"embedding_model": "embed-a"},
+		OCRModel:      &replaced,
+		EncryptionKey: testEncryptionKey,
+	}, &fakeProber{vectorSize: 3})
+	if err != nil {
+		t.Fatalf("UpdateSettings(set) error: %v", err)
+	}
+	if updated.Settings["ocr_model"] != "tesseract" {
+		t.Fatalf("updated ocr_model = %v", updated.Settings["ocr_model"])
+	}
+
+	// Knowledge bases created before OCR existed have no ocr_model; an omitted
+	// update leaves them without the field and must not fail.
+	legacy := testStoredSettings(t, "http://host", "private-key")
+	legacyUpdated, err := UpdateSettings(context.Background(), legacy, UpdateInput{
+		Values:        map[string]any{"embedding_model": "embed-a"},
+		EncryptionKey: testEncryptionKey,
+	}, &fakeProber{vectorSize: 3})
+	if err != nil {
+		t.Fatalf("UpdateSettings(legacy) error: %v", err)
+	}
+	if legacyUpdated.Settings["ocr_model"] != "" {
+		t.Fatalf("legacy ocr_model = %v", legacyUpdated.Settings["ocr_model"])
+	}
+
+	cleared := ""
+	clearedResult, err := UpdateSettings(context.Background(), current, UpdateInput{
+		Values:        map[string]any{"embedding_model": "embed-a"},
+		OCRModel:      &cleared,
+		EncryptionKey: testEncryptionKey,
+	}, &fakeProber{vectorSize: 3})
+	if err != nil {
+		t.Fatalf("UpdateSettings(clear) error: %v", err)
+	}
+	if clearedResult.Settings["ocr_model"] != "" {
+		t.Fatalf("cleared ocr_model = %v", clearedResult.Settings["ocr_model"])
+	}
+
+	invalid := "unknown-engine"
+	_, err = UpdateSettings(context.Background(), current, UpdateInput{
+		OCRModel:      &invalid,
+		EncryptionKey: testEncryptionKey,
+	}, &fakeProber{vectorSize: 3})
+	assertValidationMessage(t, err, MessageOCREngineInvalid)
+}
+
 func TestUpdateSettingsKeepsVLMWhenOmitted(t *testing.T) {
 	input := newTestCreateInput("http://host:8080/v1/")
 	input.VLMModel = "qwen2.5-vl-7b"

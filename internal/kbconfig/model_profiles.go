@@ -57,6 +57,10 @@ type ModelProfileStored struct {
 // DraftConnection (an absent base_url keeps the current value, and an explicit
 // apikey replaces the stored one). A configuration without a service URL is
 // rejected with MessageModelServiceURLRequired.
+//
+// OCR configurations are the exception: their "model" is the OCR engine id
+// (auto/easyocr/tesseract/rapidocr), base_url may stay empty because inference
+// runs inside the parsing service, and no API key is stored.
 func DraftModelProfile(
 	current modelapi.ModelConnection,
 	kind, name string,
@@ -71,6 +75,32 @@ func DraftModelProfile(
 	}
 	if utf8.RuneCountInString(name) > ModelProfileNameMaxLength {
 		return modelapi.ModelConnection{}, "", NewValidationError(MessageModelProfileNameTooLong)
+	}
+	if kind == "ocr" {
+		model := strings.TrimSpace(draft.Model)
+		if model == "" {
+			return modelapi.ModelConnection{}, "", NewValidationError(MessageOCREngineRequired)
+		}
+		if utf8.RuneCountInString(model) > ModelProfileModelMaxLength {
+			return modelapi.ModelConnection{}, "", NewValidationError(MessageModelModelTooLong)
+		}
+		engine, err := NormalizeOCREngine(model)
+		if err != nil {
+			return modelapi.ModelConnection{}, "", err
+		}
+		baseURL := strings.TrimSpace(draft.BaseURL)
+		if baseURL == "" {
+			baseURL = strings.TrimSpace(current.BaseURL)
+		}
+		connection := modelapi.ModelConnection{Model: engine}
+		if baseURL != "" {
+			normalized, err := modelapi.NormalizeBaseURL(baseURL)
+			if err != nil {
+				return modelapi.ModelConnection{}, "", err
+			}
+			connection.BaseURL = normalized
+		}
+		return connection, name, nil
 	}
 	model := strings.TrimSpace(draft.Model)
 	if model == "" {
@@ -104,7 +134,8 @@ func DraftModelProfile(
 // ProbeModelProfile validates a saved model configuration against its provider
 // before it is persisted. An embedding probe records the produced dense
 // dimension; a reranker probe only checks accessibility; VLM endpoints have no
-// cheap probe, so they are stored as entered. A nil prober uses HTTPProber.
+// cheap probe, and the OCR engine runs inside the parsing service, so both are
+// stored as entered. A nil prober uses HTTPProber.
 func ProbeModelProfile(
 	ctx context.Context,
 	connection modelapi.ModelConnection,
@@ -126,7 +157,7 @@ func ProbeModelProfile(
 			return nil, err
 		}
 		return nil, nil
-	case "vlm":
+	case "vlm", "ocr":
 		return nil, nil
 	default:
 		return nil, NewValidationError(MessageModelKindInvalid)

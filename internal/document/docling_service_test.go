@@ -90,11 +90,13 @@ type doclingServiceCall struct {
 	path        string
 	contentType string
 	filename    string
+	options     string
 	body        []byte
 }
 
 // newDoclingServiceServer starts a fake parse service that records the uploaded
-// file and then delegates the response to respond.
+// file (and the optional options text field) and then delegates the response to
+// respond.
 func newDoclingServiceServer(t *testing.T, respond func(http.ResponseWriter, *http.Request)) (*httptest.Server, *doclingServiceCall) {
 	t.Helper()
 	call := &doclingServiceCall{}
@@ -109,6 +111,7 @@ func newDoclingServiceServer(t *testing.T, respond func(http.ResponseWriter, *ht
 		}
 		defer file.Close()
 		call.filename = header.Filename
+		call.options = r.FormValue(doclingOptionsField)
 		call.body, _ = io.ReadAll(file)
 		respond(w, r)
 	}))
@@ -150,6 +153,11 @@ func TestDoclingServiceParserParseInto(t *testing.T) {
 	if string(call.body) != minimalPDF {
 		t.Fatalf("uploaded PDF = %q", call.body)
 	}
+	// Without VLM/OCR configuration the options field is omitted entirely so the
+	// service keeps its own environment defaults.
+	if call.options != "" {
+		t.Fatalf("options field = %q, want none for an unconfigured parser", call.options)
+	}
 	if got.Version != PDFParserVersionDocling {
 		t.Fatalf("manifest version = %q", got.Version)
 	}
@@ -186,6 +194,81 @@ func TestDoclingServiceParserAcceptsLegacyDoclingVersion(t *testing.T) {
 	parser := &DoclingServiceParser{BaseURL: server.URL}
 	if _, err := parser.ParseInto(context.Background(), writeValidPDF(t, "legacy.pdf"), t.TempDir()); err != nil {
 		t.Fatalf("ParseInto() error = %v", err)
+	}
+}
+
+// TestDoclingServiceParserSendsParseOptions pins the multipart "options" text
+// field contract: the VLM endpoint/credentials plus the OCR engine are sent as
+// one JSON object, and the field is omitted unless something is configured.
+func TestDoclingServiceParserSendsParseOptions(t *testing.T) {
+	manifest := doclingServiceManifestFixture(PDFParserVersionDocling)
+	archive := doclingManifestArchive(t, manifest,
+		doclingZipMember{name: "pictures/picture-0.png", data: []byte(doclingTestImage)})
+	cases := []struct {
+		name string
+		vlm  VLMSettings
+		ocr  OCRSettings
+		want string
+	}{
+		{
+			name: "vlm_and_ocr",
+			vlm: VLMSettings{
+				BaseURL: "http://vlm:8000/v1", APIKey: "vlm-key", Model: "qwen2.5-vl-7b",
+				Timeout: 120 * time.Second, Concurrency: 4,
+			},
+			ocr: OCRSettings{Engine: " easyocr "},
+			want: `{"vlm":{"base_url":"http://vlm:8000/v1","api_key":"vlm-key",` +
+				`"model":"qwen2.5-vl-7b","timeout":120,"concurrency":4},` +
+				`"ocr":{"engine":"easyocr"}}`,
+		},
+		{
+			name: "ocr_only",
+			ocr:  OCRSettings{Engine: "tesseract"},
+			want: `{"ocr":{"engine":"tesseract"}}`,
+		},
+		{
+			name: "vlm_only",
+			vlm:  VLMSettings{BaseURL: "http://vlm:8000/v1", Model: "qwen2.5-vl-7b"},
+			want: `{"vlm":{"base_url":"http://vlm:8000/v1","api_key":"","model":"qwen2.5-vl-7b"}}`,
+		},
+		{
+			name: "unconfigured",
+			want: "",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			server, call := newDoclingServiceServer(t, func(w http.ResponseWriter, r *http.Request) {
+				writeDoclingServiceZip(w, archive)
+			})
+			parser := &DoclingServiceParser{
+				BaseURL: server.URL,
+				VLM:     testCase.vlm,
+				OCR:     testCase.ocr,
+			}
+			if _, err := parser.ParseInto(context.Background(), writeValidPDF(t, "manual.pdf"), t.TempDir()); err != nil {
+				t.Fatalf("ParseInto() error = %v", err)
+			}
+			if call.options != testCase.want {
+				t.Fatalf("options = %q, want %q", call.options, testCase.want)
+			}
+		})
+	}
+
+	// The file part is still uploaded when options are present.
+	server, call := newDoclingServiceServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeDoclingServiceZip(w, archive)
+	})
+	parser := &DoclingServiceParser{
+		BaseURL: server.URL,
+		VLM:     VLMSettings{BaseURL: "http://vlm:8000/v1", Model: "m"},
+		OCR:     OCRSettings{Engine: "rapidocr"},
+	}
+	if _, err := parser.ParseInto(context.Background(), writeValidPDF(t, "manual.pdf"), t.TempDir()); err != nil {
+		t.Fatalf("ParseInto() error = %v", err)
+	}
+	if string(call.body) != minimalPDF || call.filename != "manual.pdf" {
+		t.Fatalf("uploaded file = %q (%q)", call.body, call.filename)
 	}
 }
 
