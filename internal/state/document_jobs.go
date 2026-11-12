@@ -417,12 +417,14 @@ func (d *DocumentJobs) insertJob(
 		return DocumentAdmission{}, err
 	}
 	defer func() { _ = transaction.Rollback() }()
-	// Reuse the journal's persistent namespace row to serialize submissions.
-	if err := d.stores.Uploads.guard(ctx, transaction, namespace); err != nil {
+	// Reuse the journal's persistent lease rows to serialize submissions that
+	// share one document name. Different names keep independent rows, so
+	// concurrent admissions of different files do not queue behind each other.
+	if err := d.stores.Uploads.guardName(ctx, transaction, namespace, name); err != nil {
 		return DocumentAdmission{}, err
 	}
 	var version sql.NullInt64
-	query := "SELECT version FROM knowledge_bases WHERE namespace = ?" + d.stores.Uploads.forUpdate()
+	query := "SELECT version FROM knowledge_bases WHERE namespace = ?" + d.stores.Uploads.forShare()
 	if err := transaction.QueryRowContext(ctx, query, namespace).Scan(&version); err != nil &&
 		!errors.Is(err, sql.ErrNoRows) {
 		return DocumentAdmission{}, err
@@ -431,9 +433,14 @@ func (d *DocumentJobs) insertJob(
 		return DocumentAdmission{}, newValueError("Knowledge base is not configured")
 	}
 	if idempotencyKey != nil {
+		// Read without a row lock: a missing idempotency key would otherwise
+		// take a gap lock that deadlocks against a concurrent admission's
+		// INSERT into the same index gap. The unique index plus the
+		// unique-violation fallback in Submit still make a replay return the
+		// original artifact.
 		existing, err := scanDocumentJob(transaction.QueryRowContext(ctx,
-			"SELECT "+documentJobColumns+" FROM document_jobs WHERE namespace = ? AND idempotency_key = ?"+
-				d.stores.Uploads.forUpdate(), namespace, *idempotencyKey), false)
+			"SELECT "+documentJobColumns+" FROM document_jobs WHERE namespace = ? AND idempotency_key = ?",
+			namespace, *idempotencyKey), false)
 		if err == nil {
 			if existing.Name != name || existing.SHA256 != digest {
 				return DocumentAdmission{}, newUploadConflict("Idempotency key has different file input")
@@ -457,7 +464,7 @@ func (d *DocumentJobs) insertJob(
 		}
 		if strings.EqualFold(published, name) {
 			_ = rows.Close()
-			return DocumentAdmission{}, newUploadConflict("Document already exists; use update_document")
+			return DocumentAdmission{}, newDocumentExistsConflict("Document already exists; use update_document")
 		}
 	}
 	if err := rows.Close(); err != nil {
@@ -469,7 +476,7 @@ func (d *DocumentJobs) insertJob(
 			"AND status IN (?, ?) LIMIT 1", namespace, nameKey, DocumentJobQueued, DocumentJobProcessing).
 		Scan(&pending)
 	if err == nil {
-		return DocumentAdmission{}, newUploadConflict("A document with this filename is already queued")
+		return DocumentAdmission{}, newDocumentQueuedConflict("A document with this filename is already queued")
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return DocumentAdmission{}, err

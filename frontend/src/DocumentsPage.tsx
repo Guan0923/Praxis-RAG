@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   Alert,
   App,
   Button,
   Empty,
   Modal,
+  Popover,
   Table,
   Tag,
   Tooltip,
@@ -13,9 +14,12 @@ import {
   type UploadFile,
 } from "antd";
 import {
+  CheckCircleOutlined,
+  CloseOutlined,
   DeleteOutlined,
   FileTextOutlined,
   InboxOutlined,
+  LoadingOutlined,
   ReloadOutlined,
   UploadOutlined,
 } from "@ant-design/icons";
@@ -25,20 +29,27 @@ import {
   errorText,
   fetchAccess,
   formatBytes,
-  isNotFoundError,
-  isUploadJobTerminal,
-  uploadJobLabel,
   type AccessView,
   type Connection,
   type DocumentInfo,
-  type DocumentJobStatus,
   type KnowledgeBase,
   type Strategy,
-  type SyncUploadResult,
-  type UploadFailure,
-  type UploadJob,
-  type UploadResult,
 } from "./api";
+import {
+  bindNamespace,
+  canRetryItem,
+  clearFinished,
+  getSnapshot,
+  isBatchTerminal,
+  isFailedItem,
+  itemStatusText,
+  restore,
+  retryFailedItem,
+  setOnSettled,
+  subscribe,
+  uploadFiles,
+  uploadSummary,
+} from "./uploadBatches";
 
 type Props = {
   connection: Connection;
@@ -49,36 +60,6 @@ type Props = {
   onUploading: (busy: boolean) => void;
   onHealth: () => Promise<void>;
 };
-
-const uploadJobPollIntervalMs = 1500;
-
-type TrackedUploadJob = UploadJob & { stage?: string; error?: string };
-type SkippedDocument = DocumentInfo & { requested_name?: string };
-type AsyncUploadReport = {
-  jobs: TrackedUploadJob[];
-  failed: UploadFailure[];
-  skipped: SkippedDocument[];
-  done: boolean;
-};
-
-function abortableDelay(ms: number, signal: AbortSignal) {
-  return new Promise<void>((resolve) => {
-    if (signal.aborted) {
-      resolve();
-      return;
-    }
-    let timer: ReturnType<typeof setTimeout>;
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal.addEventListener("abort", onAbort, { once: true });
-  });
-}
 
 export function DocumentsPage({
   connection,
@@ -100,17 +81,16 @@ export function DocumentsPage({
   const [open, setOpen] = useState(false);
   const [files, setFiles] = useState<UploadFile[]>([]);
   const [uploadError, setUploadError] = useState("");
-  const [report, setReport] = useState<SyncUploadResult>();
-  const [asyncReport, setAsyncReport] = useState<AsyncUploadReport>();
-  const [stage, setStage] = useState("");
+  const [bubbleOpen, setBubbleOpen] = useState(false);
   const [deleting, setDeleting] = useState<string>();
   const lifetime = useRef(new AbortController());
   const listRequest = useRef<AbortController | null>(null);
   const listSequence = useRef(0);
-  const jobPolling = useRef<AbortController | null>(null);
-  const jobPollingSequence = useRef(0);
   const mutation = useRef(false);
   const confirmDialog = useRef<{ destroy: () => void } | null>(null);
+  const restoredBatches = useRef(false);
+  const batches = useSyncExternalStore(subscribe, getSnapshot);
+  const busy = uploading || batches.unfinishedCount > 0;
 
   async function loadDocuments() {
     listRequest.current?.abort();
@@ -171,199 +151,91 @@ export function DocumentsPage({
     return () => {
       lifetime.current.abort();
       listRequest.current?.abort();
-      jobPolling.current?.abort();
       confirmDialog.current?.destroy();
     };
   }, []);
   useEffect(() => {
     if (active) void loadDocuments();
   }, [active]);
+  // Restore unfinished batches once on mount (after a page reload); leaving
+  // the page never cancels an upload because the parent keeps this component
+  // mounted.
+  useEffect(() => {
+    // A workspace switch remounts this page: drop the previous workspace's
+    // finished rows before restoring the new workspace's pending batches.
+    bindNamespace(connection.namespace);
+    if (restoredBatches.current) return;
+    restoredBatches.current = true;
+    void restore(connection);
+  }, [connection]);
+  // Batch polling lives outside React, so the settled callback refreshes the
+  // document list and health summary once every tracked batch finishes.
+  useEffect(() => {
+    setOnSettled(() => {
+      void loadDocuments();
+      void onHealth();
+    });
+    return () => setOnSettled(undefined);
+  }, [connection]);
+  // The Console locks workspace switching (not page navigation) while a batch
+  // is unfinished; this keeps its prop in sync with the upload store.
+  useEffect(() => {
+    onUploading(batches.unfinishedCount > 0);
+  }, [batches.unfinishedCount, onUploading]);
+  useEffect(() => () => onUploading(false), [onUploading]);
+  useEffect(() => {
+    if (!batches.batches.length) setBubbleOpen(false);
+  }, [batches.batches.length]);
 
-  function stopJobPolling() {
-    jobPolling.current?.abort();
-    jobPolling.current = null;
-  }
-
-  async function pollUploadJobs(
-    initial: TrackedUploadJob[],
-    failed: UploadFailure[],
-    skipped: SkippedDocument[],
-  ) {
-    stopJobPolling();
-    const controller = new AbortController();
-    jobPolling.current = controller;
-    const sequence = ++jobPollingSequence.current;
-    let jobs = initial;
-    const publish = (next: TrackedUploadJob[], done: boolean) => {
-      if (sequence !== jobPollingSequence.current || lifetime.current.signal.aborted)
-        return;
-      setAsyncReport({ jobs: next, failed, skipped, done });
-    };
-    publish(jobs, false);
-    let completed = false;
-    try {
-      while (!controller.signal.aborted) {
-        if (!jobs.some((job) => !isUploadJobTerminal(job.status))) {
-          completed = true;
-          break;
-        }
-        await abortableDelay(uploadJobPollIntervalMs, controller.signal);
-        if (controller.signal.aborted || sequence !== jobPollingSequence.current)
-          break;
-        let notFound = false;
-        const updates = await Promise.all(
-          jobs
-            .filter((job) => !isUploadJobTerminal(job.status))
-            .map(async (job) => {
-              try {
-                const status = await api<DocumentJobStatus>(
-                  `/v1/document-jobs/${encodeURIComponent(job.artifact_id)}`,
-                  connection,
-                  { signal: controller.signal, cache: "no-store" },
-                );
-                return { job, status };
-              } catch (error) {
-                if (controller.signal.aborted) return null;
-                if (isNotFoundError(error)) notFound = true;
-                return { job, error: errorText(error) };
-              }
-            }),
-        );
-        if (controller.signal.aborted || sequence !== jobPollingSequence.current)
-          break;
-        jobs = jobs.map((job) => {
-          const update = updates.find(
-            (item) => item?.job.artifact_id === job.artifact_id,
-          );
-          if (!update) return job;
-          if ("error" in update)
-            return { ...job, status: "failed" as const, error: update.error };
-          return {
-            ...job,
-            status: update.status.status,
-            stage: update.status.stage ?? undefined,
-            error: update.status.error ?? undefined,
-          };
-        });
-        publish(jobs, false);
-        if (notFound) {
-          // A 404 means the backend no longer tracks this artifact, so retrying
-          // its status can never succeed: record the failure and stop polling.
-          completed = true;
-          controller.abort();
-          break;
-        }
-      }
-    } finally {
-      if (jobPolling.current === controller) jobPolling.current = null;
-    }
-    if (!completed || sequence !== jobPollingSequence.current) return;
-    publish(jobs, true);
-    await loadDocuments();
-    void onHealth();
+  function openUploadModal() {
+    setFiles([]);
+    setUploadError("");
+    setOpen(true);
   }
 
   function closeUploadModal() {
-    stopJobPolling();
     setOpen(false);
+    setFiles([]);
+    setUploadError("");
   }
 
-  async function upload() {
-    if (mutation.current || !knowledgeBase) return;
-    mutation.current = true;
-    stopJobPolling();
+  function startUpload() {
+    if (!knowledgeBase || mutation.current) return;
+    const selected = files
+      .map((file) => file.originFileObj)
+      .filter((file): file is NonNullable<typeof file> => !!file);
+    if (!selected.length) {
+      setUploadError("请选择 Markdown、TXT、PDF、DOCX 或 DOC 文件");
+      return;
+    }
+    if (selected.some((file) => file.size > 10 * 1024 * 1024)) {
+      setUploadError("单文件不超过 10 MiB");
+      return;
+    }
+    if (selected.some((file) => !/\.(md|txt|pdf|docx|doc)$/i.test(file.name))) {
+      setUploadError("仅支持 Markdown、TXT、PDF、DOCX 和 DOC 文件");
+      return;
+    }
     setUploadError("");
-    setReport(undefined);
-    setAsyncReport(undefined);
-    try {
-      const selected = files
-        .map((file) => file.originFileObj)
-        .filter((file): file is NonNullable<typeof file> => !!file);
-      if (!selected.length)
-        throw new Error("请选择 Markdown、TXT、PDF 或 DOCX 文件");
-      if (
-        selected.length > 10 ||
-        selected.some((file) => !file.size || file.size > 10 * 1024 * 1024)
-      )
-        throw new Error("每批最多 10 个非空文件，单文件不超过 10 MiB");
-      if (selected.some((file) => !/\.(md|txt|pdf|docx)$/i.test(file.name)))
-        throw new Error("仅支持 Markdown、TXT、PDF 和 DOCX 文件");
-      if (lifetime.current.signal.aborted) return;
-      onUploading(true);
-      setStage("正在检查文件");
-      if (!globalThis.crypto?.subtle)
-        throw new Error("文件检查需要 HTTPS 或 localhost 安全连接");
-      // Preserve the existing server preflight: one digest per selected file.
-      const fingerprints = [];
-      for (const file of selected) {
-        const digest = await crypto.subtle.digest(
-          "SHA-256",
-          await file.arrayBuffer(),
-        );
-        fingerprints.push({
-          name: file.name,
-          sha256: Array.from(new Uint8Array(digest), (byte) =>
-            byte.toString(16).padStart(2, "0"),
-          ).join(""),
-        });
-      }
-      const options = { signal: lifetime.current.signal, method: "POST" };
-      const checked = await api<{
-        files: { name: string; document?: DocumentInfo }[];
-      }>("/v1/documents/check", connection, {
-        ...options,
-        body: JSON.stringify({ files: fingerprints }),
-      });
-      const skipped = checked.files
-        .filter((item) => item.document)
-        .map((item) => ({ ...item.document!, requested_name: item.name }));
-      const pending = selected.filter(
-        (_, index) => !checked.files[index].document,
-      );
-      let result: UploadResult = { imported: [], skipped: [], failed: [] };
-      if (pending.length) {
-        setStage("正在生成索引");
-        const body = new FormData();
-        pending.forEach((file) => body.append("files", file));
-        const idempotencyKey = crypto.randomUUID();
-        result = await api<UploadResult>("/v1/documents", connection, {
-          ...options,
-          headers: { "Idempotency-Key": idempotencyKey },
-          body,
-        });
-      }
-      if (lifetime.current.signal.aborted) return;
-      if (result.mode === "async") {
-        // Jobs keep running server-side: render the accepted list and poll each
-        // artifact id until it reaches a terminal state.
-        const jobs: TrackedUploadJob[] = result.jobs ?? [];
-        const failed = result.failed ?? [];
-        if (!failed.length) setFiles([]);
-        void pollUploadJobs(jobs, failed, skipped);
-        return;
-      }
-      const complete = {
-        ...result,
-        skipped: [...skipped, ...(result.skipped || [])],
-      };
-      setReport(complete);
-      if (!complete.failed.length) setFiles([]);
-      await loadDocuments();
-      void onHealth();
-    } catch (error) {
-      if (!lifetime.current.signal.aborted)
-        setUploadError(errorText(error));
-    } finally {
-      mutation.current = false;
-      if (!lifetime.current.signal.aborted) {
-        onUploading(false);
-        setStage("");
+    // Hand the files to the background store immediately: the modal closes and
+    // its selection never comes back, progress lives in the toolbar chip.
+    closeUploadModal();
+    void uploadFiles(selected, connection);
+  }
+
+  async function retryAllFailed() {
+    const failed = batches.failedItems.filter((item) => canRetryItem(item));
+    for (const item of failed) {
+      try {
+        await retryFailedItem(item, connection);
+      } catch {
+        // A restored row has no local file; the next retryable row still runs.
       }
     }
   }
 
   function removeDocument(document: DocumentInfo) {
-    if (mutation.current || uploading) return;
+    if (mutation.current || busy) return;
     confirmDialog.current = modal.confirm({
       title: "删除文档",
       content: (
@@ -399,24 +271,85 @@ export function DocumentsPage({
       },
     });
   }
-  const summary = report
-    ? `新增 ${report.imported.length} 个，跳过 ${report.skipped.length} 个，失败 ${report.failed.length} 个`
-    : "";
-  const asyncJobs = asyncReport?.jobs ?? [];
-  const asyncCompleted = asyncJobs.filter((job) =>
-    isUploadJobTerminal(job.status),
-  ).length;
-  const asyncFailed =
-    !!asyncReport &&
-    (asyncReport.failed.length > 0 ||
-      asyncJobs.some((job) => job.status === "failed"));
-  const asyncSummary = asyncReport
-    ? asyncJobs.length
-      ? asyncReport.done
-        ? `已受理 ${asyncJobs.length} 个文件，后台处理完成（${asyncCompleted}/${asyncJobs.length} 已完成）`
-        : `已受理 ${asyncJobs.length} 个文件，正在处理后台上传（${asyncCompleted}/${asyncJobs.length} 已完成）`
-      : "没有文件进入后台处理"
-    : "";
+  // uploadSummary derives the chip label and failure colour from the store;
+  // null means no batch has ever been started in this tab.
+  const summary = uploadSummary(batches);
+  const retryableFailed = batches.failedItems.filter((item) => canRetryItem(item));
+  const hasFinished = batches.batches.some((batch) => isBatchTerminal(batch.status));
+  const uploadBubble = (
+    <div className="upload-bubble">
+      <div className="upload-bubble-heading">
+        <span className="upload-bubble-title">
+          保存 {summary?.settled ?? 0}/{summary?.total ?? 0}
+        </span>
+        <Button
+          type="text"
+          size="small"
+          aria-label="关闭上传进度"
+          icon={<CloseOutlined />}
+          onClick={() => setBubbleOpen(false)}
+        />
+      </div>
+      {batches.batches.length ? (
+        <>
+          <div className="upload-bubble-list">
+            {batches.batches.flatMap((batch) =>
+              batch.items.map((item) => {
+                const failed = isFailedItem(item);
+                return (
+                  <div
+                    className="upload-bubble-item"
+                    key={`${batch.id}:${item.position}`}
+                  >
+                    <div className="upload-bubble-details">
+                      <div className="upload-bubble-name break-text">
+                        {item.name}
+                      </div>
+                      <div
+                        className={`upload-bubble-state${failed ? " upload-bubble-state-failed" : ""}`}
+                      >
+                        {itemStatusText(item, batch.transferProgress)}
+                      </div>
+                    </div>
+                    {failed && canRetryItem(item) && (
+                      <Button
+                        type="link"
+                        size="small"
+                        className="upload-bubble-retry"
+                        onClick={() => void retryFailedItem(item, connection)}
+                      >
+                        重试
+                      </Button>
+                    )}
+                  </div>
+                );
+              }),
+            )}
+          </div>
+          {(batches.failedItems.length > 0 || hasFinished) && (
+            <div className="upload-bubble-actions">
+              {batches.failedItems.length > 0 && (
+                <Button
+                  size="small"
+                  disabled={!retryableFailed.length}
+                  onClick={() => void retryAllFailed()}
+                >
+                  重试失败项
+                </Button>
+              )}
+              {hasFinished && (
+                <Button size="small" onClick={clearFinished}>
+                  清空已完成
+                </Button>
+              )}
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="upload-bubble-empty secondary">没有进行中的上传</div>
+      )}
+    </div>
+  );
 
   // Only whole-knowledge-base writers get upload/delete controls. File-level
   // writers can still replace authorized documents through the API, but the
@@ -481,7 +414,7 @@ export function DocumentsPage({
             danger
             aria-label={`删除 ${doc.name}`}
             icon={<DeleteOutlined />}
-            disabled={uploading || !!deleting}
+            disabled={busy || !!deleting}
             loading={deleting === doc.name}
             onClick={() => removeDocument(doc)}
           />
@@ -506,17 +439,38 @@ export function DocumentsPage({
               onClick={() => void loadDocuments()}
             />
           </Tooltip>
-          {!readOnly && (
+          {!readOnly && (summary ? (
+            <Popover
+              trigger="click"
+              placement="bottomRight"
+              open={bubbleOpen}
+              onOpenChange={setBubbleOpen}
+              content={uploadBubble}
+            >
+              <Button
+                size="small"
+                className={`upload-chip${summary.hasFailure ? " upload-chip-warning" : ""}`}
+                aria-label="上传进度"
+                icon={
+                  summary.phase === "completed"
+                    ? <CheckCircleOutlined />
+                    : <LoadingOutlined spin />
+                }
+              >
+                {summary.label}
+              </Button>
+            </Popover>
+          ) : (
             <Button
               aria-label="上传文档"
               type="primary"
               icon={<UploadOutlined />}
               disabled={!!deleting}
-              onClick={() => setOpen(true)}
+              onClick={openUploadModal}
             >
               上传文档
             </Button>
-          )}
+          ))}
         </div>
       </div>
       {readOnly && (
@@ -571,30 +525,20 @@ export function DocumentsPage({
         open={open}
         forceRender
         width={640}
-        onCancel={() => {
-          if (!uploading) closeUploadModal();
-        }}
-        closable={!uploading}
-        mask={{ closable: !uploading }}
-        keyboard={!uploading}
+        onCancel={closeUploadModal}
         footer={
           <>
-            <Button
-              aria-label="关闭"
-              disabled={uploading}
-              onClick={closeUploadModal}
-            >
+            <Button aria-label="关闭" onClick={closeUploadModal}>
               关闭
             </Button>
             <Button
               aria-label="上传并索引"
               type="primary"
               icon={<UploadOutlined />}
-              loading={uploading}
-              disabled={uploading || !knowledgeBase || !files.length || !!deleting}
-              onClick={() => void upload()}
+              disabled={!knowledgeBase || !files.length || !!deleting}
+              onClick={startUpload}
             >
-              {stage || "上传并索引"}
+              上传并索引
             </Button>
           </>
         }
@@ -604,7 +548,6 @@ export function DocumentsPage({
           <Upload.Dragger
             multiple
             accept=".md,.txt,.pdf,.docx,.doc"
-            disabled={uploading}
             beforeUpload={() => false}
             fileList={files}
             showUploadList={false}
@@ -615,14 +558,14 @@ export function DocumentsPage({
             </p>
             <p>选择文档</p>
             <p className="secondary">
-              MD / TXT / PDF / DOCX / DOC · 每批最多 10 个 · 单文件 10 MiB
+              MD / TXT / PDF / DOCX / DOC · 单文件 10 MiB · 超过 10 个自动分批
             </p>
           </Upload.Dragger>
           {files.length > 0 && (
             <section className="upload-selected-files" aria-label="待上传文件">
               <div className="upload-files-heading">
-                <span>待上传文件 <span className="secondary">{files.length} / 10</span></span>
-                <Button type="text" size="small" disabled={uploading} onClick={() => setFiles([])}>清空</Button>
+                <span>待上传文件 <span className="secondary">{files.length} 个</span></span>
+                <Button type="text" size="small" onClick={() => setFiles([])}>清空</Button>
               </div>
               <ul className="upload-file-list">
                 {files.map((file) => (
@@ -633,7 +576,7 @@ export function DocumentsPage({
                       <div className="secondary">{formatBytes(file.size ?? 0)}</div>
                     </div>
                     <Tooltip title="移除文件">
-                      <Button type="text" danger aria-label={`移除 ${file.name}`} icon={<DeleteOutlined />} disabled={uploading}
+                      <Button type="text" danger aria-label={`移除 ${file.name}`} icon={<DeleteOutlined />}
                         onClick={() => setFiles((current) => current.filter((item) => item.uid !== file.uid))} />
                     </Tooltip>
                   </li>
@@ -659,64 +602,6 @@ export function DocumentsPage({
                 showIcon
                 title="上传失败"
                 description={uploadError}
-              />
-            )}
-            {report && (
-              <Alert
-                type={report.failed.length || report.imported.some((item) => item.skipped_object_count) ? "warning" : "success"}
-                showIcon
-                title={summary}
-                description={
-                  <div className="upload-report">
-                    {report.imported.map((item, index) => (
-                      <div key={`import-${index}`}>{item.name}：已索引
-                        {!!item.skipped_object_count && <div>已跳过 {item.skipped_object_count} 个对象</div>}
-                        {item.diagnostics?.map((diagnostic, d) => <div key={d}>
-                          第 {diagnostic.location?.paragraph} 段：{diagnostic.text || diagnostic.message}
-                        </div>)}
-                      </div>
-                    ))}
-                    {report.skipped.map((item, index) => (
-                      <div key={`skip-${index}`}>
-                        {item.requested_name || item.name}：已存在 {item.name}
-                      </div>
-                    ))}
-                    {report.failed.map((item, index) => (
-                      <div key={`fail-${index}`}>
-                        {item.name}：{item.error}
-                      </div>
-                    ))}
-                  </div>
-                }
-              />
-            )}
-            {asyncReport && (
-              <Alert
-                type={asyncFailed ? "warning" : asyncReport.done ? "success" : "info"}
-                showIcon
-                title={asyncSummary}
-                description={
-                  <div className="upload-report">
-                    {asyncJobs.map((job) => (
-                      <div key={job.artifact_id}>
-                        {job.name}：{uploadJobLabel(job.status, job.stage)}
-                        {job.status === "failed" && job.error
-                          ? `（${job.error}）`
-                          : null}
-                      </div>
-                    ))}
-                    {asyncReport.skipped.map((item, index) => (
-                      <div key={`async-skip-${index}`}>
-                        {item.requested_name || item.name}：已存在 {item.name}
-                      </div>
-                    ))}
-                    {asyncReport.failed.map((item, index) => (
-                      <div key={`async-fail-${index}`}>
-                        {item.name}：{item.error}
-                      </div>
-                    ))}
-                  </div>
-                }
               />
             )}
           </div>

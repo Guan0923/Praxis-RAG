@@ -15,6 +15,10 @@ REST /v1/* --------------------> rag-service ──> 共享状态库（MySQL）
                  -> 无 Kafka：rag-service 内嵌文档 worker 直接轮询发件箱
                  -> 两种方式都完成解析/切分/Embedding/Qdrant 发布，用
                     GET /v1/document-jobs/{artifact_id} 轮询状态
+REST 批次上传 POST /v1/document-batches（Console 使用）
+                 -> 每文件一个事务并行受理（按文件名加锁，不同名互不排队）
+                 -> 202 返回 batch_id + 每个文件 accepted/skipped/failed
+                 -> GET /v1/document-batches/{batch_id} 同时给出保存结果与解析阶段
 REST 上传（RAG_UPLOAD_MODE=sync）-> 请求内完成解析/切分/Embedding/发布
 MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-worker -> SearchRaw + 快照
 Kafka 死信（显式 DLQ topic）-> rag-dead-letter-worker --kind document|search
@@ -321,6 +325,7 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 | `RAG_DOCUMENT_WORKER_LOCAL` | `false` | 独立 `rag-document-worker` 的单进程 outbox 模式（通常无需：无 Kafka 时服务已内嵌 worker）；仅在未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时生效 |
 | `RAG_DOCUMENT_WORKER_POLL_SECONDS` | `0.5` | 内嵌/本地 outbox 与消费轮询间隔 |
 | `RAG_DOCUMENT_WORKER_RECOVER_SECONDS` | `30` | 文档 worker 周期性 Recover（恢复中断上传/补偿） |
+| `RAG_DOCUMENT_WORKERS` | `1` | `scripts/start-stack.ps1` 启动的 `rag-document-worker` 进程数（Kafka 同组分摊 `RAG_DOCUMENT_TOPIC` 分区，上限为分区数；每个进程串行处理，N 个进程 = 最多 N 篇并发解析，同时受 pdf-parser `RAG_PDF_SERVICE_CONCURRENCY` 约束） |
 | `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_DOCUMENT_MAX_ATTEMPTS` | `5` | 文档 worker 的 Kafka 进程内最大尝试次数（前者优先；名称为兼容旧配置保留） |
 | `RAG_DOCUMENT_WORKER_CONCURRENCY` | `1` | 文档 worker 并发处理数（1..64）。`>1` 时同一 worker 可同时解析多篇 PDF；解析段的有效并行度受 pdf-parser 的 `RAG_PDF_SERVICE_CONCURRENCY` 封顶，两侧应同量级调整，并核对 pdf-parser 内存/CPU 与本地解压磁盘峰值 |
 
@@ -450,6 +455,41 @@ curl.exe http://127.0.0.1:8011/health
 curl.exe http://127.0.0.1:8011/openapi.json   # OpenAPI 3.1
 curl.exe http://127.0.0.1:8011/docs           # 自包含交互文档
 ```
+
+### 文档上传与批次进度
+
+单批上传（≤10 个文件、单文件 ≤10 MiB）有三个入口，语义一致，都是"每文件一个 `document_jobs` 行 + 一个发件箱行"：
+
+| 入口 | 行为 |
+| --- | --- |
+| `POST /v1/documents` | 同步受理一批文件：服务端逐文件提交后返回 `{"mode":"async","jobs":[...],"failed":[...]}`；`RAG_UPLOAD_MODE=sync` 时在请求内完成解析/索引 |
+| `POST /v1/document-batches` | **批次受理**：`202` 返回 `batch_id` 与每个文件的结果（`accepted` / `skipped` / `failed`），供 Console 显示进度；每文件独立事务并行提交，不同文件名之间不互相排队（同名仍串行，保证查重与插入的原子性） |
+| MCP `add_document` | 单文件异步受理，只返回 `artifact_id` |
+
+`POST /v1/document-batches` 的响应结构（Console 气泡直接消费）：
+
+```json
+{
+  "batch_id": "8f0c…",
+  "status": "processing",
+  "total": 3, "accepted": 1, "skipped": 1, "failed": 1,
+  "items": [
+    {"position": 0, "name": "a.pdf", "status": "accepted", "reason": null,
+     "artifact_id": "1feb…", "error": null,
+     "job": {"status": "processing", "stage": "parsing", "error": null}},
+    {"position": 1, "name": "b.pdf", "status": "skipped", "reason": "exists"},
+    {"position": 2, "name": "c.pdf", "status": "failed", "reason": "config", "error": "…"}
+  ]
+}
+```
+
+- `skipped.reason`：`exists`（已发布同名文档）、`queued`（同名任务在队列）、`duplicate`（本批重复）。
+- `failed.reason`：`validation`（名称/类型/大小）、`config`（知识库缺 VLM/OCR 等）、`conflict`、`network`（仅前端产生）、`internal`。
+- 同一个 `Idempotency-Key` 重发返回原批次，不会重复入队。
+- `GET /v1/document-batches/{batch_id}` 返回同一结构，`items[].job` 给出解析阶段（`parsing` → `chunking` → `staging` → `embedding` → `indexing` → `publishing`），终态为 `succeeded` / `failed`。
+- `GET /v1/document-batches?limit=20` 只返回调用方未完成的批次，Console 刷新/切页后据此恢复进度；批次只保存进度元数据（不保存文件字节），默认保留 7 天后清理。
+- 批次状态由批次行和对应 `document_jobs` 实时推导：`saving`（受理中）→ `processing` → `completed`（含全部跳过）/ `failed`（有失败且没有任何文件入队）；`interrupted` 表示服务在受理中途重启（文件未入队，可重试）。
+- Console 行为：点"上传并索引"后弹窗立即关闭，按钮缩成"保存中 x/y / 处理中 x/y / 已完成 x/y"的小徽标，点开是逐文件进度气泡；失败项可单独重试。上传期间**允许切换 Console 页面**（工作区切换仍被锁住，因为批次绑定知识库）。
 
 ### 系统监控（Console 页面与只读接口）
 

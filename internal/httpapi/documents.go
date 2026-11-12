@@ -49,6 +49,14 @@ type DocumentRuntime interface {
 	// GetDocumentStatus reads one async admission's {artifact_id, status,
 	// stage, error} projection.
 	GetDocumentStatus(ctx context.Context, namespace, artifactID string) (map[string]any, error)
+	// SubmitDocumentBatch admits every file of one batch upload and returns the
+	// durable batch record with per-file outcomes.
+	SubmitDocumentBatch(ctx context.Context, namespace string, files []UploadFile, idempotencyKey, owner string) (map[string]any, error)
+	// GetDocumentBatch reads one batch record with its items and their document
+	// job stages; viewer is the signed-in account id or "".
+	GetDocumentBatch(ctx context.Context, namespace, batchID, viewer string) (map[string]any, error)
+	// ListDocumentBatches lists the caller's unfinished batches.
+	ListDocumentBatches(ctx context.Context, namespace, viewer string, limit int) (map[string]any, error)
 	Delete(ctx context.Context, namespace, name string) (map[string]any, error)
 	CheckDocuments(ctx context.Context, namespace string, files []CheckFile) (map[string]any, error)
 	ReadDocument(ctx context.Context, namespace, name string) (text string, version string, err error)

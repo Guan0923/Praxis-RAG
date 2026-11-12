@@ -6,8 +6,8 @@
 # `docker compose up -d mysql qdrant redis kafka`, to skip it.
 # Kafka replaces the former RocketMQ stack; topics/consumer groups are created
 # explicitly below (auto-creation is also enabled on the broker).
-# rag-service is started below, and rag-document-worker is started as its child
-# process with the same database, Redis, Qdrant, encryption and Kafka settings.
+# rag-service is started below, and rag-document-worker runs as its children
+# with the same database, Redis, Qdrant, encryption and Kafka settings (RAG_DOCUMENT_WORKERS, default 1).
 # Run rag-search-worker separately: without a search consumer, MCP searches need a
 # consumer before their task deadline.
 #
@@ -274,14 +274,31 @@ $docWorker = Join-Path $binDir "rag-document-worker.exe"
 if (-not (Test-Path $docWorker)) {
     throw "Document worker executable not found: $docWorker. Run scripts\build-go.ps1 without -SkipFrontend to build dist\bin, then retry."
 }
-Write-Host "Starting rag-document-worker (inherits the loaded .env settings)..."
-$docWorkerProcess = Start-Process -FilePath $docWorker -NoNewWindow -PassThru
+# RAG_DOCUMENT_WORKERS fans out document workers: Kafka shares the
+# RAG_DOCUMENT_TOPIC partitions between consumers of RAG_DOCUMENT_GROUP and each
+# process parses one document at a time, so N workers = N concurrent parses. The
+# effective ceiling is the topic partition count (topics are provisioned with 4
+# below); extra processes stay idle. Keep the default 1 for a single-worker setup.
+$documentWorkers = 1
+if ($env:RAG_DOCUMENT_WORKERS) {
+    $parsedWorkers = 0
+    if (-not [int]::TryParse($env:RAG_DOCUMENT_WORKERS, [ref]$parsedWorkers) -or $parsedWorkers -lt 1 -or $parsedWorkers -gt 32) {
+        throw "RAG_DOCUMENT_WORKERS must be an integer between 1 and 32."
+    }
+    $documentWorkers = $parsedWorkers
+}
+$docWorkerProcesses = @()
+Write-Host "Starting $documentWorkers rag-document-worker process(es) (inherits the loaded .env settings)..."
+for ($workerIndex = 1; $workerIndex -le $documentWorkers; $workerIndex++) {
+    $docWorkerProcesses += Start-Process -FilePath $docWorker -NoNewWindow -PassThru
+}
+
 Write-Host "Starting rag-service on http://$($env:RAG_SERVICE_HOST):$($env:RAG_SERVICE_PORT)/console"
 try {
     & $ragService
 }
 finally {
-    if ($docWorkerProcess -and -not $docWorkerProcess.HasExited) {
+    foreach ($docWorkerProcess in $docWorkerProcesses) {
         Write-Host "Stopping rag-document-worker (pid $($docWorkerProcess.Id))..."
         Stop-Process -Id $docWorkerProcess.Id -Force -ErrorAction SilentlyContinue
     }

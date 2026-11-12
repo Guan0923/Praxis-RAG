@@ -106,6 +106,8 @@ migration CLI.
 | `artifact_snapshots` | `artifact_id` | durable version-bound artifact bytes, metadata and expiry |
 | `document_jobs` | `artifact_id` | **active** asynchronous ingest job: complete request bytes, status/stage, attempts, owner, execution id and SQL lease |
 | `document_job_outbox` | `id` | **active** transactional outbox row per accepted job (`PENDING`/`PUBLISHED`, retry metadata) |
+| `document_batches` | `id` | **active** Console batch upload: namespace/owner, `Idempotency-Key`, stored lifecycle (`saving`/`active`) and accepted/skipped/failed counters; no file bytes |
+| `document_batch_items` | `(batch_id, position)` | **active** per-file batch outcome: `saving`/`accepted`/`skipped`/`failed`, skip/failure reason, `artifact_id`, safe error text |
 | `document_tasks` | `artifact_id` | **legacy, inactive** asynchronous document task state |
 | `document_task_outbox` | `artifact_id` | **legacy, inactive** initial delivery generation, owner, lease, attempts and retry metadata |
 | `search_tasks` | `result_id` | **legacy, inactive** search parameters, deadline and task state |
@@ -252,6 +254,12 @@ The separate persistent read-model `cache_outbox` is unaffected.
 | `upload_objects` | immutable source, chunks and parse artifacts scoped to an operation |
 | `document_heads` | published version for each namespace/document |
 | `document_leases` | renewable document/name leases and exclusive namespace coordination |
+
+`document_batches` / `document_batch_items` are progress metadata for
+`POST /v1/document-batches`: the batch row is committed before the per-file
+admissions (so the Console can poll while saves run) and the item rows are
+settled afterwards. They never store file bytes — every admitted file is still
+a `document_jobs` row with its bytes — and are pruned after seven days.
 
 New tables are created by the existing schema initialization; no existing rows
 or Qdrant collections are rewritten automatically. Identifiers and document

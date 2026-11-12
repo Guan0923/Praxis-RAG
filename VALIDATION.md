@@ -1197,3 +1197,101 @@ derived every row id from one shared suffix, which could collide on the
 `document_jobs` primary key (~1/3 of runs); it now uses a fresh random id per row
 and passed `-count=5`. `go test ./...` for unrelated packages (e2e, cmd, workers)
 was not rerun.
+
+## Console 批次上传与逐文件进度气泡 — 2026-11-12
+
+Changed (backend, Go):
+
+- New tables `document_batches` (id, namespace, owner, idempotency_key,
+  status, total/accepted/skipped/failed, timestamps) and `document_batch_items`
+  (batch_id, position, name, status, reason, artifact_id, error, timestamps),
+  appended after the ported tables in `internal/state/schema.go` and covered by
+  `schema_test.go`. They store progress metadata only; every admitted file is
+  still a `document_jobs` row with its bytes.
+- `internal/state/document_batches.go`: Create / Finish / Get / ListActive /
+  Prune / RunRetention; stored lifecycle is `saving` → `active`, while
+  `processing`/`completed`/`failed`/`interrupted` are derived from the items and
+  their jobs. An all-skipped batch is `completed`; an all-failed one `failed`.
+- `internal/state/document_jobs.go`: `insertJob` now serializes on the per-file
+  lease row (`guardName` in `internal/state/uploads.go`) instead of the
+  namespace-wide guard, and reads `knowledge_bases.version` with `FOR SHARE`
+  instead of `FOR UPDATE`, so different file names admit in parallel while the
+  same name keeps its check-then-insert atomic. The idempotency probe no longer
+  takes a row lock (see bug below). Typed `DocumentExistsConflict` /
+  `DocumentQueuedConflict` keep the existing messages while letting the batch
+  path classify skips.
+- `internal/runtime/documents_batch.go`: `SubmitDocumentBatch` commits the batch
+  record, fans out admissions with a 6-way semaphore on a disconnect-proof
+  context, settles every item and returns the Console payload;
+  `GetDocumentBatch` / `ListDocumentBatches` (restore list only contains
+  unfinished work, owner-scoped for sessions). `internal/httpapi/documents_batch.go`
+  + routes + OpenAPI rows: `POST /v1/document-batches` (202),
+  `GET /v1/document-batches/{batch_id}`, `GET /v1/document-batches?limit=20`;
+  `/v1/documents` and `/v1/documents/check` are unchanged.
+- Retention: `RunRetention` prunes settled batch rows after seven days from
+  `cmd/rag-service/main.go` (hourly + at startup).
+
+Bug found during real-service verification: the old
+`SELECT ... WHERE namespace = ? AND idempotency_key = ? FOR UPDATE` inside
+`insertJob` takes a gap lock for a missing key; once admissions for different
+names run concurrently, two such gap locks plus their inserts deadlock and one
+file failed with the generic "Document submission failed" message. Removing the
+row lock (the unique index plus the existing unique-violation replay fallback
+already make retries correct) made 4/4 repeated 3-file batches report
+`accepted 2 / skipped 1 / failed 0`.
+
+Changed (frontend, `frontend/`):
+
+- `api.ts`: document-batch types plus `submitDocumentBatch` (XHR multipart with
+  `files`, Idempotency-Key, CSRF/Authorization headers, upload progress, 401
+  handling, AbortSignal), `getDocumentBatch`, `listActiveDocumentBatches`.
+- `uploadBatches.ts`: module store + `useSyncExternalStore`; splits a selection
+  into ≤10-file batches (two concurrent uploads), polls every 1500 ms, stops on
+  terminal states, `setOnSettled` once, `restore` (saving/processing/interrupted
+  only), per-file retry, `clearFinished`, `bindNamespace` (drops the previous
+  workspace's finished rows on a workspace switch), injectable timers.
+- `DocumentsPage.tsx`: modal is selection-only and closes immediately after
+  handing files to the store; the toolbar upload button becomes a small chip
+  (`保存中/处理中/已完成 x/y`) that opens an Ant Design Popover bubble with
+  per-file state, stage text, retry and clear actions. Navigation is not locked
+  (workspace switching stays locked in `Console.tsx`).
+- `styles.css` bubble/chip styles; `uploadBatches.test.ts` 10 cases.
+
+Verification (Windows 11, Go 1.27, Node 26; MySQL `praxis_gotest` test schema;
+`praxis_rag` used only for the transient end-to-end uploads, whose rows were
+deleted afterwards):
+
+```
+$ go build ./... ; go vet ./internal/state ./internal/httpapi ./internal/runtime ./internal/wire ./cmd/rag-service   # exit 0
+$ go test -p 1 -count=1 ./internal/state ./internal/migrate ./internal/httpapi     # ok
+$ go test -p 1 -count=1 ./internal/runtime ./cmd/rag-service                       # ok
+$ go test -p 1 -count=15 ./internal/state -run 'TestConcurrent'                    # ok
+$ cd frontend && npm run typecheck                                                 # exit 0
+$ cd frontend && npm test                                                          # 11 files / 155 tests
+$ pwsh -File scripts/build-go.ps1 -SkipGo                                          # vite build + copy to dist/web
+  # [ok] frontend -> dist/web (203 files); [ok] smoke: /health 200, /console serves index.html
+```
+
+Real service (rebuilt `dist/bin/rag-service.exe`, restarted on 127.0.0.1:8011):
+
+- `POST /v1/document-batches` with `it2-…-a.md`, `it2-…-b.md`, `it2-…-a.md` →
+  `202 {status:"processing", total:3, accepted:2, skipped:1, failed:0}`; the
+  duplicate name was classified `skipped/queued`. Four consecutive batches
+  produced the same 2/1/0 split (no internal failures).
+- Replaying the same `Idempotency-Key` returned the same `batch_id` with the
+  same counters and did not create new `document_jobs` rows.
+- A batch whose only file already exists (`cdc-probe-…txt`) → `skipped/exists`
+  and `status:"completed"` (all-skipped is not a failure).
+- `GET /v1/document-batches/{batch_id}` returned the per-file `job.stage`
+  (`retry_wait` while the worker backs off) and `GET /v1/document-batches`
+  excluded the completed batch while still returning the processing one, so a
+  reload only restores pending work.
+- The rebuilt Console bundle served at `/console/assets/assets/index-BIf5ugcH.js`
+  contains the bubble strings; the Go service serves it via `dist/web`.
+
+Not verified: manual browser click-through of the new bubble (unit tests,
+typecheck, production build and the served bundle were verified); end-to-end
+parse/embedding of batch-uploaded files depends on the target knowledge base
+having embedding/VLM configuration — the `manuals` KB used for the smoke has an
+empty embedding base URL, so its jobs stayed in worker backoff while the batch
+progress itself was correct.

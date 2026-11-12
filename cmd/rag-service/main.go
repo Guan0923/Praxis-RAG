@@ -33,6 +33,9 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/wire"
 )
 
+// documentBatchRetention is how long Console batch progress records are kept.
+const documentBatchRetention = 7 * 24 * time.Hour
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "praxis-rag: %v\n", err)
@@ -61,6 +64,13 @@ func run() error {
 		return err
 	}
 	defer func() { _ = stores.Close() }()
+	// Batch records are Console progress metadata, not document state: prune
+	// settled rows after a week so the table stays bounded.
+	retentionContext, stopRetention := context.WithCancel(context.Background())
+	defer stopRetention()
+	if stores.DocumentBatches != nil {
+		go stores.DocumentBatches.RunRetention(retentionContext, documentBatchRetention, time.Hour)
+	}
 	logger := newLogger()
 	mqSettings, err := mq.SettingsFromEnv()
 	if err != nil {

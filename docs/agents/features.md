@@ -15,6 +15,7 @@
 - 支持格式：`.md`、`.txt`、`.pdf`、`.docx`、`.doc`（DOC 需外部 LibreOffice）；每批最多 10 个文件，单文件最大 10 MiB。
 - **默认异步受理**（`RAG_UPLOAD_MODE=async`）：`POST /v1/documents` 在**一个事务**内写入 `document_jobs`（任务，含文件字节、sha256、配置版本）和 `document_job_outbox`（发件箱），提交成功即返回每文件的 `artifact_id`；解析/切分/Embedding 发布在 worker 后台完成。
 - 上传前可用 `POST /v1/documents/check` 做同名/SHA-256 预检；`Idempotency-Key` 支持重试复用原 `artifact_id`。
+- **批次上传（Console 使用）**：`POST /v1/document-batches` 先提交 `document_batches` + `document_batch_items`（每项 `saving`），再按文件名加锁并行受理每个文件（不同名互不排队，默认 6 路），最后把每项结果与计数写回并返回 `202`。`GET /v1/document-batches/{batch_id}` 同时给出保存结果（`accepted`/`skipped`/`failed` + 原因）与已受理文件的 `job.status/stage`；`GET /v1/document-batches?limit=20` 只返回仍有未完成工作的批次，供 Console 刷新后恢复进度气泡。批次只是进度元数据，不保存文件字节，7 天后清理。
 - 任务状态：`queued` → `processing`（带 `stage`）→ `succeeded` / `failed`；`stage` 依次为 `parsing`、`chunking`、`staging`、`embedding`、`indexing`、`publishing`、`completed`/`failed`。只有 `succeeded` 表示已持久发布、可检索。
 - 冲突规则：同名文档已存在、或已有同名排队/执行中的新增，会被拒绝；`add_document` 不覆盖同名文档，替换用 `update_document`。
 - 失败重试：同进程内指数退避（默认最多 5 次），仍是“至少一次”投递；耗尽后进入显式 DLQ topic，由 `rag-dead-letter-worker` 落终态。崩溃恢复：任务租约 + 心跳 + 上传 journal 对账，重复投递靠幂等吸收。
@@ -100,7 +101,7 @@
 | 基础设施 | `GET /health`、`GET /openapi.json`、`GET /docs`、`GET /`、`GET /console`、`GET /console/assets/*` |
 | 认证 | `GET /v1/auth/status`、`POST /v1/auth/register`、`POST /v1/auth/login`、`POST /v1/auth/logout`、`GET /v1/auth/me` |
 | 租户：检索/结果 | `POST /v1/search`、`GET /v1/search-results/{result_id}`、`GET /v1/artifacts/{artifact_id}`、`GET /v1/artifacts/{artifact_id}/content` |
-| 租户：文档 | `GET /v1/documents`、`POST /v1/documents`、`POST /v1/documents/check`、`GET /v1/document-jobs/{artifact_id}`、`GET /v1/documents/{name}/content`、`DELETE /v1/documents/{name}` |
+| 租户：文档 | `GET /v1/documents`、`POST /v1/documents`、`POST /v1/documents/check`、`GET /v1/document-jobs/{artifact_id}`、`POST /v1/document-batches`、`GET /v1/document-batches`、`GET /v1/document-batches/{batch_id}`、`GET /v1/documents/{name}/content`、`DELETE /v1/documents/{name}` |
 | 租户：知识库/状态 | `GET /v1/knowledge-base`、`GET /v1/namespaces`、`GET /v1/chunking/strategies`、`GET /v1/uploads`、`GET /v1/uploads/{operation_id}` |
 | Console 会话：知识库/共享 | `GET /v1/users`、`POST /v1/knowledge-bases`、`GET /v1/knowledge-bases/{namespace}/access`、`GET /v1/knowledge-bases/{namespace}/permissions`、`DELETE /v1/knowledge-bases/{namespace}/permissions/{user_id}`、`GET|POST /v1/knowledge-bases/{namespace}/invitations`、`GET /v1/invitations`、`POST /v1/invitations/preview`、`POST /v1/invitations/accept`、`POST /v1/invitations/decline`、`DELETE /v1/invitations/{invitation_id}` |
 | 管理：用户 | `GET /v1/admin/users`、`PATCH /v1/admin/users/{user_id}`、`DELETE /v1/admin/users/{user_id}` |
@@ -126,7 +127,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | 路由 | 页面 | 可见角色 | 主要功能 |
 | --- | --- | --- | --- |
 | `#/workspaces/search` | 检索调试 | 所有登录账号 | BM25/Embedding/Hybrid 检索、Cross-Encoder 重排开关、候选/Top-K 调整、三模式对比、耗时与证据状态、命中详情（分数、来源、页码/章节、图片、脚注） |
-| `#/workspaces/documents` | 知识文档 | 所有登录账号 | 文档列表（大小/块数/切分配置）、上传（SHA-256 预检 + 异步任务轮询进度）、删除；只读授权时隐藏写操作 |
+| `#/workspaces/documents` | 知识文档 | 所有登录账号 | 文档列表（大小/块数/切分配置）、上传（批次受理：工具栏徽标 + 逐文件进度气泡，可失败重试；刷新后恢复未完成批次）、删除；只读授权时隐藏写操作 |
 | `#/workspaces/documents/{name}` | 文档详情 | 所有登录账号 | 正文预览、PDF 预览（pdfjs）、图片/表格资产查看 |
 | `#/workspaces/create` | 创建知识库 | 所有登录账号 | 管理员：namespace + 切分参数 + 从「模型配置」选择 Embedding/Reranker/VLM/OCR；VIP/普通用户：简化表单（从默认模板克隆模型配置） |
 | `#/knowledge-bases` | 知识库 | 管理员 | 知识库列表、编辑抽屉（模型/切分/重新向量化确认） |

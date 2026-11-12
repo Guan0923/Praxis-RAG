@@ -40,6 +40,8 @@ var expectedSchema = []struct {
 	{"kb_permissions", []string{"id", "namespace", "grantee_user_id", "document_name", "permission", "granted_by", "created_at", "updated_at"}},
 	{"kb_invitations", []string{"id", "namespace", "inviter_user_id", "invitee_user_id", "permission", "scope", "document_names", "token_digest", "status", "created_at", "expires_at", "accepted_at", "updated_at"}},
 	{"model_profiles", []string{"id", "kind", "name", "base_url", "model", "protected_key", "vector_size", "created_at", "updated_at"}},
+	{"document_batches", []string{"id", "namespace", "owner", "idempotency_key", "status", "total", "accepted", "skipped", "failed", "created_at", "updated_at"}},
+	{"document_batch_items", []string{"batch_id", "position", "name", "status", "reason", "artifact_id", "error", "created_at", "updated_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -68,6 +70,8 @@ var expectedPrimaryKeys = map[string][]string{
 	"kb_permissions":          {"id"},
 	"kb_invitations":          {"id"},
 	"model_profiles":          {"id"},
+	"document_batches":        {"id"},
+	"document_batch_items":    {"batch_id", "position"},
 }
 
 var expectedUniques = map[string]string{
@@ -82,6 +86,7 @@ var expectedUniques = map[string]string{
 	"kb_permissions":     "uq_kb_permissions_scope",
 	"kb_invitations":     "uq_kb_invitations_token_digest",
 	"model_profiles":     "uq_model_profiles_kind_name",
+	"document_batches":   "uq_document_batch_idempotency",
 }
 
 var expectedIndexes = map[string][]string{
@@ -103,6 +108,8 @@ var expectedIndexes = map[string][]string{
 	"kb_permissions":          {"ix_kb_permissions_grantee"},
 	"kb_invitations":          {"ix_kb_invitations_invitee", "ix_kb_invitations_namespace"},
 	"model_profiles":          {"ix_model_profiles_kind"},
+	"document_batches":        {"ix_document_batch_active", "ix_document_batch_owner"},
+	"document_batch_items":    {"ix_document_batch_item_artifact"},
 }
 
 // expectedTableNames returns the schema table names in Python declaration order.

@@ -693,6 +693,55 @@ var schemaTables = []*SchemaTable{
 		Uniques: []SchemaUnique{unique("uq_model_profiles_kind_name", "kind", "name")},
 		Indexes: []SchemaIndex{index("ix_model_profiles_kind", "kind")},
 	},
+	// document_batches groups one batch upload submitted through
+	// POST /v1/document-batches. It is a Go-only addition appended after the
+	// ported tables so a migrated database and a freshly created one keep the
+	// same column order. The row stores no file bytes: every admitted file is
+	// still a document_jobs row.
+	{
+		Name: "document_batches",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("namespace", 64),
+			// owner is the Console account that submitted the batch; NULL keeps
+			// the legacy API-key behaviour (namespace-scoped visibility).
+			identifier("owner", 32).Null(),
+			identifier("idempotency_key", 200).Null(),
+			// status is "saving" while admissions run and "active" once the
+			// batch settled. The read projection derives processing/completed/
+			// failed/interrupted from the items and their document jobs.
+			identifier("status", 24),
+			integer("total"),
+			integer("accepted"),
+			integer("skipped"),
+			integer("failed"),
+			double("created_at"),
+			double("updated_at"),
+		},
+		Uniques: []SchemaUnique{unique("uq_document_batch_idempotency", "namespace", "idempotency_key")},
+		Indexes: []SchemaIndex{
+			index("ix_document_batch_active", "namespace", "status", "created_at"),
+			index("ix_document_batch_owner", "namespace", "owner", "created_at"),
+		},
+	},
+	{
+		Name: "document_batch_items",
+		Columns: []SchemaColumn{
+			identifier("batch_id", 32).PK(),
+			integer("position").PK(),
+			identifier("name", 200),
+			// status is saving/accepted/skipped/failed; reason narrows skipped
+			// (exists/queued/duplicate) and failed (validation/config/conflict/
+			// internal) rows so the Console can render them without guessing.
+			identifier("status", 24),
+			identifier("reason", 32).Null(),
+			identifier("artifact_id", 36).Null(),
+			text("error").Null(),
+			double("created_at"),
+			double("updated_at"),
+		},
+		Indexes: []SchemaIndex{index("ix_document_batch_item_artifact", "artifact_id")},
+	},
 }
 
 // SchemaTables returns the schema tables in creation order. The returned slice

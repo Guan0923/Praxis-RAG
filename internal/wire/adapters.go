@@ -70,6 +70,25 @@ func (a HTTPRuntime) GetDocumentStatus(ctx context.Context, namespace, artifactI
 	return a.Service.GetDocumentStatus(ctx, namespace, artifactID)
 }
 
+// SubmitDocumentBatch implements httpapi.DocumentRuntime.
+func (a HTTPRuntime) SubmitDocumentBatch(ctx context.Context, namespace string, files []httpapi.UploadFile, idempotencyKey, owner string) (map[string]any, error) {
+	converted := make([]runtime.UploadFile, 0, len(files))
+	for _, file := range files {
+		converted = append(converted, runtime.UploadFile{Name: file.Name, Content: file.Content})
+	}
+	return a.Service.SubmitDocumentBatch(ctx, namespace, converted, idempotencyKey, owner)
+}
+
+// GetDocumentBatch implements httpapi.DocumentRuntime.
+func (a HTTPRuntime) GetDocumentBatch(ctx context.Context, namespace, batchID, viewer string) (map[string]any, error) {
+	return a.Service.GetDocumentBatch(ctx, namespace, batchID, viewer)
+}
+
+// ListDocumentBatches implements httpapi.DocumentRuntime.
+func (a HTTPRuntime) ListDocumentBatches(ctx context.Context, namespace, viewer string, limit int) (map[string]any, error) {
+	return a.Service.ListDocumentBatches(ctx, namespace, viewer, limit)
+}
+
 // Delete implements httpapi.DocumentRuntime.
 func (a HTTPRuntime) Delete(ctx context.Context, namespace, name string) (map[string]any, error) {
 	return a.Service.Delete(ctx, namespace, name)

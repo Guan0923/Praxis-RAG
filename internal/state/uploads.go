@@ -23,6 +23,30 @@ func (e *UploadConflict) Error() string { return e.Message }
 
 func newUploadConflict(message string) *UploadConflict { return &UploadConflict{Message: message} }
 
+// DocumentExistsConflict reports a published document that already uses the
+// requested name. It keeps the UploadConflict identity and message, and adds a
+// typed target so the batch upload path can classify the outcome as "skipped"
+// instead of a generic failure.
+type DocumentExistsConflict struct{ UploadConflict }
+
+// Unwrap lets errors.As find the embedded UploadConflict.
+func (e *DocumentExistsConflict) Unwrap() error { return &e.UploadConflict }
+
+func newDocumentExistsConflict(message string) *DocumentExistsConflict {
+	return &DocumentExistsConflict{UploadConflict{Message: message}}
+}
+
+// DocumentQueuedConflict reports an in-flight document job with the requested
+// name.
+type DocumentQueuedConflict struct{ UploadConflict }
+
+// Unwrap lets errors.As find the embedded UploadConflict.
+func (e *DocumentQueuedConflict) Unwrap() error { return &e.UploadConflict }
+
+func newDocumentQueuedConflict(message string) *DocumentQueuedConflict {
+	return &DocumentQueuedConflict{UploadConflict{Message: message}}
+}
+
 // LeaseLost reports that the worker is no longer authorized to mutate the
 // upload. In Python it subclasses UploadConflict.
 type LeaseLost struct{ UploadConflict }
@@ -552,9 +576,27 @@ func (j *UploadJournal) Begin(ctx context.Context, namespace, name, documentID, 
 	return row, nil
 }
 
+// forShare returns the shared row-locking suffix: concurrent readers of the
+// same row proceed in parallel while an exclusive writer waits for them.
+func (j *UploadJournal) forShare() string {
+	return " FOR SHARE"
+}
+
 // guard serializes namespace lock acquisition with a persistent lease row.
 func (j *UploadJournal) guard(ctx context.Context, tx *sql.Tx, namespace string) error {
-	if err := j.insertIgnoreLease(ctx, tx, namespace, UploadGuardResource, "", nil, 0); err != nil {
+	return j.guardResource(ctx, tx, namespace, UploadGuardResource)
+}
+
+// guardName serializes only uploads that share one document name. Different
+// names keep independent lease rows and therefore admit concurrently, while
+// the same name still runs its check-then-insert under one lock.
+func (j *UploadJournal) guardName(ctx context.Context, tx *sql.Tx, namespace, name string) error {
+	return j.guardResource(ctx, tx, namespace, nameUploadResource(name))
+}
+
+// guardResource takes the row lock of one persistent lease resource.
+func (j *UploadJournal) guardResource(ctx context.Context, tx *sql.Tx, namespace, resource string) error {
+	if err := j.insertIgnoreLease(ctx, tx, namespace, resource, "", nil, 0); err != nil {
 		return err
 	}
 	var (
@@ -565,7 +607,7 @@ func (j *UploadJournal) guard(ctx context.Context, tx *sql.Tx, namespace string)
 	return tx.QueryRowContext(ctx,
 		"SELECT namespace, resource, owner, operation_id, expires_at FROM document_leases "+
 			"WHERE namespace = ? AND resource = ?"+j.forUpdate(),
-		namespace, UploadGuardResource).
+		namespace, resource).
 		Scan(&ignoredNamespace, &ignoredResource, &ignoredOwner, &ignoredOperation, &ignoredExpires)
 }
 

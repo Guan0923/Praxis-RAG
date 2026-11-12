@@ -64,15 +64,15 @@ func WithChangeNotifier(notifier ChangeNotifier) Option {
 
 // Server hosts the REST API, MCP endpoint, and Console static assets.
 type Server struct {
-	settings     config.ServiceSettings
-	status       StatusProvider
-	keys         KeyLookup
-	keyStore     APIKeyStore
-	runtime      Runtime
-	mcpHandler   http.Handler
-	logger       *slog.Logger
-	router       *router
-	webRoot      string
+	settings      config.ServiceSettings
+	status        StatusProvider
+	keys          KeyLookup
+	keyStore      APIKeyStore
+	runtime       Runtime
+	mcpHandler    http.Handler
+	logger        *slog.Logger
+	router        *router
+	webRoot       string
 	catalog       catalog.Store
 	tools         ToolRegistry
 	kbAdmin       KnowledgeBaseAdminRuntime
@@ -142,6 +142,9 @@ func (s *Server) registerRoutes() {
 	s.router.add("POST", "/v1/documents", authTenant, s.handleUploadDocuments)
 	s.router.add("POST", "/v1/documents/check", authTenant, s.handleCheckDocuments)
 	s.router.add("GET", "/v1/document-jobs/{artifact_id}", authTenant, s.handleDocumentJobStatus)
+	s.router.add("POST", "/v1/document-batches", authTenant, s.handleCreateDocumentBatch)
+	s.router.add("GET", "/v1/document-batches", authTenant, s.handleListDocumentBatches)
+	s.router.add("GET", "/v1/document-batches/{batch_id}", authTenant, s.handleDocumentBatchStatus)
 	s.router.add("GET", "/v1/documents/{name}/content", authTenant, s.handleDocumentContent)
 	s.router.add("DELETE", "/v1/documents/{name}", authTenant, s.handleDeleteDocument)
 	s.router.add("GET", "/v1/knowledge-base", authTenant, s.handleKnowledgeBase)

@@ -265,6 +265,55 @@ export type AsyncUploadResult = {
 // synchronous response, while mode "async" returns background jobs to poll.
 export type UploadResult = SyncUploadResult | AsyncUploadResult;
 
+// --- Document batches (批次上传) -------------------------------------------
+// A batch groups the files of one POST /v1/document-batches request. The
+// Console polls GET /v1/document-batches/{id} for per-file progress instead of
+// tracking every artifact id itself.
+export type DocumentBatchStatus =
+  | "saving"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "interrupted";
+export type DocumentBatchItemStatus = "accepted" | "skipped" | "failed" | "saving";
+export type DocumentBatchJobStatus = "queued" | "processing" | "succeeded" | "failed";
+// DocumentBatchItemReason explains a skipped item; failed items keep a safe
+// error category instead of a raw server message.
+export type DocumentBatchItemReason =
+  | "exists"
+  | "queued"
+  | "duplicate"
+  | "validation"
+  | "config"
+  | "conflict"
+  | "internal";
+export type DocumentBatchJob = {
+  status: DocumentBatchJobStatus;
+  stage: string | null;
+  error: string | null;
+};
+export type DocumentBatchItem = {
+  position: number;
+  name: string;
+  status: DocumentBatchItemStatus;
+  reason: DocumentBatchItemReason | null;
+  artifact_id: string | null;
+  error: string | null;
+  // job is projected only for accepted items.
+  job?: DocumentBatchJob;
+};
+export type DocumentBatch = {
+  batch_id: string;
+  namespace: string;
+  status: DocumentBatchStatus;
+  total: number;
+  accepted: number;
+  skipped: number;
+  failed: number;
+  created_at: number;
+  items: DocumentBatchItem[];
+};
+
 export const uploadJobStatusLabels: Record<UploadJobStatus, string> = {
   queued: "排队中",
   processing: "处理中",
@@ -384,6 +433,134 @@ export async function api<T>(
 ): Promise<T> {
   const response = await apiResponse(path, connection, options);
   return await response.json() as T;
+}
+
+// --- Document batches (批次上传) -------------------------------------------
+
+// getDocumentBatch reads one batch, including every item outcome and the
+// accepted items' job stage.
+export async function getDocumentBatch(
+  batchId: string,
+  connection?: Connection,
+): Promise<DocumentBatch> {
+  return await api<DocumentBatch>(
+    `/v1/document-batches/${encodeURIComponent(batchId)}`,
+    connection,
+    { cache: "no-store" },
+  );
+}
+
+// listActiveDocumentBatches restores the batches a page reload lost; the
+// server returns only unfinished (saving / processing) batches.
+export async function listActiveDocumentBatches(
+  connection?: Connection,
+  limit?: number,
+): Promise<DocumentBatch[]> {
+  const query = limit && limit > 0 ? `?limit=${encodeURIComponent(String(limit))}` : "";
+  const payload = await api<{ batches: DocumentBatch[] }>(
+    `/v1/document-batches${query}`,
+    connection,
+    { cache: "no-store" },
+  );
+  return payload.batches ?? [];
+}
+
+export type DocumentBatchSubmitOptions = {
+  signal?: AbortSignal;
+  idempotencyKey: string;
+  onProgress?: (percent: number) => void;
+};
+
+// submitDocumentBatch posts one multipart batch through XMLHttpRequest because
+// fetch() cannot report upload progress. Headers mirror apiResponse() so the
+// request is authenticated and scoped exactly like the JSON endpoints.
+export function submitDocumentBatch(
+  files: File[],
+  connection: Connection | undefined,
+  options: DocumentBatchSubmitOptions,
+): Promise<DocumentBatch> {
+  const method = "POST";
+  const path = "/v1/document-batches";
+  return new Promise<DocumentBatch>((resolve, reject) => {
+    const signal = options.signal;
+    let settled = false;
+    const cleanup = () => {
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const finish = (action: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      action();
+    };
+    const fail = (error: Error) => finish(() => reject(error));
+    const succeed = (batch: DocumentBatch) => finish(() => resolve(batch));
+
+    if (signal?.aborted) {
+      reject(new Error(`${method} ${path}\n上传已取消`));
+      return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    function onAbort() {
+      xhr.abort();
+    }
+    xhr.open(method, path, true);
+    // Same-origin XHR requests carry cookies by default, matching the
+    // credentials: "same-origin" policy used by apiResponse().
+    xhr.setRequestHeader("Accept", "application/json");
+    if (connection) {
+      xhr.setRequestHeader("X-RAG-Namespace", connection.namespace);
+      if (connection.token)
+        xhr.setRequestHeader("Authorization", `Bearer ${connection.token}`);
+    }
+    const token = currentCSRFToken();
+    if (token) xhr.setRequestHeader("X-CSRF-Token", token);
+    if (options.idempotencyKey)
+      xhr.setRequestHeader("Idempotency-Key", options.idempotencyKey);
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable || !event.total) return;
+      const percent = Math.min(
+        100,
+        Math.max(0, Math.round((event.loaded / event.total) * 100)),
+      );
+      options.onProgress?.(percent);
+    };
+    xhr.onload = () => {
+      const status = xhr.status;
+      const text = xhr.responseText || "";
+      if (status >= 200 && status < 300) {
+        try {
+          succeed(JSON.parse(text) as DocumentBatch);
+        } catch {
+          fail(new Error(`${method} ${path}\nHTTP ${status}：响应解析失败`));
+        }
+        return;
+      }
+      if (status === 401) unauthorizedHandler?.();
+      let detail = text || xhr.statusText;
+      try {
+        const payload = JSON.parse(text);
+        detail = typeof payload.detail === "string"
+          ? payload.detail
+          : JSON.stringify(payload.detail ?? payload);
+      } catch {
+        // Keep non-JSON server diagnostics intact.
+      }
+      fail(new Error(`${method} ${path}\nHTTP ${status}：${detail}`));
+    };
+    xhr.onerror = () => fail(new Error(`${method} ${path}\n网络请求失败`));
+    xhr.onabort = () => fail(new Error(`${method} ${path}\n上传已取消`));
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    const body = new FormData();
+    files.forEach((file) => body.append("files", file, file.name));
+    try {
+      xhr.send(body);
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
 }
 
 // --- Console authentication -------------------------------------------------

@@ -155,6 +155,15 @@ services:
   pdf-parser:
     build:
       context: ./python-workers/pdf-service
+      args:
+        # Override for restricted networks, e.g. a cached/mirrored python base.
+        BASE_IMAGE: ${RAG_PDF_BASE_IMAGE:-python:3.11-slim}
+        APT_MIRROR: ${RAG_PDF_APT_MIRROR:-http://deb.debian.org}
+        PIP_INDEX_URL: ${RAG_PDF_PIP_INDEX_URL:-https://pypi.org/simple}
+        TORCH_INDEX_URL: ${RAG_PDF_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+        # Direct wheel mirrors, e.g. https://mirrors.aliyun.com/pytorch-wheels/cpu/...
+        TORCH_WHEEL_URL: ${RAG_PDF_TORCH_WHEEL_URL:-}
+        TORCHVISION_WHEEL_URL: ${RAG_PDF_TORCHVISION_WHEEL_URL:-}
     image: ${RAG_PDF_PARSER_IMAGE:-praxis-rag-pdf-parser:local}
     container_name: praxis-rag-pdf-parser
     restart: unless-stopped

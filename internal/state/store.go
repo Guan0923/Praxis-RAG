@@ -86,6 +86,7 @@ type Stores struct {
 	Uploads   *UploadJournal
 
 	DocumentJobs       *DocumentJobs
+	DocumentBatches    *DocumentBatches
 	DocumentDispatcher *DocumentJobDispatcher
 	SearchTasks        *SearchTasks
 	SearchDispatcher   *SearchTaskDispatcher
@@ -199,6 +200,7 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 		return nil, err
 	}
 	stores.DocumentJobs = documentJobs
+	stores.DocumentBatches = NewDocumentBatches(stores)
 	documentDispatcher, err := NewDocumentJobDispatcher(stores, nil)
 	if err != nil {
 		uploads.Close()

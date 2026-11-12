@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1
+# The default BuildKit frontend is enough: avoid fetching the docker/dockerfile
+# frontend image from Docker Hub on restricted networks.
 #
 # Praxis-RAG Docling PDF parsing microservice.
 #
@@ -12,7 +13,9 @@
 # The healthcheck uses Python's standard library on purpose: the slim image
 # contains no curl/wget.
 
-FROM python:3.11-slim AS runtime
+# BASE_IMAGE raises a cached/mirrored python base for restricted networks.
+ARG BASE_IMAGE=python:3.11-slim
+FROM ${BASE_IMAGE} AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -26,8 +29,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 # Docling pulls OpenCV/EasyOCR (libGL, libglib) and PyTorch (libgomp) native
 # dependencies. Keep the image free of compilers and build tooling.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+# APT_MIRROR overrides deb.debian.org for restricted/slow networks.
+ARG APT_MIRROR=http://deb.debian.org
+RUN if [ "${APT_MIRROR}" != "http://deb.debian.org" ]; then \
+        sed -i "s|http://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/*.sources; \
+    fi \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=60 install -y --no-install-recommends \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
@@ -36,14 +44,36 @@ RUN apt-get update \
 
 WORKDIR /app
 
+# Install dependencies before copying the app so docker layer caching keeps
+# torch and docling when only application code changes.
+COPY requirements.txt ./
+
 # Install the CPU-only torch wheel first: PyPI's default linux wheel bundles the
 # CUDA runtime, which would balloon the image and is never used on CPU hosts.
 # Override TORCH_INDEX_URL/PIP_INDEX_URL for restricted networks.
 ARG PIP_INDEX_URL=https://pypi.org/simple
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+# Direct wheel URLs win over the index: useful on slow mirrors where the
+# Pytorch index is unreachable but the wheel file is mirrored elsewhere.
+ARG TORCH_WHEEL_URL=
+ARG TORCHVISION_WHEEL_URL=
+ARG PIP_RETRIES=5
+ARG PIP_TIMEOUT=120
 RUN python -m pip install --upgrade pip \
-    && pip install --index-url "${TORCH_INDEX_URL}" --extra-index-url "${PIP_INDEX_URL}" "torch>=2.0" \
-    && pip install --index-url "${PIP_INDEX_URL}" -r requirements.txt
+    && if [ -n "${TORCH_WHEEL_URL}" ]; then \
+        pip install --retries "${PIP_RETRIES}" --timeout "${PIP_TIMEOUT}" "${TORCH_WHEEL_URL}"; \
+    else \
+        pip install --retries "${PIP_RETRIES}" --timeout "${PIP_TIMEOUT}" \
+            --index-url "${TORCH_INDEX_URL}" --extra-index-url "${PIP_INDEX_URL}" "torch>=2.0"; \
+    fi \
+    && if [ -n "${TORCHVISION_WHEEL_URL}" ]; then \
+        pip install --retries "${PIP_RETRIES}" --timeout "${PIP_TIMEOUT}" "${TORCHVISION_WHEEL_URL}"; \
+    else \
+        pip install --retries "${PIP_RETRIES}" --timeout "${PIP_TIMEOUT}" \
+            --index-url "${TORCH_INDEX_URL}" --extra-index-url "${PIP_INDEX_URL}" "torchvision>=0"; \
+    fi \
+    && pip install --retries "${PIP_RETRIES}" --timeout "${PIP_TIMEOUT}" \
+        --index-url "${PIP_INDEX_URL}" -r requirements.txt
 
 COPY app ./app
 
@@ -51,7 +81,7 @@ COPY app ./app
 # reads it, so read permission is enough (chmod -R a+rX on the host if needed).
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin pdfservice \
     && mkdir -p /models /tmp/rag-pdf-service \
-    && chown pdfservice:pdfservice /tmp/rag-pdf-service
+    && chown pdfservice:pdfservice /models /tmp/rag-pdf-service
 ENV TMPDIR=/tmp/rag-pdf-service
 
 USER pdfservice

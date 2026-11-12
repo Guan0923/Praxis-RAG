@@ -41,6 +41,16 @@ type fakeDocRuntime struct {
 	admitErrFor  map[string]error
 	statusByID   map[string]map[string]any
 	statusErr    error
+
+	batchFiles   []UploadFile
+	batchKey     string
+	batchOwner   string
+	batchPayload map[string]any
+	batchErr     error
+	batchByID    map[string]map[string]any
+	batchViewer  string
+	batchLimit   int
+	batches      []map[string]any
 }
 
 func newFakeDocRuntime() *fakeDocRuntime {
@@ -76,9 +86,8 @@ func (f *fakeDocRuntime) AdmitDocument(_ context.Context, _ string, name string,
 		return f.admitPayload, nil
 	}
 	return map[string]any{
-		"artifact_id": fmt.Sprintf("9b2f9e9e-0000-4000-8000-%012d", len(f.admitted)),
-		"status":      "queued",
-		"reused":      false,
+		"artifact_id": fmt.Sprintf("9b2f9e9e-0000-4000-8000-%012d", len(f.admitted)), "status": "queued",
+		"reused": false,
 	}, nil
 }
 
@@ -97,6 +106,37 @@ func (f *fakeDocRuntime) GetDocumentStatus(_ context.Context, _ string, artifact
 
 func (f *fakeDocRuntime) Delete(context.Context, string, string) (map[string]any, error) {
 	return f.deletePayload, f.deleteErr
+}
+
+// SubmitDocumentBatch records the batch request for assertions.
+func (f *fakeDocRuntime) SubmitDocumentBatch(_ context.Context, _ string, files []UploadFile, idempotencyKey, owner string) (map[string]any, error) {
+	f.batchFiles = files
+	f.batchKey = idempotencyKey
+	f.batchOwner = owner
+	if f.batchErr != nil {
+		return nil, f.batchErr
+	}
+	if f.batchPayload != nil {
+		return f.batchPayload, nil
+	}
+	return map[string]any{"batch_id": "batch-1", "status": "processing", "total": len(files)}, nil
+}
+
+// GetDocumentBatch returns the canned batch record, or nil for an unknown id.
+func (f *fakeDocRuntime) GetDocumentBatch(_ context.Context, _ string, batchID, viewer string) (map[string]any, error) {
+	f.batchViewer = viewer
+	payload, ok := f.batchByID[batchID]
+	if !ok {
+		return nil, nil
+	}
+	return payload, nil
+}
+
+// ListDocumentBatches returns the canned active batches.
+func (f *fakeDocRuntime) ListDocumentBatches(_ context.Context, _ string, viewer string, limit int) (map[string]any, error) {
+	f.batchViewer = viewer
+	f.batchLimit = limit
+	return map[string]any{"batches": f.batches}, nil
 }
 
 func (f *fakeDocRuntime) CheckDocuments(_ context.Context, _ string, files []CheckFile) (map[string]any, error) {

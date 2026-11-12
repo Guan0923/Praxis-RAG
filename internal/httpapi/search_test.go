@@ -69,6 +69,21 @@ func (f *fakeServiceRuntime) GetDocumentStatus(context.Context, string, string) 
 	return nil, &apierrors.KnowledgeError{Message: "document job status is not available in this test runtime"}
 }
 
+// SubmitDocumentBatch satisfies the batch document surface for search-only fakes.
+func (f *fakeServiceRuntime) SubmitDocumentBatch(context.Context, string, []UploadFile, string, string) (map[string]any, error) {
+	return nil, &apierrors.KnowledgeError{Message: "batch upload is not available in this test runtime"}
+}
+
+// GetDocumentBatch satisfies the batch document surface for search-only fakes.
+func (f *fakeServiceRuntime) GetDocumentBatch(context.Context, string, string, string) (map[string]any, error) {
+	return nil, &apierrors.KnowledgeError{Message: "document batch status is not available in this test runtime"}
+}
+
+// ListDocumentBatches satisfies the batch document surface for search-only fakes.
+func (f *fakeServiceRuntime) ListDocumentBatches(context.Context, string, string, int) (map[string]any, error) {
+	return nil, &apierrors.KnowledgeError{Message: "document batches are not available in this test runtime"}
+}
+
 func newRuntimeServer(t *testing.T, runtime Runtime) *Server {
 	t.Helper()
 	return New(testSettings("test-token"), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), WithRuntime(runtime))

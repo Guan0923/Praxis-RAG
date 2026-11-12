@@ -22,6 +22,12 @@ REST 客户端 ──/v1/*────────────┴──> rag-ser
   → 两条路径都完成 解析/切分/Embedding/Qdrant 发布
   → 客户端用 GET /v1/document-jobs/{artifact_id} 轮询 status/stage
 
+Console 批次上传（POST /v1/document-batches）
+  → 先提交 document_batches + document_batch_items（每项 saving）
+  → 每文件一个事务并行受理（按文件名 lease 行加锁；不同名不排队，默认 6 路）
+  → 结果写回 items 与计数，202 返回 batch_id；GET /v1/document-batches/{batch_id}
+    同时给出保存结果与已入队任务的 status/stage
+
 MCP search（配置 Kafka 时）→ search_task_outbox → Kafka → rag-search-worker
   → 检索结果写入 Redis 快照 → get_search_result 分页读取
 ```
