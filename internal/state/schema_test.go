@@ -50,7 +50,7 @@ var expectedSchema = []struct {
 	{"cdc_cutover_state", []string{"k", "v"}},
 	// content_objects is the content-addressed byte store referenced by
 	// upload_objects.content_hash and blobs.sha256.
-	{"content_objects", []string{"hash", "size", "content", "created_at"}},
+	{"content_objects", []string{"hash", "size", "content", "created_at", "retired_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -107,6 +107,7 @@ var expectedIndexes = map[string][]string{
 	"documents":                {"ix_documents_namespace_sha256"},
 	"blobs":                    {"ix_blobs_document", "ix_blobs_sha256"},
 	"upload_objects":           {"ix_upload_objects_content"},
+	"content_objects":          {"ix_content_objects_retired"},
 	"upload_operations":        {"ix_upload_unfinished"},
 	"search_result_snapshots":  {"ix_search_result_expiry", "ix_search_result_namespace"},
 	"artifact_snapshots":       {"ix_artifact_expiry", "ix_artifact_namespace"},

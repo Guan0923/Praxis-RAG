@@ -17,13 +17,45 @@ func countTable(t *testing.T, stores *Stores, table string) int {
 	return count
 }
 
+// deleteOperationObjects removes one operation's staged objects through the real
+// deletion path so payload retirement is exercised as in production.
+func deleteOperationObjects(t *testing.T, stores *Stores, operationID string) {
+	t.Helper()
+	ctx := context.Background()
+	transaction, err := stores.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	if err := deleteUploadObjectsTx(ctx, transaction, operationID); err != nil {
+		_ = transaction.Rollback()
+		t.Fatalf("deleteUploadObjectsTx() error = %v", err)
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatalf("commit error = %v", err)
+	}
+}
+
+// retiredAt returns the retired_at value of one payload.
+func retiredAt(t *testing.T, stores *Stores, hash string) bool {
+	t.Helper()
+	var retired bool
+	if err := stores.DB.QueryRowContext(context.Background(),
+		"SELECT retired_at IS NOT NULL FROM content_objects WHERE hash = ?", hash).
+		Scan(&retired); err != nil {
+		t.Fatalf("reading retired_at: %v", err)
+	}
+	return retired
+}
+
 // TestContentObjectsDedupAcrossNamespaces verifies that equal bytes are stored
-// once and referenced by upload_objects/blobs rows from different namespaces.
+// once and that content rows survive until their retention window expires after
+// the last reference disappears.
 func TestContentObjectsDedupAcrossNamespaces(t *testing.T) {
 	stores := newTestStores(t)
 	journal := newTestJournal(t, stores)
 	ctx := context.Background()
 	payload := []byte("the same payload uploaded by two tenants")
+	payloadHash := sha256Sum(payload)
 
 	first := beginTestUpload(t, journal, "dedupe-one", "a.txt", "doc-a", "collection", BeginOptions{})
 	if err := journal.PutObject(ctx, first, SourceBucket, "a.txt", payload, nil); err != nil {
@@ -56,18 +88,68 @@ func TestContentObjectsDedupAcrossNamespaces(t *testing.T) {
 		t.Fatalf("Blobs.Get() = %q, %v, %v", content, found, err)
 	}
 
-	// Removing every reference makes the payload eligible for the GC.
-	if _, err := stores.DB.ExecContext(ctx, "DELETE FROM upload_objects WHERE operation_id IN (?, ?)", first.ID, second.ID); err != nil {
-		t.Fatalf("deleting upload references: %v", err)
+	// One removed reference does not retire a payload others still point at.
+	deleteOperationObjects(t, stores, first.ID)
+	if retiredAt(t, stores, payloadHash) {
+		t.Fatal("payload retired while two references still exist")
 	}
-	if _, err := stores.DB.ExecContext(ctx, "DELETE FROM blobs WHERE namespace = ?", "dedupe-three"); err != nil {
-		t.Fatalf("deleting blob references: %v", err)
+	if moved, err := stores.PurgeUnreferencedContent(ctx, 0, 100); err != nil || moved != 0 {
+		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want 0 while referenced", moved, err)
+	}
+
+	// Removing the remaining references retires it, but the retention window
+	// keeps the bytes around.
+	deleteOperationObjects(t, stores, second.ID)
+	if err := stores.Blobs.DeleteKey(ctx, "dedupe-three", SourceBucket, "c.txt"); err != nil {
+		t.Fatalf("Blobs.DeleteKey() error = %v", err)
+	}
+	if !retiredAt(t, stores, payloadHash) {
+		t.Fatal("payload was not retired after its last reference disappeared")
+	}
+	if moved, err := stores.PurgeUnreferencedContent(ctx, ContentObjectRetentionSeconds, 100); err != nil || moved != 0 {
+		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want 0 inside the retention window", moved, err)
+	}
+	if count := countTable(t, stores, "content_objects"); count != 1 {
+		t.Fatalf("content_objects rows inside retention = %d, want 1", count)
 	}
 	if moved, err := stores.PurgeUnreferencedContent(ctx, 0, 100); err != nil || moved != 1 {
-		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want 1 removed", moved, err)
+		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want 1 removed after retention", moved, err)
 	}
 	if count := countTable(t, stores, "content_objects"); count != 0 {
 		t.Fatalf("content_objects rows after GC = %d, want 0", count)
+	}
+}
+
+// TestContentRetirementRearmsOnNewReference verifies that reusing a retired
+// payload clears retired_at so the GC does not delete a live object.
+func TestContentRetirementRearmsOnNewReference(t *testing.T) {
+	stores := newTestStores(t)
+	journal := newTestJournal(t, stores)
+	ctx := context.Background()
+	payload := []byte("payload that is referenced again")
+	payloadHash := sha256Sum(payload)
+
+	first := beginTestUpload(t, journal, "rearm-one", "a.txt", "doc-a", "collection", BeginOptions{})
+	if err := journal.PutObject(ctx, first, SourceBucket, "a.txt", payload, nil); err != nil {
+		t.Fatalf("PutObject(first) error = %v", err)
+	}
+	deleteOperationObjects(t, stores, first.ID)
+	if !retiredAt(t, stores, payloadHash) {
+		t.Fatal("payload was not retired")
+	}
+
+	second := beginTestUpload(t, journal, "rearm-two", "b.txt", "doc-b", "collection", BeginOptions{})
+	if err := journal.PutObject(ctx, second, SourceBucket, "b.txt", payload, nil); err != nil {
+		t.Fatalf("PutObject(second) error = %v", err)
+	}
+	if retiredAt(t, stores, payloadHash) {
+		t.Fatal("a new reference did not re-arm the retired payload")
+	}
+	if moved, err := stores.PurgeUnreferencedContent(ctx, 0, 100); err != nil || moved != 0 {
+		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want 0 for a re-armed payload", moved, err)
+	}
+	if content, found, err := journal.GetObject(ctx, second.ID, SourceBucket, "b.txt"); err != nil || !found || string(content) != string(payload) {
+		t.Fatalf("GetObject(second) = %q, %v, %v", content, found, err)
 	}
 }
 
@@ -78,6 +160,7 @@ func TestContentObjectsGCKeepsReferencedRows(t *testing.T) {
 	journal := newTestJournal(t, stores)
 	ctx := context.Background()
 	payload := []byte("payload shared by two uploads")
+	payloadHash := sha256Sum(payload)
 
 	first := beginTestUpload(t, journal, "gc-one", "a.txt", "doc-a", "collection", BeginOptions{})
 	if err := journal.PutObject(ctx, first, SourceBucket, "a.txt", payload, nil); err != nil {
@@ -87,8 +170,9 @@ func TestContentObjectsGCKeepsReferencedRows(t *testing.T) {
 	if err := journal.PutObject(ctx, second, SourceBucket, "b.txt", payload, nil); err != nil {
 		t.Fatalf("PutObject(second) error = %v", err)
 	}
-	if _, err := stores.DB.ExecContext(ctx, "DELETE FROM upload_objects WHERE operation_id = ?", first.ID); err != nil {
-		t.Fatalf("deleting first reference: %v", err)
+	deleteOperationObjects(t, stores, first.ID)
+	if retiredAt(t, stores, payloadHash) {
+		t.Fatal("payload retired although the second reference still exists")
 	}
 	if moved, err := stores.PurgeUnreferencedContent(ctx, 0, 100); err != nil || moved != 0 {
 		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want 0 removed while referenced", moved, err)
@@ -98,6 +182,10 @@ func TestContentObjectsGCKeepsReferencedRows(t *testing.T) {
 	}
 	if content, found, err := journal.GetObject(ctx, second.ID, SourceBucket, "b.txt"); err != nil || !found || string(content) != string(payload) {
 		t.Fatalf("GetObject(second) = %q, %v, %v", content, found, err)
+	}
+	deleteOperationObjects(t, stores, second.ID)
+	if moved, err := stores.PurgeUnreferencedContent(ctx, 0, 100); err != nil || moved != 1 {
+		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want 1 removed after the last reference", moved, err)
 	}
 }
 
@@ -202,6 +290,12 @@ func TestKnowledgeBasePurgeBatchDeletesNamespaceRows(t *testing.T) {
 	if err := stores.Blobs.Put(ctx, "gamma", SourceBucket, "g.txt", payload, nil); err != nil {
 		t.Fatalf("Blobs.Put(gamma) error = %v", err)
 	}
+	// A payload only alpha references must be retired (not deleted) by the purge.
+	alphaOnly := []byte("payload referenced only by alpha")
+	alphaOnlyHash := sha256Sum(alphaOnly)
+	if err := stores.Blobs.Put(ctx, "alpha", SourceBucket, "only-alpha.bin", alphaOnly, nil); err != nil {
+		t.Fatalf("Blobs.Put(alpha only) error = %v", err)
+	}
 	if _, err := stores.DB.ExecContext(ctx,
 		"INSERT INTO kb_permissions (id, namespace, grantee_user_id, document_name, permission, granted_by, created_at, updated_at) "+
 			"VALUES (?, ?, ?, '', 'read', ?, ?, ?)",
@@ -262,8 +356,23 @@ func TestKnowledgeBasePurgeBatchDeletesNamespaceRows(t *testing.T) {
 			t.Fatalf("documents for %s were not soft-deleted", namespace)
 		}
 	}
+	if count := countTable(t, stores, "content_objects"); count != 2 {
+		t.Fatalf("content_objects rows = %d, want 2 (shared + alpha-only payload)", count)
+	}
+	if retiredAt(t, stores, sha256Sum(payload)) {
+		t.Fatal("shared payload retired although gamma still references it")
+	}
+	if !retiredAt(t, stores, alphaOnlyHash) {
+		t.Fatal("alpha-only payload was not retired by the purge")
+	}
+	if moved, err := stores.PurgeUnreferencedContent(ctx, ContentObjectRetentionSeconds, 100); err != nil || moved != 0 {
+		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want 0 inside the retention window", moved, err)
+	}
+	if moved, err := stores.PurgeUnreferencedContent(ctx, 0, 100); err != nil || moved != 1 {
+		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want the alpha-only payload removed", moved, err)
+	}
 	if count := countTable(t, stores, "content_objects"); count != 1 {
-		t.Fatalf("content_objects rows = %d, want 1 (gamma still owns the payload)", count)
+		t.Fatalf("content_objects rows after GC = %d, want 1 (shared payload)", count)
 	}
 	if count := countTable(t, stores, "knowledge_bases"); count != 1 {
 		t.Fatalf("knowledge_bases rows = %d, want 1 (gamma untouched)", count)
@@ -354,8 +463,22 @@ func TestKnowledgeBasePurgeBatchScalesWithDocuments(t *testing.T) {
 	if count := countTable(t, stores, "upload_operations"); count != 0 {
 		t.Fatalf("upload_operations rows = %d, want 0", count)
 	}
+	// The payload is retired by the purge, not deleted: the retention window
+	// keeps it recoverable, and the GC removes it once the window has passed.
+	if count := countTable(t, stores, "content_objects"); count != 1 {
+		t.Fatalf("content_objects rows = %d, want 1 (retired, not deleted)", count)
+	}
+	if !retiredAt(t, stores, sha256Sum([]byte("one payload shared by every scaled document"))) {
+		t.Fatal("purged payload was not retired")
+	}
+	if moved, err := stores.PurgeUnreferencedContent(ctx, ContentObjectRetentionSeconds, 100); err != nil || moved != 0 {
+		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want 0 inside the retention window", moved, err)
+	}
+	if moved, err := stores.PurgeUnreferencedContent(ctx, 0, 100); err != nil || moved != 1 {
+		t.Fatalf("PurgeUnreferencedContent() = %d, %v; want 1 removed after retention", moved, err)
+	}
 	if count := countTable(t, stores, "content_objects"); count != 0 {
-		t.Fatalf("content_objects rows = %d, want 0", count)
+		t.Fatalf("content_objects rows after GC = %d, want 0", count)
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("batched purge of %d documents took %s; it must stay one transaction", documents, elapsed)

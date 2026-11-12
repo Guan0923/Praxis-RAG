@@ -435,7 +435,13 @@ func (s *Stores) migrateContentStore(ctx context.Context) error {
 	if err := s.ensureTableIndex(ctx, "upload_objects", "ix_upload_objects_content", "content_hash"); err != nil {
 		return err
 	}
-	return s.ensureTableIndex(ctx, "blobs", "ix_blobs_sha256", "sha256")
+	if err := s.ensureTableIndex(ctx, "blobs", "ix_blobs_sha256", "sha256"); err != nil {
+		return err
+	}
+	if err := s.ensureTableColumn(ctx, "content_objects", "retired_at", "DOUBLE NULL"); err != nil {
+		return err
+	}
+	return s.ensureTableIndex(ctx, "content_objects", "ix_content_objects_retired", "retired_at")
 }
 
 // ensureTableColumn adds one nullable column to an existing table. Concurrent

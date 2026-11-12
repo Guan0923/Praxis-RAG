@@ -1098,8 +1098,7 @@ func (j *UploadJournal) rollbackFinish(ctx context.Context, operation *UploadOpe
 	if err := j.touchCache(ctx, transaction, row.Namespace, &row.ID, false, true); err != nil {
 		return err
 	}
-	if _, err := transaction.ExecContext(ctx,
-		"DELETE FROM upload_objects WHERE operation_id = ?", row.ID); err != nil {
+	if err := deleteUploadObjectsTx(ctx, transaction, row.ID); err != nil {
 		return err
 	}
 	if _, err := transaction.ExecContext(ctx,
@@ -1179,7 +1178,7 @@ func (j *UploadJournal) CommitNoop(ctx context.Context, operation *UploadOperati
 	if err := j.touchCache(ctx, transaction, row.Namespace, &row.ID, false, true); err != nil {
 		return err
 	}
-	if _, err := transaction.ExecContext(ctx, "DELETE FROM upload_objects WHERE operation_id = ?", row.ID); err != nil {
+	if err := deleteUploadObjectsTx(ctx, transaction, row.ID); err != nil {
 		return err
 	}
 	if _, err := transaction.ExecContext(ctx,
@@ -1317,8 +1316,7 @@ func (j *UploadJournal) Cleanup(ctx context.Context, operation *UploadOperation,
 			return err
 		}
 		if reloaded.OldVersion != nil {
-			if _, err := transaction.ExecContext(ctx,
-				"DELETE FROM upload_objects WHERE operation_id = ?", *reloaded.OldVersion); err != nil {
+			if err := deleteUploadObjectsTx(ctx, transaction, *reloaded.OldVersion); err != nil {
 				return err
 			}
 		}
@@ -1419,9 +1417,19 @@ func (j *UploadJournal) PurgeDocumentObjects(ctx context.Context, namespace, doc
 	if err := j.AssertLockTx(ctx, tx, token); err != nil {
 		return nil, err
 	}
+	hashes, err := contentHashesTx(ctx, tx,
+		"SELECT DISTINCT content_hash FROM upload_objects WHERE content_hash IS NOT NULL AND operation_id IN "+
+			"(SELECT id FROM upload_operations WHERE namespace = ? AND document_id = ?)",
+		namespace, documentID)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := tx.ExecContext(ctx,
 		"DELETE FROM upload_objects WHERE operation_id IN (SELECT id FROM upload_operations WHERE namespace = ? AND document_id = ?)",
 		namespace, documentID); err != nil {
+		return nil, err
+	}
+	if err := retireContentHashesTx(ctx, tx, hashes, unixSeconds()); err != nil {
 		return nil, err
 	}
 	rows, err := tx.QueryContext(ctx,

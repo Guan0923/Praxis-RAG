@@ -141,19 +141,26 @@ placeholder so the column type stays unchanged.
   fall back to inline `content` for rows written before this layout; the
   maintenance loop migrates those legacy rows in bounded batches
   (`BackfillContentObjects`, 100 rows per pass).
-- Deletes remove only reference rows (by document or operation) in the same
-  transaction as the logical document delete.
+- Deletes remove only reference rows (by document, operation or blob key) in the
+  same transaction as the logical document delete. Every path that drops a
+  reference (document delete, upload rollback/no-op/old-version cleanup, blob
+  overwrite, knowledge-base purge) sets `content_objects.retired_at` on payloads
+  whose last reference just disappeared.
 - `content_objects` rows are removed by the maintenance GC
-  (`PurgeUnreferencedContent`) only when no `upload_objects`/`blobs` row references
-  the hash and the row is older than a 600-second grace window, so a concurrent
-  upload cannot race the delete.
+  (`PurgeUnreferencedContent`) only when the row is retired, no
+  `upload_objects`/`blobs` row references the hash, and `retired_at` is older than
+  the retention window `ContentObjectRetentionSeconds` (**8 days**, i.e. more than
+  one week). A payload that receives a new reference in the meantime has
+  `retired_at` cleared by the insert path, so a live object is never deleted.
+  Reference rows are still removed immediately; only the bytes are retained.
 - Qdrant is unchanged: every knowledge base keeps its own collection and owns its
   vectors. Deduplication is a MySQL storage concern only.
 
 Existing databases are upgraded in place by `ensureSchema` (idempotent):
-`content_objects`, `upload_objects.content_hash`, `ix_upload_objects_content` and
-`ix_blobs_sha256` are created when missing, and the maintenance loop migrates
-legacy inline rows in bounded batches. Deployments that disable automatic DDL
+`content_objects`, `upload_objects.content_hash`, `content_objects.retired_at`,
+`ix_upload_objects_content`, `ix_blobs_sha256` and `ix_content_objects_retired` are
+created when missing, and the maintenance loop migrates legacy inline rows in
+bounded batches. Deployments that disable automatic DDL
 (`RAG_STATE_AUTO_SCHEMA=false`) must apply the equivalent statements manually:
 
 ```sql
@@ -162,7 +169,9 @@ CREATE TABLE `content_objects` (
   `size` bigint NOT NULL,
   `content` longblob NOT NULL,
   `created_at` double NOT NULL,
-  PRIMARY KEY (`hash`)
+  `retired_at` double NULL,
+  PRIMARY KEY (`hash`),
+  INDEX `ix_content_objects_retired` (`retired_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 ALTER TABLE `upload_objects`
   ADD COLUMN `content_hash` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL,
@@ -472,4 +481,4 @@ recorded in [GO_MIGRATION](GO_MIGRATION.md) and [VALIDATION](../VALIDATION.md).
 
 ## UUID 结果与逻辑删除
 
-artifact 以 MySQL `artifact_snapshots` 为事实来源，沿用 `RAG_RESULT_TTL_SECONDS=3600`（语义为 artifact TTL）；已签发 artifact 的版本固定及到期前保留保证不变。`search_tasks`/`search_result_snapshots` 保留历史数据但不再读写，因此不存在“搜索结果 UUID 回源”路径，重新检索即可获得新证据。文档删除通过 del_flag 隐藏，并在同一事务中删除该文档的 `upload_objects`/`blobs` 引用行；`content_objects` 中无引用的字节由维护循环在 600 秒宽限期后回收。Qdrant 数据仍不随单文档删除物理删除；删除整个知识库时才按集合删除（每库一次请求）。正常自动 schema 为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [产物引用](result-references.md)。
+artifact 以 MySQL `artifact_snapshots` 为事实来源，沿用 `RAG_RESULT_TTL_SECONDS=3600`（语义为 artifact TTL）；已签发 artifact 的版本固定及到期前保留保证不变。`search_tasks`/`search_result_snapshots` 保留历史数据但不再读写，因此不存在“搜索结果 UUID 回源”路径，重新检索即可获得新证据。文档删除通过 del_flag 隐藏，并在同一事务中删除该文档的 `upload_objects`/`blobs` 引用行；失去所有引用的 `content_objects` 行会写入 `retired_at`，由维护循环在 8 天（>1 周）保留期后回收，期间若被重新引用会自动清除 `retired_at`。Qdrant 数据仍不随单文档删除物理删除；删除整个知识库时才按集合删除（每库一次请求）。正常自动 schema 为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [产物引用](result-references.md)。

@@ -197,7 +197,7 @@ func (s *Service) maintenancePass(ctx context.Context) {
 	if _, err := s.stores.BackfillContentObjects(ctx, 100); err != nil {
 		logBackgroundFailure(ctx, "content backfill", err)
 	}
-	if _, err := s.stores.PurgeUnreferencedContent(ctx, state.ContentObjectGraceSeconds, 100); err != nil {
+	if _, err := s.stores.PurgeUnreferencedContent(ctx, state.ContentObjectRetentionSeconds, 100); err != nil {
 		logBackgroundFailure(ctx, "content purge", err)
 	}
 }

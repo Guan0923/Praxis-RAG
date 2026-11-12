@@ -1770,14 +1770,17 @@ collection、独立 point）；删除逻辑改为「没有引用才删除内容�
   对历史行自动回退读取内联 `content`。
 - 迁移：`ensureSchema` 幂等新增表/列/索引；维护循环 `BackfillContentObjects`
   每轮最多迁移 100 行历史内联内容（上传对象 + blobs），旧进程/旧行始终可读。
-- 回收：`PurgeUnreferencedContent` 仅删除「没有任何 `upload_objects.content_hash`
-  或 `blobs.sha256` 引用、且创建时间早于 600s 宽限期」的内容行，避免与并发上传
-  竞态；单文档删除只删引用行，内容由维护循环回收。
+- 回收：所有删除引用行的路径（文档删除、上传回滚/空提交/旧版本清理、blob
+  覆盖、知识库批删）都会把失去最后一个引用的内容行 `retired_at` 置为当前时间；
+  `PurgeUnreferencedContent` 只删除 `retired_at` 已超过保留期（8 天，>1 周）且
+  没有 `upload_objects.content_hash` / `blobs.sha256` 引用的内容行。期间若有新
+  引用写入，插入路径会清除 `retired_at`，保证活跃内容不会被误删。
 - 批量删除：`KnowledgeBaseRepository.Purge(namespaces...)` 在**一个事务**内完成
   全部 namespace 的清理，语句数固定（约 30 条，与文档数/namespace 数无关）：
   先把 upload_operations / content_hash / search result_id 物化到临时表，再逐表
   `DELETE ... IN (SELECT ...)`；缓存修订与 outbox 用 4 条集合语句批量写入；
-  `content_objects` 用 `JOIN 临时 hash 表 + NOT EXISTS` 精确回收。
+  `content_objects` 用 `JOIN 临时 hash 表 + NOT EXISTS` 标记 `retired_at`（不立即
+  删除字节）。
 - Qdrant：每个被删知识库只发一次 `DELETE /collections/{name}`，且仅当没有其他
   知识库引用该 collection；删除失败尽力而为，不影响 MySQL 结果。
 - HTTP/接口：`KnowledgeBaseAdminRuntime` 改为
@@ -1832,7 +1835,8 @@ DELETE /v1/admin/knowledge-bases/{c}         -> 204，70ms
 DELETE /v1/admin/knowledge-bases/{missing}   -> 404
 事后校验：documents/upload_operations/upload_objects/blobs/kb_permissions/
           knowledge_bases/document_heads 全部为 0；共享 payload 的
-          content_objects 行在最后一个引用删除后为 0
+          content_objects 行在最后一个引用删除后只剩 1 行（2026-11-12 调整后为
+          retired_at 置位、8 天后才由 GC 删除，见下方「保留期调整」）
 ```
 
 对照旧实现：同一批 300 文档要走 300 次 `deleteDocumentByName`（每次一个
@@ -1841,12 +1845,35 @@ DELETE /v1/admin/knowledge-bases/{missing}   -> 404
 
 已知限制/未验证：
 
-- `content_objects` 与引用行的写入在同一事务内，但内容行 GC 采用 600s 宽限期 +
-  维护循环批处理（每轮 100 行），因此删除后存储空间不是立即释放；这是为了避免
-  与并发上传竞态而刻意保留的窗口。
+- `content_objects` 与引用行的写入在同一事务内，但内容行采用「最后引用消失时
+  写 `retired_at` + 保留 8 天」的延迟回收，且维护循环每轮最多删 100 行，因此删除
+  后存储空间不会立即释放；保留期由 `state.ContentObjectRetentionSeconds` 控制。
 - Qdrant 仍然每库一份向量、按 collection 删除；跨租户向量共享没有实现（用户已
   确认保持现状）。
 - 历史遗留的 5 条 `asdjasdajbsc` 命名空间上传操作（workspace 记录在旧的
   `...\Temp\dsh-*\rag-txn-*` 下）仍会每 10s 记录一次
   `cleanup failed (ValueError)`：这是本次改动之前就存在的数据（workspace 根目录
   不匹配），与内容去重/批量删除无关；用新批量删除清掉该 namespace 时会一并清理。
+
+### 保留期调整（2026-11-12 追加）
+
+用户要求：内容字节在「没有引用」后要保留超过 1 周再删除，而不是 600 秒。
+
+- 新列 `content_objects.retired_at DOUBLE NULL`（+ `ix_content_objects_retired`），
+  `ensureSchema` 幂等迁移旧库；DDL 禁用部署需手工补该列/索引（见
+  `docs/state-storage.md` 的 DDL 片段）。
+- 所有删除引用行的路径统一标记 `retired_at`：文档删除
+  (`deleteDocumentContentRefsTx`)、上传回滚/空提交/旧版本清理
+  (`deleteUploadObjectsTx`)、blob 删除与覆盖 (`blobUpsert` 等)、知识库批删
+  （临时 hash 表 + `NOT EXISTS`）。标记与引用删除在同一事务内，回滚即撤销。
+- 插入路径 `INSERT IGNORE` 命中已有内容行时清除 `retired_at`，即使内容先被
+  标记、之后又有新引用，也不会被 GC 误删。
+- GC 条件：`retired_at IS NOT NULL` 且 `retired_at < now - 8 天` 且无任何引用；
+  保留期常量 `state.ContentObjectRetentionSeconds = 8 * 24 * 60 * 60`（>1 周）。
+- 相关测试：`internal/state` 的 `TestContentObjectsDedupAcrossNamespaces`、
+  `TestContentRetirementRearmsOnNewReference`、
+  `TestContentObjectsGCKeepsReferencedRows`、`TestContentBackfillMovesLegacyRows`、
+  `TestKnowledgeBasePurgeBatchDeletesNamespaceRows`、
+  `TestKnowledgeBasePurgeBatchScalesWithDocuments`、schema 断言；全部通过。
+- 生产实例重启后 `information_schema` 已出现 `retired_at` 列与
+  `ix_content_objects_retired` 索引；批量删除返回结构不变。

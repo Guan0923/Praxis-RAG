@@ -231,13 +231,16 @@ func (r *KnowledgeBaseRepository) purgeNamespaceRows(ctx context.Context, tx *sq
 	return nil
 }
 
-// purgeContentAndCache deletes unreferenced payload rows, drops the tenant cache
-// rows and bumps every affected read-model revision in batch.
+// purgeContentAndCache retires unreferenced payload rows, drops the tenant cache
+// rows and bumps every affected read-model revision in batch. Payload bytes are
+// not deleted here: retirement starts the retention window (>1 week) after which
+// the maintenance GC removes them, keeping an accidental delete recoverable.
 func (r *KnowledgeBaseRepository) purgeContentAndCache(ctx context.Context, tx *sql.Tx, active []string, arguments []any, inClause string) error {
 	if _, err := tx.ExecContext(ctx,
-		"DELETE co FROM content_objects co JOIN tmp_purge_hashes h ON h.hash = co.hash "+
-			"WHERE NOT EXISTS (SELECT 1 FROM upload_objects u WHERE u.content_hash = co.hash) "+
-			"AND NOT EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = co.hash)"); err != nil {
+		"UPDATE content_objects co JOIN tmp_purge_hashes h ON h.hash = co.hash SET co.retired_at = ? "+
+			"WHERE co.retired_at IS NULL "+
+			"AND NOT EXISTS (SELECT 1 FROM upload_objects u WHERE u.content_hash = co.hash) "+
+			"AND NOT EXISTS (SELECT 1 FROM blobs b WHERE b.sha256 = co.hash)", unixSeconds()); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,

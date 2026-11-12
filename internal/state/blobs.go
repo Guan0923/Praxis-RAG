@@ -217,11 +217,19 @@ func (b *BlobStore) DeleteKey(ctx context.Context, namespace, bucket, key string
 	return transaction.Commit()
 }
 
-// DeleteKeyTx removes one object inside the caller's transaction.
+// DeleteKeyTx removes one object inside the caller's transaction and retires its
+// payload when no reference row names it anymore.
 func (b *BlobStore) DeleteKeyTx(ctx context.Context, tx *sql.Tx, namespace, bucket, key string) error {
-	_, err := tx.ExecContext(ctx,
-		"DELETE FROM blobs WHERE namespace = ? AND bucket = ? AND `key` = ?", namespace, bucket, key)
-	return err
+	hashes, err := contentHashesTx(ctx, tx,
+		"SELECT sha256 FROM blobs WHERE namespace = ? AND bucket = ? AND `key` = ?", namespace, bucket, key)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM blobs WHERE namespace = ? AND bucket = ? AND `key` = ?", namespace, bucket, key); err != nil {
+		return err
+	}
+	return retireContentHashesTx(ctx, tx, hashes, unixSeconds())
 }
 
 // DeleteDocument removes every object owned by documentID in one bucket.
@@ -237,26 +245,42 @@ func (b *BlobStore) DeleteDocument(ctx context.Context, namespace, bucket, docum
 	return transaction.Commit()
 }
 
-// DeleteDocumentTx removes a document's objects inside the caller's transaction.
+// DeleteDocumentTx removes a document's objects inside the caller's transaction
+// and retires the payloads that lost their last reference.
 func (b *BlobStore) DeleteDocumentTx(ctx context.Context, tx *sql.Tx, namespace, bucket, documentID string) error {
-	_, err := tx.ExecContext(ctx,
-		"DELETE FROM blobs WHERE namespace = ? AND bucket = ? AND document_id = ?", namespace, bucket, documentID)
-	return err
+	hashes, err := contentHashesTx(ctx, tx,
+		"SELECT DISTINCT sha256 FROM blobs WHERE namespace = ? AND bucket = ? AND document_id = ?",
+		namespace, bucket, documentID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM blobs WHERE namespace = ? AND bucket = ? AND document_id = ?", namespace, bucket, documentID); err != nil {
+		return err
+	}
+	return retireContentHashesTx(ctx, tx, hashes, unixSeconds())
 }
 
 // blobUpsert implements BlobStore._put: UPDATE, then INSERT, then retry UPDATE
 // when another instance inserted the same (namespace, bucket, key) first. The
 // bytes live once in content_objects; the row keeps only the SHA-256 reference.
+// Overwriting a row retires the payload it referenced before, so a replaced
+// artifact still honours the retention window.
 func blobUpsert(ctx context.Context, tx *sql.Tx, namespace, bucket, key string, content []byte, documentID *string) error {
 	const updateStatement = "UPDATE blobs SET document_id = ?, content = ?, size = ?, sha256 = ?, created_at = ? " +
 		"WHERE namespace = ? AND bucket = ? AND `key` = ?"
 	const insertStatement = "INSERT INTO blobs (namespace, bucket, `key`, document_id, content, size, sha256, created_at) " +
 		"VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+	const currentHashStatement = "SELECT sha256 FROM blobs WHERE namespace = ? AND bucket = ? AND `key` = ?"
 	sum := sha256Sum(content)
 	createdAt := nowISO()
 	var owner any
 	if documentID != nil {
 		owner = *documentID
+	}
+	retired, err := contentHashesTx(ctx, tx, currentHashStatement, namespace, bucket, key)
+	if err != nil {
+		return err
 	}
 	if _, err := insertContentObjectTx(ctx, tx, content, unixSeconds()); err != nil {
 		return err
@@ -270,16 +294,23 @@ func blobUpsert(ctx context.Context, tx *sql.Tx, namespace, bucket, key string, 
 	if err != nil {
 		return err
 	}
-	if changed > 0 {
-		return nil
-	}
-	if _, err := tx.ExecContext(ctx, insertStatement,
-		namespace, bucket, key, owner, []byte{}, int64(len(content)), sum, createdAt); err != nil {
-		if !isUniqueViolation(err) {
-			return err
+	if changed == 0 {
+		if _, err := tx.ExecContext(ctx, insertStatement,
+			namespace, bucket, key, owner, []byte{}, int64(len(content)), sum, createdAt); err != nil {
+			if !isUniqueViolation(err) {
+				return err
+			}
+			// Another instance inserted the row first; replace it and retire the
+			// payload it referenced.
+			replaced, readErr := contentHashesTx(ctx, tx, currentHashStatement, namespace, bucket, key)
+			if readErr != nil {
+				return readErr
+			}
+			if _, retryErr := tx.ExecContext(ctx, updateStatement, updateArguments...); retryErr != nil {
+				return retryErr
+			}
+			retired = append(retired, replaced...)
 		}
-		_, retryErr := tx.ExecContext(ctx, updateStatement, updateArguments...)
-		return retryErr
 	}
-	return nil
+	return retireContentHashesTx(ctx, tx, retired, unixSeconds())
 }

@@ -819,7 +819,13 @@ var schemaTables = []*SchemaTable{
 			bigint("size"),
 			longBlob("content"),
 			double("created_at"),
+			// retired_at is set when the last reference row disappears. The
+			// maintenance GC deletes the payload only after the retention
+			// window (>1 week) has passed, so a reference inserted meanwhile can
+			// re-arm the row without racing the delete.
+			double("retired_at").Null(),
 		},
+		Indexes: []SchemaIndex{index("ix_content_objects_retired", "retired_at")},
 	},
 }
 
