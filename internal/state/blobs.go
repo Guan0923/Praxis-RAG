@@ -18,19 +18,28 @@ func newBlobStore(db *sql.DB) *BlobStore {
 	return &BlobStore{db: db}
 }
 
-const blobSelectContent = "SELECT content FROM blobs WHERE namespace = ? AND bucket = ? AND `key` = ?"
+const blobSelectContent = "SELECT b.content, c.content, c.hash, b.sha256 FROM blobs b " +
+	"LEFT JOIN content_objects c ON c.hash = b.sha256 " +
+	"WHERE b.namespace = ? AND b.bucket = ? AND b.`key` = ?"
 
 // Get returns the stored bytes, or found=false when the object is absent.
 func (b *BlobStore) Get(ctx context.Context, namespace, bucket, key string) ([]byte, bool, error) {
-	var content []byte
-	err := b.db.QueryRowContext(ctx, blobSelectContent, namespace, bucket, key).Scan(&content)
+	var inlineContent []byte
+	var storedContent []byte
+	var storedHash sql.NullString
+	var sha256Value string
+	err := b.db.QueryRowContext(ctx, blobSelectContent, namespace, bucket, key).
+		Scan(&inlineContent, &storedContent, &storedHash, &sha256Value)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
 	}
-	return content, true, nil
+	if storedHash.Valid && storedHash.String != "" {
+		return storedContent, true, nil
+	}
+	return inlineContent, true, nil
 }
 
 // GetText returns the stored object decoded as UTF-8. Python supports an
@@ -236,7 +245,8 @@ func (b *BlobStore) DeleteDocumentTx(ctx context.Context, tx *sql.Tx, namespace,
 }
 
 // blobUpsert implements BlobStore._put: UPDATE, then INSERT, then retry UPDATE
-// when another instance inserted the same (namespace, bucket, key) first.
+// when another instance inserted the same (namespace, bucket, key) first. The
+// bytes live once in content_objects; the row keeps only the SHA-256 reference.
 func blobUpsert(ctx context.Context, tx *sql.Tx, namespace, bucket, key string, content []byte, documentID *string) error {
 	const updateStatement = "UPDATE blobs SET document_id = ?, content = ?, size = ?, sha256 = ?, created_at = ? " +
 		"WHERE namespace = ? AND bucket = ? AND `key` = ?"
@@ -248,7 +258,10 @@ func blobUpsert(ctx context.Context, tx *sql.Tx, namespace, bucket, key string, 
 	if documentID != nil {
 		owner = *documentID
 	}
-	updateArguments := []any{owner, content, int64(len(content)), sum, createdAt, namespace, bucket, key}
+	if _, err := insertContentObjectTx(ctx, tx, content, unixSeconds()); err != nil {
+		return err
+	}
+	updateArguments := []any{owner, []byte{}, int64(len(content)), sum, createdAt, namespace, bucket, key}
 	result, err := tx.ExecContext(ctx, updateStatement, updateArguments...)
 	if err != nil {
 		return err
@@ -261,7 +274,7 @@ func blobUpsert(ctx context.Context, tx *sql.Tx, namespace, bucket, key string, 
 		return nil
 	}
 	if _, err := tx.ExecContext(ctx, insertStatement,
-		namespace, bucket, key, owner, content, int64(len(content)), sum, createdAt); err != nil {
+		namespace, bucket, key, owner, []byte{}, int64(len(content)), sum, createdAt); err != nil {
 		if !isUniqueViolation(err) {
 			return err
 		}

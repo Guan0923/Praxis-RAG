@@ -100,7 +100,9 @@ migration CLI.
 | `api_keys` | `id`, unique `digest` | service credentials |
 | `knowledge_bases` | `namespace` | committed KB settings, monotonic `version` |
 | `documents` | `(namespace, name)` | per-document manifest |
-| `blobs` | `(namespace, bucket, key)` | source bytes and parse artifacts (`LONGBLOB`) |
+| `blobs` | `(namespace, bucket, key)` | source bytes and parse artifacts; bytes live in `content_objects` |
+| `upload_objects` | `(operation_id, bucket, key)` | immutable staged upload objects; bytes live in `content_objects` |
+| `content_objects` | `hash` (SHA-256) | **content-addressed byte store**: one row per unique payload, shared by every tenant/document that uploaded it |
 | `mcp_catalogs` | `namespace` | MCP tool/prompt settings |
 | `artifact_snapshots` | `artifact_id` | durable version-bound artifact bytes, metadata and expiry |
 | `activity_counters` | `(metric, window_start)` | **active** hourly activity counters for the Console monitor (for example every retrieval execution counted as `search`); additive only, no event rows |
@@ -124,8 +126,62 @@ migration CLI.
 
 Identifier columns (`namespace`, document `name`, `digest`, blob `key`) use a
 binary collation in MySQL so `Alpha` and `alpha` do not collapse into one row.
-`settings`, `diagnostics` and MCP catalog data are `LONGTEXT`; blobs are
-`LONGBLOB`.
+`settings`, `diagnostics` and MCP catalog data are `LONGTEXT`; `content_objects.content`
+is `LONGBLOB`.
+
+### Content-addressed bytes
+
+`content_objects` stores each distinct payload once, keyed by its SHA-256.
+`upload_objects.content_hash` and `blobs.sha256` are reference columns: when a
+hundred tenants upload the same file, MySQL keeps one `content_objects` row plus
+one lightweight reference row per tenant/document. Rows keep an empty `content`
+placeholder so the column type stays unchanged.
+
+- Reads (`UploadJournal.GetObject`, `BlobStore.Get`) join `content_objects` and
+  fall back to inline `content` for rows written before this layout; the
+  maintenance loop migrates those legacy rows in bounded batches
+  (`BackfillContentObjects`, 100 rows per pass).
+- Deletes remove only reference rows (by document or operation) in the same
+  transaction as the logical document delete.
+- `content_objects` rows are removed by the maintenance GC
+  (`PurgeUnreferencedContent`) only when no `upload_objects`/`blobs` row references
+  the hash and the row is older than a 600-second grace window, so a concurrent
+  upload cannot race the delete.
+- Qdrant is unchanged: every knowledge base keeps its own collection and owns its
+  vectors. Deduplication is a MySQL storage concern only.
+
+Existing databases are upgraded in place by `ensureSchema` (idempotent):
+`content_objects`, `upload_objects.content_hash`, `ix_upload_objects_content` and
+`ix_blobs_sha256` are created when missing, and the maintenance loop migrates
+legacy inline rows in bounded batches. Deployments that disable automatic DDL
+(`RAG_STATE_AUTO_SCHEMA=false`) must apply the equivalent statements manually:
+
+```sql
+CREATE TABLE `content_objects` (
+  `hash` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  `size` bigint NOT NULL,
+  `content` longblob NOT NULL,
+  `created_at` double NOT NULL,
+  PRIMARY KEY (`hash`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+ALTER TABLE `upload_objects`
+  ADD COLUMN `content_hash` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL,
+  ADD INDEX `ix_upload_objects_content` (`content_hash`);
+ALTER TABLE `blobs` ADD INDEX `ix_blobs_sha256` (`sha256`);
+```
+
+### Batched knowledge-base deletion
+
+`DELETE /v1/admin/knowledge-bases/{namespace}` and
+`POST /v1/admin/knowledge-bases/batch-delete` share one batched purge: all
+requested namespaces are deleted in **one transaction** with a fixed (~30)
+statement count, independent of the number of documents or namespaces. Lookup
+values (upload operations, content hashes, search result ids) are materialised
+into temporary tables, and cache revisions/outbox rows are bumped with four
+set-based statements instead of four per key. Qdrant collections are deleted one
+HTTP request (`DELETE /collections/{name}`) per knowledge base, and only when no
+other knowledge base references the collection. Namespaces with a live upload
+lease are reported as failed and left untouched.
 
 `knowledge_bases.version` increments on every update. Instances compare the
 stored version before reusing a cached tenant, so a configuration change made on
@@ -256,7 +312,7 @@ explicit retirement step.
 | --- | --- |
 | `upload_operations` | operation ID, request fingerprint, owner, old/new version, outcome and cleanup marker |
 | `upload_steps` | committed step intent, completion or failure; rollback intent/outcome |
-| `upload_objects` | immutable source, chunks and parse artifacts scoped to an operation |
+| `upload_objects` | immutable source, chunks and parse artifacts scoped to an operation; bytes are content-addressed in `content_objects` |
 | `document_heads` | published version for each namespace/document |
 | `document_leases` | renewable document/name leases and exclusive namespace coordination |
 
@@ -416,4 +472,4 @@ recorded in [GO_MIGRATION](GO_MIGRATION.md) and [VALIDATION](../VALIDATION.md).
 
 ## UUID 结果与逻辑删除
 
-artifact 以 MySQL `artifact_snapshots` 为事实来源，沿用 `RAG_RESULT_TTL_SECONDS=3600`（语义为 artifact TTL）；已签发 artifact 的版本固定及到期前保留保证不变。`search_tasks`/`search_result_snapshots` 保留历史数据但不再读写，因此不存在“搜索结果 UUID 回源”路径，重新检索即可获得新证据。文档删除通过 del_flag 隐藏，不物理删除持久化源文件和 Qdrant 数据。正常自动 schema 为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [产物引用](result-references.md)。
+artifact 以 MySQL `artifact_snapshots` 为事实来源，沿用 `RAG_RESULT_TTL_SECONDS=3600`（语义为 artifact TTL）；已签发 artifact 的版本固定及到期前保留保证不变。`search_tasks`/`search_result_snapshots` 保留历史数据但不再读写，因此不存在“搜索结果 UUID 回源”路径，重新检索即可获得新证据。文档删除通过 del_flag 隐藏，并在同一事务中删除该文档的 `upload_objects`/`blobs` 引用行；`content_objects` 中无引用的字节由维护循环在 600 秒宽限期后回收。Qdrant 数据仍不随单文档删除物理删除；删除整个知识库时才按集合删除（每库一次请求）。正常自动 schema 为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [产物引用](result-references.md)。

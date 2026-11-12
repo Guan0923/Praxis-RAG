@@ -288,6 +288,25 @@ func (a HTTPRuntime) PurgeKnowledgeBase(ctx context.Context, namespace string) (
 	}, nil
 }
 
+// PurgeKnowledgeBases implements httpapi.KnowledgeBaseAdminRuntime: one batched
+// purge transaction for the whole request.
+func (a HTTPRuntime) PurgeKnowledgeBases(ctx context.Context, namespaces []string) ([]httpapi.KnowledgeBasePurgeResult, error) {
+	results, err := a.Service.PurgeKnowledgeBases(ctx, namespaces)
+	if err != nil {
+		return nil, err
+	}
+	converted := make([]httpapi.KnowledgeBasePurgeResult, len(results))
+	for index, result := range results {
+		converted[index] = httpapi.KnowledgeBasePurgeResult{
+			Namespace:            result.Namespace,
+			DocumentsDeleted:     result.DocumentsDeleted,
+			FailedDocuments:      result.FailedDocuments,
+			ConfigurationDeleted: result.ConfigurationDeleted,
+		}
+	}
+	return converted, nil
+}
+
 // ListModelProfiles implements httpapi.ModelProfileRuntime.
 func (a HTTPRuntime) ListModelProfiles(ctx context.Context) ([]map[string]any, error) {
 	return a.Service.ListModelProfiles(ctx)

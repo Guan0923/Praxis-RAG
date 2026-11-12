@@ -24,7 +24,7 @@ var expectedSchema = []struct {
 	{"upload_steps", []string{"operation_id", "name", "status", "details", "error", "started_at", "finished_at"}},
 	{"document_heads", []string{"namespace", "document_id", "version", "updated_at"}},
 	{"document_leases", []string{"namespace", "resource", "owner", "operation_id", "expires_at"}},
-	{"upload_objects", []string{"operation_id", "bucket", "key", "content", "metadata", "created_at"}},
+	{"upload_objects", []string{"operation_id", "bucket", "key", "content", "content_hash", "metadata", "created_at"}},
 	{"cache_revisions", []string{"kind", "scope", "revision", "refreshed_revision", "attempts", "last_error", "updated_at"}},
 	{"search_result_snapshots", []string{"id", "namespace", "content", "created_at", "expires_at"}},
 	{"artifact_snapshots", []string{"id", "namespace", "identity", "document_id", "version", "kind", "name", "mime_type", "content", "created_at", "expires_at"}},
@@ -48,6 +48,9 @@ var expectedSchema = []struct {
 	// Go-only CDC cutover bookkeeping table, appended last like other Go-only
 	// additions.
 	{"cdc_cutover_state", []string{"k", "v"}},
+	// content_objects is the content-addressed byte store referenced by
+	// upload_objects.content_hash and blobs.sha256.
+	{"content_objects", []string{"hash", "size", "content", "created_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -80,6 +83,7 @@ var expectedPrimaryKeys = map[string][]string{
 	"activity_counters":        {"metric", "window_start"},
 	"runtime_heartbeats":       {"role", "instance"},
 	"cdc_cutover_state":        {"k"},
+	"content_objects":          {"hash"},
 }
 
 var expectedUniques = map[string][]string{
@@ -101,7 +105,8 @@ var expectedIndexes = map[string][]string{
 	"api_keys":                 {"ix_api_keys_owner"},
 	"knowledge_bases":          {"ix_knowledge_bases_collection"},
 	"documents":                {"ix_documents_namespace_sha256"},
-	"blobs":                    {"ix_blobs_document"},
+	"blobs":                    {"ix_blobs_document", "ix_blobs_sha256"},
+	"upload_objects":           {"ix_upload_objects_content"},
 	"upload_operations":        {"ix_upload_unfinished"},
 	"search_result_snapshots":  {"ix_search_result_expiry", "ix_search_result_namespace"},
 	"artifact_snapshots":       {"ix_artifact_expiry", "ix_artifact_namespace"},

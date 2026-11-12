@@ -1366,7 +1366,7 @@ cd frontend
 - 批量删除语义从「逐条尽力而为、部分失败」改为「整批原子」：并发冲突或数据库错误时整批回滚并返回 500，客户端重试即可；`failed` 字段保留但恒为空数组。
 - 未做浏览器级性能回归：数值来自服务端日志/HTTP 计时与 Go/MySQL 隔离测量，Console 只验证了响应结构不变。
 - 未做并发压测（同时多个管理员对同一批 id 操作时，`RowsAffected` 不一致会整批回滚，预期行为但未专门压测）。
-- 知识库批量删除仍是逐文档逻辑删除（`purge` 循环），本次只优化了 API Key 批量删除；如同样慢可按相同思路改造。
+- 知识库批量删除仍是逐文档逻辑删除（`purge` 循环），本次只优化了 API Key 批量删除；如同样慢可按相同思路改造。（后续已于 2026-11-12 按同一思路完成：见文末「内容去重与批量删除」。）
 
 ## JEV model configuration — 2026-11-11
 
@@ -1752,3 +1752,101 @@ Kafka 元数据与 PDF 转换器检查正常；`/console` 提供的新 bundle
 - **MySQL 相关测试与迁移**：未在真实 MySQL 上执行依赖 `RAG_TEST_MYSQL_URL` 的测试，也未实机执行
   升级迁移（`kind='ocr'` 删除、`ocr`/`ocr_model` 清理）的验证与回滚演练。
 - 前端仅有 jsdom/Vitest，没有浏览器 E2E；三张模型卡片的自适应网格窄屏断点未人工点检。
+## 内容去重与批量删除 — 2026-11-12
+
+目标（用户原话）：MySQL 中同一份文件只保留一份内容，Qdrant 保持现状（每库独立
+collection、独立 point）；删除逻辑改为「没有引用才删除内容」，批量删除要组合成
+一次 SQL/Qdrant 操作，而不是「批量数量 = 调用次数」。
+
+### 已交付
+
+- 新表 `content_objects(hash CHAR(64) PK, size, content LONGBLOB, created_at)`：
+  按 SHA-256 内容寻址，一份文件内容只存一行。
+- 引用列：`upload_objects.content_hash`（新增，含 `ix_upload_objects_content`）与
+  `blobs.sha256`（复用，新增 `ix_blobs_sha256`）。引用行保存空 `content` 占位，
+  存储开销只与「租户/文档 × 对象」数量相关，与文件大小无关。
+- 读写：`UploadJournal.PutObjectTx` / `BlobStore` 写入前先 `INSERT IGNORE`
+  内容行再写引用；`GetObject` / `BlobStore.Get` 走 `LEFT JOIN content_objects`，
+  对历史行自动回退读取内联 `content`。
+- 迁移：`ensureSchema` 幂等新增表/列/索引；维护循环 `BackfillContentObjects`
+  每轮最多迁移 100 行历史内联内容（上传对象 + blobs），旧进程/旧行始终可读。
+- 回收：`PurgeUnreferencedContent` 仅删除「没有任何 `upload_objects.content_hash`
+  或 `blobs.sha256` 引用、且创建时间早于 600s 宽限期」的内容行，避免与并发上传
+  竞态；单文档删除只删引用行，内容由维护循环回收。
+- 批量删除：`KnowledgeBaseRepository.Purge(namespaces...)` 在**一个事务**内完成
+  全部 namespace 的清理，语句数固定（约 30 条，与文档数/namespace 数无关）：
+  先把 upload_operations / content_hash / search result_id 物化到临时表，再逐表
+  `DELETE ... IN (SELECT ...)`；缓存修订与 outbox 用 4 条集合语句批量写入；
+  `content_objects` 用 `JOIN 临时 hash 表 + NOT EXISTS` 精确回收。
+- Qdrant：每个被删知识库只发一次 `DELETE /collections/{name}`，且仅当没有其他
+  知识库引用该 collection；删除失败尽力而为，不影响 MySQL 结果。
+- HTTP/接口：`KnowledgeBaseAdminRuntime` 改为
+  `PurgeKnowledgeBases(ctx, []string)`；单删与批删共用同一批处理入口，响应结构
+  （`deleted` / `missing` / `failed` / `documents_deleted` /
+  `configurations_deleted`）保持不变，前端无需改动。
+- 冲突语义：namespace 仍有活跃上传租约（`document_leases.expires_at > now`）时，
+  该 namespace 进入 `failed` 且数据完全不动（同等旧版 409 路径）。
+
+### 验证（2026-11-12，本 worktree，Go 1.27.3，MySQL 容器 127.0.0.1:3307）
+
+```
+$env:RAG_TEST_MYSQL_URL = "mysql+pymysql://rag:praxis-dev-pw@127.0.0.1:3307/praxis_unit_test?charset=utf8mb4"
+go build ./...                                                # exit 0
+go vet ./...                                                  # exit 0
+go test -p 1 -count=1 -timeout 25m ./...                      # exit 0，全绿
+# internal/state 30.3s / internal/runtime 38.6s / internal/e2e 8.9s /
+# internal/httpapi 1.9s / internal/migrate 3.1s
+```
+
+新增/更新测试：
+
+- `internal/state/content_test.go`（新增）：
+  - 跨 namespace 相同内容只产生 1 行 `content_objects`，两条引用都能读回原文；
+  - blobs 与 upload_objects 共享同一内容行；
+  - 删除全部引用后 GC 删除内容行；仍有引用时 GC 不删；
+  - 历史内联行 backfill 后 `content_hash`/`sha256` 生效、内联字节清空、读取结果
+    不变，且重复 backfill 幂等；
+  - 一次 `Purge` 删除 2 个 namespace 的全部行（documents/heads/permissions/
+    mcp_catalogs/blobs/upload_operations），其他 namespace 与共享内容保留，
+    `kb_list` 修订被批量 bump；
+  - 活跃租约 namespace 返回 `Busy` 且一行未动；
+  - 300 文档 + 300 上传引用的批处理删除：**55.9ms**（单个事务）。
+- `internal/runtime/knowledge_base_test.go`：批处理 purge 正常删除 2 个文档并
+  清空列表；活跃上传租约时保留配置行以便重试。
+- `internal/httpapi/kb_purge_test.go` / `kb_admin_test.go`：单删 204/404/409、
+  批删 `deleted`/`missing`/`failed` 分桶、非 loopback 403、运行时错误 503 不变。
+- `internal/state/schema_test.go`：`content_objects`、`upload_objects.content_hash`、
+  `ix_upload_objects_content`、`ix_blobs_sha256` 纳入 schema 断言。
+
+正式实例（`dist/bin` 新二进制 + `praxis_rag` 库，2026-11-12 08:52 重启）：
+
+```
+information_schema: content_objects 表、upload_objects.content_hash、
+                    ix_upload_objects_content、ix_blobs_sha256 均已自动迁移
+POST /v1/admin/knowledge-bases/batch-delete  [a(150 文档), b(1), missing]
+  -> 200 {"deleted":[a,b],"missing":[missing],"documents_deleted":151,
+          "configurations_deleted":2,"failed":[]}，服务端 120ms
+POST /v1/admin/knowledge-bases/batch-delete  [d(300 文档)]
+  -> 200 {"deleted":[d],"documents_deleted":300,...}，服务端 79ms
+DELETE /v1/admin/knowledge-bases/{c}         -> 204，70ms
+DELETE /v1/admin/knowledge-bases/{missing}   -> 404
+事后校验：documents/upload_operations/upload_objects/blobs/kb_permissions/
+          knowledge_bases/document_heads 全部为 0；共享 payload 的
+          content_objects 行在最后一个引用删除后为 0
+```
+
+对照旧实现：同一批 300 文档要走 300 次 `deleteDocumentByName`（每次一个
+`journal.WithLock` + 一个事务），这正是「删除时间太久」的原因；现在是 1 个事务
++ 每库 1 次 Qdrant 集合删除。
+
+已知限制/未验证：
+
+- `content_objects` 与引用行的写入在同一事务内，但内容行 GC 采用 600s 宽限期 +
+  维护循环批处理（每轮 100 行），因此删除后存储空间不是立即释放；这是为了避免
+  与并发上传竞态而刻意保留的窗口。
+- Qdrant 仍然每库一份向量、按 collection 删除；跨租户向量共享没有实现（用户已
+  确认保持现状）。
+- 历史遗留的 5 条 `asdjasdajbsc` 命名空间上传操作（workspace 记录在旧的
+  `...\Temp\dsh-*\rag-txn-*` 下）仍会每 10s 记录一次
+  `cleanup failed (ValueError)`：这是本次改动之前就存在的数据（workspace 根目录
+  不匹配），与内容去重/批量删除无关；用新批量删除清掉该 namespace 时会一并清理。

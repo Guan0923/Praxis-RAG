@@ -418,7 +418,72 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	if err := s.migrateCacheRevisionWatermark(ctx); err != nil {
 		return err
 	}
-	return s.migrateVisionModelConfig(ctx)
+	if err := s.migrateVisionModelConfig(ctx); err != nil {
+		return err
+	}
+	return s.migrateContentStore(ctx)
+}
+
+// migrateContentStore adds the content-addressed reference columns and indexes
+// to an existing database. Bytes already stored inline stay readable through the
+// repository fallbacks and are moved into content_objects by the bounded
+// background backfill; no startup row rewrite happens here.
+func (s *Stores) migrateContentStore(ctx context.Context) error {
+	if err := s.ensureTableColumn(ctx, "upload_objects", "content_hash", "VARCHAR(64) COLLATE utf8mb4_bin NULL"); err != nil {
+		return err
+	}
+	if err := s.ensureTableIndex(ctx, "upload_objects", "ix_upload_objects_content", "content_hash"); err != nil {
+		return err
+	}
+	return s.ensureTableIndex(ctx, "blobs", "ix_blobs_sha256", "sha256")
+}
+
+// ensureTableColumn adds one nullable column to an existing table. Concurrent
+// startup may race the ALTER; only an independently confirmed existing column is
+// accepted.
+func (s *Stores) ensureTableColumn(ctx context.Context, table, column, definition string) error {
+	exists, err := s.hasTable(ctx, table)
+	if err != nil || !exists {
+		return err
+	}
+	columns, err := s.tableColumns(ctx, table)
+	if err != nil {
+		return err
+	}
+	if containsString(columns, column) {
+		return nil
+	}
+	statement := "ALTER TABLE " + quoteIdentifier(table) +
+		" ADD COLUMN " + quoteIdentifier(column) + " " + definition
+	if _, execErr := s.DB.ExecContext(ctx, statement); execErr != nil {
+		confirmed, confirmErr := s.tableColumns(ctx, table)
+		if confirmErr == nil && containsString(confirmed, column) {
+			return nil
+		}
+		return execErr
+	}
+	return nil
+}
+
+// ensureTableIndex creates one secondary index when it is absent.
+func (s *Stores) ensureTableIndex(ctx context.Context, table, indexName, column string) error {
+	exists, err := s.hasTable(ctx, table)
+	if err != nil || !exists {
+		return err
+	}
+	if found, indexErr := s.hasIndex(ctx, table, indexName); indexErr != nil || found {
+		return indexErr
+	}
+	statement := "CREATE INDEX " + quoteIdentifier(indexName) +
+		" ON " + quoteIdentifier(table) + " (" + quoteIdentifier(column) + ")"
+	if _, execErr := s.DB.ExecContext(ctx, statement); execErr != nil {
+		confirmed, confirmErr := s.hasIndex(ctx, table, indexName)
+		if confirmErr == nil && confirmed {
+			return nil
+		}
+		return execErr
+	}
+	return nil
 }
 
 // tableNames lists the current tables in one round trip; checking tables one by

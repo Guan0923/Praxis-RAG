@@ -1503,10 +1503,12 @@ func (j *UploadJournal) PutObjectTx(ctx context.Context, tx *sql.Tx, operation *
 		encodedMetadata = nil
 	}
 	var existingContent []byte
+	var existingHash sql.NullString
 	var existingMetadata sql.NullString
+	contentHash := sha256Sum(content)
 	err := tx.QueryRowContext(ctx,
-		"SELECT content, metadata FROM upload_objects WHERE operation_id = ? AND bucket = ? AND `key` = ?"+j.forUpdate(),
-		operation.ID, bucket, key).Scan(&existingContent, &existingMetadata)
+		"SELECT content, content_hash, metadata FROM upload_objects WHERE operation_id = ? AND bucket = ? AND `key` = ?"+j.forUpdate(),
+		operation.ID, bucket, key).Scan(&existingContent, &existingHash, &existingMetadata)
 	if err == nil {
 		matchesMetadata := false
 		if encodedMetadata == nil {
@@ -1514,7 +1516,11 @@ func (j *UploadJournal) PutObjectTx(ctx context.Context, tx *sql.Tx, operation *
 		} else if existingMetadata.Valid {
 			matchesMetadata = existingMetadata.String == encodedMetadata.(string)
 		}
-		if string(existingContent) != string(content) || !matchesMetadata {
+		matchesContent := string(existingContent) == string(content)
+		if existingHash.Valid && existingHash.String != "" {
+			matchesContent = existingHash.String == contentHash
+		}
+		if !matchesContent || !matchesMetadata {
 			return newUploadConflict("Upload objects are immutable")
 		}
 		return nil
@@ -1526,26 +1532,36 @@ func (j *UploadJournal) PutObjectTx(ctx context.Context, tx *sql.Tx, operation *
 	if err != nil {
 		return err
 	}
+	if _, err := insertContentObjectTx(ctx, tx, content, now); err != nil {
+		return err
+	}
 	_, err = tx.ExecContext(ctx,
-		"INSERT INTO upload_objects (operation_id, bucket, `key`, content, metadata, created_at) "+
-			"VALUES (?, ?, ?, ?, ?, ?)",
-		operation.ID, bucket, key, content, encodedMetadata, now)
+		"INSERT INTO upload_objects (operation_id, bucket, `key`, content, content_hash, metadata, created_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?)",
+		operation.ID, bucket, key, []byte{}, contentHash, encodedMetadata, now)
 	return err
 }
 
 // GetObject returns staged bytes for one version, found=false when absent.
 func (j *UploadJournal) GetObject(ctx context.Context, version, bucket, key string) ([]byte, bool, error) {
-	var content []byte
+	var inlineContent []byte
+	var storedContent []byte
+	var contentHash sql.NullString
 	err := j.stores.DB.QueryRowContext(ctx,
-		"SELECT content FROM upload_objects WHERE operation_id = ? AND bucket = ? AND `key` = ?",
-		version, bucket, key).Scan(&content)
+		"SELECT u.content, c.content, u.content_hash FROM upload_objects u "+
+			"LEFT JOIN content_objects c ON c.hash = u.content_hash "+
+			"WHERE u.operation_id = ? AND u.bucket = ? AND u.`key` = ?",
+		version, bucket, key).Scan(&inlineContent, &storedContent, &contentHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
 	}
-	return content, true, nil
+	if contentHash.Valid && contentHash.String != "" {
+		return storedContent, true, nil
+	}
+	return inlineContent, true, nil
 }
 
 // RegisterWorkspace persists a caller-managed workspace before mkdir; the

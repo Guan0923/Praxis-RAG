@@ -461,10 +461,10 @@ func (s *Service) DeleteKnowledgeBase(ctx context.Context, namespace string) (bo
 
 // KnowledgeBasePurgeResult reports what one knowledge-base purge removed.
 //
-// Every document is logically deleted through the regular document-deletion
-// path before the configuration row is removed, because the Console list merges
-// configuration rows with document workspaces: deleting only the configuration
-// would leave the namespace visible as an unconfigured workspace.
+// The purge is a single batched database transaction: every document is
+// soft-deleted and every namespace-scoped row (documents, upload references,
+// catalog, leases, permissions, configuration) is removed with a fixed number of
+// statements, independent of how many documents or namespaces are involved.
 type KnowledgeBasePurgeResult struct {
 	Namespace            string
 	DocumentsDeleted     int
@@ -472,59 +472,114 @@ type KnowledgeBasePurgeResult struct {
 	ConfigurationDeleted bool
 }
 
-// PurgeKnowledgeBase removes one knowledge base from the Console list: every
-// document is logically deleted and then the configuration row is removed.
+// PurgeKnowledgeBases removes several knowledge bases with one batched purge.
+// The results are returned in the requested order.
 //
-// Document deletion stays logical (del_flag) exactly like the single-document
-// REST/MCP delete, so Qdrant payload bytes and the collection are intentionally
-// retained; the tenant cache entry is invalidated once the purge ran. When one
-// document cannot be deleted (for example an upload still holds its lock), the
-// configuration row is kept so the knowledge base is not left half-deleted and
-// the per-document failures are reported to the caller.
-func (s *Service) PurgeKnowledgeBase(ctx context.Context, namespace string) (KnowledgeBasePurgeResult, error) {
-	result := KnowledgeBasePurgeResult{Namespace: namespace}
-	documents, err := s.ListDocuments(ctx, namespace)
+// The batch runs a single transaction regardless of the number of namespaces, so
+// a Console batch delete costs one database operation instead of one per
+// namespace (and one per document). Namespaces with an active upload lease are
+// reported as failed and left untouched. Payload bytes are only dropped from
+// content_objects when no reference row points at them anymore, and each purged
+// knowledge base has its own Qdrant collection deleted with one request.
+func (s *Service) PurgeKnowledgeBases(ctx context.Context, namespaces []string) ([]KnowledgeBasePurgeResult, error) {
+	ordered := make([]string, 0, len(namespaces))
+	seen := make(map[string]struct{}, len(namespaces))
+	for _, namespace := range namespaces {
+		if namespace == "" {
+			continue
+		}
+		if _, duplicate := seen[namespace]; duplicate {
+			continue
+		}
+		seen[namespace] = struct{}{}
+		ordered = append(ordered, namespace)
+	}
+	results := make([]KnowledgeBasePurgeResult, len(ordered))
+	for index, namespace := range ordered {
+		results[index] = KnowledgeBasePurgeResult{Namespace: namespace}
+	}
+	if len(ordered) == 0 {
+		return results, nil
+	}
+	report, err := s.stores.KnowledgeBases.Purge(ctx, ordered)
 	if err != nil {
-		return result, err
+		return nil, &apierrors.KnowledgeError{Message: "知识库配置无法删除"}
 	}
-	for _, document := range documents {
-		name, _ := document["name"].(string)
-		if name == "" {
+	for index, namespace := range ordered {
+		if report.Busy[namespace] {
+			results[index].FailedDocuments = []map[string]string{{
+				"name":  "",
+				"error": "知识库正在更新，请稍后再删除",
+			}}
 			continue
 		}
-		if _, err := s.deleteDocumentByName(ctx, namespace, name); err != nil {
-			result.FailedDocuments = append(result.FailedDocuments, map[string]string{
-				"name":  name,
-				"error": purgeDocumentFailureText(err),
-			})
-			continue
-		}
-		result.DocumentsDeleted++
+		results[index].DocumentsDeleted = report.DocumentsByNamespace[namespace]
+		results[index].ConfigurationDeleted = report.Present[namespace]
 	}
-	if len(result.FailedDocuments) == 0 {
-		deleted, err := s.DeleteKnowledgeBase(ctx, namespace)
-		if err != nil {
-			return result, err
-		}
-		result.ConfigurationDeleted = deleted
+	s.cleanupPurgedCollections(ctx, report)
+	for namespace := range report.Present {
+		s.Invalidate(namespace)
 	}
-	s.Invalidate(namespace)
-	return result, nil
+	return results, nil
 }
 
-// purgeDocumentFailureText renders one document-deletion failure for the purge
-// report. Safe runtime messages are passed through; anything else falls back to
-// a generic sentence so internal details never reach the Console.
-func purgeDocumentFailureText(err error) string {
-	var validation *apierrors.KnowledgeValidationError
-	if errors.As(err, &validation) {
-		return validation.Message
+// PurgeKnowledgeBase removes one knowledge base through the batched purge path.
+func (s *Service) PurgeKnowledgeBase(ctx context.Context, namespace string) (KnowledgeBasePurgeResult, error) {
+	results, err := s.PurgeKnowledgeBases(ctx, []string{namespace})
+	if err != nil {
+		return KnowledgeBasePurgeResult{Namespace: namespace}, err
 	}
-	var knowledge *apierrors.KnowledgeError
-	if errors.As(err, &knowledge) {
-		return knowledge.Message
+	if len(results) == 0 {
+		return KnowledgeBasePurgeResult{Namespace: namespace}, nil
 	}
-	return "文档删除失败"
+	return results[0], nil
+}
+
+// cleanupPurgedCollections deletes one Qdrant collection per purged knowledge
+// base with a single request each. Collections that another knowledge base still
+// references are kept. Failures are best-effort: MySQL is the source of truth
+// and an orphan collection only costs storage.
+func (s *Service) cleanupPurgedCollections(ctx context.Context, report state.KnowledgeBasePurgeReport) {
+	if len(report.Collections) == 0 {
+		return
+	}
+	collections := make([]string, 0, len(report.Collections))
+	seen := make(map[string]struct{}, len(report.Collections))
+	for _, collection := range report.Collections {
+		if collection == "" {
+			continue
+		}
+		if _, duplicate := seen[collection]; duplicate {
+			continue
+		}
+		seen[collection] = struct{}{}
+		collections = append(collections, collection)
+	}
+	if len(collections) == 0 {
+		return
+	}
+	inUse, err := s.stores.KnowledgeBases.CollectionsInUse(ctx, collections)
+	if err != nil {
+		logBackgroundFailure(ctx, "collection usage lookup", err)
+		return
+	}
+	for _, collection := range collections {
+		if inUse[collection] {
+			continue
+		}
+		s.deleteQdrantCollection(collection)
+	}
+}
+
+// deleteQdrantCollection removes one whole collection in one HTTP request.
+func (s *Service) deleteQdrantCollection(collection string) {
+	if collection == "" {
+		return
+	}
+	httpClient := &http.Client{Timeout: qdrant.DefaultTimeout}
+	defer httpClient.CloseIdleConnections()
+	client := qdrant.NewClient(s.config.QdrantURL, "", httpClient)
+	_ = client.Do(context.Background(), http.MethodDelete, "/collections/"+url.PathEscape(collection), nil, nil, nil)
 }
 
 // KnowledgeBaseKey reveals the decrypted provider API key for the local admin

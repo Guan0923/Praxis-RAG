@@ -332,7 +332,12 @@ var schemaTables = []*SchemaTable{
 			identifier("sha256", 64),
 			varchar("created_at", 40),
 		},
-		Indexes: []SchemaIndex{index("ix_blobs_document", "namespace", "bucket", "document_id")},
+		Indexes: []SchemaIndex{
+			index("ix_blobs_document", "namespace", "bucket", "document_id"),
+			// ix_blobs_sha256 feeds the content-addressed dedupe lookup and the
+			// unreferenced-content GC.
+			index("ix_blobs_sha256", "sha256"),
+		},
 	},
 	{
 		Name: "mcp_catalogs",
@@ -405,9 +410,13 @@ var schemaTables = []*SchemaTable{
 			identifier("bucket", 32).PK(),
 			identifier("key", 512).PK(),
 			longBlob("content"),
+			// content_hash points at content_objects; NULL marks a legacy row
+			// that still carries its bytes in content.
+			identifier("content_hash", 64).Null(),
 			longText("metadata").Null(),
 			double("created_at"),
 		},
+		Indexes: []SchemaIndex{index("ix_upload_objects_content", "content_hash")},
 	},
 	{
 		Name: "cache_revisions",
@@ -796,6 +805,20 @@ var schemaTables = []*SchemaTable{
 		Columns: []SchemaColumn{
 			identifier("k", 64).PK(),
 			longText("v"),
+		},
+	},
+	// content_objects is the content-addressed byte store: one row per unique
+	// SHA-256 payload. upload_objects.content_hash and blobs.sha256 are the
+	// reference rows; bytes are only deleted when no reference row remains.
+	// Appended last because it is a Go-only table (Python databases keep the
+	// same order for the ported tables above).
+	{
+		Name: "content_objects",
+		Columns: []SchemaColumn{
+			identifier("hash", 64).PK(),
+			bigint("size"),
+			longBlob("content"),
+			double("created_at"),
 		},
 	},
 }
