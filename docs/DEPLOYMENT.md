@@ -211,7 +211,7 @@ docker run -d --name praxis-rag-pdf-parser \
 | `PORT` | `8091` | 服务进程监听端口；Docker/Compose 内固定 8091 |
 | `RAG_PDF_SERVICE_PORT` | `8091` | 仅用于 compose 的宿主发布端口；容器内固定 8091，改宿主端口后要同步 Go 端 `RAG_PDF_SERVICE_URL` |
 | `RAG_PDF_MODELS_PATH` | `/models`（镜像内置） | Docling 模型目录；compose 把 `pdf_parser_models` 卷挂到这里 |
-| `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 并发解析请求数；Docling 模型占内存，建议保持 1，靠副本扩容 |
+| `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 并发解析请求数（`asyncio.Semaphore` 许可数）。模型权重常驻共享、不随并发翻倍，但每次转换的工作内存与 CPU 随并发线性增长；内存紧张时保持 1 靠副本扩容，CPU/内存充足时可与 worker 并发同量级调大 |
 | `RAG_PDF_SERVICE_TIMEOUT` | `900` 秒 | 单请求超时；排队等待与转换各自不超过该值（超时 504），与 Go 端同名变量取同一值 |
 | `RAG_PDF_SERVICE_MAX_BYTES` | `104857600` | 单次上传上限（字节），超限 413 |
 | `RAG_VLM_BASE_URL` / `RAG_VLM_API_KEY` / `RAG_VLM_MODEL` | 空 | 公式识别与图片描述的 OpenAI 兼容 VLM **环境回退**（请求 `options` 与 Console 知识库配置优先）；`RAG_VLM_BASE_URL` 与 `RAG_VLM_MODEL` 必须**同时**配置，否则按未配置处理。OCR 引擎只来自请求 `options`，缺省为 `easyocr` |
@@ -227,7 +227,7 @@ docker run -d --name praxis-rag-pdf-parser \
 
 资源、端口与安全：
 
-- CPU 与内存：镜像（CPU torch + docling）加模型通常占数 GB，先确认磁盘与内存；`RAG_PDF_SERVICE_CONCURRENCY=1` 表示一次只处理一个 PDF。
+- CPU 与内存：镜像（CPU torch + docling）加模型通常占数 GB，先确认磁盘与内存；`RAG_PDF_SERVICE_CONCURRENCY=1` 表示一次只处理一个 PDF。提高 Go worker 端并发（`RAG_DOCUMENT_WORKER_CONCURRENCY`）时要同步调大本变量并核对容器 CPU/内存，否则多余的解析请求只会在 pdf-parser 的信号量门口排队、占用超时窗口，吞吐不变（模型权重共享不翻倍，但每次转换的工作内存与 CPU 抢核随并发线性增长；多副本是内存隔离的替代扩容路径）。
 - 只发布 `127.0.0.1:${RAG_PDF_SERVICE_PORT:-8091}`（容器内固定 8091）。`POST /v1/parse` 没有认证，只应在本机/内网暴露，不要直接挂公网或反向代理。修改宿主端口后要同步 Go 端 `RAG_PDF_SERVICE_URL`。
 - `GET /healthz` 用于健康检查；compose 用 Python 内置 `urllib` 探测，`start_period` 60 秒给冷启动留时间。
 - 需要 systemd 时可参照 `python-workers/pdf-service/README.md` 的 uvicorn 启动方式（`app.main:app`，端口 8091）编写单元，环境变量同上，并在 `rag-service` 之前启动。
@@ -259,6 +259,8 @@ RAG_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
 # 由服务内嵌文档 worker 消费发件箱（auto 仅在未配置 bootstrap 时启用）。
 # RAG_UPLOAD_MODE=async
 # RAG_DOCUMENT_WORKER_INPROCESS=auto
+# RAG_DOCUMENT_WORKER_CONCURRENCY=1
+# RAG_SEARCH_WORKER_CONCURRENCY=1
 RAG_CACHE_TOPIC=praxis_state_cache_refresh
 RAG_CACHE_GROUP=praxis_state_cache_refresh_workers
 RAG_DOCUMENT_TOPIC=praxis_document_ingest

@@ -229,7 +229,7 @@ table 的 `image_file` 为 null、`image_file` 是安全相对路径等），避
 | `RAG_PDF_SERVICE_HOST` | `0.0.0.0` | `python -m app.main` 的监听地址（uvicorn CLI 以命令行参数为准）|
 | `PORT` | `8091` | 服务端口 |
 | `RAG_PDF_SERVICE_TIMEOUT` | `900` | 单请求超时（秒）：排队等待与转换各自不超过该值，超时返回 504 |
-| `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 进程内并发转换上限（信号量）；Docling 加载模型占内存，建议 1，靠副本扩容 |
+| `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 进程内并发转换上限（信号量）；模型权重常驻共享，转换工作内存与 CPU 随并发线性增长，内存紧张保持 1 靠副本扩容 |
 | `RAG_PDF_SERVICE_CONVERTER` | `docling` | `docling` 真实解析；`fake` 固定清单（仅测试/联调）|
 | `RAG_PDF_MODELS_PATH` | 空 | Docling 模型目录（`artifacts_path`），容器内为 `/models` |
 | `RAG_PDF_SERVICE_MAX_BYTES` | `104857600` | 上传大小上限（字节），超限 413 |
@@ -377,7 +377,7 @@ Go 端（由后端同事实现）只需：
 - **超时不能中断 Docling**：504 只是快速把错误返回给调用方，后台线程会跑完并一直占用并发槽位；遇到
   重复超时请提高 `RAG_PDF_SERVICE_TIMEOUT` 或拆分文档/扩容副本。
 - **内存**：单进程加载 Docling 模型约数 GB（CPU/GPU 视模型而定），上传文件先落临时文件（默认上限
-  100 MiB），zip 在内存中组装；并发保持 1 时最稳。
+  100 MiB），zip 在内存中组装；并发>1 时每次转换的工作内存线性叠加（权重共享），内存紧张时保持 1。
 - **VLM 描述**仅在配置了 VLM（`RAG_VLM_*` 或请求 `options.vlm`）时启用；本地 CodeFormula 模式下无 caption
   的图片/表格保持空描述。
 - **OCR 引擎**：`tesseract` 需要镜像内安装系统 Tesseract 与 `chi_sim`/`eng` 语言包（当前 Dockerfile 未装，

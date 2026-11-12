@@ -106,6 +106,10 @@ func run() error {
 	if err != nil {
 		return configError(err)
 	}
+	concurrency, err := workerConcurrencyEnv("RAG_DOCUMENT_WORKER_CONCURRENCY")
+	if err != nil {
+		return configError(err)
+	}
 	pollInterval, err := durationSecondsEnv("RAG_DOCUMENT_WORKER_POLL_SECONDS", 500*time.Millisecond)
 	if err != nil {
 		return configError(err)
@@ -173,6 +177,7 @@ func run() error {
 		"topic", mqSettings.DocumentTopic,
 		"group", mqSettings.DocumentGroup,
 		"max_attempts", maxAttempts,
+		"concurrency", concurrency,
 		"recover_seconds", recoverInterval.Seconds(),
 		"backend", string(ragConfig.Backend),
 	)
@@ -188,6 +193,7 @@ func run() error {
 		}
 		consumerConfig := mq.DefaultConsumerConfig(mqSettings.DocumentTopic, mqSettings.DocumentGroup)
 		consumerConfig.MaxAttempts = maxAttempts
+		consumerConfig.Concurrency = concurrency
 		consumer, err := mq.NewKafkaPullConsumer(mqSettings, consumerConfig, worker.MessageHandler())
 		if err != nil {
 			return err
@@ -246,6 +252,20 @@ func positiveIntEnv(fallback int, names ...string) (int, error) {
 		return value, nil
 	}
 	return fallback, nil
+}
+
+// workerConcurrencyEnv parses the number of handler goroutines processing
+// documents in parallel; the shared Kafka queue settings own the bounds.
+func workerConcurrencyEnv(name string) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return mq.DefaultConsumerConcurrency, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || value > mq.MaxConsumerConcurrency {
+		return 0, fmt.Errorf("%s must be an integer between 1 and %d", name, mq.MaxConsumerConcurrency)
+	}
+	return value, nil
 }
 
 func durationSecondsEnv(name string, fallback time.Duration) (time.Duration, error) {

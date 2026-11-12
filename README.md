@@ -187,7 +187,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
 .\dist\bin\rag-dead-letter-worker.exe --kind search
 ```
 
-worker 消费语义：handler 返回成功即提交 Kafka offset；失败在同一进程内指数重试（默认 100ms 起、上限 5s），达到 `MaxAttempts` 后把原始消息写入对应 DLQ topic、执行终态回调再提交 offset，因此是至少一次投递。无 Kafka 时 `rag-service` 默认内嵌文档 worker 直接轮询 MySQL 发件箱（`RAG_DOCUMENT_WORKER_INPROCESS`，通常无需单独启动 worker）；如关闭内嵌 worker，独立文档 worker 可用 `RAG_DOCUMENT_WORKER_LOCAL=1` 轮询发件箱（开发/单进程部署；有 Kafka 时该变量被忽略）。详细说明见[使用与部署](docs/USAGE.md)与[部署指南](docs/DEPLOYMENT.md)。
+worker 消费语义：handler 返回成功即提交 Kafka offset；失败在同一进程内指数重试（默认 100ms 起、上限 5s），达到 `MaxAttempts` 后把原始消息写入对应 DLQ topic、执行终态回调再提交 offset，因此是至少一次投递。每个 worker 默认单条串行处理，`RAG_DOCUMENT_WORKER_CONCURRENCY` / `RAG_SEARCH_WORKER_CONCURRENCY` 可让单个 worker 进程并发处理多条消息；并发时仍按分区"连续完成前缀"提交 offset，未提交记录由幂等处理吸收重投。无 Kafka 时 `rag-service` 默认内嵌文档 worker 直接轮询 MySQL 发件箱（`RAG_DOCUMENT_WORKER_INPROCESS`，通常无需单独启动 worker）；如关闭内嵌 worker，独立文档 worker 可用 `RAG_DOCUMENT_WORKER_LOCAL=1` 轮询发件箱（开发/单进程部署；有 Kafka 时该变量被忽略）。详细说明见[使用与部署](docs/USAGE.md)与[部署指南](docs/DEPLOYMENT.md)。
 
 Kafka 连接用 `RAG_KAFKA_BOOTSTRAP_SERVERS`（宿主 `127.0.0.1:9092`，compose 容器 `kafka:9092`），可选 `RAG_KAFKA_SECURITY_PROTOCOL` / `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*`；队列默认 `praxis_state_cache_refresh`、`praxis_document_ingest`、`praxis_search`，死信用显式 `RAG_DOCUMENT_DLQ_TOPIC`（`praxis_document_ingest_dead_letters`）与 `RAG_SEARCH_DLQ_TOPIC`（`praxis_search_dead_letters`）及独立 `RAG_*_DLQ_GROUP`。`rag-service`、三个 worker 必须共享同一组 bootstrap 与 topic/group 配置。
 

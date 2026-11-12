@@ -418,6 +418,9 @@ type fakePullTransport struct {
 	messages []mq.ReceivedMessage
 	acked    []mq.ReceivedMessage
 	nacked   []mq.ReceivedMessage
+	// offsets assigns deterministic per-topic offsets to pushes that carry none,
+	// so the consumer's commit tracking sees a realistic record sequence.
+	offsets map[string]int64
 }
 
 func (f *fakePullTransport) Start() error { return nil }
@@ -427,6 +430,15 @@ func (f *fakePullTransport) Stop() error { return nil }
 func (f *fakePullTransport) push(message mq.ReceivedMessage) {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
+	if f.offsets == nil {
+		f.offsets = make(map[string]int64)
+	}
+	if message.Offset == 0 {
+		f.offsets[message.Topic]++
+		message.Offset = f.offsets[message.Topic]
+	} else if message.Offset > f.offsets[message.Topic] {
+		f.offsets[message.Topic] = message.Offset
+	}
 	f.messages = append(f.messages, message)
 }
 

@@ -6,21 +6,35 @@ import (
 	"time"
 )
 
+// defaultCommitTimeout bounds one commit call so a dead broker cannot hang
+// shutdown while completed work waits for its offset to advance.
+const defaultCommitTimeout = 5 * time.Second
+
 // ReceivedMessage is one delivered payload plus the opaque transport handle used
 // for ack/commit. Workers only need Body/Topic/Key/DeliveryAttempt.
+//
+// Partition and Offset locate a record inside its topic partition. A Kafka
+// consumer group stores one offset per partition, so committing offset N also
+// commits every earlier record of that partition; the consumer therefore commits
+// only the contiguous completed prefix of each partition it consumes.
 type ReceivedMessage struct {
 	Topic           string
 	MessageID       string
 	Key             string
 	Body            []byte
 	DeliveryAttempt int
+	Partition       int32
+	Offset          int64
 	handle          any
 }
 
 // PullTransport is the SDK seam for consumers (fakes implement it in tests).
 //
-// Ack commits the record; ChangeInvisibleDuration is retained for seam
-// compatibility but Kafka consumers retry in-process without committing.
+// Receive returns up to maxMessages records in delivery order and fills
+// Partition/Offset so the consumer can advance each partition's committed offset
+// over completed records only. Ack commits the record; ChangeInvisibleDuration is
+// retained for seam compatibility but Kafka consumers retry in-process without
+// committing.
 type PullTransport interface {
 	Start() error
 	Stop() error
@@ -32,6 +46,9 @@ type PullTransport interface {
 // Handler consumes one message. Returning true acknowledges it (Kafka commit);
 // false triggers an in-process retry of the same record with exponential
 // backoff, and after MaxAttempts deliveries the consumer dead-letters it.
+//
+// Handlers may run concurrently when ConsumerConfig.Concurrency > 1, so they must
+// be safe for concurrent calls.
 type Handler func(ctx context.Context, message ReceivedMessage) bool
 
 // Consumer is the worker-facing lifecycle seam.
@@ -46,13 +63,16 @@ type RawPublisher interface {
 	Close() error
 }
 
-// ConsumerConfig is the Kafka consumer configuration. BatchSize, VisibilityTimeout
-// and AwaitDuration are kept for the shared transport/worker contract; a Kafka
-// reader fetches one record at a time and retries in-process.
+// ConsumerConfig is the Kafka consumer configuration. BatchSize is both the
+// transport receive hint and the local prefetch queue depth; Concurrency is the
+// number of handler goroutines. VisibilityTimeout and AwaitDuration are kept for
+// the shared transport/worker contract; a Kafka reader fetches records in the
+// background and retries in-process.
 type ConsumerConfig struct {
 	Topic             string
 	Group             string
 	BatchSize         int32
+	Concurrency       int
 	VisibilityTimeout time.Duration
 	AwaitDuration     time.Duration
 	PollInterval      time.Duration
@@ -66,12 +86,13 @@ type ConsumerConfig struct {
 	RetryMaxDelay  time.Duration
 }
 
-// DefaultConsumerConfig returns the Python SDK-compatible defaults.
+// DefaultConsumerConfig returns the shared worker defaults.
 func DefaultConsumerConfig(topic, group string) ConsumerConfig {
 	return ConsumerConfig{
 		Topic:             topic,
 		Group:             group,
 		BatchSize:         DefaultBatchSize,
+		Concurrency:       DefaultConsumerConcurrency,
 		VisibilityTimeout: DefaultVisibilityTimeout,
 		AwaitDuration:     DefaultAwaitDuration,
 		PollInterval:      DefaultPollInterval,
@@ -85,8 +106,11 @@ func (c ConsumerConfig) Validate() error {
 	if c.Topic == "" || c.Group == "" {
 		return newConfigError("Consumer topic and group must not be empty")
 	}
-	if c.BatchSize <= 0 || c.BatchSize > 32 {
+	if c.BatchSize <= 0 || c.BatchSize > MaxConsumerBatchSize {
 		return newConfigError("Consumer batch size must be between 1 and 32")
+	}
+	if c.Concurrency < 0 || c.Concurrency > MaxConsumerConcurrency {
+		return newConfigError("Consumer concurrency must be between 1 and 64")
 	}
 	if c.VisibilityTimeout <= 0 {
 		return newConfigError("Consumer visibility timeout must be positive")
@@ -103,6 +127,11 @@ func (c ConsumerConfig) Validate() error {
 // PullConsumer is the framework-light consumer loop used by the worker binaries.
 // It never interprets payloads: the handler gets raw bytes.
 //
+// The pull loop keeps a local prefetch queue filled from the transport and
+// Concurrency handler goroutines drain it, so one worker process can process
+// several documents at a time. Per-partition offset order is preserved: a record
+// is committed only once every earlier record of its partition has completed.
+//
 // Semantics (Kafka): handler true => commit; handler false => retry the same
 // record in-process with exponential backoff without committing; after
 // MaxAttempts the raw body is published to DLQTopic (when set), OnExhausted runs,
@@ -116,6 +145,16 @@ type PullConsumer struct {
 	// DLQ publishes exhausted raw payloads; nil (or empty DLQTopic) skips it.
 	DLQ RawPublisher
 
+	// deliver is the local prefetch queue between the pull loop and the handler
+	// goroutines.
+	deliver chan delivery
+	// workers tracks the handler goroutines for a bounded shutdown.
+	workers sync.WaitGroup
+	// tracker orders dispatched records per partition for in-order commits.
+	tracker *commitTracker
+	// commitMu serializes commits so one partition's offset only moves forward.
+	commitMu sync.Mutex
+
 	mutex   sync.Mutex
 	started bool
 	stopped bool
@@ -125,6 +164,12 @@ type PullConsumer struct {
 	lastErr error
 
 	dlqOnce sync.Once
+}
+
+// delivery pairs one dispatched record with its commit-tracking entry.
+type delivery struct {
+	message ReceivedMessage
+	tracked *trackedMessage
 }
 
 var _ Consumer = (*PullConsumer)(nil)
@@ -165,7 +210,8 @@ func NewKafkaPullConsumer(settings Settings, config ConsumerConfig, handler Hand
 	return consumer, nil
 }
 
-// Start validates, starts the transport and launches the pull loop.
+// Start validates, starts the transport and launches the pull loop plus the
+// handler goroutines.
 func (c *PullConsumer) Start(ctx context.Context) error {
 	if c.handler == nil {
 		return newConfigError("Consumer handler must not be nil")
@@ -195,6 +241,16 @@ func (c *PullConsumer) Start(ctx context.Context) error {
 		c.started = false
 		c.mutex.Unlock()
 		return newSafeError(ErrConsumerFailed, "consumer start", err)
+	}
+	concurrency := c.Config.Concurrency
+	if concurrency <= 0 {
+		concurrency = DefaultConsumerConcurrency
+	}
+	c.tracker = newCommitTracker()
+	c.deliver = make(chan delivery, c.prefetchDepth())
+	c.workers.Add(concurrency)
+	for worker := 0; worker < concurrency; worker++ {
+		go c.worker(loopContext)
 	}
 	go c.loop(loopContext)
 	return nil
@@ -247,15 +303,33 @@ func (c *PullConsumer) setLastError(err error) {
 	c.lastErr = err
 }
 
+// prefetchDepth bounds the local queue between the pull loop and the handlers.
+func (c *PullConsumer) prefetchDepth() int {
+	depth := int(c.Config.BatchSize)
+	if depth <= 0 {
+		depth = int(DefaultBatchSize)
+	}
+	if depth > int(MaxConsumerBatchSize) {
+		depth = int(MaxConsumerBatchSize)
+	}
+	return depth
+}
+
+// loop pulls batches from the transport and feeds the local queue. It blocks on
+// a full queue, which stops fetching until the handlers catch up.
 func (c *PullConsumer) loop(ctx context.Context) {
-	defer close(c.doneCh)
+	defer func() {
+		close(c.deliver)
+		c.workers.Wait()
+		close(c.doneCh)
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		messages, err := c.transport.Receive(ctx, c.Config.BatchSize, c.Config.VisibilityTimeout)
+		messages, err := c.transport.Receive(ctx, int32(c.prefetchDepth()), c.Config.VisibilityTimeout)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -267,36 +341,74 @@ func (c *PullConsumer) loop(ctx context.Context) {
 			continue
 		}
 		for _, message := range messages {
-			if !c.process(ctx, message) {
+			tracked := c.tracker.track(message)
+			if tracked == nil {
+				// A duplicate delivery of a record already in flight (or a
+				// partition whose commits are blocked) is dropped: the record
+				// stays uncommitted and is redelivered later.
+				continue
+			}
+			select {
+			case c.deliver <- delivery{message: message, tracked: tracked}:
+			case <-ctx.Done():
 				return
 			}
 		}
 	}
 }
 
-// process runs one delivery through handler until it ackes, exhausts, or the
-// context is cancelled. It returns false when the loop must stop.
-func (c *PullConsumer) process(ctx context.Context, message ReceivedMessage) bool {
+// worker drains the local queue. It returns when the queue is closed or the
+// context is cancelled; unprocessed records stay uncommitted and are redelivered.
+func (c *PullConsumer) worker(ctx context.Context) {
+	defer c.workers.Done()
+	for item := range c.deliver {
+		if ctx.Err() != nil {
+			return
+		}
+		c.processMessage(ctx, item)
+	}
+}
+
+// processMessage runs one delivery through handler until it is committed,
+// exhausted, or the context is cancelled. The commit-tracking entry travels with
+// the message so an out-of-order completion cannot commit a later offset.
+func (c *PullConsumer) processMessage(ctx context.Context, item delivery) {
 	for attempt := 1; ; attempt++ {
-		message.DeliveryAttempt = attempt
-		if c.handler(ctx, message) {
-			if err := c.transport.Ack(ctx, message); err != nil {
-				c.setLastError(newSafeError(ErrConsumerFailed, "consumer commit", err))
-			}
-			return true
+		item.message.DeliveryAttempt = attempt
+		if c.handler(ctx, item.message) {
+			c.commit(ctx, item.tracked)
+			return
 		}
 		if ctx.Err() != nil {
-			return false
+			return
 		}
 		if c.Config.MaxAttempts > 0 && attempt >= c.Config.MaxAttempts {
-			c.deadLetter(ctx, message)
-			if err := c.transport.Ack(ctx, message); err != nil {
-				c.setLastError(newSafeError(ErrConsumerFailed, "consumer commit", err))
-			}
-			return true
+			c.deadLetter(ctx, item.message)
+			c.commit(ctx, item.tracked)
+			return
 		}
 		if !c.retryDelay(ctx, attempt) {
-			return false
+			return
+		}
+	}
+}
+
+// commit advances the partition's committed offset over the contiguous completed
+// prefix. Commits are serialized because committing a later offset before an
+// earlier one would silently skip the earlier record.
+func (c *PullConsumer) commit(parent context.Context, entry *trackedMessage) {
+	c.commitMu.Lock()
+	defer c.commitMu.Unlock()
+	for _, message := range c.tracker.complete(entry) {
+		commitContext, cancel := context.WithTimeout(context.WithoutCancel(parent), defaultCommitTimeout)
+		err := c.transport.Ack(commitContext, message)
+		cancel()
+		if err != nil {
+			// Never advance past a failed commit: block the partition so its
+			// records are redelivered instead of being skipped by a later offset.
+			c.tracker.block(partitionKeyOf(message))
+			c.setLastError(newSafeError(ErrConsumerFailed, "consumer commit", err))
+			return
 		}
 	}
 }

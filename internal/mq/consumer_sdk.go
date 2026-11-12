@@ -56,6 +56,8 @@ func (t *sdkPullTransport) Receive(ctx context.Context, _ int32, _ time.Duration
 		Key:             string(message.Key),
 		Body:            message.Value,
 		DeliveryAttempt: 0,
+		Partition:       int32(message.Partition),
+		Offset:          message.Offset,
 		handle:          message,
 	}}, nil
 }

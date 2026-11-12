@@ -37,9 +37,18 @@ const (
 	DefaultVisibilityTimeout = 60 * time.Second
 	DefaultAwaitDuration     = 5 * time.Second
 	DefaultBatchSize         = int32(16)
-	DefaultPollInterval      = 500 * time.Millisecond
-	DefaultRetryBaseDelay    = 100 * time.Millisecond
-	DefaultRetryMaxDelay     = 5 * time.Second
+	// MaxConsumerBatchSize bounds one transport receive and the local prefetch
+	// queue depth of a consumer.
+	MaxConsumerBatchSize = int32(32)
+	// DefaultConsumerConcurrency keeps one handler goroutine per worker unless a
+	// deployment explicitly raises it; each extra goroutine can hold one
+	// document's parse in flight.
+	DefaultConsumerConcurrency = 1
+	// MaxConsumerConcurrency bounds the handler goroutines of one worker.
+	MaxConsumerConcurrency = 64
+	DefaultPollInterval    = 500 * time.Millisecond
+	DefaultRetryBaseDelay  = 100 * time.Millisecond
+	DefaultRetryMaxDelay   = 5 * time.Second
 )
 
 // ConfigError is a validation failure in mq-level settings (Kafka bootstrap,

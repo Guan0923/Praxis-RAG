@@ -207,7 +207,7 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_PDF_SERVICE_PORT` | `8091`（仅 compose） | pdf-parser 的宿主发布端口；容器内端口固定 `8091` |
 | `RAG_PDF_PARSER_IMAGE` | `praxis-rag-pdf-parser:local`（仅 compose） | pdf-parser 镜像名 |
 | `RAG_PDF_MODELS_PATH` | `/models` | 容器内 Docling/CodeFormula 模型目录（镜像内置默认）；compose 挂载 `pdf_parser_models` 卷到 `/models` |
-| `RAG_PDF_SERVICE_CONCURRENCY` | `1`（仅 pdf-parser 容器） | pdf-parser 并发解析请求数；CPU 推理建议保持 1 |
+| `RAG_PDF_SERVICE_CONCURRENCY` | `1`（仅 pdf-parser 容器） | pdf-parser 并发解析请求数。**与文档 worker 并发度（`RAG_DOCUMENT_WORKER_CONCURRENCY`）保持同量级**：worker 并发 > 本值时，多余请求在 pdf-parser 的信号量门口排队并消耗超时窗口。调大前先确认容器 CPU/内存（模型常驻数 GB，转换内存随并发线性增长） |
 | `RAG_VLM_BASE_URL` | 空 | 远端 OpenAI 兼容 VLM 端点的**环境回退值**，用于描述 Word 无图注图片和（docling 引擎）公式识别；Console 知识库设置优先 |
 | `RAG_VLM_API_KEY` | 空 | VLM 端点密钥，作为 `Authorization: Bearer` 发送 |
 | `RAG_VLM_MODEL` | 空 | 端点上的模型名，如 `qwen2.5-vl-7b`（环境回退值） |
@@ -230,7 +230,7 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 - **模型卷**：compose 把 `pdf_parser_models` 卷挂到容器内 `/models`（`RAG_PDF_MODELS_PATH`）。本地公式模型至少需要 CodeFormulaV2 权重（目录名形如 `docling-project--CodeFormulaV2`）；首次使用前需要联网下载或用其他方式预置：先 `docling-tools models download --output-dir /models` 拉取 Docling 默认模型（layout/TableFormer/OCR），再按 `python-workers/pdf-service/README.md` 单独准备 CodeFormulaV2。删除该卷不会影响已入库文档，但下一次 docling 解析前需要重新准备模型。知识库/环境配置了 VLM 时可不需要本地 CodeFormula 权重。
 - **Console 模型要求（docling）**：先在「模型配置」页添加 VLM（服务地址 + 模型名 + 可选 Key）与 OCR（引擎 `auto`/`easyocr`/`tesseract`/`rapidocr`）条目，再在创建/编辑知识库时选中；缺失时 PDF 上传会被拒绝并提示配置。`auto` 等价于默认的 EasyOCR；`tesseract` 还需要解析服务镜像/系统安装 tesseract 与 `chi_sim`/`eng` 语言包。OCR 与 VLM 配置随每次解析请求下发（multipart `options`），因此同一 pdf-parser 可服务不同知识库。
 - **端口与健康检查**：pdf-parser 容器内监听 `0.0.0.0:8091`，compose 只发布 `127.0.0.1:${RAG_PDF_SERVICE_PORT:-8091}`；健康检查是 `GET /healthz`，`POST /v1/parse` 不做认证，因此**不要暴露到公网**。修改宿主端口时要同步 `RAG_PDF_SERVICE_URL`（宿主 Go 进程默认 `http://127.0.0.1:8091`）。
-- **并发与超时**：`RAG_PDF_SERVICE_CONCURRENCY` 默认 `1`（CPU 推理串行，避免内存/算力打爆）；调大前先确认容器 CPU/内存。`RAG_PDF_SERVICE_TIMEOUT` 同时是 Go 端调用超时和 pdf-parser 单请求解析超时；冷启动加载模型、超大 PDF 都会占用该窗口。
+- **并发与超时**：`RAG_PDF_SERVICE_CONCURRENCY` 是 pdf-parser 内部 `asyncio.Semaphore` 的许可数，默认 `1`（安全默认：单次转换即占数 GB 内存与满核 CPU，任何机器都跑得起来）；扩容取值是“调大本变量 + 核对容器 CPU/内存”或“多副本”，**且要与 worker 端 `RAG_DOCUMENT_WORKER_CONCURRENCY` 同步**——闸门小于发单并发时，请求只是换到 pdf-parser 内排队。`RAG_PDF_SERVICE_TIMEOUT` 同时是 Go 端调用超时和 pdf-parser 单请求解析超时，**排队等待也计入**（排满返回 503「PDF 解析服务繁忙」）；冷启动加载模型、超大 PDF 都会占用该窗口。
 - **测试模式**：pdf-parser 的 `RAG_PDF_SERVICE_CONVERTER=fake` 只用于测试/联调（返回固定清单，不加载 Docling），生产必须保持默认 `docling`。
 - **`.doc` 不受影响**：旧版 `.doc` 仍由 Go 服务调用外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）；DOCX 解析仍在 Go 进程内完成。
 
@@ -306,6 +306,7 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 - `MaxAttempts=0` → 不设上限，一直重试直到进程或 context 取消；
 - 死信 worker 的 `--kind document|search` 实例消费显式 DLQ topic 与独立 `RAG_*_DLQ_GROUP`，不再使用 `%DLQ%<源组>` 或 mqadmin；`MaxAttempts=0` 的死信 worker 自身不会二次死信。
 - 消费重试与死信发布由 Go 消费端完成，不依赖 Kafka 的不可见期/重投机制；重复投递由 handler 幂等与 MySQL 业务租约吸收。
+- 每个 worker 可并发处理多条消息（`RAG_DOCUMENT_WORKER_CONCURRENCY` / `RAG_SEARCH_WORKER_CONCURRENCY`，默认 `1`）：拉取端按 `BatchSize`（默认 16）预取到本地队列，多个 goroutine 并发执行 handler。并发时仍按分区提交 offset：只提交"连续完成的前缀"，慢任务不会被后一条提交跳过；进程退出时未提交的记录会重投，由幂等处理吸收。
 
 ### 异步文档与 worker 环境
 
@@ -321,6 +322,7 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 | `RAG_DOCUMENT_WORKER_POLL_SECONDS` | `0.5` | 内嵌/本地 outbox 与消费轮询间隔 |
 | `RAG_DOCUMENT_WORKER_RECOVER_SECONDS` | `30` | 文档 worker 周期性 Recover（恢复中断上传/补偿） |
 | `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_DOCUMENT_MAX_ATTEMPTS` | `5` | 文档 worker 的 Kafka 进程内最大尝试次数（前者优先；名称为兼容旧配置保留） |
+| `RAG_DOCUMENT_WORKER_CONCURRENCY` | `1` | 文档 worker 并发处理数（1..64）。`>1` 时同一 worker 可同时解析多篇 PDF；解析段的有效并行度受 pdf-parser 的 `RAG_PDF_SERVICE_CONCURRENCY` 封顶，两侧应同量级调整，并核对 pdf-parser 内存/CPU 与本地解压磁盘峰值 |
 
 ### 排队搜索任务环境
 
@@ -328,6 +330,7 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 | --- | --- | --- |
 | `RAG_SEARCH_TIMEOUT_SECONDS` | `120` | 搜索任务总截止时间（包含排队），与调用方 `wait_seconds` 不同 |
 | `RAG_SEARCH_MAX_ATTEMPTS` | `5` | 搜索 worker 的 Kafka 进程内重试上限 |
+| `RAG_SEARCH_WORKER_CONCURRENCY` | `1` | 搜索 worker 并发处理数（1..64）；并发时同分区仍按连续完成前缀提交 |
 | `RAG_SEARCH_LEASE_SECONDS` | `120` | 任务执行租约（Go 状态机扩展） |
 | `RAG_SEARCH_RETRY_SECONDS` | `5` | 失败重投或重试等待 |
 

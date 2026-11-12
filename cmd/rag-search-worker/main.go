@@ -105,6 +105,10 @@ func run() error {
 	if err != nil {
 		return configError(err)
 	}
+	concurrency, err := workerConcurrencyEnv("RAG_SEARCH_WORKER_CONCURRENCY")
+	if err != nil {
+		return configError(err)
+	}
 
 	stores, err := state.New(stateSettings, stateSettings.AutoSchema)
 	if err != nil {
@@ -138,6 +142,7 @@ func run() error {
 
 	consumerConfig := mq.DefaultConsumerConfig(mqSettings.SearchTopic, mqSettings.SearchGroup)
 	consumerConfig.MaxAttempts = maxAttempts
+	consumerConfig.Concurrency = concurrency
 	consumer, err := mq.NewKafkaPullConsumer(mqSettings, consumerConfig, worker.MessageHandler())
 	if err != nil {
 		return err
@@ -151,6 +156,7 @@ func run() error {
 		"topic", consumerConfig.Topic,
 		"group", consumerConfig.Group,
 		"max_attempts", consumerConfig.MaxAttempts,
+		"concurrency", consumerConfig.Concurrency,
 		"backend", string(ragConfig.Backend),
 	)
 	if err := worker.RunConsumer(ctx, consumer); err != nil {
@@ -185,6 +191,20 @@ func positiveIntEnv(name string, fallback int) (int, error) {
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < 0 {
 		return 0, fmt.Errorf("%s must be a non-negative integer", name)
+	}
+	return value, nil
+}
+
+// workerConcurrencyEnv parses the number of handler goroutines processing
+// searches in parallel; the shared Kafka queue settings own the bounds.
+func workerConcurrencyEnv(name string) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return mq.DefaultConsumerConcurrency, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 || value > mq.MaxConsumerConcurrency {
+		return 0, fmt.Errorf("%s must be an integer between 1 and %d", name, mq.MaxConsumerConcurrency)
 	}
 	return value, nil
 }

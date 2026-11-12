@@ -412,6 +412,9 @@ type fakePullTransport struct {
 	stopCalls  int
 	receiveErr error
 	ackErr     error
+	// offsets assigns deterministic per-topic offsets to deliveries that do not
+	// carry one, so commit tracking sees a realistic record sequence.
+	offsets map[string]int64
 }
 
 func (f *fakePullTransport) Start() error { return f.startErr }
@@ -434,6 +437,19 @@ func (f *fakePullTransport) Receive(ctx context.Context, _ int32, _ time.Duratio
 	if len(f.batches) > 0 {
 		batch := f.batches[0]
 		f.batches = f.batches[1:]
+		if f.offsets == nil {
+			f.offsets = make(map[string]int64)
+		}
+		for index := range batch {
+			if batch[index].Offset != 0 {
+				if batch[index].Offset > f.offsets[batch[index].Topic] {
+					f.offsets[batch[index].Topic] = batch[index].Offset
+				}
+				continue
+			}
+			f.offsets[batch[index].Topic]++
+			batch[index].Offset = f.offsets[batch[index].Topic]
+		}
 		f.mutex.Unlock()
 		return batch, nil
 	}
@@ -731,6 +747,16 @@ func TestConsumerConstructorsValidationAndLifecycle(t *testing.T) {
 	if err := invalid.Validate(); err == nil {
 		t.Fatal("negative max attempts accepted")
 	}
+	invalidConcurrency := testConsumerConfig()
+	invalidConcurrency.Concurrency = -1
+	if err := invalidConcurrency.Validate(); err == nil {
+		t.Fatal("negative concurrency accepted")
+	}
+	tooConcurrent := testConsumerConfig()
+	tooConcurrent.Concurrency = MaxConsumerConcurrency + 1
+	if err := tooConcurrent.Validate(); err == nil {
+		t.Fatal("out-of-range concurrency accepted")
+	}
 	if err := NewPullConsumer(DefaultConsumerConfig("t", "g"), &fakePullTransport{}, nil).
 		Start(context.Background()); err == nil {
 		t.Fatal("nil handler accepted")
@@ -813,5 +839,188 @@ func TestConsumerMaxAttemptsZeroRetriesUntilCancelled(t *testing.T) {
 	}
 	if acked, _, _ := transport.snapshot(); len(acked) != 0 {
 		t.Fatalf("ack without exhaustion = %+v", acked)
+	}
+}
+
+func TestConsumerRunsHandlersConcurrently(t *testing.T) {
+	transport := &fakePullTransport{batches: [][]ReceivedMessage{{
+		{Topic: "doc-topic", Key: "a"},
+		{Topic: "doc-topic", Key: "b"},
+		{Topic: "doc-topic", Key: "c"},
+	}}}
+	config := testConsumerConfig()
+	config.Concurrency = 3
+	entered := make(chan struct{}, 3)
+	release := make(chan struct{})
+	consumer := NewPullConsumer(config, transport, func(context.Context, ReceivedMessage) bool {
+		entered <- struct{}{}
+		<-release
+		return true
+	})
+	if err := consumer.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	for started := 1; started <= 3; started++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d handlers started concurrently", started-1)
+		}
+	}
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if acked, _, _ := transport.snapshot(); len(acked) == 3 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := consumer.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if acked, _, _ := transport.snapshot(); len(acked) != 3 {
+		t.Fatalf("acked = %+v", acked)
+	}
+}
+
+func TestConsumerCommitsOnlyContiguousCompletedPrefix(t *testing.T) {
+	transport := &fakePullTransport{batches: [][]ReceivedMessage{{
+		{Topic: "doc-topic", Key: "a"},
+		{Topic: "doc-topic", Key: "b"},
+		{Topic: "doc-topic", Key: "c"},
+	}}}
+	config := testConsumerConfig()
+	config.Concurrency = 3
+	releaseB := make(chan struct{})
+	bStarted := make(chan struct{})
+	var once sync.Once
+	consumer := NewPullConsumer(config, transport, func(_ context.Context, message ReceivedMessage) bool {
+		if message.Key == "b" {
+			once.Do(func() { close(bStarted) })
+			<-releaseB
+		}
+		return true
+	})
+	if err := consumer.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-bStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked handler did not start")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if acked, _, _ := transport.snapshot(); len(acked) == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if acked, _, _ := transport.snapshot(); len(acked) != 1 || acked[0].Key != "a" {
+		t.Fatalf("commits advanced past the blocked record: %+v", acked)
+	}
+	close(releaseB)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if acked, _, _ := transport.snapshot(); len(acked) == 3 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := consumer.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	acked, _, _ := transport.snapshot()
+	if len(acked) != 3 || acked[0].Key != "a" || acked[1].Key != "b" || acked[2].Key != "c" {
+		t.Fatalf("commit order = %+v", acked)
+	}
+}
+
+func TestConsumerDropsDuplicateInFlightDelivery(t *testing.T) {
+	transport := &fakePullTransport{batches: [][]ReceivedMessage{{
+		{Topic: "doc-topic", Key: "dup", Offset: 7},
+		{Topic: "doc-topic", Key: "dup", Offset: 7},
+	}}}
+	config := testConsumerConfig()
+	config.Concurrency = 2
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var mutex sync.Mutex
+	calls := 0
+	consumer := NewPullConsumer(config, transport, func(context.Context, ReceivedMessage) bool {
+		mutex.Lock()
+		calls++
+		mutex.Unlock()
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		return true
+	})
+	if err := consumer.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	mutex.Lock()
+	gotCalls := calls
+	mutex.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("handler calls = %d, want 1 for a duplicate in-flight record", gotCalls)
+	}
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if acked, _, _ := transport.snapshot(); len(acked) == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := consumer.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if acked, _, _ := transport.snapshot(); len(acked) != 1 {
+		t.Fatalf("acked = %+v", acked)
+	}
+}
+
+func TestConsumerCommitFailureStopsPartitionAdvance(t *testing.T) {
+	transport := &fakePullTransport{
+		batches: [][]ReceivedMessage{{
+			{Topic: "doc-topic", Key: "a"},
+			{Topic: "doc-topic", Key: "b"},
+		}},
+		ackErr: errors.New("commit rejected"),
+	}
+	config := testConsumerConfig()
+	config.Concurrency = 2
+	consumer := NewPullConsumer(config, transport, func(context.Context, ReceivedMessage) bool {
+		return true
+	})
+	if err := consumer.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if lastErr := consumer.LastError(); lastErr != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if err := consumer.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if acked, _, _ := transport.snapshot(); len(acked) != 0 {
+		t.Fatalf("commit after a failed commit = %+v", acked)
+	}
+	if lastErr := consumer.LastError(); !errors.Is(lastErr, ErrConsumerFailed) {
+		t.Fatalf("LastError() = %v", lastErr)
 	}
 }
