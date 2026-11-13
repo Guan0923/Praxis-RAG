@@ -200,18 +200,18 @@ func TestAddDocumentAsyncAdmissionReplayAndConflicts(t *testing.T) {
 	}
 }
 
-// TestAddDocumentAsyncRejectsPDFWithoutDoclingModels pins that the asynchronous
+// TestAddDocumentAsyncRejectsPDFWithoutVLM pins that the asynchronous
 // Console upload path also rejects a PDF while the job is admitted: the
-// knowledge base has no VLM/OCR configuration, so no document job is queued and
+// knowledge base has no VLM configuration, so no document job is queued and
 // the caller gets the actionable Chinese message instead of a failed job later.
-func TestAddDocumentAsyncRejectsPDFWithoutDoclingModels(t *testing.T) {
+func TestAddDocumentAsyncRejectsPDFWithoutVLM(t *testing.T) {
 	service, stores, _ := newAsyncService(t)
-	service.config.PDFEngine = config.PDFEngineDocling
+	service.config.PDFEngine = config.PDFEngineVision
 	service.config.PDFServiceURL = "http://127.0.0.1:1"
 	ctx := context.Background()
 
 	_, err := service.addDocumentAsync(ctx, "alpha", "manual.pdf", []byte("%PDF-1.4\n"), "pdf-1")
-	assertKnowledgeValidation(t, err, doclingPDFModelsRequiredMessage)
+	assertKnowledgeValidation(t, err, remotePDFModelsRequiredMessage)
 
 	var jobs int
 	if err := stores.DB.QueryRowContext(ctx,

@@ -618,37 +618,46 @@ func TestUploadStagedVersionIDs(t *testing.T) {
 
 // TestPDFOptionsSelectsConfiguredEngine pins the runtime parser selection: the
 // in-process pure-Go engine stays the default (nil Parser) and RAG_PDF_ENGINE
-// docling builds the remote client from the configured URL and timeout.
+// vision builds the remote client from the configured URL and timeout.
 func TestPDFOptionsSelectsConfiguredEngine(t *testing.T) {
 	if options := (&Service{}).pdfOptions(nil); options.Parser != nil {
 		t.Fatalf("default pdfOptions().Parser = %T, want nil for the in-process engine", options.Parser)
 	}
 	service := &Service{config: config.RagConfig{
+		PDFEngine:         config.PDFEngineVision,
+		PDFServiceURL:     "http://127.0.0.1:8091",
+		PDFServiceTimeout: 900,
+	}}
+	parser, ok := service.pdfOptions(nil).Parser.(*document.PDFServiceParser)
+	if !ok || parser == nil {
+		t.Fatalf("pdfOptions().Parser = %T, want *document.PDFServiceParser", service.pdfOptions(nil).Parser)
+	}
+	if parser.BaseURL != "http://127.0.0.1:8091" {
+		t.Fatalf("PDFServiceParser.BaseURL = %q", parser.BaseURL)
+	}
+	if parser.Client == nil || parser.Client.Timeout != 900*time.Second {
+		t.Fatalf("PDFServiceParser.Client = %+v, want a 900s timeout", parser.Client)
+	}
+	if parser.VLM.Configured() {
+		t.Fatalf("unconfigured pdfOptions() carried a VLM: %+v", parser)
+	}
+	// The legacy "docling" alias keeps selecting the remote parser.
+	legacy := &Service{config: config.RagConfig{
 		PDFEngine:         config.PDFEngineDocling,
 		PDFServiceURL:     "http://127.0.0.1:8091",
 		PDFServiceTimeout: 900,
 	}}
-	parser, ok := service.pdfOptions(nil).Parser.(*document.DoclingServiceParser)
-	if !ok || parser == nil {
-		t.Fatalf("pdfOptions().Parser = %T, want *document.DoclingServiceParser", service.pdfOptions(nil).Parser)
-	}
-	if parser.BaseURL != "http://127.0.0.1:8091" {
-		t.Fatalf("DoclingServiceParser.BaseURL = %q", parser.BaseURL)
-	}
-	if parser.Client == nil || parser.Client.Timeout != 900*time.Second {
-		t.Fatalf("DoclingServiceParser.Client = %+v, want a 900s timeout", parser.Client)
-	}
-	if parser.VLM.Configured() || parser.OCR.Configured() {
-		t.Fatalf("unconfigured pdfOptions() carried VLM/OCR: %+v", parser)
+	if _, ok := legacy.pdfOptions(nil).Parser.(*document.PDFServiceParser); !ok {
+		t.Fatalf("legacy docling engine did not select the remote parser")
 	}
 }
 
-// TestPDFOptionsCarriesVLMAndOCR pins that the Docling client receives the
-// knowledge base's VLM endpoint and OCR engine so the parse service can use
-// them per request (options multipart field) instead of its own environment.
-func TestPDFOptionsCarriesVLMAndOCR(t *testing.T) {
+// TestPDFOptionsCarriesVLM pins that the remote client receives the knowledge
+// base's VLM endpoint so the parse service can use it per request (options
+// multipart field) instead of its own environment.
+func TestPDFOptionsCarriesVLM(t *testing.T) {
 	service := &Service{config: config.RagConfig{
-		PDFEngine:         config.PDFEngineDocling,
+		PDFEngine:         config.PDFEngineVision,
 		PDFServiceURL:     "http://127.0.0.1:8091",
 		PDFServiceTimeout: 900,
 	}}
@@ -657,9 +666,8 @@ func TestPDFOptionsCarriesVLMAndOCR(t *testing.T) {
 			BaseURL: "http://vlm:8000/v1", APIKey: "vlm-key", Model: "qwen2.5-vl-7b",
 			Timeout: 120 * time.Second, Concurrency: 4,
 		},
-		ocr: document.OCRSettings{Engine: "easyocr"},
 	}
-	parser, ok := service.pdfOptions(resources).Parser.(*document.DoclingServiceParser)
+	parser, ok := service.pdfOptions(resources).Parser.(*document.PDFServiceParser)
 	if !ok || parser == nil {
 		t.Fatalf("pdfOptions().Parser = %T", service.pdfOptions(resources).Parser)
 	}
@@ -668,53 +676,11 @@ func TestPDFOptionsCarriesVLMAndOCR(t *testing.T) {
 		parser.VLM.Concurrency != 4 {
 		t.Fatalf("parser VLM = %+v", parser.VLM)
 	}
-	if parser.OCR.Engine != "easyocr" {
-		t.Fatalf("parser OCR = %+v", parser.OCR)
-	}
 }
 
-// TestUploadOCRResolvesConfiguredEngine pins the knowledge-base OCR setting
-// resolution: absent/blank means unconfigured, known ids are normalized, and a
-// stored value outside the whitelist is a configuration error.
-func TestUploadOCRResolvesConfiguredEngine(t *testing.T) {
-	service := &Service{}
-	cases := []struct {
-		name     string
-		settings map[string]any
-		engine   string
-		wantErr  bool
-	}{
-		{name: "nil settings", settings: nil, engine: ""},
-		{name: "missing key", settings: map[string]any{}, engine: ""},
-		{name: "blank engine", settings: map[string]any{"ocr_model": ""}, engine: ""},
-		{name: "normalized engine", settings: map[string]any{"ocr_model": " EasyOCR "}, engine: "easyocr"},
-		{name: "rapidocr", settings: map[string]any{"ocr_model": "rapidocr"}, engine: "rapidocr"},
-		{name: "non-string engine", settings: map[string]any{"ocr_model": 5}, wantErr: true},
-		{name: "unknown engine", settings: map[string]any{"ocr_model": "paddleocr"}, wantErr: true},
-	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			ocr, err := service.uploadOCR(testCase.settings)
-			if testCase.wantErr {
-				var knowledge *apierrors.KnowledgeError
-				if !errors.As(err, &knowledge) || knowledge.Message != "知识库配置无效" {
-					t.Fatalf("error = %v, want KnowledgeError 知识库配置无效", err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("uploadOCR() error = %v", err)
-			}
-			if ocr.Engine != testCase.engine {
-				t.Fatalf("engine = %q, want %q", ocr.Engine, testCase.engine)
-			}
-		})
-	}
-}
-
-// TestResolveUploadResourcesCarriesVLMAndOCR pins the knowledge-base → Docling
+// TestResolveUploadResourcesCarriesVLM pins the knowledge-base → remote service
 // configuration resolution used by both synchronous and queued uploads.
-func TestResolveUploadResourcesCarriesVLMAndOCR(t *testing.T) {
+func TestResolveUploadResourcesCarriesVLM(t *testing.T) {
 	service, stores, _, _ := newUploadService(t)
 	ctx := context.Background()
 	settings, err := stores.KnowledgeBases.Get(ctx, "alpha")
@@ -729,7 +695,6 @@ func TestResolveUploadResourcesCarriesVLMAndOCR(t *testing.T) {
 	}
 	settings["vlm"] = storedVLM
 	settings["vlm_model"] = "qwen2.5-vl-7b"
-	settings["ocr_model"] = "tesseract"
 	if err := stores.KnowledgeBases.Update(ctx, settings); err != nil {
 		t.Fatalf("KnowledgeBases.Update() error = %v", err)
 	}
@@ -742,61 +707,57 @@ func TestResolveUploadResourcesCarriesVLMAndOCR(t *testing.T) {
 		resources.vlm.APIKey != "vlm-key" {
 		t.Fatalf("resolved VLM = %+v", resources.vlm)
 	}
-	if resources.ocr.Engine != "tesseract" {
-		t.Fatalf("resolved OCR = %+v", resources.ocr)
-	}
-	if !resources.vlm.Configured() || !resources.ocr.Configured() {
-		t.Fatalf("resolved configuration is not usable: %+v", resources)
+	if !resources.vlm.Configured() {
+		t.Fatalf("resolved VLM is not usable: %+v", resources)
 	}
 }
 
-// TestValidateDoclingPDFUploadRequiresVLMAndOCR pins the acceptance-time check:
-// a PDF upload under the Docling engine is rejected before any journal/queue
-// work unless a VLM (with a model) and an OCR engine are configured.
-func TestValidateDoclingPDFUploadRequiresVLMAndOCR(t *testing.T) {
-	service := &Service{config: config.RagConfig{PDFEngine: config.PDFEngineDocling}}
+// TestValidateRemotePDFUploadRequiresVLM pins the acceptance-time check: a PDF
+// upload under the remote vision engine is rejected before any journal/queue
+// work unless a VLM (with a model) is configured.
+func TestValidateRemotePDFUploadRequiresVLM(t *testing.T) {
+	service := &Service{config: config.RagConfig{PDFEngine: config.PDFEngineVision}}
 	pdf := []UploadFile{uploadFile("paper.pdf", "%PDF-1.4\n")}
 	empty := &uploadResources{}
 
-	assertKnowledgeValidation(t, service.validateDoclingPDFUpload(pdf, empty), doclingPDFModelsRequiredMessage)
+	assertKnowledgeValidation(t, service.validateRemotePDFUpload(pdf, empty), remotePDFModelsRequiredMessage)
 
 	// Non-PDF uploads never need the parsing models.
-	if err := service.validateDoclingPDFUpload([]UploadFile{uploadFile("note.md", "text")}, empty); err != nil {
+	if err := service.validateRemotePDFUpload([]UploadFile{uploadFile("note.md", "text")}, empty); err != nil {
 		t.Fatalf("markdown upload was rejected: %v", err)
 	}
 
 	// A VLM without a model id is not usable by the parse service.
 	vlmOnly := &uploadResources{vlm: document.VLMSettings{BaseURL: "http://vlm:8000/v1"}}
-	assertKnowledgeValidation(t, service.validateDoclingPDFUpload(pdf, vlmOnly), doclingPDFModelsRequiredMessage)
-	ocrOnly := &uploadResources{ocr: document.OCRSettings{Engine: "easyocr"}}
-	assertKnowledgeValidation(t, service.validateDoclingPDFUpload(pdf, ocrOnly), doclingPDFModelsRequiredMessage)
+	assertKnowledgeValidation(t, service.validateRemotePDFUpload(pdf, vlmOnly), remotePDFModelsRequiredMessage)
 
 	configured := &uploadResources{
 		vlm: document.VLMSettings{BaseURL: "http://vlm:8000/v1", Model: "qwen2.5-vl-7b"},
-		ocr: document.OCRSettings{Engine: "easyocr"},
 	}
-	if err := service.validateDoclingPDFUpload(pdf, configured); err != nil {
+	if err := service.validateRemotePDFUpload(pdf, configured); err != nil {
 		t.Fatalf("configured upload was rejected: %v", err)
 	}
 
-	// The in-process Go engine never needs VLM/OCR configuration.
+	// The in-process Go engine never needs VLM configuration; the legacy
+	// "docling" alias selects the same remote check.
 	goService := &Service{config: config.RagConfig{PDFEngine: config.PDFEngineGo}}
-	if err := goService.validateDoclingPDFUpload(pdf, empty); err != nil {
+	if err := goService.validateRemotePDFUpload(pdf, empty); err != nil {
 		t.Fatalf("go engine upload was rejected: %v", err)
 	}
+	legacy := &Service{config: config.RagConfig{PDFEngine: config.PDFEngineDocling}}
+	assertKnowledgeValidation(t, legacy.validateRemotePDFUpload(pdf, empty), remotePDFModelsRequiredMessage)
 }
-
-// TestUploadRejectsPDFWithoutDoclingModels pins that the rejection happens
-// while the upload is accepted: no journal operation or document is written.
-func TestUploadRejectsPDFWithoutDoclingModels(t *testing.T) {
+// TestUploadRejectsPDFWithoutVLM pins that the rejection happens while the
+// upload is accepted: no journal operation or document is written.
+func TestUploadRejectsPDFWithoutVLM(t *testing.T) {
 	service, stores, qdrantFake, _ := newUploadService(t)
-	service.config.PDFEngine = config.PDFEngineDocling
+	service.config.PDFEngine = config.PDFEngineVision
 	service.config.PDFServiceURL = "http://127.0.0.1:1"
 	ctx := context.Background()
 
 	_, err := service.uploadDocuments(ctx, "alpha",
 		[]UploadFile{uploadFile("paper.pdf", "%PDF-1.4\n% fake pdf\n")}, "")
-	assertKnowledgeValidation(t, err, doclingPDFModelsRequiredMessage)
+	assertKnowledgeValidation(t, err, remotePDFModelsRequiredMessage)
 
 	var operations int
 	if err := stores.DB.QueryRowContext(ctx,
@@ -830,7 +791,8 @@ func TestIndexConfigurationRecordsPDFParserEngine(t *testing.T) {
 		want   string
 	}{
 		{config.PDFEngineGo, document.PDFParserVersion},
-		{config.PDFEngineDocling, document.PDFParserVersionDocling},
+		{config.PDFEngineVision, document.PDFParserVersionService},
+		{config.PDFEngineDocling, document.PDFParserVersionService},
 	} {
 		metadata := indexConfiguration("paper.pdf", cfg, "BAAI/bge-m3", "bge-m3",
 			document.PDFParserVersionForEngine(testCase.engine))

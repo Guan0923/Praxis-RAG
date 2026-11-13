@@ -205,7 +205,7 @@ func TestHandleRetriesParserFailures(t *testing.T) {
 	notification := submitJob(t, stores, "manual.txt", []byte("original"))
 	ingester := &fakeIngester{}
 	ingester.setRun(func(context.Context, Payload) error {
-		return errors.New("docling process crashed")
+		return errors.New("pdf process crashed")
 	})
 	processor := newProcessor(t, stores, ingester, Options{})
 

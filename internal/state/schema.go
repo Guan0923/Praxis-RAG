@@ -682,7 +682,7 @@ var schemaTables = []*SchemaTable{
 		},
 	},
 	// model_profiles is a Console-only registry of reusable model
-	// configurations (Embedding / Reranker / VLM / OCR / JEV). A knowledge base
+	// configurations (Embedding / Reranker / VLM / JEV). A knowledge base
 	// still stores its own copy of the
 	// selected connection, so editing or deleting a profile never mutates an
 	// existing knowledge base. The API key is protected like every other provider

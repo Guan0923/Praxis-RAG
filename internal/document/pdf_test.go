@@ -192,14 +192,14 @@ func TestPDFParserVersionConstant(t *testing.T) {
 	if PDFParserVersion != "go-native-v1" {
 		t.Fatalf("PDFParserVersion = %q", PDFParserVersion)
 	}
-	if PDFParserVersionDocling != "docling-service-v1" {
-		t.Fatalf("PDFParserVersionDocling = %q", PDFParserVersionDocling)
+	if PDFParserVersionService != "docling-service-v1" {
+		t.Fatalf("PDFParserVersionService = %q", PDFParserVersionService)
 	}
 }
 
 func TestIsSupportedPDFParserVersion(t *testing.T) {
 	for _, supported := range []string{
-		PDFParserVersion, PDFParserVersionDocling, "docling-formula-remote-v3",
+		PDFParserVersion, PDFParserVersionService, legacyPDFParserVersion,
 	} {
 		if !IsSupportedPDFParserVersion(supported) {
 			t.Fatalf("IsSupportedPDFParserVersion(%q) = false", supported)
@@ -214,8 +214,10 @@ func TestIsSupportedPDFParserVersion(t *testing.T) {
 
 func TestPDFParserVersionForEngine(t *testing.T) {
 	cases := map[string]string{
-		"docling": PDFParserVersionDocling,
-		"DOCLING": PDFParserVersionDocling,
+		"vision":  PDFParserVersionService,
+		"VISION":  PDFParserVersionService,
+		"docling": PDFParserVersionService,
+		"DOCLING": PDFParserVersionService,
 		"go":      PDFParserVersion,
 		"":        PDFParserVersion,
 		"other":   PDFParserVersion,

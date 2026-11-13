@@ -42,7 +42,7 @@ def test_invalid_process_count_is_reported(monkeypatch: pytest.MonkeyPatch, work
 
 
 def test_two_service_processes_serve_one_port(tmp_path: Path, sample_pdf: bytes) -> None:
-    # Use the real image entrypoint with fake conversion: no Docling models are
+    # Use the real image entrypoint with fake conversion: no vision endpoint is
     # needed to verify that two processes start and preserve the HTTP contract.
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))

@@ -3,6 +3,8 @@
 
 > **传输层历史说明**：文中提到的 RocketMQ 指审计时的旧传输/旧部署。当前实现已完全切换到 Kafka（`RAG_KAFKA_*` 与显式 `RAG_*_DLQ_TOPIC`，见 [GO_MIGRATION](GO_MIGRATION.md) 最后一轮）；这些 RocketMQ 字样仅作为审计历史的对照保留，不是当前部署指令。
 
+> **PDF 解析历史说明（2026-11-13）**：文中提到的 Docling/本地模型/vision worker 指审计时的旧实现。当前 PDF 版面/OCR/表格/公式/图片描述统一由知识库配置的远端 OpenAI 兼容视觉模型完成，pdf-service 本地只做 PyMuPDF 读取/渲染/裁图，不再有 Docling/torch/模型卷；详见 [GO_MIGRATION](GO_MIGRATION.md) 的「2026-11-13」一节。
+
 
 审计对象：`D:\Project\Praxis-RAG\.agents\worktrees\dsh-d432f525-b2f1`
 审计类型：只读（本文件是唯一写入）

@@ -18,7 +18,7 @@
 | Redis | `RAG_REDIS_URL`、`RAG_REDIS_ENABLED`、`RAG_REDIS_PREFIX`、`RAG_RESULT_TTL_SECONDS`（3600）、`RAG_RESULT_MAX_BYTES`、`RAG_ARTIFACT_MAX_BYTES` |
 | Kafka | `RAG_KAFKA_BOOTSTRAP_SERVERS`、`RAG_KAFKA_SECURITY_PROTOCOL`、`RAG_KAFKA_SASL_*`、`RAG_KAFKA_TLS_*`、`RAG_*_TOPIC`/`RAG_*_GROUP`、`RAG_*_DLQ_TOPIC`、`RAG_DOCUMENT_WORKER_CONCURRENCY`/`RAG_SEARCH_WORKER_CONCURRENCY`（默认 `1`） |
 | 文档投递/监控 | `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS`（默认 604800）、`RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS`（默认 5）、`RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS`（Worker 心跳间隔，默认 15；监控页 60 秒无心跳判降级）、`RAG_DEBEZIUM_HEALTH_URL`（可选只读健康探测；采集位点不可读，监控显示「未知」）、`RAG_APP_DEBEZIUM_HEALTH_URL`（compose app profile 覆盖用）、`RAG_DEBEZIUM_PORT`（宿主机健康端口，默认 8083） |
-| PDF/Word | `RAG_PDF_ENGINE`（`docling`/`go`）、`RAG_PDF_SERVICE_URL`、`RAG_PDF_SERVICE_TIMEOUT`（900）、`RAG_WORD_CONVERTER_PATH`、`RAG_WORD_CONVERT_TIMEOUT` |
+| PDF/Word | `RAG_PDF_ENGINE`（`vision`/`go`；旧值 `docling` 是 `vision` 的兼容别名）、`RAG_PDF_SERVICE_URL`、`RAG_PDF_SERVICE_TIMEOUT`（900）、`RAG_WORD_CONVERTER_PATH`、`RAG_WORD_CONVERT_TIMEOUT`；`RAG_PDF_MODELS_PATH` 已废弃（本地无模型） |
 | VLM | `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`、`RAG_VLM_TIMEOUT`、`RAG_VLM_CONCURRENCY`（Console 知识库配置优先，环境变量是回退） |
 | 默认知识库模板 | `RAG_DEFAULT_KB_TEMPLATE`（默认 `default`，VIP/普通用户建库时克隆其模型配置） |
 
@@ -117,9 +117,9 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 
 ## 5. 改动约束（细项）
 
-1. **对外契约**：MCP 工具名与输入 schema、REST 路径与响应结构、环境变量名、`enc:v1:` 凭据格式、MySQL 表结构、PDF 清单版本（`go-native-v1` / `docling-service-v1`，旧 `docling-formula-remote-v3` 仍可读）。改契约必须同时做数据迁移、兼容读取与文档更新。
+1. **对外契约**：MCP 工具名与输入 schema、REST 路径与响应结构、环境变量名、`enc:v1:` 凭据格式、MySQL 表结构、PDF 清单版本（`go-native-v1` / `docling-service-v1`，旧 `docling-formula-remote-v3` 仍可读；`docling-service-v1` 只是证据格式契约，与是否使用 Docling 无关）。改契约必须同时做数据迁移、兼容读取与文档更新。
 2. **不要重新引入**：Python 主后端、SQLite 状态库、RocketMQ、Qdrant 本地文件模式。当前传输是 Kafka + MySQL，凭据格式是 `enc:v1:`。
-3. **Go 服务不得依赖 Python**：任何 PDF 高保真能力放在 `python-workers/pdf-service` 或纯 Go 实现里；`go build ./...` / `go test ./...` 不涉及 Python。
+3. **Go 服务不得依赖 Python**：PDF 的版面/OCR/表格/公式/图片描述能力由 `python-workers/pdf-service` 调用远端视觉模型（或纯 Go 实现）提供；`go build ./...` / `go test ./...` 不涉及 Python，也不加载任何本地模型。
 4. **测试串行**：新增包测试仍受同一 MySQL schema 与 advisory lock 约束；不要写依赖执行顺序之外并行假设的测试。
 5. **异步受理不代表完成**：涉及上传/索引的改动必须维护 `document_jobs` 状态机、发件箱、幂等与恢复语义，并保留 `GET /v1/document-jobs/{artifact_id}` 的可观测性。
 6. **不要提交生成物与本地数据**：`build/`、`dist/`、`frontend/node_modules/`、`.test-tmp/`、`.env*`（除 `.env.example`）、模型/向量数据、根目录 worker 二进制（见 `.gitignore`）。
@@ -131,7 +131,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 ## 6. 已知限制
 
 - Token 计数是确定性近似，token 策略的切分边界可能与 Python/BGE-M3 不完全一致。
-- docling 引擎的 PDF 必须先在知识库配置 VLM 与 OCR，否则受理阶段直接拒绝；pdf-parser 不可用或超时会令该次上传失败（可临时切 `RAG_PDF_ENGINE=go`）。
+- vision 引擎的 PDF 必须先在知识库配置 VLM，否则受理阶段直接拒绝；pdf-parser 不可用或超时、远端视觉模型不可用同样会令该次上传失败（可临时切 `RAG_PDF_ENGINE=go`）。OCR 已并入视觉模型，不再有独立 OCR 模型类型；升级迁移会删除旧 `kind='ocr'` 配置并清除知识库中的 `ocr`/`ocr_model` 设置。
 - `RAG_PDF_ENGINE=go` 只适合文字型 PDF：无版面分析、表格结构、OCR、公式与图片资产；扫描件需先 OCR。
 - 暂不支持 Excel、网页抓取、独立图片上传；`.doc` 依赖外部 LibreOffice。
 - 排队搜索依赖 Kafka + Redis；结果快照过期/丢失后无法回放；死信 topic 需要显式创建。
@@ -142,8 +142,8 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 ## 7. 未验证项（不要据此宣称生产就绪）
 
 - Docker 镜像构建、compose `app` profile、systemd 部署；Go worker 容器化。
-- pdf-parser 镜像构建与真实 Docling/CodeFormula 模型推理（现有测试用 fake converter 覆盖协议）。
-- 远端 VLM 端点的真实联调（只做了配置/协议单测）。
+- pdf-parser 镜像构建、真实视觉端点推理与真实扫描 PDF 的解析质量（现有测试用 fake converter 与注入式视觉客户端覆盖协议，不访问网络）。
+- 远端视觉模型端点的真实联调（只做了配置/协议单测与 httptest 集成测试）。
 - Console 的浏览器级 E2E（只有 Vitest 单元/契约测试与人工截图核对）。
 - Kafka SASL/TLS 外部集群、MySQL 多实例并发/故障切换。
 - `rag-mcp-ingest` 未连接真实 Qdrant/模型 API 实跑。
@@ -166,6 +166,6 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 | `docs/api-keys.md` | API Key 归属、命名空间与 MCP 配置 |
 | `docs/knowledge-base-settings.md` | 知识库配置、模型配置与 profile 关系（历史设计 + 当前实现说明） |
 | `deploy/debezium/README.md` | Debezium CDC 桥接配置 |
-| `python-workers/pdf-service/README.md` | Docling 解析微服务的构建、模型与接口 |
+| `python-workers/pdf-service/README.md` | PDF 视觉解析微服务的构建、视觉模型配置与接口 |
 | `VALIDATION.md` | 已执行的验证记录（按日期） |
 | `PROGRESS.md` | 早期开发阶段记录（历史，不作当前功能清单） |

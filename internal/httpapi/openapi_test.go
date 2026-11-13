@@ -63,21 +63,21 @@ func TestOpenAPIAndDocsRoutes(t *testing.T) {
 	if !containsEmbedding {
 		t.Fatalf("CreateKnowledgeBaseBody.required = %v", required)
 	}
-	// The OCR engine is a knowledge-base setting and a saved-model kind.
+	// OCR is no longer a knowledge-base setting or a saved-model kind.
 	createProperties, _ := createBody["properties"].(map[string]any)
-	if _, present := createProperties["ocr_model"]; !present {
-		t.Fatalf("CreateKnowledgeBaseBody.properties missing ocr_model: %v", createProperties)
+	if _, present := createProperties["ocr_model"]; present {
+		t.Fatalf("CreateKnowledgeBaseBody.properties still has ocr_model: %v", createProperties)
 	}
 	updateBody, _ := schemas["UpdateKnowledgeBaseBody"].(map[string]any)
 	updateProperties, _ := updateBody["properties"].(map[string]any)
-	if _, present := updateProperties["ocr_model"]; !present {
-		t.Fatalf("UpdateKnowledgeBaseBody.properties missing ocr_model: %v", updateProperties)
+	if _, present := updateProperties["ocr_model"]; present {
+		t.Fatalf("UpdateKnowledgeBaseBody.properties still has ocr_model: %v", updateProperties)
 	}
 	modelProfileBody, _ := schemas["CreateModelProfileBody"].(map[string]any)
 	modelProfileProperties, _ := modelProfileBody["properties"].(map[string]any)
 	kind, _ := modelProfileProperties["kind"].(map[string]any)
 	kindEnum, _ := kind["enum"].([]any)
-	if len(kindEnum) != 5 || kindEnum[4] != "jev" {
+	if len(kindEnum) != 4 || kindEnum[3] != "jev" {
 		t.Fatalf("CreateModelProfileBody.kind enum = %v", kindEnum)
 	}
 

@@ -31,7 +31,6 @@ func TestPublicSettingsReplacesProviders(t *testing.T) {
 			"base_url": "http://vlm:8000/v1", "protected_key": "enc:v1:vlm-secret",
 		},
 		"vlm_model": "qwen2.5-vl-7b",
-		"ocr_model": "easyocr",
 	}
 	want := map[string]any{
 		"namespace":       "alpha",
@@ -50,7 +49,6 @@ func TestPublicSettingsReplacesProviders(t *testing.T) {
 		"reranker":        map[string]any{"base_url": "http://rank:8080/v1", "api_key_set": false},
 		"vlm":             map[string]any{"base_url": "http://vlm:8000/v1", "api_key_set": true},
 		"vlm_model":       "qwen2.5-vl-7b",
-		"ocr_model":       "easyocr",
 	}
 	public := PublicSettings(settings)
 	if !reflect.DeepEqual(public, want) {

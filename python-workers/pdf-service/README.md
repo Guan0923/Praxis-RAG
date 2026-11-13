@@ -1,26 +1,31 @@
-# Praxis-RAG PDF 解析微服务（Docling）
+# Praxis-RAG PDF 解析微服务（远端视觉模型）
 
-把 PDF 解析从 Go 进程内抽取改回 Python Docling 的独立 HTTP 微服务。Go 端（`internal/document`）通过 HTTP
-调用本服务，拿回一个 zip：根目录的 `manifest.json` + 清单引用的图片，然后交给现有的
-`document.BuildPDFContent` / 入库流程。
+把 PDF 的版面、OCR、表格、公式与图片描述统一交给**远端 OpenAI 兼容视觉模型**，本服务只负责
+**PDF 读取 / 渲染 / 裁图 / 结果组装**。Go 端（`internal/document`）通过 HTTP 调用本服务，拿回一个
+zip：根目录的 `manifest.json` + 清单引用的图片，然后交给现有的 `document.BuildPDFContent` / 入库流程。
 
-本服务是提交 `f778504` 删除的旧 worker（`python-workers/rag_mcp/pdf_worker.py`）的服务端移植：
-
-- 文档转换逻辑（Docling 2.126.0、CodeFormulaV2 公式、EasyOCR、TableFormer）与原 worker 一致；
-- 去掉了 argparse/CLI，改为常驻服务，支持并发上限与单请求超时；
-- 清单版本从 `docling-formula-remote-v3` 改为 **`docling-service-v1`**；
-- Docling/torch **惰性导入**：模块 import、pytest、`RAG_PDF_SERVICE_CONVERTER=fake` 都不需要安装它们。
+- **本地不加载任何模型权重**：没有 docling、torch、easyocr、tesseract、rapidocr、CodeFormula，
+  也没有 `/models` 模型卷；进程内存里只有 PyMuPDF 与 HTTP 客户端。
+- **一个视觉模型承担全部 PDF 视觉能力**：每页一次主调用返回该页的文本/OCR、公式 LaTeX、
+  表格结构与图片区域；没有本地图注的图片再裁图调用一次生成描述。
+- 模型配置（服务地址、模型名、API Key）由 Go 端按知识库选择后随 `options` 下发；服务端
+  `RAG_VLM_*` 只是进程级回退。
+- **清单版本固定 `docling-service-v1`**：这是与 Go 端共享的**证据格式契约**（与实现无关，
+  保留旧名字是为了历史数据兼容），不是“仍在使用 Docling”。
 
 ```
 python-workers/pdf-service/
 ├── app/
 │   ├── __init__.py        # 服务名与版本
 │   ├── main.py            # FastAPI：/healthz、/v1/parse、并发/超时/错误映射
-│   └── parser.py          # Docling 转换、清单导出、fake converter、清单契约校验
-├── tests/                 # pytest（不需要 docling/torch）
+│   ├── vision.py          # OpenAI 兼容视觉客户端（chat/completions、JSON 解析、并发/重试）
+│   ├── pdfreader.py       # PyMuPDF 读取/渲染/裁图
+│   ├── parser.py          # VisionConverter（组装清单）、fake converter、清单契约校验
+│   └── errors.py          # 安全错误类型与中文消息
+├── tests/                 # pytest（除视觉调用外全部可离线跑；视觉客户端可注入 fake）
 ├── Dockerfile
-├── requirements.txt       # 运行时（docling==2.126.0 等）
-├── requirements-dev.txt   # 测试/fake 模式（无 docling/torch）
+├── requirements.txt       # pymupdf / httpx / fastapi / uvicorn / python-multipart
+├── requirements-dev.txt   # 测试依赖（pytest + 运行时依赖）
 ├── pytest.ini
 └── README.md
 ```
@@ -35,13 +40,12 @@ python-workers/pdf-service/
 {
   "status": "ok",
   "service": "praxis-rag-pdf-service",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "parser_version": "docling-service-v1",
-  "converter": "docling",
-  "converter_requested": "docling",
-  "docling_installed": true,
-  "models_configured": true,
-  "vlm_configured": false,
+  "converter": "vision",
+  "converter_requested": "vision",
+  "vision_configured": true,
+  "vision_model": "qwen2.5-vl-72b",
   "max_upload_bytes": 104857600,
   "timeout_seconds": 900.0,
   "concurrency": 1,
@@ -49,19 +53,22 @@ python-workers/pdf-service/
 }
 ```
 
-- `converter`：实际使用的转换器（`docling` / `fake` / `unavailable`）。
-- `status`：`degraded` 表示配置有误（如 `RAG_PDF_SERVICE_CONVERTER` 非法），`config_error` 给出原因。
-- 配置有问题时服务照常启动，健康检查仍 200，但 `/v1/parse` 会返回 503 并给出可读原因。
+- `converter`：实际使用的转换器（`vision` / `fake` / `unavailable`）。
+- `converter_requested`：请求的转换器（`docling` 旧值会归一化为 `vision`）。
+- `vision_configured` / `vision_model`：服务端是否配置了 `RAG_VLM_*` 回退端点（请求级
+  `options.vision` 不体现在健康检查中）；未配置时 `vision_model` 为 `null`。
+- `status`：`degraded` 表示配置有误（如 `RAG_PDF_SERVICE_CONVERTER` 非法、`RAG_VLM_*` 只配一半），
+  `config_error` 给出原因。配置有问题时服务照常启动，健康检查仍 200，但 `/v1/parse` 会返回 503。
 
-`GET /` 返回同样的服务信息（不含 `status`/`docling_installed`）。
+`GET /` 返回同样的服务信息（与 `/healthz` 相同，含 `status`）。
 
 ### `POST /v1/parse`
 
 - 请求：`multipart/form-data`，字段名 **`file`**，内容为一个 PDF（服务端检查前 1024 字节含 `%PDF-`）；
-  可选文本字段 **`options`**（JSON），用于**按请求**覆盖 VLM 与 OCR 引擎配置（见下一节）。
+  可选文本字段 **`options`**（JSON），用于**按请求**提供视觉模型配置（见下一节）。
 - 成功：`200`，`Content-Type: application/zip`，响应头
-  `X-PDF-Parser-Version: docling-service-v1`、`X-PDF-Converter: docling|fake`。
-- 失败：JSON `{"detail": "<安全消息>"}`，`detail` 不会包含文档正文；`options` 中的 API Key 不会被回显。
+  `X-PDF-Parser-Version: docling-service-v1`、`X-PDF-Converter: vision|fake`。
+- 失败：JSON `{"detail": "<安全中文消息>"}`；`detail` 不会包含文档正文、请求里的 API Key 或上游响应正文。
 
 zip 结构：
 
@@ -73,8 +80,7 @@ pictures/picture-1.png
 ```
 
 `manifest.json` 里 `image_file` 引用的每个文件都在 zip 内，路径为相对路径（`pictures/picture-N.png`）；
-**table 资产不带图**，`image_file` 为 `null`，只携带表格结构。图片之外的中间产物（表格裁剪图、OCR 明细）
-不会进入 zip。
+**table 资产不带图**，`image_file` 为 `null`，只携带表格结构。
 
 状态码：
 
@@ -83,73 +89,81 @@ pictures/picture-1.png
 | 200 | 解析成功，返回 zip |
 | 400 | 缺少文件内容 / 不是 PDF（`%PDF-` 头校验失败）|
 | 413 | 文件超过 `RAG_PDF_SERVICE_MAX_BYTES`（默认 100 MiB）|
-| 422 | multipart 字段缺失/不是 `file`（FastAPI 校验），或 `options` 不是合法 JSON / 字段类型错误 / OCR 引擎不在白名单 |
-| 500 | 转换失败（Docling 报错、公式为空、表格结构不可靠等）|
-| 503 | 配置错误（converter/模型/VLM 未配置好）或队列等待超时 |
+| 422 | multipart 字段缺失/不是 `file`；或 `options` 非法（不是 JSON 对象、未知字段、类型错误、`ocr` 键已废除、`vision`/`vlm` 同时出现）|
+| 500 | 转换失败（视觉调用失败、公式为空、表格结构识别失败等）|
+| 503 | 未配置视觉模型，或配置错误（converter 非法等）|
 | 504 | 解析超时（`RAG_PDF_SERVICE_TIMEOUT`）|
 
-### `options`：每请求 VLM / OCR 覆盖
+### `options`：每请求视觉模型覆盖
 
-`options` 是可选文本字段，内容为 JSON 对象。**不传 / 空字符串 / `{}` / `null` 时完全保持原有行为**
-（使用进程环境变量 `RAG_VLM_*` + 默认 EasyOCR），保证向后兼容。
+`options` 是可选文本字段，内容为 JSON 对象。**不传 / 空字符串 / `{}` / `null` 时完全使用进程环境变量
+`RAG_VLM_*`**。
 
 ```json
 {
-  "vlm": {
-    "base_url": "http://vlm-host:8000/v1",
+  "vision": {
+    "base_url": "https://vlm.internal/v1",
     "api_key": "sk-...",
     "model": "qwen2.5-vl-72b",
     "timeout": 120,
     "concurrency": 4
-  },
-  "ocr": {"engine": "easyocr"}
+  }
 }
 ```
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `vlm.base_url` | string | OpenAI 兼容 VLM 的 base URL，可带自定义端口（如 `https://vlm.internal:8443/v1`）|
-| `vlm.api_key` | string | 可选；只放进请求头 `Authorization: Bearer ...`，不写日志、不写 manifest |
-| `vlm.model` | string | VLM 模型名 |
-| `vlm.timeout` | number | 可选，默认 `120` 秒；下限 `30`（与 `RAG_VLM_TIMEOUT` 一致）|
-| `vlm.concurrency` | integer | 可选，默认 `4`；下限 `1` |
-| `ocr.engine` | string | 可选，默认 `easyocr`；可选值 `auto` / `easyocr` / `tesseract` / `rapidocr` |
+| `vision.base_url` | string | OpenAI 兼容视觉接口的 base URL（如 `https://vlm.internal/v1`）|
+| `vision.api_key` | string | 可选；只放进请求头 `Authorization: Bearer ...`，不写日志、不写 manifest |
+| `vision.model` | string | 视觉模型名 |
+| `vision.timeout` | number | 可选，默认 `120` 秒；下限 `30` |
+| `vision.concurrency` | integer | 可选，默认 `4`；下限 `1` |
 
 规则：
 
-- **`options` 优先于环境变量**：给了 `options.vlm` 就用它（整篇文档），否则用 `RAG_VLM_*`；
-  因此部署侧 `RAG_VLM_*` 只配置了一半（缺 `RAG_VLM_MODEL`）时，**带上完整 `options.vlm` 的请求仍可正常解析**，
-  不带 `options.vlm` 的请求仍按原行为返回 503。
-- `options.vlm` 必须同时给出非空的 `base_url` 与 `model`；`api_key` 可省略（不带鉴权头）。
-  空的 `{"vlm": {}}` 视为“不覆盖”，回落到环境变量。
-- OCR 引擎映射（Docling 2.126.0）：
-  - `easyocr`（默认）：`EasyOcrOptions(lang=["ch_sim","en"], download_enabled=False, confidence_threshold=0.0)`，
-    有 `RAG_PDF_MODELS_PATH` 时模型目录为 `<models>/EasyOcr`；
-  - `auto`：与 `easyocr` 相同（契约固定为 EasyOCR，避免 Docling 自动选择到未安装的引擎）；
-  - `tesseract`：`TesseractOcrOptions(lang=["chi_sim","eng"])`；
-  - `rapidocr`：`RapidOcrOptions()`。
-  `TesseractOcrOptions`/`RapidOcrOptions` 在 Docling 惰性导入时才导入，不影响无 docling 的测试环境。
-- 实际使用的 OCR 引擎写入 `manifest.parser.ocr_engine`（`auto` 记录为 `easyocr`）；VLM 只记录 host+model。
-- 非法 `options` 返回 `422`，`detail` 为安全中文消息（指明字段与可选值，**不回显提交值，尤其不回显 API key**）。
+- 键名规范为 **`vision`**；同时接受旧键 **`vlm`**（同一对象，作为兼容别名）。两者同时出现 → `422`。
+- **`ocr` 键已废除**：出现即 `422`，提示
+  `options.ocr 已废除：OCR 已并入视觉模型，请使用 options.vision`。
+- `vision` 为空对象 `{}` 视为“无覆盖”，走环境回退。
+- `base_url` 与 `model` 必须同时非空；`api_key` 可为空；未知字段、类型错误 → `422`，
+  消息不回显任何提交值（尤其不回显 API Key）。
+- **请求优先于环境变量**：带了完整 `options.vision` 的请求即使 `RAG_VLM_*` 只配置了一半也能解析；
+  不带 `options` 的请求按环境变量配置，缺 `RAG_VLM_BASE_URL`/`RAG_VLM_MODEL` 时返回 503。
+- 未配置视觉模型（请求与环境变量都没有）→ `503`：
+  `PDF 解析服务未配置视觉模型：请设置 RAG_VLM_BASE_URL 与 RAG_VLM_MODEL，或在请求 options.vision 中提供`。
 
-示例（自定义端口 VLM + Tesseract）：
+示例：
 
 ```bash
 curl -sS -F file=@sample.pdf \
-  -F 'options={"vlm":{"base_url":"https://vlm.internal:8443/v1","api_key":"sk-...","model":"qwen2.5-vl-72b","timeout":180,"concurrency":2},"ocr":{"engine":"tesseract"}}' \
-  http://127.0.0.1:8091/v1/parse -o out.zip
-```
-
-示例（仅切换 OCR 引擎，VLM 继续用 `RAG_VLM_*`）：
-
-```bash
-curl -sS -F file=@sample.pdf -F 'options={"ocr":{"engine":"rapidocr"}}' \
+  -F 'options={"vision":{"base_url":"https://vlm.internal/v1","api_key":"sk-...","model":"qwen2.5-vl-72b","timeout":180,"concurrency":2}}' \
   http://127.0.0.1:8091/v1/parse -o out.zip
 ```
 
 `RAG_PDF_SERVICE_CONVERTER=fake` 时 `options` 会被接受并忽略（fake 清单固定），便于 Go 端联调链路。
 
-## 2. 清单契约（与 Go 端 `internal/document/pdf.go` 严格对齐）
+## 2. 视觉调用约定
+
+- URL：`{base_url}/chat/completions`；`base_url` 以 `/chat/completions` 结尾时直接使用，以 `/v1` 结尾时补
+  `/chat/completions`，否则补 `/v1/chat/completions`。
+- 请求：`POST`，头 `Authorization: Bearer <api_key>`（key 非空时）、`Content-Type: application/json`；
+  body 为 `{"model": ..., "messages": [...], "temperature": 0, "max_tokens": ...}`，user 消息内容为
+  `[{"type":"text","text":<提示词>},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}]`。
+- 响应：OpenAI chat completions；取 `choices[0].message.content`（兼容字符串或
+  `[{"type":"text","text":...}]` 数组）。
+- 提示词要求模型**只输出 JSON**；解析时容忍 ```json 代码围栏、前后空白与首尾多余文本
+  （取第一个平衡的 `{...}`）。
+- **每页一次**主调用返回该页所有块（文本/OCR、公式 LaTeX、表格结构、图片区域）；**每张图片一次**
+  裁图描述调用（仅当没有本地图注时）。
+- 表格若主调用未给出结构：对该表格 bbox 裁图再发一次“表格结构”调用；仍失败 → `500`
+  `PDF 解析失败：第 {page} 页表格结构识别失败`。
+- 并发：页调用按 `concurrency` 并发，失败请求按“每页最多 2 次尝试”重试一次，仍失败 → 整篇失败：
+  `PDF 解析失败：第 {page} 页视觉模型调用失败，请检查服务地址、模型和 API Key`。
+- 超时 / 网络错误 → `500`（中文、含页码、不含响应体）；公式 LaTeX 为空 →
+  `PDF 解析失败：第 {page} 页公式识别结果为空`。
+- 不把 PDF 全文或密钥写日志；debug 级最多记录页码/耗时/模型名。
+
+## 3. 清单契约（与 Go 端 `internal/document/pdf.go` 严格对齐）
 
 顶层：
 
@@ -168,16 +182,16 @@ curl -sS -F file=@sample.pdf -F 'options={"ocr":{"engine":"rapidocr"}}' \
 
 | 字段 | 说明 |
 | --- | --- |
-| `ref` | Docling 引用，如 `#/texts/3`、`#/pictures/0` |
-| `kind` | `text` / `section_header` / `list_item` / `caption` / `footnote` / `formula` / `picture` / `table` …（Docling label）|
+| `ref` | 引用，如 `#/texts/3`、`#/pictures/0` |
+| `kind` | `text` / `title` / `section_header` / `list_item` / `caption` / `footnote` / `formula` / `picture` / `table` / `code` |
 | `page` | 1 起始页码 |
 | `order` | 块顺序（0 起连续）|
 | `text` | chunk 正文；picture/table 块为空串（由 asset 渲染）|
 | `asset_id` | 仅 picture/table 块非空，指向 `assets[].asset_id` |
-| `bbox` | `{l,t,r,b,coord_origin}` |
+| `bbox` | `{l,t,r,b,coord_origin}`，PDF 点坐标、原点左上（`TOPLEFT`）|
 | `locations` | `[{page,bbox,charspan}]` |
 | `latex` | 仅公式块：纯 LaTeX |
-| `original_text` | 仅公式块：Docling 原始抽取文本 |
+| `original_text` | 仅公式块：视觉模型返回的原始文本 |
 | `equation_number` | 公式编号字符串或 `null` |
 | `association` | 仅 caption/footnote：`document` / `unlinked` / `""` |
 | `associated_assets` | caption/footnote 关联的 asset_id 列表 |
@@ -195,95 +209,55 @@ curl -sS -F file=@sample.pdf -F 'options={"ocr":{"engine":"rapidocr"}}' \
 ```
 
 - 有编号时 `text` 末尾追加 `\n\n(编号)`（若 LaTeX 本身已含该编号则不重复）；
-- **`text` 与 `latex` 都不允许为空**：公式识别失败会让整篇文档失败（500），不会静默索引空公式。
+- **`latex` 与 `text` 都不允许为空**：公式识别失败会让整篇文档失败（500），不会静默索引空公式。
 
 `assets[]`：
 
 | 字段 | 说明 |
 | --- | --- |
 | `asset_id` / `kind` / `page` / `bbox` | 身份与位置，`kind` 为 `picture` 或 `table` |
-| `caption` / `caption_source` / `generated_description` | 图注（`document`/`none`）与 VLM 生成描述 |
+| `caption` / `caption_source` / `generated_description` | 图注（`document`/`none`）与视觉模型生成的描述 |
 | `image_file` | picture：`pictures/picture-N.png`；table：`null` |
 | `table` | table 结构：`num_rows`/`num_cols`/`orientation`/`headers`/`header_rows`/`rows`/`cells`/`footnotes` |
 | `captions` / `footnotes` | 注解列表：`{ref,text,page,bbox,locations}` |
 
-`warnings[]`：`{page, kind, count, message}`，目前用于低置信度 OCR（`low_confidence_ocr`），只给告警、
-不丢文本。
+`warnings[]`：`{page, kind, count, message}`；空页面可用 `kind="empty_page"`。
 
-`parser`：`{version, service_version, service, converter, docling, formula_model, formula_revision, vlm,
-formula_crop_scale, formula_crop_expansion, formula_batch_size, ocr_confidence_threshold, ocr_engine}`。
+`parser`：自由对象，建议含 `version` / `service_version` / `service` / `converter="vision"` /
+`backend="openai-compatible"` / `model` / `endpoint`（只含 host）/ `prompt_version` / `capabilities`；
+**不得**包含 API Key。
 
-- `vlm`：实际使用的远端 VLM 描述 `{backend, model, endpoint}`（`endpoint` 只含 host:port，不含 API Key）；
-  本地 CodeFormulaV2 模式为 `null`。
-- `ocr_engine`：实际运行的 OCR 引擎（`auto` 记录为 `easyocr`）；`fake` 模式为 `null`。
-
-`metrics`：`{seconds, pages, peak_cuda_allocated_bytes}`。
+`metrics`：自由对象，建议 `pages`、`vision_requests`、`vision_failures`、`elapsed_seconds`。
 
 服务端在返回前用 `app.parser.validate_manifest` 严格校验以上结构（键集合、类型、公式非空、图片文件存在、
 table 的 `image_file` 为 null、`image_file` 是安全相对路径等），避免契约漂移在 Go 端变成空字段。
 
-## 3. 环境变量
+## 4. 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `RAG_PDF_SERVICE_HOST` | `0.0.0.0` | `python -m app.main` 的监听地址（uvicorn CLI 以命令行参数为准）|
 | `PORT` | `8091` | 服务端口 |
 | `RAG_PDF_SERVICE_TIMEOUT` | `900` | 单请求超时（秒）：排队等待与转换各自不超过该值，超时返回 504 |
-| `RAG_PDF_SERVICE_WORKERS` | `1` | `python -m app.main` 启动的 Uvicorn 服务进程数（正整数）；容器默认入口同样读取此变量，各进程共用监听端口 |
-| `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 进程内并发转换上限（信号量）；模型权重常驻共享，转换工作内存与 CPU 随并发线性增长，内存紧张保持 1 靠副本扩容 |
-| `RAG_PDF_SERVICE_CONVERTER` | `docling` | `docling` 真实解析；`fake` 固定清单（仅测试/联调）|
-| `RAG_PDF_MODELS_PATH` | 空 | Docling 模型目录（`artifacts_path`），容器内为 `/models` |
+| `RAG_PDF_SERVICE_WORKERS` | `1` | Uvicorn 服务进程数（正整数）；各进程共享监听端口 |
+| `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 进程内并发转换上限（信号量）|
 | `RAG_PDF_SERVICE_MAX_BYTES` | `104857600` | 上传大小上限（字节），超限 413 |
-| `RAG_VLM_BASE_URL` | 空 | OpenAI 兼容 VLM 的 base URL（如 `http://host:8000/v1`）|
-| `RAG_VLM_API_KEY` | 空 | VLM API Key（只用于鉴权，不落盘、不进清单）|
-| `RAG_VLM_MODEL` | 空 | VLM 模型名 |
-| `RAG_VLM_TIMEOUT` | `120` | VLM 请求超时（秒，最低 30）|
-| `RAG_VLM_CONCURRENCY` | `4` | VLM 并发（Docling API engine 的 concurrency）|
+| `RAG_PDF_SERVICE_CONVERTER` | `vision` | `vision` 远端视觉解析；旧值 `docling` 作为兼容别名视为 `vision`；`fake` 固定清单（仅测试/联调）；其它值 → 配置错误 |
+| `RAG_VLM_BASE_URL` | 空 | OpenAI 兼容视觉接口的 base URL（如 `https://vlm.internal/v1`）|
+| `RAG_VLM_API_KEY` | 空 | 视觉模型 API Key（只用于鉴权，不落盘、不进清单）|
+| `RAG_VLM_MODEL` | 空 | 视觉模型名 |
+| `RAG_VLM_TIMEOUT` | `120` | 视觉请求超时（秒，最低 30）|
+| `RAG_VLM_CONCURRENCY` | `4` | 单篇文档的页级视觉并发 |
+| `RAG_VLM_MAX_TOKENS` | `4096` | 单次视觉输出上限（可选）|
+| `RAG_PDF_PAGE_DPI` | `200` | 页面渲染 DPI（可选，范围 72–300）|
+| `RAG_VLM_PROMPT_VERSION` | `vision-v1` | 提示词版本（可选，只用于 `manifest.parser` 记录）|
 
 模型选择规则：
 
-- `RAG_VLM_BASE_URL` + `RAG_VLM_MODEL` **同时配置** → 公式识别使用远端 VLM
-  （`ApiVlmEngineOptions`，temperature 0、max_tokens 1024）；无 caption 的图片/表格也会调用该 VLM 生成
-  `generated_description`（失败重试 3 次，429/5xx 重试）。
-- 否则 → 使用本地 CodeFormulaV2 模型（`artifacts_path=RAG_PDF_MODELS_PATH`，revision 固定
-  `ecedbe111d15c2dc60bfd4a823cbe80127b58af4`），图片描述跳过（保持空串）。
-- **两者都没有** → 转换前给出可读配置错误（503）：“Formula recognition is not configured …”，
-  不会静默输出空公式。
-- 只配置一半（例如只有 `RAG_VLM_BASE_URL`）→ `config_error` 明确指出缺少 `RAG_VLM_MODEL`，
-  不带 `options.vlm` 的 `/v1/parse` 请求返回 503（带完整 `options.vlm` 的请求不受影响，见第 1 节）。
-- 以上环境变量是**进程级默认值**；`/v1/parse` 的 `options` 字段可按请求覆盖 VLM 与 OCR（优先于环境变量）。
-
-## 4. 模型下载（本地 CodeFormula 模式）
-
-容器/主机需要一份 Docling 模型目录（容器内挂到 `/models`）：
-
-```bash
-# 方式一：Docling 官方下载器（layout、TableFormer、EasyOCR 等默认模型）
-docling-tools models download --output-dir /models
-
-# 方式二：单独补 CodeFormulaV2 公式模型（默认下载命令可能不含它）
-python - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id="docling-project/CodeFormulaV2",
-    revision="ecedbe111d15c2dc60bfd4a823cbe80127b58af4",
-    local_dir="/models/docling-project--CodeFormulaV2",
-)
-PY
-```
-
-目录约定（Docling 的 `artifacts_path` 命名）：
-
-```
-/models/
-├── docling-project--CodeFormulaV2/   # 公式模型（本地模式必须有）
-├── ds4sd--docling-layout-heron/      # layout（docling-tools 下载）
-├── ds4sd--docling-models/            # TableFormer（docling-tools 下载）
-└── EasyOcr/                          # OCR 模型（EasyOcrOptions.model_storage_directory）
-```
-
-服务在本地模式启动转换时会检查 `/models` 存在且包含名字带 `CodeFormula` 的目录，否则返回 503 提示
-`docling-tools models download`。
+- `options.vision`（或别名 `options.vlm`）优先；未提供时用 `RAG_VLM_*`。
+- `RAG_VLM_BASE_URL` + `RAG_VLM_MODEL` **必须同时配置**，只配一半 → `config_error` 指明缺少项，
+  请求返回 503（带完整 `options.vision` 的请求不受影响）。
+- `RAG_PDF_MODELS_PATH` **已废弃/删除**：不再有本地模型，出现也不会读取。
 
 ## 5. Docker
 
@@ -291,29 +265,23 @@ PY
 # 构建（context 必须是 python-workers/pdf-service）
 docker build -t praxis-rag-pdf-service python-workers/pdf-service
 
-# 运行（本地 CodeFormula 模式）
+# 运行：视觉模型由请求 options.vision 提供，或在此配置服务级回退
 docker run --rm -p 8091:8091 \
-  -v /srv/praxis-rag/models:/models:ro \
   -e RAG_PDF_SERVICE_TIMEOUT=900 \
   -e RAG_PDF_SERVICE_CONCURRENCY=1 \
-  praxis-rag-pdf-service
-
-# 运行（远端 VLM 模式：公式识别走远端，但 layout/table/OCR 仍需本地权重或联网下载）
-docker run --rm -p 8091:8091 \
-  -v /srv/praxis-rag/models:/models:ro \
-  -e RAG_VLM_BASE_URL=http://vlm-host:8000/v1 \
+  -e RAG_VLM_BASE_URL=https://vlm.internal/v1 \
   -e RAG_VLM_API_KEY=... \
-  -e RAG_VLM_MODEL=qwen2.5-vl-7b \
+  -e RAG_VLM_MODEL=qwen2.5-vl-72b \
   praxis-rag-pdf-service
 ```
 
-VLM 模式只是把公式识别（以及无 caption 图片描述）交给远端；Docling 的 layout/TableFormer/EasyOCR
-仍然需要模型，建议同样挂载 `/models`。不挂载时 Docling 会尝试联网下载到默认缓存（需要容器能访问
-Hugging Face）。
+镜像要点：`python:3.11-slim`；不安装 torch/CUDA/GL 系统库，不挂载 `/models`；非 root（uid 10001）运行；
+`HEALTHCHECK` 用 Python 标准库 `urllib` 调 `http://127.0.0.1:$PORT/healthz`（镜像内没有 curl）；
+默认入口为 `python -m app.main`，通过 `RAG_PDF_SERVICE_WORKERS` 配置 Uvicorn 服务进程数，默认 1。
+各进程共享监听 socket，分别持有 `RAG_PDF_SERVICE_CONCURRENCY` 个解析名额；总解析容量上限为两者乘积，
+实际任务分布受连接复用和任务耗时影响。也可通过多个容器副本扩容，此时需另行配置负载分配。
 
-镜像要点：`python:3.11-slim`；`torch>=2.0` 从 `https://download.pytorch.org/whl/cpu` 装 CPU 轮子；
-模型不打进镜像，挂载 `/models`；非 root（uid 10001）运行；`HEALTHCHECK` 用 Python 标准库
-`urllib` 调 `http://127.0.0.1:$PORT/healthz`（镜像内没有 curl）。默认入口为 `python -m app.main`，通过 `RAG_PDF_SERVICE_WORKERS` 配置 Uvicorn 服务进程数，默认 1。各进程共享监听 socket，分别持有 `RAG_PDF_SERVICE_CONCURRENCY` 个解析名额；总解析容量上限为两者乘积，实际任务分布受连接复用和任务耗时影响。进程之间不共享模型内存；例如 `2 × 2` 和 `1 × 4` 都有最多 4 个解析名额，但前者多一个服务进程的模型内存开销。也可以通过多个容器副本扩容，此时需另行配置负载分配。
+构建参数只保留 `BASE_IMAGE` / `APT_MIRROR` / `PIP_INDEX_URL` / `PIP_RETRIES` / `PIP_TIMEOUT`。
 
 ## 6. 本地开发与测试
 
@@ -321,25 +289,28 @@ Hugging Face）。
 $env:PYTHONIOENCODING='utf-8'
 cd python-workers/pdf-service
 
-# 只装测试依赖（不需要 docling/torch）
-..\..\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+# 测试依赖（pytest + 运行时依赖；不需要任何模型）
+python -m pip install -r requirements-dev.txt
 
-# 140 个测试：healthz、/v1/parse zip/manifest 契约、公式 latex、错误码、清单校验、
-# options（VLM/OCR 覆盖、引擎映射、422 安全消息）
-..\..\.venv\Scripts\python.exe -m pytest tests -q
+# 单元/契约测试：healthz、/v1/parse zip/manifest 契约、错误码、清单校验、
+# options（vision/vlm 别名、ocr 422、422 安全消息）、视觉请求体与超时/错误映射
+python -m pytest -q
 ```
 
-fake 模式（无需任何模型，Go 端 live 测试/联调用）：
+视觉客户端必须支持注入 `httpx.MockTransport` 或等价 fake，**测试不得访问网络**。
+
+fake 模式（无需视觉模型，Go 端 live 测试/联调用）：
 
 ```powershell
 $env:RAG_PDF_SERVICE_CONVERTER='fake'
 $env:RAG_PDF_SERVICE_HOST='127.0.0.1'
 $env:RAG_PDF_SERVICE_WORKERS='2'
 $env:RAG_PDF_SERVICE_CONCURRENCY='2'
-..\..\.venv\Scripts\python.exe -m app.main
+python -m app.main
 ```
 
-直接使用 `python -m uvicorn app.main:app` 时，应通过 `--workers 2` 指定服务进程数；Uvicorn CLI 不读取项目自定义的 `RAG_PDF_SERVICE_WORKERS`。每进程解析并发仍由应用读取 `RAG_PDF_SERVICE_CONCURRENCY`。
+直接使用 `python -m uvicorn app.main:app` 时，应通过 `--workers 2` 指定服务进程数；Uvicorn CLI 不读取
+项目自定义的 `RAG_PDF_SERVICE_WORKERS`。每进程解析并发仍由应用读取 `RAG_PDF_SERVICE_CONCURRENCY`。
 
 fake 清单固定为：1 个 `text` 块、1 个 `formula` 块（latex `G = X_{basis}^{T} X_{basis}`）、
 1 个 `picture` 资产（真实 8x8 PNG，`pictures/picture-0.png`），版本 `docling-service-v1`。
@@ -361,36 +332,40 @@ PY
 
 ## 7. 与 Go 后端联调
 
-Go 端（由后端同事实现）只需：
+Go 端（`internal/document/pdf_service.go`）：
 
-1. 配置服务地址（建议环境变量 `RAG_PDF_SERVICE_URL`，例如 `http://127.0.0.1:8091`，compose 内为
-   `http://pdf-service:8091`）；
-2. 对每个 PDF 发 `POST {RAG_PDF_SERVICE_URL}/v1/parse`，multipart 字段 `file`，把响应体解压到解析
-   staging 目录（保持 `manifest.json` 与 `pictures/` 的相对路径）；
+1. 配置服务地址 `RAG_PDF_SERVICE_URL`（例如 `http://127.0.0.1:8091`，compose 内为 `http://pdf-parser:8091`）；
+2. 对每个 PDF 发 `POST {RAG_PDF_SERVICE_URL}/v1/parse`，multipart 字段 `file` + 文本字段 `options`，
+   把响应体解压到解析 staging 目录（保持 `manifest.json` 与 `pictures/` 的相对路径）；
 3. 读 `manifest.json` 反序列化为 `document.PDFManifest`，走现有 `document.BuildPDFContent(...)` /
    资产入库；
 4. 非 200 时读 `{"detail"}` 作为用户可见错误；HTTP 客户端超时建议 ≥ `RAG_PDF_SERVICE_TIMEOUT`。
 
+`options` 只发 `vision`：
+
+```json
+{"vision":{"base_url":"https://vlm.internal/v1","api_key":"sk-...","model":"qwen2.5-vl-72b","timeout":120,"concurrency":4}}
+```
+
+未配置视觉模型（`VLM.Configured()==false`）时不发 `options` 字段。API Key 不进日志/错误。
+
 联调顺序建议：先以 `RAG_PDF_SERVICE_CONVERTER=fake` 打通 Go→HTTP→zip→staging→manifest 链路，
-再切回 `docling` 做真实文档验收。
+再用真实视觉端点做文档验收。
 
-## 8. 与旧 worker 的差异 / 已知限制
+## 8. 迁移说明 / 已知限制
 
-- **清单版本**：`docling-service-v1`（旧 `docling-formula-remote-v3`）。Go 端需要把 PDF 解析器版本常量与
-  校验登记为新版本，否则 `ValidatePDFParserVersion` 会拒绝。
-- **zip 只含 manifest.json + 图片**：旧 worker 还会写 `document.json`（内嵌图片、体积大）和 `ocr.json`
-  （OCR 明细）。本服务不返回它们；OCR 诊断只保留为 `warnings[]`，明细写入临时目录后丢弃。
-- **超时不能中断 Docling**：504 只是快速把错误返回给调用方，后台线程会跑完并一直占用并发槽位；遇到
-  重复超时请提高 `RAG_PDF_SERVICE_TIMEOUT` 或拆分文档/扩容副本。
-- **内存**：单进程加载 Docling 模型约数 GB（CPU/GPU 视模型而定），上传文件先落临时文件（默认上限
-  100 MiB），zip 在内存中组装；并发>1 时每次转换的工作内存线性叠加（权重共享），内存紧张时保持 1。
-- **VLM 描述**仅在配置了 VLM（`RAG_VLM_*` 或请求 `options.vlm`）时启用；本地 CodeFormula 模式下无 caption
-  的图片/表格保持空描述。
-- **OCR 引擎**：`tesseract` 需要镜像内安装系统 Tesseract 与 `chi_sim`/`eng` 语言包（当前 Dockerfile 未装，
-  选用前需自行扩展镜像）；`rapidocr` 使用 Docling 自带的 RapidOCR 依赖。`auto` 固定映射为 `easyocr`，
-  不使用 Docling 的 `OcrAutoOptions`（避免自动选中未安装引擎导致运行期失败）。
-- **每请求 `options` 只影响当前文档**：VLM 客户端按请求构造，不缓存、不复用；并发仍受
-  `RAG_PDF_SERVICE_CONCURRENCY`（进程内）与 `options.vlm.concurrency`（单个 VLM 引擎内部并发）两层约束。
-- **公式质量**依赖 Docling + CodeFormulaV2/VLM；`_CheckedFormulaEngine` 会把空输出、被截断（缺少
-  `</formula>`）的输出当作硬失败，整篇文档 500，避免把错误公式写进索引。
-- 本地模式下 EasyOCR 关闭了自动下载（`download_enabled=False`），OCR 模型必须在 `RAG_PDF_MODELS_PATH/EasyOcr`。
+- **从 Docling 实现迁移**：旧版的本地 docling/torch/easyocr/CodeFormula 及 `/models` 模型卷已全部移除；
+  `RAG_PDF_SERVICE_CONVERTER` 的旧值 `docling` 仍被接受并归一化为 `vision`（不改变行为，只做兼容）。
+  `RAG_PDF_MODELS_PATH` 已废弃，不再读取。
+- **清单版本 `docling-service-v1` 保持不变**：它标识的是证据格式契约（顶层键、块/资产结构、公式
+  `text` 中的 `$$` 等），与生产实现无关；Go 端 `IsSupportedPDFParserVersion` 继续接受
+  `go-native-v1`、`docling-service-v1`、`docling-formula-remote-v3`。
+- **zip 只含 manifest.json + 图片**：不返回 OCR 明细或 document.json；诊断只保留为 `warnings[]`。
+- **超时不能中断上游视觉请求**：504 只是快速把错误返回给调用方，后台线程可能跑完并占用并发槽位；
+  遇到重复超时请提高 `RAG_PDF_SERVICE_TIMEOUT` 或扩容副本。
+- **质量取决于远端视觉模型**：版面、OCR、表格、公式、图片描述都由同一模型完成；模型能力不足时
+  可能出现块顺序/表格结构不准确，但契约仍会强制：空公式/缺失表格结构会让整篇文档失败，
+  不会静默写入错误证据。
+- **并发与限流**：页级并发受 `options.vision.concurrency`（或 `RAG_VLM_CONCURRENCY`）与进程级
+  `RAG_PDF_SERVICE_CONCURRENCY` 两层约束；远端服务自身的限流需要部署侧配合。
+- **未验证项**：真实视觉端点、真实 PDF 端到端与 Docker 构建未在本次迁移中验证（见根目录 `VALIDATION.md`）。

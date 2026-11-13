@@ -6,7 +6,7 @@
 // Markdown/TXT are read in process; DOCX is parsed from the OOXML zip package
 // in process (including full caption/note association and skipped-object
 // diagnostics); PDF text is extracted in process by NativePDFParser, or by
-// DoclingServiceParser when a remote Docling parse service is configured.
+// PDFServiceParser when a remote vision parse service is configured.
 // Legacy .doc
 // files additionally require an external LibreOffice based converter, see
 // docconvert.go; uncaptioned Word pictures can be described by the remote VLM

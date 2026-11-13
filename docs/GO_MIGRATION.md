@@ -22,7 +22,7 @@
 - 与 Qdrant、MySQL/SQLite、Redis、RocketMQ 的现有交互格式与既有数据。
 
 前端（`frontend/`，React + Vite）不重写；构建产物仍输出到 Console 静态目录。
-DOCX 读取与 Word 图片描述由 Go 进程内完成（图片描述由 Go 直接调用远端 OpenAI 兼容 VLM）；PDF 默认由独立 Docling 解析微服务（`python-workers/pdf-service`，HTTP + zip 清单）处理，Go 端可用 `RAG_PDF_ENGINE=go` 切回内置纯文本引擎；Go 主服务与镜像不依赖 Python。仅 .doc 转换仍使用外部 LibreOffice。
+DOCX 读取与 Word 图片描述由 Go 进程内完成（图片描述由 Go 直接调用远端 OpenAI 兼容视觉模型）；PDF 默认由独立 PDF 视觉解析微服务（`python-workers/pdf-service`，HTTP + zip 清单，本地只做读取/渲染/裁图，版面/OCR/表格/公式/图片描述调用知识库配置的远端视觉模型）处理，Go 端可用 `RAG_PDF_ENGINE=go` 切回内置纯文本引擎；Go 主服务与镜像不依赖 Python，微服务本地也不加载模型。仅 .doc 转换仍使用外部 LibreOffice。
 Go 只负责按其现有协议调用并消费解析结果；语义检索和重排本来就是 HTTP 模型 API。
 
 ## 2. 目标架构
@@ -411,3 +411,14 @@ REST /v1/admin/tools -> 6 tools
 - 删除 `RAG_OUTBOX_BRIDGE` 模式选择参数及其旧模式测试，不保留配置兼容或旧值拒绝分支。监控的 `outbox_bridge` 字段固定报告 `debezium`。
 - Compose 默认启动 Debezium，启动脚本不再选择投递模式。Kafka 文档通知由独立连接器读取 binlog 产生，搜索与缓存事件继续使用各自发布机制。
 - MySQL 表结构、通知 schema、REST/MCP 契约不变，无数据迁移。本文早期章节中的 relay 与双模式验证记录仅描述当时实现，当前以本节为准。
+
+### 2026-11-13：PDF 解析统一为远端视觉模型（移除本地 Docling/torch/OCR 模型）
+
+- **背景**：旧实现把 PDF 的本地 Docling/torch/easyocr/CodeFormula 与模型卷作为默认路径，镜像大、需要联网预置模型，且版面/表格/OCR 的本地推理质量与可维护性都受限。本轮把 PDF 的版面、OCR、表格、公式、图片描述统一改为**知识库配置的远端 OpenAI 兼容视觉模型**。
+- **服务端**：`python-workers/pdf-service` 重写为「本地 PyMuPDF 读取/渲染/裁图 + 远端视觉调用 + 清单组装」，删除 docling/torch/easyocr/CodeFormula 依赖与 `RAG_PDF_MODELS_PATH`/`pdf_parser_models` 模型卷；`RAG_PDF_SERVICE_CONVERTER` 默认 `vision`，旧值 `docling` 作为兼容别名；`options` 键名规范为 `vision`（`vlm` 为兼容别名，`ocr` 键已废除并返回 422）。清单 JSON 结构与版本 `docling-service-v1` **保持不变**（证据格式契约），Go/存储/检索无需迁移。
+- **Go 端**：`internal/document/docling_service.go` 由 `pdf_service.go` 取代，仍实现 `ingest.PDFParser` 与 `document.PDFPages`，`options` 只发送 `vision`；`RAG_PDF_ENGINE` 接受 `vision`（默认）/`go`，旧值 `docling` 归一化为 `vision`；`RAG_PDF_ENGINE=vision` 且知识库未配置 VLM 时，上传在受理阶段返回固定中文提示并拒绝。
+- **配置迁移**：升级时一次性迁移（schema 迁移）**删除 `kind='ocr'` 的模型配置**，并从知识库设置中清除遗留 `ocr`/`ocr_model` 键；`model_profiles` 的 kind 收敛为 `embedding` / `reranker` / `vlm` / `jev`。
+- **前端**：`api.ts` 的知识库模型类型/标签移除 `ocr`；「模型配置」页与创建知识库表单删除 OCR 页签、引擎下拉与开关（可选模型为 Reranker / VLM），创建页模型卡片改为自适应三列。
+- **部署/文档**：Compose 的 `pdf-parser` 删除 torch 构建参数与模型卷、默认 converter 改为 `vision`；README、USAGE、DEPLOYMENT、pdf-service README、agents 文档与 `AGENTS.md` 同步；`VALIDATION.md` 追加本次验证记录。
+- **兼容性**：`docling-service-v1`、`docling-formula-remote-v3`（历史）与 `go-native-v1` 仍可被 `IsSupportedPDFParserVersion` 读取；旧文档不需要重新解析。
+- **未验证**：真实视觉端点端到端、真实扫描 PDF 的解析质量、Docker 镜像构建与 `RAG_TEST_MYSQL_URL` 相关测试未在本环境实机执行，见 `VALIDATION.md`。

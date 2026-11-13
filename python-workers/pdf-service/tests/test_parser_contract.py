@@ -1,6 +1,6 @@
 """Pure-unit tests for the manifest contract, formula rendering and validation.
 
-These tests never import docling: they cover the exporters' pure helpers plus
+These tests never contact a vision endpoint: they cover the pure helpers plus
 the strict contract validator that protects the Go backend.
 """
 
@@ -257,10 +257,13 @@ def test_validate_table_structure_rejects_unreliable_wide_table() -> None:
 
 
 def test_build_converter_selects_modes() -> None:
-    assert build_converter("fake", models_path=None, vlm=None).name == "fake"
-    assert build_converter("docling", models_path=None, vlm=None).name == "docling"
+    assert build_converter("fake", vlm=None).name == "fake"
+    assert build_converter("vision", vlm=None).name == "vision"
+    assert build_converter("", vlm=None).name == "vision"
+    # Legacy deployments keep working: docling is an alias for the vision converter.
+    assert build_converter("docling", vlm=None).name == "vision"
     with pytest.raises(ParserConfigError):
-        build_converter("onnx", models_path=None, vlm=None)
+        build_converter("onnx", vlm=None)
 
 
 def test_fake_manifest_is_independent_between_calls() -> None:
