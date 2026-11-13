@@ -85,15 +85,13 @@ type Options struct {
 	DocumentTopic string
 	DocumentGroup string
 	// KafkaProgress reads the document consumer group offsets. nil means the
-	// Kafka delivery progress is not wired in this deployment (the process runs
-	// with the in-process outbox).
+	// Kafka delivery progress is not wired in this deployment.
 	KafkaProgress func(ctx context.Context) (KafkaProgress, error)
 
-	OutboxBridge   string
-	UploadMode     string
-	DocumentWorker string
-	PDFEngine      string
-	PDFServiceURL  string
+	OutboxBridge  string
+	UploadMode    string
+	PDFEngine     string
+	PDFServiceURL string
 
 	StartedAt time.Time
 	// HTTPClient is shared by the Qdrant and PDF probes; nil uses a client
@@ -338,16 +336,15 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 		"generated_at": now.UTC().Format(time.RFC3339),
 		"ok":           statsErr == nil && !dependencyFailed,
 		"service": map[string]any{
-			"name":            version.ServiceName,
-			"version":         version.Version,
-			"backend":         "go",
-			"collection":      s.options.Collection,
-			"started_at":      startedAt.UTC().Format(time.RFC3339),
-			"uptime_seconds":  roundOneDecimal(uptime),
-			"upload_mode":     s.options.UploadMode,
-			"outbox_bridge":   s.options.OutboxBridge,
-			"document_worker": s.options.DocumentWorker,
-			"pdf_engine":      s.options.PDFEngine,
+			"name":           version.ServiceName,
+			"version":        version.Version,
+			"backend":        "go",
+			"collection":     s.options.Collection,
+			"started_at":     startedAt.UTC().Format(time.RFC3339),
+			"uptime_seconds": roundOneDecimal(uptime),
+			"upload_mode":    s.options.UploadMode,
+			"outbox_bridge":  s.options.OutboxBridge,
+			"pdf_engine":     s.options.PDFEngine,
 		},
 		"dependencies": dependencies,
 		"queues":       queues,
@@ -467,7 +464,7 @@ func (s *Service) probeKafkaProgress(ctx context.Context) pipelineKafka {
 	}
 	if len(kafkaBrokerList(s.options.KafkaBootstrapServers)) == 0 {
 		view.Status = statusDisabled
-		view.Detail = "未配置 Kafka：使用进程内 outbox"
+		view.Detail = "未配置 Kafka：文档通知不会投递"
 		return view
 	}
 	if s.options.KafkaProgress == nil {
@@ -610,7 +607,7 @@ func (s *Service) probeQdrant(ctx context.Context) probeResult {
 func (s *Service) probeKafka(ctx context.Context) probeResult {
 	brokers := kafkaBrokerList(s.options.KafkaBootstrapServers)
 	if len(brokers) == 0 {
-		return probeResult{status: statusDisabled, detail: "未配置 Kafka：同步检索 / 进程内 outbox"}
+		return probeResult{status: statusDisabled, detail: "未配置 Kafka：同步检索 / 文档任务无法投递"}
 	}
 	dialer := net.Dialer{}
 	connection, err := dialer.DialContext(ctx, "tcp", brokers[0])

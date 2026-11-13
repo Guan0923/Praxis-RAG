@@ -158,12 +158,12 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 
 ## 12. 异步队列、死信与缓存
 
-- Kafka 只在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；空值 = brokerless（内嵌文档 worker 轮询发件箱，MCP 搜索同步）。
+- Kafka 只在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；空值 = brokerless（MCP 搜索同步，文档通知无法投递、文档任务保持 `queued`）。
 - 文档 outbox 由 Debezium 读取 MySQL binlog 并投递 Kafka；应用只写入事务 outbox，不发布文档通知。
 - outbox 保留期清理（`GCOutbox`）产生的 CDC 删除事件（`op=d`，以及 Debezium tombstone）在解码层被识别为「发件箱清理记录」并直接 ACK：不进入文档任务处理、不重试、不进死信；正常修/增/读事件仍照常触发入库。业务文档删除与 outbox 清理互不影响。
 - topic：`praxis_state_cache_refresh`、`praxis_document_ingest`、`praxis_search`；DLQ 是显式 topic `praxis_document_ingest_dead_letters` / `praxis_search_dead_letters`（不是 `%DLQ%` 约定），由 `rag-dead-letter-worker --kind document|search` 消费。
 - 消费语义至少一次：成功提交 offset；失败同进程指数退避重试（100ms 起、上限 5s），达到 `MaxAttempts`（默认 5）后写 DLQ 再提交；重复投递由幂等与 MySQL 租约吸收。
-- 无 Kafka 时 `rag-service` 默认内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS=auto`）；也可关闭内嵌 worker 并运行 `RAG_DOCUMENT_WORKER_LOCAL=1` 的独立文档 worker。
+- 文档 worker 只有 Kafka 消费模式：`rag-service` 不内嵌消费者，`rag-document-worker` 消费 Debezium 投递的 `RAG_DOCUMENT_TOPIC`；未配置 Kafka 或未运行该 worker 时，上传仍受理但任务保持 `queued`。
 - Redis 用途：读模型展示缓存（短 TTL）、搜索任务状态、搜索结果快照；Redis 不可用时读模型回源 MySQL，但**排队搜索的结果快照必须有 Redis**。
 - 配置了 Kafka 后 MCP `search` 自动排队；没有部署 `rag-search-worker`/Redis 时会一直排队到 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120s）。
 

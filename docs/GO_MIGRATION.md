@@ -314,7 +314,7 @@ REST /v1/admin/tools -> 6 tools
 
 已验证：`go build ./cmd/...`、`go vet ./cmd/...` 全绿；三个二进制实跑：无 broker → 2（明确文案）、错误 backend → 2、`--kind` 非法 → 2、`--help` → 0、document worker 本地模式可启动并创建 SQLite 状态。
 
-**Worker 运行环境要点**（完整表见 CLI 输出/GO_MIGRATION 计划）：共享 `RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`RAG_REDIS_*`、`RAG_BACKEND=qdrant`、`QDRANT_URL`、`RAG_ROCKETMQ_*`；搜索 worker 另有 `RAG_SEARCH_TOPIC/GROUP/MAX_ATTEMPTS`；文档 worker 另有 `RAG_DOCUMENT_TOPIC/GROUP/BROKER_MAX_RETRIES`、`RAG_DOCUMENT_WORKER_LOCAL/POLL_SECONDS/RECOVER_SECONDS`；DLQ worker 另有 `RAG_*_DLQ_GROUP/TOPIC`。
+**Worker 运行环境要点**（完整表见 CLI 输出/GO_MIGRATION 计划）：共享 `RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`RAG_REDIS_*`、`RAG_BACKEND=qdrant`、`QDRANT_URL`、`RAG_ROCKETMQ_*`；搜索 worker 另有 `RAG_SEARCH_TOPIC/GROUP/MAX_ATTEMPTS`；文档 worker 另有 `RAG_DOCUMENT_TOPIC/GROUP/BROKER_MAX_RETRIES`、`RAG_DOCUMENT_WORKER_CONCURRENCY/RECOVER_SECONDS`；DLQ worker 另有 `RAG_*_DLQ_GROUP/TOPIC`。
 
 ### 2026-11-08 第十三轮：P0/P1 parity 修复完成
 

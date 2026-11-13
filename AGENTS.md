@@ -8,7 +8,7 @@ Praxis-RAG：面向 AI 助手与业务应用的**独立知识库与检索服务*
 
 - 后端：**Go 1.27**（`cmd/` 入口 + `internal/` 实现）；`rag-service` + 3 个 worker + 若干 CLI。
 - 前端：`frontend/`（React 19 + TypeScript + Ant Design 6 + Vite），Go 服务在 `/console` 托管。
-- 状态：**MySQL 8**（唯一状态库）；向量：**Qdrant HTTP**；缓存/快照：Redis（可选）；消息：Kafka（可选）。
+- 状态：**MySQL 8**（唯一状态库）；向量：**Qdrant HTTP**；缓存/快照：Redis（可选）；消息：Kafka（文档处理必需；排队搜索可选）。
 - PDF 高保真：可选独立微服务 `python-workers/pdf-service`（FastAPI + Docling，HTTP :8091）；除此之外无 Python 依赖。
 
 ## 2. 硬性约束（任何改动都适用）

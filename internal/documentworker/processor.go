@@ -63,12 +63,6 @@ type Ingester interface {
 	ProcessDocumentJob(ctx context.Context, job Payload) (map[string]any, error)
 }
 
-// Receiver is the optional local notification source used by Run/RunOnce.
-// Production workers consume broker messages through MessageHandler instead.
-type Receiver interface {
-	Receive(ctx context.Context) (state.DocumentNotification, bool, error)
-}
-
 // JournalRecoverer is the optional runtime hook for upload-journal recovery
 // (UploadCoordinator.recover in Python). It is best effort: maintenance
 // failures never block consumption.
@@ -83,12 +77,6 @@ type Options struct {
 	Ingester Ingester
 	Logger   *slog.Logger
 
-	// PollInterval is the Run loop idle interval (default one second).
-	PollInterval time.Duration
-	// BatchSize bounds one RunOnce pass (default one notification).
-	BatchSize int
-	// Receiver supplies notifications for Run/RunOnce; nil leaves them no-ops.
-	Receiver Receiver
 	// HeartbeatInterval overrides the job setting (tests use a short value).
 	HeartbeatInterval time.Duration
 	// TerminalError overrides the failure classification. The default mirrors
@@ -107,20 +95,10 @@ type Processor struct {
 	jobs              *state.DocumentJobs
 	ingester          Ingester
 	logger            *slog.Logger
-	pollInterval      time.Duration
-	batchSize         int
-	receiver          Receiver
 	heartbeatInterval time.Duration
 	terminalError     func(error) bool
 	journalRecovery   JournalRecoverer
 	sweepLimit        int
-
-	stopOnce sync.Once
-	stopCh   chan struct{}
-
-	mutex   sync.Mutex
-	running bool
-	closed  bool
 }
 
 // New validates options and builds the processor.
@@ -131,14 +109,6 @@ func New(options Options) (*Processor, error) {
 	logger := options.Logger
 	if logger == nil {
 		logger = slog.Default()
-	}
-	pollInterval := options.PollInterval
-	if pollInterval <= 0 {
-		pollInterval = time.Second
-	}
-	batchSize := options.BatchSize
-	if batchSize <= 0 {
-		batchSize = 1
 	}
 	heartbeat := options.HeartbeatInterval
 	if heartbeat <= 0 {
@@ -159,25 +129,11 @@ func New(options Options) (*Processor, error) {
 		jobs:              options.Jobs,
 		ingester:          options.Ingester,
 		logger:            logger,
-		pollInterval:      pollInterval,
-		batchSize:         batchSize,
-		receiver:          options.Receiver,
 		heartbeatInterval: heartbeat,
 		terminalError:     terminal,
 		journalRecovery:   options.JournalRecovery,
 		sweepLimit:        sweepLimit,
-		stopCh:            make(chan struct{}),
 	}, nil
-}
-
-// WithOutboxReceiver configures broker-less local delivery: it sets
-// options.Receiver to an OutboxReceiver so Run/RunOnce drain committed PENDING
-// document_job_outbox rows directly instead of consuming broker messages. It
-// returns the updated options so callers can build the processor in one
-// expression, and is a no-op for the broker mode where Receiver stays nil.
-func WithOutboxReceiver(options Options) Options {
-	options.Receiver = NewOutboxReceiver(options.Jobs)
-	return options
 }
 
 // defaultTerminalError ports `retry = not isinstance(exc, KnowledgeValidationError)`.
@@ -461,72 +417,6 @@ func (p *Processor) Recover(ctx context.Context) error {
 	return firstErr
 }
 
-// RunOnce drains up to BatchSize notifications from the configured Receiver and
-// returns how many were handled. Without a Receiver it is a no-op.
-func (p *Processor) RunOnce(ctx context.Context) (int, error) {
-	if p.receiver == nil {
-		return 0, nil
-	}
-	processed := 0
-	for processed < p.batchSize {
-		if err := ctx.Err(); err != nil {
-			return processed, nil
-		}
-		notification, ok, err := p.receiver.Receive(ctx)
-		if err != nil {
-			return processed, err
-		}
-		if !ok {
-			break
-		}
-		p.Handle(ctx, notification)
-		processed++
-	}
-	return processed, nil
-}
-
-// Run performs startup recovery once, then polls RunOnce every PollInterval
-// until ctx is cancelled or Stop/Close is called. It is idempotent on shutdown
-// and returns nil for a graceful stop.
-func (p *Processor) Run(ctx context.Context) error {
-	p.mutex.Lock()
-	if p.closed {
-		p.mutex.Unlock()
-		return fmt.Errorf("documentworker: processor is closed")
-	}
-	if p.running {
-		p.mutex.Unlock()
-		return fmt.Errorf("documentworker: processor is already running")
-	}
-	p.running = true
-	p.mutex.Unlock()
-	defer func() {
-		p.mutex.Lock()
-		p.running = false
-		p.mutex.Unlock()
-	}()
-
-	// Python's main loop calls worker.recover() before each consumption pass;
-	// the Go loop performs it once at start and exposes Recover for periodic use.
-	_ = p.Recover(ctx)
-
-	timer := time.NewTimer(0)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-p.stopCh:
-			return nil
-		case <-timer.C:
-		}
-		if _, err := p.RunOnce(ctx); err != nil {
-			p.logWarn("document worker pass failed", "error_type", typeName(err))
-		}
-		timer.Reset(p.pollInterval)
-	}
-}
-
 // RunConsumer starts an mq consumer whose handler is MessageHandler and blocks
 // until ctx is done, then stops the consumer. It is the production lifecycle.
 func (p *Processor) RunConsumer(ctx context.Context, consumer mq.Consumer) error {
@@ -539,69 +429,6 @@ func (p *Processor) RunConsumer(ctx context.Context, consumer mq.Consumer) error
 	defer func() { _ = consumer.Stop() }()
 	<-ctx.Done()
 	return nil
-}
-
-// Stop asks the Run loop to exit. It is idempotent and safe to call before Run.
-func (p *Processor) Stop() {
-	p.stopOnce.Do(func() { close(p.stopCh) })
-}
-
-// Close stops the processor loop and marks it closed. It is idempotent.
-func (p *Processor) Close() error {
-	p.Stop()
-	p.mutex.Lock()
-	p.closed = true
-	p.mutex.Unlock()
-	return nil
-}
-
-// OutboxReceiver is the broker-less local delivery mode: it drains committed
-// PENDING outbox rows, marks them published, and yields their schema-3
-// notifications. Job-level retries are re-emitted by Sweep, so a failed
-// delivery is redelivered after the sweep delay without a broker.
-type OutboxReceiver struct {
-	Jobs  *state.DocumentJobs
-	Limit int
-}
-
-// NewOutboxReceiver builds the local outbox-backed receiver.
-func NewOutboxReceiver(jobs *state.DocumentJobs) *OutboxReceiver {
-	return &OutboxReceiver{Jobs: jobs, Limit: 1}
-}
-
-// Receive implements Receiver.
-func (r *OutboxReceiver) Receive(ctx context.Context) (state.DocumentNotification, bool, error) {
-	if r.Jobs == nil {
-		return state.DocumentNotification{}, false, fmt.Errorf("documentworker: jobs are required")
-	}
-	limit := r.Limit
-	if limit <= 0 {
-		limit = 1
-	}
-	events, err := r.Jobs.PendingOutbox(ctx, limit)
-	if err != nil {
-		return state.DocumentNotification{}, false, err
-	}
-	if len(events) == 0 {
-		return state.DocumentNotification{}, false, nil
-	}
-	event := events[0]
-	notification, err := state.ValidateDocumentNotification(map[string]any{
-		"schema":      float64(state.DocumentEnvelopeSchema),
-		"artifact_id": event.ArtifactID,
-		"namespace":   event.Namespace,
-		"name":        event.Name,
-		"created_at":  event.CreatedAt,
-	})
-	if err != nil {
-		// Poison outbox row: record a bounded error so it backs off, then skip.
-		_ = r.Jobs.MarkPublished(ctx, event.ID, err)
-		return state.DocumentNotification{}, false, nil
-	}
-	if err := r.Jobs.MarkPublished(ctx, event.ID, nil); err != nil {
-		return state.DocumentNotification{}, false, err
-	}
-	return notification, true, nil
 }
 
 func isTerminalStatus(status string) bool {

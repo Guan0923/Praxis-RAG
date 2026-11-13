@@ -827,7 +827,6 @@ export type MonitorService = {
   uptime_seconds: number;
   upload_mode: string;
   outbox_bridge: string;
-  document_worker: string;
   pdf_engine: string;
 };
 export type MonitorOverview = {

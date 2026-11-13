@@ -220,7 +220,6 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
             { key: "collection", label: "集合", children: service?.collection || "—" },
             { key: "upload", label: "上传模式", children: service?.upload_mode || "—" },
             { key: "outbox", label: "Outbox 模式", children: service?.outbox_bridge || "—" },
-            { key: "worker", label: "文档 Worker", children: service?.document_worker || "—" },
             { key: "pdf", label: "PDF 引擎", children: service?.pdf_engine || "—" },
             { key: "started", label: "启动时间", children: formatDateTime(service?.started_at) },
           ]}

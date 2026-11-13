@@ -72,9 +72,6 @@ func TestDocumentDeadLetterExhaustion(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("dead-letter consumer did not stop")
 	}
-	if err := worker.Close(); err != nil {
-		t.Fatalf("worker.Close() error = %v", err)
-	}
 	if transport.ackCount() != 1 {
 		t.Fatalf("ack count = %d, want 1 (ack only after the durable outcome)", transport.ackCount())
 	}

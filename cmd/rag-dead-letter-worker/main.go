@@ -139,7 +139,6 @@ func run(args []string) error {
 			return err
 		}
 		handler = worker.DeadLetterHandler()
-		closeWorker = worker.Close
 	default:
 		return usagef("--kind must be %q or %q", "search", "document")
 	}
@@ -169,7 +168,10 @@ func run(args []string) error {
 	logger.Info("Praxis-RAG dead-letter worker stopping", "kind", kind)
 
 	stopErr := consumer.Stop()
-	workerErr := closeWorker()
+	var workerErr error
+	if closeWorker != nil {
+		workerErr = closeWorker()
+	}
 	if stopErr != nil {
 		return stopErr
 	}

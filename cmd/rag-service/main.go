@@ -92,31 +92,11 @@ func run() error {
 	if err := service.StartBackground(context.Background()); err != nil {
 		return err
 	}
-	// Broker-less deployments parse admitted uploads in-process; Kafka
-	// deployments keep the external rag-document-worker binary.
-	inProcessWorker, err := resolveDocumentWorkerMode(
-		os.Getenv("RAG_DOCUMENT_WORKER_INPROCESS"), mqSettings.Configured())
-	if err != nil {
-		return err
-	}
-	documentWorkerMode := "external"
-	var embeddedWorker *embeddedDocumentWorker
-	if inProcessWorker {
-		pollInterval, pollErr := documentWorkerPollInterval(os.Getenv("RAG_DOCUMENT_WORKER_POLL_SECONDS"))
-		if pollErr != nil {
-			return pollErr
-		}
-		embeddedWorker, err = startEmbeddedDocumentWorker(stores, service, logger, pollInterval)
-		if err != nil {
-			return err
-		}
-		if embeddedWorker != nil {
-			documentWorkerMode = "in-process"
-		}
-	}
-	if documentWorkerMode == "external" {
-		logger.Warn("Without an in-process document worker: REST/Console uploads stay queued until rag-document-worker runs",
-			"hint", "start rag-document-worker, or leave RAG_KAFKA_BOOTSTRAP_SERVERS empty to parse in-process")
+	// Document parsing happens only in the standalone rag-document-worker, which
+	// consumes Debezium-delivered notifications from Kafka. Without Kafka the
+	// service still admits uploads, but their jobs stay queued.
+	if !mqSettings.Configured() {
+		logger.Warn("RAG_KAFKA_BOOTSTRAP_SERVERS is not configured: document jobs stay queued because rag-document-worker consumes them through Kafka")
 	}
 	// The Console monitoring page is read-only: one state aggregate plus five
 	// bounded dependency probes, assembled per request by internal/monitor.
@@ -151,7 +131,6 @@ func run() error {
 		KafkaProgress:         kafkaProgress,
 		OutboxBridge:          "debezium",
 		UploadMode:            "async",
-		DocumentWorker:        documentWorkerMode,
 		PDFEngine:             ragConfig.PDFEngine,
 		PDFServiceURL:         ragConfig.PDFServiceURL,
 		StartedAt:             time.Now(),
@@ -219,7 +198,6 @@ func run() error {
 		"backend", string(ragConfig.Backend),
 		"console", api.WebRoot(),
 		"upload_mode", "async",
-		"document_worker", documentWorkerMode,
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -240,11 +218,6 @@ func run() error {
 	}
 
 	logger.Info("Praxis-RAG service stopping")
-	// Stop parsing before the runtime and stores close; a bounded context keeps a
-	// stuck ingestion from delaying shutdown indefinitely.
-	workerStopContext, cancelWorkerStop := context.WithTimeout(context.Background(), documentWorkerShutdownTimeout)
-	embeddedWorker.stop(workerStopContext)
-	cancelWorkerStop()
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownContext); err != nil {

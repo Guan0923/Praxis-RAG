@@ -83,11 +83,6 @@ _ = worker.Close()
 return service.Close(ctx)
 ```
 
-Broker-less single-process mode: `worker.Run(ctx)` performs startup `Recover`
-once, then polls `OutboxReceiver` (`documentworker.NewOutboxReceiver(stores.DocumentJobs)`)
-which drains committed PENDING outbox rows without a broker; job retries are
-re-emitted by `Sweep`. Override `Options.Receiver` for tests/fakes.
-
 Dead-letter binary (`cmd/rag-dead-letter-worker --kind document`): construct the
 processor with only `Jobs` (no Ingester) and a Kafka consumer subscribed to the
 document DLQ topic (`RAG_DOCUMENT_DLQ_TOPIC`), then run

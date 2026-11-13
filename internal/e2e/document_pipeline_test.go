@@ -79,9 +79,6 @@ func TestDocumentPipelineEndToEnd(t *testing.T) {
 	case <-time.After(90 * time.Second):
 		t.Fatalf("document consumer did not stop")
 	}
-	if err := worker.Close(); err != nil {
-		t.Fatalf("worker.Close() error = %v", err)
-	}
 	if transport.ackCount() != 1 || transport.nackCount() != 0 {
 		t.Fatalf("delivery ack/nack = %d/%d, want 1/0", transport.ackCount(), transport.nackCount())
 	}
@@ -144,63 +141,5 @@ func TestDocumentPipelineEndToEnd(t *testing.T) {
 	}
 	if upserts == 0 {
 		t.Fatalf("no Qdrant point upserts were issued to knowledge_test")
-	}
-}
-
-// TestDocumentWorkerOutboxLocalMode drives the same pipeline without a broker:
-// the worker polls the committed outbox rows directly (cmd/rag-document-worker
-// RAG_DOCUMENT_WORKER_LOCAL=1 mode).
-func TestDocumentWorkerOutboxLocalMode(t *testing.T) {
-	h := newHarness(t, "")
-	ctx := context.Background()
-
-	admission, err := h.Service.AddDocument(ctx, "alpha", "local.md", []byte(documentText), "")
-	if err != nil {
-		t.Fatalf("AddDocument() error = %v", err)
-	}
-	artifactID, _ := admission["artifact_id"].(string)
-	worker, err := documentworker.New(documentworker.Options{
-		Jobs:            h.Stores.DocumentJobs,
-		Ingester:        h.Service,
-		JournalRecovery: h.Service,
-		Logger:          testLogger(),
-		Receiver:        documentworker.NewOutboxReceiver(h.Stores.DocumentJobs),
-		PollInterval:    10 * time.Millisecond,
-	})
-	if err != nil {
-		t.Fatalf("documentworker.New() error = %v", err)
-	}
-	runCtx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- worker.Run(runCtx) }()
-
-	waitFor(t, 90*time.Second, "local-mode document job succeeded", func() bool {
-		current, readErr := h.Stores.DocumentJobs.Get(context.Background(), artifactID, nil)
-		return readErr == nil && current != nil && current.Status == state.DocumentJobSucceeded
-	})
-	worker.Stop()
-	select {
-	case runErr := <-done:
-		if runErr != nil {
-			t.Fatalf("Run() error = %v", runErr)
-		}
-	case <-time.After(90 * time.Second):
-		t.Fatalf("local-mode document worker did not stop")
-	}
-	cancel()
-	if err := worker.Close(); err != nil {
-		t.Fatalf("worker.Close() error = %v", err)
-	}
-
-	pending, err := h.Stores.DocumentJobs.PendingOutbox(ctx, 10)
-	if err != nil {
-		t.Fatalf("PendingOutbox() error = %v", err)
-	}
-	if len(pending) != 0 {
-		t.Fatalf("outbox not drained in local mode: %v", pending)
-	}
-	documents, err := h.Service.ListDocuments(ctx, "alpha")
-	if err != nil || len(documents) != 1 || documents[0]["name"] != "local.md" {
-		t.Fatalf("ListDocuments() = %v, %v", documents, err)
 	}
 }

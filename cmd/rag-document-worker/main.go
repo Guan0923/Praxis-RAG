@@ -1,14 +1,12 @@
-// Command rag-document-worker consumes durable document-ingest jobs: it leases
-// one committed job, keeps the SQL lease alive while the runtime parses and
-// indexes it, reconciles committed journal publications after a crash, and
+// Command rag-document-worker consumes durable document-ingest jobs from Kafka:
+// it leases one committed job, keeps the SQL lease alive while the runtime parses
+// and indexes it, reconciles committed journal publications after a crash, and
 // records retryable or terminal failures.
 //
-// Two modes are supported:
-//   - broker mode (default; RAG_KAFKA_BOOTSTRAP_SERVERS set): pull the document topic
-//     with the document consumer group;
-//   - single-process outbox mode (RAG_DOCUMENT_WORKER_LOCAL=1, no endpoint): poll
-//     the committed document_job_outbox rows directly, for development and
-//     broker-less deployments.
+// It is the only document consumer. Debezium publishes committed
+// document_job_outbox rows to RAG_DOCUMENT_TOPIC and the worker joins
+// RAG_DOCUMENT_GROUP, so RAG_KAFKA_BOOTSTRAP_SERVERS is required. rag-service
+// never parses documents itself.
 //
 // It is the Go counterpart of rag_mcp.document_worker.
 package main
@@ -110,17 +108,12 @@ func run() error {
 	if err != nil {
 		return configError(err)
 	}
-	pollInterval, err := durationSecondsEnv("RAG_DOCUMENT_WORKER_POLL_SECONDS", 500*time.Millisecond)
-	if err != nil {
-		return configError(err)
-	}
 	recoverInterval, err := durationSecondsEnv("RAG_DOCUMENT_WORKER_RECOVER_SECONDS", 30*time.Second)
 	if err != nil {
 		return configError(err)
 	}
-	localMode := isTruthy(os.Getenv("RAG_DOCUMENT_WORKER_LOCAL"))
-	if !mqSettings.Configured() && !localMode {
-		return usagef("RAG_KAFKA_BOOTSTRAP_SERVERS is required unless RAG_DOCUMENT_WORKER_LOCAL=1 selects the single-process outbox mode")
+	if !mqSettings.Configured() {
+		return usagef("RAG_KAFKA_BOOTSTRAP_SERVERS is required to run the document worker")
 	}
 
 	stores, err := state.New(stateSettings, stateSettings.AutoSchema)
@@ -129,10 +122,6 @@ func run() error {
 	}
 	defer func() { _ = stores.Close() }()
 	logger := newLogger()
-	if mqSettings.Configured() && localMode {
-		logger.Warn("RAG_DOCUMENT_WORKER_LOCAL is ignored because RAG_KAFKA_BOOTSTRAP_SERVERS is configured; using broker mode")
-		localMode = false
-	}
 
 	cache, err := redisstate.NewFromEnv()
 	if err != nil {
@@ -152,10 +141,6 @@ func run() error {
 		Ingester:        service,
 		JournalRecovery: service,
 		Logger:          logger,
-		PollInterval:    pollInterval,
-	}
-	if localMode {
-		options = documentworker.WithOutboxReceiver(options)
 	}
 	worker, err := documentworker.New(options)
 	if err != nil {
@@ -167,13 +152,8 @@ func run() error {
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	defer cancelWorker()
 
-	mode := "broker"
-	if localMode {
-		mode = "outbox-local"
-	}
 	logger.Info("Praxis-RAG document worker starting",
 		"version", version.Version,
-		"mode", mode,
 		"topic", mqSettings.DocumentTopic,
 		"group", mqSettings.DocumentGroup,
 		"max_attempts", maxAttempts,
@@ -183,28 +163,22 @@ func run() error {
 	)
 
 	go recoveryLoop(workerCtx, worker, recoverInterval, logger)
-	if localMode {
-		if err := worker.Run(workerCtx); err != nil {
-			return err
-		}
-	} else {
-		if err := worker.Recover(ctx); err != nil {
-			logger.Warn("document worker startup recovery failed", "error_type", errorTypeName(err))
-		}
-		consumerConfig := mq.DefaultConsumerConfig(mqSettings.DocumentTopic, mqSettings.DocumentGroup)
-		consumerConfig.MaxAttempts = maxAttempts
-		consumerConfig.Concurrency = concurrency
-		consumer, err := mq.NewKafkaPullConsumer(mqSettings, consumerConfig, worker.MessageHandler())
-		if err != nil {
-			return err
-		}
-		consumer.OnExhausted = worker.ExhaustedHandler()
-		if err := worker.RunConsumer(ctx, consumer); err != nil {
-			return err
-		}
+	if err := worker.Recover(ctx); err != nil {
+		logger.Warn("document worker startup recovery failed", "error_type", errorTypeName(err))
 	}
-	logger.Info("Praxis-RAG document worker stopping", "mode", mode)
-	return shutdown(worker, service)
+	consumerConfig := mq.DefaultConsumerConfig(mqSettings.DocumentTopic, mqSettings.DocumentGroup)
+	consumerConfig.MaxAttempts = maxAttempts
+	consumerConfig.Concurrency = concurrency
+	consumer, err := mq.NewKafkaPullConsumer(mqSettings, consumerConfig, worker.MessageHandler())
+	if err != nil {
+		return err
+	}
+	consumer.OnExhausted = worker.ExhaustedHandler()
+	if err := worker.RunConsumer(ctx, consumer); err != nil {
+		return err
+	}
+	logger.Info("Praxis-RAG document worker stopping")
+	return shutdown(service)
 }
 
 func recoveryLoop(ctx context.Context, worker *documentworker.Processor, interval time.Duration, logger *slog.Logger) {
@@ -222,12 +196,9 @@ func recoveryLoop(ctx context.Context, worker *documentworker.Processor, interva
 	}
 }
 
-func shutdown(worker *documentworker.Processor, service *runtime.Service) error {
+func shutdown(service *runtime.Service) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	if err := worker.Close(); err != nil {
-		return err
-	}
 	return service.Close(ctx)
 }
 

@@ -182,7 +182,6 @@ func healthyOptions(t *testing.T) Options {
 		KafkaBootstrapServers: []string{kafkaListener(t)},
 		OutboxBridge:          "debezium",
 		UploadMode:            "async",
-		DocumentWorker:        "in-process",
 		PDFEngine:             pdfEngineDocling,
 		PDFServiceURL:         pdf.URL,
 		StartedAt:             time.Now().Add(-90 * time.Second),
@@ -249,7 +248,7 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 		t.Fatalf("service = %v", service)
 	}
 	if service["upload_mode"] != "async" || service["outbox_bridge"] != "debezium" ||
-		service["document_worker"] != "in-process" || service["pdf_engine"] != pdfEngineDocling {
+		service["pdf_engine"] != pdfEngineDocling {
 		t.Fatalf("service = %v", service)
 	}
 	if uptime, _ := service["uptime_seconds"].(float64); uptime < 89 {
@@ -364,14 +363,13 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 func TestMonitorOverviewDegradedAndDisabled(t *testing.T) {
 	qdrant := qdrantServer(t, "knowledge", 0, true)
 	options := Options{
-		Stats:          &fakeStatsProvider{stats: sampleStats()},
-		MySQL:          fakeMySQLPinger{},
-		QdrantURL:      qdrant.URL,
-		Collection:     "knowledge",
-		PDFEngine:      "go",
-		UploadMode:     "sync",
-		OutboxBridge:   "debezium",
-		DocumentWorker: "external",
+		Stats:        &fakeStatsProvider{stats: sampleStats()},
+		MySQL:        fakeMySQLPinger{},
+		QdrantURL:    qdrant.URL,
+		Collection:   "knowledge",
+		PDFEngine:    "go",
+		UploadMode:   "sync",
+		OutboxBridge: "debezium",
 	}
 	overview := New(options).MonitorOverview(context.Background())
 
@@ -402,7 +400,7 @@ func TestMonitorOverviewDegradedAndDisabled(t *testing.T) {
 		t.Fatalf("pipeline.debezium = %+v", pipeline.Debezium)
 	}
 	if pipeline.Kafka.Status != statusDisabled ||
-		pipeline.Kafka.Detail != "未配置 Kafka：使用进程内 outbox" {
+		pipeline.Kafka.Detail != "未配置 Kafka：文档通知不会投递" {
 		t.Fatalf("pipeline.kafka = %+v", pipeline.Kafka)
 	}
 }
@@ -412,16 +410,15 @@ func TestMonitorOverviewDegradedAndDisabled(t *testing.T) {
 func TestMonitorOverviewErrors(t *testing.T) {
 	unreachable := unreachableAddress(t)
 	options := Options{
-		Stats:          &fakeStatsProvider{stats: sampleStats()},
-		MySQL:          fakeMySQLPinger{err: errors.New("db down")},
-		Redis:          fakeRedisProbe{enabled: true, err: errors.New("redis down")},
-		QdrantURL:      "http://" + unreachable,
-		Collection:     "knowledge",
-		PDFEngine:      pdfEngineDocling,
-		PDFServiceURL:  "http://" + unreachable,
-		UploadMode:     "async",
-		OutboxBridge:   "debezium",
-		DocumentWorker: "in-process",
+		Stats:         &fakeStatsProvider{stats: sampleStats()},
+		MySQL:         fakeMySQLPinger{err: errors.New("db down")},
+		Redis:         fakeRedisProbe{enabled: true, err: errors.New("redis down")},
+		QdrantURL:     "http://" + unreachable,
+		Collection:    "knowledge",
+		PDFEngine:     pdfEngineDocling,
+		PDFServiceURL: "http://" + unreachable,
+		UploadMode:    "async",
+		OutboxBridge:  "debezium",
 	}
 	overview := New(options).MonitorOverview(context.Background())
 
@@ -725,7 +722,7 @@ func TestMonitorPipelineKafka(t *testing.T) {
 		options.DocumentGroup = mqDocumentGroup
 		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
 		if view.Kafka.Status != statusDisabled ||
-			view.Kafka.Detail != "未配置 Kafka：使用进程内 outbox" {
+			view.Kafka.Detail != "未配置 Kafka：文档通知不会投递" {
 			t.Fatalf("pipeline.kafka = %+v", view.Kafka)
 		}
 		if view.Kafka.Topic != mqDocumentTopic || view.Kafka.Group != mqDocumentGroup {

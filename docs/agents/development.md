@@ -135,7 +135,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 - `RAG_PDF_ENGINE=go` 只适合文字型 PDF：无版面分析、表格结构、OCR、公式与图片资产；扫描件需先 OCR。
 - 暂不支持 Excel、网页抓取、独立图片上传；`.doc` 依赖外部 LibreOffice。
 - 排队搜索依赖 Kafka + Redis；结果快照过期/丢失后无法回放；死信 topic 需要显式创建。
-- 上传默认异步，必须存在文档消费者（无 Kafka 时是内嵌 worker），否则任务会一直 `queued`。
+- 上传默认异步，必须存在文档消费者：配置 Kafka + Debezium 并运行独立的 `rag-document-worker`；没有内嵌/进程内选项，未部署时任务会一直 `queued`。
 - 受限账号在启用 Kafka 的部署下不支持排队检索（同步检索不受影响）。
 - 管理凭证（Service Token / API Key）在请求时不做知识库归属校验，只受 API Key 命名空间白名单约束。
 
@@ -156,7 +156,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 | --- | --- |
 | `README.md` | 产品概览、快速开始、运行时架构、使用边界 |
 | `docs/USAGE.md` | 构建/配置/启动、REST/MCP 示例、worker、迁移 CLI、Docker、验证边界 |
-| `docs/DEPLOYMENT.md` | Docker/Compose、systemd、worker 重启策略、DLQ 监控、outbox 模式 |
+| `docs/DEPLOYMENT.md` | Docker/Compose、systemd、worker 重启策略、DLQ 监控、outbox 投递模式 |
 | `docs/PERMISSIONS.md` | 角色、知识库归属、读/写与范围、邀请流程与接口 |
 | `docs/GO_MIGRATION.md` | Python→Go 迁移总纲、阶段与进度（历史背景） |
 | `docs/GO_PARITY_AUDIT.md` | Go 与 Python/前端契约差异、P0/P1/P2 清单 |

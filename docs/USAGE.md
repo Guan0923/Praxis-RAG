@@ -7,13 +7,13 @@
 MCP 客户端 -> /mcp ------------> rag-service ──> Qdrant
 REST /v1/* --------------------> rag-service ──> 共享状态库（MySQL）
                                              ├─> Redis（读模型缓存、搜索结果快照；可选，排队搜索快照需要）
-                                             └─> Kafka（Debezium 文档通知 / 搜索队列；可选）
+                                             └─> Kafka（Debezium 文档通知 / 搜索队列；文档处理必需）
 
 网页/REST 上传（默认异步）与 MCP add_document
                  -> 状态库单事务（document_jobs + document_job_outbox）
                  -> 有 Kafka：Debezium（读取 binlog）-> Kafka 通知 -> rag-document-worker
-                 -> 无 Kafka：rag-service 内嵌文档 worker 直接轮询发件箱
-                 -> 两种方式都完成解析/切分/Embedding/Qdrant 发布，用
+                 -> 无 Kafka：没有消费者，文档任务保持 queued（rag-service 只受理）
+                 -> rag-document-worker 完成解析/切分/Embedding/Qdrant 发布，用
                     GET /v1/document-jobs/{artifact_id} 轮询状态
 REST 批次上传 POST /v1/document-batches（Console 使用）
                  -> 每文件一个事务并行受理（按文件名加锁，不同名互不排队）
@@ -36,7 +36,7 @@ RAG 只返回证据，不生成最终回答。后端为 Go 实现：DOCX 读取�
 | Qdrant | HTTP API（默认 `6333`） | 检索索引；Go **不支持** `QDRANT_PATH` 本地文件模式 |
 | 共享状态库 | MySQL 8.0+（`utf8mb4`） | 文档、KB、API Key、任务、发件箱、UploadJournal |
 | Redis | 可选，7.x | 搜索结果快照、读模型缓存；排队 MCP 搜索的快照读取必需（搜索任务状态在共享状态库） |
-| Kafka | 可选，单节点 KRaft（Compose `kafka`）或外部集群 | 异步文档通知、排队搜索；可用 SASL/TLS 环境变量连接外部集群，Compose 本身只提供 PLAINTEXT |
+| Kafka | 文档处理必需（排队搜索另用），单节点 KRaft（Compose `kafka`）或外部集群 | 异步文档通知、排队搜索；可用 SASL/TLS 环境变量连接外部集群，Compose 本身只提供 PLAINTEXT |
 | Docling 解析微服务 | 可选（默认 compose 启动） | PDF 版面/表格/OCR/公式高保真解析（`python-workers/pdf-service`，容器端口 8091）；`RAG_PDF_ENGINE=go` 时不需要。docling 引擎还需要在 Console 为知识库配置 VLM 与 OCR 模型 |
 | LibreOffice | 可选 | 仅 DOC 转换需要外部程序；PDF（go 引擎）/DOCX 解析不依赖它 |
 
@@ -117,11 +117,11 @@ MySQL 默认映射 `127.0.0.1:3307`（避免与本地 3306 冲突），Qdrant �
 
 pdf-parser 首次构建会拉取 CPU 版 torch 与 docling（镜像较大）。首次使用前需要把 Docling/CodeFormula 模型放入 `pdf_parser_models` 卷（需要联网：先 `docling-tools models download --output-dir /models`，再按 `python-workers/pdf-service/README.md` 单独准备 CodeFormulaV2 权重），或配置 `RAG_VLM_BASE_URL` + `RAG_VLM_MODEL` 改用远端 VLM 做公式识别；两者都没有时 `/v1/parse` 返回 503。宿主机直接运行的 Go 服务默认通过 `http://127.0.0.1:8091` 访问它；compose `app` 容器由 compose 注入 `http://pdf-parser:8091`。docling 引擎还要求每个知识库在 Console「模型配置」页添加 VLM 与 OCR 模型并在知识库表单中选择，缺失时 PDF 上传会在受理阶段返回中文提示（不进入队列）；OCR 引擎由 pdf-parser 本地执行（`easyocr` 默认；`tesseract` 需要镜像/系统安装 tesseract 与 `chi_sim`/`eng` 语言包），VLM 则调用知识库配置的 OpenAI 兼容端点。
 
-> Kafka 默认自动创建 topic（4 partitions、副本 1）；`scripts/start-stack.ps1` 仍会显式创建 cache/document/search 与两个 DLQ topic、等待 Kafka healthy、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe` 与 `dist/bin/rag-document-worker.exe`（收到 Ctrl+C 时一并停止）；默认同时启动 Debezium，并等待其输出 `Starting streaming`。用 `-MigrateOnly` 可只准备依赖与数据库。该脚本执行默认 `docker compose up -d`，因此也会启动 pdf-parser，并把 `.env` 中的 `RAG_PDF_ENGINE` 等变量加载进宿主进程；只用 Go 引擎时请在 `.env` 设 `RAG_PDF_ENGINE=go` 并自行停掉 pdf-parser。不配置 Kafka 时，默认异步上传由 `rag-service` 内嵌文档 worker 消费（`RAG_DOCUMENT_WORKER_INPROCESS`）。
+> Kafka 默认自动创建 topic（4 partitions、副本 1）；`scripts/start-stack.ps1` 仍会显式创建 cache/document/search 与两个 DLQ topic、等待 Kafka healthy、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe` 与 `dist/bin/rag-document-worker.exe`（收到 Ctrl+C 时一并停止）；默认同时启动 Debezium，并等待其输出 `Starting streaming`。用 `-MigrateOnly` 可只准备依赖与数据库。该脚本执行默认 `docker compose up -d`，因此也会启动 pdf-parser，并把 `.env` 中的 `RAG_PDF_ENGINE` 等变量加载进宿主进程；只用 Go 引擎时请在 `.env` 设 `RAG_PDF_ENGINE=go` 并自行停掉 pdf-parser。不配置 Kafka 时服务仍可启动（仅记录告警）并受理上传，但没有文档消费者，任务保持 `queued`；完整异步链路必须配置 Kafka + Debezium 并运行 `rag-document-worker`。
 
 ### 手动依赖
 
-REST/Console 批次上传与 MCP 新增均异步受理。无 Kafka 时，最小依赖为 Qdrant + 状态库，文档解析/索引由 `rag-service` 内嵌 worker 完成；Kafka 部署使用独立文档 worker。
+REST/Console 批次上传与 MCP 新增均异步受理，但都不在 `rag-service` 内解析：文档解析/索引只由独立的 `rag-document-worker` 消费 Kafka 通知完成。除状态库 + Qdrant 外还需要 Kafka（Debezium 投递文档通知）；无 Kafka 时服务仍能启动并受理上传，但任务保持 `queued`。
 
 ```powershell
 docker run -d --name praxis-qdrant -p 6333:6333 -p 6334:6334 `
@@ -279,11 +279,11 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 
 ### Kafka 与队列
 
-单节点 Compose Kafka 使用 INTERNAL/EXTERNAL 双 listener：宿主机进程用 `127.0.0.1:9092`，同一 compose 网络的容器用 `kafka:9092`；`RAG_KAFKA_BOOTSTRAP_SERVERS` 为空表示 brokerless：异步受理仍可提交，并由 `rag-service` 内嵌文档 worker 直接消费发件箱（`RAG_DOCUMENT_WORKER_INPROCESS`），Kafka 投递与排队搜索不可用。
+单节点 Compose Kafka 使用 INTERNAL/EXTERNAL 双 listener：宿主机进程用 `127.0.0.1:9092`，同一 compose 网络的容器用 `kafka:9092`；`RAG_KAFKA_BOOTSTRAP_SERVERS` 为空表示 brokerless：异步受理仍可提交，但没有 Kafka 就没有文档消费者，任务保持 `queued`（服务仍可启动，监控显示 Kafka 未启用），Kafka 投递与排队搜索不可用。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RAG_KAFKA_BOOTSTRAP_SERVERS` | 空 | 逗号分隔 `host:port`；宿主默认 `127.0.0.1:9092`，compose 容器 `kafka:9092`；空 = brokerless |
+| `RAG_KAFKA_BOOTSTRAP_SERVERS` | 空 | 逗号分隔 `host:port`；宿主默认 `127.0.0.1:9092`，compose 容器 `kafka:9092`；空 = brokerless（MCP 搜索同步；文档任务保持 `queued`，处理文档必须配置） |
 | `RAG_KAFKA_CLIENT_ID` | `praxis-rag` | Kafka 客户端标识 |
 | `RAG_KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` | `PLAINTEXT` / `SSL` / `SASL_PLAINTEXT` / `SASL_SSL` |
 | `RAG_KAFKA_SASL_MECHANISM` | 空 | `PLAIN` / `SCRAM-SHA-256` / `SCRAM-SHA-512`（仅 SASL 协议使用） |
@@ -321,9 +321,6 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 | `RAG_DEBEZIUM_PORT` | `8083` | Compose 把 Debezium 健康端口 8080 发布到宿主机 loopback 的端口 |
 | `RAG_APP_DEBEZIUM_HEALTH_URL` | `http://debezium:8080/q/health` | Compose `app` profile 内部覆盖用的 Debezium 健康地址 |
 | `RAG_DOCUMENT_JOB_RETENTION_SECONDS` | `2592000`（30 天） | 终态任务保留期 |
-| `RAG_DOCUMENT_WORKER_INPROCESS` | `auto` | `rag-service` 内嵌文档 worker：`auto`（未设置）仅在未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；`1/true/on` 强制启用（已配置 Kafka 时服务拒绝启动）；`0/false/off` 关闭并改跑独立 worker |
-| `RAG_DOCUMENT_WORKER_LOCAL` | `false` | 独立 `rag-document-worker` 的单进程 outbox 模式（通常无需：无 Kafka 时服务已内嵌 worker）；仅在未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时生效 |
-| `RAG_DOCUMENT_WORKER_POLL_SECONDS` | `0.5` | 内嵌/本地 outbox 与消费轮询间隔 |
 | `RAG_DOCUMENT_WORKER_RECOVER_SECONDS` | `30` | 文档 worker 周期性 Recover（恢复中断上传/补偿） |
 | `RAG_DOCUMENT_WORKERS` | `1` | `scripts/start-stack.ps1` 启动的 `rag-document-worker` 进程数（Kafka 同组分摊 `RAG_DOCUMENT_TOPIC` 分区，能分配到分区的进程数受分区数限制；文档任务总并发为有效进程数 × `RAG_DOCUMENT_WORKER_CONCURRENCY`，PDF 解析并发还受 pdf-parser 限制） |
 | `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_DOCUMENT_MAX_ATTEMPTS` | `5` | 文档 worker 的 Kafka 进程内最大尝试次数（前者优先；名称为兼容旧配置保留） |
@@ -358,12 +355,12 @@ PDF 总解析容量上限为 `RAG_PDF_SERVICE_WORKERS × RAG_PDF_SERVICE_CONCURR
 
 | 命令 | 作用 | 必需 | 退出码 |
 | --- | --- | --- | --- |
-| `rag-service` | REST + MCP + Console + 后台维护循环；无 Kafka 时内嵌文档 worker | Qdrant、状态库；MCP 需要 token；排队搜索需要 Kafka | `0` 正常停止，`1` 运行时失败 |
-| `rag-document-worker` | 消费文档通知，解析/切分/Embedding/发布 | Kafka 部署必需（无 Kafka 由 `rag-service` 内嵌 worker 代管）；状态库、Qdrant；Kafka 模式需 `RAG_KAFKA_BOOTSTRAP_SERVERS`，或 `RAG_DOCUMENT_WORKER_LOCAL=1` | `0/1/2` |
+| `rag-service` | REST + MCP + Console + 后台维护循环；只受理上传，不解析文档 | Qdrant、状态库；MCP 需要 token；排队搜索需要 Kafka | `0` 正常停止，`1` 运行时失败 |
+| `rag-document-worker` | 唯一的文档消费者：消费 Kafka 文档通知，解析/切分/Embedding/发布 | **必需**（异步上传默认开启）；需要 `RAG_KAFKA_BOOTSTRAP_SERVERS`、状态库、Qdrant | `0/1/2` |
 | `rag-search-worker` | 消费 schema 2 搜索请求，执行 `SearchRaw` + 快照 + 终态 | `RAG_KAFKA_BOOTSTRAP_SERVERS`、状态库、Qdrant、Redis（快照） | `0/1/2` |
 | `rag-dead-letter-worker --kind document\|search` | 消费显式 `RAG_DOCUMENT_DLQ_TOPIC` / `RAG_SEARCH_DLQ_TOPIC`，把可确认的失败写入持久终态并 ACK | `RAG_KAFKA_BOOTSTRAP_SERVERS`、对应 `RAG_*_DLQ_GROUP` | `0/1/2` |
 
-退出码约定（worker 与全部 CLI）：`0` = 收到 SIGINT/SIGTERM 正常停止；`1` = 运行时失败（应重启/告警）；`2` = 配置或用法错误（修配置，不要自动重启）。服务本身配置错误也以 `1` 退出。文档 worker 的本地模式适合单进程开发/独立 worker 兜底：未配置 Kafka 时它直接轮询 `document_job_outbox`，有 Kafka 时变量被忽略并切换为 Kafka 消费模式。**Kafka 模式下 worker 不在 `rag-service` 进程内运行**；无 Kafka 时 `rag-service` 默认内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS`），服务同时负责受理、维护循环与文档消费。
+退出码约定（worker 与全部 CLI）：`0` = 收到 SIGINT/SIGTERM 正常停止；`1` = 运行时失败（应重启/告警）；`2` = 配置或用法错误（修配置，不要自动重启）。服务本身配置错误也以 `1` 退出。文档 worker 只有 Kafka 消费模式：必须配置 `RAG_KAFKA_BOOTSTRAP_SERVERS`，消费 Debezium 投递的 `RAG_DOCUMENT_TOPIC`；它始终是独立进程，`rag-service` 只负责受理、维护循环与 API，不解析文档。
 
 ## 4. 启动与冒烟
 
@@ -422,9 +419,8 @@ Console 默认启用账号登录（`RAG_AUTH_ENABLED=true`）：
 ### 启动 worker
 
 ```powershell
-# Kafka 部署必需：消费默认异步上传与 MCP add_document 的通知
-# （无 Kafka 时由 rag-service 内嵌 worker 消费，无需单独启动；
-#  也可用 RAG_DOCUMENT_WORKER_LOCAL=1 让独立 worker 轮询发件箱）
+# 必需：消费默认异步上传与 MCP add_document 的 Kafka 通知
+# （由 Debezium 从 document_job_outbox 投递；未运行时任务保持 queued）
 .\dist\bin\rag-document-worker.exe
 
 # 服务端 MCP 排队搜索
@@ -443,7 +439,7 @@ worker 必须与 `rag-service` 使用**同一** `RAG_CONFIG_FILE`、`RAG_SERVICE
 2. `/console` 返回 Console 页面（构建了 `dist/web` 且 `RAG_WEB_ROOT` 正确时）。
 3. REST `/v1/documents` 需要认证，未认证返回 401。
 4. MCP 初始化成功，`tools/list` 返回 6 个工具。
-5. 异步链路：默认异步上传与 MCP `add_document` 得到 `artifact_id`；Kafka 部署启动 document worker（无 Kafka 的单进程部署依赖 `rag-service` 内嵌 worker）后，轮询 `get_document_status` 至 `succeeded`。
+5. 异步链路：默认异步上传与 MCP `add_document` 得到 `artifact_id`；配置 Kafka/Debezium 并启动 document worker 后，轮询 `get_document_status` 至 `succeeded`；未运行 worker 时任务保持 `queued`。
 6. 排队搜索：配置 Kafka/Redis 并启动 search worker 后，MCP `search` 返回结果或 `result_id`，`get_search_result` 可轮询到完成。
 7. PDF 解析（docling 引擎）：`curl.exe http://127.0.0.1:8091/healthz` 返回 200 且 `status=ok` 后上传一个 PDF，任务 `succeeded` 且该文档的 PDF 清单版本为 `docling-service-v1`；`RAG_PDF_ENGINE=go` 时清单版本为 `go-native-v1`。
 
@@ -511,8 +507,8 @@ curl.exe http://127.0.0.1:8011/docs           # 自包含交互文档
 
 管理员（或本机直连）可在 Console 侧边栏打开「系统监控」（`#/monitor`），页面每 15 秒自动刷新，全部为只读数据：
 
-- **服务信息**：版本、运行时长、后端、默认集合、上传模式（固定异步）、outbox 投递方式（固定 Debezium）、文档 worker 模式（进程内/独立）、PDF 引擎。
-- **依赖探测**：MySQL（含连接池 in_use/wait）、Redis（PING）、Qdrant（集合数与目标集合点数）、Kafka（TCP 可达，不验证认证/授权）、pdf-service（`/healthz`）；未启用的依赖标记为「未启用」。
+- **服务信息**：版本、运行时长、后端、默认集合、上传模式（固定异步）、outbox 投递方式（固定 Debezium）、PDF 引擎。
+- **依赖探测**：MySQL（含连接池 in_use/wait）、Redis（PING）、Qdrant（集合数与目标集合点数）、Kafka（TCP 可达，不验证认证/授权）、pdf-service（`/healthz`）；未启用的依赖标记为「未启用」，未配置 Kafka 时显示「未配置 Kafka：…」。
 - **文档任务与队列**：`document_jobs` 按状态/阶段计数、最老排队时长、租约过期的卡死任务数、24 小时失败数；`search_tasks` 按状态计数；未完成的上传操作数。
 - **Outbox 记录（记录统计，不是未投递积压）**：`document_job_outbox` 按状态计数、总数与最老记录时长。Debezium 只负责投递、不回写 `PUBLISHED`，所以保留期内的记录通常仍是 `PENDING`；页面明确标注该计数不代表未投递积压，字段 `oldest_pending_seconds` 已不再使用（改为 `oldest_record_seconds`）。
 - **投递与消费进度（分开展示）**：Debezium 采集状态（可选 `RAG_DEBEZIUM_HEALTH_URL` 健康探测；binlog 采集位点在 Debezium 侧，应用读不到，显示「未知」）；Kafka 文档消费组进度（topic/group、已提交位点、末尾位点与滞后，读不到显示「未知」）；文档任务处理状态摘要（`ok`/`degraded`/`unknown`）。三者与 outbox 记录统计分开，不互相推断。
@@ -787,7 +783,7 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 
 `add_document` 在状态库单事务写入完整任务（含文件字节）与发件箱，提交后返回 `{"artifact_id": "<uuid>"}`，不代表已解析/可检索。`get_document_status` 返回 `status`（`queued/processing/succeeded/failed`）、`stage`、`error`；仅 `succeeded` 表示已持久发布。同名文档已存在或已有排队/执行中的新增会被拒绝；不确定提交结果时用同一 `idempotency_key` 重试，不会重复入队。
 
-投递方式：Kafka 文档通知统一由 Debezium 读取 MySQL binlog 投递，应用只提交事务 outbox；配置见 [Debezium 指南](../deploy/debezium/README.md)。无 Kafka 的本机模式由内嵌文档 worker 或显式启动的本地 worker 直接消费发件箱。
+投递方式：Kafka 文档通知统一由 Debezium 读取 MySQL binlog 投递，应用只提交事务 outbox；配置见 [Debezium 指南](../deploy/debezium/README.md)。唯一消费者是独立的 `rag-document-worker`；未配置 Kafka/Debezium 或未运行该 worker 时，文档任务保持 `queued`。
 
 ### 资源、提示词与订阅
 
@@ -898,7 +894,7 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 
 - `go build ./...` 全部通过；`go test -p 1 -count=1 -timeout 25m ./...` 全部通过（串行是必须的：所有包共用同一个 MySQL 测试 schema，靠 advisory lock 互斥）。测试覆盖 state/runtime/workers/httpapi/mcp/searchrefs/检索栈，以及 `internal/e2e` 的真实 HTTP 全栈链路。
 - `scripts/build-go.ps1` 本机构建 + 冒烟：`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200。POSIX 的 `scripts/build-go.sh`/`make check` 未在当前 Windows 验证环境执行。
-- 三个 worker 二进制 `--help`、无 Kafka、错误 backend、非法 `--kind` 的退出码行为；文档 worker 本地模式可启动并连接 MySQL 状态。
+- 三个 worker 二进制 `--help`、缺少 Kafka、错误 backend、非法 `--kind` 的退出码行为。
 - Go 端 REST/MCP/检索/文档/资产投影/`document.md` 预览/上传事务的单元与集成测试（真实 MySQL + fake Qdrant/model）。
 - Console 角色/知识库归属/邀请共享的**全栈 HTTP E2E**（真实登录会话与 CSRF、真实 access 服务、真实 MySQL）：`internal/e2e/permissions_http_test.go` 覆盖角色变更、归属可见性、邀请创建→收件箱→预览→接受、只读/读写闸门、模板建库、撤销授权。异步上传发布后读模型刷新的回归也由 `internal/e2e` 覆盖。
 
@@ -966,9 +962,9 @@ PDF 默认由独立的 `pdf-parser` 微服务解析（Docling，HTTP + zip 清�
 - **Qdrant**：仅支持 HTTP 模式；`QDRANT_PATH` 会在启动时被拒绝。
 - **Tokenizer**：见 §10；token 预算切分位置可能与 Python 不同。
 - **解析器**：PDF 默认走独立 `pdf-parser` 微服务（Docling：版面/表格/OCR/公式 LaTeX；需要该服务、模型卷与可选 VLM，服务不可用时 docling 上传会失败）。`RAG_PDF_ENGINE=go` 时使用 Go 内置纯文本引擎（文字型 PDF；扫描件、PDF 表格/公式/图片资产不支持，需要时请先 OCR 或用其他工具预处理）。DOCX 解析在 Go 进程内完成；Word 无图注图片需要 VLM 端点才会生成描述，未配置时保留占位描述、上传不失败；.doc 转换仍需要外部 LibreOffice。
-- **异步投递**：Kafka 文档通知由 Debezium Server 读取 MySQL binlog 并写入 Kafka，应用只提交事务 outbox；无 Kafka 时可使用本地 worker 模式。
+- **异步投递**：Kafka 文档通知由 Debezium Server 读取 MySQL binlog 并写入 Kafka，应用只提交事务 outbox；必须配置 Kafka + Debezium 并运行 `rag-document-worker`，否则文档任务保持 `queued`。
 - **排队搜索**：`RAG_KAFKA_BOOTSTRAP_SERVERS` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 Kafka。
-- **上传受理**：REST/Console 统一使用 `POST /v1/document-batches` 异步受理，通过批次或文档任务状态接口观察进度。无 Kafka 时由 `rag-service` 内嵌 worker 消费，Kafka 部署运行 `rag-document-worker`。MCP `update_document`/`delete_document` 仍同步执行，与排队任务通过同名检查和发布事务内的 `ValidatePublication` 互斥。
+- **上传受理**：REST/Console 统一使用 `POST /v1/document-batches` 异步受理，通过批次或文档任务状态接口观察进度。`rag-service` 只受理，文档解析只由消费 Kafka 通知的 `rag-document-worker` 完成；未部署时任务保持 `queued`。MCP `update_document`/`delete_document` 仍同步执行，与排队任务通过同名检查和发布事务内的 `ValidatePublication` 互斥。
 - **权限与共享**：账号分为管理员 / VIP / 普通用户；知识库默认归创建者私有，共享靠邀请链接完成（权限：可读/可修改；范围：单文件/多文件/全库），只有 VIP 与管理员可发起邀请。邀请消息目前是站内通知（控制台铃铛），不发送邮件/IM；链接只展示一次，库内只存摘要。文件级写授权只能替换已授权的同名文档，不能上传新文件；历史无创建者的知识库仅管理员可用/可授权；受限账号在启用 Kafka 的排队搜索部署下会被拒绝异步检索（同步检索不受影响）。详见 [权限管理](PERMISSIONS.md)。
 - **管理边界**：`/v1/admin/*` 仅本机直连或管理员会话；**例外**是 `/v1/admin/api-keys` 的五条管理路由——任意登录角色的会话都可管理自己的 API Key（管理员管理全部，非管理员只能绑定本人拥有的知识库）。API Key 按创建账号归属隔离，历史无主密钥仅管理员/本机管理可见；管理凭证（Service Token / API Key）在请求时仍不做知识库归属校验，API Key 的 namespace 白名单仍然生效。详见 [权限管理](PERMISSIONS.md) §9。
 - **数据**：状态表用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。

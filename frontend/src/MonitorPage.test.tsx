@@ -33,7 +33,6 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
       uptime_seconds: 8400.2,
       upload_mode: "async",
       outbox_bridge: "debezium",
-      document_worker: "in-process",
       pdf_engine: "docling",
     },
     dependencies: [

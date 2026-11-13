@@ -12,14 +12,14 @@ REST 客户端 ──/v1/*────────────┴──> rag-ser
                                        ├─> Qdrant（dense + sparse 向量）
                                        ├─> MySQL（文档/KB/任务/API Key/模型配置/权限/发件箱）
                                        ├─> Redis（读模型缓存、搜索结果快照；可选）
-                                       ├─> Kafka（Debezium 文档通知 / 搜索队列；可选）
+                                       ├─> Kafka（Debezium 文档通知 / 搜索队列；文档处理必需）
                                        └─> pdf-parser :8091（HTTP，PDF 版面/表格/OCR/公式）
 
 网页/REST 上传（默认异步）与 MCP add_document
   → MySQL 单事务写 document_jobs + document_job_outbox，返回 artifact_id
   → 有 Kafka：Debezium → Kafka → rag-document-worker
-  → 无 Kafka：rag-service 内嵌文档 worker 直接轮询发件箱
-  → 两条路径都完成 解析/切分/Embedding/Qdrant 发布
+  → 无 Kafka：没有消费者，文档任务停留在 queued（rag-service 只受理）
+  → rag-document-worker 完成 解析/切分/Embedding/Qdrant 发布
   → 客户端用 GET /v1/document-jobs/{artifact_id} 轮询 status/stage
 
 Console 批次上传（POST /v1/document-batches）
@@ -37,13 +37,14 @@ MCP search（配置 Kafka 时）→ search_task_outbox → Kafka → rag-search-
 - **MySQL 是事实来源**：文档任务、发件箱、知识库配置、API Key、权限、模型配置、排队搜索任务都在 MySQL；Kafka 只负责通知，不是状态存储。
 - **上传默认异步受理**：HTTP 提交点是“任务 + 发件箱”事务提交，而不是解析完成；`add_document` 返回 `artifact_id` 不代表已可检索，只有 `succeeded` 才算发布完成。
 - **检索默认同步**（REST/Console），只有配置了 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时 MCP `search` 才切换为排队模式。
+- **文档解析必须走 Kafka**：`rag-service` 不内嵌文档消费者；未配置 Kafka + Debezium + `rag-document-worker` 时，上传仍会受理，但文档任务停留在 `queued`。
 - **PDF 双引擎**：`RAG_PDF_ENGINE=docling`（compose `app` 默认；为空时按是否配置 `RAG_PDF_SERVICE_URL` 决定）走 pdf-parser；`go` 使用 Go 进程内纯文本引擎。
 
 ## 2. 进程与可执行文件
 
 | 进程 | 作用 | 主要入口 |
 | --- | --- | --- |
-| `rag-service` | REST + MCP + Console + 后台维护循环；无 Kafka 时内嵌文档 worker | `cmd/rag-service/main.go` |
+| `rag-service` | REST + MCP + Console + 后台维护循环；只受理上传，不解析文档 | `cmd/rag-service/main.go` |
 | `rag-document-worker` | 消费文档通知，执行解析/切分/Embedding/Qdrant 发布 | `cmd/rag-document-worker/main.go` |
 | `rag-search-worker` | 消费排队搜索请求，执行检索并写 Redis 快照 | `cmd/rag-search-worker/main.go` |
 | `rag-dead-letter-worker` | 消费显式 DLQ topic（`--kind document|search`），把可确认的失败写入终态并 ACK | `cmd/rag-dead-letter-worker/main.go` |
@@ -83,7 +84,7 @@ examples/knowledge/         示例知识文档（可直接上传试用）
 | `config` | 环境变量、`~/.praxis-rag/config.toml`、启动校验 |
 | `contracts` | 检索/MCP 请求契约、JSON Schema、错误语义 |
 | `document` | PDF 原生解析、Docling 客户端、DOCX、DOC 转换、公式、VLM、图片/表格资产 |
-| `documentworker` | 文档任务处理器（Kafka 与发件箱共用） |
+| `documentworker` | 文档任务处理器（仅由 Kafka 消费者 `rag-document-worker` 调用） |
 | `httpapi` | REST 路由、认证中间件、OpenAPI、Console 静态资源 |
 | `ingest` | “解析 → 切分 → Embedding → Qdrant 发布”管线 |
 | `kbconfig` | 知识库模型连接、模型配置（profiles）、OCR 配置 |
