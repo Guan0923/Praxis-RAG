@@ -1490,3 +1490,15 @@ jsdom 测试覆盖）；结果快照索引只覆盖上线后保存且在 TTL 内
 元数据与转换器检查结果，`pipeline.worker` 正常，`library.documents=8`（旧构建为
 24，已排除软删除），`library.result_snapshots` 来自 Redis；`/console` 提供的
 `index-sut3qI55.js` 包含「关键指标」「存在降级」「未完成操作」等新文案。
+
+该分支随后合并到 `main`（合并提交 `5b4c360`），并与 main 上「Kafka 必需、移除
+进程内文档 worker」「账号邮箱验证/系统设置」等改动对齐：文档 worker 固定为独立
+进程，心跳只由 `rag-document-worker` 写入，监控响应不再包含
+`service.document_worker`，`pipeline.worker` 固定读 `document-worker` 角色；
+`activity_counters`/`runtime_heartbeats` 与 main 新增的 `user_avatars`/
+`email_verification_codes`/`app_settings` 表共存。合并后在 main checkout 重新执行
+`scripts/build-go.ps1`（冒烟通过）并重启 8011 的 `rag-service` +
+`rag-document-worker` + `rag-dead-letter-worker`：`/health` 200，监控接口仍为
+`status:"degraded"`（同一缺失集合）、`pipeline.worker` 正常、`documents=8`、
+Kafka 元数据与 PDF 转换器检查正常；`/console` 提供的新 bundle
+`index-Dsbwy_6w.js` 包含「关键指标」「存在降级」「未完成操作」文案。
