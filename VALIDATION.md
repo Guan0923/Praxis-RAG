@@ -124,6 +124,39 @@ docker compose config --quiet; docker compose --profile app config --quiet      
 
 合并到 `main`（merge commit `bc76e6f`）后在主检出补跑：`go build ./...`、`go vet ./...` → 0；上述 14 个 Go 包测试全部 ok；前端 `npm run typecheck` → 0，`npm test` → 17 文件 225 用例全通过（Node 26.13.0 / npm 12.2.2）。前端 `npm run build` 未执行（会写 `dist/`）。
 
+### 运行态重启验收（2026-11-13 晚间，合并后）
+
+在 `main`（`bc76e6f` 及后续修复）上完整重建运行栈并跑通文档链路：
+
+- Docker：`docker compose down` 后重建 mysql/kafka/redis/qdrant/pdf-parser/debezium/debezium-cache，
+  删除两个 Debezium offset 卷让连接器重新首次快照（任务表 5/3 行、缓存表 354 行 `op=r`）；重放
+  topic 后任务/缓存事件均为新 schema（`schedule_version`、定位列）。`pdf-parser` 用当前源码重建，
+  健康检查 `converter=vision`、`version=2.0.0`。
+- Go 二进制：`scripts/build-go.ps1` 重建 dist/bin 与 dist/web；`rag-service` 监听
+  `127.0.0.1:8011`（`/console`、`/v1/*`、`/mcp`），`rag-document-worker`、`rag-search-worker`、
+  `rag-cache-worker` 与 document/search/cache 三个 dead-letter worker 同时运行。
+- 迁移：`rag-state-migrate --apply` 为 `document_jobs`/`search_tasks` 增加 `schedule_version`、
+  为 `cache_revisions` 增加水位列并创建 `cdc_cutover_state`（`tables=29 schema=ready`）。
+- 端到端（REST 异步受理）：`POST /v1/document-batches`（namespace=default，`cdc-demo.md`）→ 202
+  accepted（`artifact_id=2e87ead1…`）→ `document_jobs` 经 Debezium 通知被 worker 领取 → `succeeded`
+  （`chunk_count=1`，collection `knowledge_e0fd…`）；`GET /v1/documents` 立即可见，证明缓存连接器 +
+  `rag-cache-worker` 已重建读模型。
+- 手工 SQL：对同一 job 执行 `UPDATE … SET schedule_version=schedule_version+1, status='queued',
+  owner=NULL, execution_id=NULL, lease_until=0, retry_at=0, attempts=0` → Debezium 捕获该 UPDATE →
+  worker 重新领取并成功，验证“手工 SQL 修改也会驱动任务链路”。
+- 监控：`pipeline.debezium.tasks/cache=ok`，三个 Kafka 组 `lag=0`（document 284/284、search 3/3、
+  cache 4544/4544），`pipeline.cache.dirty_keys=0`、`refresh_failures=0`，`service.delivery=debezium`。
+- 本轮修复：`aggregateConsumerProgress` 不再因“从未收到消息的空分区没有提交位点”把整组滞后降级为
+  未知（`internal/mq/progress.go` + `progress_test.go`）；Console 上文档/搜索消费组此前一直显示
+  未知，修复后均为 `ok`。
+- 已知非本次改造问题：`dependencies.qdrant` 仍降级，因为回退集合
+  `mini_agent_knowledge_pdf_assets_v1` 不存在（默认知识库实际使用 `knowledge_e0fd…`，全部 26 个
+  `knowledge_*` 集合正常）；旧 `upload_operations` 行的工作区路径已失效，恢复协程每 30 秒打印
+  `Unsafe upload workspace` 告警，不影响新上传。
+- 启动方式说明：本次由 agent 会话启动本地进程，会话进程对用户目录写入受限，因此以
+  `TMP/TEMP=dist\tmp`、`RAG_SERVICE_DATA_ROOT=dist\data` 启动；在普通 PowerShell 中按
+  `scripts/start-stack.ps1` 启动不需要这两个覆盖。
+
 ## Debezium outbox 删除事件过滤与监控语义 — 2026-11-13
 
 工作树 `dsh-1c1bab83-a90b`（Windows 11，Go 1.27.3，Node v26.13.0 / npm 12.2.2）。

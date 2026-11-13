@@ -109,6 +109,29 @@ func TestAggregateConsumerProgressClampsLag(t *testing.T) {
 	}
 }
 
+// TestAggregateConsumerProgressEmptyPartitionNoCommit asserts partitions that
+// never received a message do not hide a fully committed group: the aggregate
+// stays known, while a partition with data but no commit still reports unknown.
+func TestAggregateConsumerProgressEmptyPartitionNoCommit(t *testing.T) {
+	known := aggregateConsumerProgress("docs", "docs-workers",
+		map[int]int64{0: 10, 1: 0}, map[int]int64{0: 10})
+	if known.CommittedOffset == nil || *known.CommittedOffset != 10 {
+		t.Fatalf("CommittedOffset = %v, want 10", known.CommittedOffset)
+	}
+	if known.EndOffset == nil || *known.EndOffset != 10 {
+		t.Fatalf("EndOffset = %v, want 10", known.EndOffset)
+	}
+	if known.Lag == nil || *known.Lag != 0 {
+		t.Fatalf("Lag = %v, want 0", known.Lag)
+	}
+
+	unknown := aggregateConsumerProgress("docs", "docs-workers",
+		map[int]int64{0: 10, 1: 5}, map[int]int64{0: 10})
+	if unknown.CommittedOffset != nil || unknown.EndOffset != nil || unknown.Lag != nil {
+		t.Fatalf("progress = %+v, want nil numbers for uncommitted non-empty partition", unknown)
+	}
+}
+
 // TestDocumentConsumerProgressNotConfigured asserts brokerless deployments fail
 // closed with ErrNotConfigured before any dial.
 func TestDocumentConsumerProgressNotConfigured(t *testing.T) {

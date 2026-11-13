@@ -85,7 +85,10 @@ func consumerProgressFromSource(ctx context.Context, source documentProgressSour
 // A committed offset below zero (or a partition without a committed entry) means
 // the group has not committed the whole topic yet, so every number stays nil:
 // the aggregate would otherwise overstate the lag by counting uncommitted
-// partitions as zero progress.
+// partitions as zero progress. A partition that never received a message (end
+// offset zero) is the exception: not committing it cannot hide any work, so an
+// uncommitted empty partition does not erase the aggregate (topics have more
+// partitions than a single worker consumes, so this is the normal steady state).
 func aggregateConsumerProgress(topic, group string, ends, committed map[int]int64) ConsumerProgress {
 	progress := ConsumerProgress{Topic: topic, Group: group}
 	if len(ends) == 0 {
@@ -96,9 +99,12 @@ func aggregateConsumerProgress(topic, group string, ends, committed map[int]int6
 		endTotal += end
 	}
 	var committedTotal int64
-	for partition := range ends {
+	for partition, end := range ends {
 		committedOffset, known := committed[partition]
 		if !known || committedOffset < 0 {
+			if end == 0 {
+				continue
+			}
 			return progress
 		}
 		committedTotal += committedOffset
