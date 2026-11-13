@@ -120,7 +120,9 @@ docker compose config --quiet; docker compose --profile app config --quiet      
 - 验收套件 `internal/cdcacceptance/`：14 个用例覆盖 §11 三条链路 + 混沌（Debezium 暂停、Kafka 重复投递、worker 领取后崩溃、Redis 写失败），通过。
 - `internal/e2e/` 重写后覆盖异步上传受理、搜索提交即受理与 MySQL 结果读取、DLQ 终态；写路径不再同步刷 Redis，e2e 用 `CacheSync.MarkAllDirty`/`Revalidate` 复现缓存消费者收敛。
 - 集成阶段修复审查发现的小缺陷：cache worker 错误串字面量换行、`KeysForChange` 对 `op=u` 取 before+after namespace 并集、`RAG_CACHE_WORKER_RECOVER_SECONDS` 真正接入（默认 30s）、文档 DLQ group 默认值与代码一致、`docs/cdc-migration.md` §7.1 的 `document_heads` 行补全。
-- 仍未验证：真实 Docker/双 Debezium 连接器/Kafka/Redis 物理链路与缓存收敛、切换/回滚演练、`--retire-outbox` 实库执行、前端 `typecheck/test/build`（无 `node_modules`）。
+- 仍未验证：真实 Docker/双 Debezium 连接器/Kafka/Redis 物理链路与缓存收敛、切换/回滚演练、`--retire-outbox` 实库执行。
+
+合并到 `main`（merge commit `bc76e6f`）后在主检出补跑：`go build ./...`、`go vet ./...` → 0；上述 14 个 Go 包测试全部 ok；前端 `npm run typecheck` → 0，`npm test` → 17 文件 225 用例全通过（Node 26.13.0 / npm 12.2.2）。前端 `npm run build` 未执行（会写 `dist/`）。
 
 ## Debezium outbox 删除事件过滤与监控语义 — 2026-11-13
 
