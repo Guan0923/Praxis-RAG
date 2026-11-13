@@ -90,6 +90,10 @@ func run() error {
 		return err
 	}
 	service.SearchEngine().SetReferenceCapture(searchrefs.New(stores, logger))
+	// Every retrieval execution (synchronous REST/MCP and queued search worker)
+	// passes through the runtime search path, so one counter here covers all of
+	// them for the Console activity card.
+	service.SetActivityRecorder(stores.Activity)
 	if err := service.StartBackground(context.Background()); err != nil {
 		return err
 	}
@@ -118,6 +122,42 @@ func run() error {
 			}, nil
 		}
 	}
+	// The monitoring snapshot needs three live side channels the state aggregate
+	// cannot provide: broker metadata (authentication + topic), the Redis
+	// result-snapshot index, and the document-worker heartbeat. Each failure only
+	// makes its own row unknown.
+	var kafkaProbe func(context.Context) (monitor.KafkaStatus, error)
+	if mqSettings.Configured() {
+		kafkaProbeSettings := mqSettings
+		kafkaProbe = func(ctx context.Context) (monitor.KafkaStatus, error) {
+			status, probeErr := mq.BrokerHealth(ctx, kafkaProbeSettings)
+			if probeErr != nil {
+				return monitor.KafkaStatus{}, probeErr
+			}
+			return monitor.KafkaStatus{
+				Brokers:     status.Brokers,
+				Topic:       status.Topic,
+				TopicExists: status.TopicExists,
+				Partitions:  status.Partitions,
+			}, nil
+		}
+	}
+	var resultSnapshots func(context.Context) (int, error)
+	if cache != nil {
+		resultSnapshots = func(ctx context.Context) (int, error) {
+			return cache.ResultSnapshotIndex().CountActive(ctx, time.Now())
+		}
+	}
+	workerHeartbeat := func(ctx context.Context) (*monitor.WorkerHeartbeat, error) {
+		snapshot, beatErr := stores.Heartbeats.Latest(ctx, state.HeartbeatRoleDocumentWorker, 60*time.Second)
+		if beatErr != nil {
+			return nil, beatErr
+		}
+		if !snapshot.Found {
+			return nil, nil
+		}
+		return &monitor.WorkerHeartbeat{UpdatedAt: snapshot.UpdatedAt, Instances: snapshot.Instances}, nil
+	}
 	monitorService := monitor.New(monitor.Options{
 		Stats:                 stores,
 		MySQL:                 stores,
@@ -126,10 +166,13 @@ func run() error {
 		QdrantURL:             ragConfig.QdrantURL,
 		Collection:            ragConfig.Collection,
 		KafkaBootstrapServers: mqSettings.BootstrapServers,
+		KafkaProbe:            kafkaProbe,
 		DebeziumHealthURL:     os.Getenv("RAG_DEBEZIUM_HEALTH_URL"),
 		DocumentTopic:         mqSettings.DocumentTopic,
 		DocumentGroup:         mqSettings.DocumentGroup,
 		KafkaProgress:         kafkaProgress,
+		ResultSnapshots:       resultSnapshots,
+		WorkerHeartbeat:       workerHeartbeat,
 		OutboxBridge:          "debezium",
 		UploadMode:            "async",
 		PDFEngine:             ragConfig.PDFEngine,

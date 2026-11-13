@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -90,6 +91,16 @@ type TransientProvider interface {
 	TransientStore() TransientStore
 }
 
+// SnapshotIndex 可选地记录每个已保存结果快照的身份与过期时间，供监控页统计
+// 有效快照数。快照本身存放在 Redis transient 的 sha256 哈希 key 里，无法按
+// 前缀扫描，所以由后端额外维护一份可计数的索引（见 redisstate 的实现）。
+//
+// 它必须可并发调用；索引失败只影响观测数据，绝不能让快照保存失败。
+type SnapshotIndex interface {
+	// AddSnapshot 记录一条快照身份及过期时间（Unix 秒会话，可带小数）。
+	AddSnapshot(ctx context.Context, identity string, expiresAt float64) error
+}
+
 // ResultSnapshots stores immutable, tenant-scoped search results. It is a port
 // of rag_mcp.state.result_snapshots.ResultSnapshots.
 type ResultSnapshots struct {
@@ -97,6 +108,8 @@ type ResultSnapshots struct {
 	Settings  SnapshotSettings
 	Clock     func() float64
 	Transient TransientStore
+	// Index 是可选的快照索引；nil 时 Save 行为与引入索引前完全一致。
+	Index SnapshotIndex
 }
 
 // NewResultSnapshots builds the snapshot service. A nil clock uses wall time; a
@@ -236,6 +249,11 @@ func (s *ResultSnapshots) Save(namespace string, payload map[string]any, resultI
 	}
 	if !stored {
 		return nil, newSnapshotUnavailable("Search result ID already exists")
+	}
+	// 快照以 sha256 哈希 key 存进 transient，监控无法按前缀统计，因此保存成功
+	// 后补记一次可选索引。索引失败只丢失观测数据，不影响已保存的快照和返回值。
+	if s.Index != nil {
+		_ = s.Index.AddSnapshot(context.Background(), identifier, expires)
 	}
 	return result, nil
 }

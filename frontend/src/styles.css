@@ -1148,3 +1148,74 @@ body.drag-selecting * {
   margin: 0;
   padding-left: 18px;
 }
+/* Compact section heading inside the two-column blocks (阶段分布). */
+.monitor-subheading {
+  margin: 4px 0 0;
+  font-size: 13px;
+  line-height: 1.6;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+/* Progress rows stay one column: the label, detail and offsets wrap instead of
+   squeezing the card on a narrow screen. */
+.monitor-progress-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.monitor-progress-row > * {
+  min-width: 0;
+}
+/* Notes (outbox record semantics, upload operation semantics) wrap freely. */
+.monitor-note {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+/* The dependency table is allowed to scroll sideways on phones, so its cells
+   must wrap instead of forcing a fixed minimum width. */
+.monitor-dependency-table {
+  min-width: 0;
+}
+.monitor-dependency-table .ant-table-cell {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+/* Upload operations live on their own row under the two queue columns; the
+   divider keeps the density balanced without an extra card. */
+.monitor-uploads {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.monitor-stat .ant-statistic-title {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.monitor-stat .ant-statistic-content {
+  font-size: 22px;
+}
+/* Long collection names, dependency details and paths must wrap inside the
+   card instead of widening it. */
+.monitor-block .ant-descriptions-item-content,
+.monitor-service-info .ant-descriptions-item-content {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+@media (max-width: 767px) {
+  .monitor-block {
+    gap: 8px;
+  }
+  .monitor-uploads {
+    margin-top: 16px;
+    padding-top: 12px;
+  }
+  .monitor-dependency-table .ant-table-cell {
+    padding: 8px 6px !important;
+  }
+  .monitor-stat .ant-statistic-content {
+    font-size: 18px;
+  }
+}
+

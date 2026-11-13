@@ -73,11 +73,18 @@ func sampleStats() *state.MonitorStats {
 		},
 		OldestActiveSearchSeconds: 5,
 		SearchesRecent:            7,
-		UnfinishedUploads:         2,
-		Documents:                 10,
-		KnowledgeBases:            2,
-		ResultSnapshots:           4,
-		ArtifactSnapshots:         6,
+		UploadsByStatus: map[string]int{
+			state.UploadIntent: 1, state.UploadRunning: 1,
+			state.UploadFailed: 0, state.UploadRollingBack: 0, state.UploadRollbackFailed: 0,
+		},
+		UploadsInProgress:     2,
+		UploadsFailed:         0,
+		UploadsRollingBack:    0,
+		UploadsCleanupPending: 1,
+		UnfinishedUploads:     3,
+		Documents:             10,
+		KnowledgeBases:        2,
+		ArtifactSnapshots:     6,
 	}
 }
 
@@ -106,7 +113,7 @@ func qdrantServer(t *testing.T, collection string, points int64, missing bool) *
 	return server
 }
 
-// pdfServer serves the Docling health endpoint.
+// pdfServer serves the Docling health endpoint with a healthy converter payload.
 func pdfServer(t *testing.T, status int) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -114,7 +121,27 @@ func pdfServer(t *testing.T, status int) *httptest.Server {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"service":"praxis-rag-pdf-service","version":"1.0.0",` +
+			`"status":"ok","converter":"docling","converter_requested":"docling",` +
+			`"vlm_configured":false,"docling_installed":true}`))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// jsonServer serves one path with a fixed status and body.
+func jsonServer(t *testing.T, path string, status int, body string) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if path != "" && r.URL.Path != path {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(server.Close)
 	return server
@@ -180,11 +207,22 @@ func healthyOptions(t *testing.T) Options {
 		QdrantURL:             qdrant.URL,
 		Collection:            "knowledge",
 		KafkaBootstrapServers: []string{kafkaListener(t)},
-		OutboxBridge:          "debezium",
-		UploadMode:            "async",
-		PDFEngine:             pdfEngineDocling,
-		PDFServiceURL:         pdf.URL,
-		StartedAt:             time.Now().Add(-90 * time.Second),
+		KafkaProbe: func(context.Context) (KafkaStatus, error) {
+			return KafkaStatus{Brokers: 1, Topic: mqDocumentTopic, TopicExists: true, Partitions: 3}, nil
+		},
+		DocumentTopic: mqDocumentTopic,
+		DocumentGroup: mqDocumentGroup,
+		ResultSnapshots: func(context.Context) (int, error) {
+			return 4, nil
+		},
+		WorkerHeartbeat: func(context.Context) (*WorkerHeartbeat, error) {
+			return &WorkerHeartbeat{UpdatedAt: time.Now().Add(-2 * time.Second), Instances: 1}, nil
+		},
+		OutboxBridge:  "debezium",
+		UploadMode:    "async",
+		PDFEngine:     pdfEngineDocling,
+		PDFServiceURL: pdf.URL,
+		StartedAt:     time.Now().Add(-90 * time.Second),
 	}
 }
 
@@ -238,6 +276,10 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 	if _, err := time.Parse(time.RFC3339, generatedAt); err != nil {
 		t.Fatalf("generated_at is not RFC3339: %v", err)
 	}
+	// A fully healthy snapshot carries the explicit three-state status.
+	if overview["status"] != statusOK {
+		t.Fatalf("status = %v", overview["status"])
+	}
 
 	service, ok := overview["service"].(map[string]any)
 	if !ok {
@@ -274,6 +316,18 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 	if !strings.Contains(qdrantDependency.Detail, "集合 2 个") {
 		t.Fatalf("qdrant detail = %q", qdrantDependency.Detail)
 	}
+	// Kafka is verified with a metadata round trip, not a raw TCP dial.
+	kafkaDependency := dependencyByName(t, overview, "kafka")
+	if !strings.Contains(kafkaDependency.Detail, "元数据正常") ||
+		!strings.Contains(kafkaDependency.Detail, "1 个 broker") ||
+		!strings.Contains(kafkaDependency.Detail, "3 个分区") {
+		t.Fatalf("kafka detail = %q", kafkaDependency.Detail)
+	}
+	// The Docling health payload selects the converter instead of trusting a 200.
+	pdfDependency := dependencyByName(t, overview, "pdf-service")
+	if !strings.Contains(pdfDependency.Detail, "转换器 docling") {
+		t.Fatalf("pdf detail = %q", pdfDependency.Detail)
+	}
 
 	queues, ok := overview["queues"].(map[string]any)
 	if !ok {
@@ -299,8 +353,14 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 		t.Fatalf("search_tasks = %v", queues["search_tasks"])
 	}
 	uploads, _ := queues["uploads"].(map[string]any)
-	if uploads == nil || uploads["unfinished"] != 2 {
+	if uploads == nil || uploads["unfinished"] != 3 || uploads["in_progress"] != 2 ||
+		uploads["failed"] != 0 || uploads["rolling_back"] != 0 ||
+		uploads["cleanup_pending"] != 1 {
 		t.Fatalf("uploads = %v", queues["uploads"])
+	}
+	uploadStatuses, _ := uploads["by_status"].(map[string]int)
+	if uploadStatuses[state.UploadIntent] != 1 || uploadStatuses[state.UploadRunning] != 1 {
+		t.Fatalf("uploads.by_status = %v", uploads["by_status"])
 	}
 	// The outbox record statistics moved out of queues into the pipeline object;
 	// the queue section must not present PENDING rows as undelivered backlog.
@@ -328,6 +388,12 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 	if !strings.Contains(pipeline.DocumentJobs.Detail, "排队 2、处理中 1、成功 5、失败 1") ||
 		!strings.Contains(pipeline.DocumentJobs.Detail, "租约过期 1 个") {
 		t.Fatalf("pipeline.document_jobs.detail = %q", pipeline.DocumentJobs.Detail)
+	}
+	// The worker row is fed by a fresh heartbeat, not the static mode string.
+	if pipeline.Worker.Status != statusOK ||
+		!strings.Contains(pipeline.Worker.Detail, "最近心跳") ||
+		!strings.Contains(pipeline.Worker.Detail, "1 个实例运行中") {
+		t.Fatalf("pipeline.worker = %+v", pipeline.Worker)
 	}
 	// healthyOptions wires neither a Debezium health URL nor a progress reader,
 	// so both capture and consumption progress are explicitly unknown.
@@ -373,8 +439,10 @@ func TestMonitorOverviewDegradedAndDisabled(t *testing.T) {
 	}
 	overview := New(options).MonitorOverview(context.Background())
 
-	if overview["ok"] != true {
-		t.Fatalf("ok = %v (degraded/disabled must not fail the snapshot)", overview["ok"])
+	// A degraded dependency must never read as 运行正常: the header follows
+	// status=degraded while the snapshot itself still succeeds with all sections.
+	if overview["status"] != statusDegraded || overview["ok"] != false {
+		t.Fatalf("status/ok = %v/%v, want degraded/false", overview["status"], overview["ok"])
 	}
 	if item := dependencyByName(t, overview, "qdrant"); item.Status != statusDegraded {
 		t.Fatalf("qdrant status = %q detail = %q", item.Status, item.Detail)
@@ -422,8 +490,8 @@ func TestMonitorOverviewErrors(t *testing.T) {
 	}
 	overview := New(options).MonitorOverview(context.Background())
 
-	if overview["ok"] != false {
-		t.Fatalf("ok = %v", overview["ok"])
+	if overview["ok"] != false || overview["status"] != statusError {
+		t.Fatalf("status/ok = %v/%v", overview["status"], overview["ok"])
 	}
 	for _, name := range []string{"mysql", "redis", "qdrant", "pdf-service"} {
 		if item := dependencyByName(t, overview, name); item.Status != statusError {
@@ -457,8 +525,8 @@ func TestMonitorOverviewStatsFailure(t *testing.T) {
 	}
 	overview := New(options).MonitorOverview(context.Background())
 
-	if overview["ok"] != false {
-		t.Fatalf("ok = %v", overview["ok"])
+	if overview["ok"] != false || overview["status"] != statusError {
+		t.Fatalf("status/ok = %v/%v, want error/false", overview["status"], overview["ok"])
 	}
 	if overview["queues"] != nil || overview["library"] != nil || overview["activity"] != nil {
 		t.Fatalf("sections = %v/%v/%v, want nil",
@@ -838,11 +906,39 @@ func TestMonitorPipelineWireShape(t *testing.T) {
 	if _, present := queues["document_outbox"]; present {
 		t.Fatalf("queues.document_outbox = %v, want removed", queues["document_outbox"])
 	}
+	if _, present := document["status"]; !present {
+		t.Fatalf("status missing from the wire document: %v", document)
+	}
+	// The uploads section exposes the split counters instead of one mixed
+	// "unfinished" number the Console could mistake for files being uploaded.
+	uploads, ok := queues["uploads"].(map[string]any)
+	if !ok {
+		t.Fatalf("queues.uploads has type %T", queues["uploads"])
+	}
+	requireKeys(t, "queues.uploads", uploads, "unfinished", "by_status", "in_progress",
+		"failed", "rolling_back", "cleanup_pending")
+
+	// The live result-snapshot count comes from Redis; without the counter the
+	// library value stays null (未知) instead of a wrong MySQL table count.
+	library, ok := document["library"].(map[string]any)
+	if !ok {
+		t.Fatalf("library has type %T", document["library"])
+	}
+	if library["result_snapshots"] != nil {
+		t.Fatalf("library.result_snapshots = %v, want null without the Redis counter",
+			library["result_snapshots"])
+	}
 	pipeline, ok := document["pipeline"].(map[string]any)
 	if !ok {
 		t.Fatalf("pipeline has type %T", document["pipeline"])
 	}
-	requireKeys(t, "pipeline", pipeline, "outbox", "document_jobs", "debezium", "kafka")
+	requireKeys(t, "pipeline", pipeline, "outbox", "document_jobs", "worker", "debezium", "kafka")
+
+	worker, ok := pipeline["worker"].(map[string]any)
+	if !ok {
+		t.Fatalf("pipeline.worker has type %T", pipeline["worker"])
+	}
+	requireKeys(t, "pipeline.worker", worker, "status", "detail")
 
 	outbox, ok := pipeline["outbox"].(map[string]any)
 	if !ok {
@@ -899,4 +995,246 @@ func TestMonitorPipelineWireShape(t *testing.T) {
 	if failedPipeline["debezium"] == nil || failedPipeline["kafka"] == nil {
 		t.Fatalf("pipeline = %v, want debezium/kafka present", failedPipeline)
 	}
+}
+
+// healthyDependencyOptions is the base for the status-aggregation tests: every
+// required dependency is healthy, optional services stay disabled and the
+// worker/debezium/heartbeat views stay unknown.
+func healthyDependencyOptions(t *testing.T) Options {
+	t.Helper()
+	qdrant := qdrantServer(t, "knowledge", 5, false)
+	return Options{
+		Stats:      &fakeStatsProvider{stats: sampleStats()},
+		MySQL:      fakeMySQLPinger{},
+		Redis:      fakeRedisProbe{enabled: false},
+		QdrantURL:  qdrant.URL,
+		Collection: "knowledge",
+		PDFEngine:  "go",
+	}
+}
+
+// TestMonitorOverallStatusAggregation pins the three-state header: a degraded
+// dependency must not read as 运行正常, and only infra failures turn it red.
+func TestMonitorOverallStatusAggregation(t *testing.T) {
+	t.Run("全部正常", func(t *testing.T) {
+		overview := New(healthyDependencyOptions(t)).MonitorOverview(context.Background())
+		if overview["status"] != statusOK || overview["ok"] != true {
+			t.Fatalf("status/ok = %v/%v", overview["status"], overview["ok"])
+		}
+	})
+	t.Run("依赖降级", func(t *testing.T) {
+		options := healthyDependencyOptions(t)
+		options.QdrantURL = qdrantServer(t, "knowledge", 0, true).URL
+		overview := New(options).MonitorOverview(context.Background())
+		if overview["status"] != statusDegraded || overview["ok"] != false {
+			t.Fatalf("status/ok = %v/%v, want degraded/false", overview["status"], overview["ok"])
+		}
+	})
+	t.Run("依赖异常", func(t *testing.T) {
+		options := healthyDependencyOptions(t)
+		options.MySQL = fakeMySQLPinger{err: errors.New("db down")}
+		overview := New(options).MonitorOverview(context.Background())
+		if overview["status"] != statusError || overview["ok"] != false {
+			t.Fatalf("status/ok = %v/%v, want error/false", overview["status"], overview["ok"])
+		}
+	})
+	t.Run("Debezium 异常", func(t *testing.T) {
+		options := healthyDependencyOptions(t)
+		options.DebeziumHealthURL = debeziumServer(t, http.StatusOK, `{"status":"DOWN"}`).URL
+		overview := New(options).MonitorOverview(context.Background())
+		if overview["status"] != statusError {
+			t.Fatalf("status = %v, want error", overview["status"])
+		}
+	})
+	t.Run("Worker 心跳过期", func(t *testing.T) {
+		options := healthyDependencyOptions(t)
+		options.WorkerHeartbeat = func(context.Context) (*WorkerHeartbeat, error) {
+			return &WorkerHeartbeat{UpdatedAt: time.Now().Add(-5 * time.Minute), Instances: 1}, nil
+		}
+		overview := New(options).MonitorOverview(context.Background())
+		if overview["status"] != statusDegraded {
+			t.Fatalf("status = %v, want degraded", overview["status"])
+		}
+		if view := pipelineOf(t, overview); view.Worker.Status != statusDegraded {
+			t.Fatalf("pipeline.worker = %+v", view.Worker)
+		}
+	})
+	t.Run("Kafka 进度读取失败仅降级", func(t *testing.T) {
+		options := healthyDependencyOptions(t)
+		options.KafkaBootstrapServers = []string{kafkaListener(t)}
+		options.KafkaProgress = func(context.Context) (KafkaProgress, error) {
+			return KafkaProgress{}, errors.New("offset fetch denied")
+		}
+		overview := New(options).MonitorOverview(context.Background())
+		if overview["status"] != statusDegraded {
+			t.Fatalf("status = %v, want degraded", overview["status"])
+		}
+	})
+}
+
+// TestMonitorPipelineWorker covers the heartbeat-fed worker row: a fresh beat is
+// healthy, a stale beat degrades, and an unobserved worker stays unknown.
+func TestMonitorPipelineWorker(t *testing.T) {
+	cases := []struct {
+		name   string
+		beat   *WorkerHeartbeat
+		err    error
+		status string
+		detail string
+	}{
+		{name: "运行中", beat: &WorkerHeartbeat{UpdatedAt: time.Now().Add(-2 * time.Second), Instances: 2},
+			status: statusOK, detail: "2 个实例运行中"},
+		{name: "心跳过期", beat: &WorkerHeartbeat{UpdatedAt: time.Now().Add(-3 * time.Minute), Instances: 1},
+			status: statusDegraded, detail: "可能已停止"},
+		{name: "未上报", status: statusUnknown, detail: "未收到文档 worker 心跳"},
+		{name: "读取失败", err: errors.New("heartbeat read failed"),
+			status: statusUnknown, detail: "Worker 心跳读取失败"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			options := pipelineTestOptions(sampleStats())
+			options.WorkerHeartbeat = func(context.Context) (*WorkerHeartbeat, error) {
+				return testCase.beat, testCase.err
+			}
+			view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
+			if view.Worker.Status != testCase.status ||
+				!strings.Contains(view.Worker.Detail, testCase.detail) {
+				t.Fatalf("pipeline.worker = %+v, want %q containing %q",
+					view.Worker, testCase.status, testCase.detail)
+			}
+		})
+	}
+}
+
+// TestMonitorLibraryResultSnapshots asserts the snapshot count comes from the
+// Redis counter and stays null when that side read fails.
+func TestMonitorLibraryResultSnapshots(t *testing.T) {
+	t.Run("有计数", func(t *testing.T) {
+		options := healthyDependencyOptions(t)
+		options.ResultSnapshots = func(context.Context) (int, error) { return 7, nil }
+		library, _ := New(options).MonitorOverview(context.Background())["library"].(map[string]any)
+		if library["result_snapshots"] != 7 {
+			t.Fatalf("library.result_snapshots = %v", library["result_snapshots"])
+		}
+	})
+	t.Run("计数不可用", func(t *testing.T) {
+		options := healthyDependencyOptions(t)
+		options.ResultSnapshots = func(context.Context) (int, error) {
+			return 0, errors.New("redis unavailable")
+		}
+		library, _ := New(options).MonitorOverview(context.Background())["library"].(map[string]any)
+		if library["result_snapshots"] != nil {
+			t.Fatalf("library.result_snapshots = %v, want null", library["result_snapshots"])
+		}
+	})
+}
+
+// TestMonitorKafkaMetadataProbe asserts the dependency row uses cluster
+// metadata (brokers/topic/partitions) instead of a bare TCP dial.
+func TestMonitorKafkaMetadataProbe(t *testing.T) {
+	t.Run("元数据正常", func(t *testing.T) {
+		options := healthyDependencyOptions(t)
+		options.KafkaBootstrapServers = []string{kafkaListener(t)}
+		options.KafkaProbe = func(context.Context) (KafkaStatus, error) {
+			return KafkaStatus{Brokers: 2, Topic: mqDocumentTopic, TopicExists: true, Partitions: 6}, nil
+		}
+		item := dependencyByName(t, New(options).MonitorOverview(context.Background()), "kafka")
+		if item.Status != statusOK || !strings.Contains(item.Detail, "2 个 broker") ||
+			!strings.Contains(item.Detail, "6 个分区") || !strings.Contains(item.Detail, "元数据正常") {
+			t.Fatalf("kafka = %+v", item)
+		}
+	})
+	t.Run("读取失败", func(t *testing.T) {
+		options := healthyDependencyOptions(t)
+		options.KafkaBootstrapServers = []string{kafkaListener(t)}
+		options.KafkaProbe = func(context.Context) (KafkaStatus, error) {
+			return KafkaStatus{}, errors.New("metadata failed")
+		}
+		item := dependencyByName(t, New(options).MonitorOverview(context.Background()), "kafka")
+		if item.Status != statusError || !strings.Contains(item.Detail, "Kafka 元数据读取失败") {
+			t.Fatalf("kafka = %+v", item)
+		}
+	})
+	t.Run("主题不存在", func(t *testing.T) {
+		options := healthyDependencyOptions(t)
+		options.KafkaBootstrapServers = []string{kafkaListener(t)}
+		options.DocumentTopic = mqDocumentTopic
+		options.KafkaProbe = func(context.Context) (KafkaStatus, error) {
+			return KafkaStatus{Brokers: 1, Topic: mqDocumentTopic, TopicExists: false}, nil
+		}
+		item := dependencyByName(t, New(options).MonitorOverview(context.Background()), "kafka")
+		if item.Status != statusDegraded || !strings.Contains(item.Detail, "不存在") {
+			t.Fatalf("kafka = %+v", item)
+		}
+	})
+}
+
+// TestMonitorPDFHealthPayload asserts the Docling probe reads the converter
+// state instead of only the HTTP status code.
+func TestMonitorPDFHealthPayload(t *testing.T) {
+	doclingOptions := func(t *testing.T, server *httptest.Server) Options {
+		t.Helper()
+		options := healthyDependencyOptions(t)
+		options.PDFEngine = pdfEngineDocling
+		options.PDFServiceURL = server.URL
+		return options
+	}
+	t.Run("转换器就绪", func(t *testing.T) {
+		server := jsonServer(t, "/healthz", http.StatusOK,
+			`{"status":"ok","converter":"docling","version":"1.2.3","vlm_configured":true}`)
+		item := dependencyByName(t, New(doclingOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
+		if item.Status != statusOK || !strings.Contains(item.Detail, "转换器 docling") ||
+			!strings.Contains(item.Detail, "版本 1.2.3") || !strings.Contains(item.Detail, "VLM 已配置") {
+			t.Fatalf("pdf-service = %+v", item)
+		}
+	})
+	t.Run("转换器不可用", func(t *testing.T) {
+		server := jsonServer(t, "/healthz", http.StatusOK,
+			`{"status":"degraded","converter":"unavailable","config_error":"models missing"}`)
+		item := dependencyByName(t, New(doclingOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
+		if item.Status != statusDegraded || !strings.Contains(item.Detail, "models missing") {
+			t.Fatalf("pdf-service = %+v", item)
+		}
+	})
+	t.Run("响应不可解析", func(t *testing.T) {
+		server := jsonServer(t, "/healthz", http.StatusOK, `<html>ok</html>`)
+		item := dependencyByName(t, New(doclingOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
+		if item.Status != statusDegraded || item.Detail != "健康检查响应无法解析" {
+			t.Fatalf("pdf-service = %+v", item)
+		}
+	})
+	t.Run("HTTP 失败", func(t *testing.T) {
+		server := jsonServer(t, "/healthz", http.StatusInternalServerError, `{}`)
+		item := dependencyByName(t, New(doclingOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
+		if item.Status != statusError || !strings.Contains(item.Detail, "HTTP 500") {
+			t.Fatalf("pdf-service = %+v", item)
+		}
+	})
+}
+
+// TestMonitorDebeziumRuntimeChecks asserts the health probe reports the
+// per-check runtime state instead of trusting the aggregate HTTP code.
+func TestMonitorDebeziumRuntimeChecks(t *testing.T) {
+	t.Run("运行检查通过", func(t *testing.T) {
+		server := jsonServer(t, "/q/health", http.StatusOK,
+			`{"status":"UP","checks":[{"name":"debezium","status":"UP"},{"name":"Database connections health check","status":"UP"}]}`)
+		options := pipelineTestOptions(sampleStats())
+		options.DebeziumHealthURL = server.URL + "/q/health"
+		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
+		if view.Debezium.Status != statusOK ||
+			!strings.Contains(view.Debezium.Detail, "2 项运行检查通过") {
+			t.Fatalf("pipeline.debezium = %+v", view.Debezium)
+		}
+	})
+	t.Run("运行检查失败", func(t *testing.T) {
+		server := jsonServer(t, "/q/health", http.StatusServiceUnavailable,
+			`{"status":"DOWN","checks":[{"name":"debezium","status":"DOWN"},{"name":"Database connections health check","status":"UP"}]}`)
+		options := pipelineTestOptions(sampleStats())
+		options.DebeziumHealthURL = server.URL + "/q/health"
+		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
+		if view.Debezium.Status != statusError ||
+			!strings.Contains(view.Debezium.Detail, "检查失败：debezium") {
+			t.Fatalf("pipeline.debezium = %+v", view.Debezium)
+		}
+	})
 }

@@ -23,6 +23,7 @@ const fetchMock = vi.fn();
 function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverview {
   return {
     generated_at: "2026-11-11T14:20:00Z",
+    status: "ok",
     ok: true,
     service: {
       name: "praxis-rag",
@@ -44,20 +45,29 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
     ],
     queues: {
       document_jobs: {
-        by_status: { queued: 0, processing: 1, succeeded: 10, failed: 0 },
-        by_stage: { parsing: 1 },
+        by_status: { queued: 2, processing: 1, succeeded: 10, failed: 0 },
+        by_stage: { parsing: 1, chunking: 2 },
         oldest_queued_seconds: 12.5,
-        stuck_processing: 0,
-        failed_recent: 0,
+        stuck_processing: 1,
+        failed_recent: 2,
       },
       search_tasks: {
         by_status: { queued: 0, processing: 0, succeeded: 3, failed: 0, timed_out: 0 },
         oldest_active_seconds: 0,
       },
-      uploads: { unfinished: 0 },
+      // 上传统计的是“操作”而不是正在上传的文件：四个互斥分类 + 兼容用的合计。
+      uploads: {
+        unfinished: 5,
+        by_status: { IN_PROGRESS: 2, FAILED: 1, ROLLING_BACK: 1, CLEANUP_PENDING: 1 },
+        in_progress: 2,
+        failed: 1,
+        rolling_back: 1,
+        cleanup_pending: 1,
+      },
     },
-    // pipeline 把四个视图分开：outbox 记录（保留语义）、Debezium 采集、Kafka 消费、
-    // 文档任务状态。capture_progress 与 consumer_lag 为 null 时必须显示“未知”。
+    // pipeline 把视图分开：outbox 记录（保留语义）、Debezium 采集、文档 Worker
+    // 心跳、Kafka 消费、文档任务状态。capture_progress 与 consumer_lag 为 null
+    // 时必须显示“未知”。
     pipeline: {
       outbox: {
         // outbox 的 status 在状态库中存大写字面量，页面必须按“记录”语义本地化。
@@ -66,6 +76,7 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
         oldest_record_seconds: 90,
       },
       document_jobs: { status: "ok", detail: "文档任务正常，最近成功 10 个" },
+      worker: { status: "ok", detail: "最近心跳 3.0 秒前，1 个实例运行中" },
       debezium: { status: "unknown", detail: "未读取 Debezium 偏移", capture_progress: null },
       kafka: {
         status: "unknown",
@@ -77,7 +88,7 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
         consumer_lag: null,
       },
     },
-    library: { documents: 12, knowledge_bases: 2, result_snapshots: 0, artifact_snapshots: 3 },
+    library: { documents: 12, knowledge_bases: 2, result_snapshots: 4, artifact_snapshots: 3 },
     activity: { window_hours: 24, jobs_succeeded: 3, jobs_failed: 0, searches: 12 },
     errors: [],
     ...overrides,
@@ -89,6 +100,21 @@ function renderPage() {
     <ConfigProvider button={{ autoInsertSpace: false }}>
       <MonitorPage />
     </ConfigProvider>,
+  );
+}
+
+// statisticValue reads one Statistic's rendered number by its title, avoiding
+// ambiguity when different cards show the same count.
+function statisticValue(scope: HTMLElement, title: string) {
+  const statistic = within(scope).getByText(title).closest(".ant-statistic") as HTMLElement;
+  return (statistic.querySelector(".ant-statistic-content")?.textContent ?? "").trim();
+}
+
+// cardTitles lists the card headings in DOM order: the layout contract puts the
+// key metrics first and the static service facts last.
+function cardTitles(scope: HTMLElement) {
+  return Array.from(scope.querySelectorAll(".ant-card-head-title")).map(
+    (node) => (node.textContent ?? "").trim(),
   );
 }
 
@@ -122,7 +148,7 @@ afterEach(() => {
 });
 
 describe("MonitorPage", () => {
-  it("renders the service facts, dependency states and queue counts", async () => {
+  it("leads with the key metrics, then dependencies, queues and the static service facts", async () => {
     fetchMock.mockResolvedValue(jsonResponse(overviewFixture()));
     renderPage();
 
@@ -130,12 +156,19 @@ describe("MonitorPage", () => {
     expect(await screen.findByText("0.4.0")).toBeTruthy();
     expect(screen.getByText("运行正常")).toBeTruthy();
     expect(screen.getByText(/更新于/)).toBeTruthy();
-    // 服务信息：运行时长按中文时长渲染，后端/集合/上传方式都在。
-    expect(screen.getByText("2 小时 20 分")).toBeTruthy();
-    expect(screen.getByText("go")).toBeTruthy();
-    expect(screen.getByText("praxis_chunks")).toBeTruthy();
-    expect(screen.getByText("async")).toBeTruthy();
-    expect(screen.getByText("docling")).toBeTruthy();
+
+    // 版式验收：第一张内容卡片是关键指标，服务信息移到最后。
+    const page = screen.getByLabelText("系统监控页面") as HTMLElement;
+    expect(cardTitles(page)).toEqual(["关键指标", "依赖与投递", "队列与记录", "服务信息"]);
+
+    // 关键指标：六个任务指标都以 Statistic 渲染，数据来自 queues/library/activity。
+    const metricsCard = screen.getByText("关键指标").closest(".ant-card") as HTMLElement;
+    expect(statisticValue(metricsCard, "有效文档")).toBe("12");
+    expect(statisticValue(metricsCard, "排队文档任务")).toBe("2");
+    expect(statisticValue(metricsCard, "处理中文档任务")).toBe("1");
+    expect(statisticValue(metricsCard, "上传进行中")).toBe("2");
+    expect(statisticValue(metricsCard, "近 24 小时检索次数")).toBe("12");
+    expect(statisticValue(metricsCard, "当前结果快照")).toBe("4");
 
     // 依赖表：MySQL 行显示正常与延迟，禁用项不显示无意义的 0ms。
     const mysqlRow = screen.getByText("MySQL").closest("tr");
@@ -147,14 +180,18 @@ describe("MonitorPage", () => {
     expect(within(kafkaRow as HTMLElement).getByText("—")).toBeTruthy();
     expect(screen.getByText(/向量点 1,234/)).toBeTruthy();
 
-    // 队列计数绑定到各自的区域，避免和检索任务同名状态混淆。
+    // 文档任务：状态计数、队列年龄/卡死/失败与阶段 Tag 列表。
     const jobsBlock = screen.getByLabelText("文档任务队列");
-    expect(within(jobsBlock).getByText("排队中 0")).toBeTruthy();
+    expect(within(jobsBlock).getByText("排队中 2")).toBeTruthy();
     expect(within(jobsBlock).getByText("处理中 1")).toBeTruthy();
-    // 文档任务 succeeded 是权威处理结果：即使 outbox 记录仍是 PENDING 也显示“成功”。
     expect(within(jobsBlock).getByText("成功 10")).toBeTruthy();
     expect(within(jobsBlock).getByText("12 秒")).toBeTruthy();
-    expect(within(jobsBlock).getByText("解析中")).toBeTruthy();
+    expect(within(jobsBlock).getByText("1 个")).toBeTruthy();
+    expect(within(jobsBlock).getByText("2 个")).toBeTruthy();
+    // 阶段分布是紧凑 Tag 列表，不再是表格（Descriptions 自身的布局表格不算）。
+    expect(within(jobsBlock).getByText("解析中 1")).toBeTruthy();
+    expect(within(jobsBlock).getByText("切分中 2")).toBeTruthy();
+    expect(jobsBlock.querySelector(".ant-table")).toBeNull();
 
     // Outbox 是“记录”统计而不是待投递积压：不出现 待投递/已投递 文案。
     const outboxBlock = screen.getByLabelText("Outbox 记录");
@@ -166,26 +203,45 @@ describe("MonitorPage", () => {
     expect(within(outboxBlock).getByText(/不代表未投递积压/)).toBeTruthy();
     expect(within(outboxBlock).queryByText(/待投递/)).toBeNull();
 
-    // 投递与消费进度：Debezium / Kafka / 文档任务状态三行分开，未知进度显示“未知”。
+    // 检索任务独立于 outbox 记录。
+    const searchBlock = screen.getByLabelText("检索任务队列");
+    expect(within(searchBlock).getByText("成功 3")).toBeTruthy();
+    expect(within(searchBlock).getByText("0 秒")).toBeTruthy();
+
+    // 投递与消费进度：Debezium / 文档 Worker / Kafka / 文档任务状态四行分开，
+    // 未知进度显示“未知”，不会伪造 0 或百分比。
     const pipelineBlock = screen.getByLabelText("投递与消费进度");
     expect(within(pipelineBlock).getByText("Debezium 采集")).toBeTruthy();
     expect(within(pipelineBlock).getByText("未读取 Debezium 偏移")).toBeTruthy();
     expect(within(pipelineBlock).getByText("采集进度：未知（需在 Debezium 侧查看）")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("文档 Worker")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("最近心跳 3.0 秒前，1 个实例运行中")).toBeTruthy();
     expect(within(pipelineBlock).getByText("Kafka 消费")).toBeTruthy();
     expect(within(pipelineBlock).getByText("消费滞后：未知")).toBeTruthy();
     expect(within(pipelineBlock).getByText(/Topic：praxis\.rag\.document_jobs/)).toBeTruthy();
     expect(within(pipelineBlock).getByText("文档任务状态")).toBeTruthy();
     expect(within(pipelineBlock).getByText("文档任务正常，最近成功 10 个")).toBeTruthy();
-    // 文档任务状态显示“正常”，与 outbox 保留记录相互独立。
-    expect(within(pipelineBlock).getByText("正常")).toBeTruthy();
+    // Worker 与文档任务状态都是“正常”，Debezium/Kafka 仍是“未知”。
+    expect(within(pipelineBlock).getAllByText("正常")).toHaveLength(2);
 
-    // 资料库与活动统计。
-    const libraryCard = screen.getByText("资料库").closest(".ant-card") as HTMLElement;
-    expect(within(libraryCard).getByText("12")).toBeTruthy();
-    expect(within(libraryCard).getByText("Artifact 快照")).toBeTruthy();
-    const activityCard = screen.getByText("活动（最近 24 小时）").closest(".ant-card") as HTMLElement;
-    expect(within(activityCard).getByText("检索次数")).toBeTruthy();
-    expect(within(activityCard).getByText("3")).toBeTruthy();
+    // 上传操作按互斥分类展示，0 也要显示，并注明不代表当前正在上传的文件数。
+    const uploadsBlock = screen.getByLabelText("上传队列");
+    expect(statisticValue(uploadsBlock, "进行中")).toBe("2");
+    expect(statisticValue(uploadsBlock, "失败")).toBe("1");
+    expect(statisticValue(uploadsBlock, "回滚中")).toBe("1");
+    expect(statisticValue(uploadsBlock, "待清理")).toBe("1");
+    expect(within(uploadsBlock).getByText("未完成操作合计：5")).toBeTruthy();
+    expect(within(uploadsBlock).getByText(/未完成操作 = 进行中 \+ 失败\/回滚待处理 \+ 待清理/)).toBeTruthy();
+    expect(within(uploadsBlock).getByText(/不代表当前正在上传或入库的文件数/)).toBeTruthy();
+
+    // 服务信息在页面最后：静态配置仍完整可读。
+    const serviceCard = screen.getByText("服务信息").closest(".ant-card") as HTMLElement;
+    expect(within(serviceCard).getByText("2 小时 20 分")).toBeTruthy();
+    expect(within(serviceCard).getByText("go")).toBeTruthy();
+    expect(within(serviceCard).getByText("praxis_chunks")).toBeTruthy();
+    expect(within(serviceCard).getByText("async")).toBeTruthy();
+    expect(within(serviceCard).getByText("debezium")).toBeTruthy();
+    expect(within(serviceCard).getByText("docling")).toBeTruthy();
 
     // 首次请求直接命中聚合接口且绕过缓存。
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/admin/monitor/overview");
@@ -194,8 +250,33 @@ describe("MonitorPage", () => {
     expect(requestOptions.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it("shows an error dependency and the backend diagnostics when ok is false", async () => {
+  it("shows 存在降级 and summarizes the degraded dependencies when status is degraded", async () => {
     const fixture = overviewFixture({
+      status: "degraded",
+      ok: false,
+      dependencies: overviewFixture().dependencies.map((dependency) =>
+        dependency.name === "qdrant"
+          ? { ...dependency, status: "degraded" as const, detail: "目标集合不存在" }
+          : dependency,
+      ),
+    });
+    fetchMock.mockResolvedValue(jsonResponse(fixture));
+    renderPage();
+
+    expect(await screen.findByText("0.4.0")).toBeTruthy();
+    expect(screen.getByText("存在降级")).toBeTruthy();
+    expect(screen.queryByText("存在异常")).toBeNull();
+    expect(screen.getByText("服务存在降级")).toBeTruthy();
+    // 降级依赖自动汇总为 label + detail，而不是一句泛泛的警告。
+    expect(screen.getByText("Qdrant：目标集合不存在")).toBeTruthy();
+
+    const qdrantRow = screen.getByText("Qdrant").closest("tr");
+    expect(within(qdrantRow as HTMLElement).getByText("降级")).toBeTruthy();
+  });
+
+  it("shows the backend diagnostics when status is error", async () => {
+    const fixture = overviewFixture({
+      status: "error",
       ok: false,
       errors: ["Qdrant 连接失败：connection refused"],
       dependencies: overviewFixture().dependencies.map((dependency) =>
@@ -214,6 +295,20 @@ describe("MonitorPage", () => {
     expect(within(qdrantRow as HTMLElement).getByText("异常")).toBeTruthy();
   });
 
+  it("falls back to the ok boolean when the status field is missing", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(overviewFixture({ status: undefined, ok: true })));
+    const first = renderPage();
+    expect(await screen.findByText("运行正常")).toBeTruthy();
+    first.unmount();
+
+    fetchMock.mockResolvedValue(
+      jsonResponse(overviewFixture({ status: undefined, ok: false, errors: ["监控统计不可用：timeout"] })),
+    );
+    renderPage();
+    expect(await screen.findByText("存在异常")).toBeTruthy();
+    expect(screen.getByText("监控统计不可用：timeout")).toBeTruthy();
+  });
+
   it("shows the load failure and retries with a fresh snapshot", async () => {
     fetchMock.mockRejectedValueOnce(
       new Error("GET /v1/admin/monitor/overview\nHTTP 403：仅管理员可访问"),
@@ -224,6 +319,7 @@ describe("MonitorPage", () => {
     expect(screen.getByText(/HTTP 403/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "重试" })).toBeTruthy();
     // 首次失败没有快照：不显示任何统计卡片，只保留错误与重试入口。
+    expect(screen.queryByText("关键指标")).toBeNull();
     expect(screen.queryByText("服务信息")).toBeNull();
 
     fetchMock.mockResolvedValue(jsonResponse(overviewFixture()));
@@ -232,7 +328,7 @@ describe("MonitorPage", () => {
     await waitFor(() => expect(screen.queryByText("监控数据加载失败")).toBeNull());
   });
 
-  it("degrades to placeholders when the state database snapshot is unavailable", async () => {
+  it("renders 未知 for every metric when the state database snapshot is unavailable", async () => {
     fetchMock.mockResolvedValue(
       jsonResponse(overviewFixture({ queues: null, library: null, activity: null })),
     );
@@ -240,14 +336,119 @@ describe("MonitorPage", () => {
 
     expect(await screen.findByText("0.4.0")).toBeTruthy();
     expect(screen.getByText("运行正常")).toBeTruthy();
-    expect(screen.getAllByText("状态库暂不可用")).toHaveLength(3);
 
-    // 队列统计不可用时，文档任务降级为“未知”；Outbox 记录与进度仍各自可读。
+    const metricsCard = screen.getByText("关键指标").closest(".ant-card") as HTMLElement;
+    expect(statisticValue(metricsCard, "有效文档")).toBe("未知");
+    expect(statisticValue(metricsCard, "排队文档任务")).toBe("未知");
+    expect(statisticValue(metricsCard, "处理中文档任务")).toBe("未知");
+    expect(statisticValue(metricsCard, "上传进行中")).toBe("未知");
+    expect(statisticValue(metricsCard, "近 24 小时检索次数")).toBe("未知");
+    expect(statisticValue(metricsCard, "当前结果快照")).toBe("未知");
+
+    // 队列统计不可用时，文档任务明细降级为“未知”，阶段分布提示状态库不可用。
     const jobsBlock = screen.getByLabelText("文档任务队列");
     expect(within(jobsBlock).getAllByText("未知")).toHaveLength(3);
+    expect(within(jobsBlock).getByText("状态库暂不可用")).toBeTruthy();
+
+    // 上传分类整体不可用时保持“未知”，不显示伪造的 0。
+    const uploadsBlock = screen.getByLabelText("上传队列");
+    expect(within(uploadsBlock).getByText("上传操作：未知")).toBeTruthy();
+
+    // Outbox 记录仍在 pipeline 里，各自可读。
     const outboxBlock = screen.getByLabelText("Outbox 记录");
     expect(within(outboxBlock).getByText("PENDING 记录 2")).toBeTruthy();
     expect(within(outboxBlock).getByText("7 条")).toBeTruthy();
+  });
+
+  it("renders 暂无处理中任务 instead of an empty stage table", async () => {
+    const fixture = overviewFixture();
+    fixture.queues!.document_jobs.by_stage = {};
+    fetchMock.mockResolvedValue(jsonResponse(fixture));
+    renderPage();
+
+    expect(await screen.findByText("0.4.0")).toBeTruthy();
+    const jobsBlock = screen.getByLabelText("文档任务队列");
+    expect(within(jobsBlock).getByText("暂无处理中任务")).toBeTruthy();
+    // 阶段分布不再使用 Table：该区块内不应出现 .ant-table（Descriptions 自身的
+    // 布局表格不算），也不应残留阶段 Tag。
+    expect(jobsBlock.querySelector(".ant-table")).toBeNull();
+    expect(within(jobsBlock).queryByText(/解析中/)).toBeNull();
+  });
+
+  it("renders 未知 for a null result snapshot count, including a legacy missing field", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse(overviewFixture({ library: { documents: 12, knowledge_bases: 2, result_snapshots: null, artifact_snapshots: 3 } })),
+    );
+    const first = renderPage();
+    expect(await screen.findByText("0.4.0")).toBeTruthy();
+    const metricsCard = screen.getByText("关键指标").closest(".ant-card") as HTMLElement;
+    expect(statisticValue(metricsCard, "当前结果快照")).toBe("未知");
+    expect(statisticValue(metricsCard, "有效文档")).toBe("12");
+    first.unmount();
+
+    // 旧后端没有 result_snapshots 字段时同样视为未知，而不是 0。
+    fetchMock.mockResolvedValue(
+      jsonResponse(overviewFixture({
+        library: {
+          documents: 12,
+          knowledge_bases: 2,
+          result_snapshots: undefined as unknown as null,
+          artifact_snapshots: 3,
+        },
+      })),
+    );
+    renderPage();
+    expect(await screen.findByText("0.4.0")).toBeTruthy();
+    const legacyMetricsCard = screen.getByText("关键指标").closest(".ant-card") as HTMLElement;
+    expect(statisticValue(legacyMetricsCard, "当前结果快照")).toBe("未知");
+  });
+
+  it("renders the upload operation buckets including zeros", async () => {
+    const fixture = overviewFixture();
+    fixture.queues!.uploads = {
+      unfinished: 5,
+      by_status: { IN_PROGRESS: 0, FAILED: 2, ROLLING_BACK: 0, CLEANUP_PENDING: 3 },
+      in_progress: 0,
+      failed: 2,
+      rolling_back: 0,
+      cleanup_pending: 3,
+    };
+    fetchMock.mockResolvedValue(jsonResponse(fixture));
+    renderPage();
+
+    expect(await screen.findByText("0.4.0")).toBeTruthy();
+    const uploadsBlock = screen.getByLabelText("上传队列");
+    expect(statisticValue(uploadsBlock, "进行中")).toBe("0");
+    expect(statisticValue(uploadsBlock, "失败")).toBe("2");
+    expect(statisticValue(uploadsBlock, "回滚中")).toBe("0");
+    expect(statisticValue(uploadsBlock, "待清理")).toBe("3");
+    expect(within(uploadsBlock).getByText("未完成操作合计：5")).toBeTruthy();
+  });
+
+  it("renders the worker row as 未知 when the heartbeat is missing and 正常 once it arrives", async () => {
+    const fixture = overviewFixture();
+    fixture.pipeline!.worker = {
+      status: "unknown",
+      detail: "未收到独立文档 worker 心跳（确认 rag-document-worker 已启动）",
+    };
+    fetchMock.mockResolvedValue(jsonResponse(fixture));
+    renderPage();
+
+    expect(await screen.findByText("0.4.0")).toBeTruthy();
+    const pipelineBlock = screen.getByLabelText("投递与消费进度");
+    expect(within(pipelineBlock).getByText("文档 Worker")).toBeTruthy();
+    expect(
+      within(pipelineBlock).getByText("未收到独立文档 worker 心跳（确认 rag-document-worker 已启动）"),
+    ).toBeTruthy();
+
+    // 下一次快照带回心跳后，该行切换为“正常”。
+    fetchMock.mockResolvedValue(jsonResponse(overviewFixture()));
+    const refreshButton = screen.getByRole("button", { name: /刷新/ });
+    await waitFor(() => expect(refreshButton.className).not.toContain("ant-btn-loading"));
+    fireEvent.click(refreshButton);
+    expect(await screen.findByText("最近心跳 3.0 秒前，1 个实例运行中")).toBeTruthy();
+    const refreshedBlock = screen.getByLabelText("投递与消费进度");
+    expect(within(refreshedBlock).getAllByText("正常")).toHaveLength(2);
   });
 
   it("renders 未知 for every delivery view when the pipeline snapshot is missing", async () => {
@@ -255,17 +456,18 @@ describe("MonitorPage", () => {
     renderPage();
 
     expect(await screen.findByText("0.4.0")).toBeTruthy();
-    // 依赖表、资料库和活动不受 pipeline 缺失影响。
+    // 依赖表与关键指标不受 pipeline 缺失影响。
     expect(screen.getByText("MySQL")).toBeTruthy();
-    expect(screen.getByText("资料库")).toBeTruthy();
+    const metricsCard = screen.getByText("关键指标").closest(".ant-card") as HTMLElement;
+    expect(statisticValue(metricsCard, "有效文档")).toBe("12");
 
     const outboxBlock = screen.getByLabelText("Outbox 记录");
     expect(within(outboxBlock).getAllByText("未知")).toHaveLength(2);
     expect(within(outboxBlock).getByText(/不代表未投递积压/)).toBeTruthy();
 
     const pipelineBlock = screen.getByLabelText("投递与消费进度");
-    // 三个状态标签与三行详情都降级为“未知”，不会显示 0 或伪造进度。
-    expect(within(pipelineBlock).getAllByText("未知").length).toBeGreaterThanOrEqual(6);
+    // 四个状态标签与四行详情都降级为“未知”，不会显示 0 或伪造进度。
+    expect(within(pipelineBlock).getAllByText("未知").length).toBeGreaterThanOrEqual(8);
     expect(within(pipelineBlock).getByText("采集进度：未知（需在 Debezium 侧查看）")).toBeTruthy();
     expect(within(pipelineBlock).getByText("消费滞后：未知")).toBeTruthy();
     expect(within(pipelineBlock).getByText(/Topic：未知/)).toBeTruthy();
@@ -292,8 +494,8 @@ describe("MonitorPage", () => {
     const pipelineBlock = screen.getByLabelText("投递与消费进度");
     expect(within(pipelineBlock).getByText("消费滞后：5 条（已提交 95 / 末尾 100）")).toBeTruthy();
     expect(within(pipelineBlock).queryByText("消费滞后：未知")).toBeNull();
-    // Kafka 与文档任务两行都是“正常”。
-    expect(within(pipelineBlock).getAllByText("正常")).toHaveLength(2);
+    // Worker、Kafka 与文档任务三行都是“正常”。
+    expect(within(pipelineBlock).getAllByText("正常")).toHaveLength(3);
   });
 
   it("starts with auto refresh on and refreshes on demand", async () => {

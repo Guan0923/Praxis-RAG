@@ -151,6 +151,12 @@ func run() error {
 	defer stop()
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	defer cancelWorker()
+	// Record worker liveness so the Console monitor can prove this independent
+	// worker actually runs; the configured deployment mode alone proves nothing.
+	heartbeatInterval := documentworker.DefaultWorkerHeartbeatInterval()
+	stopHeartbeat := documentworker.StartHeartbeat(
+		workerCtx, stores.Heartbeats, state.HeartbeatRoleDocumentWorker, heartbeatInterval, logger)
+	defer stopHeartbeat()
 
 	logger.Info("Praxis-RAG document worker starting",
 		"version", version.Version,
@@ -159,6 +165,7 @@ func run() error {
 		"max_attempts", maxAttempts,
 		"concurrency", concurrency,
 		"recover_seconds", recoverInterval.Seconds(),
+		"heartbeat_seconds", heartbeatInterval.Seconds(),
 		"backend", string(ragConfig.Backend),
 	)
 

@@ -44,6 +44,8 @@ Redis 有两种不同职责，不能混用其故障语义：
 
 搜索的 Kafka/Redis 未配置、客户端不可用、连接失败或发送确认失败必须明确报错；故障期间没有 SQL 持久接收和补发保证。部分发送后的超时可能不确定，重试应保留原 idempotency_key、内容和参数。Redis 丢失、淘汰或 TTL 到期可使搜索结果引用不可用，可能需要重新提交；不读旧 SQL 结果表，也不自动重新搜索来伪造原快照。
 
+结果快照的 key 是 `<prefix>:transient:{sha256}` 哈希形式，无法按前缀扫描计数。为支持 Console 监控页的「当前结果快照」指标，`ResultSnapshots.Save` 成功后会向 `<prefix>:index:search-results` ZSET 补记 `identity → expires_at`；读取时先 `ZREMRANGEBYSCORE` 清理过期成员再 `ZCARD`。索引只是可选观测数据：写入失败不影响快照保存，Redis 未启用/不可用时监控显示「未知」。它只覆盖索引启用后保存且仍在 TTL 内的快照，索引上线前保存的快照不会补录。
+
 搜索由独立 worker、独立 topic/group 消费；缓存刷新使用第三组独立 topic/group，文档通知使用文档 topic/group。Kafka 消费语义为 ack=提交 offset、nack=同一进程内指数退避重试同一条记录、达到 `MaxAttempts` 后写入显式 `RAG_*_DLQ_TOPIC` 并提交、`MaxAttempts=0` 无限重试（至少一次）。搜索临时故障不提交，确定性故障先写 Redis 失败终态再提交，成功也先写结果/终态再提交。Redis 任务状态通过 CAS 条件更新，结果与成功终态原子写入 Redis；重复消息遵循 first-terminal-wins，不能覆盖仍存在的终态。Redis 丢失后不承诺搜索持久去重。
 
 文档侧没有 Redis 参与：任务状态、租约与终态全部由 MySQL 提供，worker 用 SQL 租约 claim 并心跳续租，只有 MySQL 记录终态后才 ACK；`get_document_status` 直接读 MySQL，无 TTL。UploadJournal 继续保障文档发布版本一致性，不存在 Redis+MySQL 原子事务问题，也没有 Redis 回源。发件箱行按 `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS`（默认 7 天）清理，任务行不在该清理范围内。日志仅记录任务/操作 ID 与安全错误类别，不记录查询、文件/消息正文或凭据。

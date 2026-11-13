@@ -45,6 +45,10 @@ var expectedSchema = []struct {
 	{"user_avatars", []string{"user_id", "content_type", "size", "sha256", "content", "updated_at"}},
 	{"email_verification_codes", []string{"id", "email", "purpose", "code_digest", "attempts", "consumed", "expires_at", "created_at"}},
 	{"app_settings", []string{"setting_key", "setting_value", "updated_at"}},
+	// Go-only monitoring tables (Console 监控页的活动计数与 Worker 心跳); they
+	// are appended after the ported tables so migrated databases keep the order.
+	{"activity_counters", []string{"metric", "window_start", "count"}},
+	{"runtime_heartbeats", []string{"role", "instance", "updated_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -78,6 +82,8 @@ var expectedPrimaryKeys = map[string][]string{
 	"user_avatars":             {"user_id"},
 	"email_verification_codes": {"id"},
 	"app_settings":             {"setting_key"},
+	"activity_counters":        {"metric", "window_start"},
+	"runtime_heartbeats":       {"role", "instance"},
 }
 
 var expectedUniques = map[string][]string{
@@ -117,6 +123,7 @@ var expectedIndexes = map[string][]string{
 	"document_batches":         {"ix_document_batch_active", "ix_document_batch_owner"},
 	"document_batch_items":     {"ix_document_batch_item_artifact"},
 	"email_verification_codes": {"ix_email_codes_lookup", "ix_email_codes_expiry"},
+	"runtime_heartbeats":       {"ix_runtime_heartbeats_role"},
 }
 
 // expectedTableNames returns the schema table names in Python declaration order.

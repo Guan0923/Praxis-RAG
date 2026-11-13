@@ -797,6 +797,30 @@ var schemaTables = []*SchemaTable{
 			varchar("updated_at", 40),
 		},
 	},
+	// activity_counters and runtime_heartbeats back the Console monitoring page
+	// (检索活动计数与 Worker 存活心跳). They are Go-only additions appended after
+	// the ported tables, so a migrated database and a freshly created one keep
+	// the same table order.
+	{
+		Name: "activity_counters",
+		Columns: []SchemaColumn{
+			// metric is the activity name (ActivitySearch and future metrics);
+			// window_start is the Unix second that starts the hourly bucket.
+			identifier("metric", 64).PK(),
+			bigint("window_start").PK(),
+			bigint("count"),
+		},
+	},
+	{
+		Name: "runtime_heartbeats",
+		Columns: []SchemaColumn{
+			// One row per (role, instance); updated_at is the newest heartbeat.
+			identifier("role", 64).PK(),
+			identifier("instance", 200).PK(),
+			double("updated_at"),
+		},
+		Indexes: []SchemaIndex{index("ix_runtime_heartbeats_role", "role", "updated_at")},
+	},
 }
 
 // SchemaTables returns the schema tables in creation order. The returned slice
