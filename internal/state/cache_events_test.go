@@ -2,51 +2,106 @@ package state
 
 import (
 	"context"
-	"sort"
+	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 )
 
-func TestAPIKeyCreateEmitsRevisionAndOutboxEvent(t *testing.T) {
+// cacheRevisionOrZero reads a revision that may not exist yet (0).
+func cacheRevisionOrZero(t *testing.T, stores *Stores, kind, scope string) int64 {
+	t.Helper()
+	var value int64
+	err := stores.DB.QueryRowContext(context.Background(),
+		"SELECT revision FROM cache_revisions WHERE kind = ? AND scope = ?", kind, scope).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0
+	}
+	if err != nil {
+		t.Fatalf("cache_revisions(%q, %q) error = %v", kind, scope, err)
+	}
+	return value
+}
+
+// cacheRevisionRow is one cache_revisions row, including the dirty/refresh
+// water-line columns added for the Debezium cache consumer.
+type cacheRevisionRow struct {
+	Revision          int64
+	RefreshedRevision int64
+	Attempts          int
+	LastError         sql.NullString
+	UpdatedAt         float64
+}
+
+// readCacheRevision reads the current dirty state of one (kind, scope).
+func readCacheRevision(t *testing.T, stores *Stores, kind, scope string) cacheRevisionRow {
+	t.Helper()
+	var row cacheRevisionRow
+	err := stores.DB.QueryRowContext(context.Background(),
+		"SELECT revision, refreshed_revision, attempts, last_error, updated_at "+
+			"FROM cache_revisions WHERE kind = ? AND scope = ?", kind, scope).
+		Scan(&row.Revision, &row.RefreshedRevision, &row.Attempts, &row.LastError, &row.UpdatedAt)
+	if err != nil {
+		t.Fatalf("cache_revisions(%q, %q) error = %v", kind, scope, err)
+	}
+	return row
+}
+
+// cacheRevisionCount returns the number of tracked read-model revisions.
+func cacheRevisionCount(t *testing.T, stores *Stores) int {
+	t.Helper()
+	var count int
+	if err := stores.DB.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM cache_revisions").Scan(&count); err != nil {
+		t.Fatalf("cache revision count error = %v", err)
+	}
+	return count
+}
+
+// requireNoCacheOutbox asserts the retired transactional outbox holds no rows.
+// A pre-existing test schema may still carry the table until the cutover CLI
+// drops it, so absence of the table itself is accepted.
+func requireNoCacheOutbox(t *testing.T, stores *Stores) {
+	t.Helper()
+	ctx := context.Background()
+	var tables int
+	if err := stores.DB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.tables "+
+			"WHERE table_schema = DATABASE() AND table_name = 'cache_outbox'").Scan(&tables); err != nil {
+		t.Fatalf("cache_outbox existence query error = %v", err)
+	}
+	if tables == 0 {
+		return
+	}
+	var rows int
+	if err := stores.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM cache_outbox").Scan(&rows); err != nil {
+		t.Fatalf("cache_outbox count error = %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("cache_outbox has %d rows: the revision water line must be the only durable signal", rows)
+	}
+}
+
+func TestAPIKeyCreateBumpsRevisionOnly(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
 	if _, err := stores.APIKeys.Create(ctx, "app", []string{"alpha"}); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	if value := revision(t, stores, "api_keys", ""); value != 1 {
-		t.Fatalf("api_keys revision = %d, want 1", value)
+	row := readCacheRevision(t, stores, "api_keys", "")
+	if row.Revision != 1 {
+		t.Fatalf("api_keys revision = %d, want 1", row.Revision)
 	}
-	var (
-		kind, scope, status string
-		eventRevision       int64
-		attempts            int
-		retryAt, createdAt  float64
-		completedAt         any
-		lastError           any
-	)
-	err := stores.DB.QueryRowContext(ctx,
-		"SELECT kind, scope, revision, status, attempts, retry_at, created_at, completed_at, last_error FROM cache_outbox").
-		Scan(&kind, &scope, &eventRevision, &status, &attempts, &retryAt, &createdAt, &completedAt, &lastError)
-	if err != nil {
-		t.Fatalf("cache_outbox query error = %v", err)
+	if row.RefreshedRevision != 0 || row.Attempts != 0 {
+		t.Fatalf("api_keys refreshed/attempts = %d/%d, want 0/0", row.RefreshedRevision, row.Attempts)
 	}
-	if kind != "api_keys" || scope != "" || eventRevision != 1 || status != "PENDING" || attempts != 0 || retryAt != 0 {
-		t.Fatalf("unexpected outbox event: kind=%q scope=%q revision=%d status=%q attempts=%d retry_at=%v",
-			kind, scope, eventRevision, status, attempts, retryAt)
+	if row.LastError.Valid {
+		t.Fatalf("api_keys last_error = %q, want NULL", row.LastError.String)
 	}
-	if createdAt <= 0 {
-		t.Fatalf("created_at = %v, want a positive epoch timestamp", createdAt)
+	if row.UpdatedAt <= 0 {
+		t.Fatalf("api_keys updated_at = %v, want a positive epoch timestamp", row.UpdatedAt)
 	}
-	if completedAt != nil || lastError != nil {
-		t.Fatalf("completed_at/last_error = %v/%v, want NULL", completedAt, lastError)
-	}
-	var eventID string
-	if err := stores.DB.QueryRowContext(ctx, "SELECT id FROM cache_outbox").Scan(&eventID); err != nil {
-		t.Fatalf("outbox id query error = %v", err)
-	}
-	if len(eventID) != 32 || strings.ToLower(eventID) != eventID {
-		t.Fatalf("event id = %q, want 32 lowercase hex characters", eventID)
-	}
+	requireNoCacheOutbox(t, stores)
 }
 
 func TestKnowledgeAndDocumentTouchesBumpEveryScope(t *testing.T) {
@@ -61,40 +116,36 @@ func TestKnowledgeAndDocumentTouchesBumpEveryScope(t *testing.T) {
 	}{
 		{"kb_list", ""}, {"kb_public", "alpha"}, {"documents", "alpha"},
 	} {
-		if value := revision(t, stores, expected.kind, expected.scope); value != 1 {
+		if value := readCacheRevision(t, stores, expected.kind, expected.scope).Revision; value != 1 {
 			t.Fatalf("%s/%s revision = %d, want 1", expected.kind, expected.scope, value)
 		}
-	}
-	if events := outboxCount(t, stores); events != 3 {
-		t.Fatalf("outbox events = %d, want 3", events)
 	}
 
 	if err := stores.Documents.Upsert(ctx, "alpha", DocumentRecord{Name: "a.txt", DocumentID: "doc-a", Collection: "c1"}); err != nil {
 		t.Fatalf("Upsert() error = %v", err)
 	}
 	// document_keys = kb_list "", documents alpha
-	if value := revision(t, stores, "kb_list", ""); value != 2 {
-		t.Fatalf("kb_list revision = %d, want 2", value)
-	}
-	if value := revision(t, stores, "documents", "alpha"); value != 2 {
-		t.Fatalf("documents revision = %d, want 2", value)
-	}
-	if value := revision(t, stores, "kb_public", "alpha"); value != 1 {
-		t.Fatalf("kb_public revision = %d, want 1", value)
-	}
-	if events := outboxCount(t, stores); events != 5 {
-		t.Fatalf("outbox events = %d, want 5", events)
+	for _, expected := range []struct {
+		kind, scope string
+		revision    int64
+	}{
+		{"kb_list", "", 2}, {"documents", "alpha", 2}, {"kb_public", "alpha", 1},
+	} {
+		if value := readCacheRevision(t, stores, expected.kind, expected.scope).Revision; value != expected.revision {
+			t.Fatalf("%s/%s revision = %d, want %d", expected.kind, expected.scope, value, expected.revision)
+		}
 	}
 
 	if _, err := stores.Documents.Delete(ctx, "alpha", "a.txt"); err != nil {
 		t.Fatalf("Delete() error = %v", err)
 	}
-	if value := revision(t, stores, "kb_list", ""); value != 3 {
+	if value := readCacheRevision(t, stores, "kb_list", "").Revision; value != 3 {
 		t.Fatalf("kb_list revision after delete = %d, want 3", value)
 	}
-	if value := revision(t, stores, "documents", "alpha"); value != 3 {
+	if value := readCacheRevision(t, stores, "documents", "alpha").Revision; value != 3 {
 		t.Fatalf("documents revision after delete = %d, want 3", value)
 	}
+	requireNoCacheOutbox(t, stores)
 }
 
 func TestTouchSortsAndDeduplicatesKeys(t *testing.T) {
@@ -111,8 +162,12 @@ func TestTouchSortsAndDeduplicatesKeys(t *testing.T) {
 		{Kind: "documents", Scope: "alpha"},
 		{Kind: "kb_list", Scope: ""},
 	}
-	if _, err := touch(ctx, transaction, keys...); err != nil {
+	eventIDs, err := touch(ctx, transaction, keys...)
+	if err != nil {
 		t.Fatalf("touch() error = %v", err)
+	}
+	if eventIDs != nil {
+		t.Fatalf("touch() event ids = %v, want nil (the outbox is retired)", eventIDs)
 	}
 	if err := transaction.Commit(); err != nil {
 		t.Fatalf("Commit() error = %v", err)
@@ -122,45 +177,37 @@ func TestTouchSortsAndDeduplicatesKeys(t *testing.T) {
 	}{
 		{"kb_public", "alpha"}, {"documents", "alpha"}, {"kb_list", ""},
 	} {
-		if value := revision(t, stores, expected.kind, expected.scope); value != 1 {
-			t.Fatalf("%s/%s revision = %d, want 1", expected.kind, expected.scope, value)
+		row := readCacheRevision(t, stores, expected.kind, expected.scope)
+		if row.Revision != 1 || row.RefreshedRevision != 0 {
+			t.Fatalf("%s/%s revision/refreshed = %d/%d, want 1/0 (dirty)",
+				expected.kind, expected.scope, row.Revision, row.RefreshedRevision)
 		}
 	}
-	// Python iterates sorted(set(keys)); the outbox insertion order therefore
-	// follows (kind, scope) ordering: documents, kb_list, kb_public. MySQL has no
-	// rowid, so only the event set is asserted here.
-	rows, err := stores.DB.QueryContext(ctx, "SELECT kind FROM cache_outbox")
+	if rows := cacheRevisionCount(t, stores); rows != 3 {
+		t.Fatalf("cache_revisions rows = %d, want 3 (deduplicated)", rows)
+	}
+	// A second touch bumps the same rows instead of inserting new ones.
+	transaction, err = stores.DB.BeginTx(ctx, nil)
 	if err != nil {
-		t.Fatalf("outbox query error = %v", err)
+		t.Fatalf("BeginTx() error = %v", err)
 	}
-	defer closeRows(t, rows)
-	ordered := make([]string, 0, 3)
-	for rows.Next() {
-		var kind string
-		if err := rows.Scan(&kind); err != nil {
-			t.Fatalf("scan error = %v", err)
-		}
-		ordered = append(ordered, kind)
+	defer func() { _ = transaction.Rollback() }()
+	if _, err := touch(ctx, transaction, keys...); err != nil {
+		t.Fatalf("second touch() error = %v", err)
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows.Err() = %v", err)
+	if err := transaction.Commit(); err != nil {
+		t.Fatalf("second Commit() error = %v", err)
 	}
-	expectedOrder := []string{"documents", "kb_list", "kb_public"}
-	if len(ordered) != len(expectedOrder) {
-		t.Fatalf("outbox kinds = %v", ordered)
+	if rows := cacheRevisionCount(t, stores); rows != 3 {
+		t.Fatalf("cache_revisions rows after second touch = %d, want 3", rows)
 	}
-	sort.Strings(ordered)
-	for index, kind := range expectedOrder {
-		if ordered[index] != kind {
-			t.Fatalf("outbox kinds = %v, want %v", ordered, expectedOrder)
-		}
+	if value := readCacheRevision(t, stores, "documents", "alpha").Revision; value != 2 {
+		t.Fatalf("documents revision after second touch = %d, want 2", value)
 	}
-	if events := outboxCount(t, stores); events != 3 {
-		t.Fatalf("deduplication failed: %d outbox events", events)
-	}
+	requireNoCacheOutbox(t, stores)
 }
 
-func TestTouchRejectsUnknownCacheKind(t *testing.T) {
+func TestTouchRejectsUnknownOrRetiredCacheKind(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
 	transaction, err := stores.DB.BeginTx(ctx, nil)
@@ -168,9 +215,12 @@ func TestTouchRejectsUnknownCacheKind(t *testing.T) {
 		t.Fatalf("BeginTx() error = %v", err)
 	}
 	defer func() { _ = transaction.Rollback() }()
-	_, err = touch(ctx, transaction, CacheKey{Kind: "unknown", Scope: ""})
-	if err == nil || err.Error() != "Unknown state cache kind" {
-		t.Fatalf("touch() error = %v, want %q", err, "Unknown state cache kind")
+	// document_status/search_status had no registered loader and are retired.
+	for _, kind := range []string{"unknown", "document_status", "search_status"} {
+		_, err = touch(ctx, transaction, CacheKey{Kind: kind, Scope: ""})
+		if err == nil || !strings.Contains(err.Error(), "Unknown state cache kind") {
+			t.Fatalf("touch(%q) error = %v, want Unknown state cache kind", kind, err)
+		}
 	}
 }
 
@@ -180,18 +230,17 @@ func TestFailedMutationsRollBackRevisions(t *testing.T) {
 	if err := stores.KnowledgeBases.Create(ctx, map[string]any{"namespace": "alpha", "collection": "c"}); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	revisionsBefore := revisionCount(t, stores)
-	eventsBefore := outboxCount(t, stores)
+	revisionsBefore := cacheRevisionCount(t, stores)
 
 	mustBeError[*StateConflict](t, stores.KnowledgeBases.Create(ctx,
 		map[string]any{"namespace": "alpha", "collection": "c2"}))
 	mustBeError[*LookupError](t, stores.KnowledgeBases.Update(ctx,
 		map[string]any{"namespace": "missing", "collection": "c"}))
 
-	if revisions := revisionCount(t, stores); revisions != revisionsBefore {
-		t.Fatalf("failed mutations changed revisions: %d -> %d", revisionsBefore, revisions)
+	if revisions := cacheRevisionCount(t, stores); revisions != revisionsBefore {
+		t.Fatalf("failed mutations changed cache_revisions rows: %d -> %d", revisionsBefore, revisions)
 	}
-	if events := outboxCount(t, stores); events != eventsBefore {
-		t.Fatalf("failed mutations added outbox events: %d -> %d", eventsBefore, events)
+	if value := readCacheRevision(t, stores, "kb_list", "").Revision; value != 1 {
+		t.Fatalf("kb_list revision = %d, want 1 (failed mutations must not bump)", value)
 	}
 }

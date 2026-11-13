@@ -1,10 +1,15 @@
-// Command rag-search-worker consumes queued full-request search envelopes from
-// the broker, runs retrieval, captures expiring artifact references, and stores
-// the immutable result plus the durable terminal task state.
+// Command rag-search-worker consumes identifier-only queued-search
+// notifications, runs retrieval against the committed task arguments, captures
+// expiring artifact references, and stores the immutable result plus the durable
+// terminal task state.
 //
-// It is the Go counterpart of rag_mcp.search_worker. The worker owns no HTTP
-// surface: it shares the state store, the Redis transient/snapshot cache and the
-// runtime retrieval stack with rag-service, then consumes the search topic.
+// It is the Go counterpart of rag_mcp.search_worker. Debezium captures committed
+// search_tasks rows (INSERT plus schedule_version bumps) and routes the
+// notifications to RAG_SEARCH_TOPIC; the worker joins RAG_SEARCH_GROUP and reads
+// arguments/deadline back from MySQL. The worker owns no HTTP surface: it shares
+// the state store, the Redis transient/snapshot cache and the runtime retrieval
+// stack with rag-service, then consumes that topic. Admission itself is a MySQL
+// commit in rag-service, so a broker outage only delays tasks.
 package main
 
 import (

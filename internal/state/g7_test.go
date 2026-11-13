@@ -3,43 +3,8 @@ package state
 import (
 	"context"
 	"strings"
-	"sync"
 	"testing"
 )
-
-type PublisherError struct{ message string }
-
-func (e *PublisherError) Error() string { return e.message }
-
-type fakeSearchPublisher struct {
-	mutex  sync.Mutex
-	sent   []SearchEnvelope
-	err    error
-	closed bool
-}
-
-func (f *fakeSearchPublisher) SendSearchEnvelope(_ context.Context, envelope SearchEnvelope) error {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	if f.err != nil {
-		return f.err
-	}
-	f.sent = append(f.sent, envelope)
-	return nil
-}
-
-func (f *fakeSearchPublisher) Close() error {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	f.closed = true
-	return nil
-}
-
-func (f *fakeSearchPublisher) messages() []SearchEnvelope {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	return append([]SearchEnvelope(nil), f.sent...)
-}
 
 func configureTestNamespace(t *testing.T, stores *Stores, namespace string) {
 	t.Helper()
@@ -72,13 +37,13 @@ func documentNotification(t *testing.T, stores *Stores, artifactID string) Docum
 	return notification
 }
 
-func TestDocumentJobSubmitCommitsJobAndPendingOutbox(t *testing.T) {
+func TestDocumentJobSubmitPersistsQueuedJobWithoutOutbox(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
 	configureTestNamespace(t, stores, "manuals")
 	content := []byte("original")
 	admission := submitTestDocument(t, stores, "manuals", "manual.txt", content, nil)
-	if len(admission.ArtifactID) != 36 || admission.Status != DocumentJobQueued || admission.Reused || admission.EventID == nil {
+	if len(admission.ArtifactID) != 36 || admission.Status != DocumentJobQueued || admission.Reused {
 		t.Fatalf("admission = %+v", admission)
 	}
 	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
@@ -86,23 +51,28 @@ func TestDocumentJobSubmitCommitsJobAndPendingOutbox(t *testing.T) {
 		t.Fatalf("Get() = %+v, %v", job, err)
 	}
 	if job.Status != DocumentJobQueued || job.Stage != DocumentJobQueued || string(job.Content) != "original" ||
-		job.Size != int64(len(content)) || job.SHA256 != sha256Sum(content) || job.ConfigurationVersion != 1 {
+		job.Size != int64(len(content)) || job.SHA256 != sha256Sum(content) || job.ConfigurationVersion != 1 ||
+		job.ScheduleVersion != 1 {
 		t.Fatalf("job = %+v", job)
 	}
-	events, err := stores.DocumentJobs.PendingOutbox(ctx, 10)
-	if err != nil || len(events) != 1 || events[0].ArtifactID != admission.ArtifactID || events[0].Status != "PENDING" {
-		t.Fatalf("PendingOutbox() = %+v, %v", events, err)
+	// The retired outbox tables are no longer part of the schema, and Submit
+	// never writes anything besides document_jobs.
+	for _, table := range []string{"document_job_outbox", "search_task_outbox", "cache_outbox", "document_task_outbox"} {
+		if _, found := TableByName(table); found {
+			t.Fatalf("retired table %q is still declared in the schema", table)
+		}
 	}
 	notification, err := DocumentJobEnvelope(job)
 	if err != nil {
 		t.Fatalf("DocumentJobEnvelope() error = %v", err)
 	}
 	if notification.Schema != DocumentEnvelopeSchema || notification.ArtifactID != admission.ArtifactID ||
-		notification.Namespace != "manuals" || notification.Name != "manual.txt" {
+		notification.Namespace != "manuals" || notification.ScheduleVersion != 1 {
 		t.Fatalf("notification = %+v", notification)
 	}
 	encoded, err := marshalJSON(notification)
-	if err != nil || strings.Contains(encoded, "original") || strings.Contains(encoded, "content") {
+	if err != nil || strings.Contains(encoded, "original") || strings.Contains(encoded, "content") ||
+		strings.Contains(encoded, `"name"`) {
 		t.Fatalf("notification leaked content: %s, %v", encoded, err)
 	}
 }
@@ -114,7 +84,7 @@ func TestDocumentJobIdempotencyReplayAndConflicts(t *testing.T) {
 	key := "same"
 	first := submitTestDocument(t, stores, "manuals", "a.txt", []byte("same"), &key)
 	replay := submitTestDocument(t, stores, "manuals", "a.txt", []byte("same"), &key)
-	if !replay.Reused || replay.ArtifactID != first.ArtifactID || replay.EventID != nil {
+	if !replay.Reused || replay.ArtifactID != first.ArtifactID {
 		t.Fatalf("replay = %+v", replay)
 	}
 	if _, err := stores.DocumentJobs.Submit(ctx, "manuals", "a.txt", []byte("different"), &key); err == nil {
@@ -169,7 +139,7 @@ func TestDocumentJobIdempotencyReplayAndConflicts(t *testing.T) {
 	}
 }
 
-func TestDocumentJobClaimHeartbeatProgressAndTerminal(t *testing.T) {
+func TestDocumentJobClaimHeartbeatProgressAndVersionSemantics(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
 	configureTestNamespace(t, stores, "manuals")
@@ -183,6 +153,8 @@ func TestDocumentJobClaimHeartbeatProgressAndTerminal(t *testing.T) {
 		string(task.Content) != "bytes" || task.Owner == nil || task.ExecutionID == nil || task.LeaseUntil <= 0 {
 		t.Fatalf("task = %+v", task)
 	}
+	// Claim does not bump the scheduling generation, so the same notification
+	// cannot be claimed twice while the lease is live.
 	if second, err := stores.DocumentJobs.Claim(ctx, notification); err != nil || second != nil {
 		t.Fatalf("live lease was re-claimed: %+v, %v", second, err)
 	}
@@ -207,7 +179,8 @@ func TestDocumentJobClaimHeartbeatProgressAndTerminal(t *testing.T) {
 		t.Fatalf("Fail(retry) error = %v", err)
 	}
 	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
-	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" || job.RetryAt <= 0 {
+	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" ||
+		job.RetryAt <= 0 || job.ScheduleVersion != 2 || job.ExecutionID != nil {
 		t.Fatalf("job after retry = %+v, %v", job, err)
 	}
 	// The retry branch keeps the last recorded failure reason visible while the
@@ -215,7 +188,16 @@ func TestDocumentJobClaimHeartbeatProgressAndTerminal(t *testing.T) {
 	if job.Error == nil || *job.Error != retryReason {
 		t.Fatalf("job after retry lost the failure reason: %+v", job)
 	}
-	task, err = stores.DocumentJobs.Claim(ctx, notification)
+	// A duplicate delivery of the old generation is skipped; the bumped
+	// generation is claimable.
+	if old, err := stores.DocumentJobs.Claim(ctx, notification); err != nil || old != nil {
+		t.Fatalf("old schedule_version was claimed: %+v, %v", old, err)
+	}
+	updated := documentNotification(t, stores, admission.ArtifactID)
+	if updated.ScheduleVersion != 2 {
+		t.Fatalf("notification after retry = %+v", updated)
+	}
+	task, err = stores.DocumentJobs.Claim(ctx, updated)
 	if err != nil || task == nil || task.Attempts != 2 {
 		t.Fatalf("second Claim() = %+v, %v", task, err)
 	}
@@ -229,6 +211,10 @@ func TestDocumentJobClaimHeartbeatProgressAndTerminal(t *testing.T) {
 	}
 	if terminal, err := stores.DocumentJobs.Terminal(ctx, admission.ArtifactID); err != nil || !terminal {
 		t.Fatalf("Terminal() = %v, %v", terminal, err)
+	}
+	// Terminal rows are never reclaimed, even for the current generation.
+	if reclaimed, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, admission.ArtifactID)); err != nil || reclaimed != nil {
+		t.Fatalf("terminal job was reclaimed: %+v, %v", reclaimed, err)
 	}
 	if _, err := stores.DocumentJobs.Status(ctx, "manuals", "d1feec53-1036-4af0-8035-86ef6990fa6a"); err == nil {
 		t.Fatal("missing status lookup succeeded")
@@ -258,7 +244,7 @@ func TestDocumentJobRetryFailureReasonPersistsThenSuccessClears(t *testing.T) {
 	if err != nil || job.Error == nil || *job.Error != reason {
 		t.Fatalf("retry_wait job error = %+v, %v; want %q", job, err, reason)
 	}
-	task, err = stores.DocumentJobs.Claim(ctx, notification)
+	task, err = stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, admission.ArtifactID))
 	if err != nil || task == nil {
 		t.Fatalf("second Claim() = %+v, %v", task, err)
 	}
@@ -277,32 +263,55 @@ func TestDocumentJobRetryFailureReasonPersistsThenSuccessClears(t *testing.T) {
 	}
 }
 
-func TestDocumentJobDeadLetterAndValidationEnvelope(t *testing.T) {
+func TestDocumentJobDeadLetterAndNotificationValidation(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
 	configureTestNamespace(t, stores, "manuals")
 	admission := submitTestDocument(t, stores, "manuals", "a.txt", []byte("x"), nil)
 	notification := documentNotification(t, stores, admission.ArtifactID)
-	// Debezium change events are accepted and normalized.
-	debezium, err := ValidateDocumentNotification(map[string]any{
-		"after": map[string]any{
-			"artifact_id": admission.ArtifactID, "namespace": "manuals", "name": "a.txt", "created_at": 1.5,
-		},
-		"op": "c",
+	// Application-native schema 4 and Debezium change events are accepted.
+	native, err := ValidateDocumentNotification(map[string]any{
+		"schema": float64(4), "artifact_id": admission.ArtifactID, "namespace": "manuals",
+		"schedule_version": float64(1),
 	})
-	if err != nil || debezium.Schema != DocumentEnvelopeSchema || debezium.CreatedAt != 1.5 {
-		t.Fatalf("Debezium envelope = %+v, %v", debezium, err)
+	if err != nil || native.Schema != DocumentEnvelopeSchema || native.ScheduleVersion != 1 {
+		t.Fatalf("native envelope = %+v, %v", native, err)
+	}
+	for _, op := range []string{"c", "r", "u"} {
+		debezium, err := ValidateDocumentNotification(map[string]any{
+			"after": map[string]any{
+				"artifact_id": admission.ArtifactID, "namespace": "manuals", "schedule_version": float64(3),
+			},
+			"op": op,
+		})
+		if err != nil || debezium.ScheduleVersion != 3 {
+			t.Fatalf("Debezium op %q = %+v, %v", op, debezium, err)
+		}
+	}
+	// Deletes, tombstones and before-only changes are recognisable non-tasks.
+	for name, payload := range map[string]any{
+		"null tombstone":       nil,
+		"op delete":            map[string]any{"before": map[string]any{"artifact_id": admission.ArtifactID}, "after": nil, "op": "d"},
+		"before-only":          map[string]any{"before": map[string]any{"artifact_id": admission.ArtifactID}},
+		"delete without image": map[string]any{"after": nil, "op": "d"},
+		"truncate without row": map[string]any{"op": "t"},
+	} {
+		if _, err := ValidateDocumentNotification(payload); !IgnorableCDCChange(err) {
+			t.Fatalf("%s: error = %v, want ignorable", name, err)
+		}
 	}
 	for name, payload := range map[string]any{
-		"not a map":      "x",
-		"unknown schema": map[string]any{"schema": 99},
-		"bad artifact":   map[string]any{"schema": 3, "artifact_id": "nope", "namespace": "manuals", "name": "a.txt"},
-		"bad namespace":  map[string]any{"schema": 3, "artifact_id": admission.ArtifactID, "namespace": "-bad", "name": "a.txt"},
-		"bad name":       map[string]any{"schema": 3, "artifact_id": admission.ArtifactID, "namespace": "manuals", "name": "a.exe"},
-		"bad timestamp":  map[string]any{"schema": 3, "artifact_id": admission.ArtifactID, "namespace": "manuals", "name": "a.txt", "created_at": -1.0},
+		"not a map":        "x",
+		"old schema 3":     map[string]any{"schema": 3, "artifact_id": admission.ArtifactID, "namespace": "manuals", "name": "a.txt", "created_at": 1.5},
+		"bad artifact":     map[string]any{"schema": 4, "artifact_id": "nope", "namespace": "manuals", "schedule_version": 1},
+		"bad namespace":    map[string]any{"schema": 4, "artifact_id": admission.ArtifactID, "namespace": "", "schedule_version": 1},
+		"missing version":  map[string]any{"schema": 4, "artifact_id": admission.ArtifactID, "namespace": "manuals"},
+		"zero version":     map[string]any{"schema": 4, "artifact_id": admission.ArtifactID, "namespace": "manuals", "schedule_version": 0},
+		"fraction version": map[string]any{"after": map[string]any{"artifact_id": admission.ArtifactID, "namespace": "manuals", "schedule_version": 1.5}, "op": "u"},
+		"unknown op":       map[string]any{"after": map[string]any{"artifact_id": admission.ArtifactID, "namespace": "manuals", "schedule_version": 1}, "op": "x"},
 	} {
-		if _, err := ValidateDocumentNotification(payload); err == nil {
-			t.Fatalf("%s: invalid notification accepted", name)
+		if _, err := ValidateDocumentNotification(payload); err == nil || IgnorableCDCChange(err) {
+			t.Fatalf("%s: invalid notification accepted (err=%v)", name, err)
 		}
 	}
 	task, err := stores.DocumentJobs.Claim(ctx, notification)
@@ -320,7 +329,9 @@ func TestDocumentJobDeadLetterAndValidationEnvelope(t *testing.T) {
 	if err := stores.DocumentJobs.Fail(ctx, task, true, &lastFailure); err != nil {
 		t.Fatalf("Fail(retry) error = %v", err)
 	}
-	if acked, err := stores.DocumentJobs.DeadLetter(ctx, notification); err != nil || !acked {
+	// The dead letter acts on the current generation; the old notification is
+	// stale, so use the recomputed envelope.
+	if acked, err := stores.DocumentJobs.DeadLetter(ctx, documentNotification(t, stores, admission.ArtifactID)); err != nil || !acked {
 		t.Fatalf("DeadLetter() = %v, %v", acked, err)
 	}
 	status, err := stores.DocumentJobs.Status(ctx, "manuals", admission.ArtifactID)
@@ -335,53 +346,52 @@ func TestDocumentJobDeadLetterAndValidationEnvelope(t *testing.T) {
 	}
 }
 
-func TestDocumentJobSweepAndGC(t *testing.T) {
+func TestDocumentJobSweepRequeuesAndBumpsVersion(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
 	configureTestNamespace(t, stores, "manuals")
 	admission := submitTestDocument(t, stores, "manuals", "stranded.txt", []byte("x"), nil)
-	if err := stores.DocumentJobs.MarkPublished(ctx, *admission.EventID, nil); err != nil {
-		t.Fatalf("MarkPublished() error = %v", err)
-	}
-	// Age the job and its outbox row beyond the sweep window.
+	// Age the queued job beyond the sweep window.
 	if _, err := stores.DB.ExecContext(ctx,
 		"UPDATE document_jobs SET updated_at = ? WHERE artifact_id = ?",
 		unixSeconds()-3600, admission.ArtifactID); err != nil {
 		t.Fatalf("age job error = %v", err)
 	}
-	if _, err := stores.DB.ExecContext(ctx,
-		"UPDATE document_job_outbox SET created_at = ? WHERE artifact_id = ?",
-		unixSeconds()-8*24*3600, admission.ArtifactID); err != nil {
-		t.Fatalf("age outbox error = %v", err)
+	requeued, err := stores.DocumentJobs.Sweep(ctx, 50)
+	if err != nil || requeued != 1 {
+		t.Fatalf("Sweep() = %d, %v", requeued, err)
 	}
-	reemitted, err := stores.DocumentJobs.Sweep(ctx, 50)
-	if err != nil || reemitted != 1 {
-		t.Fatalf("Sweep() = %d, %v", reemitted, err)
+	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
+	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" || job.ScheduleVersion != 2 {
+		t.Fatalf("swept job = %+v, %v", job, err)
 	}
-	if events, err := stores.DocumentJobs.PendingOutbox(ctx, 10); err != nil || len(events) != 1 {
-		t.Fatalf("PendingOutbox() = %+v, %v", events, err)
+	// The sweep refreshed updated_at, so the same job is not swept again
+	// immediately; a stale generation is not claimable, the new one is.
+	if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 0 {
+		t.Fatalf("second Sweep() = %d, %v", requeued, err)
 	}
-	if reemitted, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || reemitted != 0 {
-		t.Fatalf("second Sweep() = %d, %v", reemitted, err)
+	stale := DocumentNotification{Schema: DocumentEnvelopeSchema, ArtifactID: admission.ArtifactID,
+		Namespace: "manuals", ScheduleVersion: 1}
+	if task, err := stores.DocumentJobs.Claim(ctx, stale); err != nil || task != nil {
+		t.Fatalf("stale generation claim = %+v, %v", task, err)
 	}
-	// A processing job with an expired lease is requeued and re-emitted.
+	// A processing job with an expired lease is requeued with a new generation.
 	second := submitTestDocument(t, stores, "manuals", "expired.txt", []byte("y"), nil)
-	notification := documentNotification(t, stores, second.ArtifactID)
-	if task, err := stores.DocumentJobs.Claim(ctx, notification); err != nil || task == nil {
+	if task, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, second.ArtifactID)); err != nil || task == nil {
 		t.Fatalf("Claim() = %+v, %v", task, err)
 	}
 	if _, err := stores.DB.ExecContext(ctx,
 		"UPDATE document_jobs SET lease_until = 0 WHERE artifact_id = ?", second.ArtifactID); err != nil {
 		t.Fatalf("lease expiry update error = %v", err)
 	}
-	if reemitted, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || reemitted < 1 {
-		t.Fatalf("Sweep(expired) = %d, %v", reemitted, err)
+	if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued < 1 {
+		t.Fatalf("Sweep(expired) = %d, %v", requeued, err)
 	}
-	job, err := stores.DocumentJobs.Get(ctx, second.ArtifactID, nil)
-	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" {
+	job, err = stores.DocumentJobs.Get(ctx, second.ArtifactID, nil)
+	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" || job.ScheduleVersion != 2 {
 		t.Fatalf("requeued job = %+v, %v", job, err)
 	}
-	// Retention GC deletes terminal jobs and old outbox rows.
+	// Retention GC deletes terminal jobs.
 	if err := stores.DocumentJobs.Fail(ctx, &DocumentJobTask{DocumentJob: *job}, false, stringPtr("fail")); err != nil {
 		t.Fatalf("Fail() error = %v", err)
 	}
@@ -392,9 +402,6 @@ func TestDocumentJobSweepAndGC(t *testing.T) {
 	removed, err := stores.DocumentJobs.GCJobs(ctx, float64Pointer(0))
 	if err != nil || removed != 1 {
 		t.Fatalf("GCJobs() = %d, %v", removed, err)
-	}
-	if removed, err := stores.DocumentJobs.GCOutbox(ctx, float64Pointer(0)); err != nil || removed == 0 {
-		t.Fatalf("GCOutbox() = %d, %v", removed, err)
 	}
 }
 
@@ -486,8 +493,7 @@ func TestDocumentQueueSettingsValidation(t *testing.T) {
 
 func TestStoresWiresG7StateMachines(t *testing.T) {
 	stores := newTestStores(t)
-	if stores.DocumentJobs == nil ||
-		stores.SearchTasks == nil || stores.SearchDispatcher == nil {
+	if stores.DocumentJobs == nil || stores.SearchTasks == nil || stores.Results == nil {
 		t.Fatalf("G7 components not wired: %+v", stores)
 	}
 	if err := stores.Close(); err != nil {
@@ -497,89 +503,82 @@ func TestStoresWiresG7StateMachines(t *testing.T) {
 
 // Search state machine --------------------------------------------------------
 
-func submitTestSearch(t *testing.T, stores *Stores, namespace string, arguments map[string]any) SearchEnvelope {
+func submitTestSearch(t *testing.T, stores *Stores, namespace string, arguments map[string]any) SearchNotification {
 	t.Helper()
-	envelope, err := stores.SearchTasks.Submit(context.Background(), namespace, arguments, nil)
+	notification, err := stores.SearchTasks.Submit(context.Background(), namespace, arguments, nil)
 	if err != nil {
 		t.Fatalf("SearchTasks.Submit() error = %v", err)
 	}
-	return envelope
+	return notification
 }
 
-func TestSearchSubmitCreatesTaskAndOutbox(t *testing.T) {
+func TestSearchSubmitCreatesQueuedTaskWithoutBroker(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
-	envelope := submitTestSearch(t, stores, "alpha", map[string]any{"query": "hello", "top_k": float64(3)})
-	if envelope.Schema != SearchEnvelopeSchema || !canonicalUUID(envelope.ResultID) ||
-		envelope.Namespace != "alpha" || !(envelope.CreatedAt < envelope.Deadline && envelope.Deadline <= envelope.ExpiresAt) {
-		t.Fatalf("envelope = %+v", envelope)
+	notification := submitTestSearch(t, stores, "alpha", map[string]any{"query": "hello", "top_k": float64(3)})
+	if notification.Schema != SearchEnvelopeSchema || !canonicalUUID(notification.ResultID) ||
+		notification.Namespace != "alpha" || notification.ScheduleVersion != 1 {
+		t.Fatalf("notification = %+v", notification)
 	}
-	view, err := stores.SearchTasks.Get(ctx, "alpha", envelope.ResultID, 1, 10)
+	task, err := stores.SearchTasks.read(ctx, notification.ResultID)
+	if err != nil || task == nil || task.ScheduleVersion != 1 || task.Status != SearchTaskQueued {
+		t.Fatalf("task = %+v, %v", task, err)
+	}
+	view, err := stores.SearchTasks.Get(ctx, "alpha", notification.ResultID, 1, 10)
 	if err != nil || view == nil || view.Status != SearchTaskQueued || view.Stage != SearchTaskQueued {
 		t.Fatalf("Get() = %+v, %v", view, err)
 	}
-	if _, err := stores.SearchTasks.Get(ctx, "beta", envelope.ResultID, 1, 10); err != nil {
-		t.Fatalf("foreign Get() error = %v", err)
-	} else {
-		// A foreign namespace must not resolve the task.
-		if view, _ := stores.SearchTasks.Get(ctx, "beta", envelope.ResultID, 1, 10); view != nil {
-			t.Fatalf("foreign namespace view = %+v", view)
-		}
-	}
-	var pending int
-	if err := stores.DB.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM search_task_outbox WHERE pending = 1").Scan(&pending); err != nil || pending != 1 {
-		t.Fatalf("pending outbox rows = %d, %v", pending, err)
+	// A foreign namespace must not resolve the task.
+	if view, err := stores.SearchTasks.Get(ctx, "beta", notification.ResultID, 1, 10); err != nil || view != nil {
+		t.Fatalf("foreign namespace view = %+v, %v", view, err)
 	}
 	if _, err := stores.SearchTasks.Get(ctx, "alpha", "not-a-uuid", 1, 10); err == nil {
 		t.Fatal("invalid result id accepted")
 	} else {
 		mustBeError[*SnapshotUnavailable](t, err)
 	}
+	if _, of := TableByName("search_task_outbox"); of {
+		t.Fatal("search_task_outbox is still declared in the schema")
+	}
 }
 
-func TestSearchClaimLeaseAndAttempts(t *testing.T) {
+func TestSearchClaimLeaseAndVersionSemantics(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
-	envelope := submitTestSearch(t, stores, "alpha", map[string]any{"query": "hello"})
-	task, err := stores.SearchTasks.Claim(ctx, envelope)
+	notification := submitTestSearch(t, stores, "alpha", map[string]any{"query": "hello"})
+	task, err := stores.SearchTasks.Claim(ctx, notification)
 	if err != nil || task == nil {
 		t.Fatalf("Claim() = %+v, %v", task, err)
 	}
 	if task.Status != SearchTaskProcessing || task.Stage != SearchTaskProcessing || task.Attempts != 1 ||
-		task.Owner == nil || task.RemainingSec < 0 {
+		task.Owner == nil || task.RemainingSec < 0 || task.ScheduleVersion != 1 {
 		t.Fatalf("task = %+v", task)
 	}
-	if second, err := stores.SearchTasks.Claim(ctx, envelope); err != nil || second != nil {
+	if second, err := stores.SearchTasks.Claim(ctx, notification); err != nil || second != nil {
 		t.Fatalf("live lease re-claimed: %+v, %v", second, err)
+	}
+	// A different generation is skipped even when the row is claimable.
+	stale := notification
+	stale.ScheduleVersion = 99
+	if claimed, err := stores.SearchTasks.Claim(ctx, stale); err != nil || claimed != nil {
+		t.Fatalf("stale generation claimed: %+v, %v", claimed, err)
 	}
 	if _, err := stores.DB.ExecContext(ctx,
 		"UPDATE search_tasks SET lease_until = 0, status = ? WHERE result_id = ?",
-		SearchTaskQueued, envelope.ResultID); err != nil {
+		SearchTaskQueued, notification.ResultID); err != nil {
 		t.Fatalf("lease reset error = %v", err)
 	}
-	task, err = stores.SearchTasks.Claim(ctx, envelope)
+	task, err = stores.SearchTasks.Claim(ctx, notification)
 	if err != nil || task == nil || task.Attempts != 2 {
 		t.Fatalf("second Claim() = %+v, %v", task, err)
 	}
-	// A forged envelope (different arguments) must not claim the stored task.
-	forged := envelope
-	forged.Arguments = map[string]any{"query": "forged"}
-	if forgedTask, err := stores.SearchTasks.Claim(ctx, forged); err != nil || forgedTask != nil {
-		t.Fatalf("forged claim = %+v, %v", forgedTask, err)
-	}
 }
 
-func TestSearchFailureRetryAndTerminal(t *testing.T) {
+func TestSearchFailureRetryBumpsVersionAndTerminal(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
-	envelope := submitTestSearch(t, stores, "alpha", map[string]any{"query": "hello"})
-	if _, err := stores.DB.ExecContext(ctx,
-		"UPDATE search_tasks SET status = ?, owner = ? WHERE result_id = ?",
-		SearchTaskProcessing, "owner-token", envelope.ResultID); err != nil {
-		t.Fatalf("status seed error = %v", err)
-	}
-	task, err := stores.SearchTasks.Claim(ctx, envelope)
+	notification := submitTestSearch(t, stores, "alpha", map[string]any{"query": "hello"})
+	task, err := stores.SearchTasks.Claim(ctx, notification)
 	if err != nil || task == nil {
 		t.Fatalf("Claim() = %+v, %v", task, err)
 	}
@@ -587,11 +586,21 @@ func TestSearchFailureRetryAndTerminal(t *testing.T) {
 	if err != nil || !changed {
 		t.Fatalf("Fail(retry) = %v, %v", changed, err)
 	}
-	view, err := stores.SearchTasks.Get(ctx, "alpha", envelope.ResultID, 1, 10)
+	view, err := stores.SearchTasks.Get(ctx, "alpha", notification.ResultID, 1, 10)
 	if err != nil || view.Status != SearchTaskQueued || view.Stage != "retry_wait" {
 		t.Fatalf("retry view = %+v, %v", view, err)
 	}
-	task, err = stores.SearchTasks.Claim(ctx, envelope)
+	job, err := stores.SearchTasks.read(ctx, notification.ResultID)
+	if err != nil || job.ScheduleVersion != 2 {
+		t.Fatalf("retry task = %+v, %v", job, err)
+	}
+	// The old generation is skipped; the current one claims again.
+	if claimed, err := stores.SearchTasks.Claim(ctx, notification); err != nil || claimed != nil {
+		t.Fatalf("old generation claimed: %+v, %v", claimed, err)
+	}
+	updated := SearchNotification{Schema: SearchEnvelopeSchema, ResultID: job.ResultID,
+		Namespace: job.Namespace, ScheduleVersion: job.ScheduleVersion}
+	task, err = stores.SearchTasks.Claim(ctx, updated)
 	if err != nil || task == nil {
 		t.Fatalf("re-Claim() = %+v, %v", task, err)
 	}
@@ -599,7 +608,7 @@ func TestSearchFailureRetryAndTerminal(t *testing.T) {
 	if err != nil || !changed {
 		t.Fatalf("Fail(terminal) = %v, %v", changed, err)
 	}
-	if _, err := stores.SearchTasks.Get(ctx, "alpha", envelope.ResultID, 1, 10); err == nil {
+	if _, err := stores.SearchTasks.Get(ctx, "alpha", notification.ResultID, 1, 10); err == nil {
 		t.Fatal("failed task returned a view")
 	} else {
 		unavailable := mustBeError[*SnapshotUnavailable](t, err)
@@ -607,10 +616,10 @@ func TestSearchFailureRetryAndTerminal(t *testing.T) {
 			t.Fatalf("failure message = %q", unavailable.Message)
 		}
 	}
-	if terminal, err := stores.SearchTasks.Terminal(ctx, envelope.ResultID); err != nil || !terminal {
+	if terminal, err := stores.SearchTasks.Terminal(ctx, updated); err != nil || !terminal {
 		t.Fatalf("Terminal() = %v, %v", terminal, err)
 	}
-	if acked, err := stores.SearchTasks.DeadLetter(ctx, envelope); err != nil || !acked {
+	if acked, err := stores.SearchTasks.DeadLetter(ctx, updated); err != nil || !acked {
 		t.Fatalf("DeadLetter() = %v, %v", acked, err)
 	}
 	if acked, err := stores.SearchTasks.DeadLetter(ctx, "d1feec53-1036-4af0-8035-86ef6990fa6a"); err != nil || !acked {
@@ -618,89 +627,147 @@ func TestSearchFailureRetryAndTerminal(t *testing.T) {
 	}
 }
 
-func TestSearchExpireAndTimeout(t *testing.T) {
+func TestSearchExpireAndClaimTimeout(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
 	now := 1000.0
 	stores.SearchTasks.Clock = func() float64 { return now }
 	stores.SearchTasks.Settings.TimeoutSeconds = 5
-	envelope := submitTestSearch(t, stores, "alpha", map[string]any{"query": "hello"})
+	notification := submitTestSearch(t, stores, "alpha", map[string]any{"query": "hello"})
 	now = 1010
 	expired, err := stores.SearchTasks.Expire(ctx, 10)
 	if err != nil || expired != 1 {
 		t.Fatalf("Expire() = %d, %v", expired, err)
 	}
-	if _, err := stores.SearchTasks.Get(ctx, "alpha", envelope.ResultID, 1, 10); err == nil {
+	if _, err := stores.SearchTasks.Get(ctx, "alpha", notification.ResultID, 1, 10); err == nil {
 		t.Fatal("expired task returned a view")
 	} else {
 		mustBeError[*SnapshotUnavailable](t, err)
 	}
+	// Claim also converges an overdue task lazily and returns (nil, nil).
+	second := SearchNotification{Schema: SearchEnvelopeSchema, ResultID: otherUUID(t),
+		Namespace: "alpha", ScheduleVersion: 1}
+	if _, err := stores.DB.ExecContext(ctx,
+		"INSERT INTO search_tasks (result_id, namespace, arguments, status, stage, attempts, owner, "+
+			"lease_until, retry_at, deadline, created_at, updated_at, schedule_version) "+
+			"VALUES (?, ?, ?, ?, ?, 0, NULL, 0, 0, ?, ?, ?, 1)",
+		second.ResultID, "alpha", "{}", SearchTaskQueued, SearchTaskQueued, now, now-100, now); err != nil {
+		t.Fatalf("insert overdue task error = %v", err)
+	}
+	if task, err := stores.SearchTasks.Claim(ctx, second); err != nil || task != nil {
+		t.Fatalf("overdue Claim() = %+v, %v", task, err)
+	}
+	overdue, err := stores.SearchTasks.read(ctx, second.ResultID)
+	if err != nil || overdue.Status != SearchTaskTimedOut {
+		t.Fatalf("overdue task = %+v, %v", overdue, err)
+	}
+	if task, err := stores.SearchTasks.Claim(ctx, second); err != nil || task != nil {
+		t.Fatalf("timed-out Claim() = %+v, %v", task, err)
+	}
 }
 
-func TestSearchDispatchPendingAndAdmission(t *testing.T) {
+func TestSearchCompleteWritesMySQLFactAndRepairsRedis(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
-	publisher := &fakeSearchPublisher{}
-	dispatcher := NewSearchTaskDispatcher(stores, publisher)
-	envelope, err := dispatcher.Submit(ctx, "alpha", map[string]any{"query": "hello"})
-	if err != nil {
-		t.Fatalf("Submit() error = %v", err)
+	notification := submitTestSearch(t, stores, "alpha", map[string]any{"query": "hello"})
+	task, err := stores.SearchTasks.Claim(ctx, notification)
+	if err != nil || task == nil {
+		t.Fatalf("Claim() = %+v, %v", task, err)
 	}
-	messages := publisher.messages()
-	if len(messages) != 1 || messages[0].ResultID != envelope.ResultID || messages[0].Schema != SearchEnvelopeSchema {
-		t.Fatalf("messages = %+v", messages)
+	payload := map[string]any{
+		"results": []any{
+			map[string]any{"text": "first", "score": 0.9},
+			map[string]any{"text": "second", "score": 0.5},
+		},
 	}
-	if remaining, err := dispatcher.RunOnce(ctx); err != nil || remaining != 0 {
-		t.Fatalf("RunOnce() = %d, %v", remaining, err)
+	if _, err := stores.SearchTasks.Complete(ctx, task, payload); err != nil {
+		t.Fatalf("Complete() error = %v", err)
 	}
-	// No publisher means admission is refused without creating a task.
-	offline := NewSearchTaskDispatcher(stores, nil)
-	if _, err := offline.Submit(ctx, "alpha", map[string]any{"query": "offline"}); err == nil {
-		t.Fatal("offline Submit() succeeded")
-	} else if unavailable := mustBeError[*SearchTaskUnavailable](t, err); unavailable.Message != "Search broker unavailable" {
-		t.Fatalf("offline message = %q", unavailable.Message)
+	// The terminal state and the result fact row committed together.
+	view, err := stores.SearchTasks.Get(ctx, "alpha", notification.ResultID, 1, 10)
+	if err != nil || view.Status != SearchTaskSucceeded {
+		t.Fatalf("view = %+v, %v", view, err)
 	}
-	// A broker failure terminates the admitted task as failed.
-	failing := &fakeSearchPublisher{err: &PublisherError{message: "broker down"}}
-	badDispatcher := NewSearchTaskDispatcher(stores, failing)
-	if _, err := badDispatcher.Submit(ctx, "alpha", map[string]any{"query": "failing"}); err == nil {
-		t.Fatal("failing Submit() succeeded")
-	} else {
-		mustBeError[*SearchTaskUnavailable](t, err)
-	}
-	// Failure keeps the task durable but not queued; the successful admission
-	// remains queued until a worker claims it.
-	var failedTasks int
+	var content string
 	if err := stores.DB.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM search_tasks WHERE status = ?", SearchTaskFailed).Scan(&failedTasks); err != nil || failedTasks != 1 {
-		t.Fatalf("failed tasks = %d, %v", failedTasks, err)
+		"SELECT content FROM search_result_snapshots WHERE id = ?", notification.ResultID).Scan(&content); err != nil {
+		t.Fatalf("snapshot row missing: %v", err)
+	}
+	// Reading works with the Redis cache disabled entirely (MySQL fallback).
+	stores.Results.Transient = nil
+	page, err := stores.Results.Get("alpha", notification.ResultID, 1, 10)
+	if err != nil || page["total_results"] != 2 || page["snapshot_available"] != true {
+		t.Fatalf("Get() = %+v, %v", page, err)
+	}
+	// A duplicate Complete after the terminal state is idempotent.
+	if _, err := stores.SearchTasks.Complete(ctx, task, payload); err != nil {
+		t.Fatalf("duplicate Complete() error = %v", err)
+	}
+	// A second result id cannot overwrite the immutable snapshot.
+	other := otherUUID(t)
+	if _, err := stores.SearchTasks.Submit(ctx, "alpha", map[string]any{"query": "second"}, &other); err != nil {
+		t.Fatalf("second Submit() error = %v", err)
+	}
+	otherNotification := SearchNotification{Schema: SearchEnvelopeSchema, ResultID: other,
+		Namespace: "alpha", ScheduleVersion: 1}
+	otherTask, err := stores.SearchTasks.Claim(ctx, otherNotification)
+	if err != nil || otherTask == nil {
+		t.Fatalf("second Claim() = %+v, %v", otherTask, err)
+	}
+	replaced := payload
+	replaced["result_id"] = notification.ResultID
+	replaced["created_at"] = float64(1)
+	replaced["expires_at"] = float64(2)
+	replaced["snapshot_available"] = true
+	replaced["results"] = []any{}
+	if _, err := stores.SearchTasks.Complete(ctx, otherTask, map[string]any{"results": []any{}}); err != nil {
+		t.Fatalf("second Complete() error = %v", err)
 	}
 }
 
-func TestValidateSearchEnvelopeAndSettings(t *testing.T) {
+func TestValidateSearchNotification(t *testing.T) {
 	valid := map[string]any{
-		"schema": float64(2), "result_id": "d1feec53-1036-4af0-8035-86ef6990fa6a", "namespace": "alpha",
-		"arguments": map[string]any{"query": "hello"}, "created_at": 1.0, "expires_at": 100.0, "deadline": 50.0,
+		"schema": float64(3), "result_id": "d1feec53-1036-4af0-8035-86ef6990fa6a",
+		"namespace": "alpha", "schedule_version": float64(2),
 	}
-	if _, err := ValidateSearchEnvelope(valid); err != nil {
-		t.Fatalf("valid envelope error = %v", err)
+	if _, err := ValidateSearchNotification(valid); err != nil {
+		t.Fatalf("valid notification error = %v", err)
+	}
+	for _, op := range []string{"c", "r", "u"} {
+		notification, err := ValidateSearchNotification(map[string]any{
+			"after": map[string]any{
+				"result_id": "d1feec53-1036-4af0-8035-86ef6990fa6a", "namespace": "alpha",
+				"schedule_version": float64(5),
+			},
+			"op": op,
+		})
+		if err != nil || notification.Schema != SearchEnvelopeSchema || notification.ScheduleVersion != 5 {
+			t.Fatalf("Debezium op %q = %+v, %v", op, notification, err)
+		}
+	}
+	for name, payload := range map[string]any{
+		"null":        nil,
+		"delete":      map[string]any{"before": map[string]any{"result_id": "d1feec53-1036-4af0-8035-86ef6990fa6a"}, "after": nil, "op": "d"},
+		"before-only": map[string]any{"before": map[string]any{"result_id": "d1feec53-1036-4af0-8035-86ef6990fa6a"}},
+	} {
+		if _, err := ValidateSearchNotification(payload); !IgnorableCDCChange(err) {
+			t.Fatalf("%s: error = %v, want ignorable", name, err)
+		}
 	}
 	for name, mutation := range map[string]func(map[string]any){
-		"schema":    func(payload map[string]any) { payload["schema"] = float64(3) },
-		"extra key": func(payload map[string]any) { payload["extra"] = true },
+		"schema":    func(payload map[string]any) { payload["schema"] = float64(2) },
 		"result":    func(payload map[string]any) { payload["result_id"] = "nope" },
 		"namespace": func(payload map[string]any) { payload["namespace"] = "" },
-		"arguments": func(payload map[string]any) { payload["arguments"] = "x" },
-		"deadline":  func(payload map[string]any) { payload["deadline"] = 200.0 },
-		"time":      func(payload map[string]any) { payload["created_at"] = math_NaN() },
+		"version":   func(payload map[string]any) { payload["schedule_version"] = float64(0) },
+		"missing":   func(payload map[string]any) { delete(payload, "schedule_version") },
 	} {
 		payload := map[string]any{}
 		for key, value := range valid {
 			payload[key] = value
 		}
 		mutation(payload)
-		if _, err := ValidateSearchEnvelope(payload); err == nil {
-			t.Fatalf("%s: invalid envelope accepted", name)
+		if _, err := ValidateSearchNotification(payload); err == nil || IgnorableCDCChange(err) {
+			t.Fatalf("%s: invalid notification accepted (err=%v)", name, err)
 		}
 	}
 	isolateStateEnv(t)
@@ -717,22 +784,17 @@ func TestValidateSearchEnvelopeAndSettings(t *testing.T) {
 	}
 }
 
-func math_NaN() float64 {
-	value := 0.0
-	return value / value
-}
-
 func TestSearchSubmitDuplicateResultID(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
-	envelope := submitTestSearch(t, stores, "alpha", map[string]any{"query": "first"})
-	duplicate := envelope.ResultID
+	notification := submitTestSearch(t, stores, "alpha", map[string]any{"query": "first"})
+	duplicate := notification.ResultID
 	if _, err := stores.SearchTasks.Submit(ctx, "alpha", map[string]any{"query": "second"}, &duplicate); err == nil {
 		t.Fatal("duplicate result id admitted")
 	} else {
 		mustBeError[*SearchTaskUnavailable](t, err)
 	}
-	view, err := stores.SearchTasks.Get(ctx, "alpha", envelope.ResultID, 1, 10)
+	view, err := stores.SearchTasks.Get(ctx, "alpha", notification.ResultID, 1, 10)
 	if err != nil || view == nil {
 		t.Fatalf("original task = %+v, %v", view, err)
 	}

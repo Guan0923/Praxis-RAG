@@ -32,7 +32,8 @@ func TestSearchTaskArgumentsPreserveIntegerJSONTokens(t *testing.T) {
 		t.Fatalf("Submit() error = %v", err)
 	}
 
-	// The row read (used by Claim's digest comparison) preserves integer tokens.
+	// The row read (used by the worker after Claim) preserves integer tokens;
+	// the schema-3 notification carries only identifiers.
 	stored, err := stores.SearchTasks.read(ctx, envelope.ResultID)
 	if err != nil || stored == nil {
 		t.Fatalf("read() = %v, %v", stored, err)
@@ -60,8 +61,8 @@ func TestSearchTaskArgumentsPreserveIntegerJSONTokens(t *testing.T) {
 		t.Fatalf("digest changed across the round-trip:\noriginal=%s\nstored=%s", originalDigest, roundTrippedDigest)
 	}
 
-	// A broker-style decode (json.Decoder.UseNumber, like mq.DecodeSearchEnvelope)
-	// keeps the integer typing through Claim.
+	// A broker-style decode (json.Decoder.UseNumber, like mq's notification
+	// decoder) keeps the integer typing through Claim.
 	encoded, err := json.Marshal(envelope)
 	if err != nil {
 		t.Fatalf("json.Marshal(envelope) error = %v", err)
@@ -72,9 +73,9 @@ func TestSearchTaskArgumentsPreserveIntegerJSONTokens(t *testing.T) {
 	if err := decoder.Decode(&payload); err != nil {
 		t.Fatalf("decode envelope error = %v", err)
 	}
-	decodedEnvelope, err := ValidateSearchEnvelope(payload)
+	decodedEnvelope, err := ValidateSearchNotification(payload)
 	if err != nil {
-		t.Fatalf("ValidateSearchEnvelope() error = %v", err)
+		t.Fatalf("ValidateSearchNotification() error = %v", err)
 	}
 	task, err := stores.SearchTasks.Claim(ctx, decodedEnvelope)
 	if err != nil || task == nil {

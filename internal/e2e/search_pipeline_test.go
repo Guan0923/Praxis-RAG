@@ -2,25 +2,21 @@ package e2e
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
-	"github.com/Guan0923/xinghe_rag/internal/mq"
-	"github.com/Guan0923/xinghe_rag/internal/searchrefs"
-	"github.com/Guan0923/xinghe_rag/internal/searchworker"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
 // TestSearchPipelineEndToEnd drives the queued-search path through the real
-// runtime: broker-backed admission -> captured schema-2 envelope -> search
-// worker retrieval + reference capture + snapshot completion -> stored result
-// readable through the service.
+// runtime and the search worker handler:
+//
+//	MySQL-only admission (no broker acceptance) -> schema-3 notification (what
+//	Debezium emits) -> claim + retrieval + reference capture + snapshot
+//	completion -> stored result readable through the service.
 func TestSearchPipelineEndToEnd(t *testing.T) {
 	h := newHarness(t, searchQueryPoints)
-	h.startBackgroundPublisher(t)
 	ctx := context.Background()
 
 	request := contracts.SearchRequest{
@@ -30,6 +26,8 @@ func TestSearchPipelineEndToEnd(t *testing.T) {
 		CandidateK: 10,
 		TopK:       5,
 	}
+	// Admission is a MySQL commit: it must succeed with no broker configured and
+	// no background loop running.
 	resultID, err := h.Service.SubmitSearch(ctx, "alpha", request)
 	if err != nil {
 		t.Fatalf("SubmitSearch() error = %v", err)
@@ -37,78 +35,23 @@ func TestSearchPipelineEndToEnd(t *testing.T) {
 	if len(resultID) != 36 {
 		t.Fatalf("SubmitSearch() result_id = %q", resultID)
 	}
-	envelope, ok := h.Broker.lastSearchEnvelope()
-	if !ok {
-		t.Fatalf("no search envelope reached the broker")
-	}
-	if envelope.ResultID != resultID || envelope.Namespace != "alpha" {
-		t.Fatalf("published envelope = %+v", envelope)
-	}
-	if envelope.Arguments["query"] != request.Query || envelope.Arguments["retrieval"] != string(contracts.RetrievalHybrid) {
-		t.Fatalf("envelope arguments = %v", envelope.Arguments)
-	}
-	body, _, err := mq.EncodeSearchEnvelope(envelope)
-	if err != nil {
-		t.Fatalf("EncodeSearchEnvelope() error = %v", err)
-	}
-	// The broker decoder must keep integer tokens as json.Number (Python json
-	// preserves ints); float64 would make the worker reject candidate_k/top_k.
-	decodedEnvelope, err := mq.DecodeSearchEnvelope(body)
-	if err != nil {
-		t.Fatalf("DecodeSearchEnvelope() error = %v", err)
-	}
-	if candidateK, ok := decodedEnvelope.Arguments["candidate_k"].(json.Number); !ok || candidateK.String() != "10" {
-		t.Fatalf("decoded candidate_k = %#v (%T), want json.Number(\"10\")",
-			decodedEnvelope.Arguments["candidate_k"], decodedEnvelope.Arguments["candidate_k"])
-	}
-	if topK, ok := decodedEnvelope.Arguments["top_k"].(json.Number); !ok || topK.String() != "5" {
-		t.Fatalf("decoded top_k = %#v (%T), want json.Number(\"5\")",
-			decodedEnvelope.Arguments["top_k"], decodedEnvelope.Arguments["top_k"])
+	view, err := h.Stores.SearchTasks.Get(ctx, "alpha", resultID, 1, 10)
+	if err != nil || view == nil || view.Status != state.SearchTaskQueued {
+		t.Fatalf("admitted search task = %+v, %v", view, err)
 	}
 
-	worker, err := searchworker.New(searchworker.Options{
-		Tasks:    h.Stores.SearchTasks,
-		Searcher: h.Service,
-		Capturer: searchrefs.New(h.Stores, testLogger()),
-		Logger:   testLogger(),
-	})
-	if err != nil {
-		t.Fatalf("searchworker.New() error = %v", err)
+	// Debezium delivers only the locating identifiers; the worker reads the
+	// query arguments and deadline back from search_tasks.
+	worker := newSearchProcessor(t, h)
+	if acked := worker.Handle(ctx, searchNotification(resultID, "alpha")); !acked {
+		t.Fatalf("Handle() = false, want an ACK once the durable terminal outcome is saved")
 	}
-	transport := &fakePullTransport{}
-	transport.push(mq.ReceivedMessage{Topic: "praxis_search", Body: body, DeliveryAttempt: 1})
-	consumer := mq.NewPullConsumer(
-		consumerConfig("praxis_search", "praxis_search_workers"),
-		transport, worker.MessageHandler(),
-	)
-	runCtx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- worker.RunConsumer(runCtx, consumer) }()
-
-	waitFor(t, 15*time.Second, "search task succeeded", func() bool {
-		view, readErr := h.Stores.SearchTasks.Get(context.Background(), "alpha", resultID, 1, 10)
-		return readErr == nil && view != nil && view.Status == state.SearchTaskSucceeded
-	})
-	// The durable task becomes terminal inside Handle; the commit happens right
-	// after it returns, so wait for the delivery to be acknowledged too.
-	waitFor(t, 5*time.Second, "search delivery acked", func() bool { return transport.ackCount() == 1 })
-	cancel()
-	select {
-	case runErr := <-done:
-		if runErr != nil {
-			t.Fatalf("RunConsumer() error = %v", runErr)
+	defer func() {
+		if closeErr := worker.Close(); closeErr != nil {
+			t.Fatalf("worker.Close() error = %v", closeErr)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("search consumer did not stop")
-	}
-	if err := worker.Close(); err != nil {
-		t.Fatalf("worker.Close() error = %v", err)
-	}
-	if transport.ackCount() != 1 || transport.nackCount() != 0 {
-		t.Fatalf("delivery ack/nack = %d/%d, want 1/0", transport.ackCount(), transport.nackCount())
-	}
+	}()
 
-	// The durable task is terminal and the immutable snapshot is readable.
 	terminal, err := h.Stores.SearchTasks.Terminal(ctx, resultID)
 	if err != nil || !terminal {
 		t.Fatalf("Terminal() = %v, %v", terminal, err)
@@ -140,5 +83,63 @@ func TestSearchPipelineEndToEnd(t *testing.T) {
 	}
 	if queries := h.Qdrant.count(http.MethodPost, "/points/query"); queries == 0 {
 		t.Fatalf("no Qdrant query was issued")
+	}
+
+	// The result snapshot is a MySQL fact: evicting the whole Redis cache must
+	// still yield the identical result by falling back to search_result_snapshots
+	// (and the read path repairs the cache).
+	if keys := h.Redis.Keys(); len(keys) == 0 {
+		t.Fatalf("completed search left the Redis result cache empty")
+	}
+	// FlushAll evicts every Redis key; the read path must rebuild the envelope
+	// from search_result_snapshots.
+	h.Redis.FlushAll()
+	restored, err := h.Service.GetSearchResult(ctx, "alpha", resultID, 1, 10)
+	if err != nil {
+		t.Fatalf("GetSearchResult() after cache loss error = %v", err)
+	}
+	if restored["result_id"] != resultID || restored["snapshot_available"] != true {
+		t.Fatalf("restored snapshot = %v", restored)
+	}
+	restoredResults, ok := restored["results"].([]any)
+	if !ok || len(restoredResults) != len(results) {
+		t.Fatalf("restored results = %#v, want %d items", restored["results"], len(results))
+	}
+	if keys := h.Redis.Keys(); len(keys) == 0 {
+		t.Fatalf("cache was not repaired from the MySQL snapshot")
+	}
+}
+
+// TestSearchStaleNotificationIsAcknowledged pins the at-least-once delivery
+// contract: a repeated schema-3 notification for an already-succeeded task must
+// be ACKed without re-running retrieval.
+func TestSearchStaleNotificationIsAcknowledged(t *testing.T) {
+	h := newHarness(t, searchQueryPoints)
+	ctx := context.Background()
+
+	resultID, err := h.Service.SubmitSearch(ctx, "alpha", contracts.SearchRequest{
+		Query:      "E03 供水不足",
+		Retrieval:  contracts.RetrievalHybrid,
+		Rerank:     contracts.RerankCrossEncoder,
+		CandidateK: 10,
+		TopK:       5,
+	})
+	if err != nil {
+		t.Fatalf("SubmitSearch() error = %v", err)
+	}
+	worker := newSearchProcessor(t, h)
+	defer func() { _ = worker.Close() }()
+	notification := searchNotification(resultID, "alpha")
+	if acked := worker.Handle(ctx, notification); !acked {
+		t.Fatalf("Handle() = false, want ACK")
+	}
+	queriesBefore := h.Qdrant.count(http.MethodPost, "/points/query")
+	// The task is now terminal, so the duplicate delivery must be skipped and
+	// ACKed without a second retrieval.
+	if acked := worker.Handle(ctx, notification); !acked {
+		t.Fatalf("replayed Handle() = false, want a safe ACK")
+	}
+	if queriesAfter := h.Qdrant.count(http.MethodPost, "/points/query"); queriesAfter != queriesBefore {
+		t.Fatalf("duplicate delivery re-ran retrieval (%d -> %d queries)", queriesBefore, queriesAfter)
 	}
 }

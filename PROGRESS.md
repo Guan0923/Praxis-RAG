@@ -1,6 +1,6 @@
 # RAG MCP 开发进展
 
-最后更新：2026-11-11
+最后更新：2026-11-13
 
 ## 总体目标
 
@@ -555,6 +555,11 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 
 ## 2026-11-10 异步上传默认化与内嵌文档 worker
 
+> **已下线（2026-11-13）**：本节的内嵌 worker、`document_job_outbox` 写入与
+> `RAG_DOCUMENT_WORKER_INPROCESS` 配置已随事务 outbox 下线；当前由 Debezium 任务连接器
+> 采集 `document_jobs` 并投递，文档消费者固定为独立 `rag-document-worker`。见文末
+> 2026-11-13 条目。
+
 本轮把文档上传的默认路径改为异步受理，并让无 Kafka 的单进程部署无需再单独运行文档 worker：
 
 - [x] 默认值翻转：`RAG_UPLOAD_MODE` 缺省为 `async`（`internal/config` 的 `DefaultUploadMode` 与注释、`internal/httpapi` 的 OpenAPI 摘要同步更新）；`POST /v1/documents` 每文件在一个 MySQL 事务内写入 `document_jobs` + `document_job_outbox` 后立即返回 `{"mode":"async","jobs":[{"name","artifact_id","status","reused"}],"failed":[{"name","error"}]}`，解析/切分/Embedding/Qdrant 发布由文档 worker 后台完成。`sync` 保留为显式 opt-in，响应仍是请求内完成的 `imported`/`skipped`/`failed`/`documents` + `mode:"sync"`。
@@ -624,3 +629,18 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] Console：模型配置页去掉 OCR 页签与引擎下拉（现为 Embedding / Reranker / VLM / JEV 四类，均保存服务地址/模型名/加密 API Key）；创建/编辑知识库去掉 OCR 开关与 `ocr_model` 提交，模型区改为 Embedding / Reranker / VLM 三项；`api.ts` 类型与文案同步。
 - [x] 测试：pdf-service `python -m pytest -q` → 176 passed（含视觉客户端 MockTransport、PyMuPDF 现场生成 PDF 的端到端清单校验、options 契约与密钥不泄漏）；`go build ./...` 通过，`internal/config`、`internal/document`、`internal/document/pdfcontent`、`internal/kbconfig`、`internal/monitor`、`internal/ingest` 测试通过，`internal/runtime`/`internal/httpapi` 的纯逻辑用例（PDF options/受理校验/OpenAPI/model profiles）通过（需 `RAG_TEST_MYSQL_URL` 的用例在本机跳过/不可运行）；Console `npm run typecheck` 通过、`npm test` 14 文件 188 用例通过。Go 清单结构、Python `_MANIFEST_KEYS` 等键集合与 `vision` options 键经脚本交叉核对一致。
 - 已知边界：本轮未接入真实视觉端点做端到端解析，也未验证真实扫描件/复杂表格的识别质量；未构建 pdf-parser 镜像；未在有 `RAG_TEST_MYSQL_URL` 的 MySQL 上运行 runtime/httpapi/state 的全部用例与启动迁移；旧部署删除 `pdf_parser_models` 卷与清理遗留 OCR 模型配置属于升级运维动作。
+
+
+## 2026-11-13 事务 outbox 下线：Debezium 双连接器 + 三个事件（含 Console 监控与切换 CLI）
+
+本轮按 `docs/cdc-migration.md` 契约把投递机制从"应用写事务 outbox → relay/Debezium 轮询"改为"两个 Debezium 连接器直接从 MySQL 表级采集"。早期条目里关于 `document_job_outbox`、`search_task_outbox`、`cache_outbox`、`RAG_DOCUMENT_WORKER_INPROCESS`、`RAG_OUTBOX_BRIDGE`、进程内 relay 的描述均为**历史实现，已下线**，以本节与契约文档为准。
+
+- [x] 状态库：`document_jobs`/`search_tasks` 增加 `schedule_version`（默认 1），重发只在 MySQL 事务内递增版本；`cache_revisions` 增加 `refreshed_revision/attempts/last_error/updated_at` 水位列；新增 `cdc_cutover_state`；四张旧 outbox 表不再创建/写入，由迁移 CLI 显式删除。
+- [x] 事件契约：文档通知 schema 4（`artifact_id/namespace/schedule_version`）、搜索通知 schema 3（`result_id/namespace/schedule_version`）、缓存事件 schema 1（`table/op/before/after`）；消费者兼容 Debezium 原生 envelope 与原生 envelope，旧版本/终态/有效租约安全跳过。
+- [x] 搜索：`SearchTasks.Submit` 只写 MySQL，提交即返回 `result_id`；成功终态与 `search_result_snapshots` 同事务写入，Redis 降级为读取缓存（回源 + 尽力回填），后台有界清理过期快照。
+- [x] 缓存消费者：新增 `cmd/rag-cache-worker` 与 `internal/cacheconsumer`；`MarkAllDirty`、`DirtyKeys`、`RefreshDirty` 按 revision 水位收敛，失败记录 `attempts/last_error` 并 ACK。
+- [x] Debezium/Compose：任务连接器只投递 INSERT 与 `schedule_version` 变化，缓存连接器采集 8 张业务表全部 c/u/d；独立 `database.server.id`、offset/schema-history 卷与健康端口；cache 独立 topic/group/DLQ。
+- [x] 监控：`pipeline.debezium.{tasks,cache}`、`pipeline.kafka.groups.{document,search,cache}`、`pipeline.cache.{dirty_keys,refresh_failures}`、`service.delivery="debezium"`；删除 `pipeline.outbox`/`service.outbox_bridge`；`queues.search_tasks` 增加 `timed_out_recent/overdue_active`；`library.result_snapshots` 改为 MySQL 未过期快照数。Console 监控页与 `frontend/src/api.ts` 同步。
+- [x] 切换 CLI：新增 `cmd/rag-cdc-cutover`（`--inventory`/`--record-position`/`--backfill`/`--mark-cache-baseline`/`--verify`/`--all`，退出码 0/1/2）；`cmd/rag-service-migrate --retire-outbox --yes` 调用 `migrate.RetireOutbox` 删除四张旧表，缺 `--yes` 只读列出并拒绝执行。
+- [x] 文档：README、USAGE、DEPLOYMENT、state-storage、state-cache、result-references、GO_MIGRATION、agents 文档与 AGENTS.md 同步；历史 outbox 描述删除或标注已下线；`VALIDATION.md` 追加本次验证范围与未实机项。
+- 已知边界：真实 Docker/Debezium/Kafka/Redis 双连接器链路、缓存 revision 收敛、搜索 MySQL 回源、存量切换/回滚演练与 Console 前端构建均未在本轮实机执行，详见 `VALIDATION.md`。

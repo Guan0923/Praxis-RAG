@@ -130,9 +130,6 @@ func TestKnowledgeBaseFailedUpdateRollsBackRevisions(t *testing.T) {
 	if revisions := revisionCount(t, stores); revisions != 0 {
 		t.Fatalf("failed update left %d cache revisions, want 0", revisions)
 	}
-	if events := outboxCount(t, stores); events != 0 {
-		t.Fatalf("failed update left %d outbox events, want 0", events)
-	}
 }
 
 // TestKnowledgeBaseReadModelPrimitives ports the read-model expectations of

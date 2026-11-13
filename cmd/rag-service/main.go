@@ -105,29 +105,26 @@ func run() error {
 	if !mqSettings.Configured() {
 		logger.Warn("RAG_KAFKA_BOOTSTRAP_SERVERS is not configured: document jobs stay queued because rag-document-worker consumes them through Kafka")
 	}
-	// The Console monitoring page is read-only: one state aggregate plus five
-	// bounded dependency probes, assembled per request by internal/monitor.
-	// Kafka progress is wired only when a broker is configured, so a brokerless
-	// deployment reports the in-process outbox instead of fabricating offsets.
-	var kafkaProgress func(context.Context) (monitor.KafkaProgress, error)
-	if mqSettings.Configured() {
-		kafkaSettings := mqSettings
-		kafkaProgress = func(ctx context.Context) (monitor.KafkaProgress, error) {
-			progress, progressErr := mq.DocumentConsumerProgress(ctx, kafkaSettings)
-			if progressErr != nil {
-				return monitor.KafkaProgress{}, progressErr
-			}
-			return monitor.KafkaProgress{
-				CommittedOffset: progress.CommittedOffset,
-				EndOffset:       progress.EndOffset,
-				Lag:             progress.Lag,
-			}, nil
+	// The Console monitoring page is read-only: one state aggregate plus the
+	// bounded dependency probes assembled per request by internal/monitor.
+	// Task delivery is owned by Debezium, so the pipeline view reports the two
+	// capture connectors' health and three independent business consumer
+	// groups; the service never fabricates an in-process outbox row.
+	progressSettings := mqSettings
+	kafkaGroupProgress := func(ctx context.Context, topic, group string) (monitor.KafkaProgress, error) {
+		progress, progressErr := mq.ConsumerProgressFor(ctx, progressSettings, topic, group)
+		if progressErr != nil {
+			return monitor.KafkaProgress{}, progressErr
 		}
+		return monitor.KafkaProgress{
+			CommittedOffset: progress.CommittedOffset,
+			EndOffset:       progress.EndOffset,
+			Lag:             progress.Lag,
+		}, nil
 	}
-	// The monitoring snapshot needs three live side channels the state aggregate
-	// cannot provide: broker metadata (authentication + topic), the Redis
-	// result-snapshot index, and the document-worker heartbeat. Each failure only
-	// makes its own row unknown.
+	// The monitoring snapshot needs live side channels the state aggregate
+	// cannot provide: broker metadata (authentication + topic) and the
+	// document-worker heartbeat. Each failure only makes its own row unknown.
 	var kafkaProbe func(context.Context) (monitor.KafkaStatus, error)
 	if mqSettings.Configured() {
 		kafkaProbeSettings := mqSettings
@@ -142,12 +139,6 @@ func run() error {
 				TopicExists: status.TopicExists,
 				Partitions:  status.Partitions,
 			}, nil
-		}
-	}
-	var resultSnapshots func(context.Context) (int, error)
-	if cache != nil {
-		resultSnapshots = func(ctx context.Context) (int, error) {
-			return cache.ResultSnapshotIndex().CountActive(ctx, time.Now())
 		}
 	}
 	workerHeartbeat := func(ctx context.Context) (*monitor.WorkerHeartbeat, error) {
@@ -169,17 +160,23 @@ func run() error {
 		Collection:            ragConfig.Collection,
 		KafkaBootstrapServers: mqSettings.BootstrapServers,
 		KafkaProbe:            kafkaProbe,
-		DebeziumHealthURL:     os.Getenv("RAG_DEBEZIUM_HEALTH_URL"),
-		DocumentTopic:         mqSettings.DocumentTopic,
-		DocumentGroup:         mqSettings.DocumentGroup,
-		KafkaProgress:         kafkaProgress,
-		ResultSnapshots:       resultSnapshots,
-		WorkerHeartbeat:       workerHeartbeat,
-		OutboxBridge:          "debezium",
-		UploadMode:            "async",
-		PDFEngine:             ragConfig.PDFEngine,
-		PDFServiceURL:         ragConfig.PDFServiceURL,
-		StartedAt:             time.Now(),
+		// The two Debezium connectors are the delivery path now; their Quarkus
+		// health endpoints are the only capture-side signal the service can read.
+		DebeziumHealthURL:      os.Getenv("RAG_DEBEZIUM_HEALTH_URL"),
+		DebeziumCacheHealthURL: os.Getenv("RAG_DEBEZIUM_CACHE_HEALTH_URL"),
+		DocumentTopic:          mqSettings.DocumentTopic,
+		DocumentGroup:          mqSettings.DocumentGroup,
+		SearchTopic:            mqSettings.SearchTopic,
+		SearchGroup:            mqSettings.SearchGroup,
+		CacheTopic:             mqSettings.CacheTopic,
+		CacheGroup:             mqSettings.CacheGroup,
+		KafkaGroupProgress:     kafkaGroupProgress,
+		WorkerHeartbeat:        workerHeartbeat,
+		Delivery:               "debezium",
+		UploadMode:             "async",
+		PDFEngine:              ragConfig.PDFEngine,
+		PDFServiceURL:          ragConfig.PDFServiceURL,
+		StartedAt:              time.Now(),
 	})
 	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{

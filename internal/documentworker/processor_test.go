@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -54,6 +55,8 @@ func configureNamespace(t *testing.T, stores *state.Stores) {
 	}
 }
 
+// submitJob admits one document job and returns the schema-4 notification
+// Debezium would publish for the committed row (schedule_version = 1).
 func submitJob(t *testing.T, stores *state.Stores, name string, content []byte) state.DocumentNotification {
 	t.Helper()
 	admission, err := stores.DocumentJobs.Submit(context.Background(), testNamespace, name, content, nil)
@@ -64,11 +67,35 @@ func submitJob(t *testing.T, stores *state.Stores, name string, content []byte) 
 	if err != nil || job == nil {
 		t.Fatalf("DocumentJobs.Get: %v %v", job, err)
 	}
+	return notificationFor(t, job)
+}
+
+// notificationFor rebuilds the identifier-only schema-4 notification of a job,
+// optionally with a different scheduling generation (stale/new deliveries).
+func notificationFor(t *testing.T, job *state.DocumentJob) state.DocumentNotification {
+	t.Helper()
 	notification, err := state.DocumentJobEnvelope(job)
 	if err != nil {
 		t.Fatalf("DocumentJobEnvelope: %v", err)
 	}
 	return notification
+}
+
+// notificationAtVersion rewrites the scheduling generation of a notification to
+// model a stale or replacement delivery.
+func notificationAtVersion(notification state.DocumentNotification, version int64) state.DocumentNotification {
+	notification.ScheduleVersion = version
+	return notification
+}
+
+// nativeBody encodes the application-native schema-4 envelope.
+func nativeBody(t *testing.T, notification state.DocumentNotification) []byte {
+	t.Helper()
+	body, err := json.Marshal(notification)
+	if err != nil {
+		t.Fatalf("json.Marshal(DocumentNotification): %v", err)
+	}
+	return body
 }
 
 func sha256Hex(content []byte) string {
@@ -142,6 +169,38 @@ func (f *fakeIngester) callCount() int {
 	return f.calls
 }
 
+// successIngester publishes the job it is given, so the processor can reconcile
+// it into the succeeded terminal state.
+func successIngester(t *testing.T, stores *state.Stores) *fakeIngester {
+	t.Helper()
+	ingester := &fakeIngester{}
+	ingester.setRun(func(_ context.Context, payload Payload) error {
+		commitPublication(t, stores, payload)
+		return nil
+	})
+	return ingester
+}
+
+// fakeJournalRecovery records the optional upload-journal recovery pass.
+type fakeJournalRecovery struct {
+	mutex sync.Mutex
+	calls int
+	err   error
+}
+
+func (f *fakeJournalRecovery) RecoverDocumentUploads(context.Context) error {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	f.calls++
+	return f.err
+}
+
+func (f *fakeJournalRecovery) callCount() int {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	return f.calls
+}
+
 func newProcessor(t *testing.T, stores *state.Stores, ingester Ingester, options Options) *Processor {
 	t.Helper()
 	options.Jobs = stores.DocumentJobs
@@ -169,11 +228,7 @@ func TestHandleSuccess(t *testing.T) {
 	stores := newTestStores(t)
 	configureNamespace(t, stores)
 	notification := submitJob(t, stores, "manual.txt", []byte("original"))
-	ingester := &fakeIngester{}
-	ingester.setRun(func(_ context.Context, payload Payload) error {
-		commitPublication(t, stores, payload)
-		return nil
-	})
+	ingester := successIngester(t, stores)
 	processor := newProcessor(t, stores, ingester, Options{})
 
 	if acked := processor.Handle(context.Background(), notification); !acked {
@@ -200,7 +255,11 @@ func TestHandleSuccess(t *testing.T) {
 	}
 }
 
-func TestHandleRetriesParserFailures(t *testing.T) {
+// TestHandleRetryableFailureRequeuesWithNewScheduleVersion covers the retry
+// branch of docs/cdc-migration.md §4.1: Fail(retry=true) increments the
+// schedule_version in the same UPDATE, so exactly one replacement notification
+// exists and the current delivery can be acknowledged.
+func TestHandleRetryableFailureRequeuesWithNewScheduleVersion(t *testing.T) {
 	stores := newTestStores(t)
 	configureNamespace(t, stores)
 	notification := submitJob(t, stores, "manual.txt", []byte("original"))
@@ -210,23 +269,34 @@ func TestHandleRetriesParserFailures(t *testing.T) {
 	})
 	processor := newProcessor(t, stores, ingester, Options{})
 
-	if acked := processor.Handle(context.Background(), notification); acked {
-		t.Fatalf("parser failure must not be acknowledged")
+	if acked := processor.Handle(context.Background(), notification); !acked {
+		t.Fatalf("a recorded retry must be acknowledged (the sweep re-emits the new version)")
 	}
 	job := jobStatus(t, stores, notification.ArtifactID)
 	if job.Status != state.DocumentJobQueued || job.Stage != "retry_wait" || job.Attempts != 1 {
 		t.Fatalf("retried job = %+v", job)
 	}
+	if job.ScheduleVersion != 2 {
+		t.Fatalf("schedule_version = %d, want 2 (Fail(retry=true) increments)", job.ScheduleVersion)
+	}
+	if job.Error == nil || !strings.Contains(*job.Error, "Document processing failed") {
+		t.Fatalf("retry did not persist the safe failure message: %+v", job.Error)
+	}
 
+	// The replacement generation notification is claimable and runs the job.
 	ingester.setRun(func(_ context.Context, payload Payload) error {
 		commitPublication(t, stores, payload)
 		return nil
 	})
-	if acked := processor.Handle(context.Background(), notification); !acked {
+	retryNotification := notificationAtVersion(notification, job.ScheduleVersion)
+	if acked := processor.Handle(context.Background(), retryNotification); !acked {
 		t.Fatalf("retry delivery must be acknowledged after success")
 	}
 	if job := jobStatus(t, stores, notification.ArtifactID); job.Status != state.DocumentJobSucceeded || job.Attempts != 2 {
 		t.Fatalf("job = %+v", job)
+	}
+	if ingester.callCount() != 2 {
+		t.Fatalf("ingester calls = %d, want 2", ingester.callCount())
 	}
 }
 
@@ -253,38 +323,47 @@ func TestHandleValidationFailureIsTerminal(t *testing.T) {
 	if len(*job.Error) <= len(terminalPrefix) {
 		t.Fatalf("failed job error lost the structured summary: %q", *job.Error)
 	}
+	if job.ScheduleVersion != 1 {
+		t.Fatalf("terminal failure must not increment schedule_version: %d", job.ScheduleVersion)
+	}
 	if terminal, err := stores.DocumentJobs.Terminal(context.Background(), notification.ArtifactID); err != nil || !terminal {
 		t.Fatalf("Terminal() = %v, %v", terminal, err)
 	}
+	// A terminal failed job is acknowledged without re-running ingestion.
+	if acked := processor.Handle(context.Background(), notification); !acked {
+		t.Fatalf("delivery of a failed job must be acknowledged")
+	}
+	if ingester.callCount() != 1 {
+		t.Fatalf("terminal redelivery re-ran ingestion: %d calls", ingester.callCount())
+	}
 }
 
-func TestHandleLeaseExpiryAndFencing(t *testing.T) {
+// TestHandleSkipsLiveLeaseAndReclaimsAfterExpiry covers the "another owner holds
+// a live lease" case: the notification is safely skipped and ACKed, and once the
+// lease expires the same generation is claimable by a new execution.
+func TestHandleSkipsLiveLeaseAndReclaimsAfterExpiry(t *testing.T) {
 	stores := newTestStores(t)
 	configureNamespace(t, stores)
 	clock := float64(time.Now().Unix())
 	stores.DocumentJobs.Clock = func() float64 { return clock }
 	notification := submitJob(t, stores, "manual.txt", []byte("original"))
 
-	// Another live worker holds the lease: this delivery must stay retryable.
+	// Another live worker holds the lease.
 	task, err := stores.DocumentJobs.Claim(context.Background(), notification)
 	if err != nil || task == nil {
 		t.Fatalf("Claim() = %+v, %v", task, err)
 	}
-	ingester := &fakeIngester{}
-	ingester.setRun(func(_ context.Context, payload Payload) error {
-		commitPublication(t, stores, payload)
-		return nil
-	})
+	ingester := successIngester(t, stores)
 	processor := newProcessor(t, stores, ingester, Options{})
-	if acked := processor.Handle(context.Background(), notification); acked {
-		t.Fatalf("delivery under a live lease must not be acknowledged")
+	if acked := processor.Handle(context.Background(), notification); !acked {
+		t.Fatalf("delivery under a live lease must be safely acknowledged")
 	}
 	if ingester.callCount() != 0 {
 		t.Fatalf("ingester ran under a live lease")
 	}
 
 	// After the lease expires another worker takes over (fencing the old one).
-	clock += 400
+	clock += stores.DocumentJobs.Settings.LeaseSeconds + 10
 	if acked := processor.Handle(context.Background(), notification); !acked {
 		t.Fatalf("expired lease must be reclaimable")
 	}
@@ -297,6 +376,114 @@ func TestHandleLeaseExpiryAndFencing(t *testing.T) {
 	var conflict *state.UploadConflict
 	if err := stores.DocumentJobs.Progress(context.Background(), task, "stale-stage"); !errors.As(err, &conflict) {
 		t.Fatalf("stale execution Progress() error = %v, want UploadConflict", err)
+	}
+}
+
+// TestStaleScheduleVersionIsAcknowledged covers the crash-after-claim recovery
+// path: the sweep bumps schedule_version, the old delivery is skipped and ACKed,
+// and the replacement generation runs. No transactional outbox row is involved.
+func TestStaleScheduleVersionIsAcknowledged(t *testing.T) {
+	stores := newTestStores(t)
+	configureNamespace(t, stores)
+	clock := float64(time.Now().Unix())
+	stores.DocumentJobs.Clock = func() float64 { return clock }
+	notification := submitJob(t, stores, "manual.txt", []byte("original"))
+
+	// The worker claimed the job and crashed before finishing it.
+	if task, err := stores.DocumentJobs.Claim(context.Background(), notification); err != nil || task == nil {
+		t.Fatalf("Claim() = %+v, %v", task, err)
+	}
+	clock += stores.DocumentJobs.Settings.LeaseSeconds + 10
+	ingester := successIngester(t, stores)
+	processor := newProcessor(t, stores, ingester, Options{})
+	if err := processor.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	job := jobStatus(t, stores, notification.ArtifactID)
+	if job.ScheduleVersion != 2 || job.Status != state.DocumentJobQueued || job.Stage != "retry_wait" {
+		t.Fatalf("swept job = %+v", job)
+	}
+
+	// The old generation's delivery is stale: ACK without running.
+	if acked := processor.Handle(context.Background(), notification); !acked {
+		t.Fatalf("stale schedule_version delivery must be acknowledged")
+	}
+	if ingester.callCount() != 0 {
+		t.Fatalf("stale delivery ran ingestion")
+	}
+
+	// The replacement generation is claimable.
+	replacement := notificationAtVersion(notification, job.ScheduleVersion)
+	if acked := processor.Handle(context.Background(), replacement); !acked {
+		t.Fatalf("current schedule_version delivery must be acknowledged")
+	}
+	if ingester.callCount() != 1 {
+		t.Fatalf("ingester calls = %d, want 1", ingester.callCount())
+	}
+	if job := jobStatus(t, stores, notification.ArtifactID); job.Status != state.DocumentJobSucceeded {
+		t.Fatalf("job = %+v", job)
+	}
+}
+
+// TestMessageHandlerDecodesNativeAndDebeziumEnvelopes proves both accepted wire
+// shapes execute the committed job: the application-native schema-4 envelope and
+// the raw Debezium change event (schemas.enable=false, op c/r/u).
+func TestMessageHandlerDecodesNativeAndDebeziumEnvelopes(t *testing.T) {
+	cases := []struct {
+		name string
+		body func(t *testing.T, notification state.DocumentNotification) []byte
+	}{
+		{name: "native schema-4", body: nativeBody},
+		{name: "debezium create", body: func(t *testing.T, notification state.DocumentNotification) []byte {
+			return documentCDCEvent(t, nil, documentCDCRow(notification), "c")
+		}},
+		{name: "debezium snapshot read", body: func(t *testing.T, notification state.DocumentNotification) []byte {
+			return documentCDCEvent(t, nil, documentCDCRow(notification), "r")
+		}},
+		{name: "debezium schedule bump", body: func(t *testing.T, notification state.DocumentNotification) []byte {
+			return documentCDCEvent(t, documentCDCRow(notification), documentCDCRow(notification), "u")
+		}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			stores := newTestStores(t)
+			configureNamespace(t, stores)
+			notification := submitJob(t, stores, "manual.txt", []byte("original"))
+			ingester := successIngester(t, stores)
+			processor := newProcessor(t, stores, ingester, Options{})
+			if acked := processor.MessageHandler()(context.Background(), mq.ReceivedMessage{
+				Topic: "praxis_document_ingest", Body: testCase.body(t, notification),
+			}); !acked {
+				t.Fatalf("valid notification must be acknowledged")
+			}
+			if ingester.callCount() != 1 {
+				t.Fatalf("ingester calls = %d, want 1", ingester.callCount())
+			}
+			if job := jobStatus(t, stores, notification.ArtifactID); job.Status != state.DocumentJobSucceeded {
+				t.Fatalf("job = %+v, want succeeded", job)
+			}
+		})
+	}
+}
+
+func TestMessageHandlerRejectsMalformedEnvelopes(t *testing.T) {
+	stores := newTestStores(t)
+	processor := newProcessor(t, stores, &fakeIngester{}, Options{})
+	handler := processor.MessageHandler()
+	for _, body := range [][]byte{
+		[]byte("{not json"),
+		// Document schema 4 requires schedule_version; 3 is the retired document
+		// schema and 1 is the cache schema.
+		[]byte(`{"schema":3,"artifact_id":"3c1b9d0e-1111-4c2a-9f3e-9d0e11114c2a","namespace":"manuals"}`),
+		[]byte(`{"schema":1}`),
+		[]byte(`{"schema":4,"artifact_id":"not-a-uuid","namespace":"manuals","schedule_version":1}`),
+		[]byte(`{"schema":4,"artifact_id":"3c1b9d0e-1111-4c2a-9f3e-9d0e11114c2a","namespace":"manuals"}`),
+		[]byte(`{"schema":4,"artifact_id":"3c1b9d0e-1111-4c2a-9f3e-9d0e11114c2a","namespace":"manuals","schedule_version":0}`),
+		[]byte(`{"schema":4,"artifact_id":"3c1b9d0e-1111-4c2a-9f3e-9d0e11114c2a","namespace":"manuals","schedule_version":1} trailing`),
+	} {
+		if acked := handler(context.Background(), mq.ReceivedMessage{Body: body}); acked {
+			t.Fatalf("poison payload %q must be nacked for broker retry/DLQ", body)
+		}
 	}
 }
 
@@ -341,7 +528,8 @@ func TestHandleKeepsLeaseAliveDuringSlowIngestion(t *testing.T) {
 	select {
 	case acked := <-done:
 		if !acked {
-			t.Fatalf("slow ingestion must be acknowledged after success: job=%+v logs=%s", jobStatus(t, stores, notification.ArtifactID), logBuffer.String())
+			t.Fatalf("slow ingestion must be acknowledged after success: job=%+v logs=%s",
+				jobStatus(t, stores, notification.ArtifactID), logBuffer.String())
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatalf("Handle did not return")
@@ -386,8 +574,8 @@ func TestDeadLetterAndExhaustion(t *testing.T) {
 		return errors.New("permanent broker failure")
 	})
 	processor := newProcessor(t, stores, ingester, Options{})
-	if acked := processor.Handle(context.Background(), notification); acked {
-		t.Fatalf("parser failure must stay retryable")
+	if acked := processor.Handle(context.Background(), notification); !acked {
+		t.Fatalf("parser failure must be recorded and acknowledged for redelivery")
 	}
 
 	complete, err := processor.DeadLetter(context.Background(), notification)
@@ -406,10 +594,7 @@ func TestDeadLetterAndExhaustion(t *testing.T) {
 		t.Fatalf("dead-lettered job lost the last recorded failure: %q", *job.Error)
 	}
 
-	body, _, err := mq.EncodeDocumentNotification(notification)
-	if err != nil {
-		t.Fatalf("EncodeDocumentNotification: %v", err)
-	}
+	body := nativeBody(t, notification)
 	if acked := processor.DeadLetterHandler()(context.Background(), mq.ReceivedMessage{Body: body}); !acked {
 		t.Fatalf("dead-letter handler must acknowledge a terminal job")
 	}
@@ -435,66 +620,57 @@ func TestDeadLetterWhileLiveLeaseIsNotAcknowledged(t *testing.T) {
 	}
 }
 
-func TestMessageHandlerDecodesNotification(t *testing.T) {
-	stores := newTestStores(t)
-	configureNamespace(t, stores)
-	notification := submitJob(t, stores, "manual.txt", []byte("original"))
-	ingester := &fakeIngester{}
-	ingester.setRun(func(_ context.Context, payload Payload) error {
-		commitPublication(t, stores, payload)
-		return nil
-	})
-	processor := newProcessor(t, stores, ingester, Options{})
-	body, _, err := mq.EncodeDocumentNotification(notification)
-	if err != nil {
-		t.Fatalf("EncodeDocumentNotification: %v", err)
-	}
-	handler := processor.MessageHandler()
-	if acked := handler(context.Background(), mq.ReceivedMessage{Body: body}); !acked {
-		t.Fatalf("valid notification must be acknowledged")
-	}
-	if acked := handler(context.Background(), mq.ReceivedMessage{Body: []byte("{not json")}); acked {
-		t.Fatalf("poison payload must be nacked for broker retry/DLQ")
-	}
-	if acked := handler(context.Background(), mq.ReceivedMessage{Body: []byte(`{"schema":3}`)}); acked {
-		t.Fatalf("invalid schema-3 payload must be nacked")
-	}
-}
-
-func TestRecoverSweepsStrandedAndExpiredJobs(t *testing.T) {
+// TestRecoverSweepsGarbageCollectsAndRecoversJournal covers the maintenance pass:
+// Recover only requeues stranded/expired jobs (bumping schedule_version), GCs old
+// terminal rows and runs the optional upload-journal recovery. No outbox table is
+// read or written.
+func TestRecoverSweepsGarbageCollectsAndRecoversJournal(t *testing.T) {
 	stores := newTestStores(t)
 	configureNamespace(t, stores)
 	clock := float64(time.Now().Unix())
 	stores.DocumentJobs.Clock = func() float64 { return clock }
-	notification := submitJob(t, stores, "manual.txt", []byte("original"))
-	processor := newProcessor(t, stores, &fakeIngester{}, Options{})
+	recovery := &fakeJournalRecovery{}
+	ingester := successIngester(t, stores)
+	processor := newProcessor(t, stores, ingester, Options{JournalRecovery: recovery})
 
-	// A queued job whose notification was lost is re-emitted after the sweep
-	// window.
-	clock += stores.DocumentJobs.Settings.SweepAfterSeconds + 10
+	// A terminal job older than the retention window is garbage collected.
+	terminal := submitJob(t, stores, "terminal.txt", []byte("old"))
+	if acked := processor.Handle(context.Background(), terminal); !acked {
+		t.Fatalf("terminal job must be processed")
+	}
+	// A queued job whose notification was lost is re-emitted by the sweep.
+	stranded := submitJob(t, stores, "stranded.txt", []byte("lost"))
+	// A processing job whose worker crashed is requeued when its lease expires.
+	crashed := submitJob(t, stores, "crashed.txt", []byte("lease"))
+	if task, err := stores.DocumentJobs.Claim(context.Background(), crashed); err != nil || task == nil {
+		t.Fatalf("Claim() = %+v, %v", task, err)
+	}
+
+	clock += stores.DocumentJobs.Settings.LeaseSeconds +
+		stores.DocumentJobs.Settings.SweepAfterSeconds +
+		stores.DocumentJobs.Settings.TerminalRetentionSeconds + 10
 	if err := processor.Recover(context.Background()); err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
-	events, err := stores.DocumentJobs.PendingOutbox(context.Background(), 10)
-	if err != nil {
-		t.Fatalf("PendingOutbox: %v", err)
+	if recovery.callCount() != 1 {
+		t.Fatalf("journal recovery calls = %d, want 1", recovery.callCount())
 	}
-	if len(events) == 0 {
-		t.Fatalf("sweep did not re-emit the stranded notification")
+	if job, err := stores.DocumentJobs.Get(context.Background(), terminal.ArtifactID, nil); err != nil || job != nil {
+		t.Fatalf("terminal job after Recover = %+v, %v; want GC'd", job, err)
 	}
-
-	// An expired processing lease is requeued.
-	task, err := stores.DocumentJobs.Claim(context.Background(), notification)
-	if err != nil || task == nil {
-		t.Fatalf("Claim() = %+v, %v", task, err)
+	for _, notification := range []state.DocumentNotification{stranded, crashed} {
+		job := jobStatus(t, stores, notification.ArtifactID)
+		if job.Status != state.DocumentJobQueued || job.Stage != "retry_wait" || job.ScheduleVersion != 2 {
+			t.Fatalf("recovered job = %+v", job)
+		}
 	}
-	clock += stores.DocumentJobs.Settings.LeaseSeconds + 10
-	if err := processor.Recover(context.Background()); err != nil {
-		t.Fatalf("second Recover: %v", err)
+	// The replacement generation is consumable.
+	replacement := notificationAtVersion(stranded, 2)
+	if acked := processor.Handle(context.Background(), replacement); !acked {
+		t.Fatalf("swept notification must be acknowledged")
 	}
-	job := jobStatus(t, stores, notification.ArtifactID)
-	if job.Status != state.DocumentJobQueued || job.Stage != "retry_wait" {
-		t.Fatalf("expired lease job = %+v", job)
+	if job := jobStatus(t, stores, stranded.ArtifactID); job.Status != state.DocumentJobSucceeded {
+		t.Fatalf("stranded job = %+v", job)
 	}
 }
 
@@ -523,11 +699,10 @@ func TestUnknownJobIsAcknowledged(t *testing.T) {
 	configureNamespace(t, stores)
 	processor := newProcessor(t, stores, &fakeIngester{}, Options{})
 	notification := state.DocumentNotification{
-		Schema:     state.DocumentEnvelopeSchema,
-		ArtifactID: "3c1b9d0e-1111-4c2a-9f3e-9d0e11114c2a",
-		Namespace:  testNamespace,
-		Name:       "missing.txt",
-		CreatedAt:  1,
+		Schema:          state.DocumentEnvelopeSchema,
+		ArtifactID:      "3c1b9d0e-1111-4c2a-9f3e-9d0e11114c2a",
+		Namespace:       testNamespace,
+		ScheduleVersion: 1,
 	}
 	if acked := processor.Handle(context.Background(), notification); !acked {
 		t.Fatalf("unknown job delivery must be acknowledged")
@@ -579,15 +754,8 @@ func TestRunConsumerLifecycle(t *testing.T) {
 	stores := newTestStores(t)
 	configureNamespace(t, stores)
 	notification := submitJob(t, stores, "manual.txt", []byte("original"))
-	body, _, err := mq.EncodeDocumentNotification(notification)
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	ingester := &fakeIngester{}
-	ingester.setRun(func(_ context.Context, payload Payload) error {
-		commitPublication(t, stores, payload)
-		return nil
-	})
+	body := nativeBody(t, notification)
+	ingester := successIngester(t, stores)
 	processor := newProcessor(t, stores, ingester, Options{})
 	consumer := &fakeConsumer{handler: processor.MessageHandler(), messages: make(chan mq.ReceivedMessage, 1)}
 	ctx, cancel := context.WithCancel(context.Background())

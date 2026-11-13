@@ -3,10 +3,11 @@
 // request path, captures expiring artifact references without publishing a
 // snapshot, and stores the final immutable result.
 //
-// It is a port of rag_mcp/search_worker.py for the broker-driven part; the
-// Python implementation executes retrieval in a spawned child process for
-// isolation, while the Go port exposes a narrow Searcher seam so the runtime
-// keeps ownership of retrieval and the worker only owns durable task state.
+// MySQL is the source of truth. The broker carries an identifier-only
+// notification (result_id, namespace, schedule_version); the worker reads the
+// committed arguments and deadline back from search_tasks, so a redelivery can
+// never disagree with the accepted request. Submission itself returns as soon
+// as the MySQL transaction commits and does not depend on this consumer.
 //
 // The package is transport-neutral: production binaries wire MessageHandler
 // into internal/mq.PullConsumer, while tests and broker-less deployments can
@@ -41,11 +42,12 @@ type Capturer interface {
 	Capture(ctx context.Context, namespace string, payload map[string]any, saveSnapshot bool) (map[string]any, error)
 }
 
-// Receiver is the optional local envelope source used by Run/RunOnce. Production
-// workers consume broker messages through MessageHandler instead.
+// Receiver is the optional in-process notification source used by Run/RunOnce.
+// Production workers consume broker messages through MessageHandler instead.
 type Receiver interface {
-	// Receive returns the next envelope, or ok=false when nothing is available.
-	Receive(ctx context.Context) (state.SearchEnvelope, bool, error)
+	// Receive returns the next notification, or ok=false when nothing is
+	// available.
+	Receive(ctx context.Context) (state.SearchNotification, bool, error)
 }
 
 // Options configures a Processor. Tasks is required; Searcher may be nil only
@@ -58,9 +60,9 @@ type Options struct {
 
 	// PollInterval is the Run loop idle interval (default one second).
 	PollInterval time.Duration
-	// BatchSize bounds one RunOnce pass (default one envelope).
+	// BatchSize bounds one RunOnce pass (default one notification).
 	BatchSize int
-	// Receiver supplies envelopes for Run/RunOnce; nil leaves them no-ops.
+	// Receiver supplies notifications for Run/RunOnce; nil leaves them no-ops.
 	Receiver Receiver
 	// Retryable overrides the failure classification. The default mirrors
 	// Python: ValueError-shaped errors are terminal, everything else retries.
@@ -135,32 +137,49 @@ func defaultRetryable(err error) bool {
 	return true
 }
 
-// Handle processes one full-request envelope and reports whether the broker
-// delivery may be acknowledged (true) or must be retried (false).
+// Handle processes one identifier-only notification and reports whether the
+// broker delivery may be acknowledged (true) or must be retried (false).
 //
-// The result id and namespace are attached to the context as soon as they are
-// known so retry, failure and capture logs can be joined with the durable task
-// row and the final result read.
-func (p *Processor) Handle(ctx context.Context, envelope state.SearchEnvelope) bool {
-	if envelope.ResultID != "" {
-		ctx = logging.With(ctx, "result_id", envelope.ResultID)
+// The lookup order is: validate identifiers -> claim by schedule version ->
+// execute against the committed arguments -> complete in one MySQL transaction.
+// A stale version, a terminal task, a live lease held by another worker or a
+// purged row is safe to acknowledge; the maintenance loop re-emits expired
+// deadlines and the sweep/retry path bumps the version when a task needs
+// another attempt.
+func (p *Processor) Handle(ctx context.Context, notification state.SearchNotification) bool {
+	if notification.ResultID != "" {
+		ctx = logging.With(ctx, "result_id", notification.ResultID)
 	}
-	if envelope.Namespace != "" {
-		ctx = logging.WithNamespace(ctx, envelope.Namespace)
+	if notification.Namespace != "" {
+		ctx = logging.WithNamespace(ctx, notification.Namespace)
 	}
 	if p.searcher == nil {
 		// Dead-letter-only worker: execution must never run here.
 		p.logWarn(ctx, "search worker has no searcher; leaving delivery retryable")
 		return false
 	}
-	task, err := p.tasks.Claim(ctx, envelope)
+	validated, err := state.ValidateSearchNotification(map[string]any{
+		"schema":           float64(state.SearchEnvelopeSchema),
+		"result_id":        notification.ResultID,
+		"namespace":        notification.Namespace,
+		"schedule_version": notification.ScheduleVersion,
+	})
 	if err != nil {
-		// A malformed envelope or unavailable task state must not be acked.
+		p.logWarn(ctx, "search notification invalid", logging.ErrorAttrs(err)...)
+		return false
+	}
+	notification = validated
+	task, err := p.tasks.Claim(ctx, notification)
+	if err != nil {
+		// A malformed notification or unavailable task state must not be acked.
 		p.logWarn(ctx, "search claim unavailable", logging.ErrorAttrs(err)...)
 		return false
 	}
 	if task == nil {
-		return p.terminalOrNack(ctx, envelope)
+		p.logInfo(ctx, "search notification skipped",
+			"result_id", notification.ResultID,
+			"schedule_version", notification.ScheduleVersion)
+		return true
 	}
 
 	deadline := time.Now().Add(durationSeconds(task.RemainingSec))
@@ -168,12 +187,12 @@ func (p *Processor) Handle(ctx context.Context, envelope state.SearchEnvelope) b
 	defer cancel()
 
 	var failure error
-	payload, searchErr := p.search(executionContext, envelope, task)
+	payload, searchErr := p.search(executionContext, task)
 	if searchErr != nil {
 		failure = searchErr
 	} else {
 		payload = normalizePayload(payload)
-		payload = p.capture(ctx, envelope, payload)
+		payload = p.capture(ctx, task.Namespace, payload)
 		if _, completeErr := p.tasks.Complete(ctx, task, payload); completeErr != nil {
 			failure = completeErr
 		}
@@ -181,37 +200,46 @@ func (p *Processor) Handle(ctx context.Context, envelope state.SearchEnvelope) b
 
 	if failure != nil {
 		// Completion may have committed before an acknowledgement was lost.
-		if terminal, terminalErr := p.tasks.Terminal(ctx, envelopeValues(envelope)); terminalErr == nil && terminal {
+		if terminal, terminalErr := p.tasks.Terminal(ctx, notification); terminalErr == nil && terminal {
 			return true
 		}
 		retry := p.retryable(failure)
 		cause := "Search execution failed"
-		if _, failErr := p.tasks.Fail(ctx, task, retry, &cause); failErr != nil {
+		applied, failErr := p.tasks.Fail(ctx, task, retry, &cause)
+		if failErr != nil {
+			// The durable retry/terminal transition is not recorded; the
+			// delivery must stay retryable.
 			p.logWarn(ctx, "search failure could not be recorded", logging.ErrorAttrs(failErr)...)
+			return false
+		}
+		if !applied {
+			// Another worker won the lease or the task already advanced.
+			return true
 		}
 		p.logWarn(ctx, "search execution deferred",
 			append([]any{"retry", retry}, logging.ErrorAttrs(failure)...)...)
+		return true
 	}
-	return p.terminalOrNack(ctx, envelope)
+	return true
 }
 
-// search converts the durable envelope arguments into the validated contract
-// and runs the injected retrieval.
-func (p *Processor) search(ctx context.Context, envelope state.SearchEnvelope, task *state.SearchTask) (map[string]any, error) {
+// search converts the committed task arguments into the validated contract and
+// runs the injected retrieval.
+func (p *Processor) search(ctx context.Context, task *state.SearchTask) (map[string]any, error) {
 	request, err := contracts.SearchRequestFromArguments(normalizeArguments(task.Arguments))
 	if err != nil {
 		return nil, err
 	}
-	return p.searcher.Search(ctx, envelope.Namespace, request)
+	return p.searcher.Search(ctx, task.Namespace, request)
 }
 
 // normalizeArguments restores Python's integer typing for JSON numbers.
 //
-// The state (search_tasks.go scanSearchTask) and mq (DecodeSearchEnvelope)
-// decoders keep integer tokens as json.Number, which the contract validator
-// accepts; this is defence in depth for envelopes built in process or decoded by
-// an older producer that still yield float64 for candidate_k/top_k. Python's
-// json module preserves ints, so an integral float64 carries the same wire value.
+// The state (search_tasks.go scanSearchTask) decoder keeps integer tokens as
+// json.Number, which the contract validator accepts; this is defence in depth
+// for arguments built in process or decoded by an older producer that still
+// yield float64 for candidate_k/top_k. Python's json module preserves ints, so
+// an integral float64 carries the same wire value.
 func normalizeArguments(arguments map[string]any) map[string]any {
 	if len(arguments) == 0 {
 		return arguments
@@ -257,11 +285,11 @@ func normalizePayload(payload map[string]any) map[string]any {
 // capture projects artifacts onto the payload with saveSnapshot=false. Capture
 // failures never discard retrieval results (the searchrefs seam is already
 // failure tolerant; this is a second safety net).
-func (p *Processor) capture(ctx context.Context, envelope state.SearchEnvelope, payload map[string]any) map[string]any {
+func (p *Processor) capture(ctx context.Context, namespace string, payload map[string]any) map[string]any {
 	if p.capturer == nil {
 		return payload
 	}
-	enriched, err := p.capturer.Capture(ctx, envelope.Namespace, payload, false)
+	enriched, err := p.capturer.Capture(ctx, namespace, payload, false)
 	if err != nil {
 		p.logWarn(ctx, "search reference capture unavailable", logging.ErrorAttrs(err)...)
 		return payload
@@ -269,52 +297,33 @@ func (p *Processor) capture(ctx context.Context, envelope state.SearchEnvelope, 
 	return enriched
 }
 
-func (p *Processor) terminalOrNack(ctx context.Context, envelope state.SearchEnvelope) bool {
-	terminal, err := p.tasks.Terminal(ctx, envelopeValues(envelope))
-	if err != nil {
-		p.logWarn(ctx, "search terminal state unavailable", logging.ErrorAttrs(err)...)
-		return false
-	}
-	return terminal
-}
-
-// envelopeValues renders the durable envelope as the validated map shape the
-// state machine Terminal/DeadLetter helpers accept (they compare namespace).
-func envelopeValues(envelope state.SearchEnvelope) map[string]any {
-	return map[string]any{
-		"schema":     float64(envelope.Schema),
-		"result_id":  envelope.ResultID,
-		"namespace":  envelope.Namespace,
-		"arguments":  envelope.Arguments,
-		"created_at": envelope.CreatedAt,
-		"expires_at": envelope.ExpiresAt,
-		"deadline":   envelope.Deadline,
-	}
-}
-
-// MessageHandler adapts the processor to mq.PullConsumer: malformed payloads are
-// nacked so the broker retry/DLQ policy applies, exactly like the Python
-// queue's validate-before-callback behaviour.
+// MessageHandler adapts the processor to mq.PullConsumer. The decoder accepts
+// both the native schema-3 envelope and raw Debezium search_tasks records.
+// Records that are not business changes are acked without retries; malformed
+// payloads are nacked so the broker retry/DLQ policy applies.
 func (p *Processor) MessageHandler() mq.Handler {
 	return func(ctx context.Context, message mq.ReceivedMessage) bool {
-		envelope, err := mq.DecodeSearchEnvelope(message.Body)
+		notification, err := mq.DecodeSearchNotification(message.Body)
 		if err != nil {
+			if state.IgnorableCDCChange(err) {
+				return true
+			}
 			p.logWarn(ctx, "malformed search message ignored", logging.ErrorAttrs(err)...)
 			return false
 		}
-		return p.Handle(ctx, envelope)
+		return p.Handle(ctx, notification)
 	}
 }
 
 // DeadLetter records broker retry exhaustion as a durable terminal state.
-func (p *Processor) DeadLetter(ctx context.Context, envelope state.SearchEnvelope) (bool, error) {
-	if envelope.ResultID != "" {
-		ctx = logging.With(ctx, "result_id", envelope.ResultID)
+func (p *Processor) DeadLetter(ctx context.Context, notification state.SearchNotification) (bool, error) {
+	if notification.ResultID != "" {
+		ctx = logging.With(ctx, "result_id", notification.ResultID)
 	}
-	if envelope.Namespace != "" {
-		ctx = logging.WithNamespace(ctx, envelope.Namespace)
+	if notification.Namespace != "" {
+		ctx = logging.WithNamespace(ctx, notification.Namespace)
 	}
-	complete, err := p.tasks.DeadLetter(ctx, envelopeValues(envelope))
+	complete, err := p.tasks.DeadLetter(ctx, notification)
 	if err != nil {
 		p.logWarn(ctx, "search dead-letter failed", logging.ErrorAttrs(err)...)
 		return false, err
@@ -327,12 +336,15 @@ func (p *Processor) DeadLetter(ctx context.Context, envelope state.SearchEnvelop
 
 // DeadLetterMessage decodes one dead-letter delivery and records it.
 func (p *Processor) DeadLetterMessage(ctx context.Context, message mq.ReceivedMessage) (bool, error) {
-	envelope, err := mq.DecodeSearchEnvelope(message.Body)
+	notification, err := mq.DecodeSearchNotification(message.Body)
 	if err != nil {
+		if state.IgnorableCDCChange(err) {
+			return true, nil
+		}
 		p.logWarn(ctx, "malformed search dead-letter message ignored", logging.ErrorAttrs(err)...)
 		return false, nil
 	}
-	return p.DeadLetter(ctx, envelope)
+	return p.DeadLetter(ctx, notification)
 }
 
 // DeadLetterHandler adapts DeadLetterMessage to mq.PullConsumer.
@@ -352,7 +364,7 @@ func (p *Processor) ExhaustedHandler() func(ctx context.Context, message mq.Rece
 	}
 }
 
-// RunOnce drains up to BatchSize envelopes from the configured Receiver and
+// RunOnce drains up to BatchSize notifications from the configured Receiver and
 // returns how many were handled. Without a Receiver it is a no-op.
 func (p *Processor) RunOnce(ctx context.Context) (int, error) {
 	if p.receiver == nil {
@@ -363,14 +375,14 @@ func (p *Processor) RunOnce(ctx context.Context) (int, error) {
 		if err := ctx.Err(); err != nil {
 			return processed, nil
 		}
-		envelope, ok, err := p.receiver.Receive(ctx)
+		notification, ok, err := p.receiver.Receive(ctx)
 		if err != nil {
 			return processed, err
 		}
 		if !ok {
 			break
 		}
-		p.Handle(ctx, envelope)
+		p.Handle(ctx, notification)
 		processed++
 	}
 	return processed, nil

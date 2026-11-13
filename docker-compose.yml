@@ -17,8 +17,11 @@ services:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_bin
       - --max-allowed-packet=64M
-      # Required by the Debezium bridge: row-based binlog with full before/after
-      # images. Debezium uses the binlog to deliver document outbox events.
+      # Required by both Debezium connectors: row-based binlog with full
+      # before/after images. The task connector only publishes the captured
+      # locator columns, but binlog-row-image=FULL is still required: it gives
+      # Debezium the before image it needs for UPDATE detection and for the
+      # cache connector's delete (before-image-only) events.
       - --log-bin=mysql-bin
       - --binlog-format=ROW
       - --binlog-row-image=FULL
@@ -104,11 +107,12 @@ services:
       retries: 30
       start_period: 20s
 
-  # Document CDC bridge: tails the MySQL binlog of the transactional outbox
-  # table and publishes each committed notification to Kafka with the native
-  # Debezium Kafka sink. Enable with
-  #   docker compose up -d
-  # Required for Kafka document delivery. See deploy/debezium/README.md.
+  # Task CDC connector: tails the MySQL binlog of document_jobs/search_tasks and
+  # publishes identifier-only notifications to Kafka with the native Debezium
+  # Kafka sink. Connection-level filtering (captured columns +
+  # skip.messages.without.change + skipped.operations) delivers only INSERTs and
+  # schedule_version bumps. Enable with `docker compose up -d`.
+  # See deploy/debezium/README.md.
   debezium:
     image: ${DEBEZIUM_IMAGE:-quay.io/debezium/server:3.7.1.Final}
     container_name: praxis-rag-debezium
@@ -127,8 +131,11 @@ services:
       # Container-internal bootstrap address. The host-facing value in .env is
       # 127.0.0.1:9092; do not pass it into Debezium containers.
       RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
-      # SMT target topic; must match the app-side RAG_DOCUMENT_TOPIC.
+      # SMT target topics; must match the app-side RAG_DOCUMENT_TOPIC /
+      # RAG_SEARCH_TOPIC. The two ByLogicalTableRouter transforms in
+      # application.properties route document_jobs and search_tasks separately.
       RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
+      RAG_SEARCH_TOPIC: ${RAG_SEARCH_TOPIC:-praxis_search}
       DEBEZIUM_SERVER_ID: ${DEBEZIUM_SERVER_ID:-184054}
       QUARKUS_LOG_LEVEL: ${DEBEZIUM_LOG_LEVEL:-INFO}
     ports:
@@ -138,7 +145,45 @@ services:
     volumes:
       # Debezium Server reads its config from /debezium/config (not /debezium/conf).
       - ./deploy/debezium/application.properties:/debezium/config/application.properties:ro
+      # Dedicated offset/schema-history volume: the task connector must resume
+      # from its own binlog position, never the cache connector's.
       - debezium_data:/debezium/data
+
+  # Cache CDC connector: same MySQL, same Debezium image, but captures every
+  # create/update/delete of the business tables that feed the Redis read model
+  # and routes them to RAG_CACHE_TOPIC. Kept as a SEPARATE server instance
+  # because skipped.operations / skip.messages.without.change are
+  # connector-level settings that cannot differ per table (see
+  # docs/cdc-migration.md §4.4). It needs its own database.server.id,
+  # offset/schema-history volume and loopback health port.
+  debezium-cache:
+    image: ${DEBEZIUM_IMAGE:-quay.io/debezium/server:3.7.1.Final}
+    container_name: praxis-rag-debezium-cache
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      RAG_MYSQL_HOST: mysql
+      RAG_MYSQL_PORT: "3306"
+      RAG_MYSQL_USER: ${RAG_MYSQL_DEBEZIUM_USER:-debezium}
+      RAG_MYSQL_PASSWORD: ${RAG_MYSQL_DEBEZIUM_PASSWORD:?set RAG_MYSQL_DEBEZIUM_PASSWORD in .env}
+      RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
+      RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      # SMT target topic; must match the app-side RAG_CACHE_TOPIC.
+      RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
+      # Distinct binlog replication identity from the task connector.
+      DEBEZIUM_CACHE_SERVER_ID: ${DEBEZIUM_CACHE_SERVER_ID:-184055}
+      QUARKUS_LOG_LEVEL: ${DEBEZIUM_LOG_LEVEL:-INFO}
+    ports:
+      # Loopback-only Quarkus health endpoint for the Console monitor. 8084
+      # keeps it distinct from the task connector's 8083.
+      - "127.0.0.1:${RAG_DEBEZIUM_CACHE_PORT:-8084}:8080"
+    volumes:
+      - ./deploy/debezium/application-cache.properties:/debezium/config/application.properties:ro
+      - debezium_cache_data:/debezium/data
 
   # PDF parsing microservice: PyMuPDF reads/renders/crops the PDF locally and
   # delegates layout, OCR, tables, formulas and picture descriptions to one
@@ -228,6 +273,8 @@ services:
         condition: service_started
       debezium:
         condition: service_started
+      debezium-cache:
+        condition: service_started
     environment:
       RAG_SERVICE_TOKEN: ${RAG_SERVICE_TOKEN:-}
       RAG_SERVICE_HOST: "0.0.0.0"
@@ -245,10 +292,12 @@ services:
       RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
       RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
       RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
-      # Optional read-only Debezium health probe for the Console monitor. It only
-      # proves the connector process is up; the binlog capture offset lives in
-      # Debezium, so the page still reports capture progress as 未知.
+      # Optional read-only Debezium health probes for the Console monitor: one
+      # per connector (tasks/cache). They only prove the connector process is
+      # up; the binlog capture offset lives in Debezium, so the page still
+      # reports capture progress as 未知.
       RAG_DEBEZIUM_HEALTH_URL: ${RAG_APP_DEBEZIUM_HEALTH_URL:-http://debezium:8080/q/health}
+      RAG_DEBEZIUM_CACHE_HEALTH_URL: ${RAG_APP_DEBEZIUM_CACHE_HEALTH_URL:-http://debezium-cache:8080/q/health}
       # PDF parsing: the default vision engine calls the pdf-parser sidecar
       # over HTTP (zip manifest + assets); the sidecar delegates layout/OCR/
       # tables/formulas/pictures to the knowledge base's remote VLM. Set
@@ -265,8 +314,10 @@ services:
       RAG_SEARCH_GROUP: ${RAG_SEARCH_GROUP:-praxis_search_workers}
       RAG_DOCUMENT_DLQ_TOPIC: ${RAG_DOCUMENT_DLQ_TOPIC:-praxis_document_ingest_dead_letters}
       RAG_SEARCH_DLQ_TOPIC: ${RAG_SEARCH_DLQ_TOPIC:-praxis_search_dead_letters}
+      RAG_CACHE_DLQ_TOPIC: ${RAG_CACHE_DLQ_TOPIC:-praxis_state_cache_refresh_dead_letters}
       RAG_DOCUMENT_DLQ_GROUP: ${RAG_DOCUMENT_DLQ_GROUP:-praxis_document_dead_letters}
       RAG_SEARCH_DLQ_GROUP: ${RAG_SEARCH_DLQ_GROUP:-praxis_search_dead_letters}
+      RAG_CACHE_DLQ_GROUP: ${RAG_CACHE_DLQ_GROUP:-praxis_state_cache_refresh_dead_letters}
       RAG_MCP_ALLOWED_HOSTS: ${RAG_MCP_ALLOWED_HOSTS:-127.0.0.1,127.0.0.1:*,localhost,localhost:*}
       RAG_MCP_ALLOWED_ORIGINS: ${RAG_MCP_ALLOWED_ORIGINS:-http://127.0.0.1,http://127.0.0.1:*,http://localhost,http://localhost:*}
     ports:
@@ -279,6 +330,46 @@ services:
       timeout: 5s
       start_period: 20s
       retries: 3
+
+  # Cache read-model consumer: consumes RAG_CACHE_TOPIC (Debezium cache connector
+  # events), bumps the MySQL cache revision and rebuilds/invalidate the Redis
+  # views. Runs as its own process and consumer group, so it never competes with
+  # rag-service for the request path. Started with the app profile; the entrypoint
+  # overrides the image default (/app/bin/rag-service).
+  rag-cache-worker:
+    image: ${RAG_APP_IMAGE:-praxis-rag:local}
+    container_name: praxis-rag-cache-worker
+    restart: unless-stopped
+    profiles: ["app"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      debezium-cache:
+        condition: service_started
+    entrypoint: ["/app/bin/rag-cache-worker"]
+    environment:
+      RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-info}
+      RAG_LOG_FORMAT: ${RAG_LOG_FORMAT:-text}
+      RAG_DEBUG_TRACE: ${RAG_DEBUG_TRACE:-false}
+      RAG_MYSQL_HOST: ${RAG_APP_MYSQL_HOST:-mysql}
+      RAG_MYSQL_PORT: "3306"
+      RAG_MYSQL_USER: ${RAG_MYSQL_USER:-rag}
+      RAG_MYSQL_PASSWORD: ${RAG_MYSQL_PASSWORD:-}
+      RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
+      RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
+      RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      # The cache worker rebuilds the Redis read model; without Redis it can
+      # only bump revisions, so the compose deployment enables the service.
+      RAG_REDIS_ENABLED: ${RAG_REDIS_ENABLED:-true}
+      RAG_REDIS_URL: ${RAG_APP_REDIS_URL:-redis://redis:6379/0}
+      RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
+      RAG_CACHE_GROUP: ${RAG_CACHE_GROUP:-praxis_state_cache_refresh_workers}
+      RAG_CACHE_DLQ_TOPIC: ${RAG_CACHE_DLQ_TOPIC:-praxis_state_cache_refresh_dead_letters}
+      RAG_CACHE_DLQ_GROUP: ${RAG_CACHE_DLQ_GROUP:-praxis_state_cache_refresh_dead_letters}
 volumes:
   kafka_data:
   mysql_data:
@@ -286,3 +377,4 @@ volumes:
   qdrant_data:
   redis_data:
   debezium_data:
+  debezium_cache_data:

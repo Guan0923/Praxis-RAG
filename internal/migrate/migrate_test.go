@@ -201,6 +201,49 @@ func newMigrateStores(t *testing.T) *state.Stores {
 	return stores
 }
 
+// TestRetireOutboxIsIdempotentAndScoped recreates the retired outbox tables in
+// the disposable schema and asserts the explicit retirement step drops exactly
+// those tables, twice, leaving every active table intact.
+func TestRetireOutboxIsIdempotentAndScoped(t *testing.T) {
+	stores := newMigrateStores(t)
+	ctx := context.Background()
+	for _, table := range RetiredOutboxTables {
+		if _, err := stores.DB.ExecContext(ctx,
+			"CREATE TABLE IF NOT EXISTS `"+table+"` (id VARCHAR(32) PRIMARY KEY)"); err != nil {
+			t.Fatalf("creating legacy table %s: %v", table, err)
+		}
+	}
+	present, err := OutboxTablesPresent(ctx, stores)
+	if err != nil || len(present) != len(RetiredOutboxTables) {
+		t.Fatalf("OutboxTablesPresent() = %v, %v", present, err)
+	}
+	retirement, err := RetireOutbox(ctx, stores)
+	if err != nil {
+		t.Fatalf("RetireOutbox() error = %v", err)
+	}
+	if len(retirement.Dropped) != len(RetiredOutboxTables) || len(retirement.Missing) != 0 {
+		t.Fatalf("first retirement = %+v", retirement)
+	}
+	if present, err := OutboxTablesPresent(ctx, stores); err != nil || len(present) != 0 {
+		t.Fatalf("tables after retirement = %v, %v", present, err)
+	}
+	retirement, err = RetireOutbox(ctx, stores)
+	if err != nil || len(retirement.Dropped) != 0 || len(retirement.Missing) != len(RetiredOutboxTables) {
+		t.Fatalf("second retirement = %+v, %v", retirement, err)
+	}
+	// Only the outbox tables were dropped: the active source-of-truth tables
+	// still exist.
+	for _, table := range []string{
+		"document_jobs", "search_tasks", "search_result_snapshots", "document_tasks",
+		"cache_revisions", "cdc_cutover_state",
+	} {
+		exists, err := retireTableExists(ctx, stores.DB, table)
+		if err != nil || !exists {
+			t.Fatalf("active table %q exists = %v, %v", table, exists, err)
+		}
+	}
+}
+
 func containsWarning(warnings []string, substring string) bool {
 	for _, warning := range warnings {
 		if len(warning) >= len(substring) && (warning == substring || len(substring) == 0 ||

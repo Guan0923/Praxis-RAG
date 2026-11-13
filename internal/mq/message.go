@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -13,161 +14,202 @@ import (
 // lookupEnv is a test seam for environment reads.
 var lookupEnv = os.LookupEnv
 
-// EncodeDocumentNotification renders the exact schema-3 identifiers-only JSON
-// payload: {"schema":3,"artifact_id":...,"namespace":...,"name":...,"created_at":...}.
-// The payload is validated through internal/state so producer and state agree.
-func EncodeDocumentNotification(notification state.DocumentNotification) ([]byte, string, error) {
-	validated, err := state.ValidateDocumentNotification(map[string]any{
-		"schema":      float64(notification.Schema),
-		"artifact_id": notification.ArtifactID,
-		"namespace":   notification.Namespace,
-		"name":        notification.Name,
-		"created_at":  notification.CreatedAt,
-	})
-	if err != nil {
-		return nil, "", newSafeError(ErrPayloadInvalid, "encode document notification", err)
-	}
-	body, err := json.Marshal(validated)
-	if err != nil {
-		return nil, "", newSafeError(ErrPayloadInvalid, "encode document notification", err)
-	}
-	return body, validated.ArtifactID, nil
-}
+// cacheChangeSchema is the logical schema version of the cache change event
+// (docs/cdc-migration.md §2.3). It only exists in hand-published/test messages;
+// the physical Debezium event carries before/after/op/source without a schema key.
+const cacheChangeSchema = 1
 
-// DecodeDocumentNotification parses a native schema-3 notification or a raw
-// Debezium change event (consumers tolerate both, exactly like the Python worker).
+// DecodeDocumentNotification decodes one document-task topic payload.
+//
+// It accepts both message shapes a deployment can contain:
+//   - the application-native schema-4 envelope:
+//     {"schema":4,"artifact_id":...,"namespace":...,"schedule_version":...}
+//   - the raw Debezium JSON change event of document_jobs
+//     (schemas.enable=false, so before/after/op/source are top-level).
+//
+// Debezium only publishes INSERTs and schedule_version bumps for that table;
+// op r/c/u are accepted. A delete (op=d), a tombstone (null/empty Kafka value)
+// and a before-image-only record are not job work: they return
+// state.ErrIgnorableCDCChange and callers ACK them without retry or dead letter.
+// A genuinely malformed payload returns an ErrPayloadInvalid-wrapped error, so
+// the broker retry/dead-letter policy keeps applying to real poison messages.
 func DecodeDocumentNotification(body []byte) (state.DocumentNotification, error) {
-	var payload any
-	if err := json.Unmarshal(body, &payload); err != nil {
+	payload, err := decodeCDCPayload(body)
+	if err != nil {
 		return state.DocumentNotification{}, newSafeError(ErrPayloadInvalid, "decode document notification", err)
 	}
 	notification, err := state.ValidateDocumentNotification(payload)
 	if err != nil {
+		if state.IgnorableCDCChange(err) {
+			return state.DocumentNotification{}, err
+		}
 		return state.DocumentNotification{}, newSafeError(ErrPayloadInvalid, "decode document notification", err)
 	}
 	return notification, nil
 }
 
-// DocumentMessageKind classifies one payload from the document topic.
+// DecodeSearchNotification decodes one search-task topic payload.
 //
-// Debezium tails document_job_outbox, not only document_jobs: routine outbox
-// retention cleanup (state.DocumentJobs.GCOutbox) deletes expired rows from that
-// table too, and binlog row-image FULL publishes those DELETEs on the same
-// topic. Such records carry no job work, so consumers must acknowledge them
-// instead of retrying and dead-lettering them like a poisoned notification.
-type DocumentMessageKind int
-
-const (
-	// DocumentMessageJob is a document job notification: the native schema-3
-	// envelope or a Debezium insert/read/update (op c/r/u) envelope. It must be
-	// processed by the document worker's normal Claim/ingest path.
-	DocumentMessageJob DocumentMessageKind = iota
-	// DocumentMessageOutboxDeletion is a routine outbox-retention deletion:
-	// a Debezium delete event (op "d", or a before-image-only envelope), the
-	// Debezium Server tombstone (null/empty Kafka value), or a JSON null body.
-	// It must be acknowledged and must never change a document job.
-	DocumentMessageOutboxDeletion
-)
-
-// DecodeDocumentMessage classifies one document-topic payload and decodes it
-// when it is a job notification.
-//
-// Deletion records return the zero state.DocumentNotification, a nil error and
-// DocumentMessageOutboxDeletion; callers acknowledge them without retries or
-// dead letters. Genuinely malformed payloads stay DocumentMessageJob with an
-// ErrPayloadInvalid-wrapped error so the broker retry/dead-letter policy keeps
-// applying to real poison messages.
-func DecodeDocumentMessage(body []byte) (state.DocumentNotification, DocumentMessageKind, error) {
-	if isOutboxDeletionRecord(body) {
-		return state.DocumentNotification{}, DocumentMessageOutboxDeletion, nil
-	}
-	notification, err := DecodeDocumentNotification(body)
+// It accepts the application-native schema-3 envelope
+// {"schema":3,"result_id":...,"namespace":...,"schedule_version":...} and the
+// raw Debezium JSON change event of search_tasks. The ignorable/invalid rules
+// are identical to DecodeDocumentNotification.
+func DecodeSearchNotification(body []byte) (state.SearchNotification, error) {
+	payload, err := decodeCDCPayload(body)
 	if err != nil {
-		return state.DocumentNotification{}, DocumentMessageJob, err
+		return state.SearchNotification{}, newSafeError(ErrPayloadInvalid, "decode search notification", err)
 	}
-	return notification, DocumentMessageJob, nil
+	notification, err := state.ValidateSearchNotification(payload)
+	if err != nil {
+		if state.IgnorableCDCChange(err) {
+			return state.SearchNotification{}, err
+		}
+		return state.SearchNotification{}, newSafeError(ErrPayloadInvalid, "decode search notification", err)
+	}
+	return notification, nil
 }
 
-// isOutboxDeletionRecord reports whether one payload is a routine outbox
-// deletion rather than a job notification. It accepts:
-//   - an empty/whitespace body, i.e. Debezium's null-value tombstone;
-//   - the JSON literal null (tombstone with a non-empty value);
-//   - a Debezium delete envelope carrying "op":"d" (with or without before);
-//   - a before-image-only envelope (after null or absent, before an object),
-//     which covers sinks or transformations that drop the op field.
+// CacheChange is one cache read-model change derived from a Debezium event.
 //
-// Malformed JSON and non-object JSON values are not deletions: they must keep
-// the existing invalid-payload behaviour (nack, broker retry, dead letter).
-func isOutboxDeletionRecord(body []byte) bool {
-	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == 0 {
-		return true
-	}
-	var payload any
-	if err := json.Unmarshal(trimmed, &payload); err != nil {
-		return false
+// Before/After only ever contain the locator columns declared in
+// deploy/debezium/application-cache.properties (never file bytes, query text,
+// KB settings, catalog data or credentials). Op is the Debezium operation:
+// c (create), u (update), r (initial-snapshot read) or d (delete).
+type CacheChange struct {
+	Table  string         `json:"table"`
+	Op     string         `json:"op"`
+	Before map[string]any `json:"before,omitempty"`
+	After  map[string]any `json:"after,omitempty"`
+}
+
+// cacheLocator is one captured locator column of a cache-relevant table.
+// nullable columns may legitimately be JSON null / absent.
+type cacheLocator struct {
+	column   string
+	nullable bool
+}
+
+// cacheChangeLocators is the whitelist of tables and locator columns the cache
+// connector captures (docs/cdc-migration.md §7.1). Any table or column outside
+// this map is ignored by DecodeCacheChange, so a misconfigured connector cannot
+// leak unrelated data into the cache consumer.
+var cacheChangeLocators = map[string][]cacheLocator{
+	"knowledge_bases":   {{column: "namespace"}, {column: "version"}},
+	"documents":         {{column: "namespace"}, {column: "name"}, {column: "document_id"}, {column: "del_flag"}},
+	"mcp_catalogs":      {{column: "namespace"}},
+	"api_keys":          {{column: "id"}, {column: "owner_user_id", nullable: true}, {column: "enabled"}},
+	"document_heads":    {{column: "namespace"}, {column: "document_id"}, {column: "version"}},
+	"document_leases":   {{column: "namespace"}, {column: "resource"}, {column: "owner"}, {column: "operation_id", nullable: true}},
+	"upload_operations": {{column: "id"}, {column: "namespace"}, {column: "name"}, {column: "status"}},
+	"upload_steps":      {{column: "operation_id"}, {column: "name"}, {column: "status"}},
+}
+
+// DecodeCacheChange decodes one cache-topic payload.
+//
+// It accepts the raw Debezium JSON change event of any table captured by the
+// cache connector, and the application-native schema-1 envelope
+// {"schema":1,"table":...,"op":...,"before":...,"after":...} (tests and manual
+// replay). Tombstones, delete-only shapes that carry no before image, DDL
+// synthetic records and tables outside the whitelist return
+// state.ErrIgnorableCDCChange (ACK without retry). Malformed payloads and known
+// tables whose locator columns are missing return ErrPayloadInvalid (nack).
+func DecodeCacheChange(body []byte) (CacheChange, error) {
+	payload, err := decodeCDCPayload(body)
+	if err != nil {
+		return CacheChange{}, newSafeError(ErrPayloadInvalid, "decode cache change", err)
 	}
 	if payload == nil {
-		// json.Unmarshal maps the JSON literal null to a nil interface value.
-		return true
+		// JSON null value: a Kafka tombstone.
+		return CacheChange{}, state.ErrIgnorableCDCChange
 	}
-	envelope, ok := payload.(map[string]any)
+	object, ok := payload.(map[string]any)
 	if !ok {
-		return false
+		return CacheChange{}, newSafeError(ErrPayloadInvalid, "decode cache change",
+			errors.New("cache change must be a JSON object"))
 	}
-	if op, present := envelope["op"].(string); present && op == "d" {
-		return true
+
+	var (
+		table     string
+		op        string
+		beforeRaw any
+		afterRaw  any
+	)
+	if _, native := object["schema"]; native {
+		schema, ok := integerField(object["schema"])
+		if !ok || schema != cacheChangeSchema {
+			return CacheChange{}, newSafeError(ErrPayloadInvalid, "decode cache change",
+				errors.New("invalid cache change schema"))
+		}
+		table, _ = object["table"].(string)
+		op, _ = object["op"].(string)
+		beforeRaw = object["before"]
+		afterRaw = object["after"]
+	} else {
+		op, _ = object["op"].(string)
+		beforeRaw = object["before"]
+		afterRaw = object["after"]
+		if source, ok := object["source"].(map[string]any); ok {
+			table, _ = source["table"].(string)
+		}
 	}
-	// A non-null object before image with no after image means the row was
-	// removed, regardless of whether the sink preserved the op field.
-	if _, hasBefore := envelope["before"].(map[string]any); !hasBefore {
-		return false
+
+	table = bareTableName(table)
+	if table == "" || op == "" {
+		// Debezium schema-change/DDL synthetic records carry no per-row image.
+		return CacheChange{}, state.ErrIgnorableCDCChange
 	}
-	after, hasAfter := envelope["after"]
-	return !hasAfter || after == nil
+	locators, known := cacheChangeLocators[table]
+	if !known {
+		return CacheChange{}, state.ErrIgnorableCDCChange
+	}
+
+	switch op {
+	case "d":
+		before, ok := beforeRaw.(map[string]any)
+		if !ok {
+			// A delete without a before image cannot locate the cache key.
+			return CacheChange{}, newSafeError(ErrPayloadInvalid, "decode cache change",
+				errors.New("delete change is missing the before image"))
+		}
+		change := CacheChange{Table: table, Op: op, Before: filterLocators(before, locators)}
+		if err := requireLocators(change.Before, locators); err != nil {
+			return CacheChange{}, newSafeError(ErrPayloadInvalid, "decode cache change", err)
+		}
+		return change, nil
+	case "c", "u", "r":
+		after, ok := afterRaw.(map[string]any)
+		if !ok {
+			return CacheChange{}, newSafeError(ErrPayloadInvalid, "decode cache change",
+				errors.New("change is missing the after image"))
+		}
+		change := CacheChange{Table: table, Op: op, After: filterLocators(after, locators)}
+		if before, ok := beforeRaw.(map[string]any); ok {
+			change.Before = filterLocators(before, locators)
+		}
+		if err := requireLocators(change.After, locators); err != nil {
+			return CacheChange{}, newSafeError(ErrPayloadInvalid, "decode cache change", err)
+		}
+		return change, nil
+	case "t":
+		// TRUNCATE: the consumer cannot map it to a concrete cache key.
+		return CacheChange{}, state.ErrIgnorableCDCChange
+	default:
+		return CacheChange{}, newSafeError(ErrPayloadInvalid, "decode cache change",
+			errors.New("unsupported CDC operation"))
+	}
 }
 
-// EncodeSearchEnvelope renders the exact schema-2 full-request JSON payload.
-func EncodeSearchEnvelope(envelope state.SearchEnvelope) ([]byte, string, error) {
-	validated, err := state.ValidateSearchEnvelope(map[string]any{
-		"schema":     float64(envelope.Schema),
-		"result_id":  envelope.ResultID,
-		"namespace":  envelope.Namespace,
-		"arguments":  envelope.Arguments,
-		"created_at": envelope.CreatedAt,
-		"expires_at": envelope.ExpiresAt,
-		"deadline":   envelope.Deadline,
-	})
-	if err != nil {
-		return nil, "", newSafeError(ErrPayloadInvalid, "encode search envelope", err)
+// decodeCDCPayload decodes exactly one JSON value, keeping numbers as
+// json.Number (the state validators accept that form and range-check it).
+//
+// An empty/whitespace body and the JSON literal null both mean "tombstone" and
+// return (nil, nil); callers turn that into a state.ErrIgnorableCDCChange.
+func decodeCDCPayload(body []byte) (any, error) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return nil, nil
 	}
-	body, err := json.Marshal(validated)
-	if err != nil {
-		return nil, "", newSafeError(ErrPayloadInvalid, "encode search envelope", err)
-	}
-	return body, validated.ResultID, nil
-}
-
-// DecodeSearchEnvelope parses and re-validates a schema-2 request envelope.
-func DecodeSearchEnvelope(body []byte) (state.SearchEnvelope, error) {
-	payload, err := decodePayloadUseNumber(body)
-	if err != nil {
-		return state.SearchEnvelope{}, newSafeError(ErrPayloadInvalid, "decode search envelope", err)
-	}
-	envelope, err := state.ValidateSearchEnvelope(payload)
-	if err != nil {
-		return state.SearchEnvelope{}, newSafeError(ErrPayloadInvalid, "decode search envelope", err)
-	}
-	return envelope, nil
-}
-
-// decodePayloadUseNumber decodes exactly one JSON value while keeping every
-// number as json.Number. Python's json module preserves ints, and the queued
-// search contract validates candidate_k/top_k as integers; plain json.Unmarshal
-// would yield float64 and break broker round-trips (the MCP/httpapi decoders use
-// json.Decoder.UseNumber for the same reason).
-func decodePayloadUseNumber(body []byte) (any, error) {
-	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
 	decoder.UseNumber()
 	var payload any
 	if err := decoder.Decode(&payload); err != nil {
@@ -181,4 +223,63 @@ func decodePayloadUseNumber(body []byte) (any, error) {
 		return nil, err
 	}
 	return payload, nil
+}
+
+// bareTableName strips an optional schema prefix ("praxis_rag.documents") from
+// a Debezium source table name so the whitelist matches the bare table.
+func bareTableName(table string) string {
+	table = strings.TrimSpace(table)
+	if index := strings.LastIndex(table, "."); index >= 0 {
+		table = table[index+1:]
+	}
+	return table
+}
+
+// filterLocators keeps only the whitelisted locator columns of one row image.
+func filterLocators(image map[string]any, locators []cacheLocator) map[string]any {
+	filtered := make(map[string]any, len(locators))
+	for _, locator := range locators {
+		if value, present := image[locator.column]; present {
+			filtered[locator.column] = value
+		}
+	}
+	return filtered
+}
+
+// requireLocators rejects a change whose non-nullable locator columns are
+// missing: the consumer could not address the affected cache key.
+func requireLocators(image map[string]any, locators []cacheLocator) error {
+	for _, locator := range locators {
+		if locator.nullable {
+			continue
+		}
+		if _, present := image[locator.column]; !present {
+			return errors.New("cache change is missing locator column " + locator.column)
+		}
+	}
+	return nil
+}
+
+// integerField normalizes a JSON-decoded integer field (float64, json.Number or
+// an integral Go int) for the logical schema check.
+func integerField(value any) (int, bool) {
+	switch typed := value.(type) {
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(parsed), true
+	case float64:
+		if typed != float64(int(typed)) {
+			return 0, false
+		}
+		return int(typed), true
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	default:
+		return 0, false
+	}
 }

@@ -17,7 +17,8 @@
 | 向量/检索 | `RAG_BACKEND`（服务必须设 `qdrant`）、`QDRANT_URL`、`RAG_COLLECTION`、`RAG_DENSE_VECTOR_SIZE`（1024）、`RAG_EMBEDDING_MODEL`、`RAG_RERANKER_*` |
 | Redis | `RAG_REDIS_URL`、`RAG_REDIS_ENABLED`、`RAG_REDIS_PREFIX`、`RAG_RESULT_TTL_SECONDS`（3600）、`RAG_RESULT_MAX_BYTES`、`RAG_ARTIFACT_MAX_BYTES` |
 | Kafka | `RAG_KAFKA_BOOTSTRAP_SERVERS`、`RAG_KAFKA_SECURITY_PROTOCOL`、`RAG_KAFKA_SASL_*`、`RAG_KAFKA_TLS_*`、`RAG_*_TOPIC`/`RAG_*_GROUP`、`RAG_*_DLQ_TOPIC`、`RAG_DOCUMENT_WORKER_CONCURRENCY`/`RAG_SEARCH_WORKER_CONCURRENCY`（默认 `1`） |
-| 文档投递/监控 | `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS`（默认 604800）、`RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS`（默认 5）、`RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS`（Worker 心跳间隔，默认 15；监控页 60 秒无心跳判降级）、`RAG_DEBEZIUM_HEALTH_URL`（可选只读健康探测；采集位点不可读，监控显示「未知」）、`RAG_APP_DEBEZIUM_HEALTH_URL`（compose app profile 覆盖用）、`RAG_DEBEZIUM_PORT`（宿主机健康端口，默认 8083） |
+| 文档投递/监控 | `RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS`（默认 5）、`RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS`（Worker 心跳间隔，默认 15；监控页 60 秒无心跳判降级）、`RAG_DEBEZIUM_HEALTH_URL`（任务连接器只读健康探测）、`RAG_DEBEZIUM_CACHE_HEALTH_URL`（缓存连接器只读健康探测）、`RAG_APP_DEBEZIUM_HEALTH_URL`/`RAG_APP_DEBEZIUM_CACHE_HEALTH_URL`（compose app profile 覆盖用）、`RAG_DEBEZIUM_PORT`/`RAG_DEBEZIUM_CACHE_PORT`（宿主机健康端口，默认 8083/8084）；采集位点应用侧读不到，监控显示「未知」 |
+| 缓存/CDC | `RAG_CACHE_TOPIC`/`RAG_CACHE_GROUP`、`RAG_CACHE_DLQ_TOPIC`/`RAG_CACHE_DLQ_GROUP`；`cache_revisions` 的 revision/refreshed_revision/attempts/last_error/updated_at；任务表 `schedule_version`；`rag-cdc-cutover` 切换工具 |
 | PDF/Word | `RAG_PDF_ENGINE`（`vision`/`go`；旧值 `docling` 是 `vision` 的兼容别名）、`RAG_PDF_SERVICE_URL`、`RAG_PDF_SERVICE_TIMEOUT`（900）、`RAG_WORD_CONVERTER_PATH`、`RAG_WORD_CONVERT_TIMEOUT`；`RAG_PDF_MODELS_PATH` 已废弃（本地无模型） |
 | 日志 | `RAG_LOG_LEVEL`（`info`）、`RAG_LOG_FORMAT`（`text`/`json`）、`RAG_DEBUG_TRACE`（兼容旧调试开关；未设级别时为 `debug`）、`RAG_PDF_SERVICE_LOG_LEVEL`/`RAG_PDF_SERVICE_LOG_FORMAT` |
 | VLM | `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`、`RAG_VLM_TIMEOUT`、`RAG_VLM_CONCURRENCY`（Console 知识库配置优先，环境变量是回退） |
@@ -50,7 +51,9 @@ dist/bin/rag-service(.exe)             REST + MCP + Console
 dist/bin/rag-document-worker(.exe)     异步文档 worker
 dist/bin/rag-search-worker(.exe)       排队搜索 worker
 dist/bin/rag-dead-letter-worker(.exe)  死信 worker
-dist/bin/rag-service-migrate(.exe)     旧知识源迁移（默认预演）
+dist/bin/rag-service-migrate(.exe)     旧知识源迁移（默认预演）/ --retire-outbox 旧表下线
+dist/bin/rag-cdc-cutover(.exe)         CDC 存量切换（盘点/位点/补投/缓存基线/核对）
+dist/bin/rag-cache-worker(.exe)        缓存变更消费者
 dist/bin/rag-state-migrate(.exe)       状态表结构检查/创建
 dist/bin/rag-mcp-debug(.exe)           mock 检索调试
 dist/bin/rag-mcp-ingest(.exe)          本地批量导入
@@ -123,7 +126,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 2. **不要重新引入**：Python 主后端、SQLite 状态库、RocketMQ、Qdrant 本地文件模式。当前传输是 Kafka + MySQL，凭据格式是 `enc:v1:`。
 3. **Go 服务不得依赖 Python**：PDF 的版面/OCR/表格/公式/图片描述能力由 `python-workers/pdf-service` 调用远端视觉模型（或纯 Go 实现）提供；`go build ./...` / `go test ./...` 不涉及 Python，也不加载任何本地模型。
 4. **测试串行**：新增包测试仍受同一 MySQL schema 与 advisory lock 约束；不要写依赖执行顺序之外并行假设的测试。
-5. **异步受理不代表完成**：涉及上传/索引的改动必须维护 `document_jobs` 状态机、发件箱、幂等与恢复语义，并保留 `GET /v1/document-jobs/{artifact_id}` 的可观测性。
+5. **异步受理不代表完成**：涉及上传/索引的改动必须维护 `document_jobs` 状态机、`schedule_version` 重发语义、幂等与恢复语义，并保留 `GET /v1/document-jobs/{artifact_id}` 的可观测性；不要重新引入任何事务 outbox（Debezium 直接采集任务表）。
 6. **不要提交生成物与本地数据**：`build/`、`dist/`、`frontend/node_modules/`、`.test-tmp/`、`.env*`（除 `.env.example`）、模型/向量数据、根目录 worker 二进制（见 `.gitignore`）。
 7. **安全默认值**：默认只监听 loopback；非 loopback 必须要求 `RAG_SERVICE_TOKEN` + MCP 白名单；`/v1/admin/*` 默认只允许本机直连或管理员会话；日志只记录任务/操作 ID 与安全错误类别，不记录查询、文件内容、消息正文或凭据。
 8. **中文 UI 与文档**：Console 文案、`README.md`、`docs/` 均为中文；新增面向用户的文案保持一致。
@@ -136,7 +139,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 - vision 引擎的 PDF 必须先在知识库配置 VLM，否则受理阶段直接拒绝；pdf-parser 不可用或超时、远端视觉模型不可用同样会令该次上传失败（可临时切 `RAG_PDF_ENGINE=go`）。OCR 已并入视觉模型，不再有独立 OCR 模型类型；升级迁移会删除旧 `kind='ocr'` 配置并清除知识库中的 `ocr`/`ocr_model` 设置。
 - `RAG_PDF_ENGINE=go` 只适合文字型 PDF：无版面分析、表格结构、OCR、公式与图片资产；扫描件需先 OCR。
 - 暂不支持 Excel、网页抓取、独立图片上传；`.doc` 依赖外部 LibreOffice。
-- 排队搜索依赖 Kafka + Redis；结果快照过期/丢失后无法回放；死信 topic 需要显式创建。
+- 排队搜索依赖 Kafka + 搜索 worker；结果以 MySQL `search_result_snapshots` 为事实来源，Redis 丢失可回源，但过期后不可读；死信 topic 需要显式创建。
 - 上传默认异步，必须存在文档消费者：配置 Kafka + Debezium 并运行独立的 `rag-document-worker`；没有内嵌/进程内选项，未部署时任务会一直 `queued`。
 - 受限账号在启用 Kafka 的部署下不支持排队检索（同步检索不受影响）。
 - 管理凭证（Service Token / API Key）在请求时不做知识库归属校验，只受 API Key 命名空间白名单约束。
@@ -148,6 +151,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 - 远端视觉模型端点的真实联调（只做了配置/协议单测与 httptest 集成测试）。
 - Console 的浏览器级 E2E（只有 Vitest 单元/契约测试与人工截图核对）。
 - Kafka SASL/TLS 外部集群、MySQL 多实例并发/故障切换。
+- 双 Debezium 连接器与缓存消费者实链路、搜索 MySQL 回源、CDC 存量切换/回滚演练（见 `VALIDATION.md`）。
 - `rag-mcp-ingest` 未连接真实 Qdrant/模型 API 实跑。
 
 详细的验证边界见 `docs/USAGE.md` §10 与 `VALIDATION.md`。
@@ -158,16 +162,17 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 | --- | --- |
 | `README.md` | 产品概览、快速开始、运行时架构、使用边界 |
 | `docs/USAGE.md` | 构建/配置/启动、REST/MCP 示例、worker、迁移 CLI、Docker、验证边界 |
-| `docs/DEPLOYMENT.md` | Docker/Compose、systemd、worker 重启策略、DLQ 监控、outbox 投递模式 |
+| `docs/DEPLOYMENT.md` | Docker/Compose、systemd、worker 重启策略、DLQ 监控、双 Debezium 连接器与升级/回滚 |
 | `docs/PERMISSIONS.md` | 角色、知识库归属、读/写与范围、邀请流程与接口 |
 | `docs/GO_MIGRATION.md` | Python→Go 迁移总纲、阶段与进度（历史背景） |
 | `docs/GO_PARITY_AUDIT.md` | Go 与 Python/前端契约差异、P0/P1/P2 清单 |
 | `docs/state-storage.md` | MySQL 表结构、密钥加密、迁移与多实例注意事项 |
-| `docs/state-cache.md` | Redis 读模型缓存、修订与 outbox、一致性边界 |
+| `docs/state-cache.md` | Redis 读模型缓存、revision 水位、缓存消费者与一致性边界 |
 | `docs/result-references.md` | `result_id`、快照 TTL、artifact 引用与容量限制 |
 | `docs/api-keys.md` | API Key 归属、命名空间与 MCP 配置 |
 | `docs/knowledge-base-settings.md` | 知识库配置、模型配置与 profile 关系（历史设计 + 当前实现说明） |
 | `deploy/debezium/README.md` | Debezium CDC 桥接配置 |
 | `python-workers/pdf-service/README.md` | PDF 视觉解析微服务的构建、视觉模型配置与接口 |
+| `docs/cdc-migration.md` | 事务 outbox → Debezium 表级采集的迁移契约：双连接器、三类事件、调度版本、缓存消费者、存量切换、监控替换 |
 | `VALIDATION.md` | 已执行的验证记录（按日期） |
 | `PROGRESS.md` | 早期开发阶段记录（历史，不作当前功能清单） |

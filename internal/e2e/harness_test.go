@@ -1,9 +1,16 @@
 package e2e
 
-// Harness for the end-to-end async pipeline tests: a real SQLite state store, a
+// Harness for the end-to-end pipeline tests: a real MySQL test state store, a
 // real runtime.Service talking to fake model/Qdrant HTTP servers, an in-process
-// Redis (miniredis) for result snapshots/transient state, and fake broker/consumer
-// seams. No network or real broker/Qdrant/model is required.
+// Redis (miniredis) for result snapshots/transient state, and an in-process fake
+// Kafka transport standing in for Debezium-delivered notifications. No network,
+// real broker, Qdrant or model server is required.
+//
+// Task delivery is owned by Debezium in production. The tests therefore build
+// the identifier-only notifications (schema 4 for document_jobs, schema 3 for
+// search_tasks) that Debezium emits and feed them to the worker handlers either
+// directly (Handle) or through mq.PullConsumer over the fake transport, exactly
+// like the deployed workers do.
 
 import (
 	"context"
@@ -21,11 +28,14 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/xinghe_rag/internal/documentworker"
 	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
 	"github.com/Guan0923/xinghe_rag/internal/modelapi"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
+	"github.com/Guan0923/xinghe_rag/internal/searchrefs"
+	"github.com/Guan0923/xinghe_rag/internal/searchworker"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
@@ -295,14 +305,41 @@ type harness struct {
 	Qdrant  *fakeQdrant
 	Model   *httpRecorder
 	Cache   *redisstate.Client
-	Broker  *fakeBroker
+	// Redis is the in-process miniredis backing Cache; FlushAll() proves the
+	// MySQL fact source can rebuild a search result after a cache loss.
+	Redis *miniredis.Miniredis
+
+	mutex sync.Mutex
+	// artifacts lists the document artifact ids whose notifications the fake
+	// Debezium pump re-emits when their schedule_version changes.
+	artifacts []string
+
 	// ModelURL is the fake embedding/reranker endpoint used by knowledge-base
 	// creation and upload tests.
 	ModelURL string
 }
 
+// trackDocumentArtifact registers one admitted artifact so the fake Debezium
+// pump delivers its notification.
+func (h *harness) trackDocumentArtifact(artifactID string) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	for _, tracked := range h.artifacts {
+		if tracked == artifactID {
+			return
+		}
+	}
+	h.artifacts = append(h.artifacts, artifactID)
+}
+
+func (h *harness) trackedDocumentArtifacts() []string {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	return append([]string(nil), h.artifacts...)
+}
+
 // newHarness builds the real runtime over fake model/Qdrant servers, a real
-// SQLite store and an in-process Redis for snapshots.
+// MySQL test store and an in-process Redis for snapshots.
 func newHarness(t *testing.T, queryPoints string) *harness {
 	t.Helper()
 	modelURL, modelRecorder := newFakeModelServer(t)
@@ -335,7 +372,7 @@ func newHarness(t *testing.T, queryPoints string) *harness {
 		Qdrant:   qdrant,
 		Model:    modelRecorder,
 		Cache:    cache,
-		Broker:   &fakeBroker{},
+		Redis:    mr,
 		ModelURL: modelURL,
 	}
 	t.Cleanup(func() {
@@ -348,67 +385,106 @@ func newHarness(t *testing.T, queryPoints string) *harness {
 	return h
 }
 
-// startBackgroundPublisher wires the fake broker as the queue transport, which
-// enables the real Service.SubmitSearch admission path.
-func (h *harness) startBackgroundPublisher(t *testing.T) {
+// newDocumentProcessor builds the real document worker (ingestion enabled) the
+// rag-document-worker binary runs.
+func newDocumentProcessor(t *testing.T, h *harness) *documentworker.Processor {
 	t.Helper()
-	if err := h.Service.StartBackground(context.Background(),
-		runtime.WithBackgroundPublisher(h.Broker),
-		runtime.WithMaintenanceInterval(0),
-		runtime.WithInitialMaintenancePass(false),
-	); err != nil {
-		t.Fatalf("StartBackground() error = %v", err)
+	worker, err := documentworker.New(documentworker.Options{
+		Jobs:            h.Stores.DocumentJobs,
+		Ingester:        h.Service,
+		JournalRecovery: h.Service,
+		Logger:          testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("documentworker.New() error = %v", err)
 	}
-	t.Cleanup(h.Service.StopBackground)
+	return worker
 }
 
-// fakeBroker implements runtime.BackgroundPublisher: it records published search
-// envelopes and document notifications instead of using a Kafka broker.
-type fakeBroker struct {
-	mutex     sync.Mutex
-	searches  []state.SearchEnvelope
-	documents []state.DocumentNotification
-	searchErr error
-	closed    bool
-}
-
-func (b *fakeBroker) SendSearchEnvelope(_ context.Context, envelope state.SearchEnvelope) error {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-	if b.searchErr != nil {
-		return b.searchErr
+// newDocumentDeadLetterProcessor builds the ingestion-less processor the
+// dead-letter worker runs: Handle can never publish a document, so broker
+// retries keep failing until the delivery is exhausted.
+func newDocumentDeadLetterProcessor(t *testing.T, h *harness) *documentworker.Processor {
+	t.Helper()
+	worker, err := documentworker.New(documentworker.Options{
+		Jobs:   h.Stores.DocumentJobs,
+		Logger: testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("documentworker.New() error = %v", err)
 	}
-	b.searches = append(b.searches, envelope)
-	return nil
+	return worker
 }
 
-func (b *fakeBroker) SendDocumentNotification(_ context.Context, notification state.DocumentNotification) error {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-	b.documents = append(b.documents, notification)
-	return nil
-}
-
-func (b *fakeBroker) Close() error {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-	b.closed = true
-	return nil
-}
-
-func (b *fakeBroker) lastSearchEnvelope() (state.SearchEnvelope, bool) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-	if len(b.searches) == 0 {
-		return state.SearchEnvelope{}, false
+// newSearchProcessor builds the real search worker the rag-search-worker binary
+// runs: the runtime retrieval stack plus expiring artifact references.
+func newSearchProcessor(t *testing.T, h *harness) *searchworker.Processor {
+	t.Helper()
+	worker, err := searchworker.New(searchworker.Options{
+		Tasks:    h.Stores.SearchTasks,
+		Searcher: h.Service,
+		Capturer: searchrefs.New(h.Stores, testLogger()),
+		Logger:   testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("searchworker.New() error = %v", err)
 	}
-	return b.searches[len(b.searches)-1], true
+	return worker
 }
 
-func (b *fakeBroker) searchCount() int {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-	return len(b.searches)
+// newSearchDeadLetterProcessor builds the execution-less processor the
+// dead-letter worker runs.
+func newSearchDeadLetterProcessor(t *testing.T, h *harness) *searchworker.Processor {
+	t.Helper()
+	worker, err := searchworker.New(searchworker.Options{
+		Tasks:  h.Stores.SearchTasks,
+		Logger: testLogger(),
+	})
+	if err != nil {
+		t.Fatalf("searchworker.New() error = %v", err)
+	}
+	return worker
+}
+
+// documentNotification returns the identifier-only schema-4 notification
+// Debezium emits for the job's current schedule_version.
+func documentNotification(t *testing.T, h *harness, artifactID string) state.DocumentNotification {
+	t.Helper()
+	job, err := h.Stores.DocumentJobs.Get(context.Background(), artifactID, nil)
+	if err != nil {
+		t.Fatalf("DocumentJobs.Get(%s) error = %v", artifactID, err)
+	}
+	if job == nil {
+		t.Fatalf("DocumentJobs.Get(%s) = nil", artifactID)
+	}
+	notification, err := state.DocumentJobEnvelope(job)
+	if err != nil {
+		t.Fatalf("DocumentJobEnvelope() error = %v", err)
+	}
+	return notification
+}
+
+// searchNotification returns the identifier-only schema-3 notification Debezium
+// emits when a search task is admitted (schedule_version starts at 1).
+func searchNotification(resultID, namespace string) state.SearchNotification {
+	return state.SearchNotification{
+		Schema:          state.SearchEnvelopeSchema,
+		ResultID:        resultID,
+		Namespace:       namespace,
+		ScheduleVersion: 1,
+	}
+}
+
+// encodeNotification renders the application-native envelope, which is exactly
+// the payload the worker decoder accepts (and what tests push to the fake
+// transport or the dead-letter topic).
+func encodeNotification(t *testing.T, value any) []byte {
+	t.Helper()
+	body, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal notification: %v", err)
+	}
+	return body
 }
 
 // fakePullTransport is an mq.PullTransport fed by the test; it records acked and
@@ -481,6 +557,127 @@ func (f *fakePullTransport) nackCount() int {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	return len(f.nacked)
+}
+
+// runDocumentWorkerUntil starts a real mq.PullConsumer over the in-process
+// transport and re-emits each tracked artifact's current schema-4 notification
+// whenever its schedule_version changes — the same signal Debezium's
+// document_jobs capture produces — until done() holds, then stops the consumer.
+// A job that fails retryably has its version bumped inside MySQL, so the pump
+// naturally delivers the replacement notification.
+func runDocumentWorkerUntil(t *testing.T, h *harness, description string, done func() bool) {
+	t.Helper()
+	worker := newDocumentProcessor(t, h)
+	transport := &fakePullTransport{}
+	consumer := mq.NewPullConsumer(
+		consumerConfig("praxis_document_ingest", "praxis_document_ingest_workers"),
+		transport, worker.MessageHandler(),
+	)
+	runCtx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() { finished <- worker.RunConsumer(runCtx, consumer) }()
+
+	delivered := make(map[string]int64)
+	pump := func() {
+		for _, artifactID := range h.trackedDocumentArtifacts() {
+			job, err := h.Stores.DocumentJobs.Get(context.Background(), artifactID, nil)
+			if err != nil || job == nil {
+				continue
+			}
+			if delivered[artifactID] == job.ScheduleVersion {
+				continue
+			}
+			notification, err := state.DocumentJobEnvelope(job)
+			if err != nil {
+				t.Fatalf("DocumentJobEnvelope(%s) error = %v", artifactID, err)
+			}
+			transport.push(mq.ReceivedMessage{
+				Topic:           "praxis_document_ingest",
+				Body:            encodeNotification(t, notification),
+				DeliveryAttempt: 1,
+			})
+			delivered[artifactID] = job.ScheduleVersion
+		}
+	}
+	waitFor(t, 90*time.Second, description, func() bool {
+		if done() {
+			return true
+		}
+		pump()
+		return done()
+	})
+	cancel()
+	select {
+	case runErr := <-finished:
+		if runErr != nil {
+			t.Fatalf("RunConsumer() error = %v", runErr)
+		}
+	case <-time.After(90 * time.Second):
+		t.Fatalf("document worker did not stop")
+	}
+	// The write path no longer flushes Redis synchronously; replay the cache
+	// connector's revision-watermark refresh so views read after the upload
+	// observe the published document.
+	convergeDocumentViews(t, h)
+}
+
+// convergeAllViews simulates the cache connector catching up after a direct
+// write: revisions are bumped for every known kind and refreshed from MySQL.
+// The write path intentionally no longer flushes Redis synchronously.
+func convergeAllViews(t *testing.T, h *harness) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := h.Stores.CacheSync.MarkAllDirty(ctx); err != nil {
+		t.Fatalf("CacheSync.MarkAllDirty() error = %v", err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if err := h.Stores.CacheSync.RefreshDirty(ctx, 100); err != nil {
+			t.Fatalf("CacheSync.RefreshDirty() error = %v", err)
+		}
+		dirty, err := h.Stores.CacheSync.DirtyKeys(ctx, 1000)
+		if err != nil {
+			t.Fatalf("CacheSync.DirtyKeys() error = %v", err)
+		}
+		if len(dirty) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cache views did not converge: %d dirty keys", len(dirty))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// convergeDocumentViews simulates the cache connector catching up with the
+// documents written by the worker: it bumps and refreshes the same cache keys
+// the CDC event for a documents row maps to.
+func convergeDocumentViews(t *testing.T, h *harness) {
+	t.Helper()
+	ctx := context.Background()
+	seen := make(map[string]struct{})
+	keys := make([]state.CacheKey, 0, 8)
+	for _, artifactID := range h.trackedDocumentArtifacts() {
+		job, err := h.Stores.DocumentJobs.Get(ctx, artifactID, nil)
+		if err != nil || job == nil {
+			continue
+		}
+		if _, ok := seen[job.Namespace]; ok {
+			continue
+		}
+		seen[job.Namespace] = struct{}{}
+		keys = append(keys,
+			state.CacheKey{Kind: "kb_list", Scope: ""},
+			state.CacheKey{Kind: "kb_public", Scope: job.Namespace},
+			state.CacheKey{Kind: "documents", Scope: job.Namespace},
+		)
+	}
+	if len(keys) == 0 {
+		return
+	}
+	if err := h.Stores.CacheSync.Revalidate(ctx, keys); err != nil {
+		t.Fatalf("CacheSync.Revalidate() error = %v", err)
+	}
 }
 
 // consumerConfig returns a fast-polling consumer configuration for tests.

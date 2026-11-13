@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -9,14 +10,13 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
-	"github.com/Guan0923/xinghe_rag/internal/documentworker"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
-	"github.com/Guan0923/xinghe_rag/internal/searchworker"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
 // TestDocumentDeadLetterExhaustion drives a document delivery through the real
-// mq.PullConsumer retry budget: the handler keeps nacking, OnExhausted records
+// mq.PullConsumer retry budget. The dead-letter worker has no ingester, so the
+// handler keeps nacking; OnExhausted decodes the same Debezium event and records
 // the durable terminal state, and only then is the message acked.
 func TestDocumentDeadLetterExhaustion(t *testing.T) {
 	h := newHarness(t, "")
@@ -31,24 +31,25 @@ func TestDocumentDeadLetterExhaustion(t *testing.T) {
 	if err != nil || job == nil {
 		t.Fatalf("DocumentJobs.Get() = %v, %v", job, err)
 	}
-	notification, err := state.DocumentJobEnvelope(job)
-	if err != nil {
-		t.Fatalf("DocumentJobEnvelope() error = %v", err)
-	}
-	body, _, err := mq.EncodeDocumentNotification(notification)
-	if err != nil {
-		t.Fatalf("EncodeDocumentNotification() error = %v", err)
-	}
 
-	// A dead-letter-only processor cannot consume the job, so the delivery keeps
-	// failing until the broker retry budget is exhausted.
-	worker, err := documentworker.New(documentworker.Options{
-		Jobs:   h.Stores.DocumentJobs,
-		Logger: testLogger(),
+	// The dead-letter topic carries the raw Debezium change event (schema
+	// stripped, op/source present), not the application-native envelope.
+	body, err := json.Marshal(map[string]any{
+		"before": nil,
+		"after": map[string]any{
+			"artifact_id":      job.ArtifactID,
+			"namespace":        job.Namespace,
+			"schedule_version": job.ScheduleVersion,
+		},
+		"source": map[string]any{"table": "document_jobs"},
+		"op":     "c",
+		"ts_ms":  time.Now().UnixMilli(),
 	})
 	if err != nil {
-		t.Fatalf("documentworker.New() error = %v", err)
+		t.Fatalf("marshal Debezium event: %v", err)
 	}
+
+	worker := newDocumentDeadLetterProcessor(t, h)
 	transport := &fakePullTransport{}
 	transport.push(mq.ReceivedMessage{Topic: "praxis_document_ingest", Body: body, DeliveryAttempt: 1})
 	consumerConfig := consumerConfig("praxis_document_ingest", "praxis_document_ingest_workers")
@@ -97,11 +98,10 @@ func TestDocumentDeadLetterExhaustion(t *testing.T) {
 }
 
 // TestSearchDeadLetterExhaustion is the queued-search counterpart: the retry
-// budget is exhausted, the task becomes durably failed, and the Python-safe
-// failure message is exposed by the result read.
+// budget is exhausted, the dead-letter worker records a durable failure, and the
+// Python-safe failure message is exposed by the result read.
 func TestSearchDeadLetterExhaustion(t *testing.T) {
 	h := newHarness(t, "")
-	h.startBackgroundPublisher(t)
 	ctx := context.Background()
 
 	resultID, err := h.Service.SubmitSearch(ctx, "alpha", contracts.SearchRequest{
@@ -114,22 +114,9 @@ func TestSearchDeadLetterExhaustion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SubmitSearch() error = %v", err)
 	}
-	envelope, ok := h.Broker.lastSearchEnvelope()
-	if !ok {
-		t.Fatalf("no search envelope reached the broker")
-	}
-	body, _, err := mq.EncodeSearchEnvelope(envelope)
-	if err != nil {
-		t.Fatalf("EncodeSearchEnvelope() error = %v", err)
-	}
+	body := encodeNotification(t, searchNotification(resultID, "alpha"))
 
-	worker, err := searchworker.New(searchworker.Options{
-		Tasks:  h.Stores.SearchTasks,
-		Logger: testLogger(),
-	})
-	if err != nil {
-		t.Fatalf("searchworker.New() error = %v", err)
-	}
+	worker := newSearchDeadLetterProcessor(t, h)
 	transport := &fakePullTransport{}
 	transport.push(mq.ReceivedMessage{Topic: "praxis_search", Body: body, DeliveryAttempt: 1})
 	consumerConfig := consumerConfig("praxis_search", "praxis_search_workers")

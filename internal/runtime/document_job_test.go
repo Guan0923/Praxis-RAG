@@ -285,8 +285,10 @@ func TestProcessDocumentJobModelFailureIsRetryable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("documentworker.New() error = %v", err)
 	}
-	if acked := processor.Handle(ctx, notification); acked {
-		t.Fatalf("model failure must stay retryable")
+	// A retryable failure is recorded as an in-transaction requeue: the worker
+	// acknowledges the delivery and Debezium emits the new schedule_version.
+	if acked := processor.Handle(ctx, notification); !acked {
+		t.Fatalf("durable retry was not acknowledged")
 	}
 	retried, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
 	if err != nil || retried == nil {
@@ -294,6 +296,9 @@ func TestProcessDocumentJobModelFailureIsRetryable(t *testing.T) {
 	}
 	if retried.Status != state.DocumentJobQueued || retried.Stage != "retry_wait" || retried.Attempts != 1 {
 		t.Fatalf("retried job = %+v", retried)
+	}
+	if retried.ScheduleVersion != 2 {
+		t.Fatalf("schedule_version after retry = %d, want 2", retried.ScheduleVersion)
 	}
 	// A retryable failure keeps the last reason on the job row: the retry-only
 	// row must say what failed (category), where (stage) and the upstream status

@@ -32,6 +32,12 @@ const (
 
 	DefaultDocumentDLQTopic = "praxis_document_ingest_dead_letters"
 	DefaultSearchDLQTopic   = "praxis_search_dead_letters"
+	DefaultCacheDLQTopic    = "praxis_state_cache_refresh_dead_letters"
+
+	// DefaultCacheDLQGroup is the consumer group of the cache dead-letter
+	// handler. It must stay distinct from every business group and from the
+	// document/search DLQ groups.
+	DefaultCacheDLQGroup = "praxis_state_cache_refresh_dead_letters"
 
 	DefaultPublishTimeout    = 10 * time.Second
 	DefaultVisibilityTimeout = 60 * time.Second
@@ -82,6 +88,11 @@ type Settings struct {
 
 	DocumentDLQTopic string
 	SearchDLQTopic   string
+	// CacheDLQTopic/CacheDLQGroup belong to the cache read-model consumer
+	// (rag-cache-worker): a malformed cache event is dead-lettered there instead
+	// of blocking the cache topic.
+	CacheDLQTopic string
+	CacheDLQGroup string
 
 	PublishTimeout time.Duration
 }
@@ -117,6 +128,8 @@ func SettingsFromEnv() (Settings, error) {
 		SearchGroup:      strings.TrimSpace(envOrDefault("RAG_SEARCH_GROUP", DefaultSearchGroup)),
 		DocumentDLQTopic: strings.TrimSpace(envOrDefault("RAG_DOCUMENT_DLQ_TOPIC", DefaultDocumentDLQTopic)),
 		SearchDLQTopic:   strings.TrimSpace(envOrDefault("RAG_SEARCH_DLQ_TOPIC", DefaultSearchDLQTopic)),
+		CacheDLQTopic:    strings.TrimSpace(envOrDefault("RAG_CACHE_DLQ_TOPIC", DefaultCacheDLQTopic)),
+		CacheDLQGroup:    strings.TrimSpace(envOrDefault("RAG_CACHE_DLQ_GROUP", DefaultCacheDLQGroup)),
 		PublishTimeout:   publishTimeout,
 	}
 	if settings.ClientID == "" {
@@ -181,6 +194,19 @@ func (s Settings) Validate() error {
 			return newConfigError("Search dead-letter topic must be separate from the business topics")
 		}
 	}
+	if s.CacheDLQTopic != "" {
+		if s.CacheDLQTopic == s.DocumentTopic || s.CacheDLQTopic == s.SearchTopic ||
+			s.CacheDLQTopic == s.CacheTopic || s.CacheDLQTopic == s.DocumentDLQTopic ||
+			s.CacheDLQTopic == s.SearchDLQTopic {
+			return newConfigError("Cache dead-letter topic must be separate from the business topics")
+		}
+	}
+	if s.CacheDLQGroup != "" {
+		if s.CacheDLQGroup == s.DocumentGroup || s.CacheDLQGroup == s.SearchGroup ||
+			s.CacheDLQGroup == s.CacheGroup {
+			return newConfigError("Cache dead-letter group must be separate from the business consumer groups")
+		}
+	}
 	return nil
 }
 
@@ -210,6 +236,8 @@ func (s Settings) DLQTopicFor(topic string) string {
 		return s.DocumentDLQTopic
 	case s.SearchTopic:
 		return s.SearchDLQTopic
+	case s.CacheTopic:
+		return s.CacheDLQTopic
 	default:
 		return ""
 	}

@@ -60,14 +60,6 @@ func newAPIKeyRepository(db *sql.DB, encryptionKey string, cacheSync *CacheSynch
 	return &APIKeyRepository{db: db, encryptionKey: encryptionKey, cacheSync: cacheSync}
 }
 
-// flushPending refreshes the committed api_keys display cache; failures stay in
-// the durable outbox for the relay worker.
-func (r *APIKeyRepository) flushPending(ctx context.Context) {
-	if r.cacheSync != nil {
-		_ = r.cacheSync.FlushPending(ctx, apiKeyKeys())
-	}
-}
-
 const apiKeySelectColumns = "id, name, prefix, namespaces, enabled, created_at, protected_key"
 
 // apiKeyOwnerSelectColumns projects one key together with its owning account.
@@ -248,7 +240,6 @@ func (r *APIKeyRepository) create(ctx context.Context, name string, namespaces [
 	if err := database.Commit(); err != nil {
 		return CreatedAPIKey{}, newStateError("API Key 无法保存")
 	}
-	r.flushPending(ctx)
 	return CreatedAPIKey{APIKey: values, Key: secret}, nil
 }
 
@@ -288,7 +279,6 @@ func (r *APIKeyRepository) Update(ctx context.Context, keyID, name string, names
 	if err := database.Commit(); err != nil {
 		return nil, newStateError("API Key 无法更新")
 	}
-	r.flushPending(ctx)
 	return updated, nil
 }
 
@@ -313,7 +303,6 @@ func (r *APIKeyRepository) Delete(ctx context.Context, keyID string) (bool, erro
 	if err := database.Commit(); err != nil {
 		return false, err
 	}
-	r.flushPending(ctx)
 	return changed > 0, nil
 }
 
@@ -409,7 +398,6 @@ func (r *APIKeyRepository) DeleteMany(ctx context.Context, keyIDs []string, owne
 	if err := database.Commit(); err != nil {
 		return nil, nil, err
 	}
-	r.flushPending(ctx)
 	deleted = append(deleted, existing...)
 	return deleted, missing, nil
 }
@@ -513,7 +501,6 @@ func (r *APIKeyRepository) ImportRow(ctx context.Context, row APIKeyImport) erro
 	if err := database.Commit(); err != nil {
 		return err
 	}
-	r.flushPending(ctx)
 	return nil
 }
 
@@ -533,13 +520,6 @@ type KnowledgeBaseRepository struct {
 
 func newKnowledgeBaseRepository(db *sql.DB, cacheSync *CacheSynchronizer) *KnowledgeBaseRepository {
 	return &KnowledgeBaseRepository{db: db, cacheSync: cacheSync}
-}
-
-// flushPending refreshes the committed knowledge-base display caches.
-func (r *KnowledgeBaseRepository) flushPending(ctx context.Context, namespace string) {
-	if r.cacheSync != nil {
-		_ = r.cacheSync.FlushPending(ctx, knowledgeKeys(namespace))
-	}
 }
 
 // List returns every knowledge-base settings object ordered by namespace.
@@ -628,7 +608,6 @@ func (r *KnowledgeBaseRepository) create(ctx context.Context, settings map[strin
 	if err := database.Commit(); err != nil {
 		return newStateError("知识库配置无法保存")
 	}
-	r.flushPending(ctx, namespace)
 	return nil
 }
 
@@ -727,9 +706,6 @@ func (r *KnowledgeBaseRepository) SetOwner(ctx context.Context, namespace, owner
 	if err != nil {
 		return false, newStateError("知识库归属无法保存")
 	}
-	if changed > 0 {
-		r.flushPending(ctx, namespace)
-	}
 	return changed > 0, nil
 }
 
@@ -775,7 +751,6 @@ func (r *KnowledgeBaseRepository) Update(ctx context.Context, settings map[strin
 	if err := database.Commit(); err != nil {
 		return err
 	}
-	r.flushPending(ctx, namespace)
 	return nil
 }
 
@@ -811,7 +786,6 @@ func (r *KnowledgeBaseRepository) Delete(ctx context.Context, namespace string) 
 	if err := database.Commit(); err != nil {
 		return false, err
 	}
-	r.flushPending(ctx, namespace)
 	return changed > 0, nil
 }
 
@@ -877,22 +851,12 @@ func newDocumentRepository(db *sql.DB, cacheSync *CacheSynchronizer) *DocumentRe
 	return &DocumentRepository{db: db, cacheSync: cacheSync}
 }
 
-// flushPending refreshes the committed document display caches. Transactional
-// helpers (UpsertTx/DeleteTx) never flush: the owner of the transaction decides
-// when it commits.
-func (r *DocumentRepository) flushPending(ctx context.Context, namespace string) {
-	if r.cacheSync != nil {
-		_ = r.cacheSync.FlushPending(ctx, documentKeys(namespace))
-	}
-}
-
-// FlushViews refreshes the cached document and knowledge-base display views
-// after the caller's transaction committed document changes made through
-// UpsertTx/DeleteTx. The caller must invoke it only after commit; failures are
-// best-effort and stay queued for the relay.
-func (r *DocumentRepository) FlushViews(ctx context.Context, namespace string) {
-	r.flushPending(ctx, namespace)
-}
+// FlushViews is retained as a no-op compatibility seam for callers that used to
+// refresh the cached document display views after committing UpsertTx/DeleteTx.
+// The revisions are already bumped inside those transactions (touch) and the
+// Debezium cache consumer rebuilds the views, so writes no longer refresh the
+// cache directly.
+func (r *DocumentRepository) FlushViews(context.Context, string) {}
 
 const (
 	documentSelectColumns = "d.name, d.document_id, d.size, d.sha256, d.chunking, d.collection, " +
@@ -1051,7 +1015,6 @@ func (r *DocumentRepository) Upsert(ctx context.Context, namespace string, recor
 	if err := database.Commit(); err != nil {
 		return err
 	}
-	r.flushPending(ctx, namespace)
 	return nil
 }
 
@@ -1131,7 +1094,6 @@ func (r *DocumentRepository) Delete(ctx context.Context, namespace, name string)
 	if err := database.Commit(); err != nil {
 		return false, err
 	}
-	r.flushPending(ctx, namespace)
 	return changed, nil
 }
 
@@ -1199,13 +1161,6 @@ func newCatalogRepository(db *sql.DB, cacheSync *CacheSynchronizer) *CatalogRepo
 	return &CatalogRepository{db: db, cacheSync: cacheSync}
 }
 
-// flushPending refreshes the committed catalog display cache.
-func (r *CatalogRepository) flushPending(ctx context.Context, namespace string) {
-	if r.cacheSync != nil {
-		_ = r.cacheSync.FlushPending(ctx, catalogKeys(namespace))
-	}
-}
-
 // Load returns the stored catalog JSON; found is false for a missing namespace.
 func (r *CatalogRepository) Load(ctx context.Context, namespace string) (string, bool, error) {
 	var data string
@@ -1265,6 +1220,5 @@ func (r *CatalogRepository) Mutate(ctx context.Context, namespace string, transf
 	if err := database.Commit(); err != nil {
 		return nil, newStateError("MCP 配置无法保存")
 	}
-	r.flushPending(ctx, namespace)
 	return result, nil
 }

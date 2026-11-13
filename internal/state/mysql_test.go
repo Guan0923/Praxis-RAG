@@ -2,7 +2,6 @@ package state
 
 import (
 	"context"
-	"strings"
 	"testing"
 )
 
@@ -141,11 +140,26 @@ func TestMySQLG7StateMachines(t *testing.T) {
 	if err != nil {
 		t.Fatalf("document Submit() error = %v", err)
 	}
-	events, err := stores.DocumentJobs.PendingOutbox(ctx, 10)
-	if err != nil || len(events) != 1 || events[0].ArtifactID != admission.ArtifactID {
-		t.Fatalf("document outbox for Debezium = %+v, %v", events, err)
+	// Debezium watches document_jobs directly: the scheduling generation is the
+	// only delivery signal and the retired outbox table no longer exists.
+	for _, column := range []string{"schedule_version"} {
+		if !columnExists(t, stores, "document_jobs", column) ||
+			!columnExists(t, stores, "search_tasks", column) {
+			t.Fatalf("column %q is missing from the task tables", column)
+		}
+	}
+	for _, column := range []string{"refreshed_revision", "attempts", "last_error", "updated_at"} {
+		if !columnExists(t, stores, "cache_revisions", column) {
+			t.Fatalf("cache_revisions column %q is missing", column)
+		}
+	}
+	if _, of := TableByName("document_job_outbox"); of {
+		t.Fatal("retired document_job_outbox is still declared in the schema")
 	}
 	notification := documentNotification(t, stores, admission.ArtifactID)
+	if notification.ScheduleVersion != 1 || notification.Schema != DocumentEnvelopeSchema {
+		t.Fatalf("document notification = %+v", notification)
+	}
 	task, err := stores.DocumentJobs.Claim(ctx, notification)
 	if err != nil || task == nil || task.Attempts != 1 {
 		t.Fatalf("Claim() = %+v, %v", task, err)
@@ -153,31 +167,23 @@ func TestMySQLG7StateMachines(t *testing.T) {
 	if err := stores.DocumentJobs.Fail(ctx, task, false, stringPtr("test")); err != nil {
 		t.Fatalf("Fail() error = %v", err)
 	}
-	searchPublisher := &fakeSearchPublisher{}
-	searchDispatcher := NewSearchTaskDispatcher(stores, searchPublisher)
-	envelope, err := searchDispatcher.Submit(ctx, namespace, map[string]any{"query": "mysql"})
+	searchNotification, err := stores.SearchTasks.Submit(ctx, namespace, map[string]any{"query": "mysql"}, nil)
 	if err != nil {
 		t.Fatalf("search Submit() error = %v", err)
 	}
-	if len(searchPublisher.messages()) != 1 || searchPublisher.messages()[0].ResultID != envelope.ResultID {
-		t.Fatalf("search notifications = %+v", searchPublisher.messages())
+	if searchNotification.Schema != SearchEnvelopeSchema || searchNotification.ScheduleVersion != 1 {
+		t.Fatalf("search notification = %+v", searchNotification)
 	}
-	if _, err := stores.SearchTasks.Claim(ctx, envelope); err != nil {
+	if _, err := stores.SearchTasks.Claim(ctx, searchNotification); err != nil {
 		t.Fatalf("search Claim() error = %v", err)
 	}
 	t.Cleanup(func() {
 		jc := context.Background()
 		for _, statement := range []string{
-			"DELETE FROM document_job_outbox WHERE namespace = ?",
 			"DELETE FROM document_jobs WHERE namespace = ?",
-			"DELETE FROM search_task_outbox WHERE result_id = ?",
 			"DELETE FROM search_tasks WHERE namespace = ?",
 		} {
-			arguments := []any{namespace}
-			if strings.Contains(statement, "result_id = ?") {
-				arguments = []any{envelope.ResultID}
-			}
-			if _, err := stores.DB.ExecContext(jc, statement, arguments...); err != nil {
+			if _, err := stores.DB.ExecContext(jc, statement, namespace); err != nil {
 				t.Logf("cleanup %q error = %v", statement, err)
 			}
 		}
@@ -195,7 +201,6 @@ func cleanupMySQLRows(t *testing.T, stores *Stores, namespace, keyID string) {
 		{"DELETE FROM documents WHERE namespace = ?", []any{namespace}},
 		{"DELETE FROM knowledge_bases WHERE namespace = ?", []any{namespace}},
 		{"DELETE FROM mcp_catalogs WHERE namespace = ?", []any{namespace}},
-		{"DELETE FROM cache_outbox WHERE scope = ?", []any{namespace}},
 		{"DELETE FROM cache_revisions WHERE scope = ?", []any{namespace}},
 	}
 	for _, statement := range statements {

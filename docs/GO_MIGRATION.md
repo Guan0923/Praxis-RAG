@@ -1,6 +1,6 @@
 # 后端 Go 重构总纲
 
-当前文档 Kafka 通知只由 Debezium 投递；早期章节中的 relay 和双模式记录是历史实现，当前变更见文末 2026-11-12 的说明。
+当前 Kafka 通知只由两个 Debezium 连接器（任务/缓存）从 MySQL 表级采集投递，应用不再写事务 outbox；早期章节中的 relay、outbox 与单连接器记录是历史实现，当前变更见文末 2026-11-13 的说明。
 
 ## REST 上传接口统一（2026-11-12）
 
@@ -8,7 +8,7 @@
 
 旧接口的请求内同步上传模式及专用 `RAG_UPLOAD_MODE` 配置一并删除。`GET /v1/documents` 列表、文档内容下载、删除及 MCP 工具保留。不增加旧 POST 路径的兼容处理；已有文档、任务和批次无需数据库迁移。下文审计记录中的旧上传接口描述仅反映当时实现。
 
-最后更新：2026-11-10
+最后更新：2026-11-13
 
 ## 1. 目标
 
@@ -422,3 +422,19 @@ REST /v1/admin/tools -> 6 tools
 - **部署/文档**：Compose 的 `pdf-parser` 删除 torch 构建参数与模型卷、默认 converter 改为 `vision`；README、USAGE、DEPLOYMENT、pdf-service README、agents 文档与 `AGENTS.md` 同步；`VALIDATION.md` 追加本次验证记录。
 - **兼容性**：`docling-service-v1`、`docling-formula-remote-v3`（历史）与 `go-native-v1` 仍可被 `IsSupportedPDFParserVersion` 读取；旧文档不需要重新解析。
 - **未验证**：真实视觉端点端到端、真实扫描 PDF 的解析质量、Docker 镜像构建与 `RAG_TEST_MYSQL_URL` 相关测试未在本环境实机执行，见 `VALIDATION.md`。
+
+
+### 2026-11-13 第十七轮：事务 outbox → Debezium 表级采集（双连接器 + 三事件）
+
+- **契约**：新增 `docs/cdc-migration.md` 作为唯一契约来源（§1 目标架构、§2 事件契约、§3 表结构、§5 处理语义、§6 搜索事实来源、§7 缓存消费者、§8 存量切换、§9 回滚、§10 监控替换、§11 验收矩阵）。后续代码/配置/文档冲突以该文件为准。
+- **删除 outbox**：`document_job_outbox`、`search_task_outbox`、`cache_outbox`、历史 `document_task_outbox` 从写入/轮询/补发/清理路径全部移除；`schemaTables` 不再创建这四张表（已存在则保持不动）。
+- **表结构**：`document_jobs`/`search_tasks` 追加 `schedule_version BIGINT NOT NULL DEFAULT 1`；`cache_revisions` 追加 `refreshed_revision/attempts/last_error/updated_at`；新增 `cdc_cutover_state(k,v)`；`search_result_snapshots` 改为活动的结果事实来源。
+- **事件契约**：文档通知 schema 4（`artifact_id/namespace/schedule_version`）、搜索通知 schema 3（`result_id/namespace/schedule_version`）、缓存事件 schema 1（`table/op/before/after` 定位列）；消费者兼容 Debezium 原生 envelope 与应用原生 envelope。
+- **调度版本**：重发只发生在 MySQL 事务内（`schedule_version = GREATEST(schedule_version, baseline)+1`）；`Claim` 校验版本/状态/租约，旧版本/终态/有效租约安全跳过并 ACK；`Sweep`/`Fail(retry)` 用 UPDATE 递增版本重排。
+- **搜索**：`SearchTasks.Submit` 只写 MySQL 并提交后返回 `result_id`（不依赖 publisher、不回滚失败任务、删除 Dispatcher）；`Complete` 在同一事务写 `search_result_snapshots` 并置 `succeeded`；`Get` 先 Redis 后 MySQL（回源 + 尽力回填）；`PurgeExpired` 有界清理 MySQL 快照。
+- **缓存消费者**：新增 `cmd/rag-cache-worker` 与 `internal/cacheconsumer`；`touch()` 只递增 revision，不再写 outbox；新 API `Invalidate`/`RefreshKey`/`Revalidate`/`DirtyKeys`/`RefreshDirty`/`MarkAllDirty`；Redis `Put` 保留 revision 水位旧回填保护；失败记录 `attempts/last_error` 且不 nack。
+- **Debezium/Compose**：新增两个连接器配置（任务连接器只投递 INSERT 与 `schedule_version` 变化；缓存连接器采集 8 张业务表全部 c/u/d），独立 `database.server.id`、offset/schema-history 与健康端口；Compose 新增 `debezium-cache`、`rag-cache-worker`、cache DLQ topic/group。
+- **监控**：`internal/monitor` 的 `pipeline` 改为 `document_jobs`/`worker`/`debezium.{tasks,cache}`/`kafka.groups.{document,search,cache}`/`cache.{dirty_keys,refresh_failures}`；删除 `pipeline.outbox` 与 `service.outbox_bridge`，新增 `service.delivery="debezium"`；`queues.search_tasks` 增加 `timed_out_recent/overdue_active`；`library.result_snapshots` 改为 MySQL 未过期快照数。Console 监控页与 `api.ts` 同步。
+- **CLI/运维**：新增 `cmd/rag-cdc-cutover`（`--inventory`/`--record-position`/`--backfill`/`--mark-cache-baseline`/`--verify`/`--all`）；`cmd/rag-service-migrate --retire-outbox --yes` 显式删除四张旧表；`cmd/rag-service-migrate` 其余行为不变。
+- **文档**：README、USAGE、DEPLOYMENT、state-cache、result-references、state-storage、agents 文档同步；所有 outbox 描述删除或标注“已下线”；`VALIDATION.md` 追加本次验证范围与未实机项。
+- **未验证**：真实 Docker/Debezium/Kafka/Redis 双连接器链路、缓存 revision 收敛、搜索 MySQL 回源、存量切换/回滚演练均未实机执行，见 `VALIDATION.md`。

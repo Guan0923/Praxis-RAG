@@ -37,7 +37,6 @@ func TestAPIKeyRepositoryDeleteManyBatchesTransactionally(t *testing.T) {
 	}
 
 	revisionBefore := revision(t, stores, "api_keys", "")
-	outboxBefore := outboxCount(t, stores)
 
 	deleted, missing, err := stores.APIKeys.DeleteMany(ctx,
 		[]string{first.ID, "batch-missing-id", second.ID, second.ID, ""}, "")
@@ -52,9 +51,6 @@ func TestAPIKeyRepositoryDeleteManyBatchesTransactionally(t *testing.T) {
 	}
 	if got := revision(t, stores, "api_keys", ""); got != revisionBefore+1 {
 		t.Fatalf("revision = %d, want %d (one bump for the whole batch)", got, revisionBefore+1)
-	}
-	if got := outboxCount(t, stores); got != outboxBefore+1 {
-		t.Fatalf("outbox count = %d, want %d (one event for the whole batch)", got, outboxBefore+1)
 	}
 	for _, keyID := range []string{first.ID, second.ID} {
 		key, err := stores.APIKeys.Get(ctx, keyID)
@@ -71,9 +67,8 @@ func TestAPIKeyRepositoryDeleteManyBatchesTransactionally(t *testing.T) {
 	}
 
 	// A second batch of already-deleted ids reports them as missing and writes
-	// no revision or outbox row.
+	// no revision row.
 	revisionAfter := revision(t, stores, "api_keys", "")
-	outboxAfter := outboxCount(t, stores)
 	deletedAgain, missingAgain, err := stores.APIKeys.DeleteMany(ctx, []string{first.ID, second.ID}, "")
 	if err != nil {
 		t.Fatalf("DeleteMany(again) error = %v", err)
@@ -86,9 +81,6 @@ func TestAPIKeyRepositoryDeleteManyBatchesTransactionally(t *testing.T) {
 	}
 	if got := revision(t, stores, "api_keys", ""); got != revisionAfter {
 		t.Fatalf("revision after empty batch = %d, want %d", got, revisionAfter)
-	}
-	if got := outboxCount(t, stores); got != outboxAfter {
-		t.Fatalf("outbox count after empty batch = %d, want %d", got, outboxAfter)
 	}
 }
 

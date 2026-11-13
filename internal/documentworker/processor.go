@@ -163,12 +163,14 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 			"artifact_id", notification.ArtifactID)
 		return false
 	}
+	// The broker decoder already validated the Debezium/app envelope;
+	// revalidate here so an in-process caller cannot bypass the identifier and
+	// scheduling-version contract.
 	validated, err := state.ValidateDocumentNotification(map[string]any{
-		"schema":      float64(notification.Schema),
-		"artifact_id": notification.ArtifactID,
-		"namespace":   notification.Namespace,
-		"name":        notification.Name,
-		"created_at":  notification.CreatedAt,
+		"schema":           float64(state.DocumentEnvelopeSchema),
+		"artifact_id":      notification.ArtifactID,
+		"namespace":        notification.Namespace,
+		"schedule_version": notification.ScheduleVersion,
 	})
 	if err != nil {
 		p.logWarn(ctx, "document notification invalid", logging.ErrorAttrs(err)...)
@@ -208,8 +210,15 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 		return false
 	}
 	if task == nil {
-		// Another live worker owns the lease (or the job turned terminal).
-		return p.terminalOrNack(ctx, notification.ArtifactID)
+		// A stale schedule version, a terminal job, a live lease held by another
+		// worker, or a purged row: all are safe to acknowledge. The sweep pass
+		// requeues any job that still needs execution, so blocking here would
+		// only add a duplicate retry.
+		p.logInfo(ctx, "document notification skipped",
+			"artifact_id", notification.ArtifactID,
+			"schedule_version", notification.ScheduleVersion,
+			"job_status", job.Status)
+		return true
 	}
 
 	stopHeartbeat := p.startHeartbeat(ctx, task)
@@ -275,7 +284,11 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 		p.logWarn(ctx, "document processing deferred",
 			append([]any{"retry", retry}, logging.ErrorAttrs(ingestErr)...)...)
 	}
-	return p.terminalOrNack(ctx, notification.ArtifactID)
+	// The failure path always records a durable outcome (terminal row or an
+	// incremented schedule_version requeue), so the delivery can be
+	// acknowledged: the sweep pass re-emits the notification for the new
+	// version.
+	return true
 }
 
 // startHeartbeat renews the lease while ingestion runs. A failed heartbeat ends
@@ -308,46 +321,23 @@ func (p *Processor) startHeartbeat(ctx context.Context, task *state.DocumentJobT
 	}
 }
 
-func (p *Processor) terminalOrNack(ctx context.Context, artifactID string) bool {
-	terminal, err := p.jobs.Terminal(ctx, artifactID)
-	if err != nil {
-		p.logWarn(ctx, "document terminal state unavailable", logging.ErrorAttrs(err)...)
-		return false
-	}
-	return terminal
-}
-
-// MessageHandler adapts the processor to mq.PullConsumer. Malformed schema-3
-// payloads are nacked so the broker retry/DLQ policy applies, exactly like the
-// Python queue's validate-before-callback behaviour.
-//
-// Debezium also publishes routine document_job_outbox retention deletes on the
-// same topic (GCOutbox removes expired outbox rows). Those records carry no job
-// work and are acked immediately; treating them like invalid notifications
-// would retry and dead-letter normal cleanup.
+// MessageHandler adapts the processor to mq.PullConsumer. The decoder accepts
+// both the native schema-4 envelope and raw Debezium document_jobs records.
+// Records that are not business changes (tombstones, deletes filtered by the
+// connector) are acked without retries; malformed payloads are nacked so the
+// broker retry/DLQ policy applies.
 func (p *Processor) MessageHandler() mq.Handler {
 	return func(ctx context.Context, message mq.ReceivedMessage) bool {
-		notification, kind, err := mq.DecodeDocumentMessage(message.Body)
+		notification, err := mq.DecodeDocumentNotification(message.Body)
 		if err != nil {
+			if state.IgnorableCDCChange(err) {
+				return true
+			}
 			p.logWarn(ctx, "malformed document message ignored", logging.ErrorAttrs(err)...)
 			return false
 		}
-		if kind == mq.DocumentMessageOutboxDeletion {
-			p.logOutboxDeletion(ctx, "message_handler", message)
-			return true
-		}
 		return p.Handle(ctx, notification)
 	}
-}
-
-// logOutboxDeletion records one routine outbox-retention deletion. The message
-// stays stable and greppable for acceptance checks, and only bounded record
-// coordinates are attached: the payload holds outbox row values and must stay
-// out of logs.
-func (p *Processor) logOutboxDeletion(ctx context.Context, handler string, received mq.ReceivedMessage) {
-	p.logInfo(ctx, "outbox cleanup event ignored",
-		"handler", handler,
-		"topic", received.Topic, "partition", received.Partition, "offset", received.Offset)
 }
 
 // DeadLetter records broker retry exhaustion as a durable terminal state.
@@ -367,17 +357,17 @@ func (p *Processor) DeadLetter(ctx context.Context, notification state.DocumentN
 
 // DeadLetterMessage decodes one dead-letter delivery and records it.
 //
-// An outbox deletion record is already complete: replaying an old delete event
-// through the DLQ must ack it without touching any document job.
+// Records that are not business changes are already complete: replaying an old
+// tombstone or connector-filtered delete event through the DLQ must ack it
+// without touching any document job.
 func (p *Processor) DeadLetterMessage(ctx context.Context, message mq.ReceivedMessage) (bool, error) {
-	notification, kind, err := mq.DecodeDocumentMessage(message.Body)
+	notification, err := mq.DecodeDocumentNotification(message.Body)
 	if err != nil {
+		if state.IgnorableCDCChange(err) {
+			return true, nil
+		}
 		p.logWarn(ctx, "malformed document dead-letter message ignored", logging.ErrorAttrs(err)...)
 		return false, nil
-	}
-	if kind == mq.DocumentMessageOutboxDeletion {
-		p.logOutboxDeletion(ctx, "dead_letter", message)
-		return true, nil
 	}
 	return p.DeadLetter(ctx, notification)
 }
@@ -400,9 +390,11 @@ func (p *Processor) ExhaustedHandler() func(ctx context.Context, message mq.Rece
 }
 
 // Recover runs one maintenance pass: requeue stranded/expired jobs, garbage
-// collect retained terminal rows and the outbox, then recover interrupted
-// upload journals when a runtime hook is configured. Failures are logged, never
-// returned as fatal (the Python recover() never blocks consumption).
+// collect retained terminal rows, then recover interrupted upload journals when
+// a runtime hook is configured. Requeueing increments schedule_version, so
+// Debezium emits the replacement notification; no outbox row is involved.
+// Failures are logged, never returned as fatal (the Python recover() never
+// blocks consumption).
 func (p *Processor) Recover(ctx context.Context) error {
 	var firstErr error
 	if swept, err := p.jobs.Sweep(ctx, p.sweepLimit); err != nil {
@@ -415,12 +407,6 @@ func (p *Processor) Recover(ctx context.Context) error {
 	}
 	if _, err := p.jobs.GCJobs(ctx, nil); err != nil {
 		p.logWarn(ctx, "document terminal GC failed", logging.ErrorAttrs(err)...)
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
-	if _, err := p.jobs.GCOutbox(ctx, nil); err != nil {
-		p.logWarn(ctx, "document outbox GC failed", logging.ErrorAttrs(err)...)
 		if firstErr == nil {
 			firstErr = err
 		}

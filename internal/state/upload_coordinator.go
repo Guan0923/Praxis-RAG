@@ -233,7 +233,6 @@ func (c *UploadCoordinator) clearWorkspace(ctx context.Context, operation *Uploa
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	c.Journal.flushCache(ctx, operation.Namespace, &operation.ID, false, false)
 	return nil
 }
 
@@ -388,7 +387,6 @@ func (c *UploadCoordinator) recordCleanupFailure(ctx context.Context, operation 
 			if commitErr := transaction.Commit(); commitErr != nil {
 				return
 			}
-			c.Journal.flushCache(ctx, operation.Namespace, &operation.ID, false, false)
 		}()
 	}
 	logging.FromContext(ctx).Warn("Upload cleanup failed; retry pending", append([]any{"operation_id", operation.ID}, logging.ErrorAttrs(cause)...)...)

@@ -2,7 +2,9 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -74,47 +76,51 @@ func positiveIntegerEnv(name string, fallback int) (int, error) {
 	return value, nil
 }
 
-// TransientStore is the expiring key/value storage used for result snapshots.
-// In production it is the Redis-backed rag_mcp.state.transient.TransientStore;
-// the Go port keeps it behind this interface so no Redis dependency is needed.
-// Values must be JSON-marshalable maps.
+// TransientStore is the expiring key/value storage used as the search-result
+// read cache. In production it is the Redis-backed
+// rag_mcp.state.transient.TransientStore; the Go port keeps it behind this
+// interface so no Redis dependency is needed. Values must be JSON-marshalable
+// maps.
 type TransientStore interface {
 	Get(kind, identity string) (any, bool, error)
 	Put(kind, identity string, value any, ttlSeconds float64, nx bool) (bool, error)
 	Delete(kind, identity string) (int64, error)
 }
 
-// TransientProvider is implemented by a cache backend (the future Redis client)
-// that can also serve expiring transient values. The adapter is a separate view
+// TransientProvider is implemented by a cache backend (the Redis client) that
+// can also serve expiring transient values. The adapter is a separate view
 // because StateCache and TransientStore have different Get/Put shapes.
 type TransientProvider interface {
 	TransientStore() TransientStore
 }
 
-// SnapshotIndex 可选地记录每个已保存结果快照的身份与过期时间，供监控页统计
-// 有效快照数。快照本身存放在 Redis transient 的 sha256 哈希 key 里，无法按
-// 前缀扫描，所以由后端额外维护一份可计数的索引（见 redisstate 的实现）。
+// SnapshotIndex optionally records the identity and expiry of every saved
+// result snapshot so monitoring can count the live snapshots. The result
+// snapshots themselves live in MySQL (and in the Redis read cache); the index is
+// an observation aid only.
 //
-// 它必须可并发调用；索引失败只影响观测数据，绝不能让快照保存失败。
+// It must be safe for concurrent use; an index failure only loses observation
+// data and must never fail the snapshot write.
 type SnapshotIndex interface {
 	// AddSnapshot 记录一条快照身份及过期时间（Unix 秒会话，可带小数）。
 	AddSnapshot(ctx context.Context, identity string, expiresAt float64) error
 }
 
-// ResultSnapshots stores immutable, tenant-scoped search results. It is a port
-// of rag_mcp.state.result_snapshots.ResultSnapshots.
+// ResultSnapshots stores immutable, tenant-scoped search results. MySQL
+// search_result_snapshots is the fact source; the Redis transient store is a
+// read cache that is backfilled from the fact row after a miss.
 type ResultSnapshots struct {
 	Stores    *Stores
 	Settings  SnapshotSettings
 	Clock     func() float64
 	Transient TransientStore
-	// Index 是可选的快照索引；nil 时 Save 行为与引入索引前完全一致。
+	// Index 是可选的快照索引；nil 时行为与引入索引前完全一致。
 	Index SnapshotIndex
 }
 
 // NewResultSnapshots builds the snapshot service. A nil clock uses wall time; a
-// nil Transient store makes Save/Get report SnapshotUnavailable, mirroring a
-// disabled Redis backend.
+// nil Transient store only disables the read cache (the MySQL fact row is still
+// authoritative).
 func NewResultSnapshots(stores *Stores, settings SnapshotSettings, clock func() float64) *ResultSnapshots {
 	if clock == nil {
 		clock = unixSeconds
@@ -226,39 +232,158 @@ func (s *ResultSnapshots) Prepare(namespace string, payload map[string]any, resu
 	return detached, nil
 }
 
-// Save prepares and stores one immutable response.
-func (s *ResultSnapshots) Save(namespace string, payload map[string]any, resultID *string, createdAt *float64) (map[string]any, error) {
+// insertTx writes one prepared envelope into the MySQL fact table inside the
+// caller's transaction. A duplicate result_id means the immutable identity is
+// already taken.
+func (s *ResultSnapshots) insertTx(ctx context.Context, tx *sql.Tx, envelope map[string]any) error {
+	payloadValue, ok := envelope["payload"].(map[string]any)
+	if !ok {
+		return newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	identifier, ok := snapshotText(payloadValue["result_id"])
+	if !ok || !canonicalUUID(identifier) {
+		return newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	namespace, ok := snapshotText(envelope["namespace"])
+	if !ok {
+		return newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	expires, ok := finiteSnapshotNumber(envelope["expires_at"])
+	if !ok {
+		return newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	created, ok := finiteSnapshotNumber(payloadValue["created_at"])
+	if !ok || created >= expires {
+		return newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	content, err := json.Marshal(envelope)
+	if err != nil {
+		return newSnapshotUnavailable("Search result storage is temporarily unavailable")
+	}
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO search_result_snapshots (id, namespace, content, created_at, expires_at) "+
+			"VALUES (?, ?, ?, ?, ?)",
+		identifier, namespace, string(content), created, expires); err != nil {
+		if isUniqueViolation(err) {
+			return newSnapshotUnavailable("Search result ID already exists")
+		}
+		return err
+	}
+	return nil
+}
+
+// SaveTx prepares (or accepts) one result envelope and writes it into the
+// caller's MySQL transaction, so a task terminal state and its result snapshot
+// commit atomically. The Redis cache is not written here.
+func (s *ResultSnapshots) SaveTx(ctx context.Context, tx *sql.Tx, namespace string, payload map[string]any,
+	resultID *string, createdAt *float64) (map[string]any, error) {
 	envelope, err := s.Prepare(namespace, payload, resultID, createdAt)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.insertTx(ctx, tx, envelope); err != nil {
 		return nil, err
 	}
 	payloadValue, ok := envelope["payload"].(map[string]any)
 	if !ok {
 		return nil, newSnapshotUnavailable("Search result expired or unavailable")
 	}
-	result := payloadValue
-	if s.Transient == nil {
-		return nil, newSnapshotUnavailable("Search result storage is temporarily unavailable")
-	}
-	expires, _ := finiteSnapshotNumber(result["expires_at"])
-	ttl := math.Ceil(expires - s.now())
-	identifier, _ := snapshotText(result["result_id"])
-	stored, err := s.Transient.Put("search-result", identifier, envelope, ttl, true)
+	return payloadValue, nil
+}
+
+// Save prepares and stores one immutable response. MySQL is the fact source, so
+// a successful save survives a complete Redis loss; the Redis cache write is
+// best-effort.
+func (s *ResultSnapshots) Save(namespace string, payload map[string]any, resultID *string, createdAt *float64) (map[string]any, error) {
+	envelope, err := s.Prepare(namespace, payload, resultID, createdAt)
 	if err != nil {
-		return nil, newSnapshotUnavailable("Search result storage is temporarily unavailable")
+		return nil, err
 	}
-	if !stored {
-		return nil, newSnapshotUnavailable("Search result ID already exists")
+	persisted := false
+	if s.Stores != nil && s.Stores.DB != nil {
+		ctx := context.Background()
+		transaction, err := s.Stores.DB.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, newSnapshotUnavailable("Search result storage is temporarily unavailable")
+		}
+		if err := s.insertTx(ctx, transaction, envelope); err != nil {
+			_ = transaction.Rollback()
+			return nil, err
+		}
+		if err := transaction.Commit(); err != nil {
+			return nil, newSnapshotUnavailable("Search result storage is temporarily unavailable")
+		}
+		persisted = true
+	}
+	if cacheErr := s.cacheEnvelope(envelope); cacheErr != nil && !persisted {
+		return nil, cacheErr
+	}
+	payloadValue, ok := envelope["payload"].(map[string]any)
+	if !ok {
+		return nil, newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	return payloadValue, nil
+}
+
+// cacheEnvelope writes one prepared envelope into the Redis read cache with the
+// remaining TTL. It is best-effort: callers ignore the error because MySQL holds
+// the authoritative row.
+func (s *ResultSnapshots) cacheEnvelope(envelope map[string]any) error {
+	if s.Transient == nil {
+		return newSnapshotUnavailable("Search result storage is temporarily unavailable")
+	}
+	payloadValue, ok := envelope["payload"].(map[string]any)
+	if !ok {
+		return newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	identifier, ok := snapshotText(payloadValue["result_id"])
+	if !ok {
+		return newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	expires, ok := finiteSnapshotNumber(payloadValue["expires_at"])
+	if !ok {
+		return newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	ttl := math.Ceil(expires - s.now())
+	if ttl <= 0 {
+		return newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	if _, err := s.Transient.Put("search-result", identifier, envelope, ttl, false); err != nil {
+		return newSnapshotUnavailable("Search result storage is temporarily unavailable")
 	}
 	// 快照以 sha256 哈希 key 存进 transient，监控无法按前缀统计，因此保存成功
 	// 后补记一次可选索引。索引失败只丢失观测数据，不影响已保存的快照和返回值。
 	if s.Index != nil {
 		_ = s.Index.AddSnapshot(context.Background(), identifier, expires)
 	}
-	return result, nil
+	return nil
 }
 
-// Get pages one stored response, validating tenant, identity, and expiry.
+// readEnvelope loads one result envelope from the MySQL fact table.
+func (s *ResultSnapshots) readEnvelope(resultID string) (map[string]any, error) {
+	if s.Stores == nil || s.Stores.DB == nil {
+		return nil, newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	var content string
+	err := s.Stores.DB.QueryRowContext(context.Background(),
+		"SELECT content FROM search_result_snapshots WHERE id = ?", resultID).Scan(&content)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	if err != nil {
+		return nil, newSnapshotUnavailable("Search result storage is temporarily unavailable")
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal([]byte(content), &envelope); err != nil {
+		return nil, newSnapshotUnavailable("Search result expired or unavailable")
+	}
+	return envelope, nil
+}
+
+// Get pages one stored response, validating tenant, identity, and expiry. The
+// Redis cache is consulted first; a miss, an unavailable cache, or a cache entry
+// that fails validation (corrupt, stale, cross-tenant) falls back to the MySQL
+// fact row, which is also used to repair the cache.
 func (s *ResultSnapshots) Get(namespace, resultID string, page, pageSize int) (map[string]any, error) {
 	if !canonicalUUID(resultID) {
 		return nil, newSnapshotUnavailable("Search result expired or unavailable")
@@ -266,21 +391,30 @@ func (s *ResultSnapshots) Get(namespace, resultID string, page, pageSize int) (m
 	if page < 1 || pageSize < 1 || pageSize > 100 {
 		return nil, newValueError("page must be positive and page_size must be 1..100")
 	}
-	if s.Transient == nil {
-		return nil, newSnapshotUnavailable("Search result expired or unavailable")
+	if s.Transient != nil {
+		if value, found, err := s.Transient.Get("search-result", resultID); err == nil && found {
+			if envelope, ok := value.(map[string]any); ok {
+				if result, err := s.validatedResult(namespace, resultID, envelope); err == nil {
+					return pageResult(result, page, pageSize)
+				}
+			}
+		}
 	}
-	value, found, err := s.Transient.Get("search-result", resultID)
-	if err != nil || !found {
-		return nil, newSnapshotUnavailable("Search result expired or unavailable")
-	}
-	envelope, ok := value.(map[string]any)
-	if !ok {
-		return nil, newSnapshotUnavailable("Search result expired or unavailable")
+	envelope, err := s.readEnvelope(resultID)
+	if err != nil {
+		return nil, err
 	}
 	result, err := s.validatedResult(namespace, resultID, envelope)
 	if err != nil {
 		return nil, err
 	}
+	// Best-effort repair so the next read hits the cache again.
+	_ = s.cacheEnvelope(envelope)
+	return pageResult(result, page, pageSize)
+}
+
+// pageResult applies the page/page_size projection to one validated payload.
+func pageResult(result map[string]any, page, pageSize int) (map[string]any, error) {
 	items, ok := result["results"].([]any)
 	if !ok {
 		return nil, newSnapshotUnavailable("Search result expired or unavailable")
@@ -357,10 +491,23 @@ func (s *ResultSnapshots) validatedResult(namespace, resultID string, envelope m
 	return payload, nil
 }
 
-// PurgeExpired is a bounded compatibility no-op: Redis TTL owns reclamation.
+// PurgeExpired deletes expired MySQL result snapshots in bounded batches. The
+// Redis side relies on its TTL.
 func (s *ResultSnapshots) PurgeExpired(limit int) (int, error) {
 	if limit < 1 || limit > 1000 {
 		return 0, newValueError("limit must be 1..1000")
 	}
-	return 0, nil
+	if s.Stores == nil || s.Stores.DB == nil {
+		return 0, nil
+	}
+	result, err := s.Stores.DB.ExecContext(context.Background(),
+		"DELETE FROM search_result_snapshots WHERE expires_at <= ? LIMIT ?", s.now(), limit)
+	if err != nil {
+		return 0, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(affected), nil
 }
