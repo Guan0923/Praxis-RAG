@@ -120,6 +120,23 @@ func run() error {
 	}
 	// The Console monitoring page is read-only: one state aggregate plus five
 	// bounded dependency probes, assembled per request by internal/monitor.
+	// Kafka progress is wired only when a broker is configured, so a brokerless
+	// deployment reports the in-process outbox instead of fabricating offsets.
+	var kafkaProgress func(context.Context) (monitor.KafkaProgress, error)
+	if mqSettings.Configured() {
+		kafkaSettings := mqSettings
+		kafkaProgress = func(ctx context.Context) (monitor.KafkaProgress, error) {
+			progress, progressErr := mq.DocumentConsumerProgress(ctx, kafkaSettings)
+			if progressErr != nil {
+				return monitor.KafkaProgress{}, progressErr
+			}
+			return monitor.KafkaProgress{
+				CommittedOffset: progress.CommittedOffset,
+				EndOffset:       progress.EndOffset,
+				Lag:             progress.Lag,
+			}, nil
+		}
+	}
 	monitorService := monitor.New(monitor.Options{
 		Stats:                 stores,
 		MySQL:                 stores,
@@ -128,6 +145,10 @@ func run() error {
 		QdrantURL:             ragConfig.QdrantURL,
 		Collection:            ragConfig.Collection,
 		KafkaBootstrapServers: mqSettings.BootstrapServers,
+		DebeziumHealthURL:     os.Getenv("RAG_DEBEZIUM_HEALTH_URL"),
+		DocumentTopic:         mqSettings.DocumentTopic,
+		DocumentGroup:         mqSettings.DocumentGroup,
+		KafkaProgress:         kafkaProgress,
 		OutboxBridge:          "debezium",
 		UploadMode:            "async",
 		DocumentWorker:        documentWorkerMode,

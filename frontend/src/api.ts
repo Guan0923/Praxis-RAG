@@ -751,10 +751,6 @@ export type MonitorDocumentJobs = {
   stuck_processing: number;
   failed_recent: number;
 };
-export type MonitorDocumentOutbox = {
-  by_status: Record<string, number>;
-  oldest_pending_seconds: number;
-};
 export type MonitorSearchTasks = {
   by_status: Record<string, number>;
   oldest_active_seconds: number;
@@ -762,17 +758,54 @@ export type MonitorSearchTasks = {
 export type MonitorUploads = { unfinished: number };
 export type MonitorQueues = {
   document_jobs: MonitorDocumentJobs;
-  document_outbox: MonitorDocumentOutbox;
   search_tasks: MonitorSearchTasks;
   uploads: MonitorUploads;
 };
 // MonitorQueueState addresses one queue of the snapshot without naming the
-// whole MonitorQueues object.
+// whole MonitorQueues object. The outbox is not a queue: it is reported by
+// pipeline.outbox as retained records (see MonitorPipelineOutbox).
 export type MonitorQueueState =
   | MonitorDocumentJobs
-  | MonitorDocumentOutbox
   | MonitorSearchTasks
   | MonitorUploads;
+// MonitorPipelineOutbox reports outbox *records*, not an undelivered backlog.
+// In the Debezium deployment the application never writes PUBLISHED back:
+// Debezium captures the rows and Kafka records consumption progress, so rows
+// may legitimately stay PENDING during the retention window.
+export type MonitorPipelineOutbox = {
+  by_status: Record<string, number>;
+  total: number;
+  oldest_record_seconds: number;
+};
+export type MonitorPipelineDocumentJobs = {
+  status: MonitorDependencyStatus;
+  detail: string;
+};
+export type MonitorPipelineDebezium = {
+  status: MonitorDependencyStatus;
+  detail: string;
+  // capture_progress is always null: capture offsets live in Debezium, not in
+  // this service, so the page must render 未知 instead of inventing a number.
+  capture_progress: null;
+};
+export type MonitorPipelineKafka = {
+  status: MonitorDependencyStatus;
+  detail: string;
+  topic: string;
+  group: string;
+  committed_offset: number | null;
+  end_offset: number | null;
+  consumer_lag: number | null;
+};
+// MonitorPipeline keeps the four delivery/consumption views apart: outbox
+// records (retention), Debezium capture, Kafka consumption and document job
+// processing. A null field means unknown, never zero.
+export type MonitorPipeline = {
+  outbox: MonitorPipelineOutbox | null;
+  document_jobs: MonitorPipelineDocumentJobs;
+  debezium: MonitorPipelineDebezium;
+  kafka: MonitorPipelineKafka;
+};
 export type MonitorLibrary = {
   documents: number;
   knowledge_bases: number;
@@ -803,6 +836,9 @@ export type MonitorOverview = {
   service: MonitorService;
   dependencies: MonitorDependency[];
   queues: MonitorQueues | null;
+  // pipeline is always present in the wire contract; null only when the whole
+  // snapshot could not be built, in which case the page shows 未知.
+  pipeline: MonitorPipeline | null;
   library: MonitorLibrary | null;
   activity: MonitorActivity | null;
   errors: string[];

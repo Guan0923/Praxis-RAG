@@ -42,9 +42,14 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	now := time.Now()
 	recentWindow := 24 * time.Hour
 	nowUnix := float64(now.Unix())
-	queuedAge := 2 * 60 * 60.0    // 2h
-	activeSearchAge := 20 * 60.0  // 20m
-	pendingOutboxAge := 30 * 60.0 // 30m
+	queuedAge := 2 * 60 * 60.0   // 2h
+	activeSearchAge := 20 * 60.0 // 20m
+	// The PUBLISHED row is intentionally older than the PENDING row: the outbox
+	// age covers every status, because PENDING rows are retained records in the
+	// Debezium deployment and must not be mistaken for the delivery backlog.
+	publishedOutboxAge := 45 * 60.0 // 45m
+	pendingOutboxAge := 30 * 60.0   // 30m
+	oldestOutboxAge := publishedOutboxAge
 
 	artifactQuota := monitorTestArtifactID(t)
 	jobStatement := "INSERT INTO document_jobs (artifact_id, namespace, name, name_key, size, " +
@@ -77,7 +82,7 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	monitorTestExec(t, stores, outboxStatement, monitorTestID(t, 32), artifactQuota,
 		namespace, "queued.txt", "PENDING", nowUnix-3600, nowUnix-pendingOutboxAge)
 	monitorTestExec(t, stores, outboxStatement, monitorTestID(t, 32), artifactQuota,
-		namespace, "queued.txt", "PUBLISHED", nowUnix-60, nowUnix-60)
+		namespace, "queued.txt", "PUBLISHED", nowUnix-publishedOutboxAge, nowUnix-publishedOutboxAge)
 
 	searchStatement := "INSERT INTO search_tasks (result_id, namespace, arguments, status, " +
 		"stage, attempts, lease_until, retry_at, deadline, created_at, updated_at) " +
@@ -183,9 +188,11 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	if got := stats.OutboxByStatus; len(got) != 2 || got["PENDING"] != 1 || got["PUBLISHED"] != 1 {
 		t.Fatalf("OutboxByStatus = %v", got)
 	}
-	if math.Abs(stats.OldestPendingOutboxSeconds-pendingOutboxAge) > 5 {
-		t.Fatalf("OldestPendingOutboxSeconds = %f, want ~%f",
-			stats.OldestPendingOutboxSeconds, pendingOutboxAge)
+	// The PUBLISHED row is the oldest one, so an age that only considered
+	// PENDING rows would report ~pendingOutboxAge instead.
+	if math.Abs(stats.OldestOutboxRecordSeconds-oldestOutboxAge) > 5 {
+		t.Fatalf("OldestOutboxRecordSeconds = %f, want ~%f (PENDING age is %f)",
+			stats.OldestOutboxRecordSeconds, oldestOutboxAge, pendingOutboxAge)
 	}
 
 	for _, status := range []string{
@@ -241,10 +248,10 @@ func TestMonitorStatsEmptyState(t *testing.T) {
 		t.Fatalf("nil maps: stage = %v outbox = %v",
 			stats.DocumentJobsByStage, stats.OutboxByStatus)
 	}
-	if stats.OldestQueuedSeconds != 0 || stats.OldestPendingOutboxSeconds != 0 ||
+	if stats.OldestQueuedSeconds != 0 || stats.OldestOutboxRecordSeconds != 0 ||
 		stats.OldestActiveSearchSeconds != 0 {
 		t.Fatalf("empty ages = %v/%v/%v", stats.OldestQueuedSeconds,
-			stats.OldestPendingOutboxSeconds, stats.OldestActiveSearchSeconds)
+			stats.OldestOutboxRecordSeconds, stats.OldestActiveSearchSeconds)
 	}
 	if stats.Documents != 0 || stats.KnowledgeBases != 0 ||
 		stats.ResultSnapshots != 0 || stats.ArtifactSnapshots != 0 {

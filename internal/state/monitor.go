@@ -7,12 +7,6 @@ import (
 	"time"
 )
 
-// documentOutboxPendingStatus is the stored value of a queued outbox row.
-// document_job_outbox.status is a case-sensitive identifier column, so the
-// aggregate query must use the same upper-case literal that DocumentJobs writes
-// (see the "PENDING" inserts in document_jobs.go).
-const documentOutboxPendingStatus = "PENDING"
-
 // MonitorStats is the read-only queue and library snapshot behind the Console
 // monitoring page. Every field comes from a COUNT/MIN/GROUP BY aggregate: the
 // queries never select job content, search arguments, error payloads, or any
@@ -35,8 +29,11 @@ type MonitorStats struct {
 	// OutboxByStatus counts document_job_outbox rows per status; the keys are
 	// the stored values (PENDING, PUBLISHED).
 	OutboxByStatus map[string]int
-	// OldestPendingOutboxSeconds is the age of the oldest PENDING outbox row.
-	OldestPendingOutboxSeconds float64
+	// OldestOutboxRecordSeconds is the age of the oldest outbox row across all
+	// statuses, i.e. a retention age rather than a delivery lag. In the Debezium
+	// deployment the service never writes PUBLISHED back, so PENDING rows are
+	// retained delivery records, not undelivered backlog.
+	OldestOutboxRecordSeconds float64
 
 	// SearchByStatus counts search_tasks per status with the five known states
 	// always present (zero when absent).
@@ -122,11 +119,10 @@ func (s *Stores) MonitorStats(ctx context.Context, now time.Time, recentWindow t
 		stats.OutboxByStatus = map[string]int{}
 	}
 
-	stats.OldestPendingOutboxSeconds, err = s.monitorOldestAgeSeconds(ctx,
-		"SELECT MIN(created_at) FROM document_job_outbox WHERE status = ?",
-		now, documentOutboxPendingStatus)
+	stats.OldestOutboxRecordSeconds, err = s.monitorOldestAgeSeconds(ctx,
+		"SELECT MIN(created_at) FROM document_job_outbox", now)
 	if err != nil {
-		return nil, fmt.Errorf("document_job_outbox 最旧待投递事件查询失败：%w", err)
+		return nil, fmt.Errorf("document_job_outbox 最旧记录查询失败：%w", err)
 	}
 
 	searchByStatus, err := s.monitorGroupCounts(ctx,

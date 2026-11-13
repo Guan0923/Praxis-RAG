@@ -51,16 +51,32 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
         stuck_processing: 0,
         failed_recent: 0,
       },
-      document_outbox: {
-        // outbox 的 status 在状态库中存大写字面量，页面必须仍能本地化。
-        by_status: { PENDING: 2, PUBLISHED: 5 },
-        oldest_pending_seconds: 0,
-      },
       search_tasks: {
         by_status: { queued: 0, processing: 0, succeeded: 3, failed: 0, timed_out: 0 },
         oldest_active_seconds: 0,
       },
       uploads: { unfinished: 0 },
+    },
+    // pipeline 把四个视图分开：outbox 记录（保留语义）、Debezium 采集、Kafka 消费、
+    // 文档任务状态。capture_progress 与 consumer_lag 为 null 时必须显示“未知”。
+    pipeline: {
+      outbox: {
+        // outbox 的 status 在状态库中存大写字面量，页面必须按“记录”语义本地化。
+        by_status: { PENDING: 2, PUBLISHED: 5 },
+        total: 7,
+        oldest_record_seconds: 90,
+      },
+      document_jobs: { status: "ok", detail: "文档任务正常，最近成功 10 个" },
+      debezium: { status: "unknown", detail: "未读取 Debezium 偏移", capture_progress: null },
+      kafka: {
+        status: "unknown",
+        detail: "未取得消费位点",
+        topic: "praxis.rag.document_jobs",
+        group: "rag-worker",
+        committed_offset: null,
+        end_offset: null,
+        consumer_lag: null,
+      },
     },
     library: { documents: 12, knowledge_bases: 2, result_snapshots: 0, artifact_snapshots: 3 },
     activity: { window_hours: 24, jobs_succeeded: 3, jobs_failed: 0, searches: 12 },
@@ -136,11 +152,33 @@ describe("MonitorPage", () => {
     const jobsBlock = screen.getByLabelText("文档任务队列");
     expect(within(jobsBlock).getByText("排队中 0")).toBeTruthy();
     expect(within(jobsBlock).getByText("处理中 1")).toBeTruthy();
+    // 文档任务 succeeded 是权威处理结果：即使 outbox 记录仍是 PENDING 也显示“成功”。
+    expect(within(jobsBlock).getByText("成功 10")).toBeTruthy();
     expect(within(jobsBlock).getByText("12 秒")).toBeTruthy();
     expect(within(jobsBlock).getByText("解析中")).toBeTruthy();
-    const outboxBlock = screen.getByLabelText("文档 Outbox 队列");
-    expect(within(outboxBlock).getByText("待投递 2")).toBeTruthy();
-    expect(within(outboxBlock).getByText("已投递 5")).toBeTruthy();
+
+    // Outbox 是“记录”统计而不是待投递积压：不出现 待投递/已投递 文案。
+    const outboxBlock = screen.getByLabelText("Outbox 记录");
+    expect(within(outboxBlock).getByText("PENDING 记录 2")).toBeTruthy();
+    expect(within(outboxBlock).getByText("PUBLISHED 记录 5")).toBeTruthy();
+    expect(within(outboxBlock).getByText("7 条")).toBeTruthy();
+    expect(within(outboxBlock).getByText("最老记录")).toBeTruthy();
+    expect(within(outboxBlock).getByText("1 分 30 秒")).toBeTruthy();
+    expect(within(outboxBlock).getByText(/不代表未投递积压/)).toBeTruthy();
+    expect(within(outboxBlock).queryByText(/待投递/)).toBeNull();
+
+    // 投递与消费进度：Debezium / Kafka / 文档任务状态三行分开，未知进度显示“未知”。
+    const pipelineBlock = screen.getByLabelText("投递与消费进度");
+    expect(within(pipelineBlock).getByText("Debezium 采集")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("未读取 Debezium 偏移")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("采集进度：未知（需在 Debezium 侧查看）")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("Kafka 消费")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("消费滞后：未知")).toBeTruthy();
+    expect(within(pipelineBlock).getByText(/Topic：praxis\.rag\.document_jobs/)).toBeTruthy();
+    expect(within(pipelineBlock).getByText("文档任务状态")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("文档任务正常，最近成功 10 个")).toBeTruthy();
+    // 文档任务状态显示“正常”，与 outbox 保留记录相互独立。
+    expect(within(pipelineBlock).getByText("正常")).toBeTruthy();
 
     // 资料库与活动统计。
     const libraryCard = screen.getByText("资料库").closest(".ant-card") as HTMLElement;
@@ -204,6 +242,59 @@ describe("MonitorPage", () => {
     expect(await screen.findByText("0.4.0")).toBeTruthy();
     expect(screen.getByText("运行正常")).toBeTruthy();
     expect(screen.getAllByText("状态库暂不可用")).toHaveLength(3);
+
+    // 队列统计不可用时，文档任务降级为“未知”；Outbox 记录与进度仍各自可读。
+    const jobsBlock = screen.getByLabelText("文档任务队列");
+    expect(within(jobsBlock).getAllByText("未知")).toHaveLength(3);
+    const outboxBlock = screen.getByLabelText("Outbox 记录");
+    expect(within(outboxBlock).getByText("PENDING 记录 2")).toBeTruthy();
+    expect(within(outboxBlock).getByText("7 条")).toBeTruthy();
+  });
+
+  it("renders 未知 for every delivery view when the pipeline snapshot is missing", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(overviewFixture({ pipeline: null })));
+    renderPage();
+
+    expect(await screen.findByText("0.4.0")).toBeTruthy();
+    // 依赖表、资料库和活动不受 pipeline 缺失影响。
+    expect(screen.getByText("MySQL")).toBeTruthy();
+    expect(screen.getByText("资料库")).toBeTruthy();
+
+    const outboxBlock = screen.getByLabelText("Outbox 记录");
+    expect(within(outboxBlock).getAllByText("未知")).toHaveLength(2);
+    expect(within(outboxBlock).getByText(/不代表未投递积压/)).toBeTruthy();
+
+    const pipelineBlock = screen.getByLabelText("投递与消费进度");
+    // 三个状态标签与三行详情都降级为“未知”，不会显示 0 或伪造进度。
+    expect(within(pipelineBlock).getAllByText("未知").length).toBeGreaterThanOrEqual(6);
+    expect(within(pipelineBlock).getByText("采集进度：未知（需在 Debezium 侧查看）")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("消费滞后：未知")).toBeTruthy();
+    expect(within(pipelineBlock).getByText(/Topic：未知/)).toBeTruthy();
+  });
+
+  it("renders the numeric Kafka consumer lag when offsets are reported", async () => {
+    const fixture = overviewFixture();
+    fixture.pipeline = {
+      ...fixture.pipeline!,
+      kafka: {
+        status: "ok",
+        detail: "消费正常",
+        topic: "praxis.rag.document_jobs",
+        group: "rag-worker",
+        committed_offset: 95,
+        end_offset: 100,
+        consumer_lag: 5,
+      },
+    };
+    fetchMock.mockResolvedValue(jsonResponse(fixture));
+    renderPage();
+
+    expect(await screen.findByText("0.4.0")).toBeTruthy();
+    const pipelineBlock = screen.getByLabelText("投递与消费进度");
+    expect(within(pipelineBlock).getByText("消费滞后：5 条（已提交 95 / 末尾 100）")).toBeTruthy();
+    expect(within(pipelineBlock).queryByText("消费滞后：未知")).toBeNull();
+    // Kafka 与文档任务两行都是“正常”。
+    expect(within(pipelineBlock).getAllByText("正常")).toHaveLength(2);
   });
 
   it("starts with auto refresh on and refreshes on demand", async () => {

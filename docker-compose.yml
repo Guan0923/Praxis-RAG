@@ -131,6 +131,10 @@ services:
       RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
       DEBEZIUM_SERVER_ID: ${DEBEZIUM_SERVER_ID:-184054}
       QUARKUS_LOG_LEVEL: ${DEBEZIUM_LOG_LEVEL:-INFO}
+    ports:
+      # Loopback-only Quarkus health endpoint (/q/health) used by the Console
+      # monitor. It reports connector liveness, not the capture offset.
+      - "127.0.0.1:${RAG_DEBEZIUM_PORT:-8083}:8080"
     volumes:
       # Debezium Server reads its config from /debezium/config (not /debezium/conf).
       - ./deploy/debezium/application.properties:/debezium/config/application.properties:ro
@@ -239,6 +243,10 @@ services:
       RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
       RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
       RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      # Optional read-only Debezium health probe for the Console monitor. It only
+      # proves the connector process is up; the binlog capture offset lives in
+      # Debezium, so the page still reports capture progress as 未知.
+      RAG_DEBEZIUM_HEALTH_URL: ${RAG_APP_DEBEZIUM_HEALTH_URL:-http://debezium:8080/q/health}
       # PDF parsing: the default docling engine calls the pdf-parser sidecar
       # over HTTP (zip manifest + assets). Set RAG_PDF_ENGINE=go to use the
       # in-process text-only parser and drop the pdf-parser dependency.

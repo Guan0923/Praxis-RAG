@@ -13,7 +13,9 @@ import {
   monitorDependencyStatusLabels,
   uploadJobStageLabels,
   type MonitorDependency,
+  type MonitorDependencyStatus,
   type MonitorOverview,
+  type MonitorPipelineKafka,
 } from "./api";
 
 // monitorRefreshMs is the auto-refresh period: the backend does not push
@@ -22,23 +24,26 @@ import {
 const monitorRefreshMs = 15_000;
 
 // Queue statuses are rendered as compact count tags. document_jobs and
-// search_tasks share the first four states; the outbox uses delivery wording so
-// "published" is not reported as indexed. The outbox stores its status as an
-// upper-case literal ("PENDING" / "PUBLISHED") while the other queues are
-// lower-case, so the outbox map carries both spellings.
+// search_tasks share the first four states.
 const documentJobStatusLabels: Record<string, string> = {
   queued: "排队中",
   processing: "处理中",
   succeeded: "成功",
   failed: "失败",
 };
-const outboxStatusLabels: Record<string, string> = {
-  pending: "待投递",
-  published: "已投递",
-  failed: "失败",
-  PENDING: "待投递",
-  PUBLISHED: "已投递",
-  FAILED: "失败",
+// Outbox rows are retained records, not deliveries still waiting to happen: the
+// application never writes PUBLISHED back by design, Debezium captures the rows
+// and Kafka records consumption progress. The copy therefore describes record
+// state only and never says 待投递/已投递 or reports a delivery backlog. The
+// outbox stores its status as an upper-case literal ("PENDING" / "PUBLISHED"),
+// so the map carries both spellings.
+const outboxRecordStatusLabels: Record<string, string> = {
+  pending: "PENDING 记录",
+  published: "PUBLISHED 记录",
+  failed: "FAILED 记录",
+  PENDING: "PENDING 记录",
+  PUBLISHED: "PUBLISHED 记录",
+  FAILED: "FAILED 记录",
 };
 const searchTaskStatusLabels: Record<string, string> = {
   queued: "排队中",
@@ -154,13 +159,50 @@ function DependencyTable({ dependencies }: { dependencies: MonitorDependency[] }
   );
 }
 
+// PipelineStatusTag renders one delivery/consumption section status with the
+// same vocabulary as the dependency probes. A missing section stays 未知
+// instead of being reported as healthy.
+function PipelineStatusTag({ status }: { status?: MonitorDependencyStatus }) {
+  if (!status) return <Tag>未知</Tag>;
+  return (
+    <Tag color={monitorDependencyStatusColors[status] || "default"}>
+      {monitorDependencyStatusLabels[status] || "未知"}
+    </Tag>
+  );
+}
+
+// captureProgressText never invents a Debezium capture percentage: the service
+// does not read Debezium offsets, so the only honest value is 未知.
+function captureProgressText(progress?: number | null) {
+  return typeof progress === "number" && Number.isFinite(progress)
+    ? `采集进度：${progress}`
+    : "采集进度：未知（需在 Debezium 侧查看）";
+}
+
+// kafkaLagText keeps Kafka consumer lag apart from outbox records: the lag is
+// only shown when Kafka itself reports it, otherwise it stays 未知.
+function kafkaLagText(kafka?: MonitorPipelineKafka | null) {
+  const lag = kafka?.consumer_lag;
+  if (typeof lag !== "number" || !Number.isFinite(lag)) return "消费滞后：未知";
+  const committed = typeof kafka?.committed_offset === "number"
+    ? kafka.committed_offset.toLocaleString()
+    : "未知";
+  const end = typeof kafka?.end_offset === "number"
+    ? kafka.end_offset.toLocaleString()
+    : "未知";
+  return `消费滞后：${lag.toLocaleString()} 条（已提交 ${committed} / 末尾 ${end}）`;
+}
+
 // MonitorSnapshot renders one successfully fetched overview. It is a separate
-// component so every section can narrow null queues/library/activity without
-// repeating guards in the page shell.
+// component so every section can narrow null queues/pipeline/library/activity
+// without repeating guards in the page shell.
 function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
-  const { service, dependencies, queues, library, activity } = overview;
+  const { service, dependencies, queues, pipeline, library, activity } = overview;
   const jobs = queues?.document_jobs;
-  const outbox = queues?.document_outbox;
+  const outbox = pipeline?.outbox;
+  const pipelineJobs = pipeline?.document_jobs;
+  const debezium = pipeline?.debezium;
+  const kafka = pipeline?.kafka;
   const searchTasks = queues?.search_tasks;
   const uploads = queues?.uploads;
   const stages = Object.entries(jobs?.by_stage || {}).map(([stage, count]) => ({ stage, count }));
@@ -187,73 +229,121 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
       <Card size="small" title="依赖状态">
         <DependencyTable dependencies={dependencies} />
       </Card>
-      {queues ? (
-        <Card size="small" title="队列与积压">
-          <Row gutter={[16, 16]}>
-            <Col xs={24} xl={12}>
-              <section className="monitor-block" aria-label="文档任务队列">
-                <h3>文档任务</h3>
-                <QueueStatusTags counts={jobs?.by_status} labels={documentJobStatusLabels} />
+      <Card size="small" title="队列与处理进度">
+        <Row gutter={[16, 16]}>
+          <Col xs={24} xl={12}>
+            <section className="monitor-block" aria-label="文档任务队列">
+              <h3>文档任务</h3>
+              <QueueStatusTags counts={jobs?.by_status} labels={documentJobStatusLabels} />
+              <Descriptions
+                size="small"
+                column={1}
+                items={[
+                  { key: "oldest", label: "最老排队", children: queues ? formatDuration(jobs?.oldest_queued_seconds) : "未知" },
+                  { key: "stuck", label: "卡死处理中", children: queues ? `${jobs?.stuck_processing ?? 0} 个` : "未知" },
+                  { key: "failed", label: "近 24 小时失败", children: queues ? `${jobs?.failed_recent ?? 0} 个` : "未知" },
+                ]}
+              />
+              <h3>阶段分布</h3>
+              <Table
+                rowKey="stage"
+                size="small"
+                pagination={false}
+                dataSource={stages}
+                locale={{ emptyText: queues ? "暂无处理中任务" : "状态库暂不可用" }}
+                columns={[
+                  {
+                    title: "阶段",
+                    dataIndex: "stage",
+                    render: (stage: string) => uploadJobStageLabels[stage] || stage,
+                  },
+                  { title: "任务数", dataIndex: "count", width: 100 },
+                ]}
+              />
+            </section>
+          </Col>
+          <Col xs={24} xl={12}>
+            <section className="monitor-block" aria-label="Outbox 记录">
+              <h3>Outbox 记录</h3>
+              {outbox ? (
+                <>
+                  <QueueStatusTags counts={outbox.by_status} labels={outboxRecordStatusLabels} />
+                  <Descriptions
+                    size="small"
+                    column={1}
+                    items={[
+                      { key: "total", label: "记录总数", children: `${outbox.total} 条` },
+                      { key: "oldest", label: "最老记录", children: formatDuration(outbox.oldest_record_seconds) },
+                    ]}
+                  />
+                </>
+              ) : (
                 <Descriptions
                   size="small"
                   column={1}
                   items={[
-                    { key: "oldest", label: "最老排队", children: formatDuration(jobs?.oldest_queued_seconds) },
-                    { key: "stuck", label: "卡死处理中", children: `${jobs?.stuck_processing ?? 0} 个` },
-                    { key: "failed", label: "近 24 小时失败", children: `${jobs?.failed_recent ?? 0} 个` },
+                    { key: "total", label: "记录总数", children: "未知" },
+                    { key: "oldest", label: "最老记录", children: "未知" },
                   ]}
                 />
-                <h3>阶段分布</h3>
-                <Table
-                  rowKey="stage"
-                  size="small"
-                  pagination={false}
-                  dataSource={stages}
-                  locale={{ emptyText: "暂无处理中任务" }}
-                  columns={[
-                    {
-                      title: "阶段",
-                      dataIndex: "stage",
-                      render: (stage: string) => uploadJobStageLabels[stage] || stage,
-                    },
-                    { title: "任务数", dataIndex: "count", width: 100 },
-                  ]}
-                />
-              </section>
-            </Col>
-            <Col xs={24} xl={12}>
-              <section className="monitor-block" aria-label="文档 Outbox 队列">
-                <h3>文档 Outbox</h3>
-                <QueueStatusTags counts={outbox?.by_status} labels={outboxStatusLabels} />
-                <Descriptions
-                  size="small"
-                  column={1}
-                  items={[
-                    { key: "oldest", label: "最老待投递", children: formatDuration(outbox?.oldest_pending_seconds) },
-                  ]}
-                />
-              </section>
-              <section className="monitor-block" aria-label="检索任务队列">
-                <h3>检索任务</h3>
-                <QueueStatusTags counts={searchTasks?.by_status} labels={searchTaskStatusLabels} />
-                <Descriptions
-                  size="small"
-                  column={1}
-                  items={[
-                    { key: "oldest", label: "最老活跃", children: formatDuration(searchTasks?.oldest_active_seconds) },
-                  ]}
-                />
-              </section>
-              <section className="monitor-block" aria-label="上传队列">
-                <h3>上传</h3>
-                <Statistic title="未完成上传" value={uploads?.unfinished ?? 0} />
-              </section>
-            </Col>
-          </Row>
-        </Card>
-      ) : (
-        <UnavailableCard title="队列与积压" />
-      )}
+              )}
+              <p className="secondary monitor-outbox-note">
+                Outbox 记录在保留期内可能仍为 PENDING，由 Debezium 投递；该计数不代表未投递积压。
+              </p>
+            </section>
+            <section className="monitor-block" aria-label="检索任务队列">
+              <h3>检索任务</h3>
+              <QueueStatusTags counts={searchTasks?.by_status} labels={searchTaskStatusLabels} />
+              <Descriptions
+                size="small"
+                column={1}
+                items={[
+                  { key: "oldest", label: "最老活跃", children: queues ? formatDuration(searchTasks?.oldest_active_seconds) : "未知" },
+                ]}
+              />
+            </section>
+            <section className="monitor-block" aria-label="上传队列">
+              <h3>上传</h3>
+              {uploads ? (
+                <Statistic title="未完成上传" value={uploads.unfinished} />
+              ) : (
+                <span className="secondary">未完成上传：未知</span>
+              )}
+            </section>
+          </Col>
+        </Row>
+        <section className="monitor-block" aria-label="投递与消费进度">
+          <h3>投递与消费进度</h3>
+          <Flex vertical gap={12}>
+            <div className="monitor-progress-row">
+              <Flex wrap gap={8} align="center">
+                <strong>Debezium 采集</strong>
+                <PipelineStatusTag status={debezium?.status} />
+                <span className="secondary break-text">{debezium?.detail || "未知"}</span>
+              </Flex>
+              <span>{captureProgressText(debezium?.capture_progress)}</span>
+            </div>
+            <div className="monitor-progress-row">
+              <Flex wrap gap={8} align="center">
+                <strong>Kafka 消费</strong>
+                <PipelineStatusTag status={kafka?.status} />
+                <span className="secondary break-text">{kafka?.detail || "未知"}</span>
+              </Flex>
+              <span className="secondary break-text">
+                Topic：{kafka?.topic || "未知"}　Consumer Group：{kafka?.group || "未知"}
+              </span>
+              <span>{kafkaLagText(kafka)}</span>
+            </div>
+            <div className="monitor-progress-row">
+              <Flex wrap gap={8} align="center">
+                <strong>文档任务状态</strong>
+                <PipelineStatusTag status={pipelineJobs?.status} />
+                <span className="secondary break-text">{pipelineJobs?.detail || "未知"}</span>
+              </Flex>
+            </div>
+          </Flex>
+        </section>
+      </Card>
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={12}>
           {library ? (
@@ -288,8 +378,10 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
 }
 
 // MonitorPage is the read-only system overview for administrators. It shows the
-// backend service facts, the five dependency probes and the queue/library
-// backlogs, auto-refreshing every 15 seconds while the switch stays on.
+// backend service facts, the five dependency probes, the document-job queue, the
+// outbox record statistics and the delivery/consumption progress (Debezium
+// capture, Kafka consumer lag, document task status), auto-refreshing every 15
+// seconds while the switch stays on.
 export function MonitorPage() {
   const [overview, setOverview] = useState<MonitorOverview>();
   const [loading, setLoading] = useState(true);
