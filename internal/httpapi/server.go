@@ -38,6 +38,18 @@ func WithUserAuth(users UserAuth) Option {
 	return func(s *Server) { s.users = users }
 }
 
+// WithAccountProfile enables the personal-profile endpoints (e-mail
+// registration, avatar, password and mail-verified e-mail changes). It is kept
+// separate from UserAuth so existing fakes of UserAuth keep working.
+func WithAccountProfile(profile AccountProfile) Option {
+	return func(s *Server) { s.account = profile }
+}
+
+// WithMailAdmin enables the administrator SMTP settings endpoints.
+func WithMailAdmin(admin MailAdmin) Option {
+	return func(s *Server) { s.mailAdmin = admin }
+}
+
 // ChangeNotifier receives catalog mutations so the MCP layer can publish
 // tools/list_changed and prompts/list_changed notifications, plus document
 // mutations for resources/list_changed and resources/updated.
@@ -64,27 +76,30 @@ func WithChangeNotifier(notifier ChangeNotifier) Option {
 
 // Server hosts the REST API, MCP endpoint, and Console static assets.
 type Server struct {
-	settings      config.ServiceSettings
-	status        StatusProvider
-	keys          KeyLookup
-	keyStore      APIKeyStore
-	runtime       Runtime
-	mcpHandler    http.Handler
-	logger        *slog.Logger
-	router        *router
-	webRoot       string
-	catalog       catalog.Store
-	tools         ToolRegistry
-	kbAdmin       KnowledgeBaseAdminRuntime
-	kbSelfCreate  KnowledgeBaseSelfCreateRuntime
-	modelProfiles ModelProfileRuntime
-	monitor       MonitorRuntime
-	notifier      ChangeNotifier
-	users         UserAuth
-	access        AccessControl
-	limiter       *loginLimiter
-	docNotifier   DocumentChangeNotifier
-	handler       http.Handler
+	settings       config.ServiceSettings
+	status         StatusProvider
+	keys           KeyLookup
+	keyStore       APIKeyStore
+	runtime        Runtime
+	mcpHandler     http.Handler
+	logger         *slog.Logger
+	router         *router
+	webRoot        string
+	catalog        catalog.Store
+	tools          ToolRegistry
+	kbAdmin        KnowledgeBaseAdminRuntime
+	kbSelfCreate   KnowledgeBaseSelfCreateRuntime
+	modelProfiles  ModelProfileRuntime
+	monitor        MonitorRuntime
+	notifier       ChangeNotifier
+	users          UserAuth
+	account        AccountProfile
+	mailAdmin      MailAdmin
+	access         AccessControl
+	limiter        *loginLimiter
+	accountLimiter *rateLimiter
+	docNotifier    DocumentChangeNotifier
+	handler        http.Handler
 }
 
 // New builds the HTTP server. A nil StatusProvider falls back to a static
@@ -97,13 +112,14 @@ func New(settings config.ServiceSettings, status StatusProvider, keys KeyLookup,
 		status = staticStatus{}
 	}
 	server := &Server{
-		settings: settings,
-		status:   status,
-		keys:     keys,
-		logger:   logger,
-		router:   newRouter(),
-		limiter:  newLoginLimiter(),
-		webRoot:  resolveWebRoot(settings.WebRoot),
+		settings:       settings,
+		status:         status,
+		keys:           keys,
+		logger:         logger,
+		router:         newRouter(),
+		limiter:        newLoginLimiter(),
+		accountLimiter: newRateLimiter(),
+		webRoot:        resolveWebRoot(settings.WebRoot),
 	}
 	for _, option := range options {
 		option(server)
@@ -157,6 +173,7 @@ func (s *Server) registerRoutes() {
 	s.registerKnowledgeBaseAdminRoutes()
 	s.registerModelProfileRoutes()
 	s.registerUserAuthRoutes()
+	s.registerProfileRoutes()
 	s.registerAccessRoutes()
 	s.router.add("POST", "/mcp", authMCP, s.handleMCP)
 	s.router.add("GET", "/mcp", authMCP, s.handleMCP)

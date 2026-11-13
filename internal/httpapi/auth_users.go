@@ -41,10 +41,13 @@ type UserAuth interface {
 	DeleteUser(ctx context.Context, userID string) (bool, error)
 }
 
-// authBody is the registration/login request payload.
+// authBody is the registration/login request payload. Email and Code are only
+// used by the extended registration flow; login ignores them.
 type authBody struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+	Email    string `json:"email"`
+	Code     string `json:"code"`
 }
 
 // userUpdateBody is the user-management patch payload.
@@ -123,9 +126,10 @@ func (s *Server) authEnabled() bool { return s.settings.AuthEnabled && s.users !
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	payload := map[string]any{
-		"auth_enabled":         s.authEnabled(),
-		"registration_enabled": false,
-		"authenticated":        false,
+		"auth_enabled":               s.authEnabled(),
+		"registration_enabled":       false,
+		"email_verification_enabled": s.registrationVerificationEnabled(r.Context()),
+		"authenticated":              false,
 	}
 	if !s.authEnabled() {
 		// Legacy mode: the Console keeps its token/loopback behaviour.
@@ -154,12 +158,32 @@ func (s *Server) handleAuthRegister(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	login, err := s.users.Register(r.Context(), body.Username, body.Password)
+	login, err := s.registerAccount(r.Context(), body)
 	if err != nil {
 		writeAuthError(w, err)
 		return
 	}
 	s.writeLogin(w, http.StatusCreated, login)
+}
+
+// registerAccount routes the registration to the profile-aware service when it
+// is wired and keeps the legacy username/password path otherwise.
+func (s *Server) registerAccount(ctx context.Context, body authBody) (auth.Login, error) {
+	if s.account == nil {
+		return s.users.Register(ctx, body.Username, body.Password)
+	}
+	return s.account.RegisterAccount(ctx, auth.RegisterInput{
+		Username: body.Username,
+		Password: body.Password,
+		Email:    body.Email,
+		Code:     body.Code,
+	})
+}
+
+// registrationVerificationEnabled reports whether the extended registration
+// requires a verified e-mail address.
+func (s *Server) registrationVerificationEnabled(ctx context.Context) bool {
+	return s.account != nil && s.account.RegistrationVerificationEnabled(ctx)
 }
 
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
@@ -387,17 +411,29 @@ func loginAttemptKey(r *http.Request, username string) string {
 	return strings.ToLower(strings.TrimSpace(host)) + "|" + strings.ToLower(strings.TrimSpace(username))
 }
 
-// userPayload is the public JSON shape of an account.
+// userPayload is the public JSON shape of an account. Profile fields with no
+// value are omitted; email and gender are always present so the Console can
+// render the form without guessing.
 func userPayload(user state.User) map[string]any {
 	payload := map[string]any{
-		"id":         user.ID,
-		"username":   user.Username,
-		"role":       user.Role,
-		"enabled":    user.Enabled,
-		"created_at": user.CreatedAt,
+		"id":             user.ID,
+		"username":       user.Username,
+		"role":           user.Role,
+		"enabled":        user.Enabled,
+		"created_at":     user.CreatedAt,
+		"email":          user.Email,
+		"email_verified": user.EmailVerified,
+		"gender":         user.Gender,
+		"has_avatar":     user.AvatarUpdatedAt != nil,
 	}
 	if user.LastLoginAt != nil {
 		payload["last_login_at"] = *user.LastLoginAt
+	}
+	if user.Age != nil {
+		payload["age"] = *user.Age
+	}
+	if user.AvatarUpdatedAt != nil {
+		payload["avatar_updated_at"] = *user.AvatarUpdatedAt
 	}
 	return payload
 }
@@ -420,6 +456,8 @@ func writeAuthError(w http.ResponseWriter, err error) {
 		writeDetail(w, http.StatusConflict, authError.Message)
 	case auth.KindNotFound:
 		writeDetail(w, http.StatusNotFound, authError.Message)
+	case auth.KindUnavailable:
+		writeDetail(w, http.StatusServiceUnavailable, authError.Message)
 	default:
 		writeDetail(w, http.StatusInternalServerError, "认证服务异常")
 	}

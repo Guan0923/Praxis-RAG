@@ -1,5 +1,12 @@
 export type Connection = { namespace: string; token: string };
 export type Role = "admin" | "vip" | "user";
+// Gender keeps the lowercase literals stored by the server; "" means unset.
+export type Gender = "male" | "female" | "other";
+export const genderLabels: Record<Gender, string> = {
+  male: "男",
+  female: "女",
+  other: "其他",
+};
 export type AuthUser = {
   id: string;
   username: string;
@@ -7,6 +14,14 @@ export type AuthUser = {
   enabled: boolean;
   created_at?: string;
   last_login_at?: string;
+  // Profile fields stay optional: an account without an email or avatar still
+  // returns the rest of the shared user projection.
+  email?: string;
+  email_verified?: boolean;
+  age?: number | null;
+  gender?: Gender | "";
+  has_avatar?: boolean;
+  avatar_updated_at?: string;
 };
 export const roleLabels: Record<Role, string> = {
   admin: "管理员",
@@ -21,6 +36,9 @@ export type AuthStatus = {
   auth_enabled: boolean;
   registration_enabled: boolean;
   authenticated: boolean;
+  // email_verification_enabled mirrors the SMTP configuration: when the admin
+  // has configured a mail server, registration requires email + code.
+  email_verification_enabled?: boolean;
   user?: AuthUser;
 };
 export type AuthSession = { user: AuthUser; csrf_token: string; expires_at?: string };
@@ -584,13 +602,157 @@ export async function login(username: string, password: string): Promise<AuthSes
   return session;
 }
 
-export async function registerAccount(username: string, password: string): Promise<AuthSession> {
+export type RegisterAccountInput = {
+  username: string;
+  password: string;
+  email?: string;
+  code?: string;
+};
+
+// registerAccount keeps the legacy username/password flow while the server has
+// no mail server configured; otherwise the email verification code is required.
+export async function registerAccount(input: RegisterAccountInput): Promise<AuthSession> {
+  const body: Record<string, string> = {
+    username: input.username.trim(),
+    password: input.password,
+  };
+  const email = input.email?.trim() || "";
+  const code = input.code?.trim() || "";
+  if (email) body.email = email;
+  if (code) body.code = code;
   const session = await api<AuthSession>("/v1/auth/register", undefined, {
     method: "POST",
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify(body),
   });
   setCSRFToken(session.csrf_token);
   return session;
+}
+
+// requestRegisterCode mails a 6-digit code to the address being registered.
+export async function requestRegisterCode(email: string): Promise<void> {
+  await apiResponse("/v1/auth/register/code", undefined, {
+    method: "POST",
+    body: JSON.stringify({ email: email.trim() }),
+  });
+}
+
+export type ProfileUpdate = {
+  username: string;
+  age: number | null;
+  gender: Gender | "";
+};
+
+// updateProfile always sends all three fields: age:null and gender:"" clear
+// the corresponding profile value on the server.
+export async function updateProfile(input: ProfileUpdate): Promise<AuthUser> {
+  const payload = await api<{ user: AuthUser }>("/v1/auth/profile", undefined, {
+    method: "PATCH",
+    body: JSON.stringify({
+      username: input.username.trim(),
+      age: input.age,
+      gender: input.gender,
+    }),
+  });
+  return payload.user;
+}
+
+export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  await apiResponse("/v1/auth/password", undefined, {
+    method: "POST",
+    body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+  });
+}
+
+// requestEmailChange verifies the current password and mails a code to the new
+// address. A wrong password is a validation error, not a session expiry.
+export async function requestEmailChange(email: string, password: string): Promise<void> {
+  await apiResponse("/v1/auth/email/change/code", undefined, {
+    method: "POST",
+    body: JSON.stringify({ email: email.trim(), password }),
+  });
+}
+
+export async function changeEmail(email: string, code: string): Promise<AuthUser> {
+  const payload = await api<{ user: AuthUser }>("/v1/auth/email/change", undefined, {
+    method: "POST",
+    body: JSON.stringify({ email: email.trim(), code: code.trim() }),
+  });
+  return payload.user;
+}
+
+// uploadAvatar posts one multipart part. apiResponse() only sets a Content-Type
+// for string bodies, so FormData keeps its own multipart boundary.
+export async function uploadAvatar(file: File): Promise<AuthUser> {
+  const body = new FormData();
+  body.append("avatar", file, file.name);
+  const payload = await api<{ user: AuthUser }>("/v1/auth/avatar", undefined, {
+    method: "PUT",
+    body,
+  });
+  return payload.user;
+}
+
+export async function deleteAvatar(): Promise<void> {
+  await apiResponse("/v1/auth/avatar", undefined, { method: "DELETE" });
+}
+
+// avatarUrl points at the session-scoped avatar route. The version busts the
+// browser cache after an upload or removal.
+export function avatarUrl(version?: string) {
+  return version ? `/v1/auth/avatar?v=${encodeURIComponent(version)}` : "/v1/auth/avatar";
+}
+
+// --- Mail server settings (admin) ------------------------------------------
+export type MailTLS = "none" | "starttls" | "tls";
+export const mailTLSLabels: Record<MailTLS, string> = {
+  none: "无",
+  starttls: "STARTTLS",
+  tls: "SSL",
+};
+// MailSettings is the admin projection: it never carries the SMTP password,
+// only password_set so the form can hint that a password is stored. The server
+// also derives `configured` (enabled + host + from) for convenience.
+export type MailSettings = {
+  enabled: boolean;
+  host: string;
+  port: number;
+  tls: MailTLS;
+  username: string;
+  password_set: boolean;
+  from: string;
+  configured?: boolean;
+};
+export type MailSettingsInput = {
+  enabled: boolean;
+  host: string;
+  port: number;
+  tls: MailTLS;
+  username: string;
+  password: string;
+  from: string;
+};
+
+export async function fetchMailSettings(): Promise<MailSettings> {
+  const payload = await api<{ settings: MailSettings }>("/v1/admin/mail-settings", undefined, {
+    cache: "no-store",
+  });
+  return payload.settings;
+}
+
+// saveMailSettings sends an empty password to keep the stored one.
+export async function saveMailSettings(input: MailSettingsInput): Promise<MailSettings> {
+  const payload = await api<{ settings: MailSettings }>("/v1/admin/mail-settings", undefined, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+  return payload.settings;
+}
+
+export async function sendTestMail(to: string): Promise<void> {
+  await apiResponse("/v1/admin/mail-settings/test", undefined, {
+    method: "POST",
+    body: JSON.stringify({ to: to.trim() }),
+  });
 }
 
 export async function logoutSession() {

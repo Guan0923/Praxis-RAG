@@ -71,6 +71,9 @@ type Stores struct {
 	APIKeys        *APIKeyRepository
 	Users          *UserRepository
 	Sessions       *UserSessionRepository
+	Avatars        *UserAvatarRepository
+	EmailCodes     *EmailVerificationRepository
+	AppSettings    *AppSettingsRepository
 	Permissions    *PermissionRepository
 	Invitations    *InvitationRepository
 	ModelProfiles  *ModelProfileRepository
@@ -177,6 +180,9 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.APIKeys = newAPIKeyRepository(database, settings.EncryptionKey, cacheSync)
 	stores.Users = newUserRepository(database)
 	stores.Sessions = newUserSessionRepository(database)
+	stores.Avatars = newUserAvatarRepository(database)
+	stores.EmailCodes = newEmailVerificationRepository(database)
+	stores.AppSettings = newAppSettingsRepository(database)
 	stores.Permissions = newPermissionRepository(database)
 	stores.Invitations = newInvitationRepository(database)
 	stores.ModelProfiles = newModelProfileRepository(database)
@@ -416,6 +422,9 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	if err := s.migrateAPIKeyOwner(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateUserProfile(ctx); err != nil {
+		return err
+	}
 	return s.migrateDocumentOutbox(ctx)
 }
 
@@ -634,6 +643,68 @@ func (s *Stores) migrateDocumentOutbox(ctx context.Context) error {
 			return execErr
 		}
 		columns = append(columns, addition.name)
+	}
+	return nil
+}
+
+// migrateUserProfile adds the account profile columns (email/email_verified/
+// age/gender) and the uq_users_email unique index to an existing users table.
+// The columns are nullable or defaulted, so rows created before the profile
+// existed stay valid. Concurrent startup may race the ALTER/CREATE INDEX; only an
+// independently confirmed existing object is accepted.
+func (s *Stores) migrateUserProfile(ctx context.Context) error {
+	const (
+		table     = "users"
+		indexName = "uq_users_email"
+	)
+	additions := []struct {
+		name       string
+		definition string
+	}{
+		{"email", "VARCHAR(254) COLLATE utf8mb4_bin NULL"},
+		{"email_verified", "BOOL NOT NULL DEFAULT 0"},
+		{"age", "INTEGER NULL"},
+		{"gender", "VARCHAR(16) NULL"},
+	}
+	exists, err := s.hasTable(ctx, table)
+	if err != nil || !exists {
+		return err
+	}
+	columns, err := s.tableColumns(ctx, table)
+	if err != nil {
+		return err
+	}
+	for _, addition := range additions {
+		if containsString(columns, addition.name) {
+			continue
+		}
+		statement := "ALTER TABLE " + quoteIdentifier(table) +
+			" ADD COLUMN " + quoteIdentifier(addition.name) + " " + addition.definition
+		if _, execErr := s.DB.ExecContext(ctx, statement); execErr != nil {
+			confirmed, confirmErr := s.tableColumns(ctx, table)
+			if confirmErr == nil && containsString(confirmed, addition.name) {
+				columns = append(columns, addition.name)
+				continue
+			}
+			return execErr
+		}
+		columns = append(columns, addition.name)
+	}
+	// The unique index keeps e-mail addresses unique while MySQL still allows
+	// many NULL rows for accounts without one.
+	if exists, err := s.hasIndex(ctx, table, indexName); err != nil {
+		return err
+	} else if exists {
+		return nil
+	}
+	statement := "CREATE UNIQUE INDEX " + quoteIdentifier(indexName) +
+		" ON " + quoteIdentifier(table) + " (" + quoteIdentifier("email") + ")"
+	if _, err := s.DB.ExecContext(ctx, statement); err != nil {
+		confirmed, confirmErr := s.hasIndex(ctx, table, indexName)
+		if confirmErr == nil && confirmed {
+			return nil
+		}
+		return err
 	}
 	return nil
 }

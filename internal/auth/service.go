@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Guan0923/xinghe_rag/internal/mail"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
@@ -31,6 +32,9 @@ const (
 	KindConflict
 	// KindNotFound means the targeted account does not exist.
 	KindNotFound
+	// KindUnavailable means a dependency required for the operation (the mail
+	// server) is not configured.
+	KindUnavailable
 )
 
 // Error is a safe, user-facing auth failure.
@@ -56,6 +60,19 @@ const (
 	MessageLastAdmin          = "至少保留一名启用状态的管理员"
 	MessageUserNotFound       = "用户不存在"
 	MessageRoleInvalid        = "角色只能是 admin、vip 或 user"
+
+	// MessageEmail* and MessageMail* back the e-mail registration / profile
+	// flows; their wording is shared with the Console.
+	MessageEmailInvalid         = "请输入有效的邮箱地址"
+	MessageEmailTaken           = "该邮箱已被其他账号使用"
+	MessageEmailCodeRequired    = "请先获取并填写邮箱验证码"
+	MessageEmailCodeInvalid     = "验证码无效或已过期"
+	MessageEmailCodeTooFrequent = "验证码发送过于频繁，请稍后再试"
+	MessageMailUnavailable      = "邮件服务器未配置或未启用，请联系管理员"
+	MessageCurrentPasswordWrong = "当前密码不正确"
+	MessageAgeInvalid           = "年龄需为 1-150 之间的整数"
+	MessageGenderInvalid        = "性别只能是 male、female 或 other"
+	MessageAvatarInvalid        = "头像需为 PNG/JPEG/WEBP/GIF 图片且不超过 2MB"
 )
 
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{2,63}$`)
@@ -68,6 +85,12 @@ type Options struct {
 	SessionTTL time.Duration
 	// Now overrides the clock in tests.
 	Now func() time.Time
+	// Mail sends verification and test mail; nil disables e-mail verification.
+	Mail *mail.Service
+	// Codes persists the e-mail verification codes; nil disables them.
+	Codes *state.EmailVerificationRepository
+	// Avatars persists profile images; nil disables avatar uploads.
+	Avatars *state.UserAvatarRepository
 }
 
 // SessionUser is an authenticated account plus its session CSRF token.
@@ -91,6 +114,9 @@ type Service struct {
 	registration bool
 	ttl          time.Duration
 	now          func() time.Time
+	mail         *mail.Service
+	codes        *state.EmailVerificationRepository
+	avatars      *state.UserAvatarRepository
 }
 
 // NewService builds the auth service. A nil clock uses time.Now.
@@ -109,6 +135,9 @@ func NewService(users *state.UserRepository, sessions *state.UserSessionReposito
 		registration: options.RegistrationEnabled,
 		ttl:          ttl,
 		now:          clock,
+		mail:         options.Mail,
+		codes:        options.Codes,
+		avatars:      options.Avatars,
 	}
 }
 

@@ -2,16 +2,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   api,
   apiResponse,
+  avatarUrl,
+  changeEmail,
+  changePassword,
   createInvitation,
   createModelProfile,
   currentCSRFToken,
   deleteApiKeys,
+  deleteAvatar,
   deleteKnowledgeBases,
   deleteModelProfile,
   errorText,
   fetchAccess,
   fetchGrants,
   fetchInvitationInbox,
+  fetchMailSettings,
   fetchModelProfileModels,
   fetchModelProfiles,
   formatBytes,
@@ -24,12 +29,19 @@ import {
   modelKindLabels,
   modelKinds,
   permissionLabels,
+  registerAccount,
+  requestEmailChange,
+  requestRegisterCode,
   revealModelProfileKey,
   roleLabel,
+  saveMailSettings,
   scopeLabels,
+  sendTestMail,
   setCSRFToken,
   setUnauthorizedHandler,
   updateModelProfile,
+  updateProfile,
+  uploadAvatar,
   type Connection,
   type InvitationView,
 } from "./api";
@@ -501,5 +513,188 @@ describe("batch-delete API contract", () => {
     await expect(deleteKnowledgeBases(["kb-x"])).rejects.toThrow(
       "POST /v1/admin/knowledge-bases/batch-delete\nHTTP 404：namespace 不存在",
     );
+  });
+});
+
+describe("account profile and mail settings", () => {
+  function noContent() {
+    return {
+      ok: true,
+      status: 204,
+      statusText: "No Content",
+      json: async () => { throw new Error("没有响应体"); },
+      text: async () => "",
+    } as unknown as Response;
+  }
+
+  function user(overrides: Record<string, unknown> = {}) {
+    return { id: "u-1", username: "alice", role: "user", enabled: true, ...overrides };
+  }
+
+  it("sends the email verification code with a registration request", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ user: user(), csrf_token: "csrf-register" }));
+
+    const session = await registerAccount({
+      username: " alice ",
+      password: "password123",
+      email: " a@b.com ",
+      code: " 123456 ",
+    });
+
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/auth/register");
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(String(options.body))).toEqual({
+      username: "alice",
+      password: "password123",
+      email: "a@b.com",
+      code: "123456",
+    });
+    expect(session.csrf_token).toBe("csrf-register");
+    expect(currentCSRFToken()).toBe("csrf-register");
+  });
+
+  it("omits empty optional registration fields", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ user: user(), csrf_token: "csrf-plain" }));
+
+    await registerAccount({ username: "bob", password: "password123", email: "", code: "" });
+
+    expect(JSON.parse(String(requestArgs(0)[1].body))).toEqual({
+      username: "bob",
+      password: "password123",
+    });
+  });
+
+  it("requests a registration code and accepts an empty 204 body", async () => {
+    fetchMock.mockResolvedValue(noContent());
+
+    await requestRegisterCode(" a@b.com ");
+
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/auth/register/code");
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(String(options.body))).toEqual({ email: "a@b.com" });
+  });
+
+  it("updates all profile fields in one PATCH", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ user: user({ username: "alice2", age: 30, gender: "female" }) }));
+
+    const updated = await updateProfile({ username: " alice2 ", age: 30, gender: "female" });
+
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/auth/profile");
+    expect(options.method).toBe("PATCH");
+    expect(JSON.parse(String(options.body))).toEqual({
+      username: "alice2",
+      age: 30,
+      gender: "female",
+    });
+    expect(updated).toMatchObject({ username: "alice2", age: 30, gender: "female" });
+  });
+
+  it("clears age and gender when they are empty", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ user: user() }));
+
+    await updateProfile({ username: "alice", age: null, gender: "" });
+
+    expect(JSON.parse(String(requestArgs(0)[1].body))).toEqual({
+      username: "alice",
+      age: null,
+      gender: "",
+    });
+  });
+
+  it("posts the password, email-code and email-change requests", async () => {
+    fetchMock.mockResolvedValue(noContent());
+    await changePassword("oldpass123", "newpass123");
+    expect(requestArgs(0)[0]).toBe("/v1/auth/password");
+    expect(JSON.parse(String(requestArgs(0)[1].body))).toEqual({
+      current_password: "oldpass123",
+      new_password: "newpass123",
+    });
+
+    await requestEmailChange(" new@b.com ", "oldpass123");
+    expect(requestArgs(1)[0]).toBe("/v1/auth/email/change/code");
+    expect(JSON.parse(String(requestArgs(1)[1].body))).toEqual({
+      email: "new@b.com",
+      password: "oldpass123",
+    });
+
+    fetchMock.mockResolvedValue(jsonResponse({ user: user({ email: "new@b.com", email_verified: true }) }));
+    const updated = await changeEmail(" new@b.com ", " 654321 ");
+    expect(requestArgs(2)[0]).toBe("/v1/auth/email/change");
+    expect(JSON.parse(String(requestArgs(2)[1].body))).toEqual({ email: "new@b.com", code: "654321" });
+    expect(updated.email_verified).toBe(true);
+  });
+
+  it("uploads the avatar as multipart data without a JSON content type", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ user: user({ has_avatar: true, avatar_updated_at: "2026-11-13T10:00:00Z" }) }));
+
+    const file = new File(["avatar-bytes"], "avatar.png", { type: "image/png" });
+    const updated = await uploadAvatar(file);
+
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/auth/avatar");
+    expect(options.method).toBe("PUT");
+    expect(options.body).toBeInstanceOf(FormData);
+    expect((options.body as FormData).get("avatar")).toBeTruthy();
+    expect(new Headers(options.headers).has("Content-Type")).toBe(false);
+    expect(updated.has_avatar).toBe(true);
+  });
+
+  it("deletes the avatar and builds a cache-busting avatar URL", async () => {
+    fetchMock.mockResolvedValue(noContent());
+
+    await deleteAvatar();
+
+    expect(requestArgs(0)[0]).toBe("/v1/auth/avatar");
+    expect(requestArgs(0)[1].method).toBe("DELETE");
+    expect(avatarUrl()).toBe("/v1/auth/avatar");
+    expect(avatarUrl("2026-11-13T10:00:00Z")).toBe(
+      "/v1/auth/avatar?v=2026-11-13T10%3A00%3A00Z",
+    );
+  });
+
+  it("loads, saves and tests the mail settings", async () => {
+    const settings = {
+      enabled: true,
+      host: "smtp.example.com",
+      port: 587,
+      tls: "starttls" as const,
+      username: "mailer",
+      password_set: true,
+      from: "no-reply@example.com",
+    };
+    fetchMock.mockResolvedValue(jsonResponse({ settings }));
+    await expect(fetchMailSettings()).resolves.toEqual(settings);
+    expect(requestArgs(0)[0]).toBe("/v1/admin/mail-settings");
+
+    fetchMock.mockResolvedValue(jsonResponse({ settings: { ...settings, host: "smtp2.example.com" } }));
+    const saved = await saveMailSettings({
+      enabled: true,
+      host: "smtp2.example.com",
+      port: 465,
+      tls: "tls",
+      username: "mailer",
+      password: "",
+      from: "no-reply@example.com",
+    });
+    expect(requestArgs(1)[0]).toBe("/v1/admin/mail-settings");
+    expect(requestArgs(1)[1].method).toBe("PUT");
+    expect(JSON.parse(String(requestArgs(1)[1].body))).toEqual({
+      enabled: true,
+      host: "smtp2.example.com",
+      port: 465,
+      tls: "tls",
+      username: "mailer",
+      password: "",
+      from: "no-reply@example.com",
+    });
+    expect(saved.host).toBe("smtp2.example.com");
+
+    fetchMock.mockResolvedValue(noContent());
+    await sendTestMail(" ops@example.com ");
+    expect(requestArgs(2)[0]).toBe("/v1/admin/mail-settings/test");
+    expect(JSON.parse(String(requestArgs(2)[1].body))).toEqual({ to: "ops@example.com" });
   });
 });

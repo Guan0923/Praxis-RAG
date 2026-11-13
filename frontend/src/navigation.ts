@@ -10,6 +10,7 @@ export type ConsolePage =
   | "model-profiles"
   | "knowledge-bases"
   | "users"
+  | "system-settings"
   | "monitor"
   | "permissions"
   | "invitations"
@@ -27,6 +28,7 @@ export const adminOnlyPages = new Set<ConsolePage>([
   "model-profiles",
   "knowledge-bases",
   "users",
+  "system-settings",
   "monitor",
 ]);
 
@@ -100,6 +102,7 @@ export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRout
       hash === "#/model-profiles" ||
       hash === "#/knowledge-bases" ||
       hash === "#/users" ||
+      hash === "#/system-settings" ||
       hash === "#/monitor" ||
       hash === "#/permissions" ||
       hash === "#/invitations"
@@ -128,6 +131,7 @@ export function routeHash(route: ConsoleRoute) {
     route.page === "model-profiles" ||
     route.page === "knowledge-bases" ||
     route.page === "users" ||
+    route.page === "system-settings" ||
     route.page === "monitor" ||
     route.page === "permissions" ||
     route.page === "invitations"

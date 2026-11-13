@@ -35,81 +35,88 @@ var expectedSchema = []struct {
 	{"document_job_outbox", []string{"id", "artifact_id", "namespace", "name", "status", "attempts", "retry_at", "created_at", "published_at", "last_error"}},
 	{"search_tasks", []string{"result_id", "namespace", "arguments", "status", "stage", "attempts", "owner", "lease_until", "retry_at", "deadline", "created_at", "updated_at"}},
 	{"search_task_outbox", []string{"result_id", "pending", "generation", "retry_at"}},
-	{"users", []string{"id", "username", "password_hash", "role", "enabled", "created_at", "updated_at", "last_login_at"}},
+	{"users", []string{"id", "username", "password_hash", "role", "enabled", "created_at", "updated_at", "last_login_at", "email", "email_verified", "age", "gender"}},
 	{"user_sessions", []string{"id", "user_id", "token_digest", "csrf_token", "expires_at", "created_at", "last_seen_at", "revoked"}},
 	{"kb_permissions", []string{"id", "namespace", "grantee_user_id", "document_name", "permission", "granted_by", "created_at", "updated_at"}},
 	{"kb_invitations", []string{"id", "namespace", "inviter_user_id", "invitee_user_id", "permission", "scope", "document_names", "token_digest", "status", "created_at", "expires_at", "accepted_at", "updated_at"}},
 	{"model_profiles", []string{"id", "kind", "name", "base_url", "model", "protected_key", "vector_size", "created_at", "updated_at"}},
 	{"document_batches", []string{"id", "namespace", "owner", "idempotency_key", "status", "total", "accepted", "skipped", "failed", "created_at", "updated_at"}},
 	{"document_batch_items", []string{"batch_id", "position", "name", "status", "reason", "artifact_id", "error", "created_at", "updated_at"}},
+	{"user_avatars", []string{"user_id", "content_type", "size", "sha256", "content", "updated_at"}},
+	{"email_verification_codes", []string{"id", "email", "purpose", "code_digest", "attempts", "consumed", "expires_at", "created_at"}},
+	{"app_settings", []string{"setting_key", "setting_value", "updated_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
-	"api_keys":                {"id"},
-	"knowledge_bases":         {"namespace"},
-	"documents":               {"namespace", "name"},
-	"blobs":                   {"namespace", "bucket", "key"},
-	"mcp_catalogs":            {"namespace"},
-	"upload_operations":       {"id"},
-	"upload_steps":            {"operation_id", "name"},
-	"document_heads":          {"namespace", "document_id"},
-	"document_leases":         {"namespace", "resource"},
-	"upload_objects":          {"operation_id", "bucket", "key"},
-	"cache_revisions":         {"kind", "scope"},
-	"cache_outbox":            {"id"},
-	"search_result_snapshots": {"id"},
-	"artifact_snapshots":      {"id"},
-	"document_tasks":          {"artifact_id"},
-	"document_task_outbox":    {"artifact_id"},
-	"document_jobs":           {"artifact_id"},
-	"document_job_outbox":     {"id"},
-	"search_tasks":            {"result_id"},
-	"search_task_outbox":      {"result_id"},
-	"users":                   {"id"},
-	"user_sessions":           {"id"},
-	"kb_permissions":          {"id"},
-	"kb_invitations":          {"id"},
-	"model_profiles":          {"id"},
-	"document_batches":        {"id"},
-	"document_batch_items":    {"batch_id", "position"},
+	"api_keys":                 {"id"},
+	"knowledge_bases":          {"namespace"},
+	"documents":                {"namespace", "name"},
+	"blobs":                    {"namespace", "bucket", "key"},
+	"mcp_catalogs":             {"namespace"},
+	"upload_operations":        {"id"},
+	"upload_steps":             {"operation_id", "name"},
+	"document_heads":           {"namespace", "document_id"},
+	"document_leases":          {"namespace", "resource"},
+	"upload_objects":           {"operation_id", "bucket", "key"},
+	"cache_revisions":          {"kind", "scope"},
+	"cache_outbox":             {"id"},
+	"search_result_snapshots":  {"id"},
+	"artifact_snapshots":       {"id"},
+	"document_tasks":           {"artifact_id"},
+	"document_task_outbox":     {"artifact_id"},
+	"document_jobs":            {"artifact_id"},
+	"document_job_outbox":      {"id"},
+	"search_tasks":             {"result_id"},
+	"search_task_outbox":       {"result_id"},
+	"users":                    {"id"},
+	"user_sessions":            {"id"},
+	"kb_permissions":           {"id"},
+	"kb_invitations":           {"id"},
+	"model_profiles":           {"id"},
+	"document_batches":         {"id"},
+	"document_batch_items":     {"batch_id", "position"},
+	"user_avatars":             {"user_id"},
+	"email_verification_codes": {"id"},
+	"app_settings":             {"setting_key"},
 }
 
-var expectedUniques = map[string]string{
-	"api_keys":           "uq_api_keys_digest",
-	"documents":          "uq_documents_namespace_id",
-	"upload_operations":  "uq_upload_idempotency",
-	"artifact_snapshots": "uq_artifact_identity",
-	"document_tasks":     "uq_document_task_idempotency",
-	"document_jobs":      "uq_document_job_idempotency",
-	"users":              "uq_users_username",
-	"user_sessions":      "uq_user_sessions_token_digest",
-	"kb_permissions":     "uq_kb_permissions_scope",
-	"kb_invitations":     "uq_kb_invitations_token_digest",
-	"model_profiles":     "uq_model_profiles_kind_name",
-	"document_batches":   "uq_document_batch_idempotency",
+var expectedUniques = map[string][]string{
+	"api_keys":           {"uq_api_keys_digest"},
+	"documents":          {"uq_documents_namespace_id"},
+	"upload_operations":  {"uq_upload_idempotency"},
+	"artifact_snapshots": {"uq_artifact_identity"},
+	"document_tasks":     {"uq_document_task_idempotency"},
+	"document_jobs":      {"uq_document_job_idempotency"},
+	"users":              {"uq_users_username", "uq_users_email"},
+	"user_sessions":      {"uq_user_sessions_token_digest"},
+	"kb_permissions":     {"uq_kb_permissions_scope"},
+	"kb_invitations":     {"uq_kb_invitations_token_digest"},
+	"model_profiles":     {"uq_model_profiles_kind_name"},
+	"document_batches":   {"uq_document_batch_idempotency"},
 }
 
 var expectedIndexes = map[string][]string{
-	"api_keys":                {"ix_api_keys_owner"},
-	"knowledge_bases":         {"ix_knowledge_bases_collection"},
-	"documents":               {"ix_documents_namespace_sha256"},
-	"blobs":                   {"ix_blobs_document"},
-	"upload_operations":       {"ix_upload_unfinished"},
-	"cache_outbox":            {"ix_cache_outbox_pending"},
-	"search_result_snapshots": {"ix_search_result_expiry", "ix_search_result_namespace"},
-	"artifact_snapshots":      {"ix_artifact_expiry", "ix_artifact_namespace"},
-	"document_tasks":          {"ix_document_tasks_name", "ix_document_tasks_recovery"},
-	"document_task_outbox":    {"ix_document_task_dispatch"},
-	"document_jobs":           {"ix_document_job_name", "ix_document_job_recovery"},
-	"document_job_outbox":     {"ix_document_job_outbox_pending", "ix_document_job_outbox_artifact", "ix_document_job_outbox_age"},
-	"search_tasks":            {"ix_search_tasks_deadline", "ix_search_tasks_recovery", "ix_search_tasks_namespace"},
-	"search_task_outbox":      {"ix_search_task_dispatch"},
-	"user_sessions":           {"ix_user_sessions_user_id"},
-	"kb_permissions":          {"ix_kb_permissions_grantee"},
-	"kb_invitations":          {"ix_kb_invitations_invitee", "ix_kb_invitations_namespace"},
-	"model_profiles":          {"ix_model_profiles_kind"},
-	"document_batches":        {"ix_document_batch_active", "ix_document_batch_owner"},
-	"document_batch_items":    {"ix_document_batch_item_artifact"},
+	"api_keys":                 {"ix_api_keys_owner"},
+	"knowledge_bases":          {"ix_knowledge_bases_collection"},
+	"documents":                {"ix_documents_namespace_sha256"},
+	"blobs":                    {"ix_blobs_document"},
+	"upload_operations":        {"ix_upload_unfinished"},
+	"cache_outbox":             {"ix_cache_outbox_pending"},
+	"search_result_snapshots":  {"ix_search_result_expiry", "ix_search_result_namespace"},
+	"artifact_snapshots":       {"ix_artifact_expiry", "ix_artifact_namespace"},
+	"document_tasks":           {"ix_document_tasks_name", "ix_document_tasks_recovery"},
+	"document_task_outbox":     {"ix_document_task_dispatch"},
+	"document_jobs":            {"ix_document_job_name", "ix_document_job_recovery"},
+	"document_job_outbox":      {"ix_document_job_outbox_pending", "ix_document_job_outbox_artifact", "ix_document_job_outbox_age"},
+	"search_tasks":             {"ix_search_tasks_deadline", "ix_search_tasks_recovery", "ix_search_tasks_namespace"},
+	"search_task_outbox":       {"ix_search_task_dispatch"},
+	"user_sessions":            {"ix_user_sessions_user_id"},
+	"kb_permissions":           {"ix_kb_permissions_grantee"},
+	"kb_invitations":           {"ix_kb_invitations_invitee", "ix_kb_invitations_namespace"},
+	"model_profiles":           {"ix_model_profiles_kind"},
+	"document_batches":         {"ix_document_batch_active", "ix_document_batch_owner"},
+	"document_batch_items":     {"ix_document_batch_item_artifact"},
+	"email_verification_codes": {"ix_email_codes_lookup", "ix_email_codes_expiry"},
 }
 
 // expectedTableNames returns the schema table names in Python declaration order.
@@ -150,13 +157,16 @@ func TestSchemaMatchesPythonDefinition(t *testing.T) {
 				t.Fatalf("%s primary key[%d] = %q, want %q", table.Name, position, actualPK[position], column)
 			}
 		}
-		wantUnique, hasUnique := expectedUniques[table.Name]
-		if !hasUnique && len(table.Uniques) != 0 {
+		wantUniques := expectedUniques[table.Name]
+		if len(wantUniques) == 0 && len(table.Uniques) != 0 {
 			t.Fatalf("%s unexpectedly has unique constraints %v", table.Name, table.Uniques)
 		}
-		if hasUnique {
-			if len(table.Uniques) != 1 || table.Uniques[0].Name != wantUnique {
-				t.Fatalf("%s unique constraints = %v, want %q", table.Name, table.Uniques, wantUnique)
+		if len(table.Uniques) != len(wantUniques) {
+			t.Fatalf("%s unique constraints = %v, want %v", table.Name, table.Uniques, wantUniques)
+		}
+		for position, name := range wantUniques {
+			if table.Uniques[position].Name != name {
+				t.Fatalf("%s unique[%d] = %q, want %q", table.Name, position, table.Uniques[position].Name, name)
 			}
 		}
 		wantIndexes := expectedIndexes[table.Name]

@@ -14,6 +14,12 @@ describe("canViewConsolePage", () => {
     expect(canViewConsolePage("monitor", true, "user")).toBe(false);
   });
 
+  it("keeps the system settings page to administrators only", () => {
+    expect(canViewConsolePage("system-settings", true, "admin")).toBe(true);
+    expect(canViewConsolePage("system-settings", true, "vip")).toBe(false);
+    expect(canViewConsolePage("system-settings", true, "user")).toBe(false);
+  });
+
   it("keeps management pages visible in legacy no-session mode", () => {
     expect(canViewConsolePage("monitor", false, undefined)).toBe(true);
     expect(canViewConsolePage("model-profiles", false, undefined)).toBe(true);
@@ -66,7 +72,7 @@ describe("parseRoute", () => {
   });
 
   it("parses the static Console pages", () => {
-    for (const page of ["api-keys", "model-profiles", "knowledge-bases", "users", "monitor", "permissions", "invitations"]) {
+    for (const page of ["api-keys", "model-profiles", "knowledge-bases", "users", "system-settings", "monitor", "permissions", "invitations"]) {
       expect(parseRoute("#/" + page, "default")).toEqual({ namespace: "default", page });
     }
   });
@@ -121,6 +127,7 @@ describe("routeHash", () => {
       { namespace: "team", page: "documents" as const, documentName: "a b.md" },
       { namespace: "team", page: "permissions" as const },
       { namespace: "team", page: "monitor" as const },
+      { namespace: "team", page: "system-settings" as const },
       { namespace: "team", page: "model-profiles" as const },
       { namespace: "team", page: "invitations" as const },
       { namespace: "team", page: "invite" as const, token: "abc" },

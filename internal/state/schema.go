@@ -611,8 +611,18 @@ var schemaTables = []*SchemaTable{
 			varchar("created_at", 40),
 			varchar("updated_at", 40),
 			varchar("last_login_at", 40).Null(),
+			// The account profile columns are appended last so old libraries
+			// that select by position keep working; email is normalized to
+			// lower case by the auth service before it reaches the store.
+			identifier("email", 254).Null(),
+			boolean("email_verified").Default("0"),
+			integer("age").Null(),
+			varchar("gender", 16).Null(),
 		},
-		Uniques: []SchemaUnique{unique("uq_users_username", "username")},
+		Uniques: []SchemaUnique{
+			unique("uq_users_username", "username"),
+			unique("uq_users_email", "email"),
+		},
 	},
 	{
 		Name: "user_sessions",
@@ -741,6 +751,51 @@ var schemaTables = []*SchemaTable{
 			double("updated_at"),
 		},
 		Indexes: []SchemaIndex{index("ix_document_batch_item_artifact", "artifact_id")},
+	},
+	// user_avatars stores one small profile image per account. The bytes live in
+	// MySQL (not the blob store) because every Console request may need them and
+	// the size is bounded at 2 MiB by the auth service.
+	{
+		Name: "user_avatars",
+		Columns: []SchemaColumn{
+			identifier("user_id", 32).PK(),
+			varchar("content_type", 64),
+			bigint("size"),
+			varchar("sha256", 64),
+			longBlob("content"),
+			varchar("updated_at", 40),
+		},
+	},
+	// email_verification_codes backs the registration and e-mail-change codes.
+	// Only the SHA-256 digest of the 6-digit code is stored; consumed/expired
+	// rows are pruned by the auth service.
+	{
+		Name: "email_verification_codes",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("email", 254),
+			identifier("purpose", 32),
+			identifier("code_digest", 64),
+			integer("attempts").Default("0"),
+			boolean("consumed").Default("0"),
+			varchar("expires_at", 40),
+			varchar("created_at", 40),
+		},
+		Indexes: []SchemaIndex{
+			index("ix_email_codes_lookup", "email", "purpose", "created_at"),
+			index("ix_email_codes_expiry", "expires_at"),
+		},
+	},
+	// app_settings is the Console-editable key/value configuration table. The
+	// mail server settings live under the "mail" key with the SMTP password
+	// protected exactly like provider/API-key credentials.
+	{
+		Name: "app_settings",
+		Columns: []SchemaColumn{
+			identifier("setting_key", 64).PK(),
+			longText("setting_value"),
+			varchar("updated_at", 40),
+		},
 	},
 }
 

@@ -419,6 +419,12 @@ Console 默认启用账号登录（`RAG_AUTH_ENABLED=true`）：
 
 管理员会话可以让远程浏览器访问 `/v1/admin/*`（此前只允许本机）；自动化脚本继续使用 `RAG_SERVICE_TOKEN` 或 API Key，不受影响。
 
+**邮箱验证与个人信息（Console）**：管理员在侧边栏「系统设置」页配置 SMTP 邮件服务器（主机、端口、TLS 模式、用户名、密码、发件人）并可以发送测试邮件，密码与其他 provider 凭据一样按 `enc:v1:` 加密保存，接口只返回 `password_set` 标记（Console 显示为"已保存"）。启用邮件服务器后：
+
+1. 注册页要求填写邮箱并点击「发送验证码」，验证码 10 分钟内有效、最多尝试 5 次、同一邮箱 60 秒内不可重发；验证通过后账号邮箱标记为已验证。未配置/未启用邮件服务器时注册仍按用户名+密码进行（向后兼容），邮箱可在个人信息中补充但不会标记为已验证。
+2. 登录后点右上角账号菜单 →「个人信息」：上传/移除头像（PNG/JPEG/WEBP/GIF，≤2MB）、设置年龄（1-150）与性别（男/女/其他/未设置）、修改用户名；「账号安全」页签可修改邮箱（需当前密码 + 新邮箱验证码）或修改密码（需当前密码，至少 8 位）。
+3. 对应接口：`POST /v1/auth/register/code`、`PATCH /v1/auth/profile`、`POST /v1/auth/password`、`POST /v1/auth/email/change/code`、`POST /v1/auth/email/change`、`PUT/GET/DELETE /v1/auth/avatar`、管理员的 `GET/PUT /v1/admin/mail-settings` 与 `POST /v1/admin/mail-settings/test`。`GET /v1/auth/status` 的 `email_verification_enabled` 表示注册是否需要邮箱验证码。
+
 ### 启动 worker
 
 ```powershell
