@@ -104,6 +104,8 @@ migration CLI.
 | `blobs` | `(namespace, bucket, key)` | source bytes and parse artifacts (`LONGBLOB`) |
 | `mcp_catalogs` | `namespace` | MCP tool/prompt settings |
 | `artifact_snapshots` | `artifact_id` | durable version-bound artifact bytes, metadata and expiry |
+| `activity_counters` | `(metric, window_start)` | **active** hourly activity counters for the Console monitor (for example every retrieval execution counted as `search`); additive only, no event rows |
+| `runtime_heartbeats` | `(role, instance)` | **active** worker liveness heartbeats (`document-worker`); each beat upserts `updated_at`, rows older than 24h are pruned; the monitor reads the newest row and recent instance count |
 | `document_jobs` | `artifact_id` | **active** asynchronous ingest job: complete request bytes, status/stage, attempts, owner, execution id and SQL lease |
 | `document_job_outbox` | `id` | **active** transactional outbox row per accepted job (`PENDING`/`PUBLISHED`, retry metadata) |
 | `document_batches` | `id` | **active** Console batch upload: namespace/owner, `Idempotency-Key`, stored lifecycle (`saving`/`active`) and accepted/skipped/failed counters; no file bytes |

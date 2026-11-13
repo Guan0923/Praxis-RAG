@@ -68,6 +68,9 @@ type embeddedDocumentWorker struct {
 	logger *slog.Logger
 	cancel context.CancelFunc
 	done   chan error
+	// stopHeartbeat stops the worker liveness writer. The heartbeat row is what
+	// the Console monitor reads to prove the worker actually runs.
+	stopHeartbeat func()
 }
 
 // startEmbeddedDocumentWorker runs the outbox-backed worker in a goroutine and
@@ -95,14 +98,22 @@ func startEmbeddedDocumentWorker(
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	// Record a liveness heartbeat next to the Run loop: the monitoring page
+	// must be able to tell a stopped in-process worker from a configured one.
+	heartbeatInterval := documentworker.DefaultWorkerHeartbeatInterval()
+	stopHeartbeat := documentworker.StartHeartbeat(
+		ctx, stores.Heartbeats, state.HeartbeatRoleDocumentWorker, heartbeatInterval, logger)
 	embedded := &embeddedDocumentWorker{
-		worker: worker,
-		logger: logger,
-		cancel: cancel,
-		done:   make(chan error, 1),
+		worker:        worker,
+		logger:        logger,
+		cancel:        cancel,
+		done:          make(chan error, 1),
+		stopHeartbeat: stopHeartbeat,
 	}
 	go func() { embedded.done <- worker.Run(ctx) }()
-	logger.Info("Praxis-RAG in-process document worker started", "poll_seconds", pollInterval.Seconds())
+	logger.Info("Praxis-RAG in-process document worker started",
+		"poll_seconds", pollInterval.Seconds(),
+		"heartbeat_seconds", heartbeatInterval.Seconds())
 	return embedded, nil
 }
 
@@ -111,6 +122,9 @@ func startEmbeddedDocumentWorker(
 func (w *embeddedDocumentWorker) stop(ctx context.Context) {
 	if w == nil {
 		return
+	}
+	if w.stopHeartbeat != nil {
+		w.stopHeartbeat()
 	}
 	w.cancel()
 	select {

@@ -90,6 +90,11 @@ type Stores struct {
 	SearchTasks      *SearchTasks
 	SearchDispatcher *SearchTaskDispatcher
 
+	// Activity and Heartbeats are the Go-only monitoring data sources: hourly
+	// activity counters (every retrieval execution) and Worker liveness rows.
+	Activity   *ActivityCounters
+	Heartbeats *RuntimeHeartbeats
+
 	closeOnce  sync.Once
 	closeError error
 }
@@ -239,6 +244,10 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	}
 	stores.SearchTasks = searchTasks
 	stores.SearchDispatcher = NewSearchTaskDispatcher(stores, nil)
+	// Monitoring data sources need no cache flush: they are write-mostly
+	// counters/heartbeats read by the Console monitor page only.
+	stores.Activity = newActivityCounters(database)
+	stores.Heartbeats = newRuntimeHeartbeats(database)
 	warnIfUnencrypted(settings)
 	return stores, nil
 }

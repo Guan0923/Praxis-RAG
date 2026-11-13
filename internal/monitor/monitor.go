@@ -88,6 +88,19 @@ type Options struct {
 	// Kafka delivery progress is not wired in this deployment (the process runs
 	// with the in-process outbox).
 	KafkaProgress func(ctx context.Context) (KafkaProgress, error)
+	// KafkaProbe reads the broker metadata for the document topic. It replaces
+	// the legacy TCP dial: a metadata round trip proves reachability, TLS/SASL
+	// authentication and topic existence. nil keeps the TCP-only fallback for
+	// broker-less embeddings and tests.
+	KafkaProbe func(ctx context.Context) (KafkaStatus, error)
+	// ResultSnapshots counts the live search-result snapshots kept in Redis.
+	// The snapshots live in the cache, not MySQL, so the state aggregate cannot
+	// count them. nil or an error keeps the number unknown (JSON null).
+	ResultSnapshots func(ctx context.Context) (int, error)
+	// WorkerHeartbeat reads the newest document-worker liveness heartbeat from
+	// the state database. nil means the heartbeat store is not wired, so the
+	// worker row stays unknown instead of claiming the worker runs.
+	WorkerHeartbeat func(ctx context.Context) (*WorkerHeartbeat, error)
 
 	OutboxBridge   string
 	UploadMode     string
@@ -156,6 +169,25 @@ type KafkaProgress struct {
 	Lag             *int64
 }
 
+// KafkaStatus is one bounded observation of the broker cluster metadata.
+// Brokers is the number of live brokers the metadata response reports; a
+// metadata round trip also proves TLS/SASL authentication and topic existence,
+// which a raw TCP dial cannot.
+type KafkaStatus struct {
+	Brokers     int
+	Topic       string
+	TopicExists bool
+	Partitions  int
+}
+
+// WorkerHeartbeat is the newest recorded document-worker liveness heartbeat.
+// Instances counts the worker instances that recorded one inside the freshness
+// window, so a restarted worker is visible even when an old row remains.
+type WorkerHeartbeat struct {
+	UpdatedAt time.Time
+	Instances int
+}
+
 // pipelineSnapshot is the delivery-pipeline view of the monitoring snapshot. It
 // separates four questions the old queues.document_outbox row conflated:
 //
@@ -170,6 +202,7 @@ type KafkaProgress struct {
 type pipelineSnapshot struct {
 	Outbox       *pipelineOutbox  `json:"outbox"`
 	DocumentJobs pipelineJobs     `json:"document_jobs"`
+	Worker       pipelineWorker   `json:"worker"`
 	Debezium     pipelineDebezium `json:"debezium"`
 	Kafka        pipelineKafka    `json:"kafka"`
 }
@@ -184,6 +217,14 @@ type pipelineOutbox struct {
 
 // pipelineJobs is the document job processing state (ok/degraded/unknown).
 type pipelineJobs struct {
+	Status string `json:"status"`
+	Detail string `json:"detail"`
+}
+
+// pipelineWorker reports whether a document worker is actually running, read
+// from its periodic heartbeat row. The static service.document_worker field only
+// says which mode the deployment chose, not whether that worker is alive.
+type pipelineWorker struct {
 	Status string `json:"status"`
 	Detail string `json:"detail"`
 }
@@ -263,15 +304,43 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 		defer cancel()
 		kafka = s.probeKafkaProgress(probeContext)
 	}()
+
+	// The live snapshot count lives in Redis and the worker liveness in its
+	// heartbeat rows; both are optional side reads whose failure only makes
+	// their own value unknown.
+	var snapshotCount *int
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		if s.options.ResultSnapshots == nil {
+			return
+		}
+		probeContext, cancel := context.WithTimeout(ctx, probeTimeout)
+		defer cancel()
+		count, countErr := s.options.ResultSnapshots(probeContext)
+		if countErr != nil {
+			return
+		}
+		snapshotCount = &count
+	}()
+	var workerBeat *WorkerHeartbeat
+	var workerErr error
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		if s.options.WorkerHeartbeat == nil {
+			workerErr = errors.New("Worker 心跳未装配")
+			return
+		}
+		probeContext, cancel := context.WithTimeout(ctx, probeTimeout)
+		defer cancel()
+		workerBeat, workerErr = s.options.WorkerHeartbeat(probeContext)
+	}()
 	wait.Wait()
 
 	dependencies := make([]dependency, 0, len(probes))
-	dependencyFailed := false
 	for index, item := range dependencyLabels {
 		result := results[index]
-		if result.status == statusError {
-			dependencyFailed = true
-		}
 		dependencies = append(dependencies, dependency{
 			Name:      item.name,
 			Label:     item.label,
@@ -285,6 +354,7 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 	pipeline := pipelineSnapshot{
 		Outbox:       pipelineOutboxView(stats, statsErr),
 		DocumentJobs: pipelineDocumentJobsView(stats, statsErr),
+		Worker:       pipelineWorkerView(workerBeat, workerErr, s.options.DocumentWorker, now),
 		Debezium: pipelineDebezium{
 			Status: debezium.status,
 			Detail: debezium.detail,
@@ -292,6 +362,11 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 		},
 		Kafka: kafka,
 	}
+	// ok means "every observed dependency is healthy". A degraded dependency
+	// (for example a missing Qdrant collection) must never be rendered as
+	// 运行正常, so the response carries an explicit three-state status and the
+	// boolean stay aligned with it.
+	status := overallStatus(statsErr, dependencies, pipeline)
 
 	errorsList := make([]string, 0)
 	var queues, library, activity any
@@ -308,14 +383,9 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 				"by_status":             stats.SearchByStatus,
 				"oldest_active_seconds": roundOneDecimal(stats.OldestActiveSearchSeconds),
 			},
-			"uploads": map[string]any{"unfinished": stats.UnfinishedUploads},
+			"uploads": monitorUploadsView(stats),
 		}
-		library = map[string]any{
-			"documents":          stats.Documents,
-			"knowledge_bases":    stats.KnowledgeBases,
-			"result_snapshots":   stats.ResultSnapshots,
-			"artifact_snapshots": stats.ArtifactSnapshots,
-		}
+		library = monitorLibraryView(stats, snapshotCount)
 		activity = map[string]any{
 			"window_hours":   recentWindow.Hours(),
 			"jobs_succeeded": stats.JobsSucceededRecent,
@@ -336,7 +406,8 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 	}
 	return map[string]any{
 		"generated_at": now.UTC().Format(time.RFC3339),
-		"ok":           statsErr == nil && !dependencyFailed,
+		"status":       status,
+		"ok":           status == statusOK,
 		"service": map[string]any{
 			"name":            version.ServiceName,
 			"version":         version.Version,
@@ -355,6 +426,116 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 		"library":      library,
 		"activity":     activity,
 		"errors":       errorsList,
+	}
+}
+
+// monitorUploadsView renders the upload operations. The old single
+// "未完成上传" number mixed three very different states, so the Console gets the
+// status buckets and the disjoint group counters instead of one misleading
+// total: in_progress (INTENT/RUNNING), failed (FAILED/ROLLBACK_FAILED),
+// rolling_back (ROLLING_BACK) and cleanup_pending (committed operations whose
+// old-version cleanup is still pending). "unfinished" is kept as the union
+// count for compatibility; it is not "files currently uploading".
+func monitorUploadsView(stats *state.MonitorStats) map[string]any {
+	return map[string]any{
+		"unfinished":      stats.UnfinishedUploads,
+		"by_status":       monitorStringIntMap(stats.UploadsByStatus),
+		"in_progress":     stats.UploadsInProgress,
+		"failed":          stats.UploadsFailed,
+		"rolling_back":    stats.UploadsRollingBack,
+		"cleanup_pending": stats.UploadsCleanupPending,
+	}
+}
+
+// monitorLibraryView renders the library counters. result_snapshots comes from
+// the Redis transient store, where the immutable snapshots actually live; the
+// legacy MySQL search_result_snapshots table is not the source of truth. A nil
+// count stays JSON null so the Console prints 未知 instead of a wrong zero.
+func monitorLibraryView(stats *state.MonitorStats, resultSnapshots *int) map[string]any {
+	var snapshots any
+	if resultSnapshots != nil {
+		snapshots = *resultSnapshots
+	}
+	return map[string]any{
+		"documents":          stats.Documents,
+		"knowledge_bases":    stats.KnowledgeBases,
+		"result_snapshots":   snapshots,
+		"artifact_snapshots": stats.ArtifactSnapshots,
+	}
+}
+
+// overallStatus ranks the observed health into the three-state contract the
+// Console header renders. Only infra-level views participate: document job
+// counters already have their own degraded view, and a single failed document
+// must not turn the whole service status red.
+func overallStatus(statsErr error, dependencies []dependency, pipeline pipelineSnapshot) string {
+	if statsErr != nil {
+		return statusError
+	}
+	status := statusOK
+	raise := func(candidate string, errorIsFatal bool) {
+		switch candidate {
+		case statusError:
+			if errorIsFatal {
+				status = statusError
+			} else if status == statusOK {
+				status = statusDegraded
+			}
+		case statusDegraded:
+			if status == statusOK {
+				status = statusDegraded
+			}
+		}
+	}
+	for _, item := range dependencies {
+		raise(item.Status, true)
+	}
+	// Debezium delivers the document outbox; a dead capture connector breaks the
+	// delivery path, so its error is fatal to the overall status.
+	raise(pipeline.Debezium.Status, true)
+	// A missing/stopped worker is a capacity problem: jobs stay queued.
+	raise(pipeline.Worker.Status, false)
+	// An unreadable consumer-offset snapshot degrades observability only; the
+	// broker probe above already reports an unreachable cluster as an error.
+	raise(pipeline.Kafka.Status, false)
+	return status
+}
+
+// workerHeartbeatStaleAfter is the heartbeat age at which the worker row
+// degrades. Workers beat every 15 seconds, so 60 seconds means three missed
+// beats and is strong evidence the process stopped.
+const workerHeartbeatStaleAfter = 60 * time.Second
+
+// pipelineWorkerView renders the real worker liveness probe. The static
+// service.document_worker field says which mode is configured, not whether the
+// process runs; only a fresh heartbeat row proves it.
+func pipelineWorkerView(beat *WorkerHeartbeat, beatErr error, mode string, now time.Time) pipelineWorker {
+	if beatErr != nil {
+		return pipelineWorker{Status: statusUnknown, Detail: "Worker 心跳读取失败"}
+	}
+	if beat == nil || beat.UpdatedAt.IsZero() {
+		if strings.TrimSpace(mode) == "in-process" {
+			return pipelineWorker{Status: statusUnknown, Detail: "未收到进程内文档 worker 心跳（worker 可能未启动）"}
+		}
+		return pipelineWorker{Status: statusUnknown, Detail: "未收到独立文档 worker 心跳（确认 rag-document-worker 已启动）"}
+	}
+	age := now.Sub(beat.UpdatedAt)
+	if age < 0 {
+		age = 0
+	}
+	instances := beat.Instances
+	if instances < 1 {
+		instances = 1
+	}
+	if age <= workerHeartbeatStaleAfter {
+		return pipelineWorker{
+			Status: statusOK,
+			Detail: fmt.Sprintf("最近心跳 %.1f 秒前，%d 个实例运行中", age.Seconds(), instances),
+		}
+	}
+	return pipelineWorker{
+		Status: statusDegraded,
+		Detail: fmt.Sprintf("最近心跳 %.1f 秒前，worker 可能已停止", age.Seconds()),
 	}
 }
 
@@ -413,14 +594,41 @@ func pipelineDocumentJobsView(stats *state.MonitorStats, statsErr error) pipelin
 	return pipelineJobs{Status: statusOK, Detail: detail}
 }
 
-// debeziumHealth is the subset of the Debezium/Connect health payload the probe
-// reads.
+// debeziumHealth is the subset of the Debezium health payload the probe reads.
+// Debezium Server exposes Quarkus SmallRye Health: the aggregate status plus the
+// individual runtime checks. A failed connector task or database connection
+// turns its check DOWN, so reading the checks is an actual running check instead
+// of an HTTP status-only probe.
 type debeziumHealth struct {
 	Status string `json:"status"`
+	Checks []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	} `json:"checks"`
 }
 
-// probeDebezium checks the optional capture-connector health endpoint. It never
-// reports a capture offset: only Debezium knows the binlog position.
+// debeziumDownDetail names the failing runtime checks so the Console shows what
+// is actually broken instead of repeating the aggregate status.
+func debeziumDownDetail(health debeziumHealth) string {
+	failing := make([]string, 0, len(health.Checks))
+	for _, check := range health.Checks {
+		if !strings.EqualFold(strings.TrimSpace(check.Status), "UP") {
+			name := strings.TrimSpace(check.Name)
+			if name == "" {
+				name = "未命名检查"
+			}
+			failing = append(failing, boundedText(name, 40))
+		}
+	}
+	if len(failing) == 0 {
+		return "Debezium 状态为 DOWN"
+	}
+	return "Debezium 状态为 DOWN（检查失败：" + strings.Join(failing, "、") + "）"
+}
+
+// probeDebezium checks the optional capture-connector health endpoint and its
+// per-check runtime state. It never reports a capture offset: only Debezium
+// knows the binlog position.
 func (s *Service) probeDebezium(ctx context.Context) probeResult {
 	healthURL := strings.TrimSpace(s.options.DebeziumHealthURL)
 	if healthURL == "" {
@@ -436,21 +644,31 @@ func (s *Service) probeDebezium(ctx context.Context) probeResult {
 	}
 	defer func() { _ = response.Body.Close() }()
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	var health debeziumHealth
+	parsed := readErr == nil && json.Unmarshal(body, &health) == nil
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		// Quarkus answers 503 when a check is DOWN; keep the failing check names
+		// when the body is still a health document.
+		if parsed && strings.EqualFold(strings.TrimSpace(health.Status), "DOWN") {
+			return probeResult{status: statusError, detail: debeziumDownDetail(health)}
+		}
 		return probeResult{status: statusError, detail: fmt.Sprintf("健康检查返回 HTTP %d", response.StatusCode)}
 	}
 	if readErr != nil {
 		return probeResult{status: statusDegraded, detail: "健康检查响应读取失败"}
 	}
-	var health debeziumHealth
-	if err := json.Unmarshal(body, &health); err != nil {
+	if !parsed {
 		return probeResult{status: statusDegraded, detail: "健康检查响应无法解析"}
 	}
 	switch strings.ToUpper(strings.TrimSpace(health.Status)) {
 	case "UP":
-		return probeResult{status: statusOK, detail: "健康检查正常；采集位点需在 Debezium 侧查看"}
+		detail := "健康检查正常"
+		if len(health.Checks) > 0 {
+			detail = fmt.Sprintf("健康检查正常（%d 项运行检查通过）", len(health.Checks))
+		}
+		return probeResult{status: statusOK, detail: detail + "；采集位点需在 Debezium 侧查看"}
 	case "DOWN":
-		return probeResult{status: statusError, detail: "Debezium 状态为 DOWN"}
+		return probeResult{status: statusError, detail: debeziumDownDetail(health)}
 	case "":
 		return probeResult{status: statusDegraded, detail: "健康检查未返回状态"}
 	default:
@@ -605,12 +823,34 @@ func (s *Service) probeQdrant(ctx context.Context) probeResult {
 	}
 }
 
-// probeKafka performs a TCP reachability check against the first broker. It
-// never authenticates, so a reachable port is not proof of a usable cluster.
+// probeKafka verifies the broker with a metadata round trip: unlike a raw TCP
+// dial it also proves TLS/SASL authentication and that the document topic
+// exists. The TCP fallback is kept only for embeddings that do not wire the
+// metadata probe and is labelled as such.
 func (s *Service) probeKafka(ctx context.Context) probeResult {
 	brokers := kafkaBrokerList(s.options.KafkaBootstrapServers)
 	if len(brokers) == 0 {
 		return probeResult{status: statusDisabled, detail: "未配置 Kafka：同步检索 / 进程内 outbox"}
+	}
+	if s.options.KafkaProbe != nil {
+		status, err := s.options.KafkaProbe(ctx)
+		if err != nil {
+			return probeResult{status: statusError, detail: "Kafka 元数据读取失败：broker 不可达或认证失败"}
+		}
+		topic := strings.TrimSpace(status.Topic)
+		if topic == "" {
+			topic = strings.TrimSpace(s.options.DocumentTopic)
+		}
+		if !status.TopicExists {
+			if topic == "" {
+				return probeResult{status: statusDegraded, detail: "Kafka 已连接，但文档主题不存在"}
+			}
+			return probeResult{status: statusDegraded, detail: "Kafka 已连接；主题 " + topic + " 不存在"}
+		}
+		return probeResult{
+			status: statusOK,
+			detail: fmt.Sprintf("元数据正常（%d 个 broker；主题 %s 共 %d 个分区）", status.Brokers, topic, status.Partitions),
+		}
 	}
 	dialer := net.Dialer{}
 	connection, err := dialer.DialContext(ctx, "tcp", brokers[0])
@@ -621,8 +861,24 @@ func (s *Service) probeKafka(ctx context.Context) probeResult {
 	return probeResult{status: statusOK, detail: "仅 TCP 可达，未验证认证/授权（" + brokers[0] + "）"}
 }
 
-// probePDF checks the remote Docling parser health endpoint; the in-process Go
-// engine has no external dependency.
+// pdfHealth is the Docling service /healthz payload. The endpoint reports the
+// selected converter and any configuration problem, so the probe can tell a
+// healthy parser from a process that answers 200 but cannot parse.
+type pdfHealth struct {
+	Service            string  `json:"service"`
+	Version            string  `json:"version"`
+	Status             string  `json:"status"`
+	Converter          string  `json:"converter"`
+	ConverterRequested string  `json:"converter_requested"`
+	ConfigError        *string `json:"config_error"`
+	VLMConfigured      *bool   `json:"vlm_configured"`
+	DoclingInstalled   *bool   `json:"docling_installed"`
+}
+
+// probePDF checks the remote Docling parser health endpoint and the converter
+// state it reports; the in-process Go engine has no external dependency. A 200
+// response alone is not proof the parser works (an unavailable converter still
+// answers), so the payload decides between ok and degraded.
 func (s *Service) probePDF(ctx context.Context) probeResult {
 	if s.options.PDFEngine != pdfEngineDocling {
 		return probeResult{status: statusDisabled, detail: "Go 内置解析引擎"}
@@ -640,11 +896,44 @@ func (s *Service) probePDF(ctx context.Context) probeResult {
 		return probeResult{status: statusError, detail: "PDF 解析服务不可达"}
 	}
 	defer func() { _ = response.Body.Close() }()
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return probeResult{status: statusError, detail: fmt.Sprintf("健康检查返回 HTTP %d", response.StatusCode)}
 	}
-	return probeResult{status: statusOK, detail: "健康检查通过"}
+	if readErr != nil {
+		return probeResult{status: statusDegraded, detail: "健康检查响应读取失败"}
+	}
+	var health pdfHealth
+	if err := json.Unmarshal(body, &health); err != nil {
+		return probeResult{status: statusDegraded, detail: "健康检查响应无法解析"}
+	}
+	switch strings.ToLower(strings.TrimSpace(health.Status)) {
+	case "ok":
+		converter := strings.TrimSpace(health.Converter)
+		if converter == "" {
+			converter = "未知转换器"
+		}
+		detail := "转换器 " + boundedText(converter, 40)
+		if version := strings.TrimSpace(health.Version); version != "" {
+			detail += "，版本 " + boundedText(version, 40)
+		}
+		if health.VLMConfigured != nil && *health.VLMConfigured {
+			detail += "，VLM 已配置"
+		}
+		return probeResult{status: statusOK, detail: detail}
+	case "degraded":
+		detail := "转换器不可用"
+		if health.ConfigError != nil && strings.TrimSpace(*health.ConfigError) != "" {
+			detail += "：" + boundedText(*health.ConfigError, 80)
+		} else if converter := strings.TrimSpace(health.Converter); converter != "" {
+			detail = "转换器 " + boundedText(converter, 40) + " 不可用"
+		}
+		return probeResult{status: statusDegraded, detail: detail}
+	case "":
+		return probeResult{status: statusDegraded, detail: "健康检查未返回状态"}
+	default:
+		return probeResult{status: statusError, detail: "PDF 解析服务状态为 " + boundedText(health.Status, 40)}
+	}
 }
 
 // monitorStringIntMap normalizes a nil map to an empty object so the JSON never

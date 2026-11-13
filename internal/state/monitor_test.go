@@ -99,6 +99,9 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	insertSearch(SearchTaskFailed, "done", nowUnix-600, nowUnix-60)
 	insertSearch(SearchTaskTimedOut, "done", nowUnix-172800, nowUnix-172800)
 
+	// Uploads cover every category: two in progress, one failed, one rolling
+	// back and one failed rollback, plus a committed operation whose old-version
+	// cleanup is still pending (it is unfinished through cleanup_pending only).
 	uploadStatement := "INSERT INTO upload_operations (id, namespace, name, document_id, " +
 		"collection, owner, status, cleanup_pending, created_at, updated_at) " +
 		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -108,30 +111,44 @@ func TestMonitorStatsAggregates(t *testing.T) {
 			"upload.txt", "doc-"+suffix, "collection-"+suffix, monitorTestID(t, 32),
 			status, cleanupPending, nowUnix-60, nowUnix-30)
 	}
+	insertUpload(UploadIntent, false)
 	insertUpload(UploadRunning, false)
+	insertUpload(UploadFailed, false)
+	insertUpload(UploadRollingBack, false)
+	insertUpload(UploadRollbackFailed, false)
 	insertUpload(UploadCommitted, true)
 	insertUpload(UploadCommitted, false)
 
-	monitorTestExec(t, stores,
-		"INSERT INTO documents (namespace, name, document_id, size, sha256, chunking, "+
-			"collection, chunk_count, modified_at, indexed_at, diagnostics, skipped_object_count) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		namespace, "doc.txt", "doc-"+suffix, 3, "sha-"+suffix, "{}",
-		"collection-"+suffix, 1, "", "", "[]", 0)
+	// One live document and one soft-deleted tombstone: only the live record may
+	// be counted by library.documents.
+	documentStatement := "INSERT INTO documents (namespace, name, document_id, size, sha256, " +
+		"chunking, collection, chunk_count, modified_at, indexed_at, diagnostics, " +
+		"skipped_object_count, del_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	monitorTestExec(t, stores, documentStatement, namespace, "doc.txt", "doc-"+suffix, 3,
+		"sha-"+suffix, "{}", "collection-"+suffix, 1, "", "", "[]", 0, false)
+	monitorTestExec(t, stores, documentStatement, namespace, "deleted.txt", "deleted-"+suffix, 3,
+		"sha-deleted-"+suffix, "{}", "collection-"+suffix, 1, "", "", "[]", 0, true)
 	monitorTestExec(t, stores,
 		"INSERT INTO knowledge_bases (namespace, collection, settings, version, created_at, updated_at) "+
 			"VALUES (?, ?, ?, ?, ?, ?)",
 		namespace, "collection-"+suffix, "{}", 1, "", "")
-	monitorTestExec(t, stores,
-		"INSERT INTO search_result_snapshots (id, namespace, content, created_at, expires_at) "+
-			"VALUES (?, ?, ?, ?, ?)",
-		monitorTestArtifactID(t), namespace, "{}", nowUnix, nowUnix+600)
 	monitorTestExec(t, stores,
 		"INSERT INTO artifact_snapshots (id, namespace, identity, document_id, version, kind, "+
 			"name, mime_type, content, created_at, expires_at) "+
 			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		monitorTestArtifactID(t), namespace, "identity-"+suffix, "doc-"+suffix,
 		nil, "image", "a.png", "image/png", []byte("png"), nowUnix, nowUnix+600)
+
+	// The activity counter is the only source of the recent-search number: the
+	// two recent completed search_tasks rows must not be added on top of it.
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := stores.Activity.Record(ctx, ActivitySearch, now); err != nil {
+			t.Fatalf("Activity.Record() error = %v", err)
+		}
+	}
+	if err := stores.Activity.Record(ctx, ActivitySearch, now.Add(-2*recentWindow)); err != nil {
+		t.Fatalf("Activity.Record(old) error = %v", err)
+	}
 
 	t.Cleanup(func() {
 		cleanup := context.Background()
@@ -140,7 +157,6 @@ func TestMonitorStatsAggregates(t *testing.T) {
 			"DELETE FROM document_jobs WHERE namespace = ?",
 			"DELETE FROM search_tasks WHERE namespace = ?",
 			"DELETE FROM upload_operations WHERE namespace = ?",
-			"DELETE FROM search_result_snapshots WHERE namespace = ?",
 			"DELETE FROM artifact_snapshots WHERE namespace = ?",
 			"DELETE FROM documents WHERE namespace = ?",
 			"DELETE FROM knowledge_bases WHERE namespace = ?",
@@ -148,6 +164,10 @@ func TestMonitorStatsAggregates(t *testing.T) {
 			if _, err := stores.DB.ExecContext(cleanup, statement, namespace); err != nil {
 				t.Logf("cleanup %q error = %v", statement, err)
 			}
+		}
+		if _, err := stores.DB.ExecContext(cleanup,
+			"DELETE FROM activity_counters WHERE metric = ?", ActivitySearch); err != nil {
+			t.Logf("cleanup activity_counters error = %v", err)
 		}
 	})
 
@@ -207,17 +227,40 @@ func TestMonitorStatsAggregates(t *testing.T) {
 		t.Fatalf("OldestActiveSearchSeconds = %f, want ~%f",
 			stats.OldestActiveSearchSeconds, activeSearchAge)
 	}
-	if stats.SearchesRecent != 2 {
-		t.Fatalf("SearchesRecent = %d, want 2", stats.SearchesRecent)
+	// Only the three recorded activity counts are inside the window; the two
+	// recent terminal search_tasks rows are queue records and must not leak in.
+	if stats.SearchesRecent != 3 {
+		t.Fatalf("SearchesRecent = %d, want 3 (activity counter only)", stats.SearchesRecent)
 	}
 
-	if stats.UnfinishedUploads != 2 {
-		t.Fatalf("UnfinishedUploads = %d, want 2", stats.UnfinishedUploads)
+	wantUploadStatuses := map[string]int{
+		UploadIntent: 1, UploadRunning: 1, UploadFailed: 1,
+		UploadRollingBack: 1, UploadRollbackFailed: 1, UploadCommitted: 2,
 	}
-	if stats.Documents != 1 || stats.KnowledgeBases != 1 ||
-		stats.ResultSnapshots != 1 || stats.ArtifactSnapshots != 1 {
-		t.Fatalf("library counts = %d/%d/%d/%d, want 1/1/1/1",
-			stats.Documents, stats.KnowledgeBases, stats.ResultSnapshots, stats.ArtifactSnapshots)
+	for status, want := range wantUploadStatuses {
+		if got := stats.UploadsByStatus[status]; got != want {
+			t.Fatalf("UploadsByStatus[%q] = %d, want %d (map %v)",
+				status, got, want, stats.UploadsByStatus)
+		}
+	}
+	if stats.UploadsInProgress != 2 || stats.UploadsFailed != 2 ||
+		stats.UploadsRollingBack != 1 || stats.UploadsCleanupPending != 1 {
+		t.Fatalf("upload categories = in_progress %d, failed %d, rolling_back %d, cleanup_pending %d; want 2/2/1/1",
+			stats.UploadsInProgress, stats.UploadsFailed,
+			stats.UploadsRollingBack, stats.UploadsCleanupPending)
+	}
+	// 5 unfinished-status rows + 1 committed row whose cleanup is pending; the
+	// union never double counts a row that is active AND cleanup-pending.
+	if stats.UnfinishedUploads != 6 {
+		t.Fatalf("UnfinishedUploads = %d, want 6", stats.UnfinishedUploads)
+	}
+
+	if stats.Documents != 1 {
+		t.Fatalf("Documents = %d, want 1 (the del_flag=1 tombstone must not count)", stats.Documents)
+	}
+	if stats.KnowledgeBases != 1 || stats.ArtifactSnapshots != 1 {
+		t.Fatalf("library counts = documents %d, knowledge bases %d, artifacts %d; want 1/1/1",
+			stats.Documents, stats.KnowledgeBases, stats.ArtifactSnapshots)
 	}
 }
 
@@ -244,6 +287,22 @@ func TestMonitorStatsEmptyState(t *testing.T) {
 			t.Fatalf("SearchByStatus[%q] = %d, present = %v", status, got, present)
 		}
 	}
+	// The five unfinished upload states stay present so the Console renders a
+	// complete category row on an empty database.
+	for _, status := range []string{
+		UploadIntent, UploadRunning, UploadFailed, UploadRollingBack, UploadRollbackFailed,
+	} {
+		if got, present := stats.UploadsByStatus[status]; !present || got != 0 {
+			t.Fatalf("UploadsByStatus[%q] = %d, present = %v", status, got, present)
+		}
+	}
+	if stats.UploadsInProgress != 0 || stats.UploadsFailed != 0 ||
+		stats.UploadsRollingBack != 0 || stats.UploadsCleanupPending != 0 ||
+		stats.UnfinishedUploads != 0 {
+		t.Fatalf("empty upload counters = %d/%d/%d/%d/%d",
+			stats.UploadsInProgress, stats.UploadsFailed, stats.UploadsRollingBack,
+			stats.UploadsCleanupPending, stats.UnfinishedUploads)
+	}
 	if stats.DocumentJobsByStage == nil || stats.OutboxByStatus == nil {
 		t.Fatalf("nil maps: stage = %v outbox = %v",
 			stats.DocumentJobsByStage, stats.OutboxByStatus)
@@ -253,10 +312,12 @@ func TestMonitorStatsEmptyState(t *testing.T) {
 		t.Fatalf("empty ages = %v/%v/%v", stats.OldestQueuedSeconds,
 			stats.OldestOutboxRecordSeconds, stats.OldestActiveSearchSeconds)
 	}
-	if stats.Documents != 0 || stats.KnowledgeBases != 0 ||
-		stats.ResultSnapshots != 0 || stats.ArtifactSnapshots != 0 {
-		t.Fatalf("library counts = %d/%d/%d/%d, want 0/0/0/0",
-			stats.Documents, stats.KnowledgeBases, stats.ResultSnapshots, stats.ArtifactSnapshots)
+	if stats.SearchesRecent != 0 {
+		t.Fatalf("SearchesRecent = %d, want 0", stats.SearchesRecent)
+	}
+	if stats.Documents != 0 || stats.KnowledgeBases != 0 || stats.ArtifactSnapshots != 0 {
+		t.Fatalf("library counts = %d/%d/%d, want 0/0/0",
+			stats.Documents, stats.KnowledgeBases, stats.ArtifactSnapshots)
 	}
 }
 

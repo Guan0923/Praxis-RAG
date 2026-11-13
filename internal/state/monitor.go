@@ -40,18 +40,40 @@ type MonitorStats struct {
 	SearchByStatus map[string]int
 	// OldestActiveSearchSeconds is the age of the oldest queued/processing task.
 	OldestActiveSearchSeconds float64
-	// SearchesRecent counts finished searches updated inside the recent window.
+	// SearchesRecent counts every retrieval execution inside the recent window:
+	// synchronous REST/MCP searches and queued search worker runs all pass
+	// through runtime.Service.Search and are counted by the activity counter.
+	// search_tasks only holds queued searches, so it is not the source here.
 	SearchesRecent int
 
+	// UploadsByStatus counts upload_operations per stored status. The five
+	// unfinished states (INTENT/RUNNING/FAILED/ROLLING_BACK/ROLLBACK_FAILED) are
+	// always present, zero when absent.
+	UploadsByStatus map[string]int
+	// UploadsInProgress counts upload operations that are still admitting or
+	// running (INTENT + RUNNING).
+	UploadsInProgress int
+	// UploadsFailed counts upload operations that failed and still need
+	// attention: FAILED plus a failed rollback (ROLLBACK_FAILED).
+	UploadsFailed int
+	// UploadsRollingBack counts upload operations whose rollback is currently
+	// running (ROLLING_BACK).
+	UploadsRollingBack int
+	// UploadsCleanupPending counts upload operations whose old-version cleanup
+	// is pending, whatever their status (the cleanup_pending flag).
+	UploadsCleanupPending int
 	// UnfinishedUploads counts upload operations that are still active or whose
-	// old-version cleanup is pending (the UploadJournal.Unfinished predicate).
+	// old-version cleanup is pending (the UploadJournal.Unfinished predicate):
+	// the union of the unfinished statuses and cleanup_pending, never the sum of
+	// the category counters above.
 	UnfinishedUploads int
 
-	// Documents, KnowledgeBases, ResultSnapshots and ArtifactSnapshots are
-	// plain table counts of the library state.
+	// Documents counts live (not soft-deleted) document records.
+	// KnowledgeBases and ArtifactSnapshots are plain table counts of the library
+	// state. Result snapshots live in Redis and are counted there, so they are
+	// not part of the SQL aggregate.
 	Documents         int
 	KnowledgeBases    int
-	ResultSnapshots   int
 	ArtifactSnapshots int
 }
 
@@ -140,25 +162,36 @@ func (s *Stores) MonitorStats(ctx context.Context, now time.Time, recentWindow t
 		return nil, fmt.Errorf("search_tasks 最旧活动任务查询失败：%w", err)
 	}
 
-	stats.SearchesRecent, err = s.monitorCount(ctx,
-		"SELECT COUNT(*) FROM search_tasks WHERE updated_at >= ? AND status IN (?, ?, ?)",
-		recentStartSeconds, SearchTaskSucceeded, SearchTaskFailed, SearchTaskTimedOut)
+	// Every retrieval execution is counted by the hourly activity counter, so
+	// synchronous searches (REST/MCP) are included; search_tasks only holds the
+	// queued subset and must not feed this number.
+	if s.Activity == nil {
+		return nil, newStateError("活动计数器未装配")
+	}
+	stats.SearchesRecent, err = s.Activity.Count(ctx, ActivitySearch, now.Add(-recentWindow))
 	if err != nil {
-		return nil, fmt.Errorf("search_tasks 近期完成统计失败：%w", err)
+		return nil, fmt.Errorf("检索活动计数查询失败：%w", err)
 	}
 
-	// The predicate mirrors UploadJournal.Unfinished; only the count is needed.
-	stats.UnfinishedUploads, err = s.monitorCount(ctx,
-		"SELECT COUNT(*) FROM upload_operations WHERE (status IN (?, ?, ?, ?, ?) OR cleanup_pending = 1)",
+	uploadCounts, err := s.monitorUploadCounts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("upload_operations 分类统计失败：%w", err)
+	}
+	stats.UploadsByStatus = monitorWithFallbackKeys(uploadCounts.byStatus,
 		UploadIntent, UploadRunning, UploadFailed, UploadRollingBack, UploadRollbackFailed)
-	if err != nil {
-		return nil, fmt.Errorf("upload_operations 未完成统计失败：%w", err)
-	}
+	stats.UploadsInProgress = uploadCounts.inProgress
+	stats.UploadsFailed = uploadCounts.failed
+	stats.UploadsRollingBack = uploadCounts.rollingBack
+	stats.UploadsCleanupPending = uploadCounts.cleanupPending
+	stats.UnfinishedUploads = uploadCounts.unfinished
 
+	// Soft-deleted documents (del_flag = 1) are tombstones, so the library count
+	// must only include live records. Result snapshots are stored in Redis and
+	// counted by the monitoring layer there, not in the state database.
 	if err := s.DB.QueryRowContext(ctx,
-		"SELECT (SELECT COUNT(*) FROM documents), (SELECT COUNT(*) FROM knowledge_bases), "+
-			"(SELECT COUNT(*) FROM search_result_snapshots), (SELECT COUNT(*) FROM artifact_snapshots)").
-		Scan(&stats.Documents, &stats.KnowledgeBases, &stats.ResultSnapshots, &stats.ArtifactSnapshots); err != nil {
+		"SELECT (SELECT COUNT(*) FROM documents WHERE del_flag = 0), "+
+			"(SELECT COUNT(*) FROM knowledge_bases), (SELECT COUNT(*) FROM artifact_snapshots)").
+		Scan(&stats.Documents, &stats.KnowledgeBases, &stats.ArtifactSnapshots); err != nil {
 		return nil, fmt.Errorf("资料库计数查询失败：%w", err)
 	}
 	return stats, nil
@@ -219,4 +252,70 @@ func monitorWithFallbackKeys(values map[string]int, required ...string) map[stri
 		}
 	}
 	return values
+}
+
+// monitorUploadCounts is the per-(status, cleanup_pending) cross tab of the
+// upload journal. One grouped read keeps every upload counter consistent with
+// the others: the category counters are additive views of the same rows while
+// UnfinishedUploads stays the union predicate (a row is counted once even when
+// its status is active and its cleanup is pending).
+type monitorUploadCounts struct {
+	byStatus       map[string]int
+	inProgress     int
+	failed         int
+	rollingBack    int
+	cleanupPending int
+	unfinished     int
+}
+
+// monitorUploadCounts aggregates upload_operations by status and cleanup flag.
+func (s *Stores) monitorUploadCounts(ctx context.Context) (monitorUploadCounts, error) {
+	result := monitorUploadCounts{byStatus: make(map[string]int)}
+	rows, err := s.DB.QueryContext(ctx,
+		"SELECT status, cleanup_pending, COUNT(*) FROM upload_operations GROUP BY status, cleanup_pending")
+	if err != nil {
+		return monitorUploadCounts{}, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var status string
+		var cleanupPending sql.NullBool
+		var count int
+		if err := rows.Scan(&status, &cleanupPending, &count); err != nil {
+			return monitorUploadCounts{}, err
+		}
+		pending := cleanupPending.Valid && cleanupPending.Bool
+		result.byStatus[status] += count
+		if pending {
+			result.cleanupPending += count
+		}
+		switch status {
+		case UploadIntent, UploadRunning:
+			result.inProgress += count
+		case UploadFailed, UploadRollbackFailed:
+			// A failed rollback is a terminal failure that still needs cleanup,
+			// so it belongs to the failure category, not the in-flight rollback.
+			result.failed += count
+		case UploadRollingBack:
+			result.rollingBack += count
+		}
+		if pending || uploadStatusUnfinished(status) {
+			result.unfinished += count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return monitorUploadCounts{}, err
+	}
+	return result, nil
+}
+
+// uploadStatusUnfinished reports the statuses of the UploadJournal.Unfinished
+// predicate.
+func uploadStatusUnfinished(status string) bool {
+	switch status {
+	case UploadIntent, UploadRunning, UploadFailed, UploadRollingBack, UploadRollbackFailed:
+		return true
+	default:
+		return false
+	}
 }

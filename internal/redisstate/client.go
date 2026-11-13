@@ -461,6 +461,9 @@ func Attach(stores *state.Stores, client *Client) error {
 	}
 	if stores.Results != nil {
 		stores.Results.Transient = client.TransientStore()
+		// 结果快照以 sha256 哈希 key 存放，监控无法按前缀统计，因此同时装配
+		// 过期索引：Save 成功后会补记身份，CountActive 可清过期并计数。
+		stores.Results.Index = client.ResultSnapshotIndex()
 	}
 	return nil
 }

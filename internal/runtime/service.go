@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
@@ -34,10 +35,27 @@ type Service struct {
 	stores   *state.Stores
 	dataRoot string
 	search   *SearchEngine
+	// activityRecorder is the optional monitoring counter recorded once per
+	// Search call. It is set once at startup, before the service serves traffic.
+	activityRecorder ActivityRecorder
 	// views is the cached read-view source for display lists. It is nil when
 	// the store exposes no views, in which case the authoritative repository is
 	// used directly.
 	views documentReadViews
+}
+
+// ActivityRecorder records coarse-grained activity counters for the Console
+// monitoring page (for example state.ActivityCounters). It is a narrow seam so
+// the runtime does not depend on the monitoring read path.
+type ActivityRecorder interface {
+	Record(ctx context.Context, metric string, now time.Time) error
+}
+
+// SetActivityRecorder injects the optional activity counter. It must be called
+// during startup, before the service starts handling requests; a nil recorder
+// disables counting.
+func (s *Service) SetActivityRecorder(recorder ActivityRecorder) {
+	s.activityRecorder = recorder
 }
 
 // documentReadViews is the read-through cached document list used by
@@ -115,7 +133,15 @@ func (s *Service) Invalidate(namespace string) { s.search.Invalidate(namespace) 
 
 // Search runs one synchronous retrieval action.
 func (s *Service) Search(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error) {
-	return s.search.Search(ctx, namespace, request)
+	result, err := s.search.Search(ctx, namespace, request)
+	// Every retrieval execution counts, including a failed one: the Console
+	// activity card reports usage, not success. Counting failures are silently
+	// ignored so a monitoring write can never change the retrieval outcome, and
+	// the cancellation signal is dropped so a client disconnect still counts.
+	if s.activityRecorder != nil {
+		_ = s.activityRecorder.Record(context.WithoutCancel(ctx), state.ActivitySearch, time.Now())
+	}
+	return result, err
 }
 
 // PublicKnowledgeBase returns the secret-free knowledge-base settings.

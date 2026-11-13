@@ -1392,3 +1392,100 @@ parse/embedding of batch-uploaded files depends on the target knowledge base
 having embedding/VLM configuration — the `manuals` KB used for the smoke has an
 empty embedding base URL, so its jobs stayed in worker backoff while the batch
 progress itself was correct.
+
+## 系统监控页/API 六项语义修复 — 2026-11-13
+
+工作树 `dsh-2c70f4b2-96c9`（Windows 11，Go 1.27.3，Node v26.13.0 / npm 12.2.2）。
+目标：修复监控页六个问题——首屏与布局、总体状态与依赖探测、软删除文档计数、
+Outbox 待投递语义、上传操作混合计数、检索次数与结果快照数据源。
+
+**代码改动**
+
+- `internal/monitor/monitor.go`：顶层新增三态 `status`（`ok`/`degraded`/`error`，
+  `ok` 兼容字段 = `status == "ok"`）；`overallStatus` 聚合依赖与流水线视图
+  （状态库不可读/依赖 error/Debezium 检查失败 → error；依赖降级/Worker 心跳过期/
+  Kafka 进度读取失败 → degraded；未启用/未知中性；`document_jobs` 负载不参与）。
+  `queues.uploads` 增加 `by_status`/`in_progress`/`failed`/`rolling_back`/
+  `cleanup_pending`（保留 `unfinished` 并集）；`pipeline` 增加 `worker`
+  `{status, detail}`；`library.result_snapshots` 改为可空（Redis 计数）；
+  Kafka 依赖改为 broker 元数据探测（连通性/TLS-SASL/主题/分区），PDF 依赖解析
+  `/healthz`（转换器、版本、配置错误），Debezium 解析 `/q/health` 的 `checks[]`
+  并点名失败项。
+- `internal/state/monitor.go`：`documents` 只统计 `del_flag = 0`；删除
+  `ResultSnapshots`（改由 Redis 计数）；`upload_operations` 单条 `GROUP BY
+  status, cleanup_pending` 推导互斥分类与并集 `unfinished`；`SearchesRecent`
+  改读活动计数器（覆盖同步 REST/MCP 与排队检索，失败也计数）。
+- 新增 `internal/state/activity.go`（小时桶 `activity_counters`）、
+  `internal/state/heartbeat.go`（`runtime_heartbeats` + 24h 清理 +
+  `HeartbeatSnapshot`）、`internal/documentworker/heartbeat.go`
+  （`StartHeartbeat`、默认 15s、`RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS` 覆盖）。
+- 新增 `internal/mq/probe.go`（`BrokerHealth`：Metadata 请求，证明认证与主题）、
+  `internal/redisstate/snapshot_index.go`（`<prefix>:index:search-results` ZSET，
+  `Add`/`CountActive` 清过期后计数），`internal/state/result_snapshots.go`
+  增加可选 `SnapshotIndex`，`redisstate.Attach` 自动装配。
+- `internal/runtime/service.go`：`SetActivityRecorder`，`Service.Search` 每次调用
+  静默记一次活动计数。
+- `cmd/rag-service`：接线活动计数器、Kafka 元数据探测、Redis 快照计数、Worker
+  心跳读取；进程内 worker 启动心跳。`cmd/rag-document-worker`：独立 worker 启动
+  心跳。
+- `frontend/src/MonitorPage.tsx`、`api.ts`、`styles.css`：按重要性重排（页头状态 →
+  关键指标首卡 → 依赖与投递 → 队列与记录 → 服务信息），阶段分布为空不再渲染空
+  表格，上传拆成四个互斥分类并说明「未完成操作」含义，未知显示「未知」；窄屏
+  单列、表格横向滚动与长文本折行。
+- 文档：`docs/USAGE.md`（监控语义与新增环境变量）、`docs/agents/architecture.md`、
+  `docs/agents/features.md`、`docs/agents/development.md`、`docs/state-storage.md`
+  （新表）、`docs/state-cache.md`（快照索引）、`.env.example` 同步。
+
+**定向测试**（仅相关包，未跑全量）
+
+```
+$ go build ./...                                                    # exit 0
+$ go vet ./internal/monitor ./internal/state ./internal/runtime \
+         ./internal/documentworker ./internal/mq ./internal/redisstate \
+         ./cmd/rag-service ./cmd/rag-document-worker                # exit 0
+$ RAG_TEST_MYSQL_URL=mysql://rag:<env>@127.0.0.1:3307/praxis_unit_test \
+  go test -p 1 -count=1 -timeout 20m ./internal/state ./internal/monitor \
+    ./internal/mq ./internal/redisstate ./internal/documentworker \
+    ./internal/runtime ./internal/httpapi ./internal/searchrefs
+ok  internal/state 21.995s        ok  internal/monitor 2.777s
+ok  internal/mq 0.672s           ok  internal/redisstate 4.767s
+ok  internal/documentworker 2.672s  ok  internal/runtime 50.533s
+ok  internal/httpapi 2.218s      ok  internal/searchrefs 1.276s
+
+$ cd frontend && npm run typecheck                                  # exit 0
+$ cd frontend && npx vitest run src/MonitorPage.test.tsx src/api.test.ts
+  # 2 files / 44 tests passed
+```
+
+**实机验证**（复用 Compose 基础设施：MySQL 3307 / Redis 6379 / Qdrant 6333 /
+Kafka 9092 / Debezium 8083 / pdf-service 8091；本次构建的 `rag-service.exe`
+运行在 127.0.0.1:8012，状态库指向一次性 `praxis_unit_test`、Redis 使用独立
+`rag:monitorcheck` 前缀，避免干扰 8011 上的旧实例与生产数据）
+
+- 正常态：`status:"ok"`、`ok:true`；Kafka 显示「元数据正常（1 个 broker；主题
+  praxis_document_ingest 共 4 个分区）」；PDF 显示「转换器 docling，版本 1.0.0」；
+  Debezium 显示「健康检查正常（4 项运行检查通过）」；`queues.uploads` 输出五个
+  状态与四个分类；`pipeline.worker` 在无心跳时显示「未知」。
+- Worker 心跳：向 `runtime_heartbeats` 写入当前时间 → `pipeline.worker` 正常
+  （「最近心跳 2.3 秒前，1 个实例运行中」）；改成 120 秒前 → `degraded`
+  （「worker 可能已停止」）且顶层 `status` 变 `degraded`；删除行 → 未知。
+- 结果快照：向 `rag:monitorcheck:index:search-results` ZADD 一个未来过期成员 →
+  `library.result_snapshots: 1`；改成过去时间 → 清理后回到 `0`。
+- 检索次数：用本机管理员创建 API Key 后调用 `POST /v1/search`（测试库无该知识库，
+  请求返回 400）→ `activity.searches` 从 0 变 1，`activity_counters` 写入
+  `metric=search`，证明失败检索也计数。
+- 降级一致性：把 Qdrant 目标集合指向不存在的集合 → 依赖行 `degraded`
+  （「集合 … 不存在」），顶层 `status:"degraded"`、`ok:false`；此前旧构建在同样
+  场景下仍返回 `ok:true`。
+
+未验证/限制：未在浏览器里人工点检窄屏断点（单列、横向滚动与折行由 CSS 与
+jsdom 测试覆盖）；结果快照索引只覆盖上线后保存且在 TTL 内的快照，索引前保存的
+快照会短暂少计。
+
+随后用 `scripts/build-go.ps1` 重建了本工作树的 `dist/bin` + `dist/web`（冒烟通过），
+并把它部署到本机 127.0.0.1:8011（替换旧进程，`rag-document-worker` 一并启动）：
+`/health` 200；`/v1/admin/monitor/overview` 返回 `status:"degraded"`、`ok:false`
+（Qdrant 目标集合 `mini_agent_knowledge_pdf_assets_v1` 不存在），Kafka/PDF 显示
+元数据与转换器检查结果，`pipeline.worker` 正常，`library.documents=8`（旧构建为
+24，已排除软删除），`library.result_snapshots` 来自 Redis；`/console` 提供的
+`index-sut3qI55.js` 包含「关键指标」「存在降级」「未完成操作」等新文案。

@@ -90,7 +90,7 @@ examples/knowledge/         示例知识文档（可直接上传试用）
 | `mcp` | MCP 端点、工具、资源、提示词、权限 scope |
 | `migrate` | 旧知识源导入与状态迁移 |
 | `modelapi` | Embedding / Reranker HTTP 客户端 |
-| `monitor` | 只读监控快照：状态库聚合（文档任务/检索任务/上传、outbox 记录统计、资料库计数）与 MySQL/Redis/Qdrant/Kafka/pdf-service 依赖探测；另单独汇总 Debezium 健康状态与 Kafka 文档消费组进度（应用读不到的采集位点/滞后显式为「未知」），供 Console「系统监控」页与 `GET /v1/admin/monitor/overview` 使用。outbox 的 PENDING 只是保留期记录，不作为未投递积压 |
+| `monitor` | 只读监控快照：状态库聚合（文档任务/检索任务/上传分类、outbox 记录统计、有效文档计数、活动计数器）与 MySQL/Redis/Qdrant/Kafka/pdf-service 依赖探测；另单独汇总 Debezium `/q/health` 运行检查、Kafka 文档消费组进度和文档 Worker 心跳（应用读不到的采集位点/滞后显式为「未知」），并按三态聚合页头总体状态，供 Console「系统监控」页与 `GET /v1/admin/monitor/overview` 使用。outbox 的 PENDING 只是保留期记录，不作为未投递积压 |
 | `mq` | Kafka 生产/消费、进程内重试、DLQ 发布 |
 | `qdrant` | Qdrant HTTP 客户端（collection、向量、过滤、RRF 查询） |
 | `redisstate` | Redis 读模型缓存与搜索任务/快照 |

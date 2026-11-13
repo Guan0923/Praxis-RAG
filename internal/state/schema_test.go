@@ -42,6 +42,10 @@ var expectedSchema = []struct {
 	{"model_profiles", []string{"id", "kind", "name", "base_url", "model", "protected_key", "vector_size", "created_at", "updated_at"}},
 	{"document_batches", []string{"id", "namespace", "owner", "idempotency_key", "status", "total", "accepted", "skipped", "failed", "created_at", "updated_at"}},
 	{"document_batch_items", []string{"batch_id", "position", "name", "status", "reason", "artifact_id", "error", "created_at", "updated_at"}},
+	// Go-only monitoring tables (Console 监控页的活动计数与 Worker 心跳); they
+	// are appended after the ported tables so migrated databases keep the order.
+	{"activity_counters", []string{"metric", "window_start", "count"}},
+	{"runtime_heartbeats", []string{"role", "instance", "updated_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -72,6 +76,8 @@ var expectedPrimaryKeys = map[string][]string{
 	"model_profiles":          {"id"},
 	"document_batches":        {"id"},
 	"document_batch_items":    {"batch_id", "position"},
+	"activity_counters":       {"metric", "window_start"},
+	"runtime_heartbeats":      {"role", "instance"},
 }
 
 var expectedUniques = map[string]string{
@@ -110,6 +116,7 @@ var expectedIndexes = map[string][]string{
 	"model_profiles":          {"ix_model_profiles_kind"},
 	"document_batches":        {"ix_document_batch_active", "ix_document_batch_owner"},
 	"document_batch_items":    {"ix_document_batch_item_artifact"},
+	"runtime_heartbeats":      {"ix_runtime_heartbeats_role"},
 }
 
 // expectedTableNames returns the schema table names in Python declaration order.
