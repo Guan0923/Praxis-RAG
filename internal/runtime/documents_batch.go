@@ -221,8 +221,7 @@ func classifyBatchAdmissionFailure(position int, err error) state.DocumentBatchI
 }
 
 // documentBatchFileKey derives the per-file idempotency key of one batch,
-// matching uploadFileIdempotencyKey in httpapi so a retried batch addresses the
-// same logical files.
+// so a retried batch addresses the same logical files.
 func documentBatchFileKey(batchKey string, position int) *string {
 	if batchKey == "" {
 		return nil

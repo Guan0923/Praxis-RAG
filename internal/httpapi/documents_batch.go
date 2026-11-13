@@ -9,9 +9,8 @@ import (
 const documentBatchListLimit = 20
 
 // handleCreateDocumentBatch admits a batch of files in one durable batch
-// record. Every file is still admitted into the document job queue exactly as
-// POST /v1/documents does; the batch only adds per-file progress and a stable
-// batch id the Console can poll, so the endpoint answers 202 as soon as the
+// record. Each file has its own document job, while the batch provides
+// per-file progress and a stable id the Console can poll. It answers 202 once the
 // batch row and every admission have committed.
 func (s *Server) handleCreateDocumentBatch(w http.ResponseWriter, r *http.Request) {
 	namespace, ok := s.tenantNamespace(w, r)

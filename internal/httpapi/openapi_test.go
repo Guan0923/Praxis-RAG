@@ -32,6 +32,17 @@ func TestOpenAPIAndDocsRoutes(t *testing.T) {
 	if _, present := paths["/v1/search"]; !present {
 		t.Fatalf("paths missing /v1/search: %v", paths)
 	}
+	documents, _ := paths["/v1/documents"].(map[string]any)
+	if _, present := documents["get"]; !present {
+		t.Fatal("document list is missing from OpenAPI")
+	}
+	if _, present := documents["post"]; present {
+		t.Fatal("removed upload endpoint is still documented")
+	}
+	batches, _ := paths["/v1/document-batches"].(map[string]any)
+	if _, present := batches["post"]; !present {
+		t.Fatal("batch upload is missing from OpenAPI")
+	}
 	components, _ := document["components"].(map[string]any)
 	schemas, _ := components["schemas"].(map[string]any)
 	searchBody, _ := schemas["SearchBody"].(map[string]any)

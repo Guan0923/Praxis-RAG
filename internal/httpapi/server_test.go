@@ -50,11 +50,10 @@ func (f fakeKeys) NamespacesForKey(_ context.Context, secret string) ([]string, 
 
 func testSettings(token string) config.ServiceSettings {
 	return config.ServiceSettings{
-		Host:       "127.0.0.1",
-		Port:       8011,
-		Token:      token,
-		DataRoot:   "unused",
-		UploadMode: config.UploadModeSync,
+		Host:     "127.0.0.1",
+		Port:     8011,
+		Token:    token,
+		DataRoot: "unused",
 	}
 }
 

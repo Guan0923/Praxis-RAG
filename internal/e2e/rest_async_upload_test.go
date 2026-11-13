@@ -25,15 +25,14 @@ import (
 const restToken = "rest-test-token"
 
 // newRESTHandler builds the real HTTP surface over the harness runtime with the
-// asynchronous upload mode enabled.
+// asynchronous batch upload endpoint.
 func newRESTHandler(t *testing.T, h *harness) http.Handler {
 	t.Helper()
 	settings := config.ServiceSettings{
-		Host:       "127.0.0.1",
-		Port:       8011,
-		Token:      restToken,
-		DataRoot:   "unused",
-		UploadMode: config.UploadModeAsync,
+		Host:     "127.0.0.1",
+		Port:     8011,
+		Token:    restToken,
+		DataRoot: "unused",
 	}
 	server := httpapi.New(settings, nil, nil, testLogger(),
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: h.Service}))
@@ -65,7 +64,7 @@ func restRequest(handler http.Handler, method, target, namespace, idempotencyKey
 // restUploadFile is one multipart file part in submission order.
 type restUploadFile struct{ name, content string }
 
-// restMultipart renders one POST /v1/documents body.
+// restMultipart renders one POST /v1/document-batches body.
 func restMultipart(t *testing.T, files []restUploadFile) ([]byte, string) {
 	t.Helper()
 	buffer := &bytes.Buffer{}
@@ -97,7 +96,7 @@ func decodeRESTBody(t *testing.T, recorder *httptest.ResponseRecorder) map[strin
 // firstRestJobArtifactID extracts the artifact id of one admitted file.
 func firstRestJobArtifactID(t *testing.T, payload map[string]any) string {
 	t.Helper()
-	jobs, ok := payload["jobs"].([]any)
+	jobs, ok := payload["items"].([]any)
 	if !ok || len(jobs) == 0 {
 		t.Fatalf("response has no admitted jobs: %v", payload)
 	}
@@ -142,7 +141,7 @@ func runDocumentWorkerUntil(t *testing.T, h *harness, description string, done f
 	}
 }
 
-// TestRESTAsyncUploadPipeline is the end-to-end contract of RAG_UPLOAD_MODE=async:
+// TestRESTAsyncUploadPipeline is the end-to-end contract of batch uploads:
 // admission is durable and immediate, status reports worker stages, the published
 // document becomes readable/deletable, and a queued admission that loses the name
 // race to the synchronous write path fails terminally instead of overwriting it.
@@ -151,19 +150,16 @@ func TestRESTAsyncUploadPipeline(t *testing.T) {
 	handler := newRESTHandler(t, h)
 	ctx := context.Background()
 
-	// 1. The batch is admitted durably and answers with artifact ids only.
+	// 1. The batch is admitted durably and returns per-item artifact ids.
 	body, contentType := restMultipart(t, []restUploadFile{{"rest.md", documentText}})
-	admitted := restRequest(handler, http.MethodPost, "/v1/documents", "alpha", "rest-batch-1", contentType, body)
-	if admitted.Code != http.StatusOK {
+	admitted := restRequest(handler, http.MethodPost, "/v1/document-batches", "alpha", "rest-batch-1", contentType, body)
+	if admitted.Code != http.StatusAccepted {
 		t.Fatalf("async upload status = %d body = %s", admitted.Code, admitted.Body.String())
 	}
 	payload := decodeRESTBody(t, admitted)
-	if payload["mode"] != config.UploadModeAsync {
-		t.Fatalf("upload mode = %v", payload["mode"])
-	}
 	artifactID := firstRestJobArtifactID(t, payload)
-	job, _ := payload["jobs"].([]any)[0].(map[string]any)
-	if job["name"] != "rest.md" || job["status"] != "queued" {
+	job, _ := payload["items"].([]any)[0].(map[string]any)
+	if job["name"] != "rest.md" || job["status"] != state.DocumentBatchItemAccepted {
 		t.Fatalf("admitted job = %v", job)
 	}
 
@@ -193,21 +189,21 @@ func TestRESTAsyncUploadPipeline(t *testing.T) {
 
 	// A second admission of the still-queued filename is isolated per file.
 	duplicateBody, duplicateType := restMultipart(t, []restUploadFile{{"rest.md", "other bytes"}})
-	duplicate := restRequest(handler, http.MethodPost, "/v1/documents", "alpha", "rest-batch-2", duplicateType, duplicateBody)
-	if duplicate.Code != http.StatusOK {
+	duplicate := restRequest(handler, http.MethodPost, "/v1/document-batches", "alpha", "rest-batch-2", duplicateType, duplicateBody)
+	if duplicate.Code != http.StatusAccepted {
 		t.Fatalf("duplicate admission status = %d body = %s", duplicate.Code, duplicate.Body.String())
 	}
 	duplicatePayload := decodeRESTBody(t, duplicate)
-	if jobs, _ := duplicatePayload["jobs"].([]any); len(jobs) != 0 {
-		t.Fatalf("duplicate admission admitted jobs: %v", duplicatePayload)
+	if duplicatePayload["accepted"] != float64(0) || duplicatePayload["skipped"] != float64(1) {
+		t.Fatalf("duplicate admission outcome = %v", duplicatePayload)
 	}
-	failed, _ := duplicatePayload["failed"].([]any)
-	if len(failed) != 1 {
-		t.Fatalf("duplicate admission failed entries = %v", duplicatePayload)
+	items, _ := duplicatePayload["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("duplicate batch items = %v", items)
 	}
-	failure, _ := failed[0].(map[string]any)
-	if failure["name"] != "rest.md" || failure["error"] == "" {
-		t.Fatalf("duplicate failure = %v", failure)
+	failure, _ := items[0].(map[string]any)
+	if failure["name"] != "rest.md" || failure["reason"] != state.DocumentBatchReasonQueued {
+		t.Fatalf("duplicate skip = %v", failure)
 	}
 
 	// 2. The worker indexes the job; the status projection reaches succeeded.
@@ -232,8 +228,8 @@ func TestRESTAsyncUploadPipeline(t *testing.T) {
 	//    loses the name race, fails terminally, and never replaces the
 	//    synchronously written document.
 	mutexBody, mutexType := restMultipart(t, []restUploadFile{{"mutex.md", documentText}})
-	mutexAdmitted := restRequest(handler, http.MethodPost, "/v1/documents", "alpha", "mutex-batch", mutexType, mutexBody)
-	if mutexAdmitted.Code != http.StatusOK {
+	mutexAdmitted := restRequest(handler, http.MethodPost, "/v1/document-batches", "alpha", "mutex-batch", mutexType, mutexBody)
+	if mutexAdmitted.Code != http.StatusAccepted {
 		t.Fatalf("mutex admission status = %d body = %s", mutexAdmitted.Code, mutexAdmitted.Body.String())
 	}
 	mutexID := firstRestJobArtifactID(t, decodeRESTBody(t, mutexAdmitted))

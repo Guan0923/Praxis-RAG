@@ -8,6 +8,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -41,7 +42,6 @@ func permissionsHandler(t *testing.T, h *harness) http.Handler {
 		Host:                "127.0.0.1",
 		Port:                8011,
 		DataRoot:            "unused",
-		UploadMode:          config.UploadModeSync,
 		AuthEnabled:         true,
 		RegistrationEnabled: true,
 		SessionTTL:          time.Hour,
@@ -300,7 +300,7 @@ func TestPermissionsInvitationFlowEndToEnd(t *testing.T) {
 		t.Fatalf("read-only delete detail = %q", detail)
 	}
 	uploadBody, uploadType := restMultipart(t, []restUploadFile{{name: "readonly.md", content: documentText}})
-	recorder = vip.do(http.MethodPost, "/v1/documents", "team", uploadBody, uploadType)
+	recorder = vip.do(http.MethodPost, "/v1/document-batches", "team", uploadBody, uploadType)
 	requireStatus(t, recorder, http.StatusForbidden, "read-only grantee uploads")
 	if detail := decodeRESTBody(t, recorder)["detail"]; detail != access.MessageWriteRequired {
 		t.Fatalf("read-only upload detail = %v", detail)
@@ -337,8 +337,13 @@ func TestPermissionsInvitationFlowEndToEnd(t *testing.T) {
 		t.Fatalf("write grant access view = %v", payload)
 	}
 	documentBody, documentType := restMultipart(t, []restUploadFile{{name: "shared.md", content: documentText}})
-	recorder = vip.do(http.MethodPost, "/v1/documents", "team", documentBody, documentType)
-	requireStatus(t, recorder, http.StatusOK, "writer uploads document")
+	recorder = vip.do(http.MethodPost, "/v1/document-batches", "team", documentBody, documentType)
+	requireStatus(t, recorder, http.StatusAccepted, "writer uploads document")
+	artifactID := firstRestJobArtifactID(t, decodeRESTBody(t, recorder))
+	runDocumentWorkerUntil(t, h, "shared document indexed", func() bool {
+		job, err := h.Stores.DocumentJobs.Get(context.Background(), artifactID, nil)
+		return err == nil && job != nil && job.Status == state.DocumentJobSucceeded
+	})
 	recorder, payload = vip.json(http.MethodGet, "/v1/documents", "team", nil)
 	requireStatus(t, recorder, http.StatusOK, "writer lists documents")
 	if !containsDocument(payload["documents"], "shared.md") {

@@ -24,7 +24,7 @@
 - **按部署形态选择进程**：Kafka 模式下 `rag-service` 不内嵌消费者，文档/搜索/死信 worker 独立部署；无 Kafka 的单进程部署由 `rag-service` 内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS`，默认 auto），无需单独的 `rag-document-worker`。worker 不监听端口。
 - **PDF 解析引擎可选**：默认 `RAG_PDF_ENGINE=docling` 时，`rag-service`/`rag-document-worker` 通过 `RAG_PDF_SERVICE_URL` 调用独立进程 `pdf-parser`（容器端口 8091，健康检查 `/healthz`）；它不连接状态库/Qdrant，只把 PDF 转成 zip（`manifest.json` + 图片资产）。`RAG_PDF_ENGINE=go` 时 pdf-parser 不需要运行，PDF 由 Go 内置纯文本引擎处理。详见 §3.5。
 - 所有进程必须共享同一份基础设施配置：`RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`RAG_BACKEND=qdrant`/`QDRANT_URL`、`RAG_STATE_ENCRYPTION_KEY`、Redis 与 Kafka（bootstrap、topic/group、DLQ）设置。配置不一致会造成 401/找不到任务/重复发布等难以排查的问题。
-- 上传默认异步受理：最小部署是 `rag-service + Qdrant + 状态库`（无 Kafka 时由内嵌文档 worker 完成解析/索引）；Kafka 部署还需 `rag-document-worker`（`scripts/start-stack.ps1` 在开发环境会自动启动），或显式设置 `RAG_UPLOAD_MODE=sync` 回到请求内完成解析的同步模式；服务端 MCP 排队搜索需要 search worker + Redis + Kafka。
+- 上传默认异步受理：最小部署是 `rag-service + Qdrant + 状态库`（无 Kafka 时由内嵌文档 worker 完成解析/索引）；Kafka 部署还需 `rag-document-worker`（`scripts/start-stack.ps1` 在开发环境会自动启动）；服务端 MCP 排队搜索需要 search worker + Redis + Kafka。
 
 ## 2. 二进制与目录布局
 
@@ -257,7 +257,6 @@ RAG_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
 # 外部 Kafka 可追加 RAG_KAFKA_SECURITY_PROTOCOL / RAG_KAFKA_SASL_* / RAG_KAFKA_TLS_*
 # 上传默认异步受理：Kafka 部署由 rag-document-worker 消费通知；无 Kafka 时
 # 由服务内嵌文档 worker 消费发件箱（auto 仅在未配置 bootstrap 时启用）。
-# RAG_UPLOAD_MODE=async
 # RAG_DOCUMENT_WORKER_INPROCESS=auto
 # RAG_DOCUMENT_WORKER_CONCURRENCY=1
 # RAG_SEARCH_WORKER_CONCURRENCY=1
@@ -445,7 +444,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 - 表结构与 `enc:v1:` 凭据格式与旧 Python 版本兼容；从旧部署升级时应先停旧入口并备份数据库（Python 后端代码已从仓库删除）。
 - `rag-service-migrate --apply` 只写状态（blobs + documents），**不生成 Qdrant 向量**；迁移完成后需通过 HTTP/MCP 重新上传文档或等待后续 reindex，才能被检索到。
 - API 与 worker 一起发布：Go 文档通知为 schema 3，旧 Python worker 的 schema 2 不兼容，禁止混跑。
-- 升级注意：本次起 REST/Console 上传默认异步受理，必须有文档消费者。无 Kafka 的单进程部署由 `rag-service` 内嵌 worker 覆盖（`RAG_DOCUMENT_WORKER_INPROCESS` 默认 auto，`RAG_DOCUMENT_WORKER_POLL_SECONDS` 默认 0.5 秒轮询）；Kafka 部署必须运行 `rag-document-worker`（`scripts/start-stack.ps1` 会自动启动），或显式设置 `RAG_UPLOAD_MODE=sync` 保留请求内完成的旧行为。MCP `add_document` 始终异步，同样受益于内嵌 worker；`update_document`/`delete_document` 仍同步。
+- 升级注意：本次起 REST/Console 上传默认异步受理，必须有文档消费者。无 Kafka 的单进程部署由 `rag-service` 内嵌 worker 覆盖（`RAG_DOCUMENT_WORKER_INPROCESS` 默认 auto，`RAG_DOCUMENT_WORKER_POLL_SECONDS` 默认 0.5 秒轮询）；Kafka 部署必须运行 `rag-document-worker`（`scripts/start-stack.ps1` 会自动启动）。MCP `add_document` 始终异步，同样受益于内嵌 worker；`update_document`/`delete_document` 仍同步。
 - 生产 `RAG_STATE_AUTO_SCHEMA` 可关闭，由迁移步骤预先建表；否则服务启动也会尝试建缺失表。
 
 ## 7. DLQ 监控

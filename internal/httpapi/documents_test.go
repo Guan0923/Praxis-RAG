@@ -3,7 +3,6 @@ package httpapi
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -19,10 +18,6 @@ type fakeDocRuntime struct {
 
 	documents     []map[string]any
 	listErr       error
-	uploadPayload map[string]any
-	uploadErr     error
-	upoadFiles    []UploadFile
-	uploadKey     string
 	deletePayload map[string]any
 	deleteErr     error
 	checkPayload  map[string]any
@@ -34,13 +29,8 @@ type fakeDocRuntime struct {
 	readFileErr   error
 	publicKB      map[string]any
 	publicKBErr   error
-
-	admitted     []string
-	admittedKeys []string
-	admitPayload map[string]any
-	admitErrFor  map[string]error
-	statusByID   map[string]map[string]any
-	statusErr    error
+	statusByID    map[string]map[string]any
+	statusErr     error
 
 	batchFiles   []UploadFile
 	batchKey     string
@@ -56,39 +46,16 @@ type fakeDocRuntime struct {
 func newFakeDocRuntime() *fakeDocRuntime {
 	return &fakeDocRuntime{
 		fakeServiceRuntime: &fakeServiceRuntime{},
-		uploadPayload:      map[string]any{"imported": []any{}, "failed": []any{}, "documents": []any{}},
 		deletePayload:      map[string]any{"deleted": map[string]any{}, "documents": []any{}},
 		checkPayload:       map[string]any{"duplicates": []any{}},
 		readText:           "hello",
 		publicKB:           map[string]any{"namespace": "alpha", "collection": "knowledge_x"},
-		admitErrFor:        map[string]error{},
 		statusByID:         map[string]map[string]any{},
 	}
 }
 
 func (f *fakeDocRuntime) ListDocuments(context.Context, string) ([]map[string]any, error) {
 	return f.documents, f.listErr
-}
-
-func (f *fakeDocRuntime) Upload(_ context.Context, _ string, files []UploadFile, idempotencyKey string) (map[string]any, error) {
-	f.upoadFiles = files
-	f.uploadKey = idempotencyKey
-	return f.uploadPayload, f.uploadErr
-}
-
-func (f *fakeDocRuntime) AdmitDocument(_ context.Context, _ string, name string, content []byte, idempotencyKey string) (map[string]any, error) {
-	f.admitted = append(f.admitted, name)
-	f.admittedKeys = append(f.admittedKeys, idempotencyKey)
-	if failure, ok := f.admitErrFor[name]; ok {
-		return nil, failure
-	}
-	if f.admitPayload != nil {
-		return f.admitPayload, nil
-	}
-	return map[string]any{
-		"artifact_id": fmt.Sprintf("9b2f9e9e-0000-4000-8000-%012d", len(f.admitted)), "status": "queued",
-		"reused": false,
-	}, nil
 }
 
 func (f *fakeDocRuntime) GetDocumentStatus(_ context.Context, _ string, artifactID string) (map[string]any, error) {
@@ -201,26 +168,26 @@ func TestDocumentsEndpoints(t *testing.T) {
 
 	content, contentType := multipartBody(t, nil, "notes.md", "hello")
 	uploaded := performRequest(handler, testRequest{
-		method: "POST", target: "/v1/documents", headers: map[string]string{
+		method: "POST", target: "/v1/document-batches", headers: map[string]string{
 			"Authorization": "Bearer test-token", "X-RAG-Namespace": "alpha",
 			"Content-Type": contentType, "Idempotency-Key": "retry-1",
 		},
 		body: content,
 	})
-	if uploaded.Code != http.StatusOK {
+	if uploaded.Code != http.StatusAccepted {
 		t.Fatalf("upload status = %d body = %s", uploaded.Code, uploaded.Body.String())
 	}
-	if len(runtime.upoadFiles) != 1 || runtime.upoadFiles[0].Name != "notes.md" ||
-		string(runtime.upoadFiles[0].Content) != "hello" {
-		t.Fatalf("uploaded files = %+v", runtime.upoadFiles)
+	if len(runtime.batchFiles) != 1 || runtime.batchFiles[0].Name != "notes.md" ||
+		string(runtime.batchFiles[0].Content) != "hello" {
+		t.Fatalf("uploaded files = %+v", runtime.batchFiles)
 	}
-	if runtime.uploadKey != "retry-1" {
-		t.Fatalf("idempotency key = %q", runtime.uploadKey)
+	if runtime.batchKey != "retry-1" {
+		t.Fatalf("idempotency key = %q", runtime.batchKey)
 	}
 
 	extraFieldBody, extraContentType := multipartBody(t, map[string]string{"chunking": "token"}, "notes.md", "hello")
 	rejected := performRequest(handler, testRequest{
-		method: "POST", target: "/v1/documents", headers: map[string]string{
+		method: "POST", target: "/v1/document-batches", headers: map[string]string{
 			"Authorization": "Bearer test-token", "X-RAG-Namespace": "alpha", "Content-Type": extraContentType,
 		},
 		body: extraFieldBody,

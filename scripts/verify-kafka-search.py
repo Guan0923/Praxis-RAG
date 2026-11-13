@@ -1,6 +1,7 @@
 """Live Kafka queued-search check: MCP search -> Kafka -> search worker -> snapshot."""
 import base64
 import importlib.util
+import json
 import os
 import pathlib
 import subprocess
@@ -15,7 +16,7 @@ e2e = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(e2e)  # noqa: E402
 
 
-def upload_sync(api_key: str, namespace: str, name: str, content: str):
+def upload_and_wait(api_key: str, namespace: str, name: str, content: str):
     boundary = "----kafka-search-boundary"
     body = (
         f"--{boundary}\r\n"
@@ -24,11 +25,27 @@ def upload_sync(api_key: str, namespace: str, name: str, content: str):
         f"--{boundary}--\r\n"
     ).encode()
     request = urllib.request.Request(
-        e2e.SERVICE + "/v1/documents", data=body, method="POST",
+        e2e.SERVICE + "/v1/document-batches", data=body, method="POST",
         headers={"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace,
                  "Content-Type": f"multipart/form-data; boundary={boundary}"})
     with urllib.request.urlopen(request, timeout=120) as response:
-        return response.status, response.read().decode()
+        status = response.status
+        raw = response.read().decode()
+    payload = json.loads(raw)
+    if status != 202 or payload.get("accepted") != 1:
+        raise RuntimeError(f"batch upload failed: {status} {payload}")
+    artifact_id = payload["items"][0]["artifact_id"]
+    headers = {"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace}
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        job_status, _, job = e2e.http_json(
+            "GET", e2e.SERVICE + "/v1/document-jobs/" + artifact_id, headers=headers)
+        if job_status != 200 or job.get("status") == "failed":
+            raise RuntimeError(f"document indexing failed: {job_status} {job}")
+        if job.get("status") == "succeeded":
+            return status, raw
+        time.sleep(0.5)
+    raise TimeoutError("document indexing did not finish within 120 seconds")
 
 
 def _ensure_search_database() -> str:
@@ -50,7 +67,7 @@ def main() -> int:
     (e2e.WORK / "data").mkdir(parents=True, exist_ok=True)
     (e2e.WORK / "config.toml").write_text("[environment]\n", encoding="utf-8")
     model = e2e.start_model_server()
-    service = worker = None
+    service = worker = document_worker = None
     try:
         search_database = _ensure_search_database()
         env = e2e.base_env()
@@ -64,6 +81,7 @@ def main() -> int:
             return 1
         print("service healthy")
         worker, worker_log = e2e.start_process("search-worker", [str(e2e.BIN / "rag-search-worker.exe")], env)
+        document_worker, _ = e2e.start_process("document-worker", [str(e2e.BIN / "rag-document-worker.exe")], env)
 
         namespace = "gosearch" + time.strftime("%H%M%S")
         status, _, kb = e2e.http_json("POST", e2e.SERVICE + "/v1/admin/knowledge-bases", {
@@ -80,7 +98,7 @@ def main() -> int:
                                           {"name": "gosearch", "namespaces": [namespace]})
         api_key = created["key"]
         document = f"kafka-search-{int(time.time())}.md"
-        upload_status, upload_body = upload_sync(
+        upload_status, upload_body = upload_and_wait(
             api_key, namespace, document,
             "# Kafka queued search\n\nThe search worker consumes the Kafka envelope.\n")
         print("upload", upload_status, upload_body[:160])
@@ -113,6 +131,7 @@ def main() -> int:
         return 1
     finally:
         e2e.stop_process(worker)
+        e2e.stop_process(document_worker)
         e2e.stop_process(service)
         model.shutdown()
         model.server_close()

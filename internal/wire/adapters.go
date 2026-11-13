@@ -51,20 +51,6 @@ func (a HTTPRuntime) ListDocuments(ctx context.Context, namespace string) ([]map
 	return a.Service.ListDocuments(ctx, namespace)
 }
 
-// Upload implements httpapi.DocumentRuntime.
-func (a HTTPRuntime) Upload(ctx context.Context, namespace string, files []httpapi.UploadFile, idempotencyKey string) (map[string]any, error) {
-	converted := make([]runtime.UploadFile, 0, len(files))
-	for _, file := range files {
-		converted = append(converted, runtime.UploadFile{Name: file.Name, Content: file.Content})
-	}
-	return a.Service.Upload(ctx, namespace, converted, idempotencyKey)
-}
-
-// AdmitDocument implements httpapi.DocumentRuntime.
-func (a HTTPRuntime) AdmitDocument(ctx context.Context, namespace, name string, content []byte, idempotencyKey string) (map[string]any, error) {
-	return a.Service.AdmitDocument(ctx, namespace, name, content, idempotencyKey)
-}
-
 // GetDocumentStatus implements httpapi.DocumentRuntime.
 func (a HTTPRuntime) GetDocumentStatus(ctx context.Context, namespace, artifactID string) (map[string]any, error) {
 	return a.Service.GetDocumentStatus(ctx, namespace, artifactID)

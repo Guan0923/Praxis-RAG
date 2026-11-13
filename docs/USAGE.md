@@ -19,7 +19,6 @@ REST 批次上传 POST /v1/document-batches（Console 使用）
                  -> 每文件一个事务并行受理（按文件名加锁，不同名互不排队）
                  -> 202 返回 batch_id + 每个文件 accepted/skipped/failed
                  -> GET /v1/document-batches/{batch_id} 同时给出保存结果与解析阶段
-REST 上传（RAG_UPLOAD_MODE=sync）-> 请求内完成解析/切分/Embedding/发布
 MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-worker -> SearchRaw + 快照
 Kafka 死信（显式 DLQ topic）-> rag-dead-letter-worker --kind document|search
 ```
@@ -118,11 +117,11 @@ MySQL 默认映射 `127.0.0.1:3307`（避免与本地 3306 冲突），Qdrant �
 
 pdf-parser 首次构建会拉取 CPU 版 torch 与 docling（镜像较大）。首次使用前需要把 Docling/CodeFormula 模型放入 `pdf_parser_models` 卷（需要联网：先 `docling-tools models download --output-dir /models`，再按 `python-workers/pdf-service/README.md` 单独准备 CodeFormulaV2 权重），或配置 `RAG_VLM_BASE_URL` + `RAG_VLM_MODEL` 改用远端 VLM 做公式识别；两者都没有时 `/v1/parse` 返回 503。宿主机直接运行的 Go 服务默认通过 `http://127.0.0.1:8091` 访问它；compose `app` 容器由 compose 注入 `http://pdf-parser:8091`。docling 引擎还要求每个知识库在 Console「模型配置」页添加 VLM 与 OCR 模型并在知识库表单中选择，缺失时 PDF 上传会在受理阶段返回中文提示（不进入队列）；OCR 引擎由 pdf-parser 本地执行（`easyocr` 默认；`tesseract` 需要镜像/系统安装 tesseract 与 `chi_sim`/`eng` 语言包），VLM 则调用知识库配置的 OpenAI 兼容端点。
 
-> Kafka 默认自动创建 topic（4 partitions、副本 1）；`scripts/start-stack.ps1` 仍会显式创建 cache/document/search 与两个 DLQ topic、等待 Kafka healthy、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe` 与 `dist/bin/rag-document-worker.exe`（收到 Ctrl+C 时一并停止）；`RAG_OUTBOX_BRIDGE=debezium` 时带 `--profile debezium` 并等待 Debezium 输出 `Starting streaming`。用 `-MigrateOnly` 可只准备依赖与数据库。该脚本执行默认 `docker compose up -d`，因此也会启动 pdf-parser，并把 `.env` 中的 `RAG_PDF_ENGINE` 等变量加载进宿主进程；只用 Go 引擎时请在 `.env` 设 `RAG_PDF_ENGINE=go` 并自行停掉 pdf-parser。不配置 Kafka 时，默认异步上传由 `rag-service` 内嵌文档 worker 消费（`RAG_DOCUMENT_WORKER_INPROCESS`），纯同步 REST（`RAG_UPLOAD_MODE=sync`）也不需要文档 worker。
+> Kafka 默认自动创建 topic（4 partitions、副本 1）；`scripts/start-stack.ps1` 仍会显式创建 cache/document/search 与两个 DLQ topic、等待 Kafka healthy、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe` 与 `dist/bin/rag-document-worker.exe`（收到 Ctrl+C 时一并停止）；`RAG_OUTBOX_BRIDGE=debezium` 时带 `--profile debezium` 并等待 Debezium 输出 `Starting streaming`。用 `-MigrateOnly` 可只准备依赖与数据库。该脚本执行默认 `docker compose up -d`，因此也会启动 pdf-parser，并把 `.env` 中的 `RAG_PDF_ENGINE` 等变量加载进宿主进程；只用 Go 引擎时请在 `.env` 设 `RAG_PDF_ENGINE=go` 并自行停掉 pdf-parser。不配置 Kafka 时，默认异步上传由 `rag-service` 内嵌文档 worker 消费（`RAG_DOCUMENT_WORKER_INPROCESS`）。
 
 ### 手动依赖
 
-只使用同步 REST/Console（`RAG_UPLOAD_MODE=sync`）时，最小依赖是 Qdrant + 状态库；默认异步受理时解析/索引在文档 worker（无 Kafka 时是 `rag-service` 内嵌 worker），同样不需要 Kafka。
+REST/Console 批次上传与 MCP 新增均异步受理。无 Kafka 时，最小依赖为 Qdrant + 状态库，文档解析/索引由 `rag-service` 内嵌 worker 完成；Kafka 部署使用独立文档 worker。
 
 ```powershell
 docker run -d --name praxis-qdrant -p 6333:6333 -p 6334:6334 `
@@ -259,7 +258,6 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_STATE_AUTO_SCHEMA` | `true` | 启动时创建缺失表；生产可关闭并由部署账号预建 |
 | `RAG_UPLOAD_LEASE_SECONDS` | `120` | 上传事务业务租约时长 |
 | `RAG_UPLOAD_CLEANUP_DELAY_SECONDS` | `3600` | 已完成上传工作区清理延迟 |
-| `RAG_UPLOAD_MODE` | `async` | `POST /v1/documents` 受理方式：`async` 每文件提交 `document_jobs`+发件箱后立即返回 `artifact_id`，由文档 worker 后台处理（无 Kafka 时由 `rag-service` 内嵌 worker，Kafka 部署需 `rag-document-worker`）；`sync` 为旧的请求内解析/切分/Embedding/发布后返回 |
 
 `RAG_SERVICE_DATA_ROOT` 只决定上传恢复工作区等本地文件的位置，不再决定数据库。两项都未配置时启动报错；表结构可用 §7 的 `rag-state-migrate` 检查/建表。
 
@@ -458,13 +456,14 @@ curl.exe http://127.0.0.1:8011/docs           # 自包含交互文档
 
 ### 文档上传与批次进度
 
-单批上传（≤10 个文件、单文件 ≤10 MiB）有三个入口，语义一致，都是"每文件一个 `document_jobs` 行 + 一个发件箱行"：
+文档导入有两个入口：REST 批次上传（单批 ≤10 个文件、单文件 ≤10 MiB）和 MCP 单文件新增。两者都将每个文件的任务与发件箱写入同一个事务：
 
 | 入口 | 行为 |
 | --- | --- |
-| `POST /v1/documents` | 同步受理一批文件：服务端逐文件提交后返回 `{"mode":"async","jobs":[...],"failed":[...]}`；`RAG_UPLOAD_MODE=sync` 时在请求内完成解析/索引 |
 | `POST /v1/document-batches` | **批次受理**：`202` 返回 `batch_id` 与每个文件的结果（`accepted` / `skipped` / `failed`），供 Console 显示进度；每文件独立事务并行提交，不同文件名之间不互相排队（同名仍串行，保证查重与插入的原子性） |
 | MCP `add_document` | 单文件异步受理，只返回 `artifact_id` |
+
+切块完成后，同一文档的 Embedding 与 BM25 稀疏向量计算并发执行，两步都成功才写入 Qdrant。任一步失败会取消另一侧的计算，并等待其退出后清理上传；BM25 在 chunk 之间检查取消信号。Embedding 仍每批最多发送 32 个 chunk，同一文档内各批请求按顺序执行。
 
 `POST /v1/document-batches` 的响应结构（Console 气泡直接消费）：
 
@@ -495,7 +494,7 @@ curl.exe http://127.0.0.1:8011/docs           # 自包含交互文档
 
 管理员（或本机直连）可在 Console 侧边栏打开「系统监控」（`#/monitor`），页面每 15 秒自动刷新，全部为只读数据：
 
-- **服务信息**：版本、运行时长、后端、默认集合、上传模式（`RAG_UPLOAD_MODE`）、outbox 投递模式（relay/debezium）、文档 worker 模式（进程内/独立）、PDF 引擎。
+- **服务信息**：版本、运行时长、后端、默认集合、上传模式（固定异步）、outbox 投递模式（relay/debezium）、文档 worker 模式（进程内/独立）、PDF 引擎。
 - **依赖探测**：MySQL（含连接池 in_use/wait）、Redis（PING）、Qdrant（集合数与目标集合点数）、Kafka（TCP 可达，不验证认证/授权）、pdf-service（`/healthz`）；未启用的依赖标记为「未启用」。
 - **队列与积压**：`document_jobs` 按状态/阶段计数、最老排队时长、租约过期的卡死任务数、24 小时失败数；`document_job_outbox` 按状态计数与最老待投递时长；`search_tasks` 按状态计数；未完成的上传操作数。
 - **资料库与活动**：文档数、知识库数、搜索结果快照数、artifact 快照数；最近 24 小时成功/失败入库与检索次数。
@@ -669,13 +668,13 @@ curl.exe -X POST http://127.0.0.1:8011/v1/documents/check `
   -H $headers -d '{"files":[{"name":"guide.md","sha256":"<64-hex>"}]}'
 
 # 上传（默认异步受理；multipart，字段名必须为 files；可选 Idempotency-Key）
-curl.exe -X POST http://127.0.0.1:8011/v1/documents `
+curl.exe -X POST http://127.0.0.1:8011/v1/document-batches `
   -H "Authorization: Bearer <token-or-key>" `
   -H "X-RAG-Namespace: default" `
   -H "Idempotency-Key: batch-20261108-01" `
   -F "files=@guide.md" -F "files=@manual.txt"
 
-# 默认异步受理返回 jobs[].artifact_id，按 id 轮询状态（RAG_UPLOAD_MODE=sync 时为同步响应）
+# 202 响应中 items[].artifact_id 标识已受理文件，可按 id 轮询状态
 curl.exe "http://127.0.0.1:8011/v1/document-jobs/<artifact_id>" -H $headers
 
 # 列表、读取正文、删除
@@ -684,7 +683,7 @@ curl.exe "http://127.0.0.1:8011/v1/documents/guide.md/content" -H $headers   # �
 curl.exe -X DELETE "http://127.0.0.1:8011/v1/documents/guide.md" -H $headers
 ```
 
-默认异步受理的响应为 `mode:"async"`、`jobs:[{name, artifact_id, status, reused}]` 与 `failed:[{name, error}]`：每批每个文件独立受理，单个文件冲突只进入 `failed` 不阻塞其它文件；重复提交同一 `Idempotency-Key` 的同一批文件会复用原 `artifact_id`（`reused:true`）。异步任务状态：`GET /v1/document-jobs/{artifact_id}` 返回 `{artifact_id, status, stage, error}`（`queued` / `processing` + `stage` / `succeeded` / `failed`），未知或跨工作区 id 返回 404。Console 上传对话框受理后立即返回，按 排队中/处理中/已完成/失败 展示轮询结果并显示「已受理 N 个文件，正在后台处理」，解析期间页面可继续操作。设置 `RAG_UPLOAD_MODE=sync` 时回退为同步模式：响应包含 `imported`、`skipped`、`failed`、`documents` 与 `mode:"sync"`，`skipped` 条目带 `requested_name`，解析/切分/Embedding/发布在请求内完成。单文件 10 MiB、单批 10 个；上传切分参数来自知识库配置，不接受请求级覆盖。PDF 返回原始文件字节（`Content-Type: application/pdf`）；版本化 PDF/Word 的正文读取已保存的 `document.md`。
+批次上传返回 `202`，响应包含 `batch_id`、`total/accepted/skipped/failed` 计数与 `items`。每项包含文件名、`accepted/skipped/failed` 结果、原因，以及受理成功后的 `artifact_id`。使用 `GET /v1/document-batches/{batch_id}` 查询整个批次，或 `GET /v1/document-jobs/{artifact_id}` 查询单文件状态；只有任务 `succeeded` 才表示已索引。重复提交同一 `Idempotency-Key` 会返回原批次。单文件 10 MiB、单批 10 个，切分参数来自知识库配置，不接受请求级覆盖。PDF 正文下载返回原文件字节（`Content-Type: application/pdf`），版本化 PDF/Word 的文本视图读取已保存的 `document.md`。
 
 ### 搜索、结果与产物
 
@@ -950,7 +949,7 @@ PDF 默认由独立的 `pdf-parser` 微服务解析（Docling，HTTP + zip 清�
 - **解析器**：PDF 默认走独立 `pdf-parser` 微服务（Docling：版面/表格/OCR/公式 LaTeX；需要该服务、模型卷与可选 VLM，服务不可用时 docling 上传会失败）。`RAG_PDF_ENGINE=go` 时使用 Go 内置纯文本引擎（文字型 PDF；扫描件、PDF 表格/公式/图片资产不支持，需要时请先 OCR 或用其他工具预处理）。DOCX 解析在 Go 进程内完成；Word 无图注图片需要 VLM 端点才会生成描述，未配置时保留占位描述、上传不失败；.doc 转换仍需要外部 LibreOffice。
 - **异步投递**：支持 relay（默认，进程内发件箱发布到 Kafka）、debezium（Debezium Server 读 MySQL binlog，经原生 Kafka sink 写 topic，应用不发布）与本地 worker 模式；Debezium 模式需要 MySQL 状态库。
 - **排队搜索**：`RAG_KAFKA_BOOTSTRAP_SERVERS` 一旦设置，MCP `search` 自动改为排队模式；若没有部署 `rag-search-worker`/Redis，搜索会保持排队直至截止。纯同步部署不要配置 Kafka。
-- **上传受理**：`POST /v1/documents` 默认异步，逐文件受理并返回 `artifact_id`，状态由 `GET /v1/document-jobs/{artifact_id}` 读取；必须有一个文档消费者：无 Kafka 的单进程部署由 `rag-service` 内嵌 worker 覆盖（`RAG_DOCUMENT_WORKER_INPROCESS` 默认 auto），Kafka 部署需运行 `rag-document-worker`（`scripts/start-stack.ps1` 会自动启动）。设置 `RAG_UPLOAD_MODE=sync` 回退为请求内完成的旧同步模式。`update_document`/`delete_document` 仍同步执行，与排队中的异步任务靠受理期同名检查与发布事务内的 `ValidatePublication` 互斥。
+- **上传受理**：REST/Console 统一使用 `POST /v1/document-batches` 异步受理，通过批次或文档任务状态接口观察进度。无 Kafka 时由 `rag-service` 内嵌 worker 消费，Kafka 部署运行 `rag-document-worker`。MCP `update_document`/`delete_document` 仍同步执行，与排队任务通过同名检查和发布事务内的 `ValidatePublication` 互斥。
 - **权限与共享**：账号分为管理员 / VIP / 普通用户；知识库默认归创建者私有，共享靠邀请链接完成（权限：可读/可修改；范围：单文件/多文件/全库），只有 VIP 与管理员可发起邀请。邀请消息目前是站内通知（控制台铃铛），不发送邮件/IM；链接只展示一次，库内只存摘要。文件级写授权只能替换已授权的同名文档，不能上传新文件；历史无创建者的知识库仅管理员可用/可授权；受限账号在启用 Kafka 的排队搜索部署下会被拒绝异步检索（同步检索不受影响）。详见 [权限管理](PERMISSIONS.md)。
 - **管理边界**：`/v1/admin/*` 仅本机直连或管理员会话；**例外**是 `/v1/admin/api-keys` 的五条管理路由——任意登录角色的会话都可管理自己的 API Key（管理员管理全部，非管理员只能绑定本人拥有的知识库）。API Key 按创建账号归属隔离，历史无主密钥仅管理员/本机管理可见；管理凭证（Service Token / API Key）在请求时仍不做知识库归属校验，API Key 的 namespace 白名单仍然生效。详见 [权限管理](PERMISSIONS.md) §9。
 - **数据**：状态表用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧 Redis 搜索结果不迁移。

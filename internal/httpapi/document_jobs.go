@@ -8,9 +8,9 @@ import (
 )
 
 // handleDocumentJobStatus serves one asynchronous admission status. The
-// artifact id is the only lookup key a client holds after POST /v1/documents
-// returns in async mode, so it must stay readable until the job's terminal
-// retention window expires.
+// artifact id is returned on accepted items from POST /v1/document-batches
+// and by MCP add_document. It stays readable until the job's terminal retention
+// window expires.
 //
 // Status values: queued, processing (with a stage such as parsing, chunking,
 // embedding, indexing or publishing), succeeded and failed. Failed jobs carry

@@ -100,7 +100,7 @@ func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
 }
 
 // TestSubmitDocumentBatchRejectsOversizedInput keeps the batch contract at the
-// same ten-file limit as POST /v1/documents.
+// ten-file limit of the batch upload endpoint.
 func TestSubmitDocumentBatchRejectsOversizedInput(t *testing.T) {
 	service, _, _ := newAsyncService(t)
 	files := make([]UploadFile, 11)

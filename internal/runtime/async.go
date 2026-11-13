@@ -68,27 +68,6 @@ func (s *Service) addDocumentAsync(
 	return map[string]any{"artifact_id": admission.ArtifactID}, nil
 }
 
-// AdmitDocument is the REST projection of the same durable admission. The
-// Console renders the admitted jobs immediately, so it also gets the queued
-// status and the "same idempotency key reused" flag: a resent batch must show
-// the original artifact ids instead of looking like a fresh submission.
-func (s *Service) AdmitDocument(
-	ctx context.Context,
-	namespace, name string,
-	content []byte,
-	idempotencyKey string,
-) (map[string]any, error) {
-	admission, err := s.admitDocument(ctx, namespace, name, content, idempotencyKey)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{
-		"artifact_id": admission.ArtifactID,
-		"status":      admission.Status,
-		"reused":      admission.Reused,
-	}, nil
-}
-
 // asyncDocumentError maps state admission errors to the Python runtime
 // categories: validation/configuration problems are 400-style validation
 // errors, name/idempotency collisions keep the MCP-visible conflict text, and

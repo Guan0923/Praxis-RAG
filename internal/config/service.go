@@ -36,21 +36,6 @@ var DefaultMCPAllowedOrigins = []string{
 	"http://[::1]:*",
 }
 
-// Upload admission modes for POST /v1/documents.
-//
-// async is the default: it admits the batch durably (one document_jobs row plus
-// one outbox row per file) and answers as soon as MySQL commits, so the Console
-// stays usable; parsing, chunking, embedding and publication happen afterwards
-// in the document worker. sync is the legacy opt-in mode where the request
-// parses, chunks, embeds and publishes every file before it answers.
-const (
-	UploadModeSync  = "sync"
-	UploadModeAsync = "async"
-	// DefaultUploadMode is asynchronous admission: uploads return after the
-	// durable MySQL commit and a document worker performs the parse afterwards.
-	DefaultUploadMode = UploadModeAsync
-)
-
 // ServiceSettings configures the standalone HTTP service entry point.
 type ServiceSettings struct {
 	Host              string
@@ -59,9 +44,6 @@ type ServiceSettings struct {
 	Token             string
 	MCPAllowedHosts   []string
 	MCPAllowedOrigins []string
-	// UploadMode selects async (default) or sync POST /v1/documents admission.
-	// An empty value follows DefaultUploadMode.
-	UploadMode string
 	// WebRoot is the directory containing the built Console (index.html and
 	// assets). An empty value means "resolve a default location".
 	WebRoot string
@@ -152,10 +134,6 @@ func ServiceSettingsFromEnv() (ServiceSettings, error) {
 	if err != nil {
 		return ServiceSettings{}, err
 	}
-	uploadMode, err := uploadModeSetting()
-	if err != nil {
-		return ServiceSettings{}, err
-	}
 
 	return ServiceSettings{
 		Host:                host,
@@ -164,7 +142,6 @@ func ServiceSettingsFromEnv() (ServiceSettings, error) {
 		Token:               emptyToZero(token),
 		MCPAllowedHosts:     allowedHosts,
 		MCPAllowedOrigins:   allowedOrigins,
-		UploadMode:          uploadMode,
 		WebRoot:             strings.TrimSpace(os.Getenv("RAG_WEB_ROOT")),
 		AuthEnabled:         authEnabled,
 		RegistrationEnabled: registration,
@@ -197,19 +174,6 @@ func registrationSetting() (bool, error) {
 		return false, nil
 	default:
 		return false, fmt.Errorf("RAG_AUTH_REGISTRATION must be open or closed")
-	}
-}
-
-// uploadModeSetting parses RAG_UPLOAD_MODE: "async" (default) or "sync".
-func uploadModeSetting() (string, error) {
-	raw := strings.ToLower(strings.TrimSpace(os.Getenv("RAG_UPLOAD_MODE")))
-	switch raw {
-	case "":
-		return DefaultUploadMode, nil
-	case UploadModeSync, UploadModeAsync:
-		return raw, nil
-	default:
-		return "", fmt.Errorf("RAG_UPLOAD_MODE must be sync or async")
 	}
 }
 

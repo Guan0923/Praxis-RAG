@@ -58,12 +58,6 @@ func (f *fakeServiceRuntime) DownloadArtifact(_ context.Context, _, _ string) ([
 	return f.downloadBody, f.downloadMime, f.downloadName, f.downloadErr
 }
 
-// AdmitDocument satisfies the async document surface for runtimes that only
-// exercise search; fakeDocRuntime overrides it with real bookkeeping.
-func (f *fakeServiceRuntime) AdmitDocument(context.Context, string, string, []byte, string) (map[string]any, error) {
-	return nil, &apierrors.KnowledgeError{Message: "async admission is not available in this test runtime"}
-}
-
 // GetDocumentStatus satisfies the async document surface for search-only fakes.
 func (f *fakeServiceRuntime) GetDocumentStatus(context.Context, string, string) (map[string]any, error) {
 	return nil, &apierrors.KnowledgeError{Message: "document job status is not available in this test runtime"}
@@ -274,10 +268,6 @@ func TestArtifactEndpoints(t *testing.T) {
 // full httpapi.Runtime interface; the search-focused tests do not exercise them.
 func (f *fakeServiceRuntime) ListDocuments(context.Context, string) ([]map[string]any, error) {
 	return nil, nil
-}
-
-func (f *fakeServiceRuntime) Upload(context.Context, string, []UploadFile, string) (map[string]any, error) {
-	return map[string]any{}, nil
 }
 
 func (f *fakeServiceRuntime) Delete(context.Context, string, string) (map[string]any, error) {

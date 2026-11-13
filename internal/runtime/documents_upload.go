@@ -618,11 +618,7 @@ func (s *Service) storeAndIndex(
 	if err := s.documentJobProgress(ctx, options.Task, "embedding"); err != nil {
 		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
 	}
-	vectors, err := s.embedDocument(ctx, journal, operation, indexed, resources)
-	if err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
-	}
-	sparseVectors, err := s.encodeDocumentSparse(ctx, journal, operation, indexed, resources)
+	vectors, sparseVectors, err := s.encodeDocumentVectors(ctx, journal, operation, indexed, resources)
 	if err != nil {
 		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
 	}
@@ -857,54 +853,65 @@ func (s *Service) stageArtifacts(
 	return err
 }
 
-// embedDocument computes the dense vectors for the chunks.
-func (s *Service) embedDocument(
+// encodeDocumentVectors overlaps embedding requests with local BM25 encoding.
+// Both journal steps finish before the caller can publish or compensate.
+func (s *Service) encodeDocumentVectors(
 	ctx context.Context,
 	journal *state.UploadJournal,
 	operation *state.UploadOperation,
 	indexed *indexedUpload,
 	resources *uploadResources,
-) ([][]float64, error) {
-	value, err := journal.RunStep(ctx, operation, "embedding", func() (any, error) {
-		texts := make([]string, len(indexed.result.Chunks))
-		for index, chunk := range indexed.result.Chunks {
-			texts[index] = chunk.Text
+) ([][]float64, []sparse.SparseEmbedding, error) {
+	workCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	texts := make([]string, len(indexed.result.Chunks))
+	for index, chunk := range indexed.result.Chunks {
+		texts[index] = chunk.Text
+	}
+	runStep := func(name string, action func() error) {
+		// Keep journal writes on the caller's context so cancelling the sibling's
+		// computation does not prevent recording the original failed step.
+		_, err := journal.RunStep(ctx, operation, name, func() (any, error) {
+			err := action()
+			if err != nil {
+				// Capture the cause before journal fencing can fail in the sibling.
+				cancel(err)
+			}
+			return nil, err
+		}, nil)
+		if err != nil {
+			cancel(err)
 		}
-		return resources.embedder.EmbedDocuments(ctx, texts)
-	}, nil)
-	if err != nil {
-		return nil, err
 	}
-	vectors, ok := value.([][]float64)
-	if !ok {
-		return nil, fmt.Errorf("embedding step returned an unexpected result")
-	}
-	return vectors, nil
-}
-
-// encodeDocumentSparse computes the BM25 sparse vectors for the chunks.
-func (s *Service) encodeDocumentSparse(
-	ctx context.Context,
-	journal *state.UploadJournal,
-	operation *state.UploadOperation,
-	indexed *indexedUpload,
-	resources *uploadResources,
-) ([]sparse.SparseEmbedding, error) {
-	value, err := journal.RunStep(ctx, operation, "sparse", func() (any, error) {
-		texts := make([]string, len(indexed.result.Chunks))
-		for index, chunk := range indexed.result.Chunks {
-			texts[index] = chunk.Text
+	var vectors [][]float64
+	denseDone := make(chan struct{})
+	go func() {
+		defer close(denseDone)
+		runStep("embedding", func() error {
+			var err error
+			vectors, err = resources.embedder.EmbedDocuments(workCtx, texts)
+			return err
+		})
+	}()
+	sparseVectors := make([]sparse.SparseEmbedding, 0, len(texts))
+	runStep("sparse", func() error {
+		for _, text := range texts {
+			if err := workCtx.Err(); err != nil {
+				return err
+			}
+			vector, err := resources.encoder.EncodeDocument(text)
+			if err != nil {
+				return err
+			}
+			sparseVectors = append(sparseVectors, vector)
 		}
-		return resources.encoder.EncodeDocuments(texts)
-	}, nil)
-	if err != nil {
-		return nil, err
+		return nil
+	})
+	<-denseDone
+	if err := context.Cause(workCtx); err != nil {
+		return nil, nil, err
 	}
-	vectors, ok := value.([]sparse.SparseEmbedding)
-	if !ok {
-		return nil, fmt.Errorf("sparse encoding step returned an unexpected result")
-	}
-	return vectors, nil
+	return vectors, sparseVectors, nil
 }
 
 // failDocumentOperation records the failure, compensates staged vectors and

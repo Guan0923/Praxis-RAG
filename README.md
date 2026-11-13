@@ -19,7 +19,7 @@ Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可
 
 ### 文档导入与管理
 
-支持 Markdown、TXT、PDF、DOCX，以及安装 LibreOffice 后的 DOC。网页/REST 上传默认异步受理：每个文件在共享状态数据库（MySQL）的一个事务内写入完整任务与发件箱通知，**提交成功即返回 `artifact_id`**，解析与索引由文档 worker 在后台完成（无 Kafka 的单进程部署由 `rag-service` 内嵌的 worker 完成），前端用 `GET /v1/document-jobs/{artifact_id}` 轮询 `status`/`stage`。Console 使用批次接口 `POST /v1/document-batches`：点上传后弹窗立即关闭，工具栏按钮缩成"保存中/处理中/已完成 x/y"的徽标，点开是逐文件进度气泡（保存结果 + 解析阶段 + 失败重试），刷新或切页后从 `GET /v1/document-batches?limit=20` 恢复；上传期间允许切换 Console 页面，工作区切换仍锁定。设置 `RAG_UPLOAD_MODE=sync` 可回退为请求内解析/切分/Embedding/发布的同步模式。MCP `add_document` 始终异步；MCP `update_document`、`delete_document` 仍为同步请求。每批最多 10 个文件，单文件最大 10 MiB。
+支持 Markdown、TXT、PDF、DOCX，以及安装 LibreOffice 后的 DOC。网页/REST 上传默认异步受理：每个文件在共享状态数据库（MySQL）的一个事务内写入完整任务与发件箱通知，**提交成功即返回 `artifact_id`**，解析与索引由文档 worker 在后台完成（无 Kafka 的单进程部署由 `rag-service` 内嵌的 worker 完成），前端用 `GET /v1/document-jobs/{artifact_id}` 轮询 `status`/`stage`。Console 使用批次接口 `POST /v1/document-batches`：点上传后弹窗立即关闭，工具栏按钮缩成"保存中/处理中/已完成 x/y"的徽标，点开是逐文件进度气泡（保存结果 + 解析阶段 + 失败重试），刷新或切页后从 `GET /v1/document-batches?limit=20` 恢复；上传期间允许切换 Console 页面，工作区切换仍锁定。MCP `add_document` 始终异步；MCP `update_document`、`delete_document` 仍为同步请求。每批最多 10 个文件，单文件最大 10 MiB。
 
 相同内容与切分配置的重复上传会跳过；`add_document` 与异步 REST 上传不覆盖同名文档，替换请用 `update_document`。状态用 MCP `get_document_status` 或 REST `GET /v1/document-jobs/{artifact_id}` 轮询，终态为 `succeeded` / `failed`，状态在 MySQL，不依赖 Redis TTL。
 
@@ -225,7 +225,6 @@ rag-service -> Qdrant（检索索引）、共享状态库（文档/KB/Key/任务
                  -> 无 Kafka：rag-service 内嵌 worker 直接消费发件箱
                  -> 两种方式都完成解析/切分/Embedding/Qdrant 发布，用
                     GET /v1/document-jobs/{artifact_id} 轮询 status/stage
-REST 上传（RAG_UPLOAD_MODE=sync）-> 请求内解析/切分/Embedding/发布，返回 imported/skipped/failed/documents
 PDF 解析（默认 RAG_PDF_ENGINE=docling）-> pdf-parser :8091（HTTP，返回 zip：manifest.json + 图片资产）
 MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-worker -> SearchRaw + Redis 快照
 ```
@@ -262,8 +261,8 @@ npm run build
 
 ## 使用边界
 
-- 异步受理（网页/REST 上传默认方式与 MCP `add_document`）的受理点是状态库单事务提交（任务 + 发件箱），不是 Kafka 确认；解析/索引在后台进行，用 `GET /v1/document-jobs/{artifact_id}` 观察进度；批次上传额外提供 `POST /v1/document-batches` + `GET /v1/document-batches/{batch_id}`（Console 使用），每文件独立事务并行受理，不同文件名之间不排队，同名仍串行。MCP 更新/删除与 `RAG_UPLOAD_MODE=sync` 的上传仍在请求内完成，索引期间会等待。
-- `RAG_UPLOAD_MODE` 默认 `async`，必须有一个文档消费者：无 Kafka 的单进程部署由 `rag-service` 内嵌 worker 覆盖（`RAG_DOCUMENT_WORKER_INPROCESS` 默认 auto）；Kafka 部署运行 `rag-document-worker`（`scripts/start-stack.ps1` 会自动启动），或显式设置 `RAG_UPLOAD_MODE=sync` 保留请求内完成的旧行为。Kafka 部署可用 `RAG_DOCUMENT_WORKERS`（`scripts/start-stack.ps1` 读取，默认 1）并行启动多个 `rag-document-worker` 进程，每个进程一次解析一篇，上限是 `RAG_DOCUMENT_TOPIC` 的分区数（默认 4）；PDF 解析并发同时受 pdf-parser 的 `RAG_PDF_SERVICE_CONCURRENCY` 限制。
+- 异步受理（网页/REST 上传默认方式与 MCP `add_document`）的受理点是状态库单事务提交（任务 + 发件箱），不是 Kafka 确认；解析/索引在后台进行，用 `GET /v1/document-jobs/{artifact_id}` 观察进度；批次上传额外提供 `POST /v1/document-batches` + `GET /v1/document-batches/{batch_id}`（Console 使用），每文件独立事务并行受理，不同文件名之间不排队，同名仍串行。MCP 更新/删除仍在请求内完成，索引期间会等待。
+- REST/Console 上传统一使用 `POST /v1/document-batches` 异步受理，必须有文档消费者：无 Kafka 时由 `rag-service` 内嵌 worker 消费，Kafka 部署运行 `rag-document-worker`（启动脚本自动启动）。Worker 的进程数与每进程任务并发分别由 `RAG_DOCUMENT_WORKERS`、`RAG_DOCUMENT_WORKER_CONCURRENCY` 配置，PDF 解析还受解析服务的进程数与每进程并发限制。
 - 每批最多 10 个文件、单文件 10 MiB；暂不支持 Excel、网页抓取和独立图片上传。
 - Word 保留内容控件、嵌套表格、合并范围与原生公式；未知公式结构、原生图表等无法可靠读取的内容会明确拒绝入库；图注关联有歧义时跳过并报告原因。
 - 知识库（namespace）默认归创建者私有，只有创建者和管理员可以使用；共享通过「权限管理」页的邀请链接完成，权限分为可读/可修改、范围分为单文件/多文件/全库，仅 VIP 与管理员可邀请。管理凭证（Service Token / API Key / 本机无会话直连）沿用原有语义，不做知识库归属校验；`/v1/admin/*` 默认只允许本机直连或管理员会话，其中 `/v1/admin/api-keys` 例外：任意已登录账号都可以管理自己的 API Key（非管理员只能绑定本人知识库，历史无主密钥仅管理员/本机可见）。MCP/普通 API 使用 Service Token 或 API Key。详见 [知识库权限管理](docs/PERMISSIONS.md)。

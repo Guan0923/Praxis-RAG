@@ -2,11 +2,8 @@ package httpapi
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -14,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/config"
 )
 
 // Document limits mirror service_knowledge constants.
@@ -41,11 +37,6 @@ type CheckFile struct {
 // DocumentRuntime manages knowledge documents and reads their content.
 type DocumentRuntime interface {
 	ListDocuments(ctx context.Context, namespace string) ([]map[string]any, error)
-	Upload(ctx context.Context, namespace string, files []UploadFile, idempotencyKey string) (map[string]any, error)
-	// AdmitDocument durably admits one file for asynchronous indexing and
-	// returns {artifact_id, status, reused}. It is the async counterpart of
-	// Upload: it commits MySQL state and returns before parsing starts.
-	AdmitDocument(ctx context.Context, namespace, name string, content []byte, idempotencyKey string) (map[string]any, error)
 	// GetDocumentStatus reads one async admission's {artifact_id, status,
 	// stage, error} projection.
 	GetDocumentStatus(ctx context.Context, namespace, artifactID string) (map[string]any, error)
@@ -92,126 +83,7 @@ func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleUploadDocuments(w http.ResponseWriter, r *http.Request) {
-	namespace, ok := s.tenantNamespace(w, r)
-	if !ok {
-		return
-	}
-	if s.runtime == nil {
-		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
-		return
-	}
-	idempotencyKey, details := idempotencyHeader(r)
-	if details != nil {
-		writeValidation(w, http.StatusUnprocessableEntity, details)
-		return
-	}
-	files, problem := readMultipartFiles(r)
-	if problem != nil {
-		if problem.validation != nil {
-			writeValidation(w, problem.status, problem.validation)
-			return
-		}
-		writeDetail(w, problem.status, problem.detail)
-		return
-	}
-	// A file-level writer may only replace documents it holds write access to;
-	// a whole-knowledge-base writer may upload any file name.
-	if !s.requireScopeWriteBatch(w, r, files) {
-		return
-	}
-	if s.uploadMode() == config.UploadModeAsync {
-		s.handleUploadDocumentsAsync(w, r, namespace, files, idempotencyKey)
-		return
-	}
-	var before []map[string]any
-	if s.docNotifier != nil {
-		before, _ = s.runtime.ListDocuments(r.Context(), namespace)
-	}
-	payload, err := s.runtime.Upload(r.Context(), namespace, files, idempotencyKey)
-	if err != nil {
-		writeRuntimeError(w, err, false)
-		return
-	}
-	if s.docNotifier != nil {
-		s.docNotifier.DocumentsChanged(namespace, before, payloadDocuments(payload))
-	}
-	payload["mode"] = config.UploadModeSync
-	writeJSON(w, http.StatusOK, payload)
-}
-
-// uploadMode reports the configured POST /v1/documents admission mode. Async is
-// the default: only an explicit "sync" setting keeps the legacy in-request parse
-// behaviour, so an empty or unrecognised setting stays asynchronous.
-func (s *Server) uploadMode() string {
-	if strings.EqualFold(strings.TrimSpace(s.settings.UploadMode), config.UploadModeSync) {
-		return config.UploadModeSync
-	}
-	return config.UploadModeAsync
-}
-
-// asyncUploadJob is one admitted file in the async upload response. The Console
-// polls GET /v1/document-jobs/{artifact_id} for the job's stage and outcome.
-type asyncUploadJob struct {
-	Name       string `json:"name"`
-	ArtifactID string `json:"artifact_id"`
-	Status     string `json:"status"`
-	Reused     bool   `json:"reused"`
-}
-
-// handleUploadDocumentsAsync admits every file through the durable document job
-// queue and answers with artifact ids instead of waiting for parsing/embedding.
-// Per-file admission failures are isolated into "failed", exactly like the
-// synchronous batch response, so one bad file never rejects the whole batch.
-func (s *Server) handleUploadDocumentsAsync(
-	w http.ResponseWriter,
-	r *http.Request,
-	namespace string,
-	files []UploadFile,
-	idempotencyKey string,
-) {
-	if problem := validateUploadBatch(files); problem != nil {
-		if problem.validation != nil {
-			writeValidation(w, problem.status, problem.validation)
-			return
-		}
-		writeDetail(w, problem.status, problem.detail)
-		return
-	}
-	jobs := make([]asyncUploadJob, 0, len(files))
-	failed := make([]map[string]any, 0)
-	for position, file := range files {
-		requestKey := uploadFileIdempotencyKey(idempotencyKey, position)
-		payload, err := s.runtime.AdmitDocument(r.Context(), namespace, file.Name, file.Content, requestKey)
-		if err != nil {
-			failed = append(failed, map[string]any{
-				"name": file.Name, "error": uploadAdmissionErrorText(err),
-			})
-			continue
-		}
-		job := asyncUploadJob{Name: file.Name}
-		if artifactID, ok := payload["artifact_id"].(string); ok {
-			job.ArtifactID = artifactID
-		}
-		if status, ok := payload["status"].(string); ok {
-			job.Status = status
-		}
-		if reused, ok := payload["reused"].(bool); ok {
-			job.Reused = reused
-		}
-		jobs = append(jobs, job)
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, map[string]any{
-		"mode":   config.UploadModeAsync,
-		"jobs":   jobs,
-		"failed": failed,
-	})
-}
-
-// validateUploadBatch mirrors the runtime's synchronous pre-validation so an
-// async batch rejects unsupported input up front instead of queueing jobs that
-// can only fail later.
+// validateUploadBatch rejects unsupported or oversized batches before admission.
 func validateUploadBatch(files []UploadFile) *uploadProblem {
 	if len(files) > MaxFilesPerBatch {
 		return &uploadProblem{
@@ -228,40 +100,6 @@ func validateUploadBatch(files []UploadFile) *uploadProblem {
 		}
 	}
 	return nil
-}
-
-// uploadFileIdempotencyKey derives the per-file idempotency key of one batch,
-// matching the synchronous runtime derivation sha256("<header>:<position>") so
-// the same batch retried under either mode addresses the same logical file.
-func uploadFileIdempotencyKey(batchKey string, position int) string {
-	if batchKey == "" {
-		return ""
-	}
-	digest := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", batchKey, position)))
-	return hex.EncodeToString(digest[:])
-}
-
-// uploadAdmissionErrorText renders one per-file admission failure with the same
-// safety rules as the synchronous response: known validation/service messages
-// are truncated, everything else is reported by a generic category.
-func uploadAdmissionErrorText(err error) string {
-	var validation *apierrors.KnowledgeValidationError
-	if errors.As(err, &validation) {
-		return truncateDetailText(validation.Message, 500)
-	}
-	var knowledge *apierrors.KnowledgeError
-	if errors.As(err, &knowledge) {
-		return truncateDetailText(knowledge.Message, 500)
-	}
-	return "上传失败"
-}
-
-func truncateDetailText(value string, limit int) string {
-	runes := []rune(value)
-	if len(runes) <= limit {
-		return value
-	}
-	return string(runes[:limit])
 }
 
 func idempotencyHeader(r *http.Request) (string, []validationDetail) {

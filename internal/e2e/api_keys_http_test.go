@@ -36,7 +36,6 @@ func apiKeysHandler(t *testing.T, h *harness) http.Handler {
 		Host:                "127.0.0.1",
 		Port:                8011,
 		DataRoot:            "unused",
-		UploadMode:          config.UploadModeSync,
 		AuthEnabled:         true,
 		RegistrationEnabled: true,
 		SessionTTL:          time.Hour,

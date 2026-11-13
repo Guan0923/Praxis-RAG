@@ -139,7 +139,6 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/artifacts/{artifact_id}", authTenant, s.handleDownloadArtifact)
 	s.router.add("GET", "/v1/artifacts/{artifact_id}/content", authTenant, s.handleGetArtifactContent)
 	s.router.add("GET", "/v1/documents", authTenant, s.handleListDocuments)
-	s.router.add("POST", "/v1/documents", authTenant, s.handleUploadDocuments)
 	s.router.add("POST", "/v1/documents/check", authTenant, s.handleCheckDocuments)
 	s.router.add("GET", "/v1/document-jobs/{artifact_id}", authTenant, s.handleDocumentJobStatus)
 	s.router.add("POST", "/v1/document-batches", authTenant, s.handleCreateDocumentBatch)

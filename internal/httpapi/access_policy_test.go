@@ -667,7 +667,7 @@ func TestTenantWriteRoutesRequirePerFileWrite(t *testing.T) {
 	// Uploading a file outside the write grants is rejected before the runtime.
 	body, contentType := multipartBody(t, nil, "a.md", "hello")
 	denied := performRequest(handler, testRequest{
-		method: "POST", target: "/v1/documents", remote: "10.0.0.9:5000",
+		method: "POST", target: "/v1/document-batches", remote: "10.0.0.9:5000",
 		headers: mergeHeaders(sessionHeaders("user-token", "alpha"), map[string]string{"Content-Type": contentType}),
 		body:    body,
 	})
@@ -675,18 +675,18 @@ func TestTenantWriteRoutesRequirePerFileWrite(t *testing.T) {
 		decodeBody(t, denied)["detail"] != access.MessageWriteRequired {
 		t.Fatalf("denied upload status = %d body = %s", denied.Code, denied.Body.String())
 	}
-	if len(runtime.upoadFiles) != 0 {
-		t.Fatalf("runtime received files = %v", runtime.upoadFiles)
+	if len(runtime.batchFiles) != 0 {
+		t.Fatalf("runtime received files = %v", runtime.batchFiles)
 	}
 
 	allowedBody, allowedType := multipartBody(t, nil, "b.md", "hello")
 	allowed := performRequest(handler, testRequest{
-		method: "POST", target: "/v1/documents", remote: "10.0.0.9:5000",
+		method: "POST", target: "/v1/document-batches", remote: "10.0.0.9:5000",
 		headers: mergeHeaders(sessionHeaders("user-token", "alpha"), map[string]string{"Content-Type": allowedType}),
 		body:    allowedBody,
 	})
-	if allowed.Code != http.StatusOK || len(runtime.upoadFiles) != 1 || runtime.upoadFiles[0].Name != "b.md" {
-		t.Fatalf("allowed upload status = %d body = %s files = %v", allowed.Code, allowed.Body.String(), runtime.upoadFiles)
+	if allowed.Code != http.StatusAccepted || len(runtime.batchFiles) != 1 || runtime.batchFiles[0].Name != "b.md" {
+		t.Fatalf("allowed upload status = %d body = %s files = %v", allowed.Code, allowed.Body.String(), runtime.batchFiles)
 	}
 
 	// Management credentials keep the unrestricted behaviour.
@@ -985,22 +985,22 @@ func TestUploadWriteGateRunsBeforeAnyUploadSideEffect(t *testing.T) {
 		"u-user|alpha": readFilesScope("a.md"),
 	}}
 
-	syncRuntime := newFakeDocRuntime()
+	runtime := newFakeDocRuntime()
 	notifier := &fakeNotifier{}
-	syncServer := New(authTestSettings(), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		WithUserAuth(users), WithAccessControl(control), WithRuntime(syncRuntime),
+	server := New(authTestSettings(), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithUserAuth(users), WithAccessControl(control), WithRuntime(runtime),
 		WithDocumentNotifier(notifier))
 	body, contentType := multipartFiles(t, "a.md")
-	denied := performRequest(syncServer.Handler(), testRequest{
-		method: "POST", target: "/v1/documents", remote: "10.0.0.9:5000",
+	denied := performRequest(server.Handler(), testRequest{
+		method: "POST", target: "/v1/document-batches", remote: "10.0.0.9:5000",
 		headers: mergeHeaders(sessionHeaders("user-token", "alpha"), map[string]string{"Content-Type": contentType}),
 		body:    body,
 	})
 	if denied.Code != http.StatusForbidden || decodeBody(t, denied)["detail"] != access.MessageWriteRequired {
-		t.Fatalf("sync denied status = %d body = %s", denied.Code, denied.Body.String())
+		t.Fatalf("denied status = %d body = %s", denied.Code, denied.Body.String())
 	}
-	if len(syncRuntime.upoadFiles) != 0 {
-		t.Fatalf("sync runtime received files = %+v", syncRuntime.upoadFiles)
+	if len(runtime.batchFiles) != 0 {
+		t.Fatalf("runtime received files = %+v", runtime.batchFiles)
 	}
 	if len(notifier.namespaces) != 0 {
 		t.Fatalf("denied upload emitted document changes = %v", notifier.namespaces)
@@ -1008,42 +1008,19 @@ func TestUploadWriteGateRunsBeforeAnyUploadSideEffect(t *testing.T) {
 
 	// A batch is rejected as a whole when any file is outside the write grants;
 	// the allowed prefix is never uploaded.
-	syncRuntime.upoadFiles = nil
+	runtime.batchFiles = nil
 	batchBody, batchType := multipartFiles(t, "a.md", "b.md")
 	control.scopes["u-user|alpha"] = writeFilesScope("a.md")
-	batch := performRequest(syncServer.Handler(), testRequest{
-		method: "POST", target: "/v1/documents", remote: "10.0.0.9:5000",
+	batch := performRequest(server.Handler(), testRequest{
+		method: "POST", target: "/v1/document-batches", remote: "10.0.0.9:5000",
 		headers: mergeHeaders(sessionHeaders("user-token", "alpha"), map[string]string{"Content-Type": batchType}),
 		body:    batchBody,
 	})
 	if batch.Code != http.StatusForbidden {
 		t.Fatalf("batch status = %d body = %s", batch.Code, batch.Body.String())
 	}
-	if len(syncRuntime.upoadFiles) != 0 || len(syncRuntime.admitted) != 0 {
-		t.Fatalf("batch leaked side effects: upload=%+v admitted=%+v", syncRuntime.upoadFiles, syncRuntime.admitted)
+	if len(runtime.batchFiles) != 0 {
+		t.Fatalf("batch leaked side effects: files=%+v", runtime.batchFiles)
 	}
 
-	// The async admission path is gated by the same write check.
-	asyncSettings := authTestSettings()
-	asyncSettings.UploadMode = config.UploadModeAsync
-	asyncRuntime := newFakeDocRuntime()
-	asyncNotifier := &fakeNotifier{}
-	asyncServer := New(asyncSettings, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
-		WithUserAuth(users), WithAccessControl(control), WithRuntime(asyncRuntime),
-		WithDocumentNotifier(asyncNotifier))
-	asyncBody, asyncType := multipartFiles(t, "b.md")
-	asyncDenied := performRequest(asyncServer.Handler(), testRequest{
-		method: "POST", target: "/v1/documents", remote: "10.0.0.9:5000",
-		headers: mergeHeaders(sessionHeaders("user-token", "alpha"), map[string]string{"Content-Type": asyncType}),
-		body:    asyncBody,
-	})
-	if asyncDenied.Code != http.StatusForbidden {
-		t.Fatalf("async denied status = %d body = %s", asyncDenied.Code, asyncDenied.Body.String())
-	}
-	if len(asyncRuntime.admitted) != 0 {
-		t.Fatalf("async runtime admitted = %v", asyncRuntime.admitted)
-	}
-	if len(asyncNotifier.namespaces) != 0 {
-		t.Fatalf("async denied upload emitted document changes = %v", asyncNotifier.namespaces)
-	}
 }

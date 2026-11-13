@@ -1,5 +1,11 @@
 # 后端 Go 重构总纲
 
+## REST 上传接口统一（2026-11-12）
+
+删除 `POST /v1/documents`，REST 上传统一迁移到 `POST /v1/document-batches`，包括只上传一个文件的请求。multipart 的 `files` 字段、认证和 `Idempotency-Key` 请求头不变；响应改为 `202`，通过 `batch_id` 和 `items`（每文件 `accepted/skipped/failed` 与受理成功后的 `artifact_id`）读取结果。轮询整个批次使用 `GET /v1/document-batches/{batch_id}`，单文件任务仍使用 `GET /v1/document-jobs/{artifact_id}`。
+
+旧接口的请求内同步上传模式及专用 `RAG_UPLOAD_MODE` 配置一并删除。`GET /v1/documents` 列表、文档内容下载、删除及 MCP 工具保留。不增加旧 POST 路径的兼容处理；已有文档、任务和批次无需数据库迁移。下文审计记录中的旧上传接口描述仅反映当时实现。
+
 最后更新：2026-11-10
 
 ## 1. 目标

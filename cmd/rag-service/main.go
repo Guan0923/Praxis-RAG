@@ -114,8 +114,8 @@ func run() error {
 			documentWorkerMode = "in-process"
 		}
 	}
-	if documentWorkerMode == "external" && serviceSettings.UploadMode == config.UploadModeAsync {
-		logger.Warn("RAG_UPLOAD_MODE=async without an in-process document worker: REST/Console uploads stay queued until rag-document-worker runs",
+	if documentWorkerMode == "external" {
+		logger.Warn("Without an in-process document worker: REST/Console uploads stay queued until rag-document-worker runs",
 			"hint", "start rag-document-worker, or leave RAG_KAFKA_BOOTSTRAP_SERVERS empty to parse in-process")
 	}
 	// The Console monitoring page is read-only: one state aggregate plus five
@@ -133,7 +133,7 @@ func run() error {
 		Collection:            ragConfig.Collection,
 		KafkaBootstrapServers: mqSettings.BootstrapServers,
 		OutboxBridge:          outboxBridge,
-		UploadMode:            serviceSettings.UploadMode,
+		UploadMode:            "async",
 		DocumentWorker:        documentWorkerMode,
 		PDFEngine:             ragConfig.PDFEngine,
 		PDFServiceURL:         ragConfig.PDFServiceURL,
@@ -201,7 +201,7 @@ func run() error {
 		"address", address,
 		"backend", string(ragConfig.Backend),
 		"console", api.WebRoot(),
-		"upload_mode", serviceSettings.UploadMode,
+		"upload_mode", "async",
 		"document_worker", documentWorkerMode,
 	)
 
