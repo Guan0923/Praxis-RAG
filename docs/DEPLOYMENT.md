@@ -457,7 +457,8 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
   - 两个显式 DLQ topic 的堆积量与增长速率；持续增长说明消费重试耗尽。
   - 死信 worker 进程退出码/重启次数（`2` 表示配置错，`1` 表示依赖不可用）。
   - `/v1/uploads` 的失败操作、`document_jobs`/`search_tasks` 的 `failed` 计数。
-  - Kafka consumer group lag：文档 worker、搜索 worker 分别观察各自组。
+  - Kafka consumer group lag：文档 worker、搜索 worker 分别观察各自组；Console 监控页的 `pipeline.kafka` 会给出文档消费组的已提交/末尾位点与滞后，读不到时显示「未知」。
+  - outbox 保留期清理（`GCOutbox`）产生的 CDC 删除事件不是消费失败：worker 直接 ACK，不应在 DLQ 或重试日志里因此增长；若看到这类记录进入 DLQ，说明 worker 版本过旧。
   - Console「系统监控」页（`#/monitor`）汇总上述队列与依赖状态，对应只读接口 `GET /v1/admin/monitor/overview`（本机直连或管理员会话），适合作值班快速定位入口。
 - 告警处理顺序：先看死信 worker 是否在跑且配置正确，再查对应正常组是否有堆积，再按 `stage/error` 定位解析/模型/发布失败；不要直接清空 DLQ topic（会丢失持久终态）。
 
@@ -469,6 +470,8 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 | Debezium | 独立 Debezium Server | 文档通知的 Kafka 投递通道；Compose 默认启动，应用只写事务 outbox |
 
 文档 Kafka 投递依赖 Debezium Server 读取 MySQL binlog，应用不发布文档通知。Compose 默认启动 Debezium；外部部署应保证连接器持续运行。验证脚本为 `scripts/verify-debezium-e2e.py`，DLQ 与排队搜索分别见 `scripts/verify-kafka-dlq.py`、`scripts/verify-kafka-search.py`。
+
+状态职责：Debezium 只投递、Kafka 只记录消费位点、`document_jobs` 只记录处理结果；**不要求 Debezium 回写 `PUBLISHED`**，因此 outbox 行在处理成功后仍可能是 `PENDING`，监控不再把 PENDING 数量/等待时间当作未投递积压。应用按 `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS` 删除过期 outbox 行（数据库照常清理）；这些 DELETE 产生的 CDC 删除事件（`op=d`/tombstone）由 worker 解码层识别为发件箱清理并直接 ACK，不进入文档任务、不重试、不进死信。若需要 Debezium 健康状态，Compose 默认把健康端口发布到宿主机 `127.0.0.1:8083`；宿主机进程设置 `RAG_DEBEZIUM_HEALTH_URL=http://127.0.0.1:8083/q/health` 即可（采集位点仍显示「未知」）。
 
 ## 9. 安全与网络
 

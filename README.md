@@ -233,6 +233,7 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 - 搜索 worker、死信 worker 与 Kafka 模式的文档 worker 是**独立进程**；`rag-service` 只在无 Kafka 时内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS`，默认 auto），Kafka 模式不内嵌消费者。
 - `rag-service` 在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用 排队搜索（文档 outbox 由 Debezium 投递）；未配置时 MCP 搜索同步，默认由内嵌文档 worker 直接消费发件箱（`RAG_DOCUMENT_WORKER_INPROCESS=0` 可关闭并改跑独立 worker），没有消费者时任务保持 `queued`。
 - **文档通知统一由 Debezium 投递**：上传只提交 MySQL 的 `document_jobs` 与 `document_job_outbox`；Debezium 读取 binlog 并写入 Kafka，应用不轮询发布文档通知。部署与验证见 [Debezium 指南](deploy/debezium/README.md) 和 `scripts/verify-debezium-e2e.py`。
+- **outbox 保留期清理不会制造无效重试**：清理只删除 MySQL 中的过期记录；由此产生的 CDC 删除事件（`op=d`/tombstone）由 worker 解码层识别为发件箱清理并直接 ACK，不进入文档任务、不重试、不进死信。状态职责保持分离：Debezium 只投递、Kafka 只记录消费位点、`document_jobs` 记录处理结果，Debezium 不回写 outbox 的 `PUBLISHED`。Console「系统监控」把 outbox 记录统计、Debezium 采集状态、Kafka 消费滞后和文档任务状态分开显示，读不到的进度显示「未知」，不再把 PENDING 数量/等待时间当作未投递积压。
 
 ## 迁移状态
 

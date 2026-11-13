@@ -108,7 +108,7 @@
 | 管理：模型配置 | `GET|POST /v1/admin/model-profiles`、`GET|PATCH|DELETE /v1/admin/model-profiles/{profile_id}`、`GET /v1/admin/model-profiles/{profile_id}/key`、`POST /v1/admin/model-profiles/{profile_id}/models` |
 | 管理：MCP 配置 | `GET /v1/admin/tools`、`PATCH /v1/admin/tools/{name}`、`GET /v1/admin/prompts`、`PUT|DELETE /v1/admin/prompts/{name}` |
 | 管理：展示/只读 | `GET /v1/admin/published-versions`、`GET /v1/admin/upload-leases`（注册为无认证，但 handler 内二次校验管理员+本机边界） |
-| 管理：监控 | `GET /v1/admin/monitor/overview`（只读聚合：服务信息、依赖探测、队列积压、资料库计数、24 小时活动；本机直连或管理员会话） |
+| 管理：监控 | `GET /v1/admin/monitor/overview`（只读聚合：服务信息、依赖探测、文档任务/检索/上传队列、outbox 记录统计、Debezium 采集与 Kafka 消费进度、资料库计数、24 小时活动；不可得的进度显式为 `null`/未知；本机直连或管理员会话） |
 | 每账号 API Key | `GET|POST /v1/admin/api-keys`、`PUT|DELETE /v1/admin/api-keys/{key_id}`、`GET /v1/admin/api-keys/{key_id}/mcp-config` |
 | MCP | `POST|GET|DELETE /mcp` |
 
@@ -133,7 +133,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | `#/model-profiles` | 模型配置 | 管理员 | Embedding/Reranker/VLM/OCR 分页签，新增/编辑/删除、模型探测、Key 只写不读 |
 | `#/api-keys` | API Key | 所有登录账号 | 自己的密钥 CRUD/启停、一次性明文、复制 MCP 配置 |
 | `#/users` | 用户管理 | 管理员 | 角色（admin/vip/user）、启用/禁用、删除；服务端保证至少保留一名启用的管理员 |
-| `#/monitor` | 系统监控 | 管理员 | 只读监控快照：服务信息、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态、`document_jobs`/outbox/`search_tasks` 积压、资料库计数、24 小时活动；15 秒自动刷新 |
+| `#/monitor` | 系统监控 | 管理员 | 只读监控快照：服务信息、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态、`document_jobs`/`search_tasks` 队列与阶段、`document_job_outbox` 记录统计（明确标注不是未投递积压）、Debezium 采集状态与 Kafka 消费组滞后（读不到显示「未知」）、资料库计数、24 小时活动；15 秒自动刷新 |
 | `#/permissions` | 权限管理 | 管理员 / VIP | 选择知识库、按用户聚合授权、创建邀请（可读/可修改 × 全库/若干文件）、复制链接、撤销授权/邀请 |
 | `#/invitations` | 邀请中心 | 登录账号 | 待处理邀请、粘贴邀请链接、接受/拒绝（顶部铃铛轮询） |
 | `#/invite?token=` | 受邀预览 | 登录账号 | 预览邀请并接受/拒绝，随后切换到该知识库 |
@@ -160,6 +160,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 
 - Kafka 只在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；空值 = brokerless（内嵌文档 worker 轮询发件箱，MCP 搜索同步）。
 - 文档 outbox 由 Debezium 读取 MySQL binlog 并投递 Kafka；应用只写入事务 outbox，不发布文档通知。
+- outbox 保留期清理（`GCOutbox`）产生的 CDC 删除事件（`op=d`，以及 Debezium tombstone）在解码层被识别为「发件箱清理记录」并直接 ACK：不进入文档任务处理、不重试、不进死信；正常修/增/读事件仍照常触发入库。业务文档删除与 outbox 清理互不影响。
 - topic：`praxis_state_cache_refresh`、`praxis_document_ingest`、`praxis_search`；DLQ 是显式 topic `praxis_document_ingest_dead_letters` / `praxis_search_dead_letters`（不是 `%DLQ%` 约定），由 `rag-dead-letter-worker --kind document|search` 消费。
 - 消费语义至少一次：成功提交 offset；失败同进程指数退避重试（100ms 起、上限 5s），达到 `MaxAttempts`（默认 5）后写 DLQ 再提交；重复投递由幂等与 MySQL 租约吸收。
 - 无 Kafka 时 `rag-service` 默认内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS=auto`）；也可关闭内嵌 worker 并运行 `RAG_DOCUMENT_WORKER_LOCAL=1` 的独立文档 worker。

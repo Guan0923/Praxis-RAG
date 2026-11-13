@@ -6,6 +6,103 @@
 > is recorded immediately below. RocketMQ wording in the historical sections is
 > retained as history.
 
+## Debezium outbox 删除事件过滤与监控语义 — 2026-11-13
+
+工作树 `dsh-1c1bab83-a90b`（Windows 11，Go 1.27.3，Node v26.13.0 / npm 12.2.2）。
+目标：outbox 保留期清理产生的 CDC 删除事件不进入文档任务；监控不再把 outbox 的
+PENDING 数量/等待时间当作未投递积压；Debezium/Kafka/文档任务/outbox 记录分开展示，
+读不到的进度显示「未知」；Debezium 不回写 `PUBLISHED`。
+
+**代码改动**
+
+- `internal/mq/message.go`：新增 `DocumentMessageKind`（`DocumentMessageJob` /
+  `DocumentMessageOutboxDeletion`）与 `DecodeDocumentMessage`；空 body（tombstone）、
+  JSON null、`op=d`、仅 before-image 的事件分类为 outbox 清理，正常 schema-3 与
+  c/r/u 事件不变。
+- `internal/documentworker/processor.go`：`MessageHandler` 对清理事件记
+  `msg="outbox cleanup event ignored"` INFO 后直接 ACK（不调用 Handle/ingester）；
+  `DeadLetterMessage`/`DeadLetterHandler`/`ExhaustedHandler` 对清理事件返回已完成，
+  DLQ 重放不会改任何任务。`GCOutbox` 与业务文档删除未改。
+- `internal/state/monitor.go` + `internal/monitor/monitor.go`：`queues` 移除
+  `document_outbox`；新增恒在 `pipeline`（`outbox` 记录统计 / `document_jobs` /
+  `debezium` / `kafka`）；`oldest_pending_seconds` 删除，改为全状态
+  `oldest_record_seconds`；`capture_progress` 恒为 null（应用读不到 binlog 位点）。
+- `internal/mq/progress.go`：`DocumentConsumerProgress` 用 kafka-go 读取主题
+  Metadata→ListOffsets→OffsetFetch，得到已提交/末尾位点与滞后；无提交位点时全部
+  null（未知）。
+- `cmd/rag-service/main.go`：注入 `RAG_DEBEZIUM_HEALTH_URL`、文档 topic/group 与
+  Kafka 进度闭包。
+- `frontend/src/{MonitorPage.tsx,MonitorPage.test.tsx,api.ts}`：监控页拆成
+  「文档任务」「Outbox 记录（明确注明不代表未投递积压）」「投递与消费进度
+  （Debezium 采集 / Kafka 消费 / 文档任务状态）」。
+- 部署：`docker-compose.yml` 发布 Debezium 健康端口
+  `127.0.0.1:${RAG_DEBEZIUM_PORT:-8083}`，app profile 注入
+  `RAG_DEBEZIUM_HEALTH_URL=http://debezium:8080/q/health`；`.env.example`、
+  `docs/USAGE.md`、`docs/DEPLOYMENT.md`、`deploy/debezium/README.md`、
+  `docs/agents/*`、`README.md` 同步说明。
+
+**定向测试**（仅相关包，未跑全量）
+
+```
+$ go build ./...                                  # exit 0
+$ go vet ./internal/mq ./internal/documentworker ./internal/monitor ./internal/state ./cmd/rag-service
+                                                  # exit 0
+$ RAG_TEST_MYSQL_URL=mysql://rag:<env>@127.0.0.1:3307/praxis_unit_test?charset=utf8mb4 \
+  go test -p 1 -count=1 -timeout 15m ./internal/state ./internal/monitor ./internal/mq ./internal/documentworker
+ok  internal/state 20.200s   ok  internal/monitor 2.451s
+ok  internal/mq 0.681s       ok  internal/documentworker 2.468s
+
+$ cd frontend && npx tsc --noEmit                # exit 0
+$ npx vitest run src/MonitorPage.test.tsx src/api.test.ts   # 38 passed
+```
+
+新增/更新的关键用例：CDC 删除/tombstone 分类、清理事件 ACK 且不触发
+ingester、消费者对清理事件只提交一次且不重试/不写 DLQ、已完成任务在 outbox 被
+`GCOutbox` 删除后重放删除事件仍为 succeeded、正常通知仍入库、监控四视图
+（succeeded + 仍 PENDING 的 outbox 仍为 ok；Debezium/Kafka 未知为 null；stats 失败时
+`queues`/`pipeline.outbox` 为 null 而进度探针仍在）、JSON wire-shape、前端
+`不代表未投递积压`/`采集进度：未知`/`消费滞后：未知` 文案。
+
+**实机验收**（Compose 基础设施 + 本次构建的 `dist/bin/rag-service.exe` /
+`rag-document-worker.exe`，脚本 `scripts/verify-debezium-e2e.py`，2026-11-13）
+
+```
+SUMMARY passed=37 failed=0
+PASS document job reached succeeded via debezium delivery (stage=completed)
+PASS outbox row remained PENDING after processing (only Debezium published it)
+PASS outbox retention cleanup deleted the expired record (rows=1)
+PASS outbox record is gone from MySQL after cleanup
+PASS worker classified the CDC delete event as outbox cleanup and ACKed it
+PASS delete event did not take the malformed/retry path (no invalid retry)
+PASS worker did not exhaust retries for the cleanup event
+PASS document DLQ has no record for the cleaned-up outbox event
+PASS consumer kept working after the cleanup event (stage=completed)
+PASS original document job still succeeded after its outbox record was removed
+PASS document list / REST search still contains the original document
+PASS business document delete still works (HTTP 200)
+PASS business delete removed only the requested document; the cleaned-up outbox document remains
+PASS queues no longer presents document_outbox as a backlog queue
+PASS monitor response no longer reports oldest_pending_seconds
+PASS outbox record stats are self-consistent (total=1, by_status={'PENDING': 1})
+PASS document job status counts successes only (by_status={'failed': 0, 'processing': 0, 'queued': 0, 'succeeded': 2})
+PASS succeeded jobs stay ok while retained outbox rows are PENDING (not misreported)
+PASS Debezium capture progress is reported as unknown (null), never fabricated
+PASS Debezium health probe reports ok
+PASS Kafka progress names the document topic/group; lag=0 (status=ok)
+```
+
+流程：MCP 受理 → Debezium 投递 → 文档 `succeeded` → 直接删除 MySQL 中对应
+outbox 行（模拟保留期清理）→ Debezium 投递 `op=d` 事件 → worker 记录固定 INFO
+并 ACK → 再提交第二篇文档仍成功 → 原文档仍在列表/检索结果中 → REST 删除第二篇
+文档仍返回 200 且只删除目标文档（业务删除路径未受影响）→
+`/v1/admin/monitor/overview` 的 `pipeline` 语义符合上述契约。
+
+说明：为排除同组旧消费者干扰，验收期间临时停止了宿主开发栈中旧的
+`rag-document-worker.exe` 与文档死信 worker（它们是修复前二进制，会先消费同一
+topic/group），完成后已用原 `dist/bin` 二进制 detached 恢复；父检出 `.env` 早于
+Kafka 改造，恢复时显式补了 `RAG_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092`。合并后
+请重建并重启这两个进程，才能让运行中的开发栈获得删除事件过滤能力。
+
 ## Console create-knowledge-base multi-column layout — 2026-11-10
 
 Delivered: the Console「创建知识库」page no longer stacks every field vertically.

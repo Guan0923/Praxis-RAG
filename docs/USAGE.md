@@ -316,7 +316,10 @@ Redis 不可用时，持久读模型会回源状态库；**排队 MCP 搜索的�
 | `RAG_DOCUMENT_JOB_LEASE_SECONDS` | `300` | 文档任务 SQL 租约 |
 | `RAG_DOCUMENT_JOB_HEARTBEAT_SECONDS` | `20` | 处理期间续租间隔 |
 | `RAG_DOCUMENT_JOB_SWEEP_SECONDS` | `120` | 滞留/过期任务回收窗口 |
-| `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS` | `604800`（7 天） | 发件箱行保留期 |
+| `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS` | `604800`（7 天） | 发件箱行保留期；到期由应用删除，清理产生的 CDC 删除事件由 worker 直接 ACK（不重试、不进死信） |
+| `RAG_DEBEZIUM_HEALTH_URL` | 空（未知） | 可选的 Debezium/Connect 健康探测地址（只读，宿主机进程示例 `http://127.0.0.1:8083/q/health`）。只反映连接器存活，binlog 采集位点应用侧读不到，监控显示「未知」 |
+| `RAG_DEBEZIUM_PORT` | `8083` | Compose 把 Debezium 健康端口 8080 发布到宿主机 loopback 的端口 |
+| `RAG_APP_DEBEZIUM_HEALTH_URL` | `http://debezium:8080/q/health` | Compose `app` profile 内部覆盖用的 Debezium 健康地址 |
 | `RAG_DOCUMENT_JOB_RETENTION_SECONDS` | `2592000`（30 天） | 终态任务保留期 |
 | `RAG_DOCUMENT_WORKER_INPROCESS` | `auto` | `rag-service` 内嵌文档 worker：`auto`（未设置）仅在未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；`1/true/on` 强制启用（已配置 Kafka 时服务拒绝启动）；`0/false/off` 关闭并改跑独立 worker |
 | `RAG_DOCUMENT_WORKER_LOCAL` | `false` | 独立 `rag-document-worker` 的单进程 outbox 模式（通常无需：无 Kafka 时服务已内嵌 worker）；仅在未配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时生效 |
@@ -510,10 +513,12 @@ curl.exe http://127.0.0.1:8011/docs           # 自包含交互文档
 
 - **服务信息**：版本、运行时长、后端、默认集合、上传模式（固定异步）、outbox 投递方式（固定 Debezium）、文档 worker 模式（进程内/独立）、PDF 引擎。
 - **依赖探测**：MySQL（含连接池 in_use/wait）、Redis（PING）、Qdrant（集合数与目标集合点数）、Kafka（TCP 可达，不验证认证/授权）、pdf-service（`/healthz`）；未启用的依赖标记为「未启用」。
-- **队列与积压**：`document_jobs` 按状态/阶段计数、最老排队时长、租约过期的卡死任务数、24 小时失败数；`document_job_outbox` 按状态计数与最老待投递时长；`search_tasks` 按状态计数；未完成的上传操作数。
+- **文档任务与队列**：`document_jobs` 按状态/阶段计数、最老排队时长、租约过期的卡死任务数、24 小时失败数；`search_tasks` 按状态计数；未完成的上传操作数。
+- **Outbox 记录（记录统计，不是未投递积压）**：`document_job_outbox` 按状态计数、总数与最老记录时长。Debezium 只负责投递、不回写 `PUBLISHED`，所以保留期内的记录通常仍是 `PENDING`；页面明确标注该计数不代表未投递积压，字段 `oldest_pending_seconds` 已不再使用（改为 `oldest_record_seconds`）。
+- **投递与消费进度（分开展示）**：Debezium 采集状态（可选 `RAG_DEBEZIUM_HEALTH_URL` 健康探测；binlog 采集位点在 Debezium 侧，应用读不到，显示「未知」）；Kafka 文档消费组进度（topic/group、已提交位点、末尾位点与滞后，读不到显示「未知」）；文档任务处理状态摘要（`ok`/`degraded`/`unknown`）。三者与 outbox 记录统计分开，不互相推断。
 - **资料库与活动**：文档数、知识库数、搜索结果快照数、artifact 快照数；最近 24 小时成功/失败入库与检索次数。
 
-页面对应的只读接口是 `GET /v1/admin/monitor/overview`（仅本机直连或管理员会话，响应 `Cache-Control: no-store`）。依赖降级时接口仍返回 200，用 `dependencies[].status`（`ok`/`degraded`/`error`/`disabled`/`unknown`）区分；状态库不可读时 `queues`/`library`/`activity` 为 `null` 并附带 `errors` 中文说明。该接口只做聚合查询，不读取任务/文档正文，也不记录查询内容：
+页面对应的只读接口是 `GET /v1/admin/monitor/overview`（仅本机直连或管理员会话，响应 `Cache-Control: no-store`）。依赖降级时接口仍返回 200，用 `dependencies[].status`（`ok`/`degraded`/`error`/`disabled`/`unknown`）区分；状态库不可读时 `queues`/`library`/`activity` 为 `null`，`pipeline.outbox` 为 `null`、`pipeline.document_jobs.status` 为 `unknown`，`pipeline.debezium`/`pipeline.kafka` 仍各自探测，并附带 `errors` 中文说明。该接口只做聚合查询，不读取任务/文档正文，也不记录查询内容：
 
 ```powershell
 curl.exe http://127.0.0.1:8011/v1/admin/monitor/overview

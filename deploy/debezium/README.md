@@ -112,6 +112,46 @@ worker 直接读 `after` 取标识符，**不需要额外的 SMT/脚本转换**�
 MySQL 的 `document_jobs` 读回，不经过 Kafka。`ByLogicalTableRouter` 只负责把每条
 记录路由到单一合法 topic（`RAG_DOCUMENT_TOPIC`）。
 
+## 删除事件与状态职责
+
+应用按 `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS`（默认 7 天）删除过期 outbox 行。
+在 `binlog-row-image=FULL` 下，这些 DELETE 同样会进入 binlog，被 Debezium 投递为
+`op=d` 事件（`before` 有值、`after` 为 null），并可能伴随一条 tombstone（Kafka
+value 为 null）：
+
+```json
+{"before": { "id": "...", "artifact_id": "...", "status": "PENDING", ... },
+ "after": null, "op": "d", "source": {"table": "document_job_outbox"}}
+```
+
+这类事件是**发件箱清理**，不是文档任务：
+
+- `rag-document-worker` 在解码层把它分类为「发件箱清理记录」，记录一条 INFO 日志后
+  直接 ACK；不进入 `Handle`/入库流程、不重试、不进死信。tombstone（空 body）同样
+  直接 ACK。
+- 正常通知（`op` 为 `c`/`r`/`u`，或原生 schema-3 消息）不受影响，仍照常触发入库。
+- 业务文档删除走 REST/Console 的文档删除接口，与 outbox 清理无关。
+
+状态职责保持分离：
+
+| 组件 | 职责 |
+| --- | --- |
+| MySQL `document_job_outbox` | 事务发件箱；应用只写 PENDING，保留期后删除 |
+| Debezium | 读取 binlog 并投递 Kafka；**不回写** `PUBLISHED` |
+| Kafka 消费组 | 记录消费位点与滞后 |
+| `document_jobs` | 记录处理结果（`queued`/`processing`/`succeeded`/`failed`） |
+
+因此 outbox 行在处理成功后仍可能是 `PENDING`：这是设计使然，**不是未投递积压**。
+Console「系统监控」把 outbox 记录统计、Debezium 采集状态、Kafka 消费滞后和文档任务
+状态分开显示；应用读不到的进度（如 binlog 采集位点、无消费者组时的滞后）显示
+「未知」，不会用 PENDING 数量或等待时间推算积压。
+
+监控联调（可选）：Compose 把 Debezium 的 Quarkus 健康端口发布到宿主机 loopback
+`127.0.0.1:${RAG_DEBEZIUM_PORT:-8083}`；宿主机进程设置
+`RAG_DEBEZIUM_HEALTH_URL=http://127.0.0.1:8083/q/health`，compose 的 `app` profile
+默认使用 `http://debezium:8080/q/health`。健康探测只说明连接器存活，采集位点仍显示
+「未知」。
+
 ## 冒烟验证
 
 ```powershell
@@ -158,7 +198,8 @@ docker exec praxis-rag-kafka /opt/kafka/bin/kafka-console-consumer.sh `
 - **首次启动会做一次初始快照**（默认 `snapshot.mode=initial`），把现存发件箱行作为
   `op: r` 事件重放；worker 对已完成任务直接 ACK，不会重复索引。
 - **发件箱保留期**：应用按 `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS`（默认 7 天）删除旧行。
-  Debezium 停机超过该值可能错过事件；建议保留期大于最长停机时间。
+  Debezium 停机超过该值可能错过事件；建议保留期大于最长停机时间。清理产生的 CDC
+  删除事件由 worker 直接 ACK（见「删除事件与状态职责」），不会重试或进入死信。
 - **Debezium 配置目录**是 `/debezium/config`（不是 `/debezium/conf`）；compose 已按此挂载。
 - **MySQL CDC 认证**：`caching_sha2_password` 在未加密连接上需要
   `debezium.source.database.ssl.mode=preferred`（镜像自带自签证书）。

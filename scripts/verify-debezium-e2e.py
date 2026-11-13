@@ -292,6 +292,10 @@ def base_env() -> dict:
         "RAG_SEARCH_DLQ_TOPIC": SEARCH_DLQ_TOPIC,
         "RAG_DOCUMENT_DLQ_GROUP": DOCUMENT_DLQ_GROUP,
         "RAG_SEARCH_DLQ_GROUP": SEARCH_DLQ_GROUP,
+        # Compose publishes the Debezium health port on loopback; without it the
+        # monitor page reports capture progress as unknown (never fabricated).
+        "RAG_DEBEZIUM_HEALTH_URL": os.environ.get(
+            "RAG_DEBEZIUM_HEALTH_URL", "http://127.0.0.1:8083/q/health"),
     })
     return env
 
@@ -381,6 +385,46 @@ def tail(path: pathlib.Path, lines: int = 40) -> str:
         return "\n".join(content[-lines:])
     except Exception:  # noqa: BLE001
         return "<no log>"
+
+
+def log_occurrences(path: pathlib.Path, needle: str) -> int:
+    try:
+        return path.read_text("utf-8", "replace").count(needle)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def wait_log_occurrence(
+    path: pathlib.Path, needle: str, timeout: float = 90.0, above: int = 0
+) -> bool:
+    """Wait until the log holds more than `above` occurrences of the needle.
+
+    `above` distinguishes the delete event this run just produced from earlier
+    outbox-cleanup events (for example the script's own stale-row cleanup).
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if log_occurrences(path, needle) > above:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def kafka_topic_contains(topic: str, needle: str) -> tuple[bool, str]:
+    """Read a topic from the beginning and report whether the needle appears."""
+    try:
+        completed = subprocess.run([
+            "docker", "exec", "praxis-rag-kafka",
+            "/opt/kafka/bin/kafka-console-consumer.sh",
+            "--bootstrap-server", "kafka:9092",
+            "--topic", topic,
+            "--from-beginning",
+            "--timeout-ms", "5000",
+        ], capture_output=True, text=True, timeout=30)
+        output = (completed.stdout or "") + (completed.stderr or "")
+        return needle in output, output[-4000:]
+    except Exception as error:  # noqa: BLE001 - probe is optional evidence
+        return False, f"probe failed: {error}"
 
 
 # --------------------------------------------------------------------------- #
@@ -522,6 +566,128 @@ def main() -> int:
             f"WHERE artifact_id = '{artifact_id}';")
         check(still_pending.strip() == "1",
               "outbox row remained PENDING after processing (only Debezium published it)")
+
+        # ------------------------------------------------------------------ #
+        # Acceptance 1: outbox retention cleanup (MySQL DELETE) produces a CDC
+        # delete event. The database row must be gone, but the event must be
+        # ACKed as outbox cleanup: no retry, no dead letter, document intact.
+        # ------------------------------------------------------------------ #
+        malformed_before = log_occurrences(worker_log, "malformed document message ignored")
+        ignored_before = log_occurrences(worker_log, "outbox cleanup event ignored")
+        cleanup_rows = mysql_query(
+            f"DELETE FROM {MYSQL_DATABASE}.document_job_outbox "
+            f"WHERE artifact_id = '{artifact_id}'; SELECT ROW_COUNT();")
+        deleted_rows = cleanup_rows.strip().splitlines()[-1] if cleanup_rows.strip() else ""
+        check(deleted_rows == "1", f"outbox retention cleanup deleted the expired record (rows={deleted_rows})")
+        remaining = mysql_query(
+            f"SELECT COUNT(*) FROM {MYSQL_DATABASE}.document_job_outbox "
+            f"WHERE artifact_id = '{artifact_id}';")
+        check(remaining.strip() == "0", "outbox record is gone from MySQL after cleanup")
+
+        acknowledged = wait_log_occurrence(
+            worker_log, "outbox cleanup event ignored", 120, above=ignored_before)
+        check(acknowledged, "worker classified the CDC delete event as outbox cleanup and ACKed it")
+        # Give any (incorrect) retry/DLQ path a chance to run before asserting.
+        time.sleep(3)
+        malformed_after = log_occurrences(worker_log, "malformed document message ignored")
+        check(malformed_after == malformed_before,
+              "delete event did not take the malformed/retry path (no invalid retry)")
+        check("Message retry limit reached" not in tail(worker_log, 400),
+              "worker did not exhaust retries for the cleanup event")
+        dlq_hit, dlq_output = kafka_topic_contains(DOCUMENT_DLQ_TOPIC, artifact_id)
+        check(not dlq_hit, "document DLQ has no record for the cleaned-up outbox event")
+        if dlq_hit:
+            print("DLQ probe tail:\n" + dlq_output)
+
+        # Consumer health: a later normal notification still ingests.
+        second_name = f"bridge-after-cleanup-{int(time.time())}.md"
+        second_content = "# After cleanup\n\nA normal notification still triggers ingestion.\n"
+        second = mcp.call_tool("add_document", {
+            "name": second_name, "content": second_content,
+            "idempotency_key": f"e2e-cleanup-{int(time.time())}",
+        })
+        second_artifact = second.get("artifact_id", "")
+        check(bool(second_artifact), f"second add_document accepted artifact_id={mask(second_artifact)}")
+        second_deadline = time.time() + 180
+        second_status: dict = {}
+        while time.time() < second_deadline:
+            second_status = mcp.call_tool("get_document_status", {"artifact_id": second_artifact})
+            if second_status.get("status") in ("succeeded", "failed"):
+                break
+            time.sleep(1.5)
+        check(second_status.get("status") == "succeeded",
+              f"consumer kept working after the cleanup event (stage={second_status.get('stage')})")
+
+        # The already-indexed document is unaffected by the outbox cleanup.
+        first_status = mcp.call_tool("get_document_status", {"artifact_id": artifact_id})
+        check(first_status.get("status") == "succeeded",
+              "original document job still succeeded after its outbox record was removed")
+        status, _, listing = http_json(
+            "GET", SERVICE + "/v1/documents", None,
+            {"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace})
+        listed_names = [str(item.get("name", "")) for item in (listing or {}).get("documents", [])]
+        check(status == 200 and document_name in listed_names,
+              "document list still contains the original document after outbox cleanup")
+        status, _, search_again = http_json(
+            "POST", SERVICE + "/v1/search", {"query": "debezium bridge outbox", "rerank": "none"},
+            {"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace}, timeout=60)
+        again_hits = (search_again or {}).get("results") or []
+        again_names = [hit.get("source") or hit.get("title") or "" for hit in again_hits]
+        check(status == 200 and any(document_name in str(name) for name in again_names),
+              "REST search still returns the document after outbox cleanup")
+
+        # Business document deletion is a separate path and must still work: the
+        # outbox-cleanup filter only affects CDC messages, not REST deletes.
+        delete_status, _, delete_payload = http_json(
+            "DELETE", SERVICE + "/v1/documents/" + second_name, None,
+            {"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace})
+        check(delete_status == 200, f"business document delete still works (HTTP {delete_status})")
+        status, _, listing_after_delete = http_json(
+            "GET", SERVICE + "/v1/documents", None,
+            {"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace})
+        names_after_delete = [
+            str(item.get("name", "")) for item in (listing_after_delete or {}).get("documents", [])]
+        check(status == 200 and second_name not in names_after_delete and document_name in names_after_delete,
+              "business delete removed only the requested document; the cleaned-up outbox document remains")
+
+        # ------------------------------------------------------------------ #
+        # Acceptance 2: monitoring separates outbox records, Debezium capture,
+        # Kafka consumption and document job status; unknown stays unknown.
+        # ------------------------------------------------------------------ #
+        status, _, overview = http_json("GET", SERVICE + "/v1/admin/monitor/overview", timeout=20)
+        check(status == 200 and isinstance(overview, dict), f"monitor overview HTTP {status}")
+        overview = overview or {}
+        queues_section = overview.get("queues") or {}
+        pipeline_section = overview.get("pipeline") or {}
+        outbox_section = pipeline_section.get("outbox") or {}
+        outbox_status = outbox_section.get("by_status") or {}
+        jobs_section = (queues_section.get("document_jobs") or {}).get("by_status") or {}
+        check("document_outbox" not in queues_section,
+              "queues no longer presents document_outbox as a backlog queue")
+        check("oldest_pending_seconds" not in json.dumps(overview),
+              "monitor response no longer reports oldest_pending_seconds")
+        check(isinstance(outbox_section.get("total"), int) and
+              outbox_section.get("total") == sum(int(value) for value in outbox_status.values()),
+              f"outbox record stats are self-consistent (total={outbox_section.get('total')}, "
+              f"by_status={outbox_status})")
+        check(jobs_section.get("succeeded", 0) >= 2 and jobs_section.get("failed", 0) == 0,
+              f"document job status counts successes only (by_status={jobs_section})")
+        check((pipeline_section.get("document_jobs") or {}).get("status") == "ok",
+              "succeeded jobs stay ok while retained outbox rows are PENDING (not misreported)")
+        debezium_section = pipeline_section.get("debezium") or {}
+        check(debezium_section.get("capture_progress") is None,
+              "Debezium capture progress is reported as unknown (null), never fabricated")
+        check(debezium_section.get("status") == "ok",
+              f"Debezium health probe reports ok (detail={debezium_section.get('detail')})")
+        kafka_section = pipeline_section.get("kafka") or {}
+        check(kafka_section.get("topic") == DOCUMENT_TOPIC and kafka_section.get("group") == DOCUMENT_GROUP,
+              f"Kafka progress names the document topic/group "
+              f"({kafka_section.get('topic')}/{kafka_section.get('group')})")
+        lag = kafka_section.get("consumer_lag")
+        check(kafka_section.get("status") in ("ok", "unknown") and
+              (lag is None or isinstance(lag, int)),
+              f"Kafka consumer lag is numeric or explicitly unknown "
+              f"(status={kafka_section.get('status')}, lag={lag})")
     except Exception as error:  # noqa: BLE001 - report and fail
         print(f"ERROR: {error}", flush=True)
         results.append((False, f"exception: {error}"))
