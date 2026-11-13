@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"math"
@@ -73,6 +74,13 @@ func (m *memoryTransient) Delete(kind, identity string) (int64, error) {
 	return 1, nil
 }
 
+func (m *memoryTransient) has(kind, identity string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, found := m.values[transientKey(kind, identity)]
+	return found
+}
+
 func newTestSnapshots(stores *Stores, settings SnapshotSettings, clock func() float64) *ResultSnapshots {
 	snapshots := NewResultSnapshots(stores, settings, clock)
 	snapshots.Transient = newMemoryTransient()
@@ -135,7 +143,61 @@ func TestResultPaginationDetachesFullResponse(t *testing.T) {
 	}
 }
 
-func TestResultExpiryEvictionAndOutageNeverRecoverFromSQL(t *testing.T) {
+// TestResultFactRowSurvivesRedisLoss asserts the MySQL fact row is the source
+// of truth: losing the cache entry (or the whole cache) never loses a result,
+// and the read path backfills the cache again.
+func TestResultFactRowSurvivesRedisLoss(t *testing.T) {
+	stores := newTestStores(t)
+	snapshots := newTestSnapshots(stores, DefaultSnapshotSettings(), nil)
+	saved, err := snapshots.Save("ns", map[string]any{
+		"results": []any{map[string]any{"text": "durable"}},
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	resultID := saved["result_id"].(string)
+	// Clear only the Redis cache: the fact row recovers the result and repairs
+	// the cache.
+	if _, err := snapshots.Transient.Delete("search-result", resultID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	page, err := snapshots.Get("ns", resultID, 1, 10)
+	if err != nil {
+		t.Fatalf("Get(after cache clear) error = %v", err)
+	}
+	if page["results"].([]any)[0].(map[string]any)["text"] != "durable" {
+		t.Fatalf("recovered page = %+v", page)
+	}
+	if !snapshots.Transient.(*memoryTransient).has("search-result", resultID) {
+		t.Fatal("Get() did not backfill the Redis cache")
+	}
+	// A total cache outage still serves results from MySQL.
+	snapshots.Transient = nil
+	if page, err = snapshots.Get("ns", resultID, 1, 10); err != nil || page == nil {
+		t.Fatalf("Get(cache disabled) = %+v, %v", page, err)
+	}
+	// Save also works without any cache: MySQL is authoritative.
+	persisted, err := snapshots.Save("ns", map[string]any{"results": []any{}}, nil, nil)
+	if err != nil {
+		t.Fatalf("Save(cache disabled) error = %v", err)
+	}
+	second := persisted["result_id"].(string)
+	if _, err := snapshots.Get("ns", second, 1, 10); err != nil {
+		t.Fatalf("Get(second) error = %v", err)
+	}
+	// Only when both the cache and the fact row are gone is the result gone.
+	if _, err := stores.DB.ExecContext(context.Background(),
+		"DELETE FROM search_result_snapshots WHERE id = ?", resultID); err != nil {
+		t.Fatalf("delete fact row error = %v", err)
+	}
+	if _, err := snapshots.Get("ns", resultID, 1, 10); err == nil {
+		t.Fatal("deleted fact row was recovered")
+	} else {
+		mustBeError[*SnapshotUnavailable](t, err)
+	}
+}
+
+func TestResultExpiryEviction(t *testing.T) {
 	stores := newTestStores(t)
 	now := 1000.0
 	snapshots := newTestSnapshots(stores, DefaultSnapshotSettings(), func() float64 { return now })
@@ -146,23 +208,23 @@ func TestResultExpiryEvictionAndOutageNeverRecoverFromSQL(t *testing.T) {
 	resultID := saved["result_id"].(string)
 	now = saved["expires_at"].(float64)
 	_, err = snapshots.Get("ns", resultID, 1, 10)
-	mustBeError[*SnapshotUnavailable](t, err)
-	now = 1000
-	if _, err := snapshots.Transient.Delete("search-result", resultID); err != nil {
-		t.Fatalf("Delete() error = %v", err)
+	unavailable := mustBeError[*SnapshotUnavailable](t, err)
+	if containsSubstring(unavailable.Message, "credential") {
+		t.Fatalf("expiry message leaked details: %q", unavailable.Message)
 	}
-	_, err = snapshots.Get("ns", resultID, 1, 10)
-	mustBeError[*SnapshotUnavailable](t, err)
-	// A total transient outage must not fall back to SQL.
-	snapshots.Transient = nil
-	for _, operation := range []func() error{
-		func() error { _, err := snapshots.Get("ns", resultID, 1, 10); return err },
-		func() error { _, err := snapshots.Save("ns", map[string]any{"results": []any{}}, nil, nil); return err },
-	} {
-		err := operation()
-		unavailable := mustBeError[*SnapshotUnavailable](t, err)
-		if containsSubstring(unavailable.Message, "credential") {
-			t.Fatalf("outage message leaked details: %q", unavailable.Message)
+	// The fact row is expired too, so purging it is the final cleanup.
+	removed, err := snapshots.PurgeExpired(100)
+	if err != nil || removed != 1 {
+		t.Fatalf("PurgeExpired() = %d, %v", removed, err)
+	}
+	if removed, err := snapshots.PurgeExpired(100); err != nil || removed != 0 {
+		t.Fatalf("second PurgeExpired() = %d, %v", removed, err)
+	}
+	for _, limit := range []int{0, -1, 1001} {
+		if _, err := snapshots.PurgeExpired(limit); err == nil {
+			t.Fatalf("PurgeExpired(%d) succeeded", limit)
+		} else {
+			mustBeError[*ValueError](t, err)
 		}
 	}
 }
@@ -214,7 +276,9 @@ func TestResultTTLUsesResultSettings(t *testing.T) {
 	}
 }
 
-func TestCorruptSnapshotIsUnavailableWithoutFallback(t *testing.T) {
+// TestCorruptCacheFallsBackToFactRow asserts a poisoned or corrupt cache entry
+// cannot hide (or replace) the authoritative MySQL result.
+func TestCorruptCacheFallsBackToFactRow(t *testing.T) {
 	snapshots := newTestSnapshots(newTestStores(t), DefaultSnapshotSettings(), nil)
 	saved, err := snapshots.Save("ns", map[string]any{"results": []any{map[string]any{"text": "original"}}}, nil, nil)
 	if err != nil {
@@ -234,10 +298,12 @@ func TestCorruptSnapshotIsUnavailableWithoutFallback(t *testing.T) {
 		if _, err := snapshots.Transient.Put("search-result", resultID, corrupt, 3600, false); err != nil {
 			t.Fatalf("corrupt Put(%d) error = %v", index, err)
 		}
-		if _, err := snapshots.Get("ns", resultID, 1, 10); err == nil {
-			t.Fatalf("corrupt snapshot %d was accepted", index)
-		} else {
-			mustBeError[*SnapshotUnavailable](t, err)
+		page, err := snapshots.Get("ns", resultID, 1, 10)
+		if err != nil {
+			t.Fatalf("corrupt snapshot %d was not recovered: %v", index, err)
+		}
+		if page["results"].([]any)[0].(map[string]any)["text"] != "original" {
+			t.Fatalf("corrupt snapshot %d returned %+v", index, page)
 		}
 	}
 }
@@ -284,8 +350,13 @@ func TestResultWrongTenantOrIdentityIsUnavailable(t *testing.T) {
 			if _, err := snapshots.Transient.Put("search-result", resultID, envelope, 3600, false); err != nil {
 				t.Fatalf("Put() error = %v", err)
 			}
-			if _, err := snapshots.Get("ns", resultID, 1, 10); err == nil {
-				t.Fatal("poisoned envelope was accepted")
+			// A poisoned cache entry is discarded in favour of the fact row: the
+			// tenant/identity checks still run on the recovered envelope.
+			if _, err := snapshots.Get("ns", resultID, 1, 10); err != nil {
+				t.Fatalf("Get() after cache poison = %v", err)
+			}
+			if _, err := snapshots.Get("other", resultID, 1, 10); err == nil {
+				t.Fatal("cross-namespace Get() succeeded")
 			} else {
 				mustBeError[*SnapshotUnavailable](t, err)
 			}
@@ -318,17 +389,49 @@ func TestResultInvalidPagingAndIdentity(t *testing.T) {
 	}
 }
 
-func TestResultPurgeIsBoundedCompatibilityNoop(t *testing.T) {
-	snapshots := newTestSnapshots(newTestStores(t), DefaultSnapshotSettings(), nil)
-	if removed, err := snapshots.PurgeExpired(100); err != nil || removed != 0 {
-		t.Fatalf("PurgeExpired() = %d, %v", removed, err)
+func TestResultSaveTxCommitsWithCallerTransaction(t *testing.T) {
+	stores := newTestStores(t)
+	snapshots := newTestSnapshots(stores, DefaultSnapshotSettings(), nil)
+	ctx := context.Background()
+	// A rolled-back caller transaction leaves neither a fact row nor a cache
+	// entry behind.
+	transaction, err := stores.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
 	}
-	for _, limit := range []int{0, -1, 1001} {
-		if _, err := snapshots.PurgeExpired(limit); err == nil {
-			t.Fatalf("PurgeExpired(%d) succeeded", limit)
-		} else {
-			mustBeError[*ValueError](t, err)
-		}
+	saved, err := snapshots.SaveTx(ctx, transaction, "ns",
+		map[string]any{"results": []any{map[string]any{"text": "rolled back"}}}, nil, nil)
+	if err != nil {
+		t.Fatalf("SaveTx() error = %v", err)
+	}
+	resultID := saved["result_id"].(string)
+	if err := transaction.Rollback(); err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+	if _, err := snapshots.Get("ns", resultID, 1, 10); err == nil {
+		t.Fatal("rolled-back SaveTx() was readable")
+	}
+	// A committed caller transaction is durable, and the cache is not touched
+	// inside the transaction.
+	transaction, err = stores.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	saved, err = snapshots.SaveTx(ctx, transaction, "ns",
+		map[string]any{"results": []any{map[string]any{"text": "committed"}}}, nil, nil)
+	if err != nil {
+		t.Fatalf("SaveTx(commit) error = %v", err)
+	}
+	committedID := saved["result_id"].(string)
+	if snapshots.Transient.(*memoryTransient).has("search-result", committedID) {
+		t.Fatal("SaveTx() wrote the cache before the caller committed")
+	}
+	if err := transaction.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	page, err := snapshots.Get("ns", committedID, 1, 10)
+	if err != nil || page["results"].([]any)[0].(map[string]any)["text"] != "committed" {
+		t.Fatalf("Get(committed) = %+v, %v", page, err)
 	}
 }
 

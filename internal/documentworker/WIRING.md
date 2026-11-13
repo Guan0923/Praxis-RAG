@@ -3,6 +3,66 @@
 The package owns the durable job lease/heartbeat/reconcile state machine. Parsing,
 chunking, embedding and Qdrant publication are injected through `Ingester`.
 
+The worker is a **CDC notification consumer**: MySQL `document_jobs` is the only
+source of truth and Debezium publishes one identifier-only notification per
+committed INSERT (or `schedule_version` bump). The application writes no
+transactional outbox, and the worker never polls a queue table.
+
+## Event source: two Debezium connectors, three topics/groups
+
+`docs/cdc-migration.md` is the contract. The deployment runs two Debezium Server
+instances against the same MySQL (different `database.server.id`, offset and
+schema-history storage, health port):
+
+| Connector | Captures | Topic (env) | Consumer group (env) | Consumer binary |
+| --- | --- | --- | --- | --- |
+| task connector | `document_jobs` (INSERT + `schedule_version` changes only; `column.include.list=artifact_id,namespace,schedule_version`, `skip.messages.without.change=true`, `skipped.operations=d`) | `RAG_DOCUMENT_TOPIC` (default `praxis_document_ingest`) | `RAG_DOCUMENT_GROUP` (default `praxis_document_ingest_workers`) | `cmd/rag-document-worker` |
+| task connector | `search_tasks` (same column/skip rules) | `RAG_SEARCH_TOPIC` (default `praxis_search`) | `RAG_SEARCH_GROUP` (default `praxis_search_workers`) | `cmd/rag-search-worker` |
+| cache connector | 8 cache read-model tables (all c/u/d) | `RAG_CACHE_TOPIC` (default `praxis_state_cache_refresh`) | `RAG_CACHE_GROUP` (default `praxis_state_cache_refresh_workers`) | `cmd/rag-cache-worker` |
+
+Topics/consumer groups are never reused. Each stream has its own DLQ topic and
+group (`RAG_DOCUMENT_DLQ_TOPIC` / `RAG_DOCUMENT_DLQ_GROUP`,
+`RAG_SEARCH_DLQ_TOPIC` / `RAG_SEARCH_DLQ_GROUP`,
+`RAG_CACHE_DLQ_TOPIC` / `RAG_CACHE_DLQ_GROUP`); this document worker consumes only
+the document DLQ via `cmd/rag-dead-letter-worker --kind document`.
+
+### Document notification (schema 4)
+
+The native envelope (tests and manual replay) carries locating identifiers only:
+
+```json
+{"schema":4,"artifact_id":"<uuid>","namespace":"<ns>","schedule_version":3}
+```
+
+The physical record is the raw Debezium event
+(`debezium.format.value.schemas.enable=false`):
+
+```json
+{"before":null,"after":{"artifact_id":"<uuid>","namespace":"<ns>","schedule_version":3},"source":{"table":"document_jobs"},"op":"c","ts_ms":1700000000000}
+```
+
+`mq.DecodeDocumentNotification` accepts both shapes; `op` is `c` (new admission),
+`r` (initial snapshot) or `u` (requeue by `schedule_version` bump). A delete
+(`op=d`), tombstone (`null` value) or before-image-only record is not task work:
+it decodes to `state.ErrIgnorableCDCChange` and `MessageHandler` ACKs it without
+retry, without DLQ and without touching `document_jobs`. Malformed payloads are
+nacked so the broker retry/DLQ policy still applies to real poison messages.
+
+### Cache change events (schema 1)
+
+The cache connector publishes row-level changes of the 8 cache read-model tables.
+Those events never reach this worker; the cache consumer (`cmd/rag-cache-worker`)
+derives `(table, op, locator columns)` from them:
+
+```json
+{"schema":1,"table":"documents","op":"u","before":{"namespace":"<ns>","name":"a.pdf"},"after":{"namespace":"<ns>","name":"a.pdf"}}
+```
+
+`op` is `c`/`u`/`d`; a tombstone is ignored. `before`/`after` only carry the
+locator columns of `column.include.list`, never file bytes, query text, KB
+settings, catalog data or credentials. The document worker must never subscribe
+to that topic.
+
 ## Runtime seam the binary must provide
 
 ```go
@@ -58,6 +118,7 @@ if err != nil { return err }
 
 config := mq.DefaultConsumerConfig(settings.DocumentTopic, settings.DocumentGroup)
 config.MaxAttempts = 5                                    // Kafka consumer retries in-process; exhausted -> DLQ topic
+config.DLQTopic = settings.DocumentDLQTopic
 consumer, err := mq.NewKafkaPullConsumer(settings, config, worker.MessageHandler())
 if err != nil { return err }
 consumer.OnExhausted = worker.ExhaustedHandler()          // durable "failed", then ack
@@ -83,27 +144,55 @@ _ = worker.Close()
 return service.Close(ctx)
 ```
 
+Operators must verify the deployment no longer points `RAG_DOCUMENT_TOPIC` at an
+outbox-derived topic: the retired `document_job_outbox` table no longer exists,
+and the task connector must be the only producer of this topic.
+
 Dead-letter binary (`cmd/rag-dead-letter-worker --kind document`): construct the
 processor with only `Jobs` (no Ingester) and a Kafka consumer subscribed to the
-document DLQ topic (`RAG_DOCUMENT_DLQ_TOPIC`), then run
-`worker.DeadLetterHandler()` through that consumer. The Kafka adapter publishes
-exhausted deliveries to the DLQ topic; the handler acks only once the job is
-durably terminal (or absent), and returns false while a live lease or unfinished
-journal publication exists.
+document DLQ topic, then run `worker.DeadLetterHandler()` through that consumer.
+The Kafka adapter publishes exhausted deliveries to the DLQ topic; the handler
+acks only once the job is durably terminal (or absent), and returns false while a
+live lease or unfinished journal publication exists. Delete/tombstone records
+replayed through the DLQ are already complete: `DeadLetterMessage` ACKs them
+without touching any job row.
 
-## Semantics distilled from document_worker.py
+## ACK rule (docs/cdc-migration.md §5.3)
 
-1. `Validate` notification -> `Get` job (unknown = ack).
-2. Terminal job = ack. `Reconcile` a committed publication before claiming
-   (crash recovery).
-3. `Claim` lease; `nil` means another live worker owns it or it turned terminal
-   -> ack only if `Terminal`.
+ACK the delivery **iff the outcome is already durable in MySQL**:
+
+1. the notification was safely skipped — the row is unknown/foreign, terminal,
+   owned by a live lease, or carries a stale `schedule_version`; or
+2. the job was claimed (`status=processing`, `attempts+1`) and this round recorded
+   either a terminal state (`succeeded`/`failed`) or a requeue
+   (`schedule_version+1`, `status=queued`, `stage=retry_wait`); or
+3. a dead-letter outcome was recorded (`dead-letter-worker`).
+
+A DB error (claim/reconcile/fail write failure) returns false → nack, so broker
+retry and the DLQ handle it. Redis/cache failures are never a nack reason: the
+job fact lives in MySQL.
+
+## Semantics distilled from the CDC design
+
+1. `MessageHandler` decodes the schema-4 envelope or raw Debezium record;
+   ignorable changes (d/tombstone/before-only) ACK, malformed payloads nack.
+2. `Handle` revalidates identifiers, `Get`s the job (unknown = ACK), and ACKs a
+   terminal job; `Reconcile` adopts an already committed publication before
+   claiming (crash recovery).
+3. `Claim` is a single `SELECT ... FOR UPDATE` transaction: it requires
+   `schedule_version` equality, `status IN (queued, processing)` and
+   `lease_until <= now`; a stale version, terminal row, live lease or missing row
+   returns nil → ACK. Requeueing (`Fail(retry)`, `Sweep`) is the only UPDATE that
+   increments `schedule_version`, which is the only signal Debezium re-emits.
 4. Heartbeat goroutine renews the lease during ingestion (failure lets lease
    expiry recover the job).
 5. `Reconcile` again, `ExecutionBusy` check, then `Ingester.ProcessDocumentJob`.
 6. Success requires a committed publication (`Reconcile` true), otherwise nack.
 7. Failure: reconcile first; otherwise `Fail(retry)` where validation errors are
    terminal (`Invalid document or changed knowledge-base configuration`) and all
-   other errors retry (`Document processing failed (<type>)`).
-8. `Sweep` requeues expired leases and re-emits stranded queued notifications;
-   `Recover` also runs the bounded GCs and optional journal recovery.
+   other errors retry (`Document processing failed: ...`, `schedule_version+1`).
+   Both branches recorded a durable outcome → ACK; the sweep re-emits the new
+   generation for the retry branch.
+8. `Recover` runs `Sweep` (requeue stranded queued + expired leases, each bumping
+   `schedule_version`), `GCJobs` (terminal retention) and the optional journal
+   recovery. It reads/writes no outbox table.

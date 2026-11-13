@@ -26,25 +26,29 @@ type MonitorStats struct {
 	// JobsSucceededRecent counts succeeded jobs updated inside the recent window.
 	JobsSucceededRecent int
 
-	// OutboxByStatus counts document_job_outbox rows per status; the keys are
-	// the stored values (PENDING, PUBLISHED).
-	OutboxByStatus map[string]int
-	// OldestOutboxRecordSeconds is the age of the oldest outbox row across all
-	// statuses, i.e. a retention age rather than a delivery lag. In the Debezium
-	// deployment the service never writes PUBLISHED back, so PENDING rows are
-	// retained delivery records, not undelivered backlog.
-	OldestOutboxRecordSeconds float64
-
 	// SearchByStatus counts search_tasks per status with the five known states
 	// always present (zero when absent).
 	SearchByStatus map[string]int
 	// OldestActiveSearchSeconds is the age of the oldest queued/processing task.
 	OldestActiveSearchSeconds float64
+	// SearchTimedOutRecent counts tasks converged to timed_out inside the recent
+	// window (deadline expiry is a terminal outcome, not a worker failure).
+	SearchTimedOutRecent int
+	// SearchOverdueActive counts active tasks whose deadline already passed but
+	// which have not been converged to timed_out yet (Expire/Claim/Get lag).
+	SearchOverdueActive int
 	// SearchesRecent counts every retrieval execution inside the recent window:
 	// synchronous REST/MCP searches and queued search worker runs all pass
 	// through runtime.Service.Search and are counted by the activity counter.
 	// search_tasks only holds queued searches, so it is not the source here.
 	SearchesRecent int
+
+	// CacheDirtyKeys counts read-model keys whose Redis value is behind the
+	// database revision (refreshed_revision < revision).
+	CacheDirtyKeys int
+	// CacheRefreshFailures counts read-model keys whose last refresh attempt
+	// recorded an error (last_error IS NOT NULL).
+	CacheRefreshFailures int
 
 	// UploadsByStatus counts upload_operations per stored status. The five
 	// unfinished states (INTENT/RUNNING/FAILED/ROLLING_BACK/ROLLBACK_FAILED) are
@@ -70,11 +74,12 @@ type MonitorStats struct {
 
 	// Documents counts live (not soft-deleted) document records.
 	// KnowledgeBases and ArtifactSnapshots are plain table counts of the library
-	// state. Result snapshots live in Redis and are counted there, so they are
-	// not part of the SQL aggregate.
-	Documents         int
-	KnowledgeBases    int
-	ArtifactSnapshots int
+	// state. SearchResultSnapshotsActive counts unexpired search-result fact
+	// rows (search_result_snapshots; Redis is only their read cache).
+	Documents                   int
+	KnowledgeBases              int
+	ArtifactSnapshots           int
+	SearchResultSnapshotsActive int
 }
 
 // MonitorStats aggregates the monitoring counters in one call. The caller
@@ -132,21 +137,6 @@ func (s *Stores) MonitorStats(ctx context.Context, now time.Time, recentWindow t
 		return nil, fmt.Errorf("document_jobs 近期成功统计失败：%w", err)
 	}
 
-	stats.OutboxByStatus, err = s.monitorGroupCounts(ctx,
-		"SELECT status, COUNT(*) FROM document_job_outbox GROUP BY status")
-	if err != nil {
-		return nil, fmt.Errorf("document_job_outbox 状态聚合失败：%w", err)
-	}
-	if stats.OutboxByStatus == nil {
-		stats.OutboxByStatus = map[string]int{}
-	}
-
-	stats.OldestOutboxRecordSeconds, err = s.monitorOldestAgeSeconds(ctx,
-		"SELECT MIN(created_at) FROM document_job_outbox", now)
-	if err != nil {
-		return nil, fmt.Errorf("document_job_outbox 最旧记录查询失败：%w", err)
-	}
-
 	searchByStatus, err := s.monitorGroupCounts(ctx,
 		"SELECT status, COUNT(*) FROM search_tasks GROUP BY status")
 	if err != nil {
@@ -162,6 +152,20 @@ func (s *Stores) MonitorStats(ctx context.Context, now time.Time, recentWindow t
 		return nil, fmt.Errorf("search_tasks 最旧活动任务查询失败：%w", err)
 	}
 
+	stats.SearchTimedOutRecent, err = s.monitorCount(ctx,
+		"SELECT COUNT(*) FROM search_tasks WHERE status = ? AND updated_at >= ?",
+		SearchTaskTimedOut, recentStartSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("search_tasks 近期超时统计失败：%w", err)
+	}
+
+	stats.SearchOverdueActive, err = s.monitorCount(ctx,
+		"SELECT COUNT(*) FROM search_tasks WHERE status IN (?, ?) AND deadline <= ?",
+		SearchTaskQueued, SearchTaskProcessing, nowSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("search_tasks 逾期未收敛统计失败：%w", err)
+	}
+
 	// Every retrieval execution is counted by the hourly activity counter, so
 	// synchronous searches (REST/MCP) are included; search_tasks only holds the
 	// queued subset and must not feed this number.
@@ -171,6 +175,20 @@ func (s *Stores) MonitorStats(ctx context.Context, now time.Time, recentWindow t
 	stats.SearchesRecent, err = s.Activity.Count(ctx, ActivitySearch, now.Add(-recentWindow))
 	if err != nil {
 		return nil, fmt.Errorf("检索活动计数查询失败：%w", err)
+	}
+
+	// Cache convergence is observable from the revision watermark rows: a key is
+	// dirty while its refreshed_revision is behind revision (or its last refresh
+	// failed), no outbox table is involved anymore.
+	stats.CacheDirtyKeys, err = s.monitorCount(ctx,
+		"SELECT COUNT(*) FROM cache_revisions WHERE refreshed_revision < revision")
+	if err != nil {
+		return nil, fmt.Errorf("cache_revisions 脏 key 统计失败：%w", err)
+	}
+	stats.CacheRefreshFailures, err = s.monitorCount(ctx,
+		"SELECT COUNT(*) FROM cache_revisions WHERE last_error IS NOT NULL")
+	if err != nil {
+		return nil, fmt.Errorf("cache_revisions 刷新失败统计失败：%w", err)
 	}
 
 	uploadCounts, err := s.monitorUploadCounts(ctx)
@@ -186,12 +204,14 @@ func (s *Stores) MonitorStats(ctx context.Context, now time.Time, recentWindow t
 	stats.UnfinishedUploads = uploadCounts.unfinished
 
 	// Soft-deleted documents (del_flag = 1) are tombstones, so the library count
-	// must only include live records. Result snapshots are stored in Redis and
-	// counted by the monitoring layer there, not in the state database.
+	// must only include live records. Search-result snapshots are MySQL fact
+	// rows now, so the live count comes from the same aggregate.
 	if err := s.DB.QueryRowContext(ctx,
 		"SELECT (SELECT COUNT(*) FROM documents WHERE del_flag = 0), "+
-			"(SELECT COUNT(*) FROM knowledge_bases), (SELECT COUNT(*) FROM artifact_snapshots)").
-		Scan(&stats.Documents, &stats.KnowledgeBases, &stats.ArtifactSnapshots); err != nil {
+			"(SELECT COUNT(*) FROM knowledge_bases), (SELECT COUNT(*) FROM artifact_snapshots), "+
+			"(SELECT COUNT(*) FROM search_result_snapshots WHERE expires_at > ?)", nowSeconds).
+		Scan(&stats.Documents, &stats.KnowledgeBases, &stats.ArtifactSnapshots,
+			&stats.SearchResultSnapshotsActive); err != nil {
 		return nil, fmt.Errorf("资料库计数查询失败：%w", err)
 	}
 	return stats, nil

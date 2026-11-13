@@ -1,19 +1,13 @@
 package state
 
 import (
-	"context"
 	"strings"
 )
 
-// DocumentNotificationPublisher publishes identifier-only schema-3 document
-// notifications (Kafka in production; fakes in tests).
-type DocumentNotificationPublisher interface {
-	SendDocumentNotification(ctx context.Context, notification DocumentNotification) error
-	Close() error
-}
-
 // DocumentQueueSettings mirrors document_queue.document_queue_settings(), using
-// the Kafka broker/security settings shared with BrokerSettings.
+// the Kafka broker/security settings shared with BrokerSettings. Debezium owns
+// the publication side, so the state layer only declares the topic/group
+// contract; there is no publisher interface to implement.
 type DocumentQueueSettings struct {
 	BootstrapServers string
 	ClientID         string

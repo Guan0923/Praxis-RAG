@@ -175,17 +175,6 @@ func revisionCount(t *testing.T, stores *Stores) int {
 	return count
 }
 
-// outboxCount returns the number of transactional cache events.
-func outboxCount(t *testing.T, stores *Stores) int {
-	t.Helper()
-	var count int
-	if err := stores.DB.QueryRowContext(context.Background(),
-		"SELECT COUNT(*) FROM cache_outbox").Scan(&count); err != nil {
-		t.Fatalf("outboxCount error = %v", err)
-	}
-	return count
-}
-
 // columnExists reports whether the table currently has the column.
 func columnExists(t *testing.T, stores *Stores, table, column string) bool {
 	t.Helper()

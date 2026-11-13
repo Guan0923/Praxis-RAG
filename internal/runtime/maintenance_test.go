@@ -90,31 +90,26 @@ func TestMaintenanceSweepsAndGCsDocumentJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DocumentJobs.Submit() error = %v", err)
 	}
-	// Backdate the job beyond the sweep window and count its outbox rows.
+	// Backdate the stranded job beyond the sweep window. The sweep increments
+	// schedule_version, which is the only signal Debezium needs to deliver a
+	// fresh notification.
 	past := float64(time.Now().Unix()) - 10_000
 	if _, err := stores.DB.ExecContext(ctx,
 		"UPDATE document_jobs SET updated_at = ? WHERE artifact_id = ?", past, admission.ArtifactID); err != nil {
 		t.Fatalf("backdate job: %v", err)
 	}
-	if _, err := stores.DB.ExecContext(ctx,
-		"UPDATE document_job_outbox SET created_at = ? WHERE artifact_id = ?", past, admission.ArtifactID); err != nil {
-		t.Fatalf("backdate outbox: %v", err)
-	}
-	var outboxBefore int
-	if err := stores.DB.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM document_job_outbox WHERE artifact_id = ?", admission.ArtifactID).Scan(&outboxBefore); err != nil {
-		t.Fatalf("count outbox: %v", err)
-	}
 
 	service.maintenancePass(ctx)
 
-	var outboxAfter int
-	if err := stores.DB.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM document_job_outbox WHERE artifact_id = ?", admission.ArtifactID).Scan(&outboxAfter); err != nil {
-		t.Fatalf("count outbox: %v", err)
+	swept, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
+	if err != nil || swept == nil {
+		t.Fatalf("DocumentJobs.Get() = %v, %v", swept, err)
 	}
-	if outboxAfter <= outboxBefore {
-		t.Errorf("sweep did not re-emit the stranded job (outbox %d -> %d)", outboxBefore, outboxAfter)
+	if swept.ScheduleVersion != 2 {
+		t.Errorf("schedule_version after sweep = %d, want 2", swept.ScheduleVersion)
+	}
+	if swept.Status != state.DocumentJobQueued {
+		t.Errorf("swept job status = %q, want queued", swept.Status)
 	}
 
 	// A terminal job past the retention window is garbage-collected.
@@ -122,20 +117,19 @@ func TestMaintenanceSweepsAndGCsDocumentJobs(t *testing.T) {
 	if err != nil || job == nil {
 		t.Fatalf("DocumentJobs.Get() = %v, %v", job, err)
 	}
-	notification, err := state.DocumentJobEnvelope(job)
+	// The sweep requeued the job with a new schedule_version, so the fresh
+	// notification is claimable immediately.
+	notification, err := state.DocumentJobEnvelope(swept)
 	if err != nil {
 		t.Fatalf("DocumentJobEnvelope() error = %v", err)
 	}
 	task, err := stores.DocumentJobs.Claim(ctx, notification)
 	if err != nil || task == nil {
-		// The sweep requeued the job with a fresh outbox row; claiming again may
-		// be blocked by the new pending notification, which is fine.
-		t.Logf("Claim() skipped: %v", err)
-	} else {
-		failure := "failed"
-		if err := stores.DocumentJobs.Fail(ctx, task, false, &failure); err != nil {
-			t.Fatalf("Fail() error = %v", err)
-		}
+		t.Fatalf("Claim() after sweep = %v, %v", task, err)
+	}
+	failure := "failed"
+	if err := stores.DocumentJobs.Fail(ctx, task, false, &failure); err != nil {
+		t.Fatalf("Fail() error = %v", err)
 	}
 	terminalPast := float64(time.Now().Unix()) - 40*24*3600
 	if _, err := stores.DB.ExecContext(ctx,
@@ -178,15 +172,13 @@ func TestMaintenancePurgesExpiredArtifacts(t *testing.T) {
 	}
 }
 
-// TestStartBackgroundRespectsOutboxBridgeMode pins the Kafka/Debezium relay
-// contract: relay mode publishes committed outbox rows in-process, debezium mode
-// leaves them for the external CDC bridge and never starts the in-process relay.
+// TestBackgroundLifecycle pins the background loop contract: it starts
+// idempotently, expires stale search tasks through the periodic pass and stops
+// idempotently. Delivery itself is Debezium's responsibility.
 func TestBackgroundLifecycle(t *testing.T) {
 	service, stores := newMaintenanceService(t)
 	ctx := context.Background()
-	broker := &fakeBroker{}
 	if err := service.StartBackground(ctx,
-		WithBackgroundPublisher(broker),
 		WithMaintenanceInterval(20*time.Millisecond),
 		WithInitialMaintenancePass(false),
 	); err != nil {
@@ -196,7 +188,7 @@ func TestBackgroundLifecycle(t *testing.T) {
 		t.Fatalf("BackgroundRunning() = false after start")
 	}
 	// Starting twice is idempotent.
-	if err := service.StartBackground(ctx, WithBackgroundPublisher(broker)); err != nil {
+	if err := service.StartBackground(ctx); err != nil {
 		t.Fatalf("second StartBackground() error = %v", err)
 	}
 	if !service.BackgroundRunning() {
@@ -206,7 +198,7 @@ func TestBackgroundLifecycle(t *testing.T) {
 	// The periodic loop must expire a task whose deadline has passed.
 	clock := float64(time.Now().Unix())
 	stores.SearchTasks.Clock = func() float64 { return clock }
-	envelope, err := stores.SearchTasks.Submit(ctx, "alpha", map[string]any{"query": "loop"}, nil)
+	notification, err := stores.SearchTasks.Submit(ctx, "alpha", map[string]any{"query": "loop"}, nil)
 	if err != nil {
 		t.Fatalf("SearchTasks.Submit() error = %v", err)
 	}
@@ -214,7 +206,7 @@ func TestBackgroundLifecycle(t *testing.T) {
 	deadline := time.Now().Add(60 * time.Second)
 	expired := false
 	for time.Now().Before(deadline) {
-		_, err := stores.SearchTasks.Get(ctx, "alpha", envelope.ResultID, 1, 10)
+		_, err := stores.SearchTasks.Get(ctx, "alpha", notification.ResultID, 1, 10)
 		var unavailable *state.SnapshotUnavailable
 		if errors.As(err, &unavailable) {
 			expired = true

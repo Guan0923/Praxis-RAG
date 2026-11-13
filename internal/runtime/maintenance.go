@@ -10,15 +10,7 @@ import (
 	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/logging"
-	"github.com/Guan0923/xinghe_rag/internal/mq"
-	"github.com/Guan0923/xinghe_rag/internal/state"
 )
-
-// BackgroundPublisher publishes queued-search notifications. Document outbox
-// events are delivered by Debezium independently of the application.
-type BackgroundPublisher interface {
-	state.SearchNotificationPublisher
-}
 
 // maintenanceIntervalEnv optionally overrides the maintenance cadence. Python's
 // upload recovery task runs every 10 seconds; the sweep/GC work rides on it.
@@ -28,20 +20,14 @@ const maintenanceIntervalEnv = "RAG_MAINTENANCE_INTERVAL_SECONDS"
 const defaultMaintenanceInterval = 10 * time.Second
 
 // backgroundOptions configure Service.StartBackground. They exist so tests can
-// inject a fake broker and a fast cadence without touching the environment.
+// use a fast cadence without touching the environment.
 type backgroundOptions struct {
-	publisher BackgroundPublisher
-	interval  time.Duration
-	initial   bool
+	interval time.Duration
+	initial  bool
 }
 
 // BackgroundOption adjusts StartBackground.
 type BackgroundOption func(*backgroundOptions)
-
-// WithBackgroundPublisher injects the broker adapter (tests or a worker main).
-func WithBackgroundPublisher(publisher BackgroundPublisher) BackgroundOption {
-	return func(options *backgroundOptions) { options.publisher = publisher }
-}
 
 // WithMaintenanceInterval overrides the periodic maintenance cadence.
 func WithMaintenanceInterval(interval time.Duration) BackgroundOption {
@@ -57,13 +43,11 @@ func WithInitialMaintenancePass(enabled bool) BackgroundOption {
 // The Service struct is Lead-owned, so the state lives in a package registry
 // keyed by the service pointer rather than in new struct fields.
 type serviceBackground struct {
-	service        *Service
-	publisher      BackgroundPublisher
-	closePublisher bool
-	interval       time.Duration
-	cancel         context.CancelFunc
-	done           chan struct{}
-	once           sync.Once
+	service  *Service
+	interval time.Duration
+	cancel   context.CancelFunc
+	done     chan struct{}
+	once     sync.Once
 }
 
 var (
@@ -71,11 +55,12 @@ var (
 	backgroundsByService = map[*Service]*serviceBackground{}
 )
 
-// StartBackground wires queued-search publishing and cache synchronization,
-// and launches the periodic maintenance loop (upload recovery/cleanup, search expiry, document
-// job sweep/GC, snapshot/artifact purges). It never blocks on broker
-// availability: queued searches stay fail-closed without a publisher, while
-// document admission only needs its MySQL transaction.
+// StartBackground launches the periodic maintenance loop (upload
+// recovery/cleanup, search expiry, document job sweep/GC, snapshot/artifact
+// purges). Delivery itself is owned by Debezium: the application writes MySQL and
+// Debezium publishes the identifier-only notifications, so startup never depends
+// on broker availability. It also starts the cache synchronizer, whose rebuilds
+// are driven by the cache consumer.
 func (s *Service) StartBackground(ctx context.Context, options ...BackgroundOption) error {
 	configuration := backgroundOptions{
 		interval: defaultBackgroundInterval(),
@@ -91,28 +76,15 @@ func (s *Service) StartBackground(ctx context.Context, options ...BackgroundOpti
 	}
 	backgroundMu.Unlock()
 
-	publisher := configuration.publisher
-	closePublisher := false
-	if publisher == nil {
-		publisher = s.newBrokerPublisher()
-		closePublisher = publisher != nil
-	}
 	background := &serviceBackground{
-		service:        s,
-		publisher:      publisher,
-		closePublisher: closePublisher,
-		interval:       configuration.interval,
-		done:           make(chan struct{}),
+		service:  s,
+		interval: configuration.interval,
+		done:     make(chan struct{}),
 	}
 	backgroundCtx, cancel := context.WithCancel(context.Background())
 	background.cancel = cancel
 
-	// Search admission confirms broker acceptance through this publisher.
-	if s.stores.SearchDispatcher != nil {
-		s.stores.SearchDispatcher.Publisher = publisher
-		s.stores.SearchDispatcher.Start()
-	}
-	logging.FromContext(ctx).Info("Document outbox delivery=debezium")
+	logging.FromContext(ctx).Info("Task notifications delivered by Debezium")
 	if s.stores.CacheSync != nil && s.stores.CacheSync.Enabled() {
 		s.stores.CacheSync.Start()
 	}
@@ -125,8 +97,8 @@ func (s *Service) StartBackground(ctx context.Context, options ...BackgroundOpti
 	return nil
 }
 
-// StopBackground stops cache synchronization and the maintenance loop. It is idempotent and
-// safe to call before Stores.Close (which owns final transport shutdown).
+// StopBackground stops the maintenance loop. It is idempotent and safe to call
+// before Stores.Close (which owns final transport shutdown).
 func (s *Service) StopBackground() {
 	backgroundMu.Lock()
 	background, exists := backgroundsByService[s]
@@ -155,28 +127,6 @@ func (s *Service) BackgroundRunning() bool {
 	return exists
 }
 
-// newBrokerPublisher resolves Kafka settings lazily. A missing bootstrap server
-// list means "run without a broker" (nil, no error); an invalid configuration is
-// logged and also degrades to nil so the service can start and report
-// fail-closed submissions instead of crashing.
-func (s *Service) newBrokerPublisher() BackgroundPublisher {
-	settings, err := mq.SettingsFromEnv()
-	if err != nil {
-		slog.Warn("Kafka settings are invalid; queued searches stay fail-closed", logging.ErrorAttrs(err)...)
-		return nil
-	}
-	if !settings.Configured() {
-		slog.Warn("Kafka bootstrap servers are not configured; queued searches stay fail-closed")
-		return nil
-	}
-	publisher, err := mq.NewPublisher(settings)
-	if err != nil {
-		slog.Warn("Kafka publisher unavailable; queued searches stay fail-closed", logging.ErrorAttrs(err)...)
-		return nil
-	}
-	return publisher
-}
-
 // defaultBackgroundInterval reads the optional cadence override.
 func defaultBackgroundInterval() time.Duration {
 	raw := strings.TrimSpace(os.Getenv(maintenanceIntervalEnv))
@@ -195,7 +145,6 @@ func defaultBackgroundInterval() time.Duration {
 // context is cancelled.
 func (background *serviceBackground) run(ctx context.Context, initial bool) {
 	defer close(background.done)
-	defer background.publisherClose()
 	if initial {
 		background.service.maintenancePass(ctx)
 	}
@@ -215,16 +164,12 @@ func (background *serviceBackground) run(ctx context.Context, initial bool) {
 	}
 }
 
-// publisherClose closes the broker adapter this background owns. Injected
-// publishers belong to the caller and are left open.
-func (background *serviceBackground) publisherClose() {
-	if background.closePublisher && background.publisher != nil {
-		_ = background.publisher.Close()
-	}
-}
-
 // maintenancePass runs one recovery/cleanup sweep. Every step is best-effort:
 // failures are logged by category and never stop the loop.
+//
+// Requeueing a stranded or expired-lease task increments its schedule_version
+// inside MySQL; Debezium emits the replacement notification, so no outbox relay
+// or broker publish happens here.
 func (s *Service) maintenancePass(ctx context.Context) {
 	if s.stores == nil {
 		return
@@ -240,20 +185,12 @@ func (s *Service) maintenancePass(ctx context.Context) {
 			logBackgroundFailure(ctx, "search task expiry", err)
 		}
 	}
-	if s.stores.SearchDispatcher != nil && s.stores.SearchDispatcher.Publisher != nil {
-		if _, err := s.stores.SearchDispatcher.RunOnce(ctx); err != nil {
-			logBackgroundFailure(ctx, "search outbox relay", err)
-		}
-	}
 	if s.stores.DocumentJobs != nil {
 		if _, err := s.stores.DocumentJobs.Sweep(ctx, 50); err != nil {
 			logBackgroundFailure(ctx, "document job sweep", err)
 		}
 		if _, err := s.stores.DocumentJobs.GCJobs(ctx, nil); err != nil {
 			logBackgroundFailure(ctx, "document job GC", err)
-		}
-		if _, err := s.stores.DocumentJobs.GCOutbox(ctx, nil); err != nil {
-			logBackgroundFailure(ctx, "document outbox GC", err)
 		}
 	}
 	if s.stores.Results != nil {

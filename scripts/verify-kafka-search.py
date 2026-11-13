@@ -100,7 +100,7 @@ def main() -> int:
         document = f"kafka-search-{int(time.time())}.md"
         upload_status, upload_body = upload_and_wait(
             api_key, namespace, document,
-            "# Kafka queued search\n\nThe search worker consumes the Kafka envelope.\n")
+            "# Kafka queued search\n\nThe search worker consumes the Debezium search_tasks notification.\n")
         print("upload", upload_status, upload_body[:160])
 
         mcp = e2e.MCP(api_key, namespace)
@@ -120,7 +120,7 @@ def main() -> int:
         ok = any(document in name for name in names)
         print("search hits:", len(hits), "match:", ok, "snapshot_available:", result.get("snapshot_available"))
         worker_text = e2e.tail(worker_log, 60)
-        print("worker consumed envelope:", "search" in worker_text or "claimed" in worker_text)
+        print("worker consumed search_tasks notification:", "search" in worker_text or "claimed" in worker_text)
         print("PASS" if ok else "FAIL", "queued MCP search completed through Kafka")
         if not ok:
             print("--- service log tail ---\n" + e2e.tail(service_log, 30))

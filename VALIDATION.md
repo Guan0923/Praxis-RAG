@@ -5,6 +5,122 @@
 > (`RAG_KAFKA_*`, explicit `RAG_*_DLQ_TOPIC`); the Kafka/MySQL/Debezium live check
 > is recorded immediately below. RocketMQ wording in the historical sections is
 > retained as history.
+>
+> **Superseded (2026-11-13):** 事务 outbox 与单 Debezium 连接器已下线，当前为
+> 两个 Debezium 连接器表级采集；下方 outbox/relay 记录均为历史。
+
+## 当前验证范围：Debezium 双连接器（事务 outbox 已下线）— 2026-11-13
+
+> **取代关系**：本文件下方所有提到 outbox / relay / 单个 Debezium 连接器 / outbox
+> PENDING 记录 / `capture_progress` 的验证记录，验证的是**已下线的旧链路**，仅作历史
+> 保留；当前投递为两个 Debezium 连接器直接从 MySQL 表级采集，契约见
+> [docs/cdc-migration.md](docs/cdc-migration.md)。本轮改造的代码/文档/Console 变更范围
+> 见 [PROGRESS.md](PROGRESS.md) 与 [GO_MIGRATION.md](docs/GO_MIGRATION.md) 最后一轮。
+
+工作树 `dsh-b0dc9fd1-4cde`（Windows 11，Go 1.27.3）。本轮验证目标是**文档、Console
+监控页、存量切换 CLI 与旧表退役 CLI**；Go worker/监控后端由并行任务实现并各自定向测试，
+本记录不重复声明其覆盖。
+
+### 已验证（可复核）
+
+```powershell
+# 仅构建本轮新增/修改的两个命令（避免与并行任务的全仓构建相互影响）
+go build ./cmd/rag-cdc-cutover/ ./cmd/rag-service-migrate/   # exit 0
+go vet   ./cmd/rag-cdc-cutover/ ./cmd/rag-service-migrate/   # exit 0
+gofmt -l cmd/rag-cdc-cutover/main.go cmd/rag-service-migrate/main.go  # 无输出
+
+# CLI 退出码冒烟（go run 包装层会把内层 exit 2 显示为 exit status 2）
+go run ./cmd/rag-cdc-cutover                      # 用法错误 → 2（未连接数据库）
+go run ./cmd/rag-cdc-cutover --help               # → 0
+go run ./cmd/rag-cdc-cutover --backfill           # 缺 --baseline → 2
+go run ./cmd/rag-cdc-cutover --record-position    # 缺 --file/--pos → 2
+
+# 旧表退役：无 --yes 时必须拒绝执行（需真实 MySQL 才能观察，本轮未连库执行）
+# rag-service-migrate --retire-outbox            → 2，只读列出仍存在的旧表，不执行 DROP
+# rag-service-migrate --retire-outbox --yes      → 0，逐表打印 DROP 结果（幂等）
+```
+
+- 依赖的状态库 API 由并行任务落地并测试：`internal/state` 的
+  `CutoverStateGet/Set/All`、`CutoverInventory`、`CutoverCacheRevisions`、
+  `DocumentJobs.RequeueActive`、`SearchTasks.RequeueActive`、`CacheSync.MarkAllDirty`；
+  `internal/migrate` 的 `RetireOutbox`/`OutboxTablesPresent`。对方报告
+  `go test -count=1 ./internal/state/ ./internal/migrate/` 全绿；本轮 CLI 只调用这些
+  已测试入口，不重复实现 DDL/重排逻辑。
+- 文档一致性：在 `README.md`、`AGENTS.md`、`docs/**`、`PROGRESS.md` 中检索
+  `document_job_outbox`/`search_task_outbox`/`cache_outbox`/`outbox_bridge`/
+  `RAG_OUTBOX_BRIDGE`/`进程内 relay`，剩余命中均为明确标注「已下线 / 历史实现」或
+  契约对比表；`docs/GO_PARITY_AUDIT.md` 与历史审计记录按要求保留原文。
+- 前端搜索文案：`frontend/src` 中未找到「等待 Kafka 确认 / 受理失败 / 提交失败」等
+  旧文案；Console 检索页只走同步 REST `/v1/search`，排队搜索的受理语义只存在于 MCP
+  与文档（已在 USAGE/README/result-references 改为「提交即受理，稍后按 result_id 读取」），
+  因此本项无需改前端组件。
+
+### 未验证（需要真实环境）
+
+- **后端链路**：未启动 Docker/Compose，未运行真实 MySQL 8 + 两个 Debezium 连接器 +
+  Kafka 3.9 + Redis，未观察任务连接器快照/流式切换、缓存连接器 8 表事件、三个消费组
+  积压与 DLQ；未验证缓存 revision 收敛与 `RefreshDirty`。
+- **切换与回滚演练**：未在真实库上执行 `--record-position`/`--backfill`/
+  `--mark-cache-baseline`/`--verify`/`--retire-outbox` 全序列，也未演练失败中断后按单个
+  模式续跑；未验证 `--verify` 在真实活动任务下的失败/通过分支。
+- **搜索与结果读缓存**：未验证 MySQL `search_result_snapshots` 回源、Redis 未命中
+  回填、TTL 清理后 410 的真实行为。
+- **全仓构建**：只构建了本轮的两个 CLI；`go build ./...` 未作为验收命令执行（并行任务
+  正在接线 `cmd/rag-service` 的 `monitor.Options`，全仓构建在其完成前可能失败）。
+- **Console 前端**：`frontend/node_modules` 不存在，按要求未执行 `npm install`；
+  因此**未运行** `npm run typecheck`、`npm test`、`npm run build`。`api.ts` 的
+  monitor 类型、`MonitorPage.tsx` 的卡片/行、`MonitorPage.test.tsx` 的 fixture/断言
+  仅按最终字段契约静态对齐，需在有依赖的环境补跑 typecheck 与用例。
+- 没有浏览器 E2E；监控页的自动刷新、降级告警与窄屏布局未人工点检。
+
+### 切换/演练/回滚步骤（供真实环境执行）
+
+演练（建议先在一次性 MySQL schema + 测试 topic 上）：
+
+1. 停旧入口与旧 worker，确认无 outbox 写入进程；保留数据库备份。
+2. `rag-cdc-cutover --inventory`：核对未完成任务数、最老年龄、最小
+   `schedule_version`、缓存 key 数与各 key revision（只读）。
+3. `SHOW MASTER STATUS` 取 File/Position →
+   `rag-cdc-cutover --record-position --file=<File> --pos=<Position>`。
+4. 启动缓存连接器与任务连接器，确认初始快照完成。
+5. `rag-cdc-cutover --backfill --baseline=<N>`：循环到 0；重复执行应再返回 0（幂等）。
+6. `rag-cdc-cutover --mark-cache-baseline`：记录标脏 key 数（无 Redis 也可执行）。
+7. `rag-cdc-cutover --verify --baseline=<N>`：活动任务必须全部
+   `schedule_version >= N+1`；脏缓存数等待收敛（警告不阻塞）。
+8. 也可用 `--all --file=... --pos=... --baseline=N` 顺序执行 2–7，任一步失败即停止，
+   之后用单模式续跑。
+
+回滚：
+
+- **`--retire-outbox` 之前**：停新连接器/新 worker，回退服务与 worker 二进制并重新启用
+  旧 outbox 写入链路即可；MySQL 数据与位点文件保留，消费者幂等去重。
+- **`--retire-outbox` 之后**：四张 outbox 表已 DROP，回滚必须从迁移前备份恢复这四张表；
+  因此只在确认 CDC 切换稳定、无需回滚后执行，且执行前做完整备份。
+- 切换窗口内不要同时运行旧 relay 与新连接器消费同一批 topic；回滚后需按旧版本的
+  topic/group 配置重新部署。
+
+
+### Lead 最终集成验证（2026-11-13，在文档/Console 任务之后）
+
+工作树 `dsh-b0dc9fd1-4cde`，Go 1.27.3，MySQL 8（`praxis_unit_test`，127.0.0.1:3307），测试串行 `-p 1`。
+
+```powershell
+$env:RAG_TEST_MYSQL_URL='mysql+pymysql://rag:praxis-dev-pw@127.0.0.1:3307/praxis_unit_test?charset=utf8mb4'
+go build ./...                                   # exit 0
+go vet ./...                                     # exit 0
+go test -p 1 -count=1 ./internal/state/ ./internal/migrate/ ./internal/mq/ ./internal/monitor/ `
+  ./internal/runtime/ ./internal/documentworker/ ./internal/searchworker/ ./internal/cacheconsumer/ `
+  ./internal/e2e/ ./internal/cdcacceptance/       # 全部 ok
+go test -p 1 -count=1 ./internal/httpapi/ ./internal/mcp/ ./internal/config/ ./internal/redisstate/  # 全部 ok
+python -m py_compile scripts/verify-debezium-e2e.py scripts/verify-kafka-search.py                    # exit 0
+# .env 必填变量用占位值验证 Compose 解析
+docker compose config --quiet; docker compose --profile app config --quiet                            # exit 0 / exit 0
+```
+
+- 验收套件 `internal/cdcacceptance/`：14 个用例覆盖 §11 三条链路 + 混沌（Debezium 暂停、Kafka 重复投递、worker 领取后崩溃、Redis 写失败），通过。
+- `internal/e2e/` 重写后覆盖异步上传受理、搜索提交即受理与 MySQL 结果读取、DLQ 终态；写路径不再同步刷 Redis，e2e 用 `CacheSync.MarkAllDirty`/`Revalidate` 复现缓存消费者收敛。
+- 集成阶段修复审查发现的小缺陷：cache worker 错误串字面量换行、`KeysForChange` 对 `op=u` 取 before+after namespace 并集、`RAG_CACHE_WORKER_RECOVER_SECONDS` 真正接入（默认 30s）、文档 DLQ group 默认值与代码一致、`docs/cdc-migration.md` §7.1 的 `document_heads` 行补全。
+- 仍未验证：真实 Docker/双 Debezium 连接器/Kafka/Redis 物理链路与缓存收敛、切换/回滚演练、`--retire-outbox` 实库执行、前端 `typecheck/test/build`（无 `node_modules`）。
 
 ## Debezium outbox 删除事件过滤与监控语义 — 2026-11-13
 

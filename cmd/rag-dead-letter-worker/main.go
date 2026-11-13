@@ -1,19 +1,25 @@
 // Command rag-dead-letter-worker records broker retry exhaustion as a durable
 // terminal state. It never re-runs inference and never re-enqueues: a
 // dead-lettered document job becomes "failed" in document_jobs and a dead
-// lettered search task becomes failed/timed-out in search_tasks, which clients
-// observe through the normal status endpoints.
+// lettered search task becomes failed in search_tasks, which clients observe
+// through the normal status endpoints.
 //
 // Usage:
 //
-//	rag-dead-letter-worker --kind search|document
+//	rag-dead-letter-worker --kind search|document|cache
 //
 // The consumer listens on an explicit Kafka dead-letter topic
-// (RAG_DOCUMENT_DLQ_TOPIC / RAG_SEARCH_DLQ_TOPIC) with an independent
-// RAG_*_DLQ_GROUP. It acks only after the durable terminal outcome is saved (or
-// the task is already absent/terminal); a live lease or an uncommitted journal
-// publication returns false so the record stays uncommitted and is redelivered.
-// Malformed dead-letter payloads are logged by safe category and left unacked.
+// (RAG_DOCUMENT_DLQ_TOPIC / RAG_SEARCH_DLQ_TOPIC / RAG_CACHE_DLQ_TOPIC) with an
+// independent RAG_*_DLQ_GROUP. Document/search dead letters ack only after the
+// durable terminal outcome is saved (or the task is already absent/terminal); a
+// live lease or an uncommitted journal publication returns false so the record
+// stays uncommitted and is redelivered. Malformed document/search dead-letter
+// payloads are logged by safe category and left unacked.
+//
+// Cache changes are derived state: the affected keys stay dirty in MySQL
+// (cache_revisions) and the cache worker's compensation pass converges once the
+// cause is fixed, so a cache dead letter is recorded and acknowledged without
+// touching any business state.
 package main
 
 import (
@@ -21,6 +27,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -142,8 +149,13 @@ func run(args []string) error {
 			return err
 		}
 		handler = worker.DeadLetterHandler()
+	case "cache":
+		// Cache refreshes are derived state with their own MySQL dirty-key
+		// retry water line; a dead letter is only recorded, never replayed, and
+		// the delivery is always acknowledged so poison records cannot loop.
+		handler = cacheDeadLetterHandler(logger)
 	default:
-		return usagef("--kind must be %q or %q", "search", "document")
+		return usagef(`--kind must be "search", "document" or "cache"`)
 	}
 
 	consumerConfig := mq.DefaultConsumerConfig(target.topic, target.group)
@@ -190,7 +202,7 @@ type consumerTarget struct {
 func parseKind(args []string) (string, error) {
 	flags := flag.NewFlagSet("rag-dead-letter-worker", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	kind := flags.String("kind", "", "dead-letter source kind: search or document")
+	kind := flags.String("kind", "", "dead-letter source kind: search, document or cache")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return "", err
@@ -201,8 +213,8 @@ func parseKind(args []string) (string, error) {
 		return "", usagef("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
 	value := strings.ToLower(strings.TrimSpace(*kind))
-	if value != "search" && value != "document" {
-		return "", usagef(`--kind is required and must be "search" or "document"`)
+	if value != "search" && value != "document" && value != "cache" {
+		return "", usagef(`--kind is required and must be "search", "document" or "cache"`)
 	}
 	return value, nil
 }
@@ -211,26 +223,38 @@ func deadLetterTarget(kind string, settings mq.Settings) (consumerTarget, error)
 	sources := map[string]string{
 		"document": settings.DocumentGroup,
 		"search":   settings.SearchGroup,
+		"cache":    settings.CacheGroup,
 	}
 	topics := map[string]string{
 		"document": settings.DocumentDLQTopic,
 		"search":   settings.SearchDLQTopic,
+		"cache":    settings.CacheDLQTopic,
 	}
-	groups := make(map[string]string, len(sources))
-	for _, name := range []string{"document", "search"} {
-		groups[name] = strings.TrimSpace(envOr("RAG_"+strings.ToUpper(name)+"_DLQ_GROUP", defaultDeadLetterGroup(name)))
+	cacheGroup := strings.TrimSpace(settings.CacheDLQGroup)
+	if cacheGroup == "" {
+		cacheGroup = strings.TrimSpace(envOr("RAG_CACHE_DLQ_GROUP", defaultDeadLetterGroup("cache")))
+	}
+	groups := map[string]string{
+		"document": strings.TrimSpace(envOr("RAG_DOCUMENT_DLQ_GROUP", defaultDeadLetterGroup("document"))),
+		"search":   strings.TrimSpace(envOr("RAG_SEARCH_DLQ_GROUP", defaultDeadLetterGroup("search"))),
+		"cache":    cacheGroup,
 	}
 	source, ok := sources[kind]
 	if !ok {
-		return consumerTarget{}, usagef(`--kind is required and must be "search" or "document"`)
+		return consumerTarget{}, usagef(`--kind is required and must be "search", "document" or "cache"`)
 	}
 	topic := strings.TrimSpace(topics[kind])
 	if topic == "" {
 		return consumerTarget{}, usagef("RAG_%s_DLQ_TOPIC must not be empty", strings.ToUpper(kind))
 	}
+	// The three dead-letter groups must be valid and mutually independent: two
+	// DLQ consumers sharing a group would split one topic's records.
 	if !deadLetterGroupPattern.MatchString(groups["document"]) ||
 		!deadLetterGroupPattern.MatchString(groups["search"]) ||
-		groups["document"] == groups["search"] {
+		!deadLetterGroupPattern.MatchString(groups["cache"]) ||
+		groups["document"] == groups["search"] ||
+		groups["document"] == groups["cache"] ||
+		groups["search"] == groups["cache"] {
 		return consumerTarget{}, usagef("Dead-letter consumer groups must be valid, independent groups")
 	}
 	reserved := map[string]struct{}{
@@ -249,11 +273,39 @@ func deadLetterTarget(kind string, settings mq.Settings) (consumerTarget, error)
 	return consumerTarget{topic: topic, group: groups[kind], sourceGroup: source}, nil
 }
 
+// cacheDeadLetterHandler drains the cache dead-letter topic. The payload is
+// recorded by category (table/op are locator metadata, never row content) and
+// acknowledged; cache keys keep their dirty revision row in MySQL, so the cache
+// worker's compensation pass converges once the underlying cause is fixed.
+func cacheDeadLetterHandler(logger *slog.Logger) mq.Handler {
+	return func(ctx context.Context, message mq.ReceivedMessage) bool {
+		change, err := mq.DecodeCacheChange(message.Body)
+		if err != nil && !state.IgnorableCDCChange(err) {
+			logger.Warn("cache dead letter recorded",
+				"topic", message.Topic,
+				"partition", message.Partition,
+				"offset", message.Offset,
+				"bytes", len(message.Body),
+				"reason", "undecodable payload")
+			return true
+		}
+		logger.Warn("cache dead letter recorded",
+			"topic", message.Topic,
+			"partition", message.Partition,
+			"offset", message.Offset,
+			"table", change.Table,
+			"op", change.Op)
+		return true
+	}
+}
+
 // defaultDeadLetterGroup mirrors the shared contract defaults.
 func defaultDeadLetterGroup(kind string) string {
 	switch kind {
 	case "document":
 		return "praxis_document_dead_letters"
+	case "cache":
+		return mq.DefaultCacheDLQGroup
 	default:
 		return "praxis_search_dead_letters"
 	}

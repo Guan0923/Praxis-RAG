@@ -31,14 +31,6 @@ type StateCache interface {
 	Close() error
 }
 
-// EventPublisher is the durable retry transport for cache refresh events
-// (Kafka in production). Only 32-char lowercase event ids cross the queue.
-type EventPublisher interface {
-	Send(eventID string) error
-	ConsumeOnce(callback func(eventID string) bool)
-	Close() error
-}
-
 // DisabledStateCache is the backend used when no cache client is configured.
 type DisabledStateCache struct{}
 

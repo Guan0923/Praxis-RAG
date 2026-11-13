@@ -349,6 +349,7 @@ func TestPermissionsInvitationFlowEndToEnd(t *testing.T) {
 	recorder = vip.do(http.MethodPost, "/v1/document-batches", "team", documentBody, documentType)
 	requireStatus(t, recorder, http.StatusAccepted, "writer uploads document")
 	artifactID := firstRestJobArtifactID(t, decodeRESTBody(t, recorder))
+	h.trackDocumentArtifact(artifactID)
 	runDocumentWorkerUntil(t, h, "shared document indexed", func() bool {
 		job, err := h.Stores.DocumentJobs.Get(context.Background(), artifactID, nil)
 		return err == nil && job != nil && job.Status == state.DocumentJobSucceeded
@@ -374,6 +375,7 @@ func TestPermissionsInvitationFlowEndToEnd(t *testing.T) {
 		"namespace": "vip-kb", "strategy": "character", "chunk_size": 120, "chunk_overlap": 20,
 	})
 	requireStatus(t, recorder, http.StatusCreated, "vip self-creates knowledge base")
+	convergeAllViews(t, h)
 	recorder, payload = vip.json(http.MethodGet, "/v1/knowledge-bases/vip-kb/access", "", nil)
 	requireStatus(t, recorder, http.StatusOK, "self-created access view")
 	if payload["owner"] != true || payload["can_manage"] != true || payload["can_share"] != true {
@@ -389,6 +391,7 @@ func TestPermissionsInvitationFlowEndToEnd(t *testing.T) {
 	// again, while the owner keeps access.
 	recorder, _ = admin.json(http.MethodDelete, "/v1/knowledge-bases/team/permissions/"+vip.id, "", nil)
 	requireStatus(t, recorder, http.StatusNoContent, "revoke grant")
+	convergeAllViews(t, h)
 	recorder, payload = vip.json(http.MethodGet, "/v1/knowledge-bases/team/access", "", nil)
 	requireStatus(t, recorder, http.StatusForbidden, "access after revoke")
 	if detail := detailOf(payload); detail != access.MessageKnowledgeAccess {

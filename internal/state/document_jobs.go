@@ -20,8 +20,6 @@ const (
 	DocumentJobSucceeded  = "succeeded"
 	DocumentJobFailed     = "failed"
 
-	// DocumentEnvelopeSchema is the notification schema version (identifiers only).
-	DocumentEnvelopeSchema = 3
 	// MaxDocumentJobFileBytes is the async admission file ceiling.
 	MaxDocumentJobFileBytes = 10 * 1024 * 1024
 )
@@ -51,7 +49,6 @@ type DocumentJobSettings struct {
 	LeaseSeconds             float64
 	HeartbeatSeconds         float64
 	SweepAfterSeconds        float64
-	OutboxRetentionSeconds   float64
 	TerminalRetentionSeconds float64
 }
 
@@ -61,7 +58,6 @@ func DefaultDocumentJobSettings() DocumentJobSettings {
 		LeaseSeconds:             300,
 		HeartbeatSeconds:         20,
 		SweepAfterSeconds:        120,
-		OutboxRetentionSeconds:   7 * 24 * 3600,
 		TerminalRetentionSeconds: 30 * 24 * 3600,
 	}
 }
@@ -77,7 +73,6 @@ func DocumentJobSettingsFromEnv() (DocumentJobSettings, error) {
 		{"RAG_DOCUMENT_JOB_LEASE_SECONDS", settings.LeaseSeconds, &settings.LeaseSeconds},
 		{"RAG_DOCUMENT_JOB_HEARTBEAT_SECONDS", settings.HeartbeatSeconds, &settings.HeartbeatSeconds},
 		{"RAG_DOCUMENT_JOB_SWEEP_SECONDS", settings.SweepAfterSeconds, &settings.SweepAfterSeconds},
-		{"RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS", settings.OutboxRetentionSeconds, &settings.OutboxRetentionSeconds},
 		{"RAG_DOCUMENT_JOB_RETENTION_SECONDS", settings.TerminalRetentionSeconds, &settings.TerminalRetentionSeconds},
 	}
 	for _, item := range values {
@@ -100,15 +95,6 @@ func positiveFloatEnv(name string, fallback float64) (float64, error) {
 		return 0, newValueError(name + " must be positive")
 	}
 	return value, nil
-}
-
-// DocumentNotification is the identifier-only schema-3 broker message.
-type DocumentNotification struct {
-	Schema     int     `json:"schema"`
-	ArtifactID string  `json:"artifact_id"`
-	Namespace  string  `json:"namespace"`
-	Name       string  `json:"name"`
-	CreatedAt  float64 `json:"created_at"`
 }
 
 func canonicalArtifactID(value string) (string, error) {
@@ -160,71 +146,6 @@ func windowsReservedName(name string) bool {
 	return false
 }
 
-// ValidateDocumentNotification accepts the native schema-3 notification or a
-// raw Debezium change event and returns the canonical envelope.
-func ValidateDocumentNotification(payload any) (DocumentNotification, error) {
-	object, ok := payload.(map[string]any)
-	if !ok {
-		return DocumentNotification{}, newValueError("Invalid document message")
-	}
-	value := object
-	if schema, present := object["schema"]; !present || numericValue(schema) != DocumentEnvelopeSchema {
-		after, hasAfter := object["after"].(map[string]any)
-		op, hasOp := object["op"].(string)
-		if !hasAfter || !hasOp || (op != "c" && op != "r" && op != "u") {
-			return DocumentNotification{}, newValueError("Invalid document message schema")
-		}
-		value = map[string]any{"schema": DocumentEnvelopeSchema}
-		for _, key := range []string{"artifact_id", "namespace", "name", "created_at"} {
-			value[key] = after[key]
-		}
-	}
-	artifactID, ok := value["artifact_id"].(string)
-	if !ok {
-		return DocumentNotification{}, newValueError("artifact_id must be a canonical UUID")
-	}
-	if _, err := canonicalArtifactID(artifactID); err != nil {
-		return DocumentNotification{}, err
-	}
-	namespace, ok := value["namespace"].(string)
-	if !ok || !documentNamespacePattern.MatchString(namespace) {
-		return DocumentNotification{}, newValueError("Invalid document namespace")
-	}
-	name, ok := value["name"].(string)
-	if !ok {
-		return DocumentNotification{}, newValueError("Invalid document filename or file type")
-	}
-	if err := validateDocumentName(name); err != nil {
-		return DocumentNotification{}, err
-	}
-	createdAt := 0.0
-	if raw, present := value["created_at"]; present && raw != nil {
-		parsed, ok := finiteNumericValue(raw)
-		if !ok || parsed < 0 {
-			return DocumentNotification{}, newValueError("Invalid document message timestamp")
-		}
-		createdAt = parsed
-	}
-	return DocumentNotification{
-		Schema:     DocumentEnvelopeSchema,
-		ArtifactID: artifactID,
-		Namespace:  namespace,
-		Name:       name,
-		CreatedAt:  createdAt,
-	}, nil
-}
-
-// DocumentJobEnvelope builds the content-free notification of one job/outbox row.
-func DocumentJobEnvelope(job *DocumentJob) (DocumentNotification, error) {
-	return ValidateDocumentNotification(map[string]any{
-		"schema":      float64(DocumentEnvelopeSchema),
-		"artifact_id": job.ArtifactID,
-		"namespace":   job.Namespace,
-		"name":        job.Name,
-		"created_at":  job.CreatedAt,
-	})
-}
-
 // DocumentJob is one durable ingest job row.
 type DocumentJob struct {
 	ArtifactID           string  `json:"artifact_id"`
@@ -247,6 +168,9 @@ type DocumentJob struct {
 	Error                *string `json:"error"`
 	CreatedAt            float64 `json:"created_at"`
 	UpdatedAt            float64 `json:"updated_at"`
+	// ScheduleVersion is the scheduling generation Debezium watches. It starts
+	// at 1 and is incremented inside the transaction that requeues the job.
+	ScheduleVersion int64 `json:"schedule_version"`
 }
 
 // DocumentJobTask couples the leased job row with the file bytes read back.
@@ -257,10 +181,9 @@ type DocumentJobTask struct {
 
 // DocumentAdmission is the submit() result.
 type DocumentAdmission struct {
-	ArtifactID string  `json:"artifact_id"`
-	Status     string  `json:"status"`
-	Reused     bool    `json:"reused"`
-	EventID    *string `json:"event_id"`
+	ArtifactID string `json:"artifact_id"`
+	Status     string `json:"status"`
+	Reused     bool   `json:"reused"`
 }
 
 // DocumentJobStatus is the status() projection.
@@ -271,21 +194,9 @@ type DocumentJobStatus struct {
 	Error      *string `json:"error"`
 }
 
-// DocumentOutboxEvent is one document_job_outbox row.
-type DocumentOutboxEvent struct {
-	ID          string   `json:"id"`
-	ArtifactID  string   `json:"artifact_id"`
-	Namespace   string   `json:"namespace"`
-	Name        string   `json:"name"`
-	Status      string   `json:"status"`
-	Attempts    int      `json:"attempts"`
-	RetryAt     float64  `json:"retry_at"`
-	CreatedAt   float64  `json:"created_at"`
-	PublishedAt *float64 `json:"published_at"`
-	LastError   *string  `json:"last_error"`
-}
-
-// DocumentJobs is the repository for durable ingest jobs and their outbox.
+// DocumentJobs is the repository for durable ingest jobs. MySQL is the source
+// of truth; Debezium delivers the identifier-only notifications and no
+// transactional outbox is written.
 type DocumentJobs struct {
 	stores   *Stores
 	Settings DocumentJobSettings
@@ -311,7 +222,7 @@ func (d *DocumentJobs) now() float64 {
 
 const documentJobColumns = "artifact_id, namespace, name, name_key, content, size, sha256, " +
 	"configuration_version, idempotency_key, status, stage, attempts, owner, execution_id, " +
-	"lease_until, operation_id, retry_at, error, created_at, updated_at"
+	"lease_until, operation_id, retry_at, error, created_at, updated_at, schedule_version"
 
 func scanDocumentJob(scanner rowScanner, includeContent bool) (*DocumentJob, error) {
 	var (
@@ -332,7 +243,8 @@ func scanDocumentJob(scanner rowScanner, includeContent bool) (*DocumentJob, err
 	}
 	destinations = append(destinations, &job.Size, &job.SHA256, &job.ConfigurationVersion,
 		&idempotencyKey, &job.Status, &job.Stage, &job.Attempts, &owner, &executionID,
-		&job.LeaseUntil, &operationID, &job.RetryAt, &errorText, &job.CreatedAt, &job.UpdatedAt)
+		&job.LeaseUntil, &operationID, &job.RetryAt, &errorText, &job.CreatedAt, &job.UpdatedAt,
+		&job.ScheduleVersion)
 	if err := scanner.Scan(destinations...); err != nil {
 		return nil, err
 	}
@@ -349,7 +261,8 @@ func documentJobNameKey(namespace, name string) string {
 	return sha256Hex(namespace + ":" + strings.ToLower(name))
 }
 
-// Submit persists the complete job and its outbox notification atomically.
+// Submit persists the complete job in one transaction; the schedule_version
+// written with the row is the only notification Debezium produces.
 func (d *DocumentJobs) Submit(ctx context.Context, namespace, name string, content []byte, idempotencyKey *string) (DocumentAdmission, error) {
 	if err := validateDocumentName(name); err != nil {
 		return DocumentAdmission{}, newDocumentValidationError(err.Error())
@@ -366,12 +279,8 @@ func (d *DocumentJobs) Submit(ctx context.Context, namespace, name string, conte
 	if err != nil {
 		return DocumentAdmission{}, err
 	}
-	eventID, err := randomHex(16)
-	if err != nil {
-		return DocumentAdmission{}, err
-	}
 	now := d.now()
-	admission, insertErr := d.insertJob(ctx, namespace, name, content, idempotencyKey, digest, nameKey, artifactID, eventID, now)
+	admission, insertErr := d.insertJob(ctx, namespace, name, content, idempotencyKey, digest, nameKey, artifactID, now)
 	if insertErr == nil {
 		return admission, nil
 	}
@@ -409,7 +318,7 @@ func (d *DocumentJobs) insertJob(
 	namespace, name string,
 	content []byte,
 	idempotencyKey *string,
-	digest, nameKey, artifactID, eventID string,
+	digest, nameKey, artifactID string,
 	now float64,
 ) (DocumentAdmission, error) {
 	transaction, err := d.stores.DB.BeginTx(ctx, nil)
@@ -484,16 +393,10 @@ func (d *DocumentJobs) insertJob(
 	if _, err := transaction.ExecContext(ctx,
 		"INSERT INTO document_jobs (artifact_id, namespace, name, name_key, content, size, sha256, "+
 			"configuration_version, idempotency_key, status, stage, attempts, owner, execution_id, "+
-			"lease_until, operation_id, retry_at, error, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0, NULL, ?, NULL, ?, ?)",
+			"lease_until, operation_id, retry_at, error, created_at, updated_at, schedule_version) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, 0, NULL, ?, NULL, ?, ?, 1)",
 		artifactID, namespace, name, nameKey, content, int64(len(content)), digest, version.Int64,
 		idempotencyKey, DocumentJobQueued, DocumentJobQueued, now, now, now); err != nil {
-		return DocumentAdmission{}, err
-	}
-	if _, err := transaction.ExecContext(ctx,
-		"INSERT INTO document_job_outbox (id, artifact_id, namespace, name, status, attempts, retry_at, "+
-			"created_at, published_at, last_error) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL)",
-		eventID, artifactID, namespace, name, "PENDING", now, now); err != nil {
 		return DocumentAdmission{}, err
 	}
 	if err := transaction.Commit(); err != nil {
@@ -503,7 +406,6 @@ func (d *DocumentJobs) insertJob(
 		ArtifactID: artifactID,
 		Status:     DocumentJobQueued,
 		Reused:     false,
-		EventID:    &eventID,
 	}, nil
 }
 
@@ -557,12 +459,13 @@ func (d *DocumentJobs) Terminal(ctx context.Context, artifactID string) (bool, e
 	return false, nil
 }
 
-// Claim takes the execution lease; nil means terminal, live, or unknown.
+// Claim takes the execution lease for one schema-4 notification. Returning
+// (nil, nil) means the delivery is safely skippable: the row is missing,
+// terminal, owned by a live lease, or carries a different schedule_version.
 func (d *DocumentJobs) Claim(ctx context.Context, notification DocumentNotification) (*DocumentJobTask, error) {
 	validated, err := ValidateDocumentNotification(map[string]any{
-		"schema": float64(notification.Schema), "artifact_id": notification.ArtifactID,
-		"namespace": notification.Namespace, "name": notification.Name,
-		"created_at": notification.CreatedAt,
+		"schema": float64(DocumentEnvelopeSchema), "artifact_id": notification.ArtifactID,
+		"namespace": notification.Namespace, "schedule_version": notification.ScheduleVersion,
 	})
 	if err != nil {
 		return nil, err
@@ -590,10 +493,8 @@ func (d *DocumentJobs) Claim(ctx context.Context, notification DocumentNotificat
 	if err != nil {
 		return nil, err
 	}
-	for _, terminal := range documentJobTerminalStatuses {
-		if job.Status == terminal {
-			return nil, nil
-		}
+	if job.ScheduleVersion != validated.ScheduleVersion || !documentJobActiveStatus(job.Status) {
+		return nil, nil
 	}
 	if job.Status == DocumentJobProcessing && job.LeaseUntil > now {
 		return nil, nil
@@ -617,6 +518,16 @@ func (d *DocumentJobs) Claim(ctx context.Context, notification DocumentNotificat
 	job.Attempts = attempts
 	job.UpdatedAt = now
 	return &DocumentJobTask{DocumentJob: *job, Content: job.Content}, nil
+}
+
+// documentJobActiveStatus reports whether the status can still be executed.
+func documentJobActiveStatus(status string) bool {
+	for _, active := range documentJobActiveStatuses {
+		if status == active {
+			return true
+		}
+	}
+	return false
 }
 
 // Heartbeat renews the processing lease of this execution.
@@ -820,9 +731,11 @@ func (d *DocumentJobs) Fail(ctx context.Context, task *DocumentJobTask, retry bo
 	if task.ExecutionID == nil {
 		return newUploadConflict("Document execution is no longer current")
 	}
+	// Requeueing is the only UPDATE that must produce a new Debezium
+	// notification, so it increments schedule_version in the same statement.
 	_, err = d.stores.DB.ExecContext(ctx,
-		"UPDATE document_jobs SET status = ?, stage = ?, error = COALESCE(?, error), "+
-			"owner = NULL, lease_until = 0, retry_at = ?, "+
+		"UPDATE document_jobs SET schedule_version = schedule_version + 1, status = ?, stage = ?, "+
+			"error = COALESCE(?, error), owner = NULL, execution_id = NULL, lease_until = 0, retry_at = ?, "+
 			"updated_at = ? WHERE artifact_id = ? AND execution_id = ? AND status = ?",
 		DocumentJobQueued, "retry_wait", errorMessage, now+d.Settings.SweepAfterSeconds, now,
 		task.ArtifactID, *task.ExecutionID, DocumentJobProcessing)
@@ -833,9 +746,8 @@ func (d *DocumentJobs) Fail(ctx context.Context, task *DocumentJobTask, retry bo
 // committed publication exists.
 func (d *DocumentJobs) DeadLetter(ctx context.Context, notification DocumentNotification) (bool, error) {
 	validated, err := ValidateDocumentNotification(map[string]any{
-		"schema": float64(notification.Schema), "artifact_id": notification.ArtifactID,
-		"namespace": notification.Namespace, "name": notification.Name,
-		"created_at": notification.CreatedAt,
+		"schema": float64(DocumentEnvelopeSchema), "artifact_id": notification.ArtifactID,
+		"namespace": notification.Namespace, "schedule_version": notification.ScheduleVersion,
 	})
 	if err != nil {
 		return false, err
@@ -885,80 +797,15 @@ func (d *DocumentJobs) DeadLetter(ctx context.Context, notification DocumentNoti
 	return true, nil
 }
 
-// OutboxEvent returns one outbox row (nil when missing).
-func (d *DocumentJobs) OutboxEvent(ctx context.Context, eventID string) (*DocumentOutboxEvent, error) {
-	event, err := scanDocumentOutboxEvent(d.stores.DB.QueryRowContext(ctx,
-		"SELECT id, artifact_id, namespace, name, status, attempts, retry_at, created_at, published_at, "+
-			"last_error FROM document_job_outbox WHERE id = ?", eventID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	return event, err
-}
-
-func scanDocumentOutboxEvent(scanner rowScanner) (*DocumentOutboxEvent, error) {
-	var (
-		event       DocumentOutboxEvent
-		publishedAt sql.NullFloat64
-		lastError   sql.NullString
-	)
-	if err := scanner.Scan(&event.ID, &event.ArtifactID, &event.Namespace, &event.Name, &event.Status,
-		&event.Attempts, &event.RetryAt, &event.CreatedAt, &publishedAt, &lastError); err != nil {
-		return nil, err
-	}
-	if publishedAt.Valid {
-		value := publishedAt.Float64
-		event.PublishedAt = &value
-	}
-	event.LastError = nullStringPointer(lastError)
-	return &event, nil
-}
-
-// PendingOutbox returns due PENDING outbox rows oldest first.
-func (d *DocumentJobs) PendingOutbox(ctx context.Context, limit int) ([]DocumentOutboxEvent, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-	rows, err := d.stores.DB.QueryContext(ctx,
-		"SELECT id, artifact_id, namespace, name, status, attempts, retry_at, created_at, published_at, "+
-			"last_error FROM document_job_outbox WHERE status = ? AND retry_at <= ? "+
-			"ORDER BY created_at LIMIT ?", "PENDING", d.now(), limit)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	events := make([]DocumentOutboxEvent, 0)
-	for rows.Next() {
-		event, err := scanDocumentOutboxEvent(rows)
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, *event)
-	}
-	return events, rows.Err()
-}
-
-// MarkPublished records a successful publish or a bounded retry state.
-func (d *DocumentJobs) MarkPublished(ctx context.Context, eventID string, cause error) error {
-	now := d.now()
-	if cause == nil {
-		_, err := d.stores.DB.ExecContext(ctx,
-			"UPDATE document_job_outbox SET status = ?, published_at = ?, last_error = NULL WHERE id = ?",
-			"PUBLISHED", now, eventID)
-		return err
-	}
-	errorType := errorTypeName(cause)
-	if len(errorType) > 128 {
-		errorType = errorType[:128]
-	}
-	_, err := d.stores.DB.ExecContext(ctx,
-		"UPDATE document_job_outbox SET attempts = attempts + 1, retry_at = ?, last_error = ? WHERE id = ?",
-		now+5, errorType, eventID)
-	return err
-}
-
-// Sweep re-emits notifications for stranded queued jobs and requeues expired
-// processing leases.
+// Sweep requeues jobs that need a fresh notification and increments their
+// schedule_version in the same UPDATE, so Debezium emits exactly one consumable
+// change per requeue:
+//
+//   - queued jobs stranded past the sweep window, whose notification was lost
+//     or never delivered;
+//   - processing jobs whose lease expired, because the worker crashed.
+//
+// No outbox row is written; the schedule_version change is the only signal.
 func (d *DocumentJobs) Sweep(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {
 		limit = 50
@@ -971,41 +818,32 @@ func (d *DocumentJobs) Sweep(ctx context.Context, limit int) (int, error) {
 	}
 	defer func() { _ = transaction.Rollback() }()
 	stuck, err := d.selectJobsForSweep(ctx, transaction,
-		"status = ? AND updated_at <= ? AND NOT EXISTS (SELECT 1 FROM document_job_outbox o "+
-			"WHERE o.artifact_id = document_jobs.artifact_id AND o.created_at > ?) ORDER BY updated_at LIMIT ?",
-		DocumentJobQueued, cutoff, cutoff, limit)
+		"status = ? AND updated_at <= ? ORDER BY updated_at LIMIT ?"+d.stores.Uploads.forUpdate(),
+		DocumentJobQueued, cutoff, limit)
 	if err != nil {
 		return 0, err
 	}
 	expired, err := d.selectJobsForSweep(ctx, transaction,
-		"status = ? AND lease_until <= ? ORDER BY created_at LIMIT ?",
+		"status = ? AND lease_until <= ? ORDER BY created_at LIMIT ?"+d.stores.Uploads.forUpdate(),
 		DocumentJobProcessing, now, limit)
 	if err != nil {
 		return 0, err
 	}
-	reemitted := 0
-	for _, job := range stuck {
-		if err := d.reemit(ctx, transaction, job, now); err != nil {
-			return 0, err
-		}
-		reemitted++
-	}
-	for _, job := range expired {
+	requeued := 0
+	for _, job := range append(stuck, expired...) {
 		if _, err := transaction.ExecContext(ctx,
-			"UPDATE document_jobs SET status = ?, stage = ?, owner = NULL, lease_until = 0, retry_at = ?, "+
-				"updated_at = ? WHERE artifact_id = ?",
+			"UPDATE document_jobs SET schedule_version = schedule_version + 1, status = ?, stage = ?, "+
+				"owner = NULL, execution_id = NULL, lease_until = 0, retry_at = ?, updated_at = ? "+
+				"WHERE artifact_id = ?",
 			DocumentJobQueued, "retry_wait", now, now, job.ArtifactID); err != nil {
 			return 0, err
 		}
-		if err := d.reemit(ctx, transaction, job, now); err != nil {
-			return 0, err
-		}
-		reemitted++
+		requeued++
 	}
 	if err := transaction.Commit(); err != nil {
 		return 0, err
 	}
-	return reemitted, nil
+	return requeued, nil
 }
 
 func (d *DocumentJobs) selectJobsForSweep(ctx context.Context, transaction *sql.Tx, where string, arguments ...any) ([]*DocumentJob, error) {
@@ -1026,22 +864,6 @@ func (d *DocumentJobs) selectJobsForSweep(ctx context.Context, transaction *sql.
 	return jobs, rows.Err()
 }
 
-func (d *DocumentJobs) reemit(ctx context.Context, transaction *sql.Tx, job *DocumentJob, now float64) error {
-	eventID, err := randomHex(16)
-	if err != nil {
-		return err
-	}
-	if _, err := transaction.ExecContext(ctx,
-		"INSERT INTO document_job_outbox (id, artifact_id, namespace, name, status, attempts, retry_at, "+
-			"created_at, published_at, last_error) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL)",
-		eventID, job.ArtifactID, job.Namespace, job.Name, "PENDING", now, now); err != nil {
-		return err
-	}
-	_, err = transaction.ExecContext(ctx,
-		"UPDATE document_jobs SET updated_at = ? WHERE artifact_id = ?", now, job.ArtifactID)
-	return err
-}
-
 // GCJobs deletes terminal jobs older than the retention window.
 func (d *DocumentJobs) GCJobs(ctx context.Context, retainSeconds *float64) (int, error) {
 	retention := d.Settings.TerminalRetentionSeconds
@@ -1051,24 +873,6 @@ func (d *DocumentJobs) GCJobs(ctx context.Context, retainSeconds *float64) (int,
 	result, err := d.stores.DB.ExecContext(ctx,
 		"DELETE FROM document_jobs WHERE status IN (?, ?) AND updated_at < ?",
 		DocumentJobSucceeded, DocumentJobFailed, d.now()-retention)
-	if err != nil {
-		return 0, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	return int(affected), nil
-}
-
-// GCOutbox deletes outbox rows older than the retention window.
-func (d *DocumentJobs) GCOutbox(ctx context.Context, maxAgeSeconds *float64) (int, error) {
-	age := d.Settings.OutboxRetentionSeconds
-	if maxAgeSeconds != nil {
-		age = *maxAgeSeconds
-	}
-	result, err := d.stores.DB.ExecContext(ctx,
-		"DELETE FROM document_job_outbox WHERE created_at < ?", d.now()-age)
 	if err != nil {
 		return 0, err
 	}

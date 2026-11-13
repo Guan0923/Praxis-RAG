@@ -920,6 +920,12 @@ export type MonitorDocumentJobs = {
 export type MonitorSearchTasks = {
   by_status: Record<string, number>;
   oldest_active_seconds: number;
+  // timed_out_recent counts search tasks that converged to timed_out in the
+  // last 24h; overdue_active counts active tasks past their deadline that have
+  // not converged yet. Both are null when the state database could not be read,
+  // never a fake zero.
+  timed_out_recent: number | null;
+  overdue_active: number | null;
 };
 // MonitorUploads counts upload *operations*, not files currently uploading.
 // unfinished stays for compatibility and unions the four disjoint buckets:
@@ -940,20 +946,20 @@ export type MonitorQueues = {
   uploads: MonitorUploads;
 };
 // MonitorQueueState addresses one queue of the snapshot without naming the
-// whole MonitorQueues object. The outbox is not a queue: it is reported by
-// pipeline.outbox as retained records (see MonitorPipelineOutbox).
+// whole MonitorQueues object.
 export type MonitorQueueState =
   | MonitorDocumentJobs
   | MonitorSearchTasks
   | MonitorUploads;
-// MonitorPipelineOutbox reports outbox *records*, not an undelivered backlog.
-// In the Debezium deployment the application never writes PUBLISHED back:
-// Debezium captures the rows and Kafka records consumption progress, so rows
-// may legitimately stay PENDING during the retention window.
-export type MonitorPipelineOutbox = {
-  by_status: Record<string, number>;
-  total: number;
-  oldest_record_seconds: number;
+// MonitorPipelineConnector reports one Debezium connector health. The task and
+// cache connectors are separate processes with independent offset/schema
+// history, so the backend reports them separately.
+export type MonitorPipelineConnector = {
+  status: MonitorDependencyStatus;
+  detail: string;
+  // capture_progress is always null: capture offsets live in Debezium, not in
+  // this service, so the page renders 未知 instead of inventing a percentage.
+  capture_progress: number | null;
 };
 export type MonitorPipelineDocumentJobs = {
   status: MonitorDependencyStatus;
@@ -967,13 +973,15 @@ export type MonitorPipelineWorker = {
   detail: string;
 };
 export type MonitorPipelineDebezium = {
-  status: MonitorDependencyStatus;
-  detail: string;
-  // capture_progress is always null: capture offsets live in Debezium, not in
-  // this service, so the page must render 未知 instead of inventing a number.
-  capture_progress: null;
+  // tasks captures document_jobs/search_tasks (INSERT + schedule_version
+  // changes); cache captures the read-model business tables (all c/u/d).
+  tasks: MonitorPipelineConnector;
+  cache: MonitorPipelineConnector;
 };
-export type MonitorPipelineKafka = {
+// MonitorPipelineKafkaGroup is one consumer group of the three independent
+// pipelines: document, search and cache. Offsets stay null when Kafka does not
+// report them, so the page prints 未知 instead of 0.
+export type MonitorPipelineKafkaGroup = {
   status: MonitorDependencyStatus;
   detail: string;
   topic: string;
@@ -982,17 +990,42 @@ export type MonitorPipelineKafka = {
   end_offset: number | null;
   consumer_lag: number | null;
 };
-// MonitorPipeline keeps the delivery/consumption views apart: outbox records
-// (retention), Debezium capture, Kafka consumption, document job processing and
-// the worker heartbeat. A null field means unknown, never zero.
+export type MonitorPipelineKafka = {
+  status: MonitorDependencyStatus;
+  detail: string;
+  // topic/group/offsets mirror the document group for compatibility; the page
+  // reads groups.* so all three pipelines are visible.
+  topic: string;
+  group: string;
+  committed_offset: number | null;
+  end_offset: number | null;
+  consumer_lag: number | null;
+  groups: {
+    document: MonitorPipelineKafkaGroup;
+    search: MonitorPipelineKafkaGroup;
+    cache: MonitorPipelineKafkaGroup;
+  };
+};
+// MonitorPipelineCache reports the read-model revision watermark: dirty keys
+// have refreshed_revision below revision, failures keep last_error. Both
+// counters are null when the state database could not be read.
+export type MonitorPipelineCache = {
+  status: MonitorDependencyStatus;
+  dirty_keys: number | null;
+  refresh_failures: number | null;
+};
+// MonitorPipeline keeps the delivery/consumption views apart: document job
+// processing, worker heartbeat, the two Debezium connectors, the three Kafka
+// consumer groups and the cache revision watermark. A null field means unknown,
+// never zero.
 export type MonitorPipeline = {
-  outbox: MonitorPipelineOutbox | null;
   document_jobs: MonitorPipelineDocumentJobs;
   // worker is optional so a pre-upgrade backend still type-checks; the page
   // renders a missing worker row as 未知.
   worker?: MonitorPipelineWorker;
   debezium: MonitorPipelineDebezium;
   kafka: MonitorPipelineKafka;
+  cache: MonitorPipelineCache;
 };
 export type MonitorLibrary = {
   documents: number;
@@ -1016,7 +1049,9 @@ export type MonitorService = {
   started_at: string;
   uptime_seconds: number;
   upload_mode: string;
-  outbox_bridge: string;
+  // delivery is a fixed "debezium" marker: the service never publishes task
+  // notifications itself, both Debezium connectors do.
+  delivery: string;
   pdf_engine: string;
 };
 export type MonitorOverview = {

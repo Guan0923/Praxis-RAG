@@ -13,12 +13,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/config"
-	"github.com/Guan0923/xinghe_rag/internal/documentworker"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
-	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 	"github.com/Guan0923/xinghe_rag/internal/wire"
 )
@@ -109,80 +106,6 @@ func firstRestJobArtifactID(t *testing.T, payload map[string]any) string {
 	return artifactID
 }
 
-// runDocumentWorkerUntil delivers committed outbox notifications through a fake
-// Kafka transport (the Debezium seam) until the predicate holds, then stops the
-// worker.
-func runDocumentWorkerUntil(t *testing.T, h *harness, description string, done func() bool) {
-	t.Helper()
-	worker, err := documentworker.New(documentworker.Options{
-		Jobs:            h.Stores.DocumentJobs,
-		Ingester:        h.Service,
-		JournalRecovery: h.Service,
-		Logger:          testLogger(),
-	})
-	if err != nil {
-		t.Fatalf("documentworker.New() error = %v", err)
-	}
-	transport := &fakePullTransport{}
-	consumer := mq.NewPullConsumer(
-		consumerConfig("praxis_document_ingest", "praxis_document_ingest_workers"),
-		transport, worker.MessageHandler(),
-	)
-	runCtx, cancel := context.WithCancel(context.Background())
-	finished := make(chan error, 1)
-	go func() { finished <- worker.RunConsumer(runCtx, consumer) }()
-
-	// The fake transport has no consumer offsets, so track what was handed over.
-	delivered := make(map[string]bool)
-	waitFor(t, 90*time.Second, description, func() bool {
-		if done() {
-			return true
-		}
-		pushPendingDocumentNotifications(t, h, transport, delivered)
-		return done()
-	})
-	cancel()
-	select {
-	case runErr := <-finished:
-		if runErr != nil {
-			t.Fatalf("RunConsumer() error = %v", runErr)
-		}
-	case <-time.After(90 * time.Second):
-		t.Fatalf("document worker did not stop")
-	}
-}
-
-// pushPendingDocumentNotifications publishes every not-yet-delivered committed
-// document_job_outbox row as the schema-3 notification Debezium would emit.
-func pushPendingDocumentNotifications(t *testing.T, h *harness, transport *fakePullTransport, delivered map[string]bool) {
-	t.Helper()
-	events, err := h.Stores.DocumentJobs.PendingOutbox(context.Background(), 10)
-	if err != nil {
-		t.Fatalf("PendingOutbox() error = %v", err)
-	}
-	for _, event := range events {
-		if delivered[event.ID] {
-			continue
-		}
-		notification, err := state.ValidateDocumentNotification(map[string]any{
-			"schema":      float64(state.DocumentEnvelopeSchema),
-			"artifact_id": event.ArtifactID,
-			"namespace":   event.Namespace,
-			"name":        event.Name,
-			"created_at":  event.CreatedAt,
-		})
-		if err != nil {
-			t.Fatalf("ValidateDocumentNotification() error = %v", err)
-		}
-		body, _, err := mq.EncodeDocumentNotification(notification)
-		if err != nil {
-			t.Fatalf("EncodeDocumentNotification() error = %v", err)
-		}
-		transport.push(mq.ReceivedMessage{Topic: "praxis_document_ingest", Body: body, DeliveryAttempt: 1})
-		delivered[event.ID] = true
-	}
-}
-
 // TestRESTAsyncUploadPipeline is the end-to-end contract of batch uploads:
 // admission is durable and immediate, status reports worker stages, the published
 // document becomes readable/deletable, and a queued admission that loses the name
@@ -200,6 +123,7 @@ func TestRESTAsyncUploadPipeline(t *testing.T) {
 	}
 	payload := decodeRESTBody(t, admitted)
 	artifactID := firstRestJobArtifactID(t, payload)
+	h.trackDocumentArtifact(artifactID)
 	job, _ := payload["items"].([]any)[0].(map[string]any)
 	if job["name"] != "rest.md" || job["status"] != state.DocumentBatchItemAccepted {
 		t.Fatalf("admitted job = %v", job)
@@ -275,6 +199,7 @@ func TestRESTAsyncUploadPipeline(t *testing.T) {
 		t.Fatalf("mutex admission status = %d body = %s", mutexAdmitted.Code, mutexAdmitted.Body.String())
 	}
 	mutexID := firstRestJobArtifactID(t, decodeRESTBody(t, mutexAdmitted))
+	h.trackDocumentArtifact(mutexID)
 	if _, err := h.Service.WriteDocument(ctx, "alpha", "mutex.md",
 		[]byte(documentText+"\n\nSynchronous replacement wins.\n"), false, ""); err != nil {
 		t.Fatalf("synchronous WriteDocument() error = %v", err)

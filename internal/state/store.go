@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,12 +55,11 @@ func isAlreadyExists(err error) bool {
 // process. It mirrors rag_mcp.state.store.StateStores.
 //
 // TODO(G2/G7) still deferred from the state-layer port:
-//   - Concrete Kafka document/search notification publishers and the Redis
-//     StateCache/TransientStore clients; the narrow interfaces and durable
-//     outbox state machines are in place for the worker binaries.
+//   - Concrete Kafka notification publishers and the Redis StateCache/Transient
+//     clients; the durable task state machines are in place for the worker
+//     binaries, while Debezium owns notification delivery (no outbox relay).
 //   - Worker main packages (rag-document-worker / rag-search-worker /
-//     rag-dead-letter-worker), broker-side DLQ consumption and Debezium bridge
-//     deployment.
+//     rag-dead-letter-worker), broker-side DLQ consumption and deployment.
 //   - KnowledgeBaseRepository.publish/confirm_publication (needs the lease
 //     journal) and the schema migrate CLI (migrate.py).
 //   - UploadCoordinator is constructed by the runtime (NewUploadCoordinator) so
@@ -89,10 +89,9 @@ type Stores struct {
 	Artifacts *ArtifactRegistry
 	Uploads   *UploadJournal
 
-	DocumentJobs     *DocumentJobs
-	DocumentBatches  *DocumentBatches
-	SearchTasks      *SearchTasks
-	SearchDispatcher *SearchTaskDispatcher
+	DocumentJobs    *DocumentJobs
+	DocumentBatches *DocumentBatches
+	SearchTasks     *SearchTasks
 
 	// Activity and Heartbeats are the Go-only monitoring data sources: hourly
 	// activity counters (every retrieval execution) and Worker liveness rows.
@@ -250,7 +249,6 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 		return nil, err
 	}
 	stores.SearchTasks = searchTasks
-	stores.SearchDispatcher = NewSearchTaskDispatcher(stores, nil)
 	// Monitoring data sources need no cache flush: they are write-mostly
 	// counters/heartbeats read by the Console monitor page only.
 	stores.Activity = newActivityCounters(database)
@@ -274,11 +272,6 @@ func (s *Stores) Ping(ctx context.Context) error {
 func (s *Stores) Close() error {
 	s.closeOnce.Do(func() {
 		var firstErr error
-		if s.SearchDispatcher != nil {
-			if err := s.SearchDispatcher.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
 		if s.CacheSync != nil {
 			if err := s.CacheSync.Close(); err != nil && firstErr == nil {
 				firstErr = err
@@ -435,7 +428,10 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	if err := s.migrateUserProfile(ctx); err != nil {
 		return err
 	}
-	if err := s.migrateDocumentOutbox(ctx); err != nil {
+	if err := s.migrateScheduleVersions(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateCacheRevisionWatermark(ctx); err != nil {
 		return err
 	}
 	return s.migrateVisionModelConfig(ctx)
@@ -621,43 +617,77 @@ func (s *Stores) hasIndex(ctx context.Context, table, index string) (bool, error
 	return true, nil
 }
 
-// migrateDocumentOutbox mirrors schema_migrations.migrate_document_outbox:
-// upgrade the retired delivery metadata without changing pending generations.
-func (s *Stores) migrateDocumentOutbox(ctx context.Context) error {
-	const table = "document_task_outbox"
-	additions := []struct {
-		name       string
-		definition string
-	}{
-		{"owner", "VARCHAR(32) NULL"},
-		{"lease_until", "DOUBLE NOT NULL DEFAULT 0"},
-		{"attempts", "INTEGER NOT NULL DEFAULT 0"},
-		{"last_error", "TEXT NULL"},
+// columnAddition is one additive `ALTER TABLE ... ADD COLUMN` migration.
+type columnAddition struct {
+	name       string
+	definition string
+}
+
+// migrateAddColumns applies missing additive columns to existing tables. It is
+// idempotent and tolerates concurrent startup: an ALTER that loses the race is
+// accepted only after the column is independently confirmed present. Tables
+// that do not exist are skipped.
+func (s *Stores) migrateAddColumns(ctx context.Context, additions map[string][]columnAddition) error {
+	tables := make([]string, 0, len(additions))
+	for table := range additions {
+		tables = append(tables, table)
 	}
-	exists, err := s.hasTable(ctx, table)
-	if err != nil || !exists {
-		return err
-	}
-	columns, err := s.tableColumns(ctx, table)
-	if err != nil {
-		return err
-	}
-	for _, addition := range additions {
-		if containsString(columns, addition.name) {
+	sort.Strings(tables)
+	for _, table := range tables {
+		exists, err := s.hasTable(ctx, table)
+		if err != nil || !exists {
+			if err != nil {
+				return err
+			}
 			continue
 		}
-		statement := "ALTER TABLE " + quoteIdentifier(table) +
-			" ADD COLUMN " + quoteIdentifier(addition.name) + " " + addition.definition
-		if _, execErr := s.DB.ExecContext(ctx, statement); execErr != nil {
-			confirmed, confirmErr := s.tableColumns(ctx, table)
-			if confirmErr == nil && containsString(confirmed, addition.name) {
+		columns, err := s.tableColumns(ctx, table)
+		if err != nil {
+			return err
+		}
+		for _, addition := range additions[table] {
+			if containsString(columns, addition.name) {
 				continue
 			}
-			return execErr
+			statement := "ALTER TABLE " + quoteIdentifier(table) +
+				" ADD COLUMN " + quoteIdentifier(addition.name) + " " + addition.definition
+			if _, execErr := s.DB.ExecContext(ctx, statement); execErr != nil {
+				confirmed, confirmErr := s.tableColumns(ctx, table)
+				if confirmErr == nil && containsString(confirmed, addition.name) {
+					columns = append(columns, addition.name)
+					continue
+				}
+				return execErr
+			}
+			columns = append(columns, addition.name)
 		}
-		columns = append(columns, addition.name)
 	}
 	return nil
+}
+
+// migrateScheduleVersions adds the Debezium scheduling generation to existing
+// document_jobs/search_tasks tables. New rows default to 1; existing rows get 1
+// as well, which is the correct starting generation for the cutover backfill.
+func (s *Stores) migrateScheduleVersions(ctx context.Context) error {
+	return s.migrateAddColumns(ctx, map[string][]columnAddition{
+		"document_jobs": {{name: "schedule_version", definition: "BIGINT NOT NULL DEFAULT 1"}},
+		"search_tasks":  {{name: "schedule_version", definition: "BIGINT NOT NULL DEFAULT 1"}},
+	})
+}
+
+// migrateCacheRevisionWatermark turns cache_revisions from a bare version row
+// into a dirty-state/refresh-watermark row. The columns are additive; existing
+// rows start with refreshed_revision=0 (dirty), no recorded error and no
+// timestamp, so the cache consumer rebuilds every tracked key once.
+func (s *Stores) migrateCacheRevisionWatermark(ctx context.Context) error {
+	return s.migrateAddColumns(ctx, map[string][]columnAddition{
+		"cache_revisions": {
+			{name: "refreshed_revision", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "attempts", definition: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "last_error", definition: "VARCHAR(128) COLLATE utf8mb4_bin NULL"},
+			{name: "updated_at", definition: "DOUBLE NOT NULL DEFAULT 0"},
+		},
+	})
 }
 
 // migrateVisionModelConfig is the one-shot, idempotent upgrade that removes the

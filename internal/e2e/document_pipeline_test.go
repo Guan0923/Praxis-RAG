@@ -5,17 +5,20 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/documentworker"
-	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
-// TestDocumentPipelineEndToEnd drives the MCP add path through the real runtime
-// ingester and the document worker consumer: admission -> broker delivery ->
-// parse/chunk/embed/upsert + journal commit -> durable succeeded -> documents
-// list/status readable.
+// TestDocumentPipelineEndToEnd drives the asynchronous upload path through the
+// real runtime ingester and the document worker handler:
+//
+//	MySQL admission -> schema-4 notification (what Debezium emits) ->
+//	parse/chunk/embed/upsert + journal commit -> durable succeeded -> documents
+//	list/status readable.
+//
+// There is no transactional outbox and no broker acceptance step: admission is a
+// committed document_jobs row, and the identifier-only notification drives the
+// worker.
 func TestDocumentPipelineEndToEnd(t *testing.T) {
 	h := newHarness(t, "")
 	ctx := context.Background()
@@ -35,52 +38,18 @@ func TestDocumentPipelineEndToEnd(t *testing.T) {
 	if job.Status != state.DocumentJobQueued {
 		t.Fatalf("admitted job status = %q", job.Status)
 	}
-	notification, err := state.DocumentJobEnvelope(job)
-	if err != nil {
-		t.Fatalf("DocumentJobEnvelope() error = %v", err)
-	}
-	body, _, err := mq.EncodeDocumentNotification(notification)
-	if err != nil {
-		t.Fatalf("EncodeDocumentNotification() error = %v", err)
+	// Admission is the only write: MySQL is the fact source and Debezium starts
+	// watching the task at schedule_version 1.
+	if job.ScheduleVersion != 1 {
+		t.Fatalf("admitted job schedule_version = %d, want 1", job.ScheduleVersion)
 	}
 
-	worker, err := documentworker.New(documentworker.Options{
-		Jobs:            h.Stores.DocumentJobs,
-		Ingester:        h.Service,
-		JournalRecovery: h.Service,
-		Logger:          testLogger(),
-	})
-	if err != nil {
-		t.Fatalf("documentworker.New() error = %v", err)
-	}
-	transport := &fakePullTransport{}
-	transport.push(mq.ReceivedMessage{Topic: "praxis_document_ingest", Body: body, DeliveryAttempt: 1})
-	consumer := mq.NewPullConsumer(
-		consumerConfig("praxis_document_ingest", "praxis_document_ingest_workers"),
-		transport, worker.MessageHandler(),
-	)
-	runCtx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- worker.RunConsumer(runCtx, consumer) }()
-
-	waitFor(t, 90*time.Second, "document job succeeded", func() bool {
-		current, readErr := h.Stores.DocumentJobs.Get(context.Background(), artifactID, nil)
-		return readErr == nil && current != nil && current.Status == state.DocumentJobSucceeded
-	})
-	// The durable job becomes succeeded inside Handle; the commit/ack happens
-	// right after it returns, so wait for the delivery to be acknowledged too.
-	waitFor(t, 90*time.Second, "document delivery acked", func() bool { return transport.ackCount() == 1 })
-	cancel()
-	select {
-	case runErr := <-done:
-		if runErr != nil {
-			t.Fatalf("RunConsumer() error = %v", runErr)
-		}
-	case <-time.After(90 * time.Second):
-		t.Fatalf("document consumer did not stop")
-	}
-	if transport.ackCount() != 1 || transport.nackCount() != 0 {
-		t.Fatalf("delivery ack/nack = %d/%d, want 1/0", transport.ackCount(), transport.nackCount())
+	// Debezium delivers the identifier-only schema-4 notification; the worker
+	// reads every parameter back from the committed row.
+	notification := documentNotification(t, h, artifactID)
+	worker := newDocumentProcessor(t, h)
+	if acked := worker.Handle(ctx, notification); !acked {
+		t.Fatalf("Handle() = false, want an ACK once the durable outcome is saved")
 	}
 
 	// Durable job state and the client-facing status projection.
@@ -97,6 +66,17 @@ func TestDocumentPipelineEndToEnd(t *testing.T) {
 	}
 	if status["status"] != state.DocumentJobSucceeded || status["stage"] != "completed" {
 		t.Fatalf("document status = %v", status)
+	}
+
+	// A redelivery of the same notification (at-least-once delivery) is safe to
+	// ACK and must not change the terminal row.
+	if acked := worker.Handle(ctx, notification); !acked {
+		t.Fatalf("replayed Handle() = false, want a safe ACK for the terminal job")
+	}
+	replayed, err := h.Stores.DocumentJobs.Get(ctx, artifactID, nil)
+	if err != nil || replayed == nil || replayed.Status != state.DocumentJobSucceeded ||
+		replayed.Stage != current.Stage || replayed.Attempts != current.Attempts {
+		t.Fatalf("replayed job = %+v, %v", replayed, err)
 	}
 
 	// The document list shows the assetless markdown record.

@@ -7,13 +7,18 @@
 # `docker compose up -d mysql qdrant redis kafka`, to skip it.
 # Kafka replaces the former RocketMQ stack; topics/consumer groups are created
 # explicitly below (auto-creation is also enabled on the broker).
-# rag-service is started below, and rag-document-worker runs as its children
-# with the same database, Redis, Qdrant, encryption and Kafka settings (RAG_DOCUMENT_WORKERS, default 1).
+# rag-service is started below; rag-document-worker (RAG_DOCUMENT_WORKERS, default 1)
+# and rag-cache-worker run as sibling processes with the same database, Redis,
+# encryption and Kafka settings.
 # Run rag-search-worker separately: without a search consumer, MCP searches need a
 # consumer before their task deadline.
 #
-# Debezium Server delivers committed document outbox events from MySQL binlog
-# to Kafka. The application does not publish document notifications.
+# Two Debezium Server connectors tail the MySQL binlog and deliver the async
+# pipeline (no transactional outbox):
+#   * debezium       (task connector)  document_jobs -> RAG_DOCUMENT_TOPIC
+#                                      search_tasks  -> RAG_SEARCH_TOPIC
+#   * debezium-cache (cache connector) business tables -> RAG_CACHE_TOPIC
+# The application never publishes task/cache notifications itself.
 #
 #   .\scripts\start-stack.ps1                 # full start
 #   .\scripts\start-stack.ps1 -MigrateOnly    # only start dependencies + migrate
@@ -96,21 +101,35 @@ if (-not $env:RAG_SEARCH_TOPIC) { $env:RAG_SEARCH_TOPIC = "praxis_search" }
 if (-not $env:RAG_SEARCH_GROUP) { $env:RAG_SEARCH_GROUP = "praxis_search_workers" }
 if (-not $env:RAG_DOCUMENT_DLQ_TOPIC) { $env:RAG_DOCUMENT_DLQ_TOPIC = "praxis_document_ingest_dead_letters" }
 if (-not $env:RAG_SEARCH_DLQ_TOPIC) { $env:RAG_SEARCH_DLQ_TOPIC = "praxis_search_dead_letters" }
+if (-not $env:RAG_CACHE_DLQ_TOPIC) { $env:RAG_CACHE_DLQ_TOPIC = "praxis_state_cache_refresh_dead_letters" }
 if (-not $env:RAG_DOCUMENT_DLQ_GROUP) { $env:RAG_DOCUMENT_DLQ_GROUP = "praxis_document_dead_letters" }
 if (-not $env:RAG_SEARCH_DLQ_GROUP) { $env:RAG_SEARCH_DLQ_GROUP = "praxis_search_dead_letters" }
+if (-not $env:RAG_CACHE_DLQ_GROUP) { $env:RAG_CACHE_DLQ_GROUP = "praxis_state_cache_refresh_dead_letters" }
+# Debezium health ports published on loopback by compose (tasks=8083, cache=8084)
+# and the matching health URLs used by the Console monitor.
+if (-not $env:RAG_DEBEZIUM_PORT) { $env:RAG_DEBEZIUM_PORT = "8083" }
+if (-not $env:RAG_DEBEZIUM_CACHE_PORT) { $env:RAG_DEBEZIUM_CACHE_PORT = "8084" }
+if (-not $env:RAG_DEBEZIUM_HEALTH_URL) { $env:RAG_DEBEZIUM_HEALTH_URL = "http://127.0.0.1:$($env:RAG_DEBEZIUM_PORT)/q/health" }
+if (-not $env:RAG_DEBEZIUM_CACHE_HEALTH_URL) { $env:RAG_DEBEZIUM_CACHE_HEALTH_URL = "http://127.0.0.1:$($env:RAG_DEBEZIUM_CACHE_PORT)/q/health" }
 
 $normalTopics = @($env:RAG_CACHE_TOPIC, $env:RAG_DOCUMENT_TOPIC, $env:RAG_SEARCH_TOPIC)
-$dlqTopics = @($env:RAG_DOCUMENT_DLQ_TOPIC, $env:RAG_SEARCH_DLQ_TOPIC)
+$dlqTopics = @($env:RAG_DOCUMENT_DLQ_TOPIC, $env:RAG_SEARCH_DLQ_TOPIC, $env:RAG_CACHE_DLQ_TOPIC)
 $normalGroups = @($env:RAG_CACHE_GROUP, $env:RAG_DOCUMENT_GROUP, $env:RAG_SEARCH_GROUP)
-$dlqGroups = @($env:RAG_DOCUMENT_DLQ_GROUP, $env:RAG_SEARCH_DLQ_GROUP)
+$dlqGroups = @($env:RAG_DOCUMENT_DLQ_GROUP, $env:RAG_SEARCH_DLQ_GROUP, $env:RAG_CACHE_DLQ_GROUP)
 if (@($normalTopics | Sort-Object -Unique).Count -ne $normalTopics.Count) {
     throw "RAG_CACHE_TOPIC, RAG_DOCUMENT_TOPIC and RAG_SEARCH_TOPIC must be distinct."
 }
 if (@($dlqTopics | Sort-Object -Unique).Count -ne $dlqTopics.Count) {
-    throw "RAG_DOCUMENT_DLQ_TOPIC and RAG_SEARCH_DLQ_TOPIC must be distinct."
+    throw "RAG_CACHE_DLQ_TOPIC, RAG_DOCUMENT_DLQ_TOPIC and RAG_SEARCH_DLQ_TOPIC must be distinct."
 }
-if ($dlqGroups[0] -eq $dlqGroups[1] -or @($dlqGroups | Where-Object { $_ -in $normalGroups }).Count) {
-    throw "DLQ handler groups must be distinct from each other and all normal consumer groups."
+if (@($normalGroups | Sort-Object -Unique).Count -ne $normalGroups.Count) {
+    throw "RAG_CACHE_GROUP, RAG_DOCUMENT_GROUP and RAG_SEARCH_GROUP must be distinct."
+}
+if (@($dlqGroups | Sort-Object -Unique).Count -ne $dlqGroups.Count) {
+    throw "DLQ handler groups must be distinct from each other."
+}
+if (@($dlqGroups | Where-Object { $_ -in $normalGroups }).Count) {
+    throw "DLQ handler groups must be distinct from all normal consumer groups."
 }
 if (@($dlqTopics | Where-Object { $_ -in $normalTopics }).Count) {
     throw "DLQ topics must be separate from the normal cache/document/search topics."
@@ -141,7 +160,7 @@ if (-not $env:RAG_MYSQL_DEBEZIUM_PASSWORD) {
     throw "RAG_MYSQL_DEBEZIUM_PASSWORD must be set in .env for Debezium."
 }
 
-Write-Host "Starting MySQL, Qdrant, Redis, Kafka, Debezium and the PDF vision parser (pdf-parser)..."
+Write-Host "Starting MySQL, Qdrant, Redis, Kafka, both Debezium connectors and the PDF vision parser (pdf-parser)..."
 Invoke-Compose -Arguments @("up", "-d")
 if ($LASTEXITCODE -ne 0) {
     throw "docker compose up failed. Is Docker Desktop running and this shell allowed to access it?"
@@ -216,10 +235,10 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
 }
 if (-not $topicsReady) { throw "Kafka topic creation failed. Check docker compose logs kafka." }
 Write-Host "Kafka topics ready: $((& docker exec praxis-rag-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list) -join ', ')"
-Write-Host "Consumers: rag-document-worker is started automatically with rag-service below; run rag-search-worker for MCP search separately."
-Write-Host "REST/Console batch uploads return after durable admission; rag-document-worker parses them afterwards."
+Write-Host "Consumers: rag-document-worker is started automatically with rag-service below; rag-cache-worker is started automatically too; run rag-search-worker for MCP search separately."
+Write-Host "REST/Console batch uploads and queued searches return after durable admission; rag-document-worker / rag-search-worker process them afterwards."
 Write-Host "Workers retry in-process and publish exhausted messages to RAG_*_DLQ_TOPIC; run rag-dead-letter-worker --kind document|search for them."
-Write-Host "Document uploads are accepted by a MySQL commit; Kafka only carries the identifier notification. Deploy API and workers together; drain schema-2 chunked messages before upgrading."
+Write-Host "Task/cache notifications come from Debezium instead of an outbox: document schema 4 and search schema 3 carry only locator ids plus schedule_version; the cache connector publishes locator-only c/u/d events to RAG_CACHE_TOPIC. Deploy API and workers together; drain schema-3 document / schema-2 search messages before upgrading."
 
 if (-not $SkipMigrate) {
     # Go state schema migration is idempotent; run it before the service touches the database.
@@ -238,19 +257,40 @@ if (-not $SkipMigrate) {
     }
 }
 
-Write-Host "Waiting for Debezium to start streaming the document_job_outbox binlog..."
-$streaming = $false
-for ($attempt = 0; $attempt -lt 90; $attempt++) {
-    $logs = docker logs praxis-rag-debezium --tail 200 2>&1
-    if ($logs -match "Starting streaming") { $streaming = $true; break }
-    Start-Sleep -Seconds 2
+# Both connectors must be capturing before the workers start: the task connector
+# drives document/search jobs, the cache connector keeps the Redis read model
+# converged. A connector is ready when its Quarkus health endpoint reports UP and
+# its log shows the streaming phase (a started process is not proof of capture).
+function Wait-DebeziumConnector {
+    param(
+        [string]$Container,
+        [string]$HealthURL,
+        [string]$Label
+    )
+    for ($attempt = 0; $attempt -lt 90; $attempt++) {
+        $healthOk = $false
+        try {
+            $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri $HealthURL
+            $healthOk = $response.StatusCode -eq 200 -and ($response.Content -match '"status"\s*:\s*"UP"')
+        }
+        catch {
+            $healthOk = $false
+        }
+        $logs = docker logs $Container --tail 200 2>&1
+        $streaming = $logs -match "Starting streaming"
+        if ($healthOk -and $streaming) {
+            Write-Host "$Label is healthy and streaming."
+            return
+        }
+        Start-Sleep -Seconds 2
+    }
+    throw "$Label did not become healthy and streaming; check docker logs $Container."
 }
-if ($streaming) {
-    Write-Host "Debezium is streaming MySQL binlog -> Kafka topic $($env:RAG_DOCUMENT_TOPIC)."
-}
-else {
-    throw "Debezium did not report 'Starting streaming'; check docker logs praxis-rag-debezium."
-}
+
+Write-Host "Waiting for both Debezium connectors (tasks/cache) to become healthy..."
+Wait-DebeziumConnector -Container "praxis-rag-debezium" -HealthURL $env:RAG_DEBEZIUM_HEALTH_URL -Label "Debezium task connector"
+Wait-DebeziumConnector -Container "praxis-rag-debezium-cache" -HealthURL $env:RAG_DEBEZIUM_CACHE_HEALTH_URL -Label "Debezium cache connector"
+Write-Host "Debezium is streaming MySQL binlog -> topics $($env:RAG_DOCUMENT_TOPIC), $($env:RAG_SEARCH_TOPIC), $($env:RAG_CACHE_TOPIC)."
 
 if ($MigrateOnly) {
     Write-Host "Dependencies started and migration finished."
@@ -281,6 +321,15 @@ for ($workerIndex = 1; $workerIndex -le $documentWorkers; $workerIndex++) {
 }
 
 Write-Host "Starting rag-service on http://$($env:RAG_SERVICE_HOST):$($env:RAG_SERVICE_PORT)/console"
+$cacheWorkerProcess = $null
+$cacheWorker = Join-Path $binDir "rag-cache-worker.exe"
+if (-not (Test-Path $cacheWorker)) {
+    Write-Warning "rag-cache-worker executable not found ($cacheWorker); the Redis read model only converges through the periodic fallback refresh until it is started. Run scripts\build-go.ps1 to build it."
+}
+else {
+    Write-Host "Starting rag-cache-worker (consumes $($env:RAG_CACHE_TOPIC) as group $($env:RAG_CACHE_GROUP))..."
+    $cacheWorkerProcess = Start-Process -FilePath $cacheWorker -NoNewWindow -PassThru
+}
 try {
     & $ragService
 }
@@ -288,5 +337,9 @@ finally {
     foreach ($docWorkerProcess in $docWorkerProcesses) {
         Write-Host "Stopping rag-document-worker (pid $($docWorkerProcess.Id))..."
         Stop-Process -Id $docWorkerProcess.Id -Force -ErrorAction SilentlyContinue
+    }
+    if ($cacheWorkerProcess) {
+        Write-Host "Stopping rag-cache-worker (pid $($cacheWorkerProcess.Id))..."
+        Stop-Process -Id $cacheWorkerProcess.Id -Force -ErrorAction SilentlyContinue
     }
 }

@@ -19,16 +19,15 @@ const (
 	SearchTaskFailed     = "failed"
 	SearchTaskTimedOut   = "timed_out"
 
-	SearchEnvelopeSchema     = 2
 	MaxSearchArgumentBytes   = 1024 * 1024
-	MaxSearchEnvelopeBytes   = MaxSearchArgumentBytes + 4096
 	searchUnavailableMessage = "Search result expired or unavailable"
 )
 
 var searchActiveStatuses = []string{SearchTaskQueued, SearchTaskProcessing}
 
 // SearchTaskUnavailable mirrors the RuntimeError raised when search admission
-// cannot be confirmed (no broker / duplicate admission).
+// cannot be persisted (duplicate admission). Admission itself never waits for a
+// broker confirmation.
 type SearchTaskUnavailable struct{ Message string }
 
 // Error implements error.
@@ -71,101 +70,6 @@ func SearchTaskSettingsFromEnv() (SearchTaskSettings, error) {
 	return settings, nil
 }
 
-// SearchEnvelope is the full-request schema-2 broker message.
-type SearchEnvelope struct {
-	Schema    int            `json:"schema"`
-	ResultID  string         `json:"result_id"`
-	Namespace string         `json:"namespace"`
-	Arguments map[string]any `json:"arguments"`
-	CreatedAt float64        `json:"created_at"`
-	ExpiresAt float64        `json:"expires_at"`
-	Deadline  float64        `json:"deadline"`
-}
-
-// ValidateSearchEnvelope mirrors validate_search_envelope; a malformed transport
-// payload is a plain ValueError("Invalid search message envelope").
-func ValidateSearchEnvelope(payload any) (SearchEnvelope, error) {
-	invalid := func() (SearchEnvelope, error) {
-		return SearchEnvelope{}, newValueError("Invalid search message envelope")
-	}
-	object, ok := payload.(map[string]any)
-	if !ok {
-		return invalid()
-	}
-	expected := map[string]struct{}{
-		"schema": {}, "result_id": {}, "namespace": {}, "arguments": {},
-		"created_at": {}, "expires_at": {}, "deadline": {},
-	}
-	if len(object) != len(expected) {
-		return invalid()
-	}
-	for key := range object {
-		if _, known := expected[key]; !known {
-			return invalid()
-		}
-	}
-	schema, ok := finiteNumericValue(object["schema"])
-	if !ok || schema != float64(SearchEnvelopeSchema) {
-		return invalid()
-	}
-	resultID, ok := object["result_id"].(string)
-	if !ok || !canonicalUUID(resultID) {
-		return invalid()
-	}
-	namespace, ok := object["namespace"].(string)
-	if !ok || len(namespace) < 1 || len(namespace) > 64 {
-		return invalid()
-	}
-	arguments, ok := object["arguments"].(map[string]any)
-	if !ok {
-		return invalid()
-	}
-	createdAt, ok := finiteNumericValue(object["created_at"])
-	if !ok {
-		return invalid()
-	}
-	expiresAt, ok := finiteNumericValue(object["expires_at"])
-	if !ok {
-		return invalid()
-	}
-	deadline, ok := finiteNumericValue(object["deadline"])
-	if !ok {
-		return invalid()
-	}
-	if !(createdAt < deadline && deadline <= expiresAt) {
-		return invalid()
-	}
-	argumentJSON, err := marshalJSON(arguments)
-	if err != nil {
-		return invalid()
-	}
-	encoded, err := marshalJSON(map[string]any{
-		"schema": SearchEnvelopeSchema, "result_id": resultID, "namespace": namespace,
-		"arguments": arguments, "created_at": createdAt, "expires_at": expiresAt, "deadline": deadline,
-	})
-	if err != nil {
-		return invalid()
-	}
-	if len(argumentJSON) > MaxSearchArgumentBytes || len(encoded) > MaxSearchEnvelopeBytes {
-		return invalid()
-	}
-	return SearchEnvelope{
-		Schema: SearchEnvelopeSchema, ResultID: resultID, Namespace: namespace,
-		Arguments: arguments, CreatedAt: createdAt, ExpiresAt: expiresAt, Deadline: deadline,
-	}, nil
-}
-
-func searchRequestDigest(envelope SearchEnvelope) string {
-	encoded, err := marshalJSON(map[string]any{
-		"namespace": envelope.Namespace, "arguments": envelope.Arguments,
-		"created_at": envelope.CreatedAt, "expires_at": envelope.ExpiresAt, "deadline": envelope.Deadline,
-	})
-	if err != nil {
-		return ""
-	}
-	return sha256Hex(encoded)
-}
-
 // SearchTask is one durable search task row.
 type SearchTask struct {
 	ResultID     string         `json:"result_id"`
@@ -181,6 +85,9 @@ type SearchTask struct {
 	CreatedAt    float64        `json:"created_at"`
 	UpdatedAt    float64        `json:"updated_at"`
 	RemainingSec float64        `json:"remaining_seconds"`
+	// ScheduleVersion is the scheduling generation Debezium watches. It starts
+	// at 1 and is incremented inside the transaction that requeues the task.
+	ScheduleVersion int64 `json:"schedule_version"`
 }
 
 // SearchTaskView is the public status projection returned by Get.
@@ -192,9 +99,8 @@ type SearchTaskView struct {
 	Deadline  float64 `json:"deadline"`
 }
 
-// SearchTasks is the durable search-task state machine. Python keeps active
-// task state in Redis; the Go port uses the existing search_tasks table so the
-// state machine and outbox are testable before the Redis client lands.
+// SearchTasks is the durable search-task state machine. MySQL is the source of
+// truth; Debezium delivers the identifier-only notifications.
 type SearchTasks struct {
 	stores   *Stores
 	Settings SearchTaskSettings
@@ -222,7 +128,7 @@ func (s *SearchTasks) resultTTL() float64 {
 }
 
 const searchTaskColumns = "result_id, namespace, arguments, status, stage, attempts, owner, " +
-	"lease_until, retry_at, deadline, created_at, updated_at"
+	"lease_until, retry_at, deadline, created_at, updated_at, schedule_version"
 
 func scanSearchTask(scanner rowScanner) (*SearchTask, error) {
 	var (
@@ -232,15 +138,15 @@ func scanSearchTask(scanner rowScanner) (*SearchTask, error) {
 	)
 	if err := scanner.Scan(&task.ResultID, &task.Namespace, &arguments, &task.Status, &task.Stage,
 		&task.Attempts, &owner, &task.LeaseUntil, &task.RetryAt, &task.Deadline,
-		&task.CreatedAt, &task.UpdatedAt); err != nil {
+		&task.CreatedAt, &task.UpdatedAt, &task.ScheduleVersion); err != nil {
 		return nil, err
 	}
 	task.Owner = nullStringPointer(owner)
 	// Decode with UseNumber so integer JSON tokens stay json.Number. Python's
 	// json keeps ints as int, and contracts.SearchRequestFromArguments validates
 	// candidate_k/top_k with isinstance(int) semantics; plain json.Unmarshal would
-	// turn them into float64 after the database/broker round-trip and make every
-	// real queued task fail validation.
+	// turn them into float64 after the database round-trip and make every real
+	// queued task fail validation.
 	argumentDecoder := json.NewDecoder(strings.NewReader(arguments))
 	argumentDecoder.UseNumber()
 	if err := argumentDecoder.Decode(&task.Arguments); err != nil {
@@ -249,23 +155,37 @@ func scanSearchTask(scanner rowScanner) (*SearchTask, error) {
 	return &task, nil
 }
 
-// Submit persists a queued task and its pending outbox row atomically.
-func (s *SearchTasks) Submit(ctx context.Context, namespace string, arguments map[string]any, resultID *string) (SearchEnvelope, error) {
+// Submit persists one queued task and returns its identifier-only schema-3
+// notification. Submission is accepted when the MySQL transaction commits; it
+// no longer waits for (or rolls back on) a Kafka acknowledgement. Debezium
+// emits the notification from the committed row, and a paused broker only
+// delays the task, it cannot reject it.
+func (s *SearchTasks) Submit(ctx context.Context, namespace string, arguments map[string]any, resultID *string) (SearchNotification, error) {
 	identifier := ""
 	if resultID == nil {
 		generated, err := uuid4String()
 		if err != nil {
-			return SearchEnvelope{}, err
+			return SearchNotification{}, err
 		}
 		identifier = generated
 	} else {
 		if !canonicalUUID(*resultID) {
-			return SearchEnvelope{}, newValueError("result_id must be a canonical UUID")
+			return SearchNotification{}, newValueError("result_id must be a canonical UUID")
 		}
 		identifier = *resultID
 	}
+	if len(namespace) < 1 || len(namespace) > 64 {
+		return SearchNotification{}, newValueError("Invalid search namespace")
+	}
 	if arguments == nil {
 		arguments = map[string]any{}
+	}
+	encoded, err := marshalJSON(arguments)
+	if err != nil {
+		return SearchNotification{}, err
+	}
+	if len(encoded) > MaxSearchArgumentBytes {
+		return SearchNotification{}, newValueError("Search arguments exceed the size limit")
 	}
 	now := s.now()
 	expires := now + s.resultTTL()
@@ -273,45 +193,31 @@ func (s *SearchTasks) Submit(ctx context.Context, namespace string, arguments ma
 	if expires < deadline {
 		deadline = expires
 	}
-	envelope, err := ValidateSearchEnvelope(map[string]any{
-		"schema": float64(SearchEnvelopeSchema), "result_id": identifier, "namespace": namespace,
-		"arguments": arguments, "created_at": now, "expires_at": expires, "deadline": deadline,
-	})
-	if err != nil {
-		return SearchEnvelope{}, err
-	}
-	encoded, err := marshalJSON(envelope.Arguments)
-	if err != nil {
-		return SearchEnvelope{}, err
-	}
 	transaction, err := s.stores.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return SearchEnvelope{}, err
+		return SearchNotification{}, err
 	}
 	defer func() { _ = transaction.Rollback() }()
 	if _, err := transaction.ExecContext(ctx,
 		"INSERT INTO search_tasks (result_id, namespace, arguments, status, stage, attempts, owner, "+
-			"lease_until, retry_at, deadline, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, ?, 0, NULL, 0, ?, ?, ?, ?)",
+			"lease_until, retry_at, deadline, created_at, updated_at, schedule_version) "+
+			"VALUES (?, ?, ?, ?, ?, 0, NULL, 0, ?, ?, ?, ?, 1)",
 		identifier, namespace, encoded, SearchTaskQueued, SearchTaskQueued,
 		now, deadline, now, now); err != nil {
 		if isUniqueViolation(err) {
-			return SearchEnvelope{}, newSearchTaskUnavailable("Search admission unavailable")
+			return SearchNotification{}, newSearchTaskUnavailable("Search admission unavailable")
 		}
-		return SearchEnvelope{}, err
-	}
-	if _, err := transaction.ExecContext(ctx,
-		"INSERT INTO search_task_outbox (result_id, pending, generation, retry_at) VALUES (?, 1, 0, ?)",
-		identifier, now); err != nil {
-		if isUniqueViolation(err) {
-			return SearchEnvelope{}, newSearchTaskUnavailable("Search admission unavailable")
-		}
-		return SearchEnvelope{}, err
+		return SearchNotification{}, err
 	}
 	if err := transaction.Commit(); err != nil {
-		return SearchEnvelope{}, err
+		return SearchNotification{}, err
 	}
-	return envelope, nil
+	return SearchNotification{
+		Schema:          SearchEnvelopeSchema,
+		ResultID:        identifier,
+		Namespace:       namespace,
+		ScheduleVersion: 1,
+	}, nil
 }
 
 // Get returns the status view; nil means the task is unknown/foreign.
@@ -353,7 +259,7 @@ func (s *SearchTasks) Get(ctx context.Context, namespace, resultID string, page,
 func (s *SearchTasks) Terminal(ctx context.Context, envelope any) (bool, error) {
 	resultID, namespace, err := s.resolveEnvelope(ctx, envelope)
 	if err != nil {
-		if errors.As(err, new(*ValueError)) {
+		if errors.As(err, new(*ValueError)) || IgnorableCDCChange(err) {
 			return true, nil
 		}
 		return false, err
@@ -374,23 +280,37 @@ func (s *SearchTasks) Terminal(ctx context.Context, envelope any) (bool, error) 
 	return !s.isActive(task.Status), nil
 }
 
+// resolveEnvelope normalizes a notification (typed), a decoded map (app native
+// envelope or raw Debezium change), or a bare result identifier.
 func (s *SearchTasks) resolveEnvelope(ctx context.Context, envelope any) (string, string, error) {
-	if object, ok := envelope.(map[string]any); ok {
-		validated, err := ValidateSearchEnvelope(object)
+	switch typed := envelope.(type) {
+	case SearchNotification:
+		validated, err := ValidateSearchNotification(map[string]any{
+			"schema": float64(SearchEnvelopeSchema), "result_id": typed.ResultID,
+			"namespace": typed.Namespace, "schedule_version": typed.ScheduleVersion,
+		})
 		if err != nil {
 			return "", "", err
 		}
 		return validated.ResultID, validated.Namespace, nil
-	}
-	resultID, ok := envelope.(string)
-	if !ok || !canonicalUUID(resultID) {
+	case map[string]any:
+		validated, err := ValidateSearchNotification(typed)
+		if err != nil {
+			return "", "", err
+		}
+		return validated.ResultID, validated.Namespace, nil
+	case string:
+		if !canonicalUUID(typed) {
+			return "", "", newValueError("Invalid search message envelope")
+		}
+		task, err := s.read(ctx, typed)
+		if err != nil || task == nil {
+			return typed, "", err
+		}
+		return typed, task.Namespace, nil
+	default:
 		return "", "", newValueError("Invalid search message envelope")
 	}
-	task, err := s.read(ctx, resultID)
-	if err != nil || task == nil {
-		return resultID, "", err
-	}
-	return resultID, task.Namespace, nil
 }
 
 func (s *SearchTasks) read(ctx context.Context, resultID string) (*SearchTask, error) {
@@ -417,6 +337,8 @@ func (s *SearchTasks) isExpired(task *SearchTask) bool {
 	return now >= task.Deadline || now >= expires
 }
 
+// markTimedOut converges an overdue active task. It is a plain UPDATE: the task
+// is terminal, so no new scheduling generation is emitted.
 func (s *SearchTasks) markTimedOut(ctx context.Context, task *SearchTask) error {
 	_, err := s.stores.DB.ExecContext(ctx,
 		"UPDATE search_tasks SET status = ?, stage = ?, owner = NULL, lease_until = 0, updated_at = ? "+
@@ -425,12 +347,14 @@ func (s *SearchTasks) markTimedOut(ctx context.Context, task *SearchTask) error 
 	return err
 }
 
-// Claim takes the execution lease; nil means terminal, foreign, live, or expired.
-func (s *SearchTasks) Claim(ctx context.Context, envelope SearchEnvelope) (*SearchTask, error) {
-	validated, err := ValidateSearchEnvelope(map[string]any{
-		"schema": float64(envelope.Schema), "result_id": envelope.ResultID,
-		"namespace": envelope.Namespace, "arguments": envelope.Arguments,
-		"created_at": envelope.CreatedAt, "expires_at": envelope.ExpiresAt, "deadline": envelope.Deadline,
+// Claim takes the execution lease for one schema-3 notification. Returning
+// (nil, nil) means the delivery is safely skippable: the row is missing,
+// foreign, terminal, carries a different schedule_version, is overdue, or is
+// owned by a live lease.
+func (s *SearchTasks) Claim(ctx context.Context, notification SearchNotification) (*SearchTask, error) {
+	validated, err := ValidateSearchNotification(map[string]any{
+		"schema": float64(SearchEnvelopeSchema), "result_id": notification.ResultID,
+		"namespace": notification.Namespace, "schedule_version": notification.ScheduleVersion,
 	})
 	if err != nil {
 		return nil, err
@@ -450,12 +374,14 @@ func (s *SearchTasks) Claim(ctx context.Context, envelope SearchEnvelope) (*Sear
 	if err != nil {
 		return nil, err
 	}
-	if task.Namespace != validated.Namespace || !s.isActive(task.Status) {
+	if task.Namespace != validated.Namespace || task.ScheduleVersion != validated.ScheduleVersion ||
+		!s.isActive(task.Status) {
 		return nil, nil
 	}
 	if s.isExpired(task) {
 		if _, err := transaction.ExecContext(ctx,
-			"UPDATE search_tasks SET status = ?, stage = ?, updated_at = ? WHERE result_id = ?",
+			"UPDATE search_tasks SET status = ?, stage = ?, owner = NULL, lease_until = 0, updated_at = ? "+
+				"WHERE result_id = ?",
 			SearchTaskTimedOut, SearchTaskFailed, now, task.ResultID); err != nil {
 			return nil, err
 		}
@@ -465,18 +391,6 @@ func (s *SearchTasks) Claim(ctx context.Context, envelope SearchEnvelope) (*Sear
 		return nil, nil
 	}
 	if task.Status == SearchTaskProcessing && task.LeaseUntil > now {
-		return nil, nil
-	}
-	storedDigest := ""
-	if stored, err := marshalJSON(task.Arguments); err == nil {
-		storedDigest = sha256Hex(stored)
-	}
-	envelopeArguments, err := marshalJSON(validated.Arguments)
-	if err != nil {
-		return nil, err
-	}
-	if storedDigest != sha256Hex(envelopeArguments) || task.Deadline != validated.Deadline ||
-		math.Abs(task.CreatedAt-validated.CreatedAt) > 1e-9 {
 		return nil, nil
 	}
 	attempts := task.Attempts + 1
@@ -503,48 +417,91 @@ func (s *SearchTasks) Claim(ctx context.Context, envelope SearchEnvelope) (*Sear
 	task.Owner = &owner
 	task.LeaseUntil = leaseUntil
 	task.UpdatedAt = now
-	task.Arguments = validated.Arguments
 	task.RemainingSec = math.Max(0, task.Deadline-now)
 	return task, nil
 }
 
-// Complete marks the task succeeded after preparing (and, when a transient store
-// is wired, saving) the immutable result snapshot.
+// Complete stores the immutable result snapshot and marks the task succeeded in
+// one MySQL transaction. MySQL is the fact source, so a crash between the
+// snapshot and the terminal status cannot happen; the Redis result cache is
+// written best-effort after the commit.
 func (s *SearchTasks) Complete(ctx context.Context, task *SearchTask, payload map[string]any) (map[string]any, error) {
-	prepared, err := s.stores.Results.Prepare(task.Namespace, payload, &task.ResultID, nil)
+	if task == nil {
+		return nil, newValueError("Invalid search task")
+	}
+	envelope, err := s.stores.Results.Prepare(task.Namespace, payload, &task.ResultID, nil)
 	if err != nil {
 		return nil, err
 	}
-	if s.stores.Results.Transient != nil {
-		if _, err := s.stores.Results.Save(task.Namespace, payload, &task.ResultID, nil); err != nil {
-			return nil, err
-		}
+	preparedPayload, ok := envelope["payload"].(map[string]any)
+	if !ok {
+		return nil, newSnapshotUnavailable(searchUnavailableMessage)
 	}
-	preparedPayload, _ := prepared["payload"].(map[string]any)
-	query := "UPDATE search_tasks SET status = ?, stage = ?, owner = NULL, lease_until = 0, updated_at = ? " +
-		"WHERE result_id = ?"
-	arguments := []any{SearchTaskSucceeded, "completed", s.now(), task.ResultID}
-	if task.Owner != nil {
-		query += " AND owner = ?"
-		arguments = append(arguments, *task.Owner)
-	}
-	if _, err := s.stores.DB.ExecContext(ctx, query, arguments...); err != nil {
+	now := s.now()
+	transaction, err := s.stores.DB.BeginTx(ctx, nil)
+	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = transaction.Rollback() }()
+	current, err := scanSearchTask(transaction.QueryRowContext(ctx,
+		"SELECT "+searchTaskColumns+" FROM search_tasks WHERE result_id = ?"+s.stores.Uploads.forUpdate(),
+		task.ResultID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, newSnapshotUnavailable(searchUnavailableMessage)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if current.Namespace != task.Namespace {
+		return nil, newSnapshotUnavailable(searchUnavailableMessage)
+	}
+	if current.Status == SearchTaskSucceeded {
+		// A duplicate delivery after the commit: the snapshot is already durable.
+		if err := transaction.Commit(); err != nil {
+			return nil, err
+		}
+		return preparedPayload, nil
+	}
+	if !s.isActive(current.Status) {
+		return nil, newSnapshotUnavailable("Search task is no longer active")
+	}
+	if task.Owner != nil && (current.Owner == nil || *current.Owner != *task.Owner) {
+		return nil, newSnapshotUnavailable("Search task is no longer current")
+	}
+	if err := s.stores.Results.insertTx(ctx, transaction, envelope); err != nil {
+		return nil, err
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"UPDATE search_tasks SET status = ?, stage = ?, owner = NULL, lease_until = 0, updated_at = ? "+
+			"WHERE result_id = ?",
+		SearchTaskSucceeded, "completed", now, task.ResultID); err != nil {
+		return nil, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return nil, err
+	}
+	// The search already succeeded in MySQL; a Redis failure only costs a cache
+	// miss that Get repairs by reading the fact row.
+	_ = s.stores.Results.cacheEnvelope(envelope)
 	return preparedPayload, nil
 }
 
-// Fail requeues or terminates an active task.
+// Fail requeues or terminates an active task. A retry is the only UPDATE that
+// must produce a new Debezium notification, so it increments schedule_version
+// in the same statement.
 func (s *SearchTasks) Fail(ctx context.Context, task *SearchTask, retry bool, cause *string) (bool, error) {
 	_ = cause
 	now := s.now()
 	status, stage := SearchTaskFailed, SearchTaskFailed
+	versionIncrement := ""
 	retryAt := now
 	if retry {
 		status, stage = SearchTaskQueued, "retry_wait"
+		versionIncrement = "schedule_version = schedule_version + 1, "
 		retryAt = now + s.Settings.RetrySeconds
 	}
-	query := "UPDATE search_tasks SET status = ?, stage = ?, owner = NULL, lease_until = 0, retry_at = ?, " +
+	query := "UPDATE search_tasks SET " + versionIncrement +
+		"status = ?, stage = ?, owner = NULL, lease_until = 0, retry_at = ?, " +
 		"updated_at = ? WHERE result_id = ? AND status IN (?, ?)"
 	arguments := []any{status, stage, retryAt, now, task.ResultID, SearchTaskQueued, SearchTaskProcessing}
 	if task.Owner != nil {
@@ -583,7 +540,7 @@ func (s *SearchTasks) DeadLetter(ctx context.Context, envelope any) (bool, error
 	return true, nil
 }
 
-// Expire fails active tasks whose deadline passed.
+// Expire converges active tasks whose deadline passed into timed_out.
 func (s *SearchTasks) Expire(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {
 		limit = 20
@@ -629,130 +586,4 @@ func (s *SearchTasks) Expire(ctx context.Context, limit int) (int, error) {
 		return 0, err
 	}
 	return int(affected), nil
-}
-
-// SearchNotificationPublisher publishes full-request schema-2 envelopes.
-type SearchNotificationPublisher interface {
-	SendSearchEnvelope(ctx context.Context, envelope SearchEnvelope) error
-	Close() error
-}
-
-// DispatchPending publishes due pending outbox rows for queued tasks.
-func (s *SearchTasks) DispatchPending(ctx context.Context, publisher SearchNotificationPublisher, limit int) (int, error) {
-	if publisher == nil {
-		return 0, nil
-	}
-	if limit <= 0 {
-		limit = 20
-	}
-	now := s.now()
-	rows, err := s.stores.DB.QueryContext(ctx,
-		"SELECT result_id FROM search_task_outbox WHERE pending = 1 AND retry_at <= ? ORDER BY retry_at LIMIT ?",
-		now, limit)
-	if err != nil {
-		return 0, err
-	}
-	identifiers := make([]string, 0)
-	for rows.Next() {
-		var resultID string
-		if err := rows.Scan(&resultID); err != nil {
-			_ = rows.Close()
-			return 0, err
-		}
-		identifiers = append(identifiers, resultID)
-	}
-	if err := rows.Close(); err != nil {
-		return 0, err
-	}
-	published := 0
-	for _, resultID := range identifiers {
-		task, err := s.read(ctx, resultID)
-		if err != nil {
-			return published, err
-		}
-		if task == nil || task.Status != SearchTaskQueued {
-			if _, err := s.stores.DB.ExecContext(ctx,
-				"UPDATE search_task_outbox SET pending = 0 WHERE result_id = ?", resultID); err != nil {
-				return published, err
-			}
-			continue
-		}
-		envelope, err := ValidateSearchEnvelope(map[string]any{
-			"schema": float64(SearchEnvelopeSchema), "result_id": task.ResultID,
-			"namespace": task.Namespace, "arguments": task.Arguments,
-			"created_at": task.CreatedAt, "expires_at": task.CreatedAt + s.resultTTL(),
-			"deadline": task.Deadline,
-		})
-		if err != nil {
-			if _, markErr := s.stores.DB.ExecContext(ctx,
-				"UPDATE search_task_outbox SET pending = 0 WHERE result_id = ?", resultID); markErr != nil {
-				return published, markErr
-			}
-			continue
-		}
-		if sendErr := publisher.SendSearchEnvelope(ctx, envelope); sendErr != nil {
-			if _, updateErr := s.stores.DB.ExecContext(ctx,
-				"UPDATE search_task_outbox SET retry_at = ?, generation = generation + 1 WHERE result_id = ?",
-				now+s.Settings.RetrySeconds, resultID); updateErr != nil {
-				return published, updateErr
-			}
-			continue
-		}
-		if _, err := s.stores.DB.ExecContext(ctx,
-			"UPDATE search_task_outbox SET pending = 0 WHERE result_id = ?", resultID); err != nil {
-			return published, err
-		}
-		published++
-	}
-	return published, nil
-}
-
-// SearchTaskDispatcher is the broker-facing admission seam
-// (search_queue.SearchTaskDispatcher) with a narrow publisher interface.
-type SearchTaskDispatcher struct {
-	Tasks     *SearchTasks
-	Publisher SearchNotificationPublisher
-}
-
-// NewSearchTaskDispatcher builds the dispatcher over the store's task state.
-func NewSearchTaskDispatcher(stores *Stores, publisher SearchNotificationPublisher) *SearchTaskDispatcher {
-	return &SearchTaskDispatcher{Tasks: stores.SearchTasks, Publisher: publisher}
-}
-
-// Submit admits one search request and confirms broker acceptance.
-func (d *SearchTaskDispatcher) Submit(ctx context.Context, namespace string, arguments map[string]any) (SearchEnvelope, error) {
-	if d.Publisher == nil {
-		return SearchEnvelope{}, newSearchTaskUnavailable("Search broker unavailable")
-	}
-	envelope, err := d.Tasks.Submit(ctx, namespace, arguments, nil)
-	if err != nil {
-		return SearchEnvelope{}, err
-	}
-	published, err := d.Tasks.DispatchPending(ctx, d.Publisher, 1)
-	if err != nil || published == 0 {
-		failed := "Search admission unconfirmed"
-		task := &SearchTask{ResultID: envelope.ResultID, Namespace: envelope.Namespace}
-		_, _ = d.Tasks.Fail(ctx, task, false, &failed)
-		return SearchEnvelope{}, newSearchTaskUnavailable("Search queue acceptance was not confirmed")
-	}
-	return envelope, nil
-}
-
-// RunOnce publishes due search tasks (relay seam for worker binaries).
-func (d *SearchTaskDispatcher) RunOnce(ctx context.Context) (int, error) {
-	return d.Tasks.DispatchPending(ctx, d.Publisher, 50)
-}
-
-// Start is a no-op hook for dispatcher symmetry.
-func (d *SearchTaskDispatcher) Start() {}
-
-// Stop is a no-op hook for dispatcher symmetry.
-func (d *SearchTaskDispatcher) Stop() {}
-
-// Close closes the publisher.
-func (d *SearchTaskDispatcher) Close() error {
-	if d.Publisher != nil {
-		return d.Publisher.Close()
-	}
-	return nil
 }

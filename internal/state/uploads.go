@@ -288,13 +288,6 @@ func (j *UploadJournal) touchCache(ctx context.Context, tx *sql.Tx, namespace st
 	return err
 }
 
-func (j *UploadJournal) flushCache(ctx context.Context, namespace string, operationID *string, heads, leases bool) {
-	if j.stores.CacheSync == nil {
-		return
-	}
-	_ = j.stores.CacheSync.FlushPending(ctx, j.cacheKeys(namespace, operationID, heads, leases))
-}
-
 // forUpdate returns the row-locking suffix.
 func (j *UploadJournal) forUpdate() string {
 	return " FOR UPDATE"
@@ -571,7 +564,6 @@ func (j *UploadJournal) Begin(ctx context.Context, namespace, name, documentID, 
 	if err := transaction.Commit(); err != nil {
 		return nil, err
 	}
-	j.flushCache(ctx, namespace, &operationID, false, true)
 	j.startHeartbeat(row)
 	return row, nil
 }
@@ -811,7 +803,6 @@ func (j *UploadJournal) Intent(ctx context.Context, operation *UploadOperation, 
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	j.flushCache(ctx, row.Namespace, &row.ID, false, false)
 	return nil
 }
 
@@ -864,7 +855,6 @@ func (j *UploadJournal) RunStep(ctx context.Context, operation *UploadOperation,
 	if err := transaction.Commit(); err != nil {
 		return nil, err
 	}
-	j.flushCache(ctx, row.Namespace, &row.ID, false, false)
 
 	var result any
 	actionErr := j.WithHeartbeat(ctx, operation, func() error {
@@ -908,7 +898,6 @@ func (j *UploadJournal) RunStep(ctx context.Context, operation *UploadOperation,
 	if err := transaction.Commit(); err != nil {
 		return nil, err
 	}
-	j.flushCache(ctx, row.Namespace, &row.ID, false, false)
 	return result, nil
 }
 
@@ -952,7 +941,6 @@ func (j *UploadJournal) Fail(ctx context.Context, operation *UploadOperation, ca
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	j.flushCache(ctx, row.Namespace, &row.ID, false, false)
 	return nil
 }
 
@@ -1013,7 +1001,6 @@ func (j *UploadJournal) ClaimRecovery(ctx context.Context, operationID string) (
 	if err := transaction.Commit(); err != nil {
 		return nil, err
 	}
-	j.flushCache(ctx, row.Namespace, &operationID, false, true)
 	j.stopHeartbeat(snapshot)
 	claimed, err := j.loadSteps(ctx, row)
 	if err != nil {
@@ -1087,7 +1074,6 @@ func (j *UploadJournal) rollbackStart(ctx context.Context, operation *UploadOper
 	if err := transaction.Commit(); err != nil {
 		return nil, err
 	}
-	j.flushCache(ctx, row.Namespace, &row.ID, false, false)
 	return row, nil
 }
 
@@ -1131,7 +1117,6 @@ func (j *UploadJournal) rollbackFinish(ctx context.Context, operation *UploadOpe
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	j.flushCache(ctx, row.Namespace, &row.ID, false, true)
 	return nil
 }
 
@@ -1169,7 +1154,6 @@ func (j *UploadJournal) recordRollbackFailure(ctx context.Context, operation *Up
 	if err := transaction.Commit(); err != nil {
 		return nil, cause
 	}
-	j.flushCache(ctx, row.Namespace, &row.ID, false, false)
 	return nil, cause
 }
 
@@ -1209,7 +1193,6 @@ func (j *UploadJournal) CommitNoop(ctx context.Context, operation *UploadOperati
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	j.flushCache(ctx, row.Namespace, &row.ID, false, true)
 	j.stopHeartbeat(operation)
 	return nil
 }
@@ -1347,7 +1330,6 @@ func (j *UploadJournal) Cleanup(ctx context.Context, operation *UploadOperation,
 		if err := transaction.Commit(); err != nil {
 			return err
 		}
-		j.flushCache(ctx, reloaded.Namespace, &reloaded.ID, false, false)
 		return nil
 	})
 	if lockErr != nil {
@@ -1600,7 +1582,6 @@ func (j *UploadJournal) RegisterWorkspace(ctx context.Context, operation *Upload
 	if err := transaction.Commit(); err != nil {
 		return "", err
 	}
-	j.flushCache(ctx, row.Namespace, &row.ID, false, false)
 	operation.Workspace = &path
 	operation.WorkspaceNode = &workspaceNode
 	return path, nil
@@ -1632,7 +1613,6 @@ func (j *UploadJournal) AcquireLock(ctx context.Context, namespace string, docum
 	if err := transaction.Commit(); err != nil {
 		return nil, err
 	}
-	j.flushCache(ctx, namespace, nil, false, true)
 	return token, nil
 }
 
@@ -1706,7 +1686,6 @@ func (j *UploadJournal) RenewLock(ctx context.Context, token *LockToken) error {
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	j.flushCache(ctx, token.Namespace, nil, false, true)
 	return nil
 }
 
@@ -1741,7 +1720,6 @@ func (j *UploadJournal) ReleaseLock(ctx context.Context, token *LockToken) error
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	j.flushCache(ctx, token.Namespace, nil, false, true)
 	return nil
 }
 
@@ -1834,7 +1812,6 @@ func (j *UploadJournal) renew(operation *UploadOperation) error {
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	j.flushCache(ctx, operation.Namespace, nil, false, true)
 	return nil
 }
 

@@ -10,7 +10,7 @@ import (
 // same batch is reported as skipped instead of failing the whole batch, and a
 // retried batch with the same idempotency key reuses the original record.
 func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
-	service, stores, broker := newAsyncService(t)
+	service, stores := newAsyncService(t)
 	ctx := context.Background()
 	files := []UploadFile{
 		{Name: "one.md", Content: []byte("# one")},
@@ -53,13 +53,6 @@ func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
 	if len(oneNameStatuses) != 2 || oneNameStatuses[0] == oneNameStatuses[1] {
 		t.Fatalf("same-name outcomes = %v", oneNameStatuses)
 	}
-	if got := broker.documentNotificationCount(); got != 0 {
-		t.Fatalf("application document notifications = %d, want 0", got)
-	}
-	events, err := stores.DocumentJobs.PendingOutbox(ctx, 10)
-	if err != nil || len(events) != 2 {
-		t.Fatalf("committed outbox events for Debezium = %+v, %v", events, err)
-	}
 	var jobs int
 	if err := stores.DB.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM document_jobs WHERE namespace = ?", "alpha").Scan(&jobs); err != nil {
@@ -67,6 +60,14 @@ func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
 	}
 	if jobs != 2 {
 		t.Fatalf("document jobs = %d, want 2", jobs)
+	}
+	var queuedVersions int
+	if err := stores.DB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM document_jobs WHERE namespace = ? AND schedule_version = 1", "alpha").Scan(&queuedVersions); err != nil {
+		t.Fatalf("count scheduled jobs: %v", err)
+	}
+	if queuedVersions != 2 {
+		t.Fatalf("jobs with initial schedule_version = %d, want 2", queuedVersions)
 	}
 
 	replayed, err := service.SubmitDocumentBatch(ctx, "alpha", files, "batch-key-1", "")
@@ -106,7 +107,7 @@ func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
 // TestSubmitDocumentBatchRejectsOversizedInput keeps the batch contract at the
 // ten-file limit of the batch upload endpoint.
 func TestSubmitDocumentBatchRejectsOversizedInput(t *testing.T) {
-	service, _, _ := newAsyncService(t)
+	service, _ := newAsyncService(t)
 	files := make([]UploadFile, 11)
 	for index := range files {
 		files[index] = UploadFile{Name: string(rune('a'+index)) + ".md", Content: []byte("x")}

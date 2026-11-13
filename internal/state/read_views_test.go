@@ -51,7 +51,7 @@ func TestPublicSettingsRedactsProviderCredentials(t *testing.T) {
 }
 
 func TestMissingViewsAreCachedPerNamespace(t *testing.T) {
-	stores, cache, _ := newCacheTestStores(t)
+	stores, cache := newCacheTestStores(t)
 	ctx := context.Background()
 	if value, err := stores.Views.KnowledgeBase(ctx, "absent"); err != nil || value != nil {
 		t.Fatalf("KnowledgeBase(absent) = %+v, %v", value, err)
@@ -87,7 +87,7 @@ func TestMissingViewsAreCachedPerNamespace(t *testing.T) {
 }
 
 func TestKnowledgeBaseListMergesConfigurationAndDocumentCounts(t *testing.T) {
-	stores, cache, _ := newCacheTestStores(t)
+	stores, cache := newCacheTestStores(t)
 	ctx := context.Background()
 	for _, namespace := range []string{"zulu", "alpha", "empty"} {
 		settings := activeKnowledgeBaseSettings()
@@ -136,7 +136,7 @@ func TestKnowledgeBaseListMergesConfigurationAndDocumentCounts(t *testing.T) {
 }
 
 func TestDocumentViewOverlaysActiveConfigAndPreservesRepositoryRecord(t *testing.T) {
-	stores, cache, _ := newCacheTestStores(t)
+	stores, cache := newCacheTestStores(t)
 	ctx := context.Background()
 	if err := stores.KnowledgeBases.Create(ctx, activeKnowledgeBaseSettings()); err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -187,7 +187,7 @@ func TestDocumentViewOverlaysActiveConfigAndPreservesRepositoryRecord(t *testing
 }
 
 func TestRegisteredRefreshLoadersRedactSecrets(t *testing.T) {
-	stores, cache, _ := newCacheTestStores(t)
+	stores, cache := newCacheTestStores(t)
 	ctx := context.Background()
 	if err := stores.KnowledgeBases.Create(ctx, activeKnowledgeBaseSettings()); err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -227,7 +227,7 @@ func TestRegisteredRefreshLoadersRedactSecrets(t *testing.T) {
 }
 
 func TestUploadReadViews(t *testing.T) {
-	stores, cache, _ := newCacheTestStores(t)
+	stores, cache := newCacheTestStores(t)
 	ctx := context.Background()
 	now := unixSeconds()
 	ctxInsert := "INSERT INTO upload_operations (id, namespace, name, document_id, collection, " +
@@ -333,7 +333,7 @@ func TestUploadReadViews(t *testing.T) {
 }
 
 func TestLeaseExpiryRecalculatedWithoutCacheWrite(t *testing.T) {
-	stores, cache, _ := newCacheTestStores(t)
+	stores, cache := newCacheTestStores(t)
 	ctx := context.Background()
 	if _, err := stores.DB.ExecContext(ctx,
 		"INSERT INTO document_leases (namespace, resource, owner, operation_id, expires_at) VALUES (?, ?, ?, NULL, ?)",

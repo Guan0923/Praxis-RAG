@@ -25,16 +25,12 @@ var expectedSchema = []struct {
 	{"document_heads", []string{"namespace", "document_id", "version", "updated_at"}},
 	{"document_leases", []string{"namespace", "resource", "owner", "operation_id", "expires_at"}},
 	{"upload_objects", []string{"operation_id", "bucket", "key", "content", "metadata", "created_at"}},
-	{"cache_revisions", []string{"kind", "scope", "revision"}},
-	{"cache_outbox", []string{"id", "kind", "scope", "revision", "status", "attempts", "retry_at", "created_at", "completed_at", "last_error"}},
+	{"cache_revisions", []string{"kind", "scope", "revision", "refreshed_revision", "attempts", "last_error", "updated_at"}},
 	{"search_result_snapshots", []string{"id", "namespace", "content", "created_at", "expires_at"}},
 	{"artifact_snapshots", []string{"id", "namespace", "identity", "document_id", "version", "kind", "name", "mime_type", "content", "created_at", "expires_at"}},
 	{"document_tasks", []string{"artifact_id", "namespace", "name", "name_key", "content", "sha256", "idempotency_key", "configuration_version", "status", "stage", "attempts", "owner", "lease_until", "operation_id", "error", "created_at", "updated_at"}},
-	{"document_task_outbox", []string{"artifact_id", "pending", "generation", "retry_at", "owner", "lease_until", "attempts", "last_error"}},
-	{"document_jobs", []string{"artifact_id", "namespace", "name", "name_key", "content", "size", "sha256", "configuration_version", "idempotency_key", "status", "stage", "attempts", "owner", "execution_id", "lease_until", "operation_id", "retry_at", "error", "created_at", "updated_at"}},
-	{"document_job_outbox", []string{"id", "artifact_id", "namespace", "name", "status", "attempts", "retry_at", "created_at", "published_at", "last_error"}},
-	{"search_tasks", []string{"result_id", "namespace", "arguments", "status", "stage", "attempts", "owner", "lease_until", "retry_at", "deadline", "created_at", "updated_at"}},
-	{"search_task_outbox", []string{"result_id", "pending", "generation", "retry_at"}},
+	{"document_jobs", []string{"artifact_id", "namespace", "name", "name_key", "content", "size", "sha256", "configuration_version", "idempotency_key", "status", "stage", "attempts", "owner", "execution_id", "lease_until", "operation_id", "retry_at", "error", "created_at", "updated_at", "schedule_version"}},
+	{"search_tasks", []string{"result_id", "namespace", "arguments", "status", "stage", "attempts", "owner", "lease_until", "retry_at", "deadline", "created_at", "updated_at", "schedule_version"}},
 	{"users", []string{"id", "username", "password_hash", "role", "enabled", "created_at", "updated_at", "last_login_at", "email", "email_verified", "age", "gender"}},
 	{"user_sessions", []string{"id", "user_id", "token_digest", "csrf_token", "expires_at", "created_at", "last_seen_at", "revoked"}},
 	{"kb_permissions", []string{"id", "namespace", "grantee_user_id", "document_name", "permission", "granted_by", "created_at", "updated_at"}},
@@ -49,6 +45,9 @@ var expectedSchema = []struct {
 	// are appended after the ported tables so migrated databases keep the order.
 	{"activity_counters", []string{"metric", "window_start", "count"}},
 	{"runtime_heartbeats", []string{"role", "instance", "updated_at"}},
+	// Go-only CDC cutover bookkeeping table, appended last like other Go-only
+	// additions.
+	{"cdc_cutover_state", []string{"k", "v"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -63,15 +62,11 @@ var expectedPrimaryKeys = map[string][]string{
 	"document_leases":          {"namespace", "resource"},
 	"upload_objects":           {"operation_id", "bucket", "key"},
 	"cache_revisions":          {"kind", "scope"},
-	"cache_outbox":             {"id"},
 	"search_result_snapshots":  {"id"},
 	"artifact_snapshots":       {"id"},
 	"document_tasks":           {"artifact_id"},
-	"document_task_outbox":     {"artifact_id"},
 	"document_jobs":            {"artifact_id"},
-	"document_job_outbox":      {"id"},
 	"search_tasks":             {"result_id"},
-	"search_task_outbox":       {"result_id"},
 	"users":                    {"id"},
 	"user_sessions":            {"id"},
 	"kb_permissions":           {"id"},
@@ -84,6 +79,7 @@ var expectedPrimaryKeys = map[string][]string{
 	"app_settings":             {"setting_key"},
 	"activity_counters":        {"metric", "window_start"},
 	"runtime_heartbeats":       {"role", "instance"},
+	"cdc_cutover_state":        {"k"},
 }
 
 var expectedUniques = map[string][]string{
@@ -107,15 +103,11 @@ var expectedIndexes = map[string][]string{
 	"documents":                {"ix_documents_namespace_sha256"},
 	"blobs":                    {"ix_blobs_document"},
 	"upload_operations":        {"ix_upload_unfinished"},
-	"cache_outbox":             {"ix_cache_outbox_pending"},
 	"search_result_snapshots":  {"ix_search_result_expiry", "ix_search_result_namespace"},
 	"artifact_snapshots":       {"ix_artifact_expiry", "ix_artifact_namespace"},
 	"document_tasks":           {"ix_document_tasks_name", "ix_document_tasks_recovery"},
-	"document_task_outbox":     {"ix_document_task_dispatch"},
 	"document_jobs":            {"ix_document_job_name", "ix_document_job_recovery"},
-	"document_job_outbox":      {"ix_document_job_outbox_pending", "ix_document_job_outbox_artifact", "ix_document_job_outbox_age"},
 	"search_tasks":             {"ix_search_tasks_deadline", "ix_search_tasks_recovery", "ix_search_tasks_namespace"},
-	"search_task_outbox":       {"ix_search_task_dispatch"},
 	"user_sessions":            {"ix_user_sessions_user_id"},
 	"kb_permissions":           {"ix_kb_permissions_grantee"},
 	"kb_invitations":           {"ix_kb_invitations_invitee", "ix_kb_invitations_namespace"},

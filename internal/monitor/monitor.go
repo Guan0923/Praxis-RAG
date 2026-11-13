@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -76,32 +77,38 @@ type Options struct {
 
 	KafkaBootstrapServers []string
 
-	// DebeziumHealthURL is the optional Debezium/Connect health endpoint. It
-	// reports whether the capture connector is running, never the binlog offset:
-	// the service cannot observe that from its own state database.
-	DebeziumHealthURL string
-	// DocumentTopic/DocumentGroup label the document delivery pipeline. They are
-	// reported even when the progress read is unavailable.
+	// DebeziumHealthURL / DebeziumCacheHealthURL are the optional Quarkus health
+	// endpoints of the two capture connectors (task connector and cache
+	// connector). They report whether a connector is running, never the binlog
+	// offset: the service cannot observe that from its own state database.
+	DebeziumHealthURL      string
+	DebeziumCacheHealthURL string
+	// Document/Search/Cache Topic+Group label the three independent business
+	// consumer groups. They are reported even when a progress read is unavailable.
 	DocumentTopic string
 	DocumentGroup string
-	// KafkaProgress reads the document consumer group offsets. nil means the
-	// Kafka delivery progress is not wired in this deployment.
-	KafkaProgress func(ctx context.Context) (KafkaProgress, error)
+	SearchTopic   string
+	SearchGroup   string
+	CacheTopic    string
+	CacheGroup    string
+	// KafkaGroupProgress reads one consumer group's committed offsets against its
+	// topic's end offsets. nil means the Kafka delivery progress is not wired in
+	// this deployment.
+	KafkaGroupProgress func(ctx context.Context, topic, group string) (KafkaProgress, error)
 	// KafkaProbe reads the broker metadata for the document topic. It replaces
 	// the legacy TCP dial: a metadata round trip proves reachability, TLS/SASL
 	// authentication and topic existence. nil keeps the TCP-only fallback for
 	// broker-less embeddings and tests.
 	KafkaProbe func(ctx context.Context) (KafkaStatus, error)
-	// ResultSnapshots counts the live search-result snapshots kept in Redis.
-	// The snapshots live in the cache, not MySQL, so the state aggregate cannot
-	// count them. nil or an error keeps the number unknown (JSON null).
-	ResultSnapshots func(ctx context.Context) (int, error)
 	// WorkerHeartbeat reads the newest document-worker liveness heartbeat from
 	// the state database. nil means the heartbeat store is not wired, so the
 	// worker row stays unknown instead of claiming the worker runs.
 	WorkerHeartbeat func(ctx context.Context) (*WorkerHeartbeat, error)
 
-	OutboxBridge  string
+	// Delivery names the task-notification transport ("debezium"). Empty falls
+	// back to "debezium": the transactional outbox no longer exists, so a caller
+	// that predates the field still reports the current pipeline truthfully.
+	Delivery      string
 	UploadMode    string
 	PDFEngine     string
 	PDFServiceURL string
@@ -186,31 +193,23 @@ type WorkerHeartbeat struct {
 	Instances int
 }
 
-// pipelineSnapshot is the delivery-pipeline view of the monitoring snapshot. It
-// separates four questions the old queues.document_outbox row conflated:
+// pipelineSnapshot is the delivery-pipeline view of the monitoring snapshot:
 //
-//   - outbox: how many delivery records are retained and how old the oldest is
-//     (record statistics, not undelivered backlog),
 //   - document_jobs: the processing state of admitted documents,
-//   - debezium: whether the capture connector is healthy (the binlog offset is
-//     only visible inside Debezium),
-//   - kafka: how far the document worker's consumer group has advanced.
+//   - worker: whether a document worker heartbeat is fresh,
+//   - debezium: the health of the two capture connectors (tasks/cache); the
+//     binlog offset is only visible inside Debezium, so capture_progress is
+//     always null,
+//   - kafka: how far the three independent consumer groups have advanced,
+//   - cache: the cache read-model dirty/failed refresh counters.
 //
 // Null numbers are unknown: the Console renders them as 未知/未启用.
 type pipelineSnapshot struct {
-	Outbox       *pipelineOutbox  `json:"outbox"`
 	DocumentJobs pipelineJobs     `json:"document_jobs"`
 	Worker       pipelineWorker   `json:"worker"`
 	Debezium     pipelineDebezium `json:"debezium"`
 	Kafka        pipelineKafka    `json:"kafka"`
-}
-
-// pipelineOutbox reports the retained document_job_outbox records. It is nil
-// when the state aggregate is unavailable.
-type pipelineOutbox struct {
-	ByStatus            map[string]int `json:"by_status"`
-	Total               int            `json:"total"`
-	OldestRecordSeconds float64        `json:"oldest_record_seconds"`
+	Cache        pipelineCache    `json:"cache"`
 }
 
 // pipelineJobs is the document job processing state (ok/degraded/unknown).
@@ -226,19 +225,44 @@ type pipelineWorker struct {
 	Detail string `json:"detail"`
 }
 
-// pipelineDebezium reports the capture-connector health. CaptureProgress is
+// pipelineDebezium reports both capture connectors' health. CaptureProgress is
 // always nil: the application side cannot read the binlog offset and must not
 // invent one.
 type pipelineDebezium struct {
+	Tasks pipelineConnector `json:"tasks"`
+	Cache pipelineConnector `json:"cache"`
+}
+
+// pipelineConnector is one Debezium connector's readiness row.
+type pipelineConnector struct {
 	Status          string `json:"status"`
 	Detail          string `json:"detail"`
 	CaptureProgress *int64 `json:"capture_progress"`
 }
 
-// pipelineKafka reports the document consumer group progress. Topic/Group are
-// always present so the Console can label the row even when the offsets are
-// unknown.
+// pipelineKafka reports the three independent consumer groups. The document
+// group is also mirrored into the legacy top-level Topic/Group/offset fields so
+// an older Console build still labels the row; groups is authoritative.
 type pipelineKafka struct {
+	Status          string              `json:"status"`
+	Detail          string              `json:"detail"`
+	Topic           string              `json:"topic"`
+	Group           string              `json:"group"`
+	CommittedOffset *int64              `json:"committed_offset"`
+	EndOffset       *int64              `json:"end_offset"`
+	ConsumerLag     *int64              `json:"consumer_lag"`
+	Groups          pipelineKafkaGroups `json:"groups"`
+}
+
+// pipelineKafkaGroups holds one progress row per business consumer group.
+type pipelineKafkaGroups struct {
+	Document pipelineKafkaGroup `json:"document"`
+	Search   pipelineKafkaGroup `json:"search"`
+	Cache    pipelineKafkaGroup `json:"cache"`
+}
+
+// pipelineKafkaGroup is one consumer group's committed-offset observation.
+type pipelineKafkaGroup struct {
 	Status          string `json:"status"`
 	Detail          string `json:"detail"`
 	Topic           string `json:"topic"`
@@ -246,6 +270,14 @@ type pipelineKafka struct {
 	CommittedOffset *int64 `json:"committed_offset"`
 	EndOffset       *int64 `json:"end_offset"`
 	ConsumerLag     *int64 `json:"consumer_lag"`
+}
+
+// pipelineCache reports the cache read-model convergence state. Nil numbers mean
+// the state aggregate is unavailable (the Console prints 未知), never zero.
+type pipelineCache struct {
+	Status          string `json:"status"`
+	DirtyKeys       *int   `json:"dirty_keys"`
+	RefreshFailures *int   `json:"refresh_failures"`
 }
 
 // MonitorOverview renders the full monitoring snapshot. The response is always
@@ -287,39 +319,33 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 
 	// The delivery-progress probes run next to the statistics read: neither the
 	// snapshot nor statsErr may wait on a slow capture connector or broker.
-	var debezium probeResult
+	var debeziumTasks, debeziumCache probeResult
 	var kafka pipelineKafka
 	wait.Add(1)
 	go func() {
 		defer wait.Done()
-		debezium = s.runProbe(ctx, s.probeDebezium)
+		debeziumTasks = s.runProbe(ctx, func(probeCtx context.Context) probeResult {
+			return s.probeDebeziumConnector(probeCtx, s.options.DebeziumHealthURL, "任务连接器")
+		})
+	}()
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		debeziumCache = s.runProbe(ctx, func(probeCtx context.Context) probeResult {
+			return s.probeDebeziumConnector(probeCtx, s.options.DebeziumCacheHealthURL, "缓存连接器")
+		})
 	}()
 	wait.Add(1)
 	go func() {
 		defer wait.Done()
 		probeContext, cancel := context.WithTimeout(ctx, probeTimeout)
 		defer cancel()
-		kafka = s.probeKafkaProgress(probeContext)
+		kafka = s.probeKafkaGroups(probeContext)
 	}()
 
-	// The live snapshot count lives in Redis and the worker liveness in its
-	// heartbeat rows; both are optional side reads whose failure only makes
-	// their own value unknown.
-	var snapshotCount *int
-	wait.Add(1)
-	go func() {
-		defer wait.Done()
-		if s.options.ResultSnapshots == nil {
-			return
-		}
-		probeContext, cancel := context.WithTimeout(ctx, probeTimeout)
-		defer cancel()
-		count, countErr := s.options.ResultSnapshots(probeContext)
-		if countErr != nil {
-			return
-		}
-		snapshotCount = &count
-	}()
+	// The worker liveness read is an optional side read whose failure only makes
+	// its own value unknown; the result-snapshot count now comes from MySQL via
+	// state.MonitorStats, so no Redis index read is needed here.
 	var workerBeat *WorkerHeartbeat
 	var workerErr error
 	wait.Add(1)
@@ -349,15 +375,15 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 	}
 
 	pipeline := pipelineSnapshot{
-		Outbox:       pipelineOutboxView(stats, statsErr),
 		DocumentJobs: pipelineDocumentJobsView(stats, statsErr),
 		Worker:       pipelineWorkerView(workerBeat, workerErr, now),
 		Debezium: pipelineDebezium{
-			Status: debezium.status,
-			Detail: debezium.detail,
+			Tasks: pipelineConnector{Status: debeziumTasks.status, Detail: debeziumTasks.detail},
+			Cache: pipelineConnector{Status: debeziumCache.status, Detail: debeziumCache.detail},
 			// capture_progress stays nil: only Debezium can read the binlog offset.
 		},
 		Kafka: kafka,
+		Cache: pipelineCacheView(stats, statsErr),
 	}
 	// ok means "every observed dependency is healthy". A degraded dependency
 	// (for example a missing Qdrant collection) must never be rendered as
@@ -379,10 +405,12 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 			"search_tasks": map[string]any{
 				"by_status":             stats.SearchByStatus,
 				"oldest_active_seconds": roundOneDecimal(stats.OldestActiveSearchSeconds),
+				"timed_out_recent":      stats.SearchTimedOutRecent,
+				"overdue_active":        stats.SearchOverdueActive,
 			},
 			"uploads": monitorUploadsView(stats),
 		}
-		library = monitorLibraryView(stats, snapshotCount)
+		library = monitorLibraryView(stats)
 		activity = map[string]any{
 			"window_hours":   recentWindow.Hours(),
 			"jobs_succeeded": stats.JobsSucceededRecent,
@@ -413,7 +441,7 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 			"started_at":     startedAt.UTC().Format(time.RFC3339),
 			"uptime_seconds": roundOneDecimal(uptime),
 			"upload_mode":    s.options.UploadMode,
-			"outbox_bridge":  s.options.OutboxBridge,
+			"delivery":       s.deliveryMode(),
 			"pdf_engine":     s.options.PDFEngine,
 		},
 		"dependencies": dependencies,
@@ -443,21 +471,52 @@ func monitorUploadsView(stats *state.MonitorStats) map[string]any {
 	}
 }
 
-// monitorLibraryView renders the library counters. result_snapshots comes from
-// the Redis transient store, where the immutable snapshots actually live; the
-// legacy MySQL search_result_snapshots table is not the source of truth. A nil
-// count stays JSON null so the Console prints 未知 instead of a wrong zero.
-func monitorLibraryView(stats *state.MonitorStats, resultSnapshots *int) map[string]any {
-	var snapshots any
-	if resultSnapshots != nil {
-		snapshots = *resultSnapshots
-	}
+// monitorLibraryView renders the library counters. result_snapshots is the
+// MySQL search_result_snapshots count (the fact source): the cached copy in
+// Redis may be evicted, so it is never the denominator. Stats availability is
+// handled by the caller, which leaves the whole library object null on failure.
+func monitorLibraryView(stats *state.MonitorStats) map[string]any {
 	return map[string]any{
 		"documents":          stats.Documents,
 		"knowledge_bases":    stats.KnowledgeBases,
-		"result_snapshots":   snapshots,
+		"result_snapshots":   stats.SearchResultSnapshotsActive,
 		"artifact_snapshots": stats.ArtifactSnapshots,
 	}
+}
+
+// deliveryMode reports the task-notification transport. The outbox is retired;
+// a caller that has not wired Delivery yet still gets the truthful "debezium".
+func (s *Service) deliveryMode() string {
+	if mode := strings.TrimSpace(s.options.Delivery); mode != "" {
+		return mode
+	}
+	return "debezium"
+}
+
+// pipelineCacheView renders the cache read-model convergence counters. Nil
+// numbers mean the state aggregate is unavailable so the Console prints 未知.
+func pipelineCacheView(stats *state.MonitorStats, statsErr error) pipelineCache {
+	if statsErr != nil || stats == nil {
+		return pipelineCache{Status: statusUnknown}
+	}
+	dirtyKeys := stats.CacheDirtyKeys
+	refreshFailures := stats.CacheRefreshFailures
+	view := pipelineCache{
+		Status:          statusOK,
+		DirtyKeys:       &dirtyKeys,
+		RefreshFailures: &refreshFailures,
+	}
+	reasons := make([]string, 0, 2)
+	if dirtyKeys > 0 {
+		reasons = append(reasons, fmt.Sprintf("脏缓存 %d 个", dirtyKeys))
+	}
+	if refreshFailures > 0 {
+		reasons = append(reasons, fmt.Sprintf("刷新失败 %d 个", refreshFailures))
+	}
+	if len(reasons) > 0 {
+		view.Status = statusDegraded
+	}
+	return view
 }
 
 // overallStatus ranks the observed health into the three-state contract the
@@ -486,14 +545,17 @@ func overallStatus(statsErr error, dependencies []dependency, pipeline pipelineS
 	for _, item := range dependencies {
 		raise(item.Status, true)
 	}
-	// Debezium delivers the document outbox; a dead capture connector breaks the
-	// delivery path, so its error is fatal to the overall status.
-	raise(pipeline.Debezium.Status, true)
+	// Debezium delivers the task and cache notifications; a dead connector
+	// breaks a delivery path, so its error is fatal to the overall status.
+	raise(pipeline.Debezium.Tasks.Status, true)
+	raise(pipeline.Debezium.Cache.Status, true)
 	// A missing/stopped worker is a capacity problem: jobs stay queued.
 	raise(pipeline.Worker.Status, false)
 	// An unreadable consumer-offset snapshot degrades observability only; the
 	// broker probe above already reports an unreachable cluster as an error.
 	raise(pipeline.Kafka.Status, false)
+	// Dirty cache keys converge through the retry watermark: degraded, not fatal.
+	raise(pipeline.Cache.Status, false)
 	return status
 }
 
@@ -532,31 +594,13 @@ func pipelineWorkerView(beat *WorkerHeartbeat, beatErr error, now time.Time) pip
 	}
 }
 
-// pipelineOutboxView renders the retained outbox record statistics, or nil when
-// the state aggregate is unavailable (the Console prints 未知).
-func pipelineOutboxView(stats *state.MonitorStats, statsErr error) *pipelineOutbox {
-	if statsErr != nil || stats == nil {
-		return nil
-	}
-	byStatus := monitorStringIntMap(stats.OutboxByStatus)
-	total := 0
-	for _, count := range byStatus {
-		total += count
-	}
-	return &pipelineOutbox{
-		ByStatus:            byStatus,
-		Total:               total,
-		OldestRecordSeconds: roundOneDecimal(stats.OldestOutboxRecordSeconds),
-	}
-}
-
 // oldestQueuedDegradedSeconds is the queue age at which the document job view
 // degrades. An old queued job means no worker is draining the queue.
 const oldestQueuedDegradedSeconds = 600.0
 
 // pipelineDocumentJobsView summarizes the document job processing state. It only
-// reads document_jobs: a succeeded job whose outbox row is still PENDING is a
-// normal Debezium record and must never make this view degraded.
+// reads document_jobs: task status is the fact source, and a notification still
+// in flight must never make this view degraded.
 func pipelineDocumentJobsView(stats *state.MonitorStats, statsErr error) pipelineJobs {
 	if statsErr != nil || stats == nil {
 		return pipelineJobs{Status: statusUnknown, Detail: "状态库不可用，任务状态未知"}
@@ -614,26 +658,27 @@ func debeziumDownDetail(health debeziumHealth) string {
 		}
 	}
 	if len(failing) == 0 {
-		return "Debezium 状态为 DOWN"
+		return "状态为 DOWN"
 	}
-	return "Debezium 状态为 DOWN（检查失败：" + strings.Join(failing, "、") + "）"
+	return "状态为 DOWN（检查失败：" + strings.Join(failing, "、") + "）"
 }
 
-// probeDebezium checks the optional capture-connector health endpoint and its
-// per-check runtime state. It never reports a capture offset: only Debezium
-// knows the binlog position.
-func (s *Service) probeDebezium(ctx context.Context) probeResult {
-	healthURL := strings.TrimSpace(s.options.DebeziumHealthURL)
+// probeDebeziumConnector checks one capture connector's Quarkus health endpoint
+// and its per-check runtime state. It never reports a capture offset: only
+// Debezium knows the binlog position. label ("任务连接器"/"缓存连接器") keeps the
+// two rows distinguishable in the detail line.
+func (s *Service) probeDebeziumConnector(ctx context.Context, healthURL, label string) probeResult {
+	healthURL = strings.TrimSpace(healthURL)
 	if healthURL == "" {
-		return probeResult{status: statusUnknown, detail: "未配置 Debezium 健康检查地址，采集进度未知"}
+		return probeResult{status: statusUnknown, detail: "未配置" + label + "健康检查地址，采集进度未知"}
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 	if err != nil {
-		return probeResult{status: statusError, detail: "Debezium 健康检查地址无效"}
+		return probeResult{status: statusError, detail: label + "健康检查地址无效"}
 	}
 	response, err := s.httpClient.Do(request)
 	if err != nil {
-		return probeResult{status: statusError, detail: "Debezium 健康检查不可达"}
+		return probeResult{status: statusError, detail: label + "健康检查不可达"}
 	}
 	defer func() { _ = response.Body.Close() }()
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
@@ -643,58 +688,122 @@ func (s *Service) probeDebezium(ctx context.Context) probeResult {
 		// Quarkus answers 503 when a check is DOWN; keep the failing check names
 		// when the body is still a health document.
 		if parsed && strings.EqualFold(strings.TrimSpace(health.Status), "DOWN") {
-			return probeResult{status: statusError, detail: debeziumDownDetail(health)}
+			return probeResult{status: statusError, detail: label + debeziumDownDetail(health)}
 		}
-		return probeResult{status: statusError, detail: fmt.Sprintf("健康检查返回 HTTP %d", response.StatusCode)}
+		return probeResult{status: statusError, detail: fmt.Sprintf("%s健康检查返回 HTTP %d", label, response.StatusCode)}
 	}
 	if readErr != nil {
-		return probeResult{status: statusDegraded, detail: "健康检查响应读取失败"}
+		return probeResult{status: statusDegraded, detail: label + "健康检查响应读取失败"}
 	}
 	if !parsed {
-		return probeResult{status: statusDegraded, detail: "健康检查响应无法解析"}
+		return probeResult{status: statusDegraded, detail: label + "健康检查响应无法解析"}
 	}
 	switch strings.ToUpper(strings.TrimSpace(health.Status)) {
 	case "UP":
-		detail := "健康检查正常"
+		detail := label + "健康检查正常"
 		if len(health.Checks) > 0 {
-			detail = fmt.Sprintf("健康检查正常（%d 项运行检查通过）", len(health.Checks))
+			detail = fmt.Sprintf("%s健康检查正常（%d 项运行检查通过）", label, len(health.Checks))
 		}
 		return probeResult{status: statusOK, detail: detail + "；采集位点需在 Debezium 侧查看"}
 	case "DOWN":
-		return probeResult{status: statusError, detail: debeziumDownDetail(health)}
+		return probeResult{status: statusError, detail: label + debeziumDownDetail(health)}
 	case "":
-		return probeResult{status: statusDegraded, detail: "健康检查未返回状态"}
+		return probeResult{status: statusDegraded, detail: label + "健康检查未返回状态"}
 	default:
-		return probeResult{status: statusDegraded, detail: "Debezium 状态为 " + boundedText(health.Status, 40)}
+		return probeResult{status: statusDegraded, detail: label + "状态为 " + boundedText(health.Status, 40)}
 	}
 }
 
-// probeKafkaProgress reads the document consumer group offsets through the
+// probeKafkaGroups reads the three independent business consumer groups (one
+// row each) concurrently and aggregates them into pipeline.kafka. The document
+// row is mirrored into the legacy top-level fields; groups is authoritative.
+func (s *Service) probeKafkaGroups(ctx context.Context) pipelineKafka {
+	var groups pipelineKafkaGroups
+	probes := []struct {
+		label  string
+		topic  string
+		group  string
+		target *pipelineKafkaGroup
+	}{
+		{label: "文档任务", topic: s.options.DocumentTopic, group: s.options.DocumentGroup, target: &groups.Document},
+		{label: "搜索任务", topic: s.options.SearchTopic, group: s.options.SearchGroup, target: &groups.Search},
+		{label: "缓存刷新", topic: s.options.CacheTopic, group: s.options.CacheGroup, target: &groups.Cache},
+	}
+	var wait sync.WaitGroup
+	for index := range probes {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			*probes[index].target = s.probeKafkaGroup(ctx, probes[index].label, probes[index].topic, probes[index].group)
+		}(index)
+	}
+	wait.Wait()
+
+	view := pipelineKafka{Groups: groups}
+	// Compatibility mirror for older Console builds: the document group.
+	view.Topic = groups.Document.Topic
+	view.Group = groups.Document.Group
+	view.CommittedOffset = groups.Document.CommittedOffset
+	view.EndOffset = groups.Document.EndOffset
+	view.ConsumerLag = groups.Document.ConsumerLag
+
+	switch {
+	case groups.Document.Status == statusDisabled && groups.Search.Status == statusDisabled &&
+		groups.Cache.Status == statusDisabled:
+		view.Status = statusDisabled
+		view.Detail = "未配置 Kafka：任务/缓存通知不会投递"
+	case groups.Document.Status == statusError || groups.Search.Status == statusError ||
+		groups.Cache.Status == statusError:
+		view.Status = statusError
+		view.Detail = "Kafka 消费进度读取失败"
+	case groups.Document.Status == statusUnknown || groups.Search.Status == statusUnknown ||
+		groups.Cache.Status == statusUnknown:
+		view.Status = statusUnknown
+		view.Detail = fmt.Sprintf("文档组滞后 %s；搜索组滞后 %s；缓存组滞后 %s",
+			consumerLagText(groups.Document.ConsumerLag),
+			consumerLagText(groups.Search.ConsumerLag),
+			consumerLagText(groups.Cache.ConsumerLag))
+	default:
+		view.Status = statusOK
+		view.Detail = fmt.Sprintf("文档组滞后 %s；搜索组滞后 %s；缓存组滞后 %s",
+			consumerLagText(groups.Document.ConsumerLag),
+			consumerLagText(groups.Search.ConsumerLag),
+			consumerLagText(groups.Cache.ConsumerLag))
+	}
+	return view
+}
+
+// probeKafkaGroup reads one consumer group's committed offsets through the
 // injected progress reader. Unknown values stay nil so the Console prints 未知.
-func (s *Service) probeKafkaProgress(ctx context.Context) pipelineKafka {
-	view := pipelineKafka{
-		Topic: strings.TrimSpace(s.options.DocumentTopic),
-		Group: strings.TrimSpace(s.options.DocumentGroup),
+func (s *Service) probeKafkaGroup(ctx context.Context, label, topic, group string) pipelineKafkaGroup {
+	view := pipelineKafkaGroup{
+		Topic: strings.TrimSpace(topic),
+		Group: strings.TrimSpace(group),
 	}
 	if len(kafkaBrokerList(s.options.KafkaBootstrapServers)) == 0 {
 		view.Status = statusDisabled
-		view.Detail = "未配置 Kafka：文档通知不会投递"
+		view.Detail = "未配置 Kafka"
 		return view
 	}
-	if s.options.KafkaProgress == nil {
+	if view.Topic == "" || view.Group == "" {
+		view.Status = statusUnknown
+		view.Detail = label + " topic/group 未配置"
+		return view
+	}
+	if s.options.KafkaGroupProgress == nil {
 		view.Status = statusUnknown
 		view.Detail = "未装配 Kafka 进度读取"
 		return view
 	}
-	progress, err := s.options.KafkaProgress(ctx)
+	progress, err := s.options.KafkaGroupProgress(ctx, view.Topic, view.Group)
 	if err != nil {
 		view.Status = statusError
-		view.Detail = "Kafka 消费进度读取失败：" + shortError(err)
+		view.Detail = label + "消费进度读取失败：" + shortError(err)
 		return view
 	}
 	if progress.CommittedOffset == nil || progress.EndOffset == nil {
 		view.Status = statusUnknown
-		view.Detail = "消费组尚未提交位点"
+		view.Detail = label + "消费组尚未提交位点"
 		return view
 	}
 	lag := *progress.EndOffset - *progress.CommittedOffset
@@ -708,8 +817,16 @@ func (s *Service) probeKafkaProgress(ctx context.Context) pipelineKafka {
 	view.EndOffset = progress.EndOffset
 	view.ConsumerLag = &lag
 	view.Status = statusOK
-	view.Detail = fmt.Sprintf("消费组滞后 %d 条", lag)
+	view.Detail = fmt.Sprintf("%s消费组滞后 %d 条", label, lag)
 	return view
+}
+
+// consumerLagText renders one group's lag for the aggregate detail line.
+func consumerLagText(lag *int64) string {
+	if lag == nil {
+		return "未知"
+	}
+	return strconv.FormatInt(*lag, 10)
 }
 
 // boundedText trims a remote-provided label and bounds it for one Chinese

@@ -3,7 +3,6 @@ package state
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -90,59 +89,12 @@ func detachCacheValue(value any) (any, error) {
 	return detached, nil
 }
 
-// memoryPublisher is the test EventPublisher.
-type memoryPublisher struct {
-	mu       sync.Mutex
-	down     bool
-	closed   bool
-	messages []string
-}
-
-func (m *memoryPublisher) Send(eventID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.down {
-		return errors.New("queue unavailable")
-	}
-	m.messages = append(m.messages, eventID)
-	return nil
-}
-
-func (m *memoryPublisher) ConsumeOnce(callback func(eventID string) bool) {
-	m.mu.Lock()
-	pending := m.messages
-	m.messages = nil
-	m.mu.Unlock()
-	for _, eventID := range pending {
-		if !callback(eventID) {
-			m.mu.Lock()
-			m.messages = append(m.messages, eventID)
-			m.mu.Unlock()
-		}
-	}
-}
-
-func (m *memoryPublisher) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closed = true
-	return nil
-}
-
-func (m *memoryPublisher) snapshotMessages() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]string(nil), m.messages...)
-}
-
-func newCacheTestStores(t *testing.T) (*Stores, *memoryCache, *memoryPublisher) {
+func newCacheTestStores(t *testing.T) (*Stores, *memoryCache) {
 	t.Helper()
 	stores := newTestStores(t)
 	cache := newMemoryCache()
-	transport := &memoryPublisher{}
 	stores.CacheSync.Backend = cache
-	stores.CacheSync.Transport = transport
-	return stores, cache, transport
+	return stores, cache
 }
 
 func cacheTestKnowledgeBase(collection string) map[string]any {
@@ -154,46 +106,8 @@ func cacheTestKnowledgeBase(collection string) map[string]any {
 	}
 }
 
-type outboxRow struct {
-	ID, Kind, Scope, Status string
-	Revision                int64
-	Attempts                int
-	RetryAt                 float64
-	LastError               *string
-}
-
-func outboxRows(t *testing.T, stores *Stores) []outboxRow {
-	t.Helper()
-	rows, err := stores.DB.QueryContext(context.Background(),
-		"SELECT id, kind, scope, status, revision, attempts, retry_at, last_error FROM cache_outbox ORDER BY created_at, id")
-	if err != nil {
-		t.Fatalf("outbox query error = %v", err)
-	}
-	defer closeRows(t, rows)
-	records := make([]outboxRow, 0)
-	for rows.Next() {
-		var record outboxRow
-		var lastError *string
-		if err := rows.Scan(&record.ID, &record.Kind, &record.Scope, &record.Status, &record.Revision,
-			&record.Attempts, &record.RetryAt, &lastError); err != nil {
-			t.Fatalf("outbox scan error = %v", err)
-		}
-		record.LastError = lastError
-		records = append(records, record)
-	}
-	return records
-}
-
-func statuses(rows []outboxRow) []string {
-	values := make([]string, len(rows))
-	for index, row := range rows {
-		values[index] = row.Status
-	}
-	return values
-}
-
 func TestCacheHitReadsNoSQLAndConfigurationIsRedacted(t *testing.T) {
-	stores, cache, _ := newCacheTestStores(t)
+	stores, cache := newCacheTestStores(t)
 	ctx := context.Background()
 	if err := stores.KnowledgeBases.Create(ctx, cacheTestKnowledgeBase("c")); err != nil {
 		t.Fatalf("Create() error = %v", err)
@@ -217,7 +131,8 @@ func TestCacheHitReadsNoSQLAndConfigurationIsRedacted(t *testing.T) {
 	if err != nil || len(documents) != 0 {
 		t.Fatalf("Documents() = %v, %v", documents, err)
 	}
-	// Bypass the repositories (and their touch) to prove the next read is a hit.
+	// Bypass the repositories (and their revision touch) to prove the next read
+	// is served by the backend without touching MySQL.
 	if _, err := stores.DB.ExecContext(ctx, "DELETE FROM knowledge_bases"); err != nil {
 		t.Fatalf("raw delete error = %v", err)
 	}
@@ -230,77 +145,69 @@ func TestCacheHitReadsNoSQLAndConfigurationIsRedacted(t *testing.T) {
 	if strings.Contains(payload, "NEVER_CACHE") || strings.Contains(payload, "protected_key") {
 		t.Fatalf("cache payload leaked a credential: %s", payload)
 	}
-	for _, row := range outboxRows(t, stores) {
-		if row.Status != "DONE" {
-			t.Fatalf("outbox row %+v was not refreshed", row)
-		}
-	}
 }
 
-func TestCacheWriteRefreshesValuesAndDeleteIsVersioned(t *testing.T) {
-	stores, cache, _ := newCacheTestStores(t)
+func TestRevalidatePublishesLatestRevisionAndWatermarkRejectsStale(t *testing.T) {
+	stores, cache := newCacheTestStores(t)
 	ctx := context.Background()
 	if err := stores.KnowledgeBases.Create(ctx, cacheTestKnowledgeBase("c")); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	cache.mu.Lock()
-	firstRevision := cache.watermarks[CacheKey{Kind: "kb_public", Scope: "ns"}]
-	cache.mu.Unlock()
-	oldValue := cacheTestKnowledgeBase("c")
+	if dirty, err := stores.CacheSync.DirtyKeys(ctx, 0); err != nil || len(dirty) != 3 {
+		t.Fatalf("DirtyKeys() before refresh = %v, %v; want the three knowledge keys", dirty, err)
+	}
+	if err := stores.CacheSync.Revalidate(ctx, knowledgeKeys("ns")); err != nil {
+		t.Fatalf("Revalidate() error = %v", err)
+	}
+	row := readCacheRevision(t, stores, "kb_public", "ns")
+	if row.RefreshedRevision != row.Revision || row.LastError.Valid {
+		t.Fatalf("after refresh refreshed/last_error = %d/%v (revision %d), want clean",
+			row.RefreshedRevision, row.LastError, row.Revision)
+	}
+	if dirty, err := stores.CacheSync.DirtyKeys(ctx, 0); err != nil || len(dirty) != 0 {
+		t.Fatalf("DirtyKeys() after refresh = %v, %v; want none", dirty, err)
+	}
+	oldRevision := row.Revision
+	oldValue, err := stores.Views.KnowledgeBase(ctx, "ns")
+	if err != nil || oldValue["collection"] != "c" {
+		t.Fatalf("KnowledgeBase() = %+v, %v", oldValue, err)
+	}
 	if err := stores.KnowledgeBases.Update(ctx, cacheTestKnowledgeBase("updated")); err != nil {
 		t.Fatalf("Update() error = %v", err)
 	}
+	if dirty, err := stores.CacheSync.DirtyKeys(ctx, 0); err != nil || len(dirty) != 3 {
+		t.Fatalf("DirtyKeys() after write = %v, %v; want the three knowledge keys", dirty, err)
+	}
+	// The CDC consumer refreshes the dirty keys; the previous revision is then
+	// rejected by the backend watermark.
+	if err := stores.CacheSync.RefreshDirty(ctx, 0); err != nil {
+		t.Fatalf("RefreshDirty() error = %v", err)
+	}
 	updated, err := stores.Views.KnowledgeBase(ctx, "ns")
 	if err != nil || updated["collection"] != "updated" {
-		t.Fatalf("KnowledgeBase() after update = %+v, %v", updated, err)
+		t.Fatalf("KnowledgeBase() after refresh = %+v, %v", updated, err)
 	}
+	if accepted, err := cache.Put(ctx, "kb_public", "ns", oldRevision, oldValue, false); err != nil || accepted {
+		t.Fatalf("stale Put() = %v, %v; want false", accepted, err)
+	}
+	if value, err := stores.Views.KnowledgeBase(ctx, "ns"); err != nil || value["collection"] != "updated" {
+		t.Fatalf("stale fill resurrected an old view: %+v, %v", value, err)
+	}
+	// Deleting the row is rebuilt as a cached deletion at the next revision.
 	if _, err := stores.KnowledgeBases.Delete(ctx, "ns"); err != nil {
 		t.Fatalf("Delete() error = %v", err)
+	}
+	if err := stores.CacheSync.RefreshDirty(ctx, 0); err != nil {
+		t.Fatalf("RefreshDirty() after delete error = %v", err)
 	}
 	deleted, err := stores.Views.KnowledgeBase(ctx, "ns")
 	if err != nil || deleted != nil {
 		t.Fatalf("KnowledgeBase() after delete = %+v, %v", deleted, err)
 	}
-	stale, err := cache.Put(ctx, "kb_public", "ns", firstRevision, oldValue, false)
-	if err != nil || stale {
-		t.Fatalf("stale Put() = %v, %v; want false", stale, err)
-	}
-	if value, err := stores.Views.KnowledgeBase(ctx, "ns"); err != nil || value != nil {
-		t.Fatalf("stale fill resurrected a deleted view: %+v, %v", value, err)
-	}
-	for _, row := range outboxRows(t, stores) {
-		if row.Status != "DONE" {
-			t.Fatalf("outbox row %+v was not marked DONE", row)
-		}
-	}
 }
 
-func TestBusinessTransactionRollbackAlsoRollsBackOutbox(t *testing.T) {
-	stores, _, _ := newCacheTestStores(t)
-	ctx := context.Background()
-	before := outboxRows(t, stores)
-	transaction, err := stores.DB.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatalf("BeginTx() error = %v", err)
-	}
-	if err := stores.Documents.UpsertTx(ctx, transaction, "ns", DocumentRecord{
-		Name: "a", DocumentID: "doc", Collection: "c",
-	}); err != nil {
-		t.Fatalf("UpsertTx() error = %v", err)
-	}
-	if err := transaction.Rollback(); err != nil {
-		t.Fatalf("Rollback() error = %v", err)
-	}
-	if after := outboxRows(t, stores); len(after) != len(before) {
-		t.Fatalf("rollback leaked outbox rows: %d -> %d", len(before), len(after))
-	}
-	if documents, err := stores.Documents.List(ctx, "ns"); err != nil || len(documents) != 0 {
-		t.Fatalf("Documents.List() = %v, %v", documents, err)
-	}
-}
-
-func TestCacheFailureQueuesOnlyEventIDsThenConsumerRefreshesLatest(t *testing.T) {
-	stores, cache, transport := newCacheTestStores(t)
+func TestRefreshKeyRecordsRedisFailureAndDirtySweepConverges(t *testing.T) {
+	stores, cache := newCacheTestStores(t)
 	ctx := context.Background()
 	cache.mu.Lock()
 	cache.down = true
@@ -308,128 +215,321 @@ func TestCacheFailureQueuesOnlyEventIDsThenConsumerRefreshesLatest(t *testing.T)
 	if err := stores.KnowledgeBases.Create(ctx, cacheTestKnowledgeBase("c")); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	rows := outboxRows(t, stores)
-	if statuses(rows) == nil || len(rows) == 0 {
-		t.Fatal("expected durable outbox rows")
+	// A Redis outage is not a caller error: the dirty state stays in MySQL.
+	if err := stores.CacheSync.Revalidate(ctx, knowledgeKeys("ns")); err != nil {
+		t.Fatalf("Revalidate() error = %v; a backend outage must not fail the call", err)
 	}
-	for _, row := range rows {
-		if row.Status != "QUEUED" {
-			t.Fatalf("row status = %q, want QUEUED", row.Status)
-		}
+	row := readCacheRevision(t, stores, "kb_public", "ns")
+	if row.RefreshedRevision != 0 {
+		t.Fatalf("refreshed_revision = %d after a failed publish, want 0", row.RefreshedRevision)
 	}
-	messages := transport.snapshotMessages()
-	if len(messages) == 0 {
-		t.Fatal("queue did not receive retry events")
+	if row.Attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", row.Attempts)
 	}
-	for _, message := range messages {
-		if len(message) != 32 || !ValidateCacheEventID(message) {
-			t.Fatalf("queue message %q is not a 32-char event id", message)
-		}
+	if !row.LastError.Valid || row.LastError.String != "CacheUnavailable" {
+		t.Fatalf("last_error = %v, want the sanitized CacheUnavailable category", row.LastError)
 	}
-	if err := stores.KnowledgeBases.Update(ctx, cacheTestKnowledgeBase("latest")); err != nil {
-		t.Fatalf("Update() error = %v", err)
+	dirty, err := stores.CacheSync.DirtyKeys(ctx, 0)
+	if err != nil || len(dirty) != 3 {
+		t.Fatalf("DirtyKeys() = %v, %v; want the three failed keys", dirty, err)
 	}
+
 	cache.mu.Lock()
 	cache.down = false
 	cache.mu.Unlock()
-	replayed := make([]string, 0, len(transport.snapshotMessages())*2)
-	replayed = append(replayed, transport.snapshotMessages()...)
-	replayed = append(replayed, replayed...)
-	for index := len(replayed) - 1; index >= 0; index-- {
-		refreshed, err := stores.CacheSync.RefreshEvent(ctx, replayed[index])
-		if err != nil {
-			t.Fatalf("RefreshEvent() error = %v", err)
-		}
-		if !refreshed {
-			t.Fatalf("RefreshEvent(%s) returned false", replayed[index])
-		}
+	if err := stores.CacheSync.RefreshDirty(ctx, 0); err != nil {
+		t.Fatalf("RefreshDirty() error = %v", err)
+	}
+	row = readCacheRevision(t, stores, "kb_public", "ns")
+	if row.RefreshedRevision != row.Revision || row.LastError.Valid {
+		t.Fatalf("after retry refreshed/last_error = %d/%v (revision %d), want clean",
+			row.RefreshedRevision, row.LastError, row.Revision)
+	}
+	if dirty, err := stores.CacheSync.DirtyKeys(ctx, 0); err != nil || len(dirty) != 0 {
+		t.Fatalf("DirtyKeys() after retry = %v, %v; want none", dirty, err)
 	}
 	value, err := stores.Views.KnowledgeBase(ctx, "ns")
-	if err != nil || value["collection"] != "latest" {
-		t.Fatalf("KnowledgeBase() = %+v, %v; want the latest committed snapshot", value, err)
+	if err != nil || value["collection"] != "c" {
+		t.Fatalf("KnowledgeBase() after recovery = %+v, %v", value, err)
 	}
-	for _, row := range outboxRows(t, stores) {
-		if row.Status != "DONE" {
-			t.Fatalf("row %+v was not marked DONE", row)
+}
+
+func TestInvalidateAndRefreshKeyEdges(t *testing.T) {
+	stores, cache := newCacheTestStores(t)
+	ctx := context.Background()
+	if count, err := stores.CacheSync.Invalidate(ctx, nil); err != nil || count != 0 {
+		t.Fatalf("Invalidate(nil) = %d, %v; want 0, nil", count, err)
+	}
+	keys := []CacheKey{
+		{Kind: "kb_public", Scope: "ns"},
+		{Kind: "documents", Scope: "ns"},
+		{Kind: "kb_public", Scope: "ns"},
+	}
+	if count, err := stores.CacheSync.Invalidate(ctx, keys); err != nil || count != 2 {
+		t.Fatalf("Invalidate() = %d, %v; want 2 deduplicated keys", count, err)
+	}
+	if value := readCacheRevision(t, stores, "kb_public", "ns").Revision; value != 1 {
+		t.Fatalf("kb_public revision = %d, want 1", value)
+	}
+	if count, err := stores.CacheSync.Invalidate(ctx, keys); err != nil || count != 2 {
+		t.Fatalf("second Invalidate() = %d, %v", count, err)
+	}
+	if value := readCacheRevision(t, stores, "kb_public", "ns").Revision; value != 2 {
+		t.Fatalf("kb_public revision = %d, want 2", value)
+	}
+	if _, err := stores.CacheSync.Invalidate(ctx, []CacheKey{{Kind: "document_status", Scope: ""}}); err == nil {
+		t.Fatal("Invalidate() accepted a retired cache kind")
+	}
+	// Kinds without a registered loader are a no-op, never an error.
+	if refreshed, err := stores.CacheSync.RefreshKey(ctx, "document_status", ""); err != nil || refreshed {
+		t.Fatalf("RefreshKey(retired) = %v, %v; want false, nil", refreshed, err)
+	}
+	// Revalidate de-duplicates (one bump) and publishes each key once.
+	if err := stores.CacheSync.Revalidate(ctx, []CacheKey{{Kind: "api_keys", Scope: ""}, {Kind: "api_keys", Scope: ""}}); err != nil {
+		t.Fatalf("Revalidate() error = %v", err)
+	}
+	if value := readCacheRevision(t, stores, "api_keys", "").Revision; value != 1 {
+		t.Fatalf("api_keys revision = %d, want 1 (deduplicated)", value)
+	}
+	if hit, _, err := cache.Get(ctx, "api_keys", ""); err != nil || !hit {
+		t.Fatalf("api_keys cache hit = %v, %v; want a published empty list", hit, err)
+	}
+}
+
+func TestDirtyKeyBatchLimitsAndOrdering(t *testing.T) {
+	stores, _ := newCacheTestStores(t)
+	ctx := context.Background()
+	if count, err := stores.CacheSync.Invalidate(ctx, knowledgeKeys("alpha")); err != nil || count != 3 {
+		t.Fatalf("Invalidate() = %d, %v", count, err)
+	}
+	dirty, err := stores.CacheSync.DirtyKeys(ctx, 2)
+	if err != nil || len(dirty) != 2 {
+		t.Fatalf("DirtyKeys(2) = %v, %v; want 2 keys", dirty, err)
+	}
+	if dirty[0] != (CacheKey{Kind: "documents", Scope: "alpha"}) ||
+		dirty[1] != (CacheKey{Kind: "kb_list", Scope: ""}) {
+		t.Fatalf("DirtyKeys(2) order = %v", dirty)
+	}
+	if err := stores.CacheSync.RefreshDirty(ctx, 2); err != nil {
+		t.Fatalf("RefreshDirty(2) error = %v", err)
+	}
+	remaining, err := stores.CacheSync.DirtyKeys(ctx, 0)
+	if err != nil || len(remaining) != 1 || remaining[0] != (CacheKey{Kind: "kb_public", Scope: "alpha"}) {
+		t.Fatalf("remaining dirty keys = %v, %v", remaining, err)
+	}
+}
+
+func TestDirtySweepIgnoresRetiredKindRows(t *testing.T) {
+	stores, _ := newCacheTestStores(t)
+	ctx := context.Background()
+	// A row left behind by a retired kind has no loader; it must not occupy the
+	// dirty batch (its name sorts before the live kinds).
+	if _, err := stores.DB.ExecContext(ctx,
+		"INSERT INTO cache_revisions (kind, scope, revision, updated_at) VALUES (?, ?, ?, ?)",
+		"document_status", "legacy", 5, 1.0); err != nil {
+		t.Fatalf("legacy row insert error = %v", err)
+	}
+	if count, err := stores.CacheSync.Invalidate(ctx, []CacheKey{{Kind: "kb_public", Scope: "alpha"}}); err != nil || count != 1 {
+		t.Fatalf("Invalidate() = %d, %v", count, err)
+	}
+	dirty, err := stores.CacheSync.DirtyKeys(ctx, 1)
+	if err != nil || len(dirty) != 1 || dirty[0] != (CacheKey{Kind: "kb_public", Scope: "alpha"}) {
+		t.Fatalf("DirtyKeys(1) = %v, %v; want the live key", dirty, err)
+	}
+	if err := stores.CacheSync.RefreshDirty(ctx, 0); err != nil {
+		t.Fatalf("RefreshDirty() error = %v", err)
+	}
+	if dirty, err := stores.CacheSync.DirtyKeys(ctx, 0); err != nil || len(dirty) != 0 {
+		t.Fatalf("DirtyKeys() after sweep = %v, %v; want none", dirty, err)
+	}
+	if value := readCacheRevision(t, stores, "document_status", "legacy").Revision; value != 5 {
+		t.Fatalf("retired row revision = %d, want it untouched", value)
+	}
+}
+
+func TestDirtyKeysIncludesFailureEvenWhenRevisionIsCurrent(t *testing.T) {
+	stores, _ := newCacheTestStores(t)
+	ctx := context.Background()
+	if count, err := stores.CacheSync.Invalidate(ctx, []CacheKey{{Kind: "kb_public", Scope: "alpha"}}); err != nil || count != 1 {
+		t.Fatalf("Invalidate() = %d, %v", count, err)
+	}
+	if refreshed, err := stores.CacheSync.RefreshKey(ctx, "kb_public", "alpha"); err != nil || !refreshed {
+		t.Fatalf("RefreshKey() = %v, %v", refreshed, err)
+	}
+	// A recorded failure must keep the key dirty even when the published
+	// revision already equals the committed revision.
+	if _, err := stores.DB.ExecContext(ctx,
+		"UPDATE cache_revisions SET attempts = 3, last_error = 'CacheUnavailable' "+
+			"WHERE kind = ? AND scope = ?", "kb_public", "alpha"); err != nil {
+		t.Fatalf("simulated failure update error = %v", err)
+	}
+	row := readCacheRevision(t, stores, "kb_public", "alpha")
+	if row.RefreshedRevision != row.Revision || !row.LastError.Valid {
+		t.Fatalf("simulated row = %+v, want a current watermark plus last_error", row)
+	}
+	dirty, err := stores.CacheSync.DirtyKeys(ctx, 0)
+	if err != nil || len(dirty) != 1 || dirty[0] != (CacheKey{Kind: "kb_public", Scope: "alpha"}) {
+		t.Fatalf("DirtyKeys() = %v, %v; want the failed key", dirty, err)
+	}
+	if err := stores.CacheSync.RefreshDirty(ctx, 0); err != nil {
+		t.Fatalf("RefreshDirty() error = %v", err)
+	}
+	row = readCacheRevision(t, stores, "kb_public", "alpha")
+	if row.LastError.Valid {
+		t.Fatalf("last_error = %v after retry, want NULL", row.LastError)
+	}
+	if dirty, err := stores.CacheSync.DirtyKeys(ctx, 0); err != nil || len(dirty) != 0 {
+		t.Fatalf("DirtyKeys() after retry = %v, %v; want none", dirty, err)
+	}
+}
+
+func TestMarkAllDirtyCoversEveryKnownScope(t *testing.T) {
+	stores, _ := newCacheTestStores(t)
+	ctx := context.Background()
+	for _, namespace := range []string{"alpha", "beta"} {
+		if err := stores.KnowledgeBases.Create(ctx, map[string]any{"namespace": namespace, "collection": "c"}); err != nil {
+			t.Fatalf("Create(%q) error = %v", namespace, err)
+		}
+	}
+	if err := stores.Documents.Upsert(ctx, "alpha", DocumentRecord{Name: "a.txt", DocumentID: "doc-a", Collection: "c"}); err != nil {
+		t.Fatalf("Upsert() error = %v", err)
+	}
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{"INSERT INTO mcp_catalogs (namespace, data, version, updated_at) VALUES (?, ?, ?, ?)",
+			[]any{"alpha", `{"servers":[]}`, 1, nowISO()}},
+		{"INSERT INTO document_heads (namespace, document_id, version, updated_at) VALUES (?, ?, ?, ?)",
+			[]any{"beta", "doc-b", "v1", 1.0}},
+		{"INSERT INTO document_leases (namespace, resource, owner, operation_id, expires_at) VALUES (?, ?, ?, NULL, ?)",
+			[]any{"gamma", "resource:one", "owner", unixSeconds() + 60}},
+		{"INSERT INTO upload_operations (id, namespace, name, document_id, collection, owner, status, " +
+			"cleanup_pending, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			[]any{"op-1", "delta", "file.txt", "doc-d", "c", "owner", "RUNNING", false, 1.0, 2.0}},
+	} {
+		if _, err := stores.DB.ExecContext(ctx, statement.query, statement.args...); err != nil {
+			t.Fatalf("seed %q error = %v", statement.query, err)
+		}
+	}
+	expected := []CacheKey{
+		{Kind: "kb_list", Scope: ""},
+		{Kind: "api_keys", Scope: ""},
+		{Kind: "kb_public", Scope: "alpha"},
+		{Kind: "documents", Scope: "alpha"},
+		{Kind: "catalog", Scope: "alpha"},
+		{Kind: "kb_public", Scope: "beta"},
+		{Kind: "documents", Scope: "beta"},
+		{Kind: "heads", Scope: "beta"},
+		{Kind: "leases", Scope: "gamma"},
+		{Kind: "upload_list", Scope: "delta"},
+		{Kind: "upload_status", Scope: "op-1"},
+	}
+	before := make(map[CacheKey]int64, len(expected))
+	for _, key := range expected {
+		before[key] = cacheRevisionOrZero(t, stores, key.Kind, key.Scope)
+	}
+	coveredKinds := make(map[string]struct{}, len(expected))
+	for _, key := range expected {
+		coveredKinds[key.Kind] = struct{}{}
+	}
+	for kind := range cacheKinds {
+		if _, covered := coveredKinds[kind]; !covered {
+			t.Fatalf("cacheMarkAllDirty expected keys miss the registered kind %q", kind)
+		}
+	}
+	count, err := stores.CacheSync.MarkAllDirty(ctx)
+	if err != nil {
+		t.Fatalf("MarkAllDirty() error = %v", err)
+	}
+	if count != len(expected) {
+		t.Fatalf("MarkAllDirty() count = %d, want %d", count, len(expected))
+	}
+	for _, key := range expected {
+		row := readCacheRevision(t, stores, key.Kind, key.Scope)
+		if row.Revision != before[key]+1 {
+			t.Fatalf("%s/%s revision = %d, want %d", key.Kind, key.Scope, row.Revision, before[key]+1)
+		}
+	}
+	dirty, err := stores.CacheSync.DirtyKeys(ctx, 0)
+	if err != nil || len(dirty) != len(expected) {
+		t.Fatalf("DirtyKeys() after baseline = %d keys, %v; want %d", len(dirty), err, len(expected))
+	}
+	// Idempotent: a second baseline pass bumps the same rows again.
+	if count, err := stores.CacheSync.MarkAllDirty(ctx); err != nil || count != len(expected) {
+		t.Fatalf("second MarkAllDirty() = %d, %v", count, err)
+	}
+	if value := readCacheRevision(t, stores, "kb_list", "").Revision; value != before[expected[0]]+2 {
+		t.Fatalf("kb_list revision after second baseline = %d, want %d", value, before[expected[0]]+2)
+	}
+	// Every derived view can be rebuilt through the registered loaders.
+	if err := stores.CacheSync.RefreshDirty(ctx, 0); err != nil {
+		t.Fatalf("RefreshDirty() error = %v", err)
+	}
+	if dirty, err := stores.CacheSync.DirtyKeys(ctx, 0); err != nil || len(dirty) != 0 {
+		t.Fatalf("DirtyKeys() after full rebuild = %v, %v; want none", dirty, err)
+	}
+}
+
+func TestMarkAllDirtyOnEmptyDatabase(t *testing.T) {
+	stores, _ := newCacheTestStores(t)
+	ctx := context.Background()
+	count, err := stores.CacheSync.MarkAllDirty(ctx)
+	if err != nil || count != 2 {
+		t.Fatalf("MarkAllDirty() on an empty database = %d, %v; want the two global keys", count, err)
+	}
+	for _, kind := range []string{"kb_list", "api_keys"} {
+		row := readCacheRevision(t, stores, kind, "")
+		if row.Revision != 1 || row.RefreshedRevision != 0 {
+			t.Fatalf("%s revision/refreshed = %d/%d, want 1/0", kind, row.Revision, row.RefreshedRevision)
 		}
 	}
 }
 
-func TestBothCacheAndQueueFailuresLeaveDurableRetry(t *testing.T) {
-	stores, cache, transport := newCacheTestStores(t)
+func TestDisabledBackendStillDrainsDirtyState(t *testing.T) {
+	stores := newTestStores(t)
 	ctx := context.Background()
-	cache.mu.Lock()
-	cache.down = true
-	cache.mu.Unlock()
-	transport.down = true
+	if stores.CacheSync.Enabled() {
+		t.Fatal("default synchronizer should start with the cache disabled")
+	}
 	if err := stores.KnowledgeBases.Create(ctx, cacheTestKnowledgeBase("c")); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	for _, row := range outboxRows(t, stores) {
-		if row.Status != "PENDING" {
-			t.Fatalf("row status = %q, want PENDING", row.Status)
-		}
+	if err := stores.CacheSync.Revalidate(ctx, knowledgeKeys("ns")); err != nil {
+		t.Fatalf("Revalidate() error = %v", err)
 	}
-	settings := stores.Settings
-	if err := stores.Close(); err != nil {
+	if dirty, err := stores.CacheSync.DirtyKeys(ctx, 0); err != nil || len(dirty) != 0 {
+		t.Fatalf("DirtyKeys() with a disabled backend = %v, %v; want none", dirty, err)
+	}
+	value, err := stores.Views.KnowledgeBase(ctx, "ns")
+	if err != nil || value["collection"] != "c" {
+		t.Fatalf("KnowledgeBase() = %+v, %v", value, err)
+	}
+}
+
+func TestCloseClosesBackendAndIsIdempotent(t *testing.T) {
+	stores, cache := newCacheTestStores(t)
+	if err := stores.CacheSync.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	restarted, err := New(settings, true)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	defer func() { _ = restarted.Close() }()
-	restartedCache := newMemoryCache()
-	restarted.CacheSync.Backend = restartedCache
-	restarted.CacheSync.Transport = &memoryPublisher{}
-	if _, err := restarted.DB.ExecContext(ctx, "UPDATE cache_outbox SET retry_at = 0"); err != nil {
-		t.Fatalf("retry_at reset error = %v", err)
-	}
-	if err := restarted.CacheSync.FlushPending(ctx, nil); err != nil {
-		t.Fatalf("FlushPending() error = %v", err)
-	}
-	value, err := restarted.Views.KnowledgeBase(ctx, "ns")
-	if err != nil || value["collection"] != "c" {
-		t.Fatalf("KnowledgeBase() after restart = %+v, %v", value, err)
-	}
-	for _, row := range outboxRows(t, restarted) {
-		if row.Status != "DONE" {
-			t.Fatalf("row %+v was not marked DONE after restart", row)
-		}
-	}
-}
-
-func TestStaleMissCannotOverwriteNewerWrite(t *testing.T) {
-	stores, cache, _ := newCacheTestStores(t)
-	ctx := context.Background()
-	if err := stores.KnowledgeBases.Create(ctx, cacheTestKnowledgeBase("c")); err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
 	cache.mu.Lock()
-	oldRevision := cache.watermarks[CacheKey{Kind: "kb_public", Scope: "ns"}]
+	closed := cache.closed
 	cache.mu.Unlock()
-	oldValue, err := stores.Views.KnowledgeBase(ctx, "ns")
-	if err != nil {
-		t.Fatalf("KnowledgeBase() error = %v", err)
+	if !closed {
+		t.Fatal("Close() did not close the cache backend")
 	}
-	if err := stores.KnowledgeBases.Update(ctx, cacheTestKnowledgeBase("new")); err != nil {
-		t.Fatalf("Update() error = %v", err)
+	if err := stores.CacheSync.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
 	}
-	if accepted, err := cache.Put(ctx, "kb_public", "ns", oldRevision, oldValue, false); err != nil || accepted {
-		t.Fatalf("stale Put() = %v, %v; want false", accepted, err)
-	}
-	value, err := stores.Views.KnowledgeBase(ctx, "ns")
-	if err != nil || value["collection"] != "new" {
-		t.Fatalf("KnowledgeBase() = %+v, %v; want new", value, err)
-	}
+	// Start/Stop are compatibility no-ops now that the relay poll is gone.
+	stores.CacheSync.Start()
+	stores.CacheSync.Stop()
 }
 
-func TestUploadPublicationRollbackNeverRefreshesUncommittedList(t *testing.T) {
-	stores, _, _ := newCacheTestStores(t)
+func TestBusinessTransactionRollbackAlsoRollsBackRevisions(t *testing.T) {
+	stores, _ := newCacheTestStores(t)
 	ctx := context.Background()
-	if documents, err := stores.Views.Documents(ctx, "ns"); err != nil || len(documents) != 0 {
-		t.Fatalf("Documents() = %v, %v", documents, err)
-	}
+	before := cacheRevisionCount(t, stores)
 	transaction, err := stores.DB.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("BeginTx() error = %v", err)
@@ -442,48 +542,10 @@ func TestUploadPublicationRollbackNeverRefreshesUncommittedList(t *testing.T) {
 	if err := transaction.Rollback(); err != nil {
 		t.Fatalf("Rollback() error = %v", err)
 	}
-	if err := stores.CacheSync.FlushPending(ctx, nil); err != nil {
-		t.Fatalf("FlushPending() error = %v", err)
+	if after := cacheRevisionCount(t, stores); after != before {
+		t.Fatalf("rollback leaked cache_revisions rows: %d -> %d", before, after)
 	}
-	if documents, err := stores.Views.Documents(ctx, "ns"); err != nil || len(documents) != 0 {
-		t.Fatalf("Documents() after rollback = %v, %v", documents, err)
-	}
-	if value := revision(t, stores, "documents", "ns"); value != 0 {
-		t.Fatalf("documents revision = %d, want 0", value)
-	}
-}
-
-func TestLifespanStopClosesQueueClients(t *testing.T) {
-	stores, _, transport := newCacheTestStores(t)
-	stores.CacheSync.Start()
-	stores.CacheSync.Stop()
-	transport.mu.Lock()
-	closed := transport.closed
-	transport.mu.Unlock()
-	if !closed {
-		t.Fatal("Stop() did not close the queue transport")
-	}
-	stores.CacheSync.workerMu.Lock()
-	worker := stores.CacheSync.worker
-	stores.CacheSync.workerMu.Unlock()
-	if worker != nil {
-		t.Fatal("Stop() left a background worker registered")
-	}
-}
-
-func TestSynchronousWriteRefreshNotSkippedWhileRelayIsActive(t *testing.T) {
-	stores, _, _ := newCacheTestStores(t)
-	ctx := context.Background()
-	if err := stores.KnowledgeBases.Create(ctx, cacheTestKnowledgeBase("c")); err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
-	stores.CacheSync.mutex.Lock()
-	defer stores.CacheSync.mutex.Unlock()
-	if err := stores.KnowledgeBases.Update(ctx, cacheTestKnowledgeBase("synchronously-updated")); err != nil {
-		t.Fatalf("Update() error = %v", err)
-	}
-	value, err := stores.Views.KnowledgeBase(ctx, "ns")
-	if err != nil || value["collection"] != "synchronously-updated" {
-		t.Fatalf("KnowledgeBase() = %+v, %v", value, err)
+	if documents, err := stores.Documents.List(ctx, "ns"); err != nil || len(documents) != 0 {
+		t.Fatalf("Documents.List() = %v, %v", documents, err)
 	}
 }

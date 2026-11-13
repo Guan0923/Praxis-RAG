@@ -30,9 +30,9 @@ func TestDocumentProgressFromSourceAggregates(t *testing.T) {
 		ends:      map[int]int64{0: 10, 1: 20},
 		committed: map[int]int64{0: 8, 1: 20},
 	}
-	progress, err := documentProgressFromSource(context.Background(), source, "docs", "docs-workers")
+	progress, err := consumerProgressFromSource(context.Background(), source, "docs", "docs-workers")
 	if err != nil {
-		t.Fatalf("documentProgressFromSource() error = %v", err)
+		t.Fatalf("consumerProgressFromSource() error = %v", err)
 	}
 	if source.calls != 1 {
 		t.Fatalf("source calls = %d, want 1", source.calls)
@@ -58,9 +58,9 @@ func TestDocumentProgressFromSourceNoCommit(t *testing.T) {
 		ends:      map[int]int64{0: 10, 1: 20},
 		committed: map[int]int64{0: -1, 1: -1},
 	}
-	progress, err := documentProgressFromSource(context.Background(), source, "docs", "docs-workers")
+	progress, err := consumerProgressFromSource(context.Background(), source, "docs", "docs-workers")
 	if err != nil {
-		t.Fatalf("documentProgressFromSource() error = %v", err)
+		t.Fatalf("consumerProgressFromSource() error = %v", err)
 	}
 	if progress.CommittedOffset != nil || progress.EndOffset != nil || progress.Lag != nil {
 		t.Fatalf("progress = %+v, want nil numbers", progress)
@@ -75,7 +75,7 @@ func TestDocumentProgressFromSourceNoCommit(t *testing.T) {
 func TestDocumentProgressFromSourceErrors(t *testing.T) {
 	failure := errors.New("broker unavailable")
 	source := &fakeProgressSource{err: failure}
-	progress, err := documentProgressFromSource(context.Background(), source, "docs", "docs-workers")
+	progress, err := consumerProgressFromSource(context.Background(), source, "docs", "docs-workers")
 	if !errors.Is(err, failure) {
 		t.Fatalf("error = %v, want %v", err, failure)
 	}
@@ -83,7 +83,7 @@ func TestDocumentProgressFromSourceErrors(t *testing.T) {
 		t.Fatalf("progress = %+v, want no numbers on error", progress)
 	}
 
-	if _, err := documentProgressFromSource(context.Background(), nil, "docs", "docs-workers"); err == nil {
+	if _, err := consumerProgressFromSource(context.Background(), nil, "docs", "docs-workers"); err == nil {
 		t.Fatal("nil source error = nil, want a failure")
 	}
 }
@@ -118,5 +118,31 @@ func TestDocumentConsumerProgressNotConfigured(t *testing.T) {
 	}
 	if progress.CommittedOffset != nil || progress.EndOffset != nil || progress.Lag != nil {
 		t.Fatalf("progress = %+v, want no numbers", progress)
+	}
+}
+
+// TestConsumerProgressForValidatesIdentity asserts the generic multi-group probe
+// rejects a missing topic/group before dialing (the monitor labels each business
+// group, including the cache and DLQ groups).
+func TestConsumerProgressForValidatesIdentity(t *testing.T) {
+	settings := testSettings(true)
+	for _, item := range []struct {
+		topic, group string
+	}{
+		{topic: "", group: "g"},
+		{topic: "t", group: ""},
+		{topic: "  ", group: "  "},
+	} {
+		progress, err := ConsumerProgressFor(context.Background(), settings, item.topic, item.group)
+		if !errors.Is(err, ErrNotConfigured) {
+			t.Fatalf("ConsumerProgressFor(%q,%q) error = %v, want ErrNotConfigured",
+				item.topic, item.group, err)
+		}
+		if progress.CommittedOffset != nil || progress.EndOffset != nil || progress.Lag != nil {
+			t.Fatalf("progress = %+v, want no numbers", progress)
+		}
+	}
+	if _, err := ConsumerProgressFor(context.Background(), Settings{}, "topic", "group"); !errors.Is(err, ErrNotConfigured) {
+		t.Fatalf("brokerless error = %v, want ErrNotConfigured", err)
 	}
 }

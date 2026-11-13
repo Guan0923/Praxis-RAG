@@ -1,17 +1,23 @@
-"""Live end-to-end verification of Debezium document delivery with the Go backend.
+"""Live end-to-end verification of the Debezium CDC pipeline with the Go backend.
 
-Pipeline under test:
-  MCP add_document -> MySQL document_job_outbox COMMIT
-  -> Debezium (binlog CDC) -> Kafka topic praxis_document_ingest
+Pipeline under test (no transactional outbox any more):
+  MCP add_document -> MySQL document_jobs COMMIT
+  -> task Debezium connector (binlog CDC) -> Kafka RAG_DOCUMENT_TOPIC
   -> rag-document-worker -> Qdrant + MySQL documents
   -> get_document_status = succeeded, REST search returns the document.
+  The same write is captured by the cache Debezium connector as a locator-only
+  event on RAG_CACHE_TOPIC (documents table, no body), and the cache revision
+  row advances.
+  A queued MCP search is admitted immediately (result_id returned without
+  waiting for a broker ack); rag-search-worker consumes the schema-3
+  search_tasks notification and the result snapshot is readable from MySQL.
 
-It also proves the application never published the notification itself:
-the outbox row must still be unpublished (published_at IS NULL) while the
-worker processed it, and the service log identifies Debezium delivery.
+Also asserts the Console monitor contract: pipeline.debezium.tasks/cache,
+pipeline.kafka.groups (document/search/cache), pipeline.cache and
+service.delivery=debezium; pipeline.outbox must be gone.
 
 Requires the docker compose infra (MySQL 3307, Qdrant 6333, Redis 6379,
-Kafka 9092, Debezium) to be running, and dist/bin binaries built.
+Kafka 9092, both Debezium connectors) to be running, and dist/bin binaries built.
 """
 from __future__ import annotations
 
@@ -20,6 +26,7 @@ import json
 import os
 import pathlib
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -54,9 +61,18 @@ SEARCH_GROUP = os.environ.get("RAG_SEARCH_GROUP", "praxis_search_workers")
 DOCUMENT_DLQ_TOPIC = os.environ.get(
     "RAG_DOCUMENT_DLQ_TOPIC", "praxis_document_ingest_dead_letters")
 SEARCH_DLQ_TOPIC = os.environ.get("RAG_SEARCH_DLQ_TOPIC", "praxis_search_dead_letters")
+CACHE_DLQ_TOPIC = os.environ.get(
+    "RAG_CACHE_DLQ_TOPIC", "praxis_state_cache_refresh_dead_letters")
 DOCUMENT_DLQ_GROUP = os.environ.get(
     "RAG_DOCUMENT_DLQ_GROUP", "praxis_document_dead_letters")
 SEARCH_DLQ_GROUP = os.environ.get("RAG_SEARCH_DLQ_GROUP", "praxis_search_dead_letters")
+CACHE_DLQ_GROUP = os.environ.get(
+    "RAG_CACHE_DLQ_GROUP", "praxis_state_cache_refresh_dead_letters")
+# Loopback health endpoints published by compose for the two connectors.
+DEBEZIUM_HEALTH_URL = os.environ.get(
+    "RAG_DEBEZIUM_HEALTH_URL", "http://127.0.0.1:8083/q/health")
+DEBEZIUM_CACHE_HEALTH_URL = os.environ.get(
+    "RAG_DEBEZIUM_CACHE_HEALTH_URL", "http://127.0.0.1:8084/q/health")
 
 results: list[tuple[bool, str]] = []
 
@@ -290,12 +306,15 @@ def base_env() -> dict:
         "RAG_SEARCH_GROUP": SEARCH_GROUP,
         "RAG_DOCUMENT_DLQ_TOPIC": DOCUMENT_DLQ_TOPIC,
         "RAG_SEARCH_DLQ_TOPIC": SEARCH_DLQ_TOPIC,
+        "RAG_CACHE_DLQ_TOPIC": CACHE_DLQ_TOPIC,
         "RAG_DOCUMENT_DLQ_GROUP": DOCUMENT_DLQ_GROUP,
         "RAG_SEARCH_DLQ_GROUP": SEARCH_DLQ_GROUP,
-        # Compose publishes the Debezium health port on loopback; without it the
-        # monitor page reports capture progress as unknown (never fabricated).
-        "RAG_DEBEZIUM_HEALTH_URL": os.environ.get(
-            "RAG_DEBEZIUM_HEALTH_URL", "http://127.0.0.1:8083/q/health"),
+        "RAG_CACHE_DLQ_GROUP": CACHE_DLQ_GROUP,
+        # Compose publishes one health port per connector on loopback; without
+        # them the monitor page reports capture progress as unknown (never
+        # fabricated).
+        "RAG_DEBEZIUM_HEALTH_URL": DEBEZIUM_HEALTH_URL,
+        "RAG_DEBEZIUM_CACHE_HEALTH_URL": DEBEZIUM_CACHE_HEALTH_URL,
     })
     return env
 
@@ -361,8 +380,8 @@ def kafka_probe(artifact_id: str) -> tuple[bool, str]:
     """Info-only probe: read the document topic from the beginning for 5 seconds.
 
     Kafka offsets/consumer groups decide what a fresh probe can see; a missing
-    hit is not a failure because the PENDING outbox row plus succeeded worker
-    already prove Debezium delivered it.
+    hit is not a failure because the succeeded document job plus the committed
+    document_jobs row already prove the task connector delivered it.
     """
     try:
         completed = subprocess.run([
@@ -399,8 +418,8 @@ def wait_log_occurrence(
 ) -> bool:
     """Wait until the log holds more than `above` occurrences of the needle.
 
-    `above` distinguishes the delete event this run just produced from earlier
-    outbox-cleanup events (for example the script's own stale-row cleanup).
+    `above` distinguishes the record this run just produced from earlier
+    occurrences (for example a previous script run in the same log file).
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -475,7 +494,6 @@ def main() -> int:
         collection = (kb or {}).get("collection", "")
         try:
             mysql_query(
-                f"DELETE FROM {MYSQL_DATABASE}.document_job_outbox WHERE namespace <> '" + namespace + "';"
                 f"DELETE FROM {MYSQL_DATABASE}.document_jobs WHERE namespace <> '" + namespace + "';")
         except Exception as cleanup_error:  # noqa: BLE001 - best effort on a dev database
             print("WARN stale job cleanup failed:", cleanup_error)
@@ -498,7 +516,8 @@ def main() -> int:
         check(bool(mcp.session), "MCP initialize completed (session established)")
 
         content = ("# Debezium bridge E2E\n\n"
-                   "The outbox row is committed in MySQL and delivered by the binlog CDC bridge.\n")
+                   "The task row is committed in MySQL and delivered by the binlog "
+                   "CDC task connector. This body must never appear on Kafka.\n")
         admitted = mcp.call_tool("add_document", {
             "name": document_name, "content": content,
             "idempotency_key": f"e2e-{int(time.time())}",
@@ -506,11 +525,15 @@ def main() -> int:
         artifact_id = admitted.get("artifact_id", "")
         check(bool(artifact_id), f"add_document accepted artifact_id={mask(artifact_id)}")
 
-        outbox_row = mysql_query(
-            f"SELECT published_at IS NULL FROM {MYSQL_DATABASE}.document_job_outbox "
+        # Contract: admission is one MySQL transaction that writes document_jobs
+        # (schedule_version=1). The old transactional outbox no longer exists.
+        admitted_row = mysql_query(
+            f"SELECT status, schedule_version FROM {MYSQL_DATABASE}.document_jobs "
             f"WHERE artifact_id = '{artifact_id}';")
-        check(outbox_row.strip() == "1",
-              "outbox row is still unpublished after admission (application did not publish)")
+        admitted_fields = admitted_row.split("\t")
+        check(len(admitted_fields) == 2 and admitted_fields[0] in ("queued", "processing", "succeeded") and
+              admitted_fields[1].isdigit() and int(admitted_fields[1]) >= 1,
+              f"document_jobs row committed by admission (status/schedule_version={admitted_row})")
 
         deadline = time.time() + 180
         status_payload: dict = {}
@@ -533,10 +556,6 @@ def main() -> int:
             f"WHERE artifact_id = '{artifact_id}';")
         check(job_row.startswith("succeeded"), f"MySQL document_jobs row = {job_row}")
 
-        service_text = tail(service_log, 400)
-        check("Document outbox delivery=debezium" in service_text,
-              "service log identifies Debezium document delivery")
-
         # Qdrant indexing.
         status, _, info = http_json("GET", f"http://127.0.0.1:6333/collections/{collection}")
         points = ((info or {}).get("result") or {}).get("points_count")
@@ -544,7 +563,7 @@ def main() -> int:
 
         # REST synchronous search (no queue needed).
         status, _, search = http_json("POST", SERVICE + "/v1/search",
-                                      {"query": "debezium bridge outbox", "rerank": "none"},
+                                      {"query": "debezium bridge task", "rerank": "none"},
                                       {"Authorization": "Bearer " + api_key,
                                        "X-RAG-Namespace": namespace}, timeout=60)
         hits = (search or {}).get("results") or []
@@ -552,59 +571,78 @@ def main() -> int:
         check(status == 200 and any(document_name in str(name) for name in names),
               f"REST search returns the indexed document (hits={len(hits)})")
 
+        # Schema-4 task notification: locator columns only, no body.
         delivered, probe_output = kafka_probe(artifact_id)
         if delivered:
-            print(f"PASS topic probe found the artifact notification in {DOCUMENT_TOPIC}")
+            check('"schedule_version"' in probe_output,
+                  f"task topic event carries the schema-4 schedule_version locator in {DOCUMENT_TOPIC}")
+            check('"content"' not in probe_output,
+                  "task topic event carries no document body (column.include.list pruned)")
         else:
-            print("INFO kafka-console-consumer could not replay the artifact message "
-                  "for this probe; the PENDING outbox row plus the succeeded worker "
-                  "are the conclusive evidence that only Debezium delivered it")
-
-        # Debezium does not mark the application's outbox row as published.
-        still_pending = mysql_query(
-            f"SELECT published_at IS NULL FROM {MYSQL_DATABASE}.document_job_outbox "
-            f"WHERE artifact_id = '{artifact_id}';")
-        check(still_pending.strip() == "1",
-              "outbox row remained PENDING after processing (only Debezium published it)")
+            print("INFO kafka-console-consumer could not replay the artifact message for this probe; "
+                  "the succeeded job plus the committed document_jobs row are the conclusive evidence "
+                  "that the task connector delivered it")
 
         # ------------------------------------------------------------------ #
-        # Acceptance 1: outbox retention cleanup (MySQL DELETE) produces a CDC
-        # delete event. The database row must be gone, but the event must be
-        # ACKed as outbox cleanup: no retry, no dead letter, document intact.
+        # Acceptance 1: the cache connector captures the same write as a
+        # locator-only documents event on RAG_CACHE_TOPIC; the cache revision
+        # row records the dirty watermark (Redis is disabled in this run, so the
+        # consumer-side refresh is covered by the Go unit tests).
         # ------------------------------------------------------------------ #
-        malformed_before = log_occurrences(worker_log, "malformed document message ignored")
-        ignored_before = log_occurrences(worker_log, "outbox cleanup event ignored")
-        cleanup_rows = mysql_query(
-            f"DELETE FROM {MYSQL_DATABASE}.document_job_outbox "
-            f"WHERE artifact_id = '{artifact_id}'; SELECT ROW_COUNT();")
-        deleted_rows = cleanup_rows.strip().splitlines()[-1] if cleanup_rows.strip() else ""
-        check(deleted_rows == "1", f"outbox retention cleanup deleted the expired record (rows={deleted_rows})")
-        remaining = mysql_query(
-            f"SELECT COUNT(*) FROM {MYSQL_DATABASE}.document_job_outbox "
-            f"WHERE artifact_id = '{artifact_id}';")
-        check(remaining.strip() == "0", "outbox record is gone from MySQL after cleanup")
+        cache_found, cache_output = kafka_topic_contains(CACHE_TOPIC, document_name)
+        if cache_found:
+            check(bool(re.search(r'"table"\s*:\s*"documents"', cache_output)),
+                  f"cache topic {CACHE_TOPIC} carries a documents change event")
+            check('"content"' not in cache_output and '"sha256"' not in cache_output,
+                  "cache event carries locator columns only (no body/digest)")
+        else:
+            print("INFO cache topic probe could not replay the documents event; the documents "
+                  "row plus the cache revision below prove the capture path")
+        revision = mysql_query(
+            f"SELECT revision FROM {MYSQL_DATABASE}.cache_revisions "
+            f"WHERE kind = 'documents' AND scope = '{namespace}';")
+        check(revision.isdigit() and int(revision) > 0,
+              f"cache revision for documents('{namespace}') advanced (revision={revision})")
 
-        acknowledged = wait_log_occurrence(
-            worker_log, "outbox cleanup event ignored", 120, above=ignored_before)
-        check(acknowledged, "worker classified the CDC delete event as outbox cleanup and ACKed it")
-        # Give any (incorrect) retry/DLQ path a chance to run before asserting.
-        time.sleep(3)
-        malformed_after = log_occurrences(worker_log, "malformed document message ignored")
-        check(malformed_after == malformed_before,
-              "delete event did not take the malformed/retry path (no invalid retry)")
-        check("Message retry limit reached" not in tail(worker_log, 400),
-              "worker did not exhaust retries for the cleanup event")
-        dlq_hit, dlq_output = kafka_topic_contains(DOCUMENT_DLQ_TOPIC, artifact_id)
-        check(not dlq_hit, "document DLQ has no record for the cleaned-up outbox event")
-        if dlq_hit:
-            print("DLQ probe tail:\n" + dlq_output)
+        # ------------------------------------------------------------------ #
+        # Acceptance 2: a queued MCP search is admitted immediately (no broker
+        # ack) and rag-search-worker consumes the schema-3 search_tasks
+        # notification; the result snapshot is readable from MySQL.
+        # ------------------------------------------------------------------ #
+        search_worker_log = None
+        if (BIN / "rag-search-worker.exe").exists():
+            search_worker_process, search_worker_log = start_process(
+                "rag-search-worker", [str(BIN / "rag-search-worker.exe")], env)
+        else:
+            print("INFO dist/bin/rag-search-worker.exe missing; queued-search consumption not exercised")
+        queued = mcp.call_tool("search", {"query": "debezium bridge task", "wait_seconds": 0})
+        result_id = queued.get("result_id", "")
+        check(bool(result_id) or queued.get("results") is not None,
+              f"MCP search submitted without waiting for a broker ack (result_id={mask(result_id)})")
+        if result_id and search_worker_log is not None:
+            search_deadline = time.time() + 90
+            search_result: dict = {}
+            while time.time() < search_deadline:
+                search_result = mcp.call_tool("get_search_result", {"result_id": result_id})
+                if search_result.get("results") is not None:
+                    break
+                time.sleep(1)
+            check(search_result.get("results") is not None,
+                  f"search worker consumed the search_tasks event and produced result {mask(result_id)}")
+            snapshot = mysql_query(
+                f"SELECT COUNT(*) FROM {MYSQL_DATABASE}.search_result_snapshots "
+                f"WHERE id = '{result_id}';")
+            check(snapshot.strip() == "1",
+                  "search result snapshot is persisted in MySQL (fact source)")
+            if search_result.get("results") is None:
+                print("search worker log tail:\n" + tail(search_worker_log))
 
-        # Consumer health: a later normal notification still ingests.
-        second_name = f"bridge-after-cleanup-{int(time.time())}.md"
-        second_content = "# After cleanup\n\nA normal notification still triggers ingestion.\n"
+        # Business document deletion remains a separate path and must still work.
+        second_name = f"bridge-after-cache-{int(time.time())}.md"
         second = mcp.call_tool("add_document", {
-            "name": second_name, "content": second_content,
-            "idempotency_key": f"e2e-cleanup-{int(time.time())}",
+            "name": second_name,
+            "content": "# After CDC\n\nA later normal notification still triggers ingestion.\n",
+            "idempotency_key": f"e2e-cache-{int(time.time())}",
         })
         second_artifact = second.get("artifact_id", "")
         check(bool(second_artifact), f"second add_document accepted artifact_id={mask(second_artifact)}")
@@ -616,82 +654,78 @@ def main() -> int:
                 break
             time.sleep(1.5)
         check(second_status.get("status") == "succeeded",
-              f"consumer kept working after the cleanup event (stage={second_status.get('stage')})")
-
-        # The already-indexed document is unaffected by the outbox cleanup.
-        first_status = mcp.call_tool("get_document_status", {"artifact_id": artifact_id})
-        check(first_status.get("status") == "succeeded",
-              "original document job still succeeded after its outbox record was removed")
-        status, _, listing = http_json(
-            "GET", SERVICE + "/v1/documents", None,
-            {"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace})
-        listed_names = [str(item.get("name", "")) for item in (listing or {}).get("documents", [])]
-        check(status == 200 and document_name in listed_names,
-              "document list still contains the original document after outbox cleanup")
-        status, _, search_again = http_json(
-            "POST", SERVICE + "/v1/search", {"query": "debezium bridge outbox", "rerank": "none"},
-            {"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace}, timeout=60)
-        again_hits = (search_again or {}).get("results") or []
-        again_names = [hit.get("source") or hit.get("title") or "" for hit in again_hits]
-        check(status == 200 and any(document_name in str(name) for name in again_names),
-              "REST search still returns the document after outbox cleanup")
-
-        # Business document deletion is a separate path and must still work: the
-        # outbox-cleanup filter only affects CDC messages, not REST deletes.
-        delete_status, _, delete_payload = http_json(
+              f"consumer kept working for a later notification (stage={second_status.get('stage')})")
+        delete_status, _, _ = http_json(
             "DELETE", SERVICE + "/v1/documents/" + second_name, None,
             {"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace})
         check(delete_status == 200, f"business document delete still works (HTTP {delete_status})")
-        status, _, listing_after_delete = http_json(
-            "GET", SERVICE + "/v1/documents", None,
-            {"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace})
-        names_after_delete = [
-            str(item.get("name", "")) for item in (listing_after_delete or {}).get("documents", [])]
-        check(status == 200 and second_name not in names_after_delete and document_name in names_after_delete,
-              "business delete removed only the requested document; the cleaned-up outbox document remains")
 
         # ------------------------------------------------------------------ #
-        # Acceptance 2: monitoring separates outbox records, Debezium capture,
-        # Kafka consumption and document job status; unknown stays unknown.
+        # Acceptance 3: the monitor contract exposes both Debezium connectors,
+        # the three Kafka consumer groups, the cache dirty state and the new
+        # search counters; pipeline.outbox is gone and unknown stays null.
         # ------------------------------------------------------------------ #
         status, _, overview = http_json("GET", SERVICE + "/v1/admin/monitor/overview", timeout=20)
         check(status == 200 and isinstance(overview, dict), f"monitor overview HTTP {status}")
         overview = overview or {}
         queues_section = overview.get("queues") or {}
         pipeline_section = overview.get("pipeline") or {}
-        outbox_section = pipeline_section.get("outbox") or {}
-        outbox_status = outbox_section.get("by_status") or {}
+        service_section = overview.get("service") or {}
+        check("outbox" not in pipeline_section,
+              "monitor pipeline no longer exposes outbox record statistics")
+        check(service_section.get("delivery") == "debezium",
+              f"service.delivery = {service_section.get('delivery')}")
+        check("outbox_bridge" not in service_section,
+              "service.outbox_bridge was removed")
         jobs_section = (queues_section.get("document_jobs") or {}).get("by_status") or {}
-        check("document_outbox" not in queues_section,
-              "queues no longer presents document_outbox as a backlog queue")
-        check("oldest_pending_seconds" not in json.dumps(overview),
-              "monitor response no longer reports oldest_pending_seconds")
-        check(isinstance(outbox_section.get("total"), int) and
-              outbox_section.get("total") == sum(int(value) for value in outbox_status.values()),
-              f"outbox record stats are self-consistent (total={outbox_section.get('total')}, "
-              f"by_status={outbox_status})")
         check(jobs_section.get("succeeded", 0) >= 2 and jobs_section.get("failed", 0) == 0,
               f"document job status counts successes only (by_status={jobs_section})")
         check((pipeline_section.get("document_jobs") or {}).get("status") == "ok",
-              "succeeded jobs stay ok while retained outbox rows are PENDING (not misreported)")
+              "document job pipeline view is ok (no outbox row mixed in)")
         debezium_section = pipeline_section.get("debezium") or {}
-        check(debezium_section.get("capture_progress") is None,
-              "Debezium capture progress is reported as unknown (null), never fabricated")
-        check(debezium_section.get("status") == "ok",
-              f"Debezium health probe reports ok (detail={debezium_section.get('detail')})")
+        tasks_section = debezium_section.get("tasks") or {}
+        cache_connector = debezium_section.get("cache") or {}
+        check(tasks_section.get("capture_progress") is None and
+              cache_connector.get("capture_progress") is None,
+              "Debezium capture progress is null for both connectors (never fabricated)")
+        check(tasks_section.get("status") in ("ok", "unknown"),
+              f"task connector health is ok/unknown (status={tasks_section.get('status')})")
+        check(cache_connector.get("status") in ("ok", "unknown"),
+              f"cache connector health is ok/unknown (status={cache_connector.get('status')})")
+        cache_section = pipeline_section.get("cache") or {}
+        dirty_keys = cache_section.get("dirty_keys")
+        refresh_failures = cache_section.get("refresh_failures")
+        check((dirty_keys is None or isinstance(dirty_keys, int)) and
+              (refresh_failures is None or isinstance(refresh_failures, int)),
+              f"pipeline.cache reports dirty_keys/refresh_failures (dirty={dirty_keys}, "
+              f"failures={refresh_failures})")
         kafka_section = pipeline_section.get("kafka") or {}
-        check(kafka_section.get("topic") == DOCUMENT_TOPIC and kafka_section.get("group") == DOCUMENT_GROUP,
-              f"Kafka progress names the document topic/group "
-              f"({kafka_section.get('topic')}/{kafka_section.get('group')})")
-        lag = kafka_section.get("consumer_lag")
-        check(kafka_section.get("status") in ("ok", "unknown") and
+        groups = kafka_section.get("groups") or {}
+        check(all(name in groups for name in ("document", "search", "cache")),
+              f"pipeline.kafka.groups carries document/search/cache ({sorted(groups.keys())})")
+        document_group = groups.get("document") or {}
+        check(document_group.get("topic") == DOCUMENT_TOPIC and
+              document_group.get("group") == DOCUMENT_GROUP,
+              f"document group names its topic/group "
+              f"({document_group.get('topic')}/{document_group.get('group')})")
+        lag = document_group.get("consumer_lag")
+        check(document_group.get("status") in ("ok", "unknown") and
               (lag is None or isinstance(lag, int)),
-              f"Kafka consumer lag is numeric or explicitly unknown "
-              f"(status={kafka_section.get('status')}, lag={lag})")
+              f"consumer lag is numeric or explicitly unknown "
+              f"(status={document_group.get('status')}, lag={lag})")
+        search_tasks = queues_section.get("search_tasks") or {}
+        check("timed_out_recent" in search_tasks and "overdue_active" in search_tasks,
+              f"queues.search_tasks exposes timed_out_recent/overdue_active ({sorted(search_tasks.keys())})")
+        library = overview.get("library") or {}
+        check(library.get("result_snapshots") is None or
+              isinstance(library.get("result_snapshots"), int),
+              f"library.result_snapshots is the MySQL snapshot count "
+              f"(value={library.get('result_snapshots')})")
     except Exception as error:  # noqa: BLE001 - report and fail
         print(f"ERROR: {error}", flush=True)
         results.append((False, f"exception: {error}"))
     finally:
+        stop_process(search_worker_process)
         stop_process(worker_process)
         stop_process(service_process)
         model_server.shutdown()

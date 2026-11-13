@@ -14,19 +14,19 @@ type CacheKey struct {
 	Scope string
 }
 
-// cacheKinds mirrors cache_events.KINDS.
+// cacheKinds is the set of read-model kinds owned by the state layer: every
+// kind with a registered refresh loader (see NewCachedReadViews). Unused kinds
+// (document_status/search_status) were removed together with cache_outbox.
 var cacheKinds = map[string]struct{}{
-	"kb_public":       {},
-	"kb_list":         {},
-	"documents":       {},
-	"catalog":         {},
-	"api_keys":        {},
-	"heads":           {},
-	"leases":          {},
-	"upload_status":   {},
-	"upload_list":     {},
-	"document_status": {},
-	"search_status":   {},
+	"kb_public":     {},
+	"kb_list":       {},
+	"documents":     {},
+	"catalog":       {},
+	"api_keys":      {},
+	"heads":         {},
+	"leases":        {},
+	"upload_status": {},
+	"upload_list":   {},
 }
 
 // knowledgeKeys mirrors cache_events.knowledge_keys.
@@ -51,12 +51,10 @@ func catalogKeys(namespace string) []CacheKey {
 	return []CacheKey{{Kind: "catalog", Scope: namespace}}
 }
 
-// touch mirrors cache_events.touch: bump every read-model revision and append
-// one PENDING outbox event per key inside the caller's transaction. Sorted,
-// de-duplicated acquisition order prevents cross-kind lock inversion. The Redis
-// publication side (CacheSynchronizer.flush_pending) is deferred to a later
-// round, but the transactional rows are written now so revisions stay correct.
-func touch(ctx context.Context, tx *sql.Tx, keys ...CacheKey) ([]string, error) {
+// sortedCacheKeys validates, de-duplicates and sorts cache keys by (kind,
+// scope), which is the single global acquisition order for cache_revisions
+// rows. Sorted acquisition prevents cross-kind lock inversion between writers.
+func sortedCacheKeys(keys []CacheKey) ([]CacheKey, error) {
 	pending := make([]CacheKey, 0, len(keys))
 	seen := make(map[CacheKey]struct{}, len(keys))
 	for _, key := range keys {
@@ -75,36 +73,47 @@ func touch(ctx context.Context, tx *sql.Tx, keys ...CacheKey) ([]string, error) 
 		}
 		return pending[left].Scope < pending[right].Scope
 	})
+	return pending, nil
+}
 
-	insertRevision := "INSERT INTO cache_revisions (kind, scope, revision) VALUES (?, ?, 0) " +
-		"ON DUPLICATE KEY UPDATE revision = revision"
-	eventIDs := make([]string, 0, len(pending))
-	for _, key := range pending {
-		if _, err := tx.ExecContext(ctx, insertRevision, key.Kind, key.Scope); err != nil {
-			return nil, err
-		}
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE cache_revisions SET revision = revision + 1 WHERE kind = ? AND scope = ?",
-			key.Kind, key.Scope); err != nil {
-			return nil, err
-		}
-		var revision int64
-		if err := tx.QueryRowContext(ctx,
-			"SELECT revision FROM cache_revisions WHERE kind = ? AND scope = ?",
-			key.Kind, key.Scope).Scan(&revision); err != nil {
-			return nil, err
-		}
-		eventID, err := uuid4Hex()
-		if err != nil {
-			return nil, err
-		}
-		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO cache_outbox (id, kind, scope, revision, status, attempts, retry_at, created_at) "+
-				"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-			eventID, key.Kind, key.Scope, revision, "PENDING", 0, 0.0, unixSeconds()); err != nil {
-			return nil, err
-		}
-		eventIDs = append(eventIDs, eventID)
+// knownCacheKinds returns the registered kinds in deterministic order. The
+// dirty sweep uses it to ignore revision rows for retired kinds, which could
+// otherwise occupy every batch forever (no loader can rebuild them).
+func knownCacheKinds() []string {
+	kinds := make([]string, 0, len(cacheKinds))
+	for kind := range cacheKinds {
+		kinds = append(kinds, kind)
 	}
-	return eventIDs, nil
+	sort.Strings(kinds)
+	return kinds
+}
+
+// bumpRevisionTx bumps one read-model revision inside the caller's transaction.
+// cache_revisions is the only durable cache signal: Debezium captures the
+// business-table change and the cache consumer rebuilds the affected scope from
+// MySQL. No outbox row is written.
+func bumpRevisionTx(ctx context.Context, tx *sql.Tx, key CacheKey, updatedAt float64) error {
+	_, err := tx.ExecContext(ctx,
+		"INSERT INTO cache_revisions (kind, scope, revision, updated_at) VALUES (?, ?, 1, ?) "+
+			"ON DUPLICATE KEY UPDATE revision = revision + 1, updated_at = ?",
+		key.Kind, key.Scope, updatedAt, updatedAt)
+	return err
+}
+
+// touch mirrors cache_events.touch: bump every read-model revision inside the
+// caller's transaction. The legacy event-id return value is kept for call-site
+// compatibility and is always nil; the revision water line replaces the
+// transactional outbox.
+func touch(ctx context.Context, tx *sql.Tx, keys ...CacheKey) ([]string, error) {
+	pending, err := sortedCacheKeys(keys)
+	if err != nil {
+		return nil, err
+	}
+	updatedAt := unixSeconds()
+	for _, key := range pending {
+		if err := bumpRevisionTx(ctx, tx, key, updatedAt); err != nil {
+			return nil, err
+		}
+	}
+	return nil, nil
 }

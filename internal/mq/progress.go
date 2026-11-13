@@ -3,6 +3,7 @@ package mq
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -39,21 +40,38 @@ type documentProgressSource interface {
 // it only reads topic metadata, the per-partition end offsets and the committed
 // group offsets, so it is safe to call from a monitoring request.
 func DocumentConsumerProgress(ctx context.Context, settings Settings) (ConsumerProgress, error) {
+	return ConsumerProgressFor(ctx, settings, settings.DocumentTopic, settings.DocumentGroup)
+}
+
+// ConsumerProgressFor reads one consumer group's committed offsets against one
+// topic's end offsets. The monitor uses it for every business group (document,
+// search, cache) and their DLQ handlers; it never joins a consumer group, so a
+// monitoring request cannot trigger a rebalance or steal an assignment.
+//
+// An empty topic/group returns ErrNotConfigured; an unknown group (no committed
+// offsets yet) yields nil pointers, which callers render as 未知, never as zero.
+func ConsumerProgressFor(ctx context.Context, settings Settings, topic, group string) (ConsumerProgress, error) {
+	topic = strings.TrimSpace(topic)
+	group = strings.TrimSpace(group)
 	if !settings.Configured() {
-		return ConsumerProgress{}, newSafeError(ErrNotConfigured, "document consumer progress", nil)
+		return ConsumerProgress{}, newSafeError(ErrNotConfigured, "consumer progress", nil)
+	}
+	if topic == "" || group == "" {
+		return ConsumerProgress{Topic: topic, Group: group},
+			newSafeError(ErrNotConfigured, "consumer progress", nil)
 	}
 	source, err := newKafkaProgressSource(settings)
 	if err != nil {
 		return ConsumerProgress{}, err
 	}
-	return documentProgressFromSource(ctx, source, settings.DocumentTopic, settings.DocumentGroup)
+	return consumerProgressFromSource(ctx, source, topic, group)
 }
 
-// documentProgressFromSource reads one progress observation through the seam and
+// consumerProgressFromSource reads one progress observation through the seam and
 // aggregates it.
-func documentProgressFromSource(ctx context.Context, source documentProgressSource, topic, group string) (ConsumerProgress, error) {
+func consumerProgressFromSource(ctx context.Context, source documentProgressSource, topic, group string) (ConsumerProgress, error) {
 	if source == nil {
-		return ConsumerProgress{}, newSafeError(ErrConsumerFailed, "document consumer progress", nil)
+		return ConsumerProgress{}, newSafeError(ErrConsumerFailed, "consumer progress", nil)
 	}
 	ends, committed, err := source.offsets(ctx, topic, group)
 	if err != nil {

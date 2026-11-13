@@ -11,9 +11,10 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
-// searchSubmissionFailedMessage mirrors service_knowledge.submit_search's
-// safe fail-closed message when queue acceptance cannot be confirmed.
-const searchSubmissionFailedMessage = "Search submission unavailable; queue acceptance was not confirmed"
+// searchSubmissionFailedMessage is the safe fail-closed message when the
+// accepted search task cannot be persisted. Acceptance is a MySQL commit; it
+// does not depend on the broker.
+const searchSubmissionFailedMessage = "Search submission unavailable"
 
 // searchWaitPollInterval mirrors rag_mcp.mcp_http.search_queued's 0.1s poll.
 const searchWaitPollInterval = 100 * time.Millisecond
@@ -42,24 +43,24 @@ func searchArguments(request contracts.SearchRequest) map[string]any {
 	}
 }
 
-// submitSearchTask is the admission half behind Service.SubmitSearch. It
-// persists the task + outbox atomically through the dispatcher, which publishes
-// the envelope and fails the task when acceptance is not confirmed.
+// submitSearchTask is the admission half behind Service.SubmitSearch. It commits
+// the durable search_tasks row (arguments, deadline, queued, schedule_version=1)
+// and returns the result id. Debezium picks the committed row up and routes an
+// identifier-only notification to the search consumer; a broker outage does not
+// change acceptance, the task simply stays queued until delivery resumes.
 func (s *Service) submitSearchTask(
 	ctx context.Context,
 	namespace string,
 	request contracts.SearchRequest,
 ) (string, error) {
-	dispatcher := s.stores.SearchDispatcher
-	if dispatcher == nil || dispatcher.Publisher == nil {
-		// Fail closed: no result ids without a broker-backed queue.
+	if s.stores.SearchTasks == nil {
 		return "", &apierrors.KnowledgeError{Message: searchSubmissionFailedMessage}
 	}
-	envelope, err := dispatcher.Submit(ctx, namespace, searchArguments(request))
+	notification, err := s.stores.SearchTasks.Submit(ctx, namespace, searchArguments(request), nil)
 	if err != nil {
 		return "", searchSubmissionError(err)
 	}
-	return envelope.ResultID, nil
+	return notification.ResultID, nil
 }
 
 // searchSubmissionError mirrors service_knowledge.submit_search: knowledge and
@@ -173,13 +174,13 @@ func searchResultReadError(err error) error {
 // worker) can exercise the exact worker contract: claim, execute, complete.
 func (s *Service) executeQueuedSearchTaskOnce(
 	ctx context.Context,
-	envelope state.SearchEnvelope,
+	notification state.SearchNotification,
 	executor func(ctx context.Context, namespace string, arguments map[string]any) (map[string]any, error),
 ) error {
 	if s.stores.SearchTasks == nil {
 		return nil
 	}
-	task, err := s.stores.SearchTasks.Claim(ctx, envelope)
+	task, err := s.stores.SearchTasks.Claim(ctx, notification)
 	if err != nil || task == nil {
 		return err
 	}

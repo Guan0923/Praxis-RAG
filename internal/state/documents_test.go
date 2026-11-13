@@ -211,9 +211,6 @@ func TestDocumentUpsertTransactionRollsBack(t *testing.T) {
 	if revisions := revisionCount(t, stores); revisions != 0 {
 		t.Fatalf("rollback left %d cache revisions", revisions)
 	}
-	if events := outboxCount(t, stores); events != 0 {
-		t.Fatalf("rollback left %d outbox events", events)
-	}
 }
 
 func TestDocumentDeleteTransactionRollsBack(t *testing.T) {

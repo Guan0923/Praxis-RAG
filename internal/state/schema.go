@@ -415,23 +415,16 @@ var schemaTables = []*SchemaTable{
 			identifier("kind", 32).PK(),
 			identifier("scope", 64).PK(),
 			bigint("revision"),
-		},
-	},
-	{
-		Name: "cache_outbox",
-		Columns: []SchemaColumn{
-			identifier("id", 32).PK(),
-			identifier("kind", 32),
-			identifier("scope", 64),
-			bigint("revision"),
-			identifier("status", 24),
-			integer("attempts"),
-			double("retry_at"),
-			double("created_at"),
-			double("completed_at").Null(),
+			// refreshed_revision is the watermark of the last successfully
+			// published Redis value; refreshed_revision < revision (or a
+			// non-NULL last_error) marks a dirty key that the cache consumer
+			// must rebuild. The columns are appended last so a migrated
+			// database keeps the same column order as a freshly created one.
+			bigint("refreshed_revision").Default("0"),
+			integer("attempts").Default("0"),
 			identifier("last_error", 128).Null(),
+			double("updated_at").Default("0"),
 		},
-		Indexes: []SchemaIndex{index("ix_cache_outbox_pending", "status", "retry_at")},
 	},
 	{
 		Name: "search_result_snapshots",
@@ -468,10 +461,10 @@ var schemaTables = []*SchemaTable{
 			index("ix_artifact_namespace", "namespace"),
 		},
 	},
-	// Retired tables: retained so existing databases keep their history, but
-	// they are no longer read or written. The active path is document_jobs +
-	// document_job_outbox (MySQL is the source of truth, Kafka carries a
-	// notification only).
+	// Retired table: retained so existing databases keep their history, but it
+	// is no longer read or written. The active path is document_jobs, which
+	// Debezium collects directly (schedule_version changes are the only UPDATE
+	// signal a consumer needs).
 	{
 		Name: "document_tasks",
 		Columns: []SchemaColumn{
@@ -500,20 +493,6 @@ var schemaTables = []*SchemaTable{
 		},
 	},
 	{
-		Name: "document_task_outbox",
-		Columns: []SchemaColumn{
-			identifier("artifact_id", 36).PK(),
-			boolean("pending"),
-			bigint("generation"),
-			double("retry_at"),
-			identifier("owner", 32).Null(),
-			double("lease_until").Default("0"),
-			integer("attempts").Default("0"),
-			text("last_error").Null(),
-		},
-		Indexes: []SchemaIndex{index("ix_document_task_dispatch", "pending", "retry_at")},
-	},
-	{
 		Name: "document_jobs",
 		Columns: []SchemaColumn{
 			identifier("artifact_id", 36).PK(),
@@ -538,31 +517,15 @@ var schemaTables = []*SchemaTable{
 			text("error").Null(),
 			double("created_at"),
 			double("updated_at"),
+			// schedule_version is the scheduling generation Debezium watches:
+			// it starts at 1 and is incremented inside the MySQL transaction
+			// that requeues a job (stranded/expired lease/retryable failure).
+			bigint("schedule_version").Default("1"),
 		},
 		Uniques: []SchemaUnique{unique("uq_document_job_idempotency", "namespace", "idempotency_key")},
 		Indexes: []SchemaIndex{
 			index("ix_document_job_name", "namespace", "name_key", "status"),
 			index("ix_document_job_recovery", "status", "lease_until"),
-		},
-	},
-	{
-		Name: "document_job_outbox",
-		Columns: []SchemaColumn{
-			identifier("id", 32).PK(),
-			identifier("artifact_id", 36),
-			identifier("namespace", 64),
-			identifier("name", 200),
-			identifier("status", 16),
-			integer("attempts").Default("0"),
-			double("retry_at").Default("0"),
-			double("created_at"),
-			double("published_at").Null(),
-			identifier("last_error", 128).Null(),
-		},
-		Indexes: []SchemaIndex{
-			index("ix_document_job_outbox_pending", "status", "retry_at"),
-			index("ix_document_job_outbox_artifact", "artifact_id"),
-			index("ix_document_job_outbox_age", "created_at"),
 		},
 	},
 	{
@@ -580,22 +543,16 @@ var schemaTables = []*SchemaTable{
 			double("deadline"),
 			double("created_at"),
 			double("updated_at"),
+			// schedule_version is the scheduling generation Debezium watches:
+			// it starts at 1 and is incremented inside the MySQL transaction
+			// that requeues a task (retryable failure or cutover backfill).
+			bigint("schedule_version").Default("1"),
 		},
 		Indexes: []SchemaIndex{
 			index("ix_search_tasks_deadline", "status", "deadline"),
 			index("ix_search_tasks_recovery", "status", "lease_until", "updated_at"),
 			index("ix_search_tasks_namespace", "namespace"),
 		},
-	},
-	{
-		Name: "search_task_outbox",
-		Columns: []SchemaColumn{
-			identifier("result_id", 36).PK(),
-			boolean("pending"),
-			bigint("generation"),
-			double("retry_at"),
-		},
-		Indexes: []SchemaIndex{index("ix_search_task_dispatch", "pending", "retry_at")},
 	},
 	// users + user_sessions back the Console login/registration flow. The
 	// password hash is a self-describing PBKDF2 string; session tokens are only
@@ -820,6 +777,18 @@ var schemaTables = []*SchemaTable{
 			double("updated_at"),
 		},
 		Indexes: []SchemaIndex{index("ix_runtime_heartbeats_role", "role", "updated_at")},
+	},
+	// cdc_cutover_state holds the Debezium cutover bookkeeping written by the
+	// rag-cdc-cutover CLI: cdc_start_file, cdc_start_pos, cutover_at,
+	// schedule_baseline and phase. It is a Go-only addition appended after the
+	// ported tables so a migrated database and a freshly created one keep the
+	// same table order.
+	{
+		Name: "cdc_cutover_state",
+		Columns: []SchemaColumn{
+			identifier("k", 64).PK(),
+			longText("v"),
+		},
 	},
 }
 

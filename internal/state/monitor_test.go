@@ -44,12 +44,6 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	nowUnix := float64(now.Unix())
 	queuedAge := 2 * 60 * 60.0   // 2h
 	activeSearchAge := 20 * 60.0 // 20m
-	// The PUBLISHED row is intentionally older than the PENDING row: the outbox
-	// age covers every status, because PENDING rows are retained records in the
-	// Debezium deployment and must not be mistaken for the delivery backlog.
-	publishedOutboxAge := 45 * 60.0 // 45m
-	pendingOutboxAge := 30 * 60.0   // 30m
-	oldestOutboxAge := publishedOutboxAge
 
 	artifactQuota := monitorTestArtifactID(t)
 	jobStatement := "INSERT INTO document_jobs (artifact_id, namespace, name, name_key, size, " +
@@ -77,27 +71,44 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	insertJob(monitorTestArtifactID(t), "failed-old.txt", DocumentJobFailed, "parse",
 		0, nowUnix-172800, nowUnix-172800)
 
-	outboxStatement := "INSERT INTO document_job_outbox (id, artifact_id, namespace, name, " +
-		"status, retry_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-	monitorTestExec(t, stores, outboxStatement, monitorTestID(t, 32), artifactQuota,
-		namespace, "queued.txt", "PENDING", nowUnix-3600, nowUnix-pendingOutboxAge)
-	monitorTestExec(t, stores, outboxStatement, monitorTestID(t, 32), artifactQuota,
-		namespace, "queued.txt", "PUBLISHED", nowUnix-publishedOutboxAge, nowUnix-publishedOutboxAge)
-
 	searchStatement := "INSERT INTO search_tasks (result_id, namespace, arguments, status, " +
 		"stage, attempts, lease_until, retry_at, deadline, created_at, updated_at) " +
-		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-	insertSearch := func(status, stage string, createdAt, updatedAt float64) {
+		"VALUES (?, ?, ?, ?, ?, 1, 0, 0, ?, ?, ?)"
+	insertSearch := func(status, stage string, createdAt, deadline, updatedAt float64) {
 		t.Helper()
 		monitorTestExec(t, stores, searchStatement,
 			monitorTestArtifactID(t), namespace, "{}",
-			status, stage, 1, 0.0, 0.0, createdAt+120, createdAt, updatedAt)
+			status, stage, deadline, createdAt, updatedAt)
 	}
-	insertSearch(SearchTaskQueued, "admission", nowUnix-600, nowUnix-600)
-	insertSearch(SearchTaskProcessing, "retrieve", nowUnix-activeSearchAge, nowUnix-30)
-	insertSearch(SearchTaskSucceeded, "done", nowUnix-600, nowUnix-60)
-	insertSearch(SearchTaskFailed, "done", nowUnix-600, nowUnix-60)
-	insertSearch(SearchTaskTimedOut, "done", nowUnix-172800, nowUnix-172800)
+	// Two active queued tasks: one healthy (future deadline) and one overdue
+	// (deadline already passed, not converged yet), plus one active processing.
+	insertSearch(SearchTaskQueued, "admission", nowUnix-600, nowUnix+600, nowUnix-600)
+	insertSearch(SearchTaskQueued, "admission", nowUnix-300, nowUnix-60, nowUnix-300)
+	insertSearch(SearchTaskProcessing, "retrieve", nowUnix-activeSearchAge, nowUnix+300, nowUnix-30)
+	insertSearch(SearchTaskSucceeded, "done", nowUnix-600, nowUnix-480, nowUnix-60)
+	insertSearch(SearchTaskFailed, "done", nowUnix-600, nowUnix-480, nowUnix-60)
+	insertSearch(SearchTaskTimedOut, "done", nowUnix-600, nowUnix-480, nowUnix-60)
+
+	// cache_revisions: one clean key (watermark caught up), one dirty key
+	// (watermark behind revision) and one failed key (last refresh recorded an
+	// error while the watermark itself is current). No cache_outbox exists.
+	cacheStatement := "INSERT INTO cache_revisions (kind, scope, revision, refreshed_revision, " +
+		"attempts, last_error, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+	monitorTestExec(t, stores, cacheStatement, "documents", "clean-"+suffix, 3, 3, 0, nil, nowUnix-60)
+	monitorTestExec(t, stores, cacheStatement, "documents", "dirty-"+suffix, 5, 4, 0, nil, nowUnix-60)
+	monitorTestExec(t, stores, cacheStatement, "documents", "failed-"+suffix, 2, 2, 3,
+		"CacheUnavailable: redis timeout", nowUnix-60)
+
+	// One unexpired and one expired search-result fact row: only the live one is
+	// reported.
+	monitorTestExec(t, stores,
+		"INSERT INTO search_result_snapshots (id, namespace, content, created_at, expires_at) "+
+			"VALUES (?, ?, ?, ?, ?)",
+		monitorTestArtifactID(t), namespace, "{}", nowUnix-60, nowUnix+600)
+	monitorTestExec(t, stores,
+		"INSERT INTO search_result_snapshots (id, namespace, content, created_at, expires_at) "+
+			"VALUES (?, ?, ?, ?, ?)",
+		monitorTestArtifactID(t), namespace, "{}", nowUnix-1200, nowUnix-600)
 
 	// Uploads cover every category: two in progress, one failed, one rolling
 	// back and one failed rollback, plus a committed operation whose old-version
@@ -140,7 +151,7 @@ func TestMonitorStatsAggregates(t *testing.T) {
 		nil, "image", "a.png", "image/png", []byte("png"), nowUnix, nowUnix+600)
 
 	// The activity counter is the only source of the recent-search number: the
-	// two recent completed search_tasks rows must not be added on top of it.
+	// recent terminal search_tasks rows must not be added on top of it.
 	for attempt := 0; attempt < 3; attempt++ {
 		if err := stores.Activity.Record(ctx, ActivitySearch, now); err != nil {
 			t.Fatalf("Activity.Record() error = %v", err)
@@ -153,16 +164,29 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	t.Cleanup(func() {
 		cleanup := context.Background()
 		for _, statement := range []string{
-			"DELETE FROM document_job_outbox WHERE namespace = ?",
 			"DELETE FROM document_jobs WHERE namespace = ?",
 			"DELETE FROM search_tasks WHERE namespace = ?",
+			"DELETE FROM search_result_snapshots WHERE namespace = ?",
+			"DELETE FROM cache_revisions WHERE scope = ?",
 			"DELETE FROM upload_operations WHERE namespace = ?",
 			"DELETE FROM artifact_snapshots WHERE namespace = ?",
 			"DELETE FROM documents WHERE namespace = ?",
 			"DELETE FROM knowledge_bases WHERE namespace = ?",
 		} {
-			if _, err := stores.DB.ExecContext(cleanup, statement, namespace); err != nil {
+			scope := namespace
+			if statement == "DELETE FROM cache_revisions WHERE scope = ?" {
+				// The three monitor rows use suffixed scopes; delete them by their
+				// common prefix through three explicit deletes below.
+				continue
+			}
+			if _, err := stores.DB.ExecContext(cleanup, statement, scope); err != nil {
 				t.Logf("cleanup %q error = %v", statement, err)
+			}
+		}
+		for _, scope := range []string{"clean-" + suffix, "dirty-" + suffix, "failed-" + suffix} {
+			if _, err := stores.DB.ExecContext(cleanup,
+				"DELETE FROM cache_revisions WHERE scope = ?", scope); err != nil {
+				t.Logf("cleanup cache_revisions error = %v", err)
 			}
 		}
 		if _, err := stores.DB.ExecContext(cleanup,
@@ -205,32 +229,39 @@ func TestMonitorStatsAggregates(t *testing.T) {
 		t.Fatalf("JobsSucceededRecent = %d, want 1", stats.JobsSucceededRecent)
 	}
 
-	if got := stats.OutboxByStatus; len(got) != 2 || got["PENDING"] != 1 || got["PUBLISHED"] != 1 {
-		t.Fatalf("OutboxByStatus = %v", got)
+	wantSearchStatuses := map[string]int{
+		SearchTaskQueued: 2, SearchTaskProcessing: 1, SearchTaskSucceeded: 1,
+		SearchTaskFailed: 1, SearchTaskTimedOut: 1,
 	}
-	// The PUBLISHED row is the oldest one, so an age that only considered
-	// PENDING rows would report ~pendingOutboxAge instead.
-	if math.Abs(stats.OldestOutboxRecordSeconds-oldestOutboxAge) > 5 {
-		t.Fatalf("OldestOutboxRecordSeconds = %f, want ~%f (PENDING age is %f)",
-			stats.OldestOutboxRecordSeconds, oldestOutboxAge, pendingOutboxAge)
-	}
-
-	for _, status := range []string{
-		SearchTaskQueued, SearchTaskProcessing, SearchTaskSucceeded,
-		SearchTaskFailed, SearchTaskTimedOut,
-	} {
-		if got := stats.SearchByStatus[status]; got != 1 {
-			t.Fatalf("SearchByStatus[%q] = %d, want 1 (map %v)", status, got, stats.SearchByStatus)
+	for status, want := range wantSearchStatuses {
+		if got := stats.SearchByStatus[status]; got != want {
+			t.Fatalf("SearchByStatus[%q] = %d, want %d (map %v)",
+				status, got, want, stats.SearchByStatus)
 		}
 	}
 	if math.Abs(stats.OldestActiveSearchSeconds-activeSearchAge) > 5 {
 		t.Fatalf("OldestActiveSearchSeconds = %f, want ~%f",
 			stats.OldestActiveSearchSeconds, activeSearchAge)
 	}
-	// Only the three recorded activity counts are inside the window; the two
-	// recent terminal search_tasks rows are queue records and must not leak in.
+	if stats.SearchTimedOutRecent != 1 {
+		t.Fatalf("SearchTimedOutRecent = %d, want 1", stats.SearchTimedOutRecent)
+	}
+	if stats.SearchOverdueActive != 1 {
+		t.Fatalf("SearchOverdueActive = %d, want 1", stats.SearchOverdueActive)
+	}
+	// Only the three recorded activity counts are inside the window; the recent
+	// terminal search_tasks rows are queue records and must not leak in.
 	if stats.SearchesRecent != 3 {
 		t.Fatalf("SearchesRecent = %d, want 3 (activity counter only)", stats.SearchesRecent)
+	}
+	if stats.CacheDirtyKeys != 1 {
+		t.Fatalf("CacheDirtyKeys = %d, want 1", stats.CacheDirtyKeys)
+	}
+	if stats.CacheRefreshFailures != 1 {
+		t.Fatalf("CacheRefreshFailures = %d, want 1", stats.CacheRefreshFailures)
+	}
+	if stats.SearchResultSnapshotsActive != 1 {
+		t.Fatalf("SearchResultSnapshotsActive = %d, want 1", stats.SearchResultSnapshotsActive)
 	}
 
 	wantUploadStatuses := map[string]int{
@@ -303,17 +334,12 @@ func TestMonitorStatsEmptyState(t *testing.T) {
 			stats.UploadsInProgress, stats.UploadsFailed, stats.UploadsRollingBack,
 			stats.UploadsCleanupPending, stats.UnfinishedUploads)
 	}
-	if stats.DocumentJobsByStage == nil || stats.OutboxByStatus == nil {
-		t.Fatalf("nil maps: stage = %v outbox = %v",
-			stats.DocumentJobsByStage, stats.OutboxByStatus)
-	}
-	if stats.OldestQueuedSeconds != 0 || stats.OldestOutboxRecordSeconds != 0 ||
-		stats.OldestActiveSearchSeconds != 0 {
-		t.Fatalf("empty ages = %v/%v/%v", stats.OldestQueuedSeconds,
-			stats.OldestOutboxRecordSeconds, stats.OldestActiveSearchSeconds)
-	}
-	if stats.SearchesRecent != 0 {
-		t.Fatalf("SearchesRecent = %d, want 0", stats.SearchesRecent)
+	if stats.CacheDirtyKeys != 0 || stats.CacheRefreshFailures != 0 ||
+		stats.SearchTimedOutRecent != 0 || stats.SearchOverdueActive != 0 ||
+		stats.SearchResultSnapshotsActive != 0 {
+		t.Fatalf("empty CDC counters = dirty %d, failures %d, timed_out %d, overdue %d, snapshots %d",
+			stats.CacheDirtyKeys, stats.CacheRefreshFailures, stats.SearchTimedOutRecent,
+			stats.SearchOverdueActive, stats.SearchResultSnapshotsActive)
 	}
 	if stats.Documents != 0 || stats.KnowledgeBases != 0 || stats.ArtifactSnapshots != 0 {
 		t.Fatalf("library counts = %d/%d/%d, want 0/0/0",

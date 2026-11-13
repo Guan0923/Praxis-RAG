@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -167,12 +168,18 @@ func TestInitializeFailureIsWrapped(t *testing.T) {
 func TestMigrationsAddMissingLegacyColumns(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
+	// Simulate an older database: the soft-delete tombstone, the Debezium
+	// scheduling generation, the cache-refresh watermark columns and the cutover
+	// bookkeeping table are all absent.
 	for _, statement := range []string{
 		"ALTER TABLE documents DROP COLUMN del_flag",
-		"ALTER TABLE document_task_outbox DROP COLUMN owner",
-		"ALTER TABLE document_task_outbox DROP COLUMN lease_until",
-		"ALTER TABLE document_task_outbox DROP COLUMN attempts",
-		"ALTER TABLE document_task_outbox DROP COLUMN last_error",
+		"ALTER TABLE document_jobs DROP COLUMN schedule_version",
+		"ALTER TABLE search_tasks DROP COLUMN schedule_version",
+		"ALTER TABLE cache_revisions DROP COLUMN refreshed_revision",
+		"ALTER TABLE cache_revisions DROP COLUMN attempts",
+		"ALTER TABLE cache_revisions DROP COLUMN last_error",
+		"ALTER TABLE cache_revisions DROP COLUMN updated_at",
+		"DROP TABLE cdc_cutover_state",
 	} {
 		if _, err := stores.DB.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("%s error = %v", statement, err)
@@ -183,13 +190,39 @@ func TestMigrationsAddMissingLegacyColumns(t *testing.T) {
 	}
 
 	reopened := reopenStores(t, stores)
-	if !columnExists(t, reopened, "documents", "del_flag") {
-		t.Fatal("reopen did not add documents.del_flag")
-	}
-	for _, column := range []string{"owner", "lease_until", "attempts", "last_error"} {
-		if !columnExists(t, reopened, "document_task_outbox", column) {
-			t.Fatalf("reopen did not add document_task_outbox.%s", column)
+	for _, wanted := range []struct{ table, column string }{
+		{"documents", "del_flag"},
+		{"document_jobs", "schedule_version"},
+		{"search_tasks", "schedule_version"},
+		{"cache_revisions", "refreshed_revision"},
+		{"cache_revisions", "attempts"},
+		{"cache_revisions", "last_error"},
+		{"cache_revisions", "updated_at"},
+	} {
+		if !columnExists(t, reopened, wanted.table, wanted.column) {
+			t.Fatalf("reopen did not add %s.%s", wanted.table, wanted.column)
 		}
+	}
+	if exists, err := reopened.hasTable(ctx, "cdc_cutover_state"); err != nil || !exists {
+		t.Fatalf("reopen did not recreate cdc_cutover_state: %v, %v", exists, err)
+	}
+	// The additive column defaults keep old rows schedulable and dirty.
+	if _, err := reopened.DB.ExecContext(ctx,
+		"INSERT INTO cache_revisions (kind, scope, revision) VALUES (?, ?, ?)", "documents", "legacy", 4); err != nil {
+		t.Fatalf("insert legacy cache_revisions row error = %v", err)
+	}
+	var refreshed, attempts int64
+	var lastError sql.NullString
+	var updatedAt float64
+	if err := reopened.DB.QueryRowContext(ctx,
+		"SELECT refreshed_revision, attempts, last_error, updated_at FROM cache_revisions "+
+			"WHERE kind = ? AND scope = ?", "documents", "legacy").
+		Scan(&refreshed, &attempts, &lastError, &updatedAt); err != nil {
+		t.Fatalf("read legacy cache_revisions row error = %v", err)
+	}
+	if refreshed != 0 || attempts != 0 || lastError.Valid || updatedAt != 0 {
+		t.Fatalf("legacy cache_revisions row = refreshed %d, attempts %d, last_error %v, updated_at %v",
+			refreshed, attempts, lastError, updatedAt)
 	}
 }
 

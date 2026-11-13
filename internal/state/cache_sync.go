@@ -5,10 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/logging"
 )
@@ -24,53 +22,42 @@ type viewQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// CacheSynchronizer is the port of rag_mcp.state.cache_sync.CacheSynchronizer:
-// MySQL owns revisions/outbox, Redis failures never roll back a committed write,
-// and only event IDs cross the queue.
+// defaultCacheDirtyLimit bounds one dirty-key retry sweep.
+const defaultCacheDirtyLimit = 100
+
+// CacheSynchronizer owns the MySQL revision water line and the Redis
+// read-model snapshot cache. Writers bump cache_revisions inside their business
+// transaction (touch); the Debezium cache consumer derives the affected keys,
+// rebuilds each view in a revision-latched transaction and publishes it to the
+// backend with the new revision. Redis failures are recorded on the revision
+// row (attempts/last_error) and retried by RefreshDirty, so they never roll
+// back or fail the MySQL fact.
 type CacheSynchronizer struct {
 	stores   *Stores
 	Settings CacheSettings
 	// Backend is the read-through snapshot cache (Redis in production).
 	Backend StateCache
-	// Transport is the durable retry publisher (Kafka in production).
-	Transport EventPublisher
 
 	loaders map[string]ViewLoader
 
-	mutex        sync.Mutex
-	queueRetryAt time.Time
-
-	workerMu sync.Mutex
-	stop     chan struct{}
-	worker   *sync.WaitGroup
-	closed   bool
+	closeMu sync.Mutex
+	closed  bool
 }
 
-// NewDefaultCacheSynchronizer builds the synchronizer from RAG_REDIS_* and
-// RAG_KAFKA_* environment settings. The Redis client and Kafka producer are not
-// ported yet (deferred to the async phase); configured endpoints log a warning
-// and fall back to authoritative reads while the durable outbox keeps pending
-// events.
+// NewDefaultCacheSynchronizer builds the synchronizer from RAG_REDIS_*
+// settings. It starts with the cache disabled; the process that owns a Redis
+// client attaches it through Stores.CacheSync.Backend (see redisstate.Attach).
 func NewDefaultCacheSynchronizer(stores *Stores) (*CacheSynchronizer, error) {
 	settings, err := CacheSettingsFromEnv()
 	if err != nil {
 		return nil, err
 	}
-	synchronizer := &CacheSynchronizer{
+	return &CacheSynchronizer{
 		stores:   stores,
 		Settings: settings,
 		Backend:  DisabledStateCache{},
 		loaders:  map[string]ViewLoader{},
-	}
-	if settings.backendEnabled() {
-		slog.Warn("RAG_REDIS_URL/RAG_REDIS_ENABLED is set but the Go Redis state-cache client is not ported yet; " +
-			"reads use the authoritative database (deferred to the async phase)")
-	}
-	if BrokerSettingsFromEnv().BootstrapServers != "" {
-		slog.Warn("RAG_KAFKA_BOOTSTRAP_SERVERS is set but the Go Kafka transport is not ported yet; " +
-			"cache refresh events stay in the durable outbox (deferred to the async phase)")
-	}
-	return synchronizer, nil
+	}, nil
 }
 
 // Register installs the loader for one cache kind.
@@ -153,296 +140,257 @@ func (c *CacheSynchronizer) snapshot(ctx context.Context, kind, scope string, lo
 	return revision, value, nil
 }
 
-// RefreshEvent loads the current committed snapshot for one outbox event and
-// marks every not-newer pending event DONE.
-func (c *CacheSynchronizer) RefreshEvent(ctx context.Context, eventID string) (bool, error) {
-	var kind, scope, status string
-	err := c.stores.DB.QueryRowContext(ctx,
-		"SELECT kind, scope, status FROM cache_outbox WHERE id = ?", eventID).Scan(&kind, &scope, &status)
-	if errors.Is(err, sql.ErrNoRows) || (err == nil && status == "DONE") {
-		return true, nil
-	}
+// Invalidate bumps every given read-model revision in one transaction without
+// rebuilding the views. It is the entry point of the CDC cache consumer: the
+// committed revisions are the dirty state that RefreshKey/RefreshDirty drain.
+func (c *CacheSynchronizer) Invalidate(ctx context.Context, keys []CacheKey) (int, error) {
+	pending, err := sortedCacheKeys(keys)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
+	if len(pending) == 0 {
+		return 0, nil
+	}
+	transaction, err := c.stores.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = transaction.Rollback() }()
+	updatedAt := unixSeconds()
+	for _, key := range pending {
+		if err := bumpRevisionTx(ctx, transaction, key, updatedAt); err != nil {
+			return 0, err
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return 0, err
+	}
+	return len(pending), nil
+}
+
+// Revalidate invalidates the keys and immediately rebuilds each one. A Redis
+// failure is recorded for the dirty-key retry and does not fail the call; only
+// database errors are returned.
+func (c *CacheSynchronizer) Revalidate(ctx context.Context, keys []CacheKey) error {
+	if _, err := c.Invalidate(ctx, keys); err != nil {
+		return err
+	}
+	refreshed := make(map[CacheKey]struct{}, len(keys))
+	for _, key := range keys {
+		if _, duplicate := refreshed[key]; duplicate {
+			continue
+		}
+		refreshed[key] = struct{}{}
+		if _, err := c.RefreshKey(ctx, key.Kind, key.Scope); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RefreshKey rebuilds one view at its current revision and publishes it to the
+// backend. The loader runs in the same revision-latched transaction as the
+// read-path snapshot, so the value and the watermark always agree. Success
+// records refreshed_revision and clears last_error; an unavailable backend
+// records attempts+1/last_error and returns false, nil so the caller ACKs and a
+// periodic sweep retries later.
+func (c *CacheSynchronizer) RefreshKey(ctx context.Context, kind, scope string) (bool, error) {
 	loader, ok := c.loaders[kind]
-	if !ok || !c.Enabled() {
+	if !ok {
 		return false, nil
 	}
 	revision, value, err := c.snapshot(ctx, kind, scope, loader)
 	if err != nil {
-		var unavailable *CacheUnavailable
-		if errors.As(err, &unavailable) {
-			c.recordAttempt(ctx, eventID, err)
-			return false, nil
-		}
 		return false, err
 	}
-	if _, err := c.Backend.Put(ctx, kind, scope, revision, value, value == nil); err != nil {
-		var unavailable *CacheUnavailable
-		if errors.As(err, &unavailable) {
-			c.recordAttempt(ctx, eventID, err)
-			return false, nil
-		}
-		return false, err
+	backend := c.Backend
+	if backend == nil || !backend.Enabled() {
+		backend = DisabledStateCache{}
 	}
-	if _, err := c.stores.DB.ExecContext(ctx,
-		"UPDATE cache_outbox SET status = 'DONE', completed_at = ?, last_error = NULL "+
-			"WHERE kind = ? AND scope = ? AND revision <= ?",
-		unixSeconds(), kind, scope, revision); err != nil {
+	if _, err := backend.Put(ctx, kind, scope, revision, value, value == nil); err != nil {
+		c.recordRefreshFailure(ctx, kind, scope, err)
+		return false, nil
+	}
+	if err := c.markRefreshed(ctx, kind, scope, revision); err != nil {
 		return false, err
 	}
 	return true, nil
 }
 
-func (c *CacheSynchronizer) recordAttempt(ctx context.Context, eventID string, cause error) {
-	if _, err := c.stores.DB.ExecContext(ctx,
-		"UPDATE cache_outbox SET attempts = attempts + 1, last_error = ? WHERE id = ? AND status != 'DONE'",
-		errorTypeName(cause), eventID); err != nil {
-		logging.FromContext(ctx).Warn("Cache refresh attempt record failed", logging.ErrorAttrs(err)...)
+// DirtyKeys returns up to limit keys whose published revision lags the committed
+// revision or whose last refresh failed. Rows are ordered deterministically so
+// concurrent sweeps make progress on the same head of the backlog. Revision rows
+// for retired kinds are ignored: they have no loader and would otherwise
+// starve the sweep.
+func (c *CacheSynchronizer) DirtyKeys(ctx context.Context, limit int) ([]CacheKey, error) {
+	if limit <= 0 {
+		limit = defaultCacheDirtyLimit
 	}
-}
-
-// FlushPending is the best-effort synchronous refresh after a committed write.
-// Failure persists for the relay worker.
-func (c *CacheSynchronizer) FlushPending(ctx context.Context, keys []CacheKey) error {
-	return c.flushPending(ctx, 50, keys)
-}
-
-func (c *CacheSynchronizer) flushPending(ctx context.Context, limit int, keys []CacheKey) error {
-	if !c.Enabled() || len(c.loaders) == 0 {
-		return nil
+	kinds := knownCacheKinds()
+	placeholders := make([]string, len(kinds))
+	arguments := make([]any, 0, len(kinds)+1)
+	for index, kind := range kinds {
+		placeholders[index] = "?"
+		arguments = append(arguments, kind)
 	}
-	ownsMutex := false
-	if keys == nil {
-		if !c.mutex.TryLock() {
-			return nil
-		}
-		ownsMutex = true
-	}
-	if ownsMutex {
-		defer c.mutex.Unlock()
-	}
-	ids, err := c.pendingEventIDs(ctx, limit, keys)
-	if err != nil {
-		logging.FromContext(ctx).Warn("Cache dispatch unavailable", logging.ErrorAttrs(err)...)
-		return nil
-	}
-	for _, eventID := range ids {
-		refreshed, err := c.RefreshEvent(ctx, eventID)
-		if err != nil {
-			logging.FromContext(ctx).Warn("Cache refresh pending", append([]any{"event_id", eventID}, logging.ErrorAttrs(err)...)...)
-			continue
-		}
-		if !refreshed {
-			c.enqueue(ctx, eventID)
-		}
-	}
-	return nil
-}
-
-func (c *CacheSynchronizer) pendingEventIDs(ctx context.Context, limit int, keys []CacheKey) ([]string, error) {
-	where := "status = 'PENDING' AND retry_at <= ?"
-	arguments := []any{unixSeconds()}
-	if len(keys) > 0 {
-		parts := make([]string, len(keys))
-		for index, key := range keys {
-			parts[index] = "(kind = ? AND scope = ?)"
-			arguments = append(arguments, key.Kind, key.Scope)
-		}
-		where += " AND (" + strings.Join(parts, " OR ") + ")"
-	}
-	query := "SELECT kind, scope, MAX(revision) FROM cache_outbox WHERE " + where +
-		" GROUP BY kind, scope LIMIT ?"
 	arguments = append(arguments, limit)
+	query := "SELECT kind, scope FROM cache_revisions " +
+		"WHERE (refreshed_revision < revision OR last_error IS NOT NULL) " +
+		"AND kind IN (" + strings.Join(placeholders, ", ") + ") " +
+		"ORDER BY kind, scope LIMIT ?"
 	rows, err := c.stores.DB.QueryContext(ctx, query, arguments...)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	type pendingGroup struct {
-		kind, scope string
-		revision    int64
-	}
-	groups := make([]pendingGroup, 0)
+	keys := make([]CacheKey, 0, limit)
 	for rows.Next() {
-		var group pendingGroup
-		if err := rows.Scan(&group.kind, &group.scope, &group.revision); err != nil {
+		var key CacheKey
+		if err := rows.Scan(&key.Kind, &key.Scope); err != nil {
 			return nil, err
 		}
-		groups = append(groups, group)
+		keys = append(keys, key)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	ids := make([]string, 0, len(groups))
-	for _, group := range groups {
-		var eventID string
-		err := c.stores.DB.QueryRowContext(ctx,
-			"SELECT id FROM cache_outbox WHERE kind = ? AND scope = ? AND revision = ? AND status = 'PENDING' LIMIT 1",
-			group.kind, group.scope, group.revision).Scan(&eventID)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		ids = append(ids, eventID)
-	}
-	return ids, nil
+	return keys, nil
 }
 
-// enqueue publishes one event ID and records the durable retry state.
-func (c *CacheSynchronizer) enqueue(ctx context.Context, eventID string) {
-	if c.Transport == nil || c.queueRetryAt.After(time.Now()) {
-		return
-	}
-	if err := c.Transport.Send(eventID); err != nil {
-		c.queueRetryAt = time.Now().Add(5 * time.Second)
-		if _, updateErr := c.stores.DB.ExecContext(ctx,
-			"UPDATE cache_outbox SET retry_at = ?, last_error = ? WHERE id = ? AND status != 'DONE'",
-			unixSeconds()+5, errorTypeName(err), eventID); updateErr != nil {
-			logging.FromContext(ctx).Warn("Cache queue retry record failed", logging.ErrorAttrs(updateErr)...)
-		}
-		logging.FromContext(ctx).Warn("Cache queue publish pending", append([]any{"event_id", eventID}, logging.ErrorAttrs(err)...)...)
-		return
-	}
-	if _, err := c.stores.DB.ExecContext(ctx,
-		"UPDATE cache_outbox SET status = 'QUEUED', retry_at = ? WHERE id = ? AND status != 'DONE'",
-		unixSeconds()+60, eventID); err != nil {
-		logging.FromContext(ctx).Warn("Cache queue state record failed", logging.ErrorAttrs(err)...)
-	}
-}
-
-// RelayOnce re-publishes missing/expired deliveries, including events stranded
-// in a dead-letter queue.
-func (c *CacheSynchronizer) RelayOnce(ctx context.Context) error {
-	if err := c.flushPending(ctx, 50, nil); err != nil {
-		return err
-	}
-	if c.Transport == nil || !c.Enabled() {
-		return nil
-	}
-	rows, err := c.stores.DB.QueryContext(ctx,
-		"SELECT id FROM cache_outbox WHERE status != 'DONE' AND retry_at <= ? ORDER BY created_at LIMIT 50",
-		unixSeconds())
+// RefreshDirty drains one batch of dirty keys: it rebuilds every view whose
+// published revision lags or whose last publish failed. Redis failures stay
+// recorded and are retried by the next sweep; only database errors return.
+func (c *CacheSynchronizer) RefreshDirty(ctx context.Context, limit int) error {
+	keys, err := c.DirtyKeys(ctx, limit)
 	if err != nil {
 		return err
 	}
-	ids := make([]string, 0)
+	var firstErr error
+	for _, key := range keys {
+		if _, err := c.RefreshKey(ctx, key.Kind, key.Scope); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// MarkAllDirty is the cutover baseline: it bumps the revision of every known
+// kind/scope pair derived from the live business tables (fixed globals plus each
+// namespace/operation id), forcing the cache consumer to rebuild the whole
+// read model. It is safe on an empty database and idempotent (a second call
+// bumps the revisions again). It needs neither registered loaders nor Redis: it
+// only reads MySQL and writes cache_revisions.
+func (c *CacheSynchronizer) MarkAllDirty(ctx context.Context) (int, error) {
+	keys := []CacheKey{
+		{Kind: "kb_list", Scope: ""},
+		{Kind: "api_keys", Scope: ""},
+	}
+	namespaceMappings := []struct {
+		query string
+		kind  string
+	}{
+		{"SELECT DISTINCT namespace FROM knowledge_bases", "kb_public"},
+		{"SELECT DISTINCT namespace FROM knowledge_bases", "documents"},
+		{"SELECT DISTINCT namespace FROM mcp_catalogs", "catalog"},
+		{"SELECT DISTINCT namespace FROM document_heads", "heads"},
+		{"SELECT DISTINCT namespace FROM document_leases", "leases"},
+		{"SELECT DISTINCT namespace FROM upload_operations", "upload_list"},
+	}
+	for _, mapping := range namespaceMappings {
+		scopes, err := c.distinctScopes(ctx, mapping.query)
+		if err != nil {
+			return 0, err
+		}
+		for _, scope := range scopes {
+			keys = append(keys, CacheKey{Kind: mapping.kind, Scope: scope})
+		}
+	}
+	operationIDs, err := c.distinctScopes(ctx, "SELECT DISTINCT id FROM upload_operations")
+	if err != nil {
+		return 0, err
+	}
+	for _, operationID := range operationIDs {
+		keys = append(keys, CacheKey{Kind: "upload_status", Scope: operationID})
+	}
+	return c.Invalidate(ctx, keys)
+}
+
+// distinctScopes runs one fixed, compile-time constant projection query.
+func (c *CacheSynchronizer) distinctScopes(ctx context.Context, query string) ([]string, error) {
+	rows, err := c.stores.DB.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	scopes := make([]string, 0)
 	for rows.Next() {
-		var eventID string
-		if err := rows.Scan(&eventID); err != nil {
-			_ = rows.Close()
-			return err
+		var scope string
+		if err := rows.Scan(&scope); err != nil {
+			return nil, err
 		}
-		ids = append(ids, eventID)
+		scopes = append(scopes, scope)
 	}
-	if err := rows.Close(); err != nil {
-		return err
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	for _, eventID := range ids {
-		c.enqueue(ctx, eventID)
-	}
-	return nil
+	return scopes, nil
 }
 
-// Start begins the background relay/consume loop.
-func (c *CacheSynchronizer) Start() {
-	if !c.Enabled() {
-		return
-	}
-	c.workerMu.Lock()
-	if c.worker != nil {
-		c.workerMu.Unlock()
-		return
-	}
-	stop := make(chan struct{})
-	c.stop = stop
-	group := &sync.WaitGroup{}
-	group.Add(1)
-	c.worker = group
-	c.workerMu.Unlock()
-	go func() {
-		defer group.Done()
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				ctx := context.Background()
-				if err := c.RelayOnce(ctx); err != nil {
-					logging.FromContext(ctx).Warn("Cache worker will retry", logging.ErrorAttrs(err)...)
-				}
-				if c.Transport != nil {
-					c.Transport.ConsumeOnce(func(eventID string) bool {
-						refreshed, err := c.RefreshEvent(ctx, eventID)
-						if err != nil {
-							logging.FromContext(ctx).Warn("Cache refresh failed", logging.ErrorAttrs(err)...)
-							return false
-						}
-						return refreshed
-					})
-				}
-			}
-		}
-	}()
+// markRefreshed records a successful publish without ever moving the published
+// revision backwards (a concurrent, newer refresh may have won the race).
+func (c *CacheSynchronizer) markRefreshed(ctx context.Context, kind, scope string, revision int64) error {
+	_, err := c.stores.DB.ExecContext(ctx,
+		"UPDATE cache_revisions SET refreshed_revision = GREATEST(refreshed_revision, ?), last_error = NULL "+
+			"WHERE kind = ? AND scope = ?", revision, kind, scope)
+	return err
 }
 
-// Stop ends the background worker and closes the queue transport, mirroring
-// CacheSynchronizer.stop.
-func (c *CacheSynchronizer) Stop() {
-	c.workerMu.Lock()
-	stop := c.stop
-	group := c.worker
-	c.stop = nil
-	c.worker = nil
-	c.workerMu.Unlock()
-	if stop != nil {
-		close(stop)
-	}
-	if group != nil {
-		done := make(chan struct{})
-		go func() {
-			group.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(30 * time.Second):
-		}
-	}
-	if c.Transport != nil {
-		if err := c.Transport.Close(); err != nil {
-			slog.Warn("Cache queue close failed", logging.ErrorAttrs(err)...)
-		}
+// recordRefreshFailure bumps the retry counter and stores a sanitized failure
+// category (never the raw backend error, which could echo credentials). The
+// dirty row stays eligible for RefreshDirty until a publish succeeds.
+func (c *CacheSynchronizer) recordRefreshFailure(ctx context.Context, kind, scope string, cause error) {
+	_, err := c.stores.DB.ExecContext(ctx,
+		"UPDATE cache_revisions SET attempts = attempts + 1, last_error = ? WHERE kind = ? AND scope = ?",
+		cacheFailureCategory(cause), kind, scope)
+	if err != nil {
+		logging.FromContext(ctx).Warn("Cache refresh failure record failed", logging.ErrorAttrs(err)...)
 	}
 }
 
-// Close stops the worker and releases the transport and cache clients.
+// cacheFailureCategory is the sanitized last_error value (column is VARCHAR(128)).
+func cacheFailureCategory(cause error) string {
+	category := errorTypeName(cause)
+	if category == "" {
+		category = "Error"
+	}
+	if len(category) > 128 {
+		category = category[:128]
+	}
+	return category
+}
+
+// Start is retained for process-wiring compatibility. The legacy 2s
+// relay/consume poll over cache_outbox was removed; refreshes are driven by the
+// Debezium cache consumer and the RefreshDirty sweep it owns.
+func (c *CacheSynchronizer) Start() {}
+
+// Stop is retained for process-wiring compatibility; Close releases the
+// backend client.
+func (c *CacheSynchronizer) Stop() {}
+
+// Close releases the cache backend. It is idempotent.
 func (c *CacheSynchronizer) Close() error {
-	c.workerMu.Lock()
+	c.closeMu.Lock()
 	if c.closed {
-		c.workerMu.Unlock()
+		c.closeMu.Unlock()
 		return nil
 	}
 	c.closed = true
-	c.workerMu.Unlock()
-	c.Stop()
-	var firstErr error
-	if c.Transport != nil {
-		if err := c.Transport.Close(); err != nil {
-			firstErr = err
-		}
-		c.Transport = nil
+	backend := c.Backend
+	c.Backend = DisabledStateCache{}
+	c.closeMu.Unlock()
+	if backend == nil {
+		return nil
 	}
-	if c.Backend != nil {
-		if err := c.Backend.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		c.Backend = DisabledStateCache{}
-	}
-	return firstErr
+	return backend.Close()
 }

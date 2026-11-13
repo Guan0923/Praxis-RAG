@@ -33,7 +33,7 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
       started_at: "2026-11-11T12:00:00Z",
       uptime_seconds: 8400.2,
       upload_mode: "async",
-      outbox_bridge: "debezium",
+      delivery: "debezium",
       pdf_engine: "vision",
     },
     dependencies: [
@@ -54,6 +54,8 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
       search_tasks: {
         by_status: { queued: 0, processing: 0, succeeded: 3, failed: 0, timed_out: 0 },
         oldest_active_seconds: 0,
+        timed_out_recent: 0,
+        overdue_active: 1,
       },
       // 上传统计的是“操作”而不是正在上传的文件：四个互斥分类 + 兼容用的合计。
       uploads: {
@@ -65,28 +67,56 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
         cleanup_pending: 1,
       },
     },
-    // pipeline 把视图分开：outbox 记录（保留语义）、Debezium 采集、文档 Worker
-    // 心跳、Kafka 消费、文档任务状态。capture_progress 与 consumer_lag 为 null
-    // 时必须显示“未知”。
+    // pipeline 把视图分开：任务/缓存两个 Debezium 连接器、三组 Kafka 消费、
+    // 缓存水位、文档 Worker 心跳与文档任务状态。capture_progress 与 offsets
+    // 为 null 时必须显示“未知”。
     pipeline: {
-      outbox: {
-        // outbox 的 status 在状态库中存大写字面量，页面必须按“记录”语义本地化。
-        by_status: { PENDING: 2, PUBLISHED: 5 },
-        total: 7,
-        oldest_record_seconds: 90,
-      },
       document_jobs: { status: "ok", detail: "文档任务正常，最近成功 10 个" },
       worker: { status: "ok", detail: "最近心跳 3.0 秒前，1 个实例运行中" },
-      debezium: { status: "unknown", detail: "未读取 Debezium 偏移", capture_progress: null },
+      debezium: {
+        tasks: { status: "unknown", detail: "任务连接器未读健康端点", capture_progress: null },
+        cache: { status: "ok", detail: "缓存连接器运行中", capture_progress: null },
+      },
       kafka: {
         status: "unknown",
         detail: "未取得消费位点",
+        // 兼容镜像字段：页面读取 groups，三组各自可读。
         topic: "praxis.rag.document_jobs",
         group: "rag-worker",
         committed_offset: null,
         end_offset: null,
         consumer_lag: null,
+        groups: {
+          document: {
+            status: "unknown",
+            detail: "文档组未取得消费位点",
+            topic: "praxis.rag.document_jobs",
+            group: "rag-document-workers",
+            committed_offset: null,
+            end_offset: null,
+            consumer_lag: null,
+          },
+          search: {
+            status: "ok",
+            detail: "搜索消费正常",
+            topic: "praxis.rag.search_tasks",
+            group: "rag-search-workers",
+            committed_offset: 20,
+            end_offset: 25,
+            consumer_lag: 5,
+          },
+          cache: {
+            status: "unknown",
+            detail: "缓存组未取得消费位点",
+            topic: "praxis.rag.cache",
+            group: "rag-cache-workers",
+            committed_offset: null,
+            end_offset: null,
+            consumer_lag: null,
+          },
+        },
       },
+      cache: { status: "degraded", dirty_keys: 7, refresh_failures: 2 },
     },
     library: { documents: 12, knowledge_bases: 2, result_snapshots: 4, artifact_snapshots: 3 },
     activity: { window_hours: 24, jobs_succeeded: 3, jobs_failed: 0, searches: 12 },
@@ -193,36 +223,43 @@ describe("MonitorPage", () => {
     expect(within(jobsBlock).getByText("切分中 2")).toBeTruthy();
     expect(jobsBlock.querySelector(".ant-table")).toBeNull();
 
-    // Outbox 是“记录”统计而不是待投递积压：不出现 待投递/已投递 文案。
-    const outboxBlock = screen.getByLabelText("Outbox 记录");
-    expect(within(outboxBlock).getByText("PENDING 记录 2")).toBeTruthy();
-    expect(within(outboxBlock).getByText("PUBLISHED 记录 5")).toBeTruthy();
-    expect(within(outboxBlock).getByText("7 条")).toBeTruthy();
-    expect(within(outboxBlock).getByText("最老记录")).toBeTruthy();
-    expect(within(outboxBlock).getByText("1 分 30 秒")).toBeTruthy();
-    expect(within(outboxBlock).getByText(/不代表未投递积压/)).toBeTruthy();
-    expect(within(outboxBlock).queryByText(/待投递/)).toBeNull();
+    // 缓存水位取代旧的 outbox 记录卡：脏 key 与刷新失败分别展示。
+    const cacheBlock = screen.getByLabelText("缓存水位");
+    expect(within(cacheBlock).getByText("脏 key")).toBeTruthy();
+    expect(within(cacheBlock).getByText("7")).toBeTruthy();
+    expect(within(cacheBlock).getByText("刷新失败")).toBeTruthy();
+    expect(within(cacheBlock).getByText("2")).toBeTruthy();
+    expect(within(cacheBlock).getByText(/refreshed_revision/)).toBeTruthy();
 
-    // 检索任务独立于 outbox 记录。
+    // 检索任务独立于缓存水位：状态、年龄、近期超时与逾期未收敛。
     const searchBlock = screen.getByLabelText("检索任务队列");
     expect(within(searchBlock).getByText("成功 3")).toBeTruthy();
     expect(within(searchBlock).getByText("0 秒")).toBeTruthy();
+    expect(within(searchBlock).getByText("近 24 小时超时")).toBeTruthy();
+    expect(within(searchBlock).getByText("0 个")).toBeTruthy();
+    expect(within(searchBlock).getByText("逾期未收敛")).toBeTruthy();
+    expect(within(searchBlock).getByText("1 个")).toBeTruthy();
 
-    // 投递与消费进度：Debezium / 文档 Worker / Kafka / 文档任务状态四行分开，
-    // 未知进度显示“未知”，不会伪造 0 或百分比。
+    // 投递与消费进度：任务/缓存两个 Debezium 连接器、三组 Kafka 消费、
+    // 文档 Worker 与文档任务状态分开；未知进度显示“未知”，不伪造 0 或百分比。
     const pipelineBlock = screen.getByLabelText("投递与消费进度");
-    expect(within(pipelineBlock).getByText("Debezium 采集")).toBeTruthy();
-    expect(within(pipelineBlock).getByText("未读取 Debezium 偏移")).toBeTruthy();
-    expect(within(pipelineBlock).getByText("采集进度：未知（需在 Debezium 侧查看）")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("Debezium 任务连接器")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("任务连接器未读健康端点")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("Debezium 缓存连接器")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("缓存连接器运行中")).toBeTruthy();
+    expect(
+      within(pipelineBlock).getAllByText("采集进度：未知（需在 Debezium 侧查看）"),
+    ).toHaveLength(2);
+    expect(within(pipelineBlock).getByText("Kafka 文档消费")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("Kafka 搜索消费")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("Kafka 缓存消费")).toBeTruthy();
+    expect(within(pipelineBlock).getByText("消费滞后：5 条（已提交 20 / 末尾 25）")).toBeTruthy();
+    expect(within(pipelineBlock).getAllByText("消费滞后：未知")).toHaveLength(2);
+    expect(within(pipelineBlock).getByText(/Topic：praxis\.rag\.cache/)).toBeTruthy();
     expect(within(pipelineBlock).getByText("文档 Worker")).toBeTruthy();
     expect(within(pipelineBlock).getByText("最近心跳 3.0 秒前，1 个实例运行中")).toBeTruthy();
-    expect(within(pipelineBlock).getByText("Kafka 消费")).toBeTruthy();
-    expect(within(pipelineBlock).getByText("消费滞后：未知")).toBeTruthy();
-    expect(within(pipelineBlock).getByText(/Topic：praxis\.rag\.document_jobs/)).toBeTruthy();
     expect(within(pipelineBlock).getByText("文档任务状态")).toBeTruthy();
     expect(within(pipelineBlock).getByText("文档任务正常，最近成功 10 个")).toBeTruthy();
-    // Worker 与文档任务状态都是“正常”，Debezium/Kafka 仍是“未知”。
-    expect(within(pipelineBlock).getAllByText("正常")).toHaveLength(2);
 
     // 上传操作按互斥分类展示，0 也要显示，并注明不代表当前正在上传的文件数。
     const uploadsBlock = screen.getByLabelText("上传队列");
@@ -240,6 +277,7 @@ describe("MonitorPage", () => {
     expect(within(serviceCard).getByText("go")).toBeTruthy();
     expect(within(serviceCard).getByText("praxis_chunks")).toBeTruthy();
     expect(within(serviceCard).getByText("async")).toBeTruthy();
+    expect(within(serviceCard).getByText("投递方式")).toBeTruthy();
     expect(within(serviceCard).getByText("debezium")).toBeTruthy();
     expect(within(serviceCard).getByText("vision")).toBeTruthy();
 
@@ -354,10 +392,10 @@ describe("MonitorPage", () => {
     const uploadsBlock = screen.getByLabelText("上传队列");
     expect(within(uploadsBlock).getByText("上传操作：未知")).toBeTruthy();
 
-    // Outbox 记录仍在 pipeline 里，各自可读。
-    const outboxBlock = screen.getByLabelText("Outbox 记录");
-    expect(within(outboxBlock).getByText("PENDING 记录 2")).toBeTruthy();
-    expect(within(outboxBlock).getByText("7 条")).toBeTruthy();
+    // 缓存水位独立于状态库队列，仍可读。
+    const cacheBlock = screen.getByLabelText("缓存水位");
+    expect(within(cacheBlock).getByText("7")).toBeTruthy();
+    expect(within(cacheBlock).getByText("2")).toBeTruthy();
   });
 
   it("renders 暂无处理中任务 instead of an empty stage table", async () => {
@@ -448,7 +486,8 @@ describe("MonitorPage", () => {
     fireEvent.click(refreshButton);
     expect(await screen.findByText("最近心跳 3.0 秒前，1 个实例运行中")).toBeTruthy();
     const refreshedBlock = screen.getByLabelText("投递与消费进度");
-    expect(within(refreshedBlock).getAllByText("正常")).toHaveLength(2);
+    // 缓存连接器、搜索消费组、文档 Worker 与文档任务状态都是“正常”。
+    expect(within(refreshedBlock).getAllByText("正常")).toHaveLength(4);
   });
 
   it("renders 未知 for every delivery view when the pipeline snapshot is missing", async () => {
@@ -461,31 +500,31 @@ describe("MonitorPage", () => {
     const metricsCard = screen.getByText("关键指标").closest(".ant-card") as HTMLElement;
     expect(statisticValue(metricsCard, "有效文档")).toBe("12");
 
-    const outboxBlock = screen.getByLabelText("Outbox 记录");
-    expect(within(outboxBlock).getAllByText("未知")).toHaveLength(2);
-    expect(within(outboxBlock).getByText(/不代表未投递积压/)).toBeTruthy();
+    const cacheBlock = screen.getByLabelText("缓存水位");
+    // 状态标签、脏 key、刷新失败都降级为“未知”。
+    expect(within(cacheBlock).getAllByText("未知")).toHaveLength(3);
 
     const pipelineBlock = screen.getByLabelText("投递与消费进度");
-    // 四个状态标签与四行详情都降级为“未知”，不会显示 0 或伪造进度。
-    expect(within(pipelineBlock).getAllByText("未知").length).toBeGreaterThanOrEqual(8);
-    expect(within(pipelineBlock).getByText("采集进度：未知（需在 Debezium 侧查看）")).toBeTruthy();
-    expect(within(pipelineBlock).getByText("消费滞后：未知")).toBeTruthy();
-    expect(within(pipelineBlock).getByText(/Topic：未知/)).toBeTruthy();
+    // 两个连接器、三组 Kafka、Worker 与文档任务的状态和详情都降级为“未知”，
+    // 不会显示 0 或伪造进度。
+    expect(within(pipelineBlock).getAllByText("未知").length).toBeGreaterThanOrEqual(14);
+    expect(
+      within(pipelineBlock).getAllByText("采集进度：未知（需在 Debezium 侧查看）"),
+    ).toHaveLength(2);
+    expect(within(pipelineBlock).getAllByText("消费滞后：未知")).toHaveLength(3);
+    expect(within(pipelineBlock).getAllByText(/Topic：未知/)).toHaveLength(3);
   });
 
   it("renders the numeric Kafka consumer lag when offsets are reported", async () => {
     const fixture = overviewFixture();
-    fixture.pipeline = {
-      ...fixture.pipeline!,
-      kafka: {
-        status: "ok",
-        detail: "消费正常",
-        topic: "praxis.rag.document_jobs",
-        group: "rag-worker",
-        committed_offset: 95,
-        end_offset: 100,
-        consumer_lag: 5,
-      },
+    fixture.pipeline!.kafka.groups.document = {
+      status: "ok",
+      detail: "文档消费正常",
+      topic: "praxis.rag.document_jobs",
+      group: "rag-document-workers",
+      committed_offset: 95,
+      end_offset: 100,
+      consumer_lag: 5,
     };
     fetchMock.mockResolvedValue(jsonResponse(fixture));
     renderPage();
@@ -493,9 +532,10 @@ describe("MonitorPage", () => {
     expect(await screen.findByText("0.4.0")).toBeTruthy();
     const pipelineBlock = screen.getByLabelText("投递与消费进度");
     expect(within(pipelineBlock).getByText("消费滞后：5 条（已提交 95 / 末尾 100）")).toBeTruthy();
-    expect(within(pipelineBlock).queryByText("消费滞后：未知")).toBeNull();
-    // Worker、Kafka 与文档任务三行都是“正常”。
-    expect(within(pipelineBlock).getAllByText("正常")).toHaveLength(3);
+    // 缓存组仍无位点：未知不会被 0 覆盖。
+    expect(within(pipelineBlock).getAllByText("消费滞后：未知")).toHaveLength(1);
+    // 缓存连接器、搜索组、文档组、Worker 与文档任务都是“正常”。
+    expect(within(pipelineBlock).getAllByText("正常")).toHaveLength(5);
   });
 
   it("starts with auto refresh on and refreshes on demand", async () => {

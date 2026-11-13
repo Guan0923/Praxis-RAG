@@ -27,7 +27,7 @@ import {
   type MonitorDependencyStatus,
   type MonitorOverallStatus,
   type MonitorOverview,
-  type MonitorPipelineKafka,
+  type MonitorPipelineKafkaGroup,
 } from "./api";
 
 // monitorRefreshMs is the auto-refresh period: the backend does not push
@@ -59,20 +59,6 @@ const documentJobStatusLabels: Record<string, string> = {
   processing: "处理中",
   succeeded: "成功",
   failed: "失败",
-};
-// Outbox rows are retained records, not deliveries still waiting to happen: the
-// application never writes PUBLISHED back by design, Debezium captures the rows
-// and Kafka records consumption progress. The copy therefore describes record
-// state only and never says 待投递/已投递 or reports a delivery backlog. The
-// outbox stores its status as an upper-case literal ("PENDING" / "PUBLISHED"),
-// so the map carries both spellings.
-const outboxRecordStatusLabels: Record<string, string> = {
-  pending: "PENDING 记录",
-  published: "PUBLISHED 记录",
-  failed: "FAILED 记录",
-  PENDING: "PENDING 记录",
-  PUBLISHED: "PUBLISHED 记录",
-  FAILED: "FAILED 记录",
 };
 const searchTaskStatusLabels: Record<string, string> = {
   queued: "排队中",
@@ -127,7 +113,7 @@ function StatusCountTags({ counts, labels }: {
   const tags = (
     <Flex wrap gap={6} className="monitor-tags">
       {entries.map(([status, count]) => {
-        // 状态 key 的大小写由后端存储决定（outbox 用大写），查文案时统一兜底。
+        // 状态 key 的大小写由后端存储决定，查文案时统一兜底。
         const label = labels[status] ?? labels[status.toLowerCase()] ?? status;
         return (
           <Tag key={status}>
@@ -216,16 +202,16 @@ function captureProgressText(progress?: number | null) {
     : "采集进度：未知（需在 Debezium 侧查看）";
 }
 
-// kafkaLagText keeps Kafka consumer lag apart from outbox records: the lag is
-// only shown when Kafka itself reports it, otherwise it stays 未知.
-function kafkaLagText(kafka?: MonitorPipelineKafka | null) {
-  const lag = kafka?.consumer_lag;
+// kafkaGroupLagText renders one consumer group's lag. The lag is only shown
+// when Kafka itself reports it, otherwise it stays 未知 (never 0).
+function kafkaGroupLagText(group?: MonitorPipelineKafkaGroup | null) {
+  const lag = group?.consumer_lag;
   if (typeof lag !== "number" || !Number.isFinite(lag)) return "消费滞后：未知";
-  const committed = typeof kafka?.committed_offset === "number"
-    ? kafka.committed_offset.toLocaleString()
+  const committed = typeof group?.committed_offset === "number"
+    ? group.committed_offset.toLocaleString()
     : "未知";
-  const end = typeof kafka?.end_offset === "number"
-    ? kafka.end_offset.toLocaleString()
+  const end = typeof group?.end_offset === "number"
+    ? group.end_offset.toLocaleString()
     : "未知";
   return `消费滞后：${lag.toLocaleString()} 条（已提交 ${committed} / 末尾 ${end}）`;
 }
@@ -240,13 +226,17 @@ function degradedDependencyNotes(overview: MonitorOverview): string[] {
   const pipeline = overview.pipeline;
   if (pipeline) {
     const views: Array<[string, { status: MonitorDependencyStatus; detail: string } | undefined]> = [
-      ["Debezium 采集", pipeline.debezium],
+      ["Debezium 任务连接器", pipeline.debezium?.tasks],
+      ["Debezium 缓存连接器", pipeline.debezium?.cache],
       ["文档 Worker", pipeline.worker],
       ["Kafka 消费", pipeline.kafka],
       ["文档任务", pipeline.document_jobs],
     ];
     for (const [label, view] of views) {
       if (view?.status === "degraded") notes.push(`${label}：${view.detail || "降级"}`);
+    }
+    if (pipeline.cache?.status === "degraded") {
+      notes.push("缓存刷新：存在脏 key 或刷新失败未归零");
     }
   }
   return notes;
@@ -258,11 +248,15 @@ function degradedDependencyNotes(overview: MonitorOverview): string[] {
 function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
   const { service, dependencies, queues, pipeline, library, activity } = overview;
   const jobs = queues?.document_jobs;
-  const outbox = pipeline?.outbox;
   const pipelineJobs = pipeline?.document_jobs;
   const worker = pipeline?.worker;
-  const debezium = pipeline?.debezium;
-  const kafka = pipeline?.kafka;
+  const debeziumTasks = pipeline?.debezium?.tasks;
+  const debeziumCache = pipeline?.debezium?.cache;
+  const kafkaGroups = pipeline?.kafka?.groups;
+  const kafkaDocument = kafkaGroups?.document;
+  const kafkaSearch = kafkaGroups?.search;
+  const kafkaCache = kafkaGroups?.cache;
+  const cache = pipeline?.cache;
   const searchTasks = queues?.search_tasks;
   const uploads = queues?.uploads;
   const stages = Object.entries(jobs?.by_stage || {}).map(([stage, count]) => ({ stage, count }));
@@ -331,29 +325,43 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
               <Flex vertical gap={12}>
                 <div className="monitor-progress-row">
                   <Flex wrap gap={8} align="center">
-                    <strong>Debezium 采集</strong>
-                    <PipelineStatusTag status={debezium?.status} />
-                    <span className="secondary break-text">{debezium?.detail || "未知"}</span>
+                    <strong>Debezium 任务连接器</strong>
+                    <PipelineStatusTag status={debeziumTasks?.status} />
+                    <span className="secondary break-text">{debeziumTasks?.detail || "未知"}</span>
                   </Flex>
-                  <span className="break-text">{captureProgressText(debezium?.capture_progress)}</span>
+                  <span className="break-text">{captureProgressText(debeziumTasks?.capture_progress)}</span>
                 </div>
+                <div className="monitor-progress-row">
+                  <Flex wrap gap={8} align="center">
+                    <strong>Debezium 缓存连接器</strong>
+                    <PipelineStatusTag status={debeziumCache?.status} />
+                    <span className="secondary break-text">{debeziumCache?.detail || "未知"}</span>
+                  </Flex>
+                  <span className="break-text">{captureProgressText(debeziumCache?.capture_progress)}</span>
+                </div>
+                {([
+                  ["Kafka 文档消费", kafkaDocument],
+                  ["Kafka 搜索消费", kafkaSearch],
+                  ["Kafka 缓存消费", kafkaCache],
+                ] as const).map(([label, group]) => (
+                  <div className="monitor-progress-row" key={label}>
+                    <Flex wrap gap={8} align="center">
+                      <strong>{label}</strong>
+                      <PipelineStatusTag status={group?.status} />
+                      <span className="secondary break-text">{group?.detail || "未知"}</span>
+                    </Flex>
+                    <span className="secondary break-text">
+                      Topic：{group?.topic || "未知"}　Consumer Group：{group?.group || "未知"}
+                    </span>
+                    <span className="break-text">{kafkaGroupLagText(group)}</span>
+                  </div>
+                ))}
                 <div className="monitor-progress-row">
                   <Flex wrap gap={8} align="center">
                     <strong>文档 Worker</strong>
                     <PipelineStatusTag status={worker?.status} />
                     <span className="secondary break-text">{worker?.detail || "未知"}</span>
                   </Flex>
-                </div>
-                <div className="monitor-progress-row">
-                  <Flex wrap gap={8} align="center">
-                    <strong>Kafka 消费</strong>
-                    <PipelineStatusTag status={kafka?.status} />
-                    <span className="secondary break-text">{kafka?.detail || "未知"}</span>
-                  </Flex>
-                  <span className="secondary break-text">
-                    Topic：{kafka?.topic || "未知"}　Consumer Group：{kafka?.group || "未知"}
-                  </span>
-                  <span className="break-text">{kafkaLagText(kafka)}</span>
                 </div>
                 <div className="monitor-progress-row">
                   <Flex wrap gap={8} align="center">
@@ -400,32 +408,31 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
           </Col>
           <Col xs={24} xl={12}>
             <Flex vertical gap={20}>
-              <section className="monitor-block" aria-label="Outbox 记录">
-                <h3>Outbox 记录</h3>
-                {outbox ? (
-                  <>
-                    <StatusCountTags counts={outbox.by_status} labels={outboxRecordStatusLabels} />
-                    <Descriptions
-                      size="small"
-                      column={1}
-                      items={[
-                        { key: "total", label: "记录总数", children: `${outbox.total} 条` },
-                        { key: "oldest", label: "最老记录", children: formatDuration(outbox.oldest_record_seconds) },
-                      ]}
-                    />
-                  </>
-                ) : (
-                  <Descriptions
-                    size="small"
-                    column={1}
-                    items={[
-                      { key: "total", label: "记录总数", children: "未知" },
-                      { key: "oldest", label: "最老记录", children: "未知" },
-                    ]}
-                  />
-                )}
+              <section className="monitor-block" aria-label="缓存水位">
+                <h3>缓存水位</h3>
+                <Descriptions
+                  size="small"
+                  column={1}
+                  items={[
+                    {
+                      key: "status",
+                      label: "状态",
+                      children: <PipelineStatusTag status={cache?.status} />,
+                    },
+                    {
+                      key: "dirty",
+                      label: "脏 key",
+                      children: cache ? unknownOrNumber(cache.dirty_keys) : "未知",
+                    },
+                    {
+                      key: "failures",
+                      label: "刷新失败",
+                      children: cache ? unknownOrNumber(cache.refresh_failures) : "未知",
+                    },
+                  ]}
+                />
                 <p className="secondary monitor-note">
-                  Outbox 记录在保留期内可能仍为 PENDING，由 Debezium 投递；该计数不代表未投递积压。
+                  脏 key = refreshed_revision 小于 revision；刷新失败 = last_error 非空。数字未知表示状态库或统计不可读。
                 </p>
               </section>
               <section className="monitor-block" aria-label="检索任务队列">
@@ -436,6 +443,8 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
                   column={1}
                   items={[
                     { key: "oldest", label: "最老活跃", children: queues ? formatDuration(searchTasks?.oldest_active_seconds) : "未知" },
+                    { key: "timeout", label: "近 24 小时超时", children: queues ? `${searchTasks?.timed_out_recent ?? 0} 个` : "未知" },
+                    { key: "overdue", label: "逾期未收敛", children: queues ? `${searchTasks?.overdue_active ?? 0} 个` : "未知" },
                   ]}
                 />
               </section>
@@ -483,7 +492,7 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
             { key: "backend", label: "后端", children: service?.backend || "—" },
             { key: "collection", label: "集合", children: service?.collection || "—" },
             { key: "upload", label: "上传模式", children: service?.upload_mode || "—" },
-            { key: "outbox", label: "Outbox 模式", children: service?.outbox_bridge || "—" },
+            { key: "delivery", label: "投递方式", children: service?.delivery || "—" },
             { key: "pdf", label: "PDF 引擎", children: service?.pdf_engine || "—" },
             { key: "started", label: "启动时间", children: formatDateTime(service?.started_at) },
           ]}

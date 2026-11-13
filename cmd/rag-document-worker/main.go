@@ -1,12 +1,13 @@
-// Command rag-document-worker consumes durable document-ingest jobs from Kafka:
-// it leases one committed job, keeps the SQL lease alive while the runtime parses
-// and indexes it, reconciles committed journal publications after a crash, and
-// records retryable or terminal failures.
+// Command rag-document-worker consumes durable document-ingest jobs: it leases
+// one committed job by schedule_version, keeps the SQL lease alive while the
+// runtime parses and indexes it, reconciles committed journal publications after
+// a crash, and records retryable or terminal failures.
 //
-// It is the only document consumer. Debezium publishes committed
-// document_job_outbox rows to RAG_DOCUMENT_TOPIC and the worker joins
-// RAG_DOCUMENT_GROUP, so RAG_KAFKA_BOOTSTRAP_SERVERS is required. rag-service
-// never parses documents itself.
+// It is the only document consumer. Debezium captures committed document_jobs
+// rows (INSERT plus schedule_version bumps) and routes identifier-only
+// notifications to RAG_DOCUMENT_TOPIC; the worker joins RAG_DOCUMENT_GROUP and
+// reads the job parameters back from MySQL. RAG_KAFKA_BOOTSTRAP_SERVERS is
+// required. rag-service never parses documents itself.
 //
 // It is the Go counterpart of rag_mcp.document_worker.
 package main
@@ -192,6 +193,9 @@ func run() error {
 	return shutdown(service)
 }
 
+// recoveryLoop runs the periodic maintenance pass: Sweep requeues stranded jobs
+// by incrementing schedule_version inside MySQL, and Debezium emits the
+// replacement notification. No outbox row or broker publish happens here.
 func recoveryLoop(ctx context.Context, worker *documentworker.Processor, interval time.Duration, logger *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
