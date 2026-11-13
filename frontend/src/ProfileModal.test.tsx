@@ -99,7 +99,7 @@ describe("ProfileModal", () => {
     expect(within(profileForm).getByTitle("女")).toBeTruthy();
     expect(within(profileForm).getByRole("button", { name: /移除头像/ })).toBeTruthy();
 
-    fireEvent.click(within(dialog).getByRole("tab", { name: "账号安全" }));
+    fireEvent.click(within(dialog).getByRole("tab", { name: "修改邮箱" }));
     await within(dialog).findByRole("form", { name: "修改邮箱" });
     expect(within(dialog).getByText(/alice@example\.com/)).toBeTruthy();
     expect(within(dialog).getByText("已验证")).toBeTruthy();
@@ -172,7 +172,7 @@ describe("ProfileModal", () => {
   it("rejects mismatched new passwords and then changes the password", async () => {
     renderModal();
     const dialog = await screen.findByRole("dialog");
-    fireEvent.click(within(dialog).getByRole("tab", { name: "账号安全" }));
+    fireEvent.click(within(dialog).getByRole("tab", { name: "修改密码" }));
     const passwordForm = await within(dialog).findByRole("form", { name: "修改密码" });
 
     fireEvent.change(within(passwordForm).getByLabelText("当前密码"), { target: { value: "oldpass123" } });
@@ -206,7 +206,7 @@ describe("ProfileModal", () => {
     });
     const { onUpdated } = renderModal();
     const dialog = await screen.findByRole("dialog");
-    fireEvent.click(within(dialog).getByRole("tab", { name: "账号安全" }));
+    fireEvent.click(within(dialog).getByRole("tab", { name: "修改邮箱" }));
     const emailForm = await within(dialog).findByRole("form", { name: "修改邮箱" });
 
     fireEvent.change(within(emailForm).getByLabelText("新邮箱"), { target: { value: "new@example.com" } });

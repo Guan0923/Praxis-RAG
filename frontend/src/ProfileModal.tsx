@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import {
-  Alert, App, Avatar, Button, Divider, Form, Input, InputNumber, Modal, Select, Space, Tabs,
+  Alert, App, Avatar, Button, Form, Input, InputNumber, Modal, Select, Space, Tabs,
   Tag, Typography, Upload,
 } from "antd";
 import {
@@ -50,8 +50,8 @@ function isFormValidationError(error: unknown) {
 }
 
 // ProfileModal edits the signed-in account: the basic tab saves the public
-// profile (avatar / username / age / gender) and the security tab changes the
-// email address through a mailed code and rotates the password.
+// profile (avatar / username / age / gender), and the email and password tabs
+// each own one security flow so neither form competes for the dialog space.
 export function ProfileModal({ open, user, onUpdated, onClose }: {
   open: boolean;
   user: AuthUser;
@@ -237,7 +237,7 @@ export function ProfileModal({ open, user, onUpdated, onClose }: {
     </Form>
   );
 
-  const securityPane = (
+  const emailPane = (
     <div className="profile-security">
       <Typography.Title level={5} className="profile-section-title">修改邮箱</Typography.Title>
       <Typography.Paragraph type="secondary">
@@ -294,7 +294,11 @@ export function ProfileModal({ open, user, onUpdated, onClose }: {
         </Form.Item>
         <Button type="primary" htmlType="submit" loading={changingEmail}>确认修改邮箱</Button>
       </Form>
-      <Divider />
+    </div>
+  );
+
+  const passwordPane = (
+    <div className="profile-security">
       <Typography.Title level={5} className="profile-section-title">修改密码</Typography.Title>
       <Form<PasswordValues>
         form={passwordForm}
@@ -356,10 +360,14 @@ export function ProfileModal({ open, user, onUpdated, onClose }: {
       )}
       <Tabs
         activeKey={tab}
-        onChange={setTab}
+        onChange={(key) => {
+          setTab(key);
+          setError("");
+        }}
         items={[
           { key: "profile", label: "基本资料", children: profilePane },
-          { key: "security", label: "账号安全", children: securityPane },
+          { key: "email", label: "修改邮箱", children: emailPane },
+          { key: "password", label: "修改密码", children: passwordPane },
         ]}
       />
     </Modal>
