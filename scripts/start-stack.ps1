@@ -11,10 +11,8 @@
 # Run rag-search-worker separately: without a search consumer, MCP searches need a
 # consumer before their task deadline.
 #
-# RAG_OUTBOX_BRIDGE selects how a committed document job reaches Kafka:
-#   relay    (default) in-process outbox publisher inside rag-service
-#   debezium           the optional Debezium Server profile tails the MySQL binlog
-# Both deliver the same identifier-only notification; never enable both.
+# Debezium Server delivers committed document outbox events from MySQL binlog
+# to Kafka. The application does not publish document notifications.
 #
 #   .\scripts\start-stack.ps1                 # full start
 #   .\scripts\start-stack.ps1 -MigrateOnly    # only start dependencies + migrate
@@ -88,10 +86,6 @@ if ($env:RAG_KAFKA_BOOTSTRAP_SERVERS -match '^kafka(:|$)') {
     Write-Warning "RAG_KAFKA_BOOTSTRAP_SERVERS=$($env:RAG_KAFKA_BOOTSTRAP_SERVERS) is container-internal; host processes must use 127.0.0.1:9092."
 }
 if (-not $env:RAG_KAFKA_CLIENT_ID) { $env:RAG_KAFKA_CLIENT_ID = "praxis-rag" }
-if (-not $env:RAG_OUTBOX_BRIDGE) { $env:RAG_OUTBOX_BRIDGE = "relay" }
-if ($env:RAG_OUTBOX_BRIDGE -notin @("relay", "debezium")) {
-    throw "RAG_OUTBOX_BRIDGE must be relay or debezium."
-}
 if (-not $env:RAG_MYSQL_DATABASE) { $env:RAG_MYSQL_DATABASE = "praxis_rag" }
 if (-not $env:RAG_CACHE_TOPIC) { $env:RAG_CACHE_TOPIC = "praxis_state_cache_refresh" }
 if (-not $env:RAG_CACHE_GROUP) { $env:RAG_CACHE_GROUP = "praxis_state_cache_refresh_workers" }
@@ -142,17 +136,12 @@ foreach ($legacy in @("praxis-rag-rocketmq", "praxis-rag-rocketmq-namesrv", "pra
     }
 }
 
-$composeProfiles = @()
-if ($env:RAG_OUTBOX_BRIDGE -eq "debezium") {
-    $composeProfiles = @("--profile", "debezium")
-    if (-not $env:RAG_MYSQL_DEBEZIUM_PASSWORD) {
-        throw "RAG_MYSQL_DEBEZIUM_PASSWORD must be set in .env for the Debezium profile."
-    }
-    Write-Host "Debezium bridge enabled: tailing MySQL binlog for $($env:RAG_DOCUMENT_TOPIC)"
+if (-not $env:RAG_MYSQL_DEBEZIUM_PASSWORD) {
+    throw "RAG_MYSQL_DEBEZIUM_PASSWORD must be set in .env for Debezium."
 }
 
-Write-Host "Starting MySQL, Qdrant, Redis, Kafka and the Docling PDF parser (pdf-parser)..."
-Invoke-Compose (@($composeProfiles) + @("up", "-d"))
+Write-Host "Starting MySQL, Qdrant, Redis, Kafka, Debezium and the Docling PDF parser (pdf-parser)..."
+Invoke-Compose -Arguments @("up", "-d")
 if ($LASTEXITCODE -ne 0) {
     throw "docker compose up failed. Is Docker Desktop running and this shell allowed to access it?"
 }
@@ -247,21 +236,18 @@ if (-not $SkipMigrate) {
     }
 }
 
-if ($env:RAG_OUTBOX_BRIDGE -eq "debezium") {
-    Write-Host "Waiting for Debezium to start streaming the document_job_outbox binlog..."
-    $streaming = $false
-    for ($attempt = 0; $attempt -lt 90; $attempt++) {
-        $logs = docker logs praxis-rag-debezium --since 5m 2>&1
-        if ($logs -match "Starting streaming") { $streaming = $true; break }
-        Start-Sleep -Seconds 2
-    }
-    if ($streaming) {
-        Write-Host "Debezium is streaming MySQL binlog -> Kafka topic $($env:RAG_DOCUMENT_TOPIC)."
-        Write-Host "The Go service will NOT start its in-process relay (RAG_OUTBOX_BRIDGE=debezium)."
-    }
-    else {
-        Write-Warning "Debezium did not report 'Starting streaming' yet; check docker logs praxis-rag-debezium before relying on async uploads."
-    }
+Write-Host "Waiting for Debezium to start streaming the document_job_outbox binlog..."
+$streaming = $false
+for ($attempt = 0; $attempt -lt 90; $attempt++) {
+    $logs = docker logs praxis-rag-debezium --tail 200 2>&1
+    if ($logs -match "Starting streaming") { $streaming = $true; break }
+    Start-Sleep -Seconds 2
+}
+if ($streaming) {
+    Write-Host "Debezium is streaming MySQL binlog -> Kafka topic $($env:RAG_DOCUMENT_TOPIC)."
+}
+else {
+    throw "Debezium did not report 'Starting streaming'; check docker logs praxis-rag-debezium."
 }
 
 if ($MigrateOnly) {
@@ -273,10 +259,11 @@ if (-not (Test-Path $docWorker)) {
     throw "Document worker executable not found: $docWorker. Run scripts\build-go.ps1 without -SkipFrontend to build dist\bin, then retry."
 }
 # RAG_DOCUMENT_WORKERS fans out document workers: Kafka shares the
-# RAG_DOCUMENT_TOPIC partitions between consumers of RAG_DOCUMENT_GROUP and each
-# process parses one document at a time, so N workers = N concurrent parses. The
-# effective ceiling is the topic partition count (topics are provisioned with 4
-# below); extra processes stay idle. Keep the default 1 for a single-worker setup.
+# RAG_DOCUMENT_TOPIC partitions between consumers of RAG_DOCUMENT_GROUP. Each
+# process runs RAG_DOCUMENT_WORKER_CONCURRENCY handler goroutines (default 1).
+# The partition count limits active consumer processes, not handler goroutines;
+# one process can handle multiple documents concurrently. PDF parsing is also
+# bounded by pdf-parser's RAG_PDF_SERVICE_CONCURRENCY.
 $documentWorkers = 1
 if ($env:RAG_DOCUMENT_WORKERS) {
     $parsedWorkers = 0

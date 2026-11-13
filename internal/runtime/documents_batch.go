@@ -42,7 +42,7 @@ func (s *Service) SubmitDocumentBatch(
 	if s.stores == nil || s.stores.DocumentBatches == nil {
 		return nil, &apierrors.KnowledgeError{Message: asyncSubmissionFailedMessage}
 	}
-	if s.stores.DocumentDispatcher == nil {
+	if s.stores.DocumentJobs == nil {
 		return nil, &apierrors.KnowledgeError{Message: asyncSubmissionFailedMessage}
 	}
 	if err := s.validateUploads(files); err != nil {
@@ -165,7 +165,7 @@ func (s *Service) admitDocumentBatchFile(
 		result.Error = batchFailureText(err)
 		return result
 	}
-	admission, err := s.stores.DocumentDispatcher.Submit(ctx, namespace, file.Name, file.Content, idempotencyKey)
+	admission, err := s.stores.DocumentJobs.Submit(ctx, namespace, file.Name, file.Content, idempotencyKey)
 	if err != nil {
 		return classifyBatchAdmissionFailure(position, err)
 	}

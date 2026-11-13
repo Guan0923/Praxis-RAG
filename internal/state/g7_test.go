@@ -11,36 +11,6 @@ type PublisherError struct{ message string }
 
 func (e *PublisherError) Error() string { return e.message }
 
-type fakeDocumentPublisher struct {
-	mutex  sync.Mutex
-	sent   []DocumentNotification
-	err    error
-	closed bool
-}
-
-func (f *fakeDocumentPublisher) SendDocumentNotification(_ context.Context, notification DocumentNotification) error {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	if f.err != nil {
-		return f.err
-	}
-	f.sent = append(f.sent, notification)
-	return nil
-}
-
-func (f *fakeDocumentPublisher) Close() error {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	f.closed = true
-	return nil
-}
-
-func (f *fakeDocumentPublisher) messages() []DocumentNotification {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	return append([]DocumentNotification(nil), f.sent...)
-}
-
 type fakeSearchPublisher struct {
 	mutex  sync.Mutex
 	sent   []SearchEnvelope
@@ -450,62 +420,7 @@ func TestDocumentJobReconcileCommittedPublication(t *testing.T) {
 	}
 }
 
-func TestDocumentDispatcherRelayAndBridgeModes(t *testing.T) {
-	stores := newTestStores(t)
-	ctx := context.Background()
-	configureTestNamespace(t, stores, "manuals")
-	publisher := &fakeDocumentPublisher{}
-	dispatcher, err := NewDocumentJobDispatcher(stores, publisher)
-	if err != nil {
-		t.Fatalf("NewDocumentJobDispatcher() error = %v", err)
-	}
-	defer func() { _ = dispatcher.Close() }()
-	if dispatcher.Mode != "relay" || dispatcher.Relay == nil {
-		t.Fatalf("dispatcher = %+v", dispatcher)
-	}
-	admission, err := dispatcher.Submit(ctx, "manuals", "manual.txt", []byte("SECRET-BYTES"), nil)
-	if err != nil {
-		t.Fatalf("Submit() error = %v", err)
-	}
-	messages := publisher.messages()
-	if len(messages) != 1 || messages[0].ArtifactID != admission.ArtifactID ||
-		messages[0].Schema != DocumentEnvelopeSchema {
-		t.Fatalf("messages = %+v", messages)
-	}
-	events, err := stores.DocumentJobs.PendingOutbox(ctx, 10)
-	if err != nil || len(events) != 0 {
-		t.Fatalf("outbox after publish = %+v, %v", events, err)
-	}
-	// A broker failure keeps the row PENDING with a bounded error type.
-	failing := &fakeDocumentPublisher{err: &PublisherError{message: "private broker detail"}}
-	stores.DocumentJobs.Clock = func() float64 { return unixSeconds() }
-	second, err := dispatcher.Jobs.Submit(ctx, "manuals", "second.txt", []byte("deferred"), nil)
-	if err != nil {
-		t.Fatalf("Jobs.Submit() error = %v", err)
-	}
-	dispatcher.Transport = failing
-	if _, err := dispatcher.Relay.PublishOne(ctx, *second.EventID); err != nil {
-		t.Fatalf("PublishOne() error = %v", err)
-	}
-	event, err := dispatcher.Jobs.OutboxEvent(ctx, *second.EventID)
-	if err != nil || event.Status != "PENDING" || event.Attempts != 1 || event.LastError == nil ||
-		*event.LastError != "PublisherError" || event.RetryAt <= unixSeconds() {
-		t.Fatalf("failed publish event = %+v, %v", event, err)
-	}
-	if published, err := dispatcher.Relay.PublishOne(ctx, "missing"); err != nil || published {
-		t.Fatalf("missing PublishOne() = %v, %v", published, err)
-	}
-}
-
-func TestDocumentBridgeModeValidation(t *testing.T) {
-	isolateStateEnv(t)
-	if mode, err := DocumentBridgeModeFromEnv(); err != nil || mode != "relay" {
-		t.Fatalf("default bridge mode = %q, %v", mode, err)
-	}
-	t.Setenv("RAG_OUTBOX_BRIDGE", "kafka")
-	if _, err := DocumentBridgeModeFromEnv(); err == nil || !strings.Contains(err.Error(), "relay or debezium") {
-		t.Fatalf("invalid bridge error = %v", err)
-	}
+func TestDocumentQueueSettingsValidation(t *testing.T) {
 	isolateStateEnv(t)
 	settings, err := DocumentQueueSettingsFromEnv()
 	if err != nil || settings.Topic != "praxis_document_ingest" || settings.Group != "praxis_document_ingest_workers" {
@@ -524,12 +439,9 @@ func TestDocumentBridgeModeValidation(t *testing.T) {
 
 func TestStoresWiresG7StateMachines(t *testing.T) {
 	stores := newTestStores(t)
-	if stores.DocumentJobs == nil || stores.DocumentDispatcher == nil ||
+	if stores.DocumentJobs == nil ||
 		stores.SearchTasks == nil || stores.SearchDispatcher == nil {
 		t.Fatalf("G7 components not wired: %+v", stores)
-	}
-	if stores.DocumentDispatcher.Mode != "relay" || stores.DocumentDispatcher.Relay == nil {
-		t.Fatalf("document dispatcher = %+v", stores.DocumentDispatcher)
 	}
 	if err := stores.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)

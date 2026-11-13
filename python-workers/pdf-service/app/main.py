@@ -59,6 +59,7 @@ LOGGER = logging.getLogger(SERVICE_NAME)
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8091
 DEFAULT_TIMEOUT = 900.0
+DEFAULT_WORKERS = 1
 DEFAULT_CONCURRENCY = 1
 DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
@@ -80,6 +81,7 @@ class Settings:
     port: int = DEFAULT_PORT
     models_path: Path | None = None
     timeout: float = DEFAULT_TIMEOUT
+    workers: int = DEFAULT_WORKERS
     concurrency: int = DEFAULT_CONCURRENCY
     converter: str = "docling"
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
@@ -107,6 +109,7 @@ class Settings:
         host = os.environ.get("RAG_PDF_SERVICE_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
         port = _int_env("PORT", DEFAULT_PORT, minimum=1, errors=errors)
         timeout = _float_env("RAG_PDF_SERVICE_TIMEOUT", DEFAULT_TIMEOUT, minimum=0.001, errors=errors)
+        workers = _int_env("RAG_PDF_SERVICE_WORKERS", DEFAULT_WORKERS, minimum=1, errors=errors)
         concurrency = _int_env("RAG_PDF_SERVICE_CONCURRENCY", DEFAULT_CONCURRENCY, minimum=1,
                                errors=errors)
         max_upload_bytes = _int_env("RAG_PDF_SERVICE_MAX_BYTES", DEFAULT_MAX_UPLOAD_BYTES,
@@ -129,6 +132,7 @@ class Settings:
             port=port,
             models_path=models_path,
             timeout=timeout,
+            workers=workers,
             concurrency=concurrency,
             converter=converter,
             max_upload_bytes=max_upload_bytes,
@@ -463,11 +467,13 @@ app = create_app()
 
 
 def main() -> None:
-    """``python -m app.main`` convenience runner (uvicorn CLI is the default)."""
+    """Start the configured Uvicorn processes on one shared listening port."""
     import uvicorn
 
     settings = Settings.from_env()
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    # An import string is required for Uvicorn's multiprocess launcher; passing
+    # the app object would prevent workers > 1 from starting.
+    uvicorn.run("app.main:app", host=settings.host, port=settings.port, workers=settings.workers)
 
 
 if __name__ == "__main__":

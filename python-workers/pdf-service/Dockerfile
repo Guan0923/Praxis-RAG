@@ -91,6 +91,7 @@ EXPOSE 8091
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD python -c "import os, sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '8091') + '/healthz', timeout=5).status == 200 else 1)"
 
-# One uvicorn worker: Docling loads models into memory and requests are bounded
-# by RAG_PDF_SERVICE_CONCURRENCY inside the process. Scale with replicas.
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8091"]
+# Uvicorn manages RAG_PDF_SERVICE_WORKERS processes on the same port. Each has
+# its own models and RAG_PDF_SERVICE_CONCURRENCY conversion slots.
+ENV RAG_PDF_SERVICE_WORKERS=1
+CMD ["python", "-m", "app.main"]

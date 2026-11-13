@@ -16,7 +16,7 @@
 | 状态库 | `RAG_STATE_URL` 或 `RAG_MYSQL_*`、`RAG_MYSQL_DATABASE`（`praxis_rag`）、`RAG_STATE_ENCRYPTION_KEY`、`RAG_STATE_AUTO_SCHEMA` |
 | 向量/检索 | `RAG_BACKEND`（服务必须设 `qdrant`）、`QDRANT_URL`、`RAG_COLLECTION`、`RAG_DENSE_VECTOR_SIZE`（1024）、`RAG_EMBEDDING_MODEL`、`RAG_RERANKER_*` |
 | Redis | `RAG_REDIS_URL`、`RAG_REDIS_ENABLED`、`RAG_REDIS_PREFIX`、`RAG_RESULT_TTL_SECONDS`（3600）、`RAG_RESULT_MAX_BYTES`、`RAG_ARTIFACT_MAX_BYTES` |
-| Kafka | `RAG_KAFKA_BOOTSTRAP_SERVERS`、`RAG_KAFKA_SECURITY_PROTOCOL`、`RAG_KAFKA_SASL_*`、`RAG_KAFKA_TLS_*`、`RAG_*_TOPIC`/`RAG_*_GROUP`、`RAG_*_DLQ_TOPIC`、`RAG_OUTBOX_BRIDGE`、`RAG_DOCUMENT_WORKER_CONCURRENCY`/`RAG_SEARCH_WORKER_CONCURRENCY`（默认 `1`） |
+| Kafka | `RAG_KAFKA_BOOTSTRAP_SERVERS`、`RAG_KAFKA_SECURITY_PROTOCOL`、`RAG_KAFKA_SASL_*`、`RAG_KAFKA_TLS_*`、`RAG_*_TOPIC`/`RAG_*_GROUP`、`RAG_*_DLQ_TOPIC`、`RAG_DOCUMENT_WORKER_CONCURRENCY`/`RAG_SEARCH_WORKER_CONCURRENCY`（默认 `1`） |
 | PDF/Word | `RAG_PDF_ENGINE`（`docling`/`go`）、`RAG_PDF_SERVICE_URL`、`RAG_PDF_SERVICE_TIMEOUT`（900）、`RAG_WORD_CONVERTER_PATH`、`RAG_WORD_CONVERT_TIMEOUT` |
 | VLM | `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`、`RAG_VLM_TIMEOUT`、`RAG_VLM_CONCURRENCY`（Console 知识库配置优先，环境变量是回退） |
 | 默认知识库模板 | `RAG_DEFAULT_KB_TEMPLATE`（默认 `default`，VIP/普通用户建库时克隆其模型配置） |
@@ -110,7 +110,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 
 真实基础设施上的验证脚本（需要 Docker + Python 3）：
 
-- `scripts/verify-debezium-e2e.py`（relay / debezium 两种链路）
+- `scripts/verify-debezium-e2e.py`（Debezium 文档通知链路）
 - `scripts/verify-kafka-dlq.py`（显式 DLQ）
 - `scripts/verify-kafka-search.py`（排队搜索 + Redis 快照）
 

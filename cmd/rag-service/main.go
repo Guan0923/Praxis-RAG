@@ -120,10 +120,6 @@ func run() error {
 	}
 	// The Console monitoring page is read-only: one state aggregate plus five
 	// bounded dependency probes, assembled per request by internal/monitor.
-	outboxBridge := "relay"
-	if stores.DocumentDispatcher != nil && stores.DocumentDispatcher.Mode != "" {
-		outboxBridge = stores.DocumentDispatcher.Mode
-	}
 	monitorService := monitor.New(monitor.Options{
 		Stats:                 stores,
 		MySQL:                 stores,
@@ -132,7 +128,7 @@ func run() error {
 		QdrantURL:             ragConfig.QdrantURL,
 		Collection:            ragConfig.Collection,
 		KafkaBootstrapServers: mqSettings.BootstrapServers,
-		OutboxBridge:          outboxBridge,
+		OutboxBridge:          "debezium",
 		UploadMode:            "async",
 		DocumentWorker:        documentWorkerMode,
 		PDFEngine:             ragConfig.PDFEngine,

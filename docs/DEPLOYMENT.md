@@ -11,7 +11,7 @@
 浏览器/MCP/REST ──>│ rag-service :8011          │──> Qdrant（HTTP :6333）
                   │ REST /v1, MCP /mcp, /console│──> 共享状态库 MySQL
                   └────────────┬───────────────┘──> Redis（可选：缓存/快照）
-                               │ Kafka（可选：outbox relay + 排队搜索）
+                               │ Kafka（可选：Debezium 文档通知 + 排队搜索）
              ┌─────────────────┼──────────────────────┐
              ▼                 ▼                      ▼
   rag-document-worker   rag-search-worker   rag-dead-letter-worker --kind {document,search}
@@ -211,6 +211,7 @@ docker run -d --name praxis-rag-pdf-parser \
 | `PORT` | `8091` | 服务进程监听端口；Docker/Compose 内固定 8091 |
 | `RAG_PDF_SERVICE_PORT` | `8091` | 仅用于 compose 的宿主发布端口；容器内固定 8091，改宿主端口后要同步 Go 端 `RAG_PDF_SERVICE_URL` |
 | `RAG_PDF_MODELS_PATH` | `/models`（镜像内置） | Docling 模型目录；compose 把 `pdf_parser_models` 卷挂到这里 |
+| `RAG_PDF_SERVICE_WORKERS` | `1` | 容器内 Uvicorn 服务进程数（正整数）；默认入口 `python -m app.main` 读取。所有进程共用同一端口，每进程独立加载模型并持有解析并发名额 |
 | `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 并发解析请求数（`asyncio.Semaphore` 许可数）。模型权重常驻共享、不随并发翻倍，但每次转换的工作内存与 CPU 随并发线性增长；内存紧张时保持 1 靠副本扩容，CPU/内存充足时可与 worker 并发同量级调大 |
 | `RAG_PDF_SERVICE_TIMEOUT` | `900` 秒 | 单请求超时；排队等待与转换各自不超过该值（超时 504），与 Go 端同名变量取同一值 |
 | `RAG_PDF_SERVICE_MAX_BYTES` | `104857600` | 单次上传上限（字节），超限 413 |
@@ -227,7 +228,8 @@ docker run -d --name praxis-rag-pdf-parser \
 
 资源、端口与安全：
 
-- CPU 与内存：镜像（CPU torch + docling）加模型通常占数 GB，先确认磁盘与内存；`RAG_PDF_SERVICE_CONCURRENCY=1` 表示一次只处理一个 PDF。提高 Go worker 端并发（`RAG_DOCUMENT_WORKER_CONCURRENCY`）时要同步调大本变量并核对容器 CPU/内存，否则多余的解析请求只会在 pdf-parser 的信号量门口排队、占用超时窗口，吞吐不变（模型权重共享不翻倍，但每次转换的工作内存与 CPU 抢核随并发线性增长；多副本是内存隔离的替代扩容路径）。
+- CPU 与内存：镜像（CPU torch + docling）加模型通常占数 GB，先确认磁盘与内存；`RAG_PDF_SERVICE_CONCURRENCY=1` 表示每个进程一次只处理一个 PDF。提高 Go worker 总任务并发时，要核对 PDF 端的总解析容量（服务进程数 × 每进程解析并发）和容器 CPU/内存，否则多余请求会在解析进程内排队并消耗超时窗口。同进程内增加并发会增加转换工作内存，增加进程还会增加各进程独立的模型内存开销。
+- 进程数与进程内并发分开配置：`RAG_PDF_SERVICE_WORKERS=1`、`RAG_PDF_SERVICE_CONCURRENCY=4` 表示一个服务进程最多同时解析 4 份；改为 `2` 和 `2` 时，两个进程总解析容量上限仍为 4。进程之间不共享模型内存，也不共享信号量；连接复用可能使任务分布不均。修改后执行 `docker compose up -d --build pdf-parser`，确保镜像使用支持进程数设置的新入口；不需要增加端口或修改 Go 客户端地址。
 - 只发布 `127.0.0.1:${RAG_PDF_SERVICE_PORT:-8091}`（容器内固定 8091）。`POST /v1/parse` 没有认证，只应在本机/内网暴露，不要直接挂公网或反向代理。修改宿主端口后要同步 Go 端 `RAG_PDF_SERVICE_URL`。
 - `GET /healthz` 用于健康检查；compose 用 Python 内置 `urllib` 探测，`start_period` 60 秒给冷启动留时间。
 - 需要 systemd 时可参照 `python-workers/pdf-service/README.md` 的 uvicorn 启动方式（`app.main:app`，端口 8091）编写单元，环境变量同上，并在 `rag-service` 之前启动。
@@ -310,7 +312,7 @@ TimeoutStopSec=20
 WantedBy=multi-user.target
 ```
 
-服务收到 SIGTERM 后停止后台 relay/维护循环、关闭 HTTP 与状态库；`Restart=on-failure` 覆盖意外崩溃。服务配置错误也以 `1` 退出，因此若配置写错会反复重启——上线前先用前台方式验证一次 `ExecStart`。
+服务收到 SIGTERM 后停止后台发布与维护循环、关闭 HTTP 与状态库；`Restart=on-failure` 覆盖意外崩溃。服务配置错误也以 `1` 退出，因此若配置写错会反复重启——上线前先用前台方式验证一次 `ExecStart`。
 
 ### 4.3 文档 worker
 
@@ -405,7 +407,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 1. MySQL/Redis/Kafka/Qdrant 就绪。
 2. `pdf-parser` 就绪（使用 docling 引擎时；compose 默认随基础设施启动，等待 `/healthz` 返回 200）。它不依赖状态库，可与基础设施并行启动。
 3. `rag-state-migrate --apply`（见 §6）。
-4. `praxis-rag.service`（API 受理、relay、维护循环）。
+4. `praxis-rag.service`（API 受理、维护循环）。
 5. `praxis-rag-document-worker.service`（Kafka 部署；无 Kafka 的单进程部署由 `rag-service` 内嵌 worker 覆盖，可跳过）、`praxis-rag-search-worker.service`。
 6. `praxis-rag-dead-letter-worker@document/search`。
 7. 打开 `/health`，创建/确认 API Key，做一次上传与检索冒烟；docling 引擎还要确认 `http://127.0.0.1:8091/healthz`。
@@ -463,11 +465,10 @@ systemctl enable --now praxis-rag-dead-letter-worker@search.service
 
 | 模式 | 配置 | 行为 |
 | --- | --- | --- |
-| relay（Go 默认且唯一内建） | `RAG_KAFKA_BOOTSTRAP_SERVERS` 设置 | `rag-service` 进程内轮询 `document_job_outbox` 投递纯通知；搜索请求也由进程内 relay 投递 |
 | 本地单进程 | 不设置 Kafka（`RAG_DOCUMENT_WORKER_INPROCESS` 默认 auto） | `rag-service` 内嵌文档 worker 直接轮询 outbox；搜索只能是同步（MCP `search` 无 `wait_seconds`）。关闭内嵌 worker 时改由独立 worker 加 `RAG_DOCUMENT_WORKER_LOCAL=1` 轮询 |
-| Debezium | `RAG_OUTBOX_BRIDGE=debezium` + 外部 Debezium | 已实现并验证；应用不发布，由 CDC 投递。不要与 relay 同时启用 |
+| Debezium | 独立 Debezium Server | 文档通知的 Kafka 投递通道；Compose 默认启动，应用只写事务 outbox |
 
-Debezium 模式（`RAG_OUTBOX_BRIDGE=debezium`）要求状态库为 MySQL：启动 compose `debezium` profile（或外部 Debezium Server），应用侧保持该环境变量；应用不会启动进程内 relay，避免双投递。已验证 CDC 部署链路：MySQL 8.0 + Debezium Server 3.7.1.Final + 原生 Kafka sink + Kafka 3.9.0（topic 记录与 outbox PENDING 一致）；Go 服务/worker 消费真实 Kafka 的完整链路也已实机验证（debezium 与 relay 两种模式，脚本 `scripts/verify-debezium-e2e.py`；DLQ 与排队搜索见 `scripts/verify-kafka-dlq.py` / `scripts/verify-kafka-search.py`）。
+文档 Kafka 投递依赖 Debezium Server 读取 MySQL binlog，应用不发布文档通知。Compose 默认启动 Debezium；外部部署应保证连接器持续运行。验证脚本为 `scripts/verify-debezium-e2e.py`，DLQ 与排队搜索分别见 `scripts/verify-kafka-dlq.py`、`scripts/verify-kafka-search.py`。
 
 ## 9. 安全与网络
 
@@ -489,7 +490,7 @@ Debezium 模式（`RAG_OUTBOX_BRIDGE=debezium`）要求状态库为 MySQL：启�
 - `scripts/build-go.ps1` 本机构建 + 冒烟（健康检查、Console、`/`）。
 - 三个 worker 的启动/退出码行为（无 Kafka、错误 backend、非法 `--kind`、`--help`）。
 
-本环境**未完整验证**：Docker 镜像构建、`app`/worker Compose profile、`pdf-parser` 镜像与真实 Docling/CodeFormula 推理（Python 测试使用 `RAG_PDF_SERVICE_CONVERTER=fake`；模型下载/缓存未实测）、systemd 单元、真实 MySQL 多实例并发与故障切换、真实 Kafka+SASL/TLS 集群、LibreOffice DOC 转换与真实 VLM 端点实链路（Go 纯文本引擎与 DOCX 解析已有单元/集成测试）；已实机验证：Kafka 3.9.0 + Debezium 3.7.1 + MySQL 8.0 + Redis + Qdrant 基础设施、CDC 投递、Go 服务/worker 的 debezium/relay 异步链路、排队搜索与显式 DLQ（脚本 `scripts/verify-*.py`，见 [USAGE](USAGE.md)）。上线前请在预发环境按本指南逐项演练，并参考 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 的剩余 P1/P2 与 [GO_MIGRATION](GO_MIGRATION.md) 的进行中项。
+本环境**未完整验证**：Docker 镜像构建、`app`/worker Compose profile、`pdf-parser` 镜像与真实 Docling/CodeFormula 推理（Python 测试使用 `RAG_PDF_SERVICE_CONVERTER=fake`；模型下载/缓存未实测）、systemd 单元、真实 MySQL 多实例并发与故障切换、真实 Kafka+SASL/TLS 集群、LibreOffice DOC 转换与真实 VLM 端点实链路（Go 纯文本引擎与 DOCX 解析已有单元/集成测试）；已实机验证：Kafka 3.9.0 + Debezium 3.7.1 + MySQL 8.0 + Redis + Qdrant 基础设施、CDC 投递、Go 服务/worker 的 Debezium 异步链路、排队搜索与显式 DLQ（脚本 `scripts/verify-*.py`，见 [USAGE](USAGE.md)）。上线前请在预发环境按本指南逐项演练，并参考 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 的剩余 P1/P2 与 [GO_MIGRATION](GO_MIGRATION.md) 的进行中项。
 
 
 

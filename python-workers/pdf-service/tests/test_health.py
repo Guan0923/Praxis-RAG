@@ -45,6 +45,7 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.host == "0.0.0.0"
     assert settings.port == 8091
     assert settings.timeout == 900.0
+    assert settings.workers == 1
     assert settings.concurrency == 1
     assert settings.converter == "docling"
     assert settings.models_path is None
@@ -56,6 +57,7 @@ def test_settings_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RAG_PDF_SERVICE_HOST", "127.0.0.1")
     monkeypatch.setenv("PORT", "9123")
     monkeypatch.setenv("RAG_PDF_SERVICE_TIMEOUT", "42.5")
+    monkeypatch.setenv("RAG_PDF_SERVICE_WORKERS", "2")
     monkeypatch.setenv("RAG_PDF_SERVICE_CONCURRENCY", "3")
     monkeypatch.setenv("RAG_PDF_MODELS_PATH", "/models")
     monkeypatch.setenv("RAG_VLM_BASE_URL", "http://vlm.example/v1")
@@ -69,6 +71,7 @@ def test_settings_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.host == "127.0.0.1"
     assert settings.port == 9123
     assert settings.timeout == 42.5
+    assert settings.workers == 2
     assert settings.concurrency == 3
     assert settings.models_path is not None
     assert settings.models_path.name == "models"

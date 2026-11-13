@@ -1,6 +1,6 @@
 # Debezium 桥接：MySQL binlog → Kafka
 
-这个目录让 MySQL 里已经提交的事务**必然**产生一条 Kafka 通知，中间不依赖应用进程是否存活。
+该服务读取 MySQL 事务 outbox 的 binlog 变更并投递 Kafka，投递进程独立于主后端；消费者通过幂等处理支持至少一次投递。
 
 > **实测记录（2026-11-09，Windows + Docker Desktop）**：仓库的 `docker-compose.yml`
 > 使用单节点 KRaft Kafka（`apache/kafka:3.9.0`）与 Debezium Server 3.7.1.Final。
@@ -16,21 +16,20 @@
 
 ## 为什么需要它
 
-异步新增文档的投递有两条**互斥**的路径，由 `RAG_OUTBOX_BRIDGE` 选择：
+文档通知统一由 Debezium 投递：
 
-| 模式 | 谁把 `document_job_outbox` 的行变成 Kafka 消息 | 适用场景 |
-| --- | --- | --- |
-| `relay`（默认） | `rag-service` 进程内的 outbox relay 轮询 PENDING 行并发送 | 本地开发、没有 CDC 基础设施的部署 |
-| `debezium` | Debezium Server 读取 MySQL binlog 中该表的 INSERT 事件并写入 Kafka | 生产环境：投递不依赖应用进程，事务提交即保证有投递 |
+```text
+上传受理 → MySQL 单事务写入 document_jobs + document_job_outbox
+        → Debezium 读取 binlog → Kafka → rag-document-worker
+```
 
-两种模式**不能同时开启**，否则同一行会被投递两次。重复投递本身安全（worker 幂等），但会浪费 Kafka 容量并让排障变复杂。使用 `debezium` 时应用**不会**启动进程内 relay。
+应用只提交事务 outbox，不直接向 Kafka 发布文档通知。搜索与缓存事件有各自的发布流程。
 
 ## 启动
 
 1. 在 `.env` 里填好：
 
 ```dotenv
-RAG_OUTBOX_BRIDGE=debezium
 # 必须与 Debezium SMT 的 topic.replacement 一致
 RAG_DOCUMENT_TOPIC=praxis_document_ingest
 # 宿主机进程（rag-service / worker / kafka 工具）：宿主机映射端口
@@ -46,7 +45,7 @@ RAG_MYSQL_DEBEZIUM_PASSWORD=change-me
 .\scripts\start-stack.ps1
 ```
 
-脚本会依次：起依赖（`RAG_OUTBOX_BRIDGE=debezium` 时带 `--profile debezium`）→ 等 MySQL healthy →
+脚本会依次：起依赖（包括 Debezium）→ 等 MySQL healthy →
 等 Kafka healthy → 可创建 cache/document/search/DLQ topic → 执行 `rag-state-migrate --apply` →
 等待 Debezium "Starting streaming" → 启动 `dist/bin/rag-service.exe`。
 只想准备依赖与数据库时加 `-MigrateOnly`。
@@ -57,7 +56,7 @@ RAG_MYSQL_DEBEZIUM_PASSWORD=change-me
 # 构建（一次即可）
 pwsh -File scripts/build-go.ps1 -SkipFrontend
 
-# 终端 1：API（RAG_OUTBOX_BRIDGE=debezium 时不会启动进程内 relay）
+# 终端 1：API（只提交事务 outbox）
 dist\bin\rag-service.exe
 
 # 终端 2：文档 worker（消费 Debezium 投递到 Kafka 的 schema-3 事件）
@@ -68,7 +67,7 @@ dist\bin\rag-document-worker.exe
 端到端验证脚本：`python scripts/verify-debezium-e2e.py`（需要本目录的 compose
 栈与 `dist/bin` 已就绪，脚本使用临时 fake 模型 API，不会写入真实知识库配置）。
 
-3. 用 `RAG_OUTBOX_BRIDGE=debezium` 启动 `rag-service` 和 `rag-document-worker`。
+3. 保持 Debezium 运行，再启动 `rag-service` 和 `rag-document-worker`。
 
 ## Kafka 拓扑与地址
 
@@ -139,17 +138,6 @@ docker exec praxis-rag-kafka /opt/kafka/bin/kafka-console-consumer.sh `
 `kafka-console-consumer.sh` 的探测是**信息性**的：没有历史消息或 offset 已提交时可能
 读不到内容；发件箱 PENDING 行 + worker 状态终态才是结论性证据。
 
-## 回退到 relay
-
-```powershell
-$env:RAG_OUTBOX_BRIDGE="relay"
-docker compose --profile debezium stop debezium
-# 重启 rag-service 与 rag-document-worker
-```
-
-应用内 relay 会在下一轮轮询（默认 2 秒）接手所有 PENDING 行；历史未标记行会被重新
-投递，worker 幂等。
-
 ## 实测踩坑（Kafka 版）
 
 | 现象 | 原因 | 修正 |
@@ -159,7 +147,7 @@ docker compose --profile debezium stop debezium
 | `Failed to establish connection with the database:`（消息为空） | CDC 账号是 `caching_sha2_password`，而配置写了 `ssl.mode=disabled`，JDBC 取不到服务端公钥 | `debezium.source.database.ssl.mode=preferred`（镜像自带自签证书） |
 | 宿主机连不上 `kafka:9092`，或容器连不上 `127.0.0.1:9092` | Kafka 通告地址区分 internal/external listener | 宿主机用 `127.0.0.1:9092`，compose 容器用 `kafka:9092`；compose 已为 app/debezium 分别设置 |
 | 容器重建后 topic/offset 丢失 | `apache/kafka` 默认 `log.dirs=/tmp/kafka-logs`，未落到挂载卷 | compose 设置 `KAFKA_LOG_DIRS=/var/lib/kafka/data` 并挂载 `kafka_data`（已实测） |
-| worker 收不到通知 | 应用仍以 `RAG_OUTBOX_BRIDGE=relay` 启动了进程内 relay，或 topic 不一致 | `RAG_OUTBOX_BRIDGE=debezium`；SMT 的 `topic.replacement` 与 `RAG_DOCUMENT_TOPIC` 必须相同 |
+| worker 收不到通知 | Debezium 未运行或 topic 不一致 | 确认 Debezium 正在 streaming，SMT 的 `topic.replacement` 与 `RAG_DOCUMENT_TOPIC` 相同 |
 
 ## 已知限制
 

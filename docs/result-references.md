@@ -136,7 +136,7 @@ RAG_ARTIFACT_MAX_BYTES=67108864
 RAG_RESULT_MAX_ARTIFACTS=100
 ```
 
-- MCP 搜索必须运行独立 `rag-search-worker`；没有消费者会排队直至 deadline。每个消费进程默认顺序执行，文档、搜索、缓存刷新使用独立 topic/group；worker 与 API 共享 MySQL、必需的 Redis/Kafka、Qdrant 和状态加密设置。文档异步新增另需 `rag-document-worker`（不依赖 Redis），投递模式由 `RAG_OUTBOX_BRIDGE` 选择。
+- MCP 搜索必须运行独立 `rag-search-worker`；没有消费者会排队直至 deadline。每个消费进程默认顺序执行，文档、搜索、缓存刷新使用独立 topic/group；worker 与 API 共享 MySQL、必需的 Redis/Kafka、Qdrant 和状态加密设置。文档异步新增另需 `rag-document-worker`（不依赖 Redis），文档通知由 Debezium 读取 MySQL binlog 投递。
 - 任务默认总超时 120 秒，包含排队等待，与 `wait_seconds`（默认 10 秒）和完成快照的 3600 秒 TTL 独立。生产检索在子进程执行；Kafka 消费失败在同一进程内指数退避重试（100ms 起、上限 5s），不承诺立即取消正在执行的检索或下游调用。
 - Kafka 携带完整查询参数，Redis 保存短期搜索任务/结果；任务状态采用 CAS，结果快照与成功终态在 Redis 内原子保存（不含 MySQL 事务）。消费语义：成功提交 offset；临时故障在同一进程内重试同一条记录；达到 `RAG_SEARCH_MAX_ATTEMPTS` 后原始消息写入 `RAG_SEARCH_DLQ_TOPIC` 再提交；至少一次。确定性失败先写 Redis 失败终态再提交，成功先存结果/终态再提交。终态 first-terminal-wins；重复消息不覆盖仍存在的终态；Redis 丢失后不保证搜索持久去重。
 - 文档消息只含 schema 3 通知标识；worker 按 `artifact_id` 从 MySQL 读回任务与文件字节，用 SQL 租约 claim 并心跳续租，只有 MySQL 记录终态才提交 offset；瞬时失败在同一进程内重试，达到 `RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS` 后写入 `RAG_DOCUMENT_DLQ_TOPIC` 再提交（至少一次）。没有 Redis 任务状态或重组 TTL，也没有 Redis+MySQL 原子事务：文档 `succeeded` 就是 MySQL 持久发布结果。

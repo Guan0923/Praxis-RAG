@@ -159,7 +159,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 ## 12. 异步队列、死信与缓存
 
 - Kafka 只在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；空值 = brokerless（内嵌文档 worker 轮询发件箱，MCP 搜索同步）。
-- outbox 投递二选一：`RAG_OUTBOX_BRIDGE=relay`（默认，进程内发布）或 `debezium`（Debezium Server 读 MySQL binlog 投递，应用不发布）。**两者不能同时启用**。
+- 文档 outbox 由 Debezium 读取 MySQL binlog 并投递 Kafka；应用只写入事务 outbox，不发布文档通知。
 - topic：`praxis_state_cache_refresh`、`praxis_document_ingest`、`praxis_search`；DLQ 是显式 topic `praxis_document_ingest_dead_letters` / `praxis_search_dead_letters`（不是 `%DLQ%` 约定），由 `rag-dead-letter-worker --kind document|search` 消费。
 - 消费语义至少一次：成功提交 offset；失败同进程指数退避重试（100ms 起、上限 5s），达到 `MaxAttempts`（默认 5）后写 DLQ 再提交；重复投递由幂等与 MySQL 租约吸收。
 - 无 Kafka 时 `rag-service` 默认内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS=auto`）；也可关闭内嵌 worker 并运行 `RAG_DOCUMENT_WORKER_LOCAL=1` 的独立文档 worker。
@@ -171,6 +171,6 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 - 健康检查 `GET /health`；OpenAPI `GET /openapi.json`（OpenAPI 3.1.0）、交互文档 `GET /docs`。
 - `rag-state-migrate [--apply]`：状态库表结构检查/幂等创建；`rag-service-migrate` 默认只读预演，`--apply` 只导入源文件与文档记录，**不重建向量**，需要重新上传才会可检索。
 - `rag-mcp-ingest`：递归导入本地文件/目录，输出 `OK/SKIP/FAIL` 与 `SUMMARY`；`--dry-run` 不打开运行时。
-- `docker compose up -d` 启动基础设施（MySQL 3307、Qdrant 6333、Redis 6379、Kafka 9092）与 `pdf-parser`（8091）；`--profile app` 构建并启动 Go 服务；`--profile debezium` 启动 CDC。
+- `docker compose up -d` 启动基础设施（MySQL 3307、Qdrant 6333、Redis 6379、Kafka 9092）与 `pdf-parser`（8091）；`--profile app` 构建并启动 Go 服务；默认启动 Debezium CDC。
 - `scripts/start-stack.ps1` 一键起依赖、建 topic、迁移并启动 `rag-service` + `rag-document-worker`；`stop-stack.ps1` 停止。
 - `scripts/verify-debezium-e2e.py`、`verify-kafka-dlq.py`、`verify-kafka-search.py` 是真实基础设施上的验证脚本（需要 Docker 与 Python 3）。

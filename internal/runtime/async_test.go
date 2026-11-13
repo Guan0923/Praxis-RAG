@@ -151,14 +151,12 @@ func TestAddDocumentAsyncAdmissionReplayAndConflicts(t *testing.T) {
 	if len(payload) != 1 {
 		t.Errorf("admission payload = %v, want only artifact_id", payload)
 	}
-	if broker.documentNotificationCount() != 1 {
+	if broker.documentNotificationCount() != 0 {
 		t.Errorf("published document notifications = %d", broker.documentNotificationCount())
 	}
-	broker.mu.Lock()
-	notification := broker.documentNotifications[0]
-	broker.mu.Unlock()
-	if notification.ArtifactID != artifactID || notification.Namespace != "alpha" || notification.Name != "manual.md" {
-		t.Errorf("notification = %+v", notification)
+	events, err := stores.DocumentJobs.PendingOutbox(ctx, 10)
+	if err != nil || len(events) != 1 || events[0].ArtifactID != artifactID || events[0].Namespace != "alpha" || events[0].Name != "manual.md" {
+		t.Fatalf("committed outbox event = %+v, %v", events, err)
 	}
 
 	// Same idempotency key and bytes replays the same artifact.

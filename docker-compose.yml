@@ -18,7 +18,7 @@ services:
       - --collation-server=utf8mb4_bin
       - --max-allowed-packet=64M
       # Required by the Debezium bridge: row-based binlog with full before/after
-      # images. Harmless when running with RAG_OUTBOX_BRIDGE=relay.
+      # images. Debezium uses the binlog to deliver document outbox events.
       - --log-bin=mysql-bin
       - --binlog-format=ROW
       - --binlog-row-image=FULL
@@ -60,7 +60,7 @@ services:
       retries: 20
 
   # Single-node KRaft Kafka used by the async document/search queues and the
-  # optional Debezium bridge. Two listeners:
+  # Debezium document bridge. Two listeners:
   #   INTERNAL kafka:9092   -> rag-service/worker/Debezium containers on this network
   #   EXTERNAL 127.0.0.1:9092 -> processes on the host (start-stack, local binaries)
   # The external listener binds container port 29092 and is published on the host
@@ -104,17 +104,15 @@ services:
       retries: 30
       start_period: 20s
 
-  # Optional CDC bridge: tails the MySQL binlog of the transactional outbox
+  # Document CDC bridge: tails the MySQL binlog of the transactional outbox
   # table and publishes each committed notification to Kafka with the native
   # Debezium Kafka sink. Enable with
-  #   docker compose --profile debezium up -d
-  # and run rag-service/rag-document-worker with RAG_OUTBOX_BRIDGE=debezium.
-  # See deploy/debezium/README.md. Not started by default.
+  #   docker compose up -d
+  # Required for Kafka document delivery. See deploy/debezium/README.md.
   debezium:
     image: ${DEBEZIUM_IMAGE:-quay.io/debezium/server:3.7.1.Final}
     container_name: praxis-rag-debezium
     restart: unless-stopped
-    profiles: ["debezium"]
     depends_on:
       mysql:
         condition: service_healthy
@@ -173,6 +171,7 @@ services:
       RAG_PDF_SERVICE_HOST: "0.0.0.0"
       RAG_PDF_SERVICE_PORT: "8091"
       RAG_PDF_MODELS_PATH: ${RAG_PDF_MODELS_PATH:-/models}
+      RAG_PDF_SERVICE_WORKERS: ${RAG_PDF_SERVICE_WORKERS:-1}
       RAG_PDF_SERVICE_CONCURRENCY: ${RAG_PDF_SERVICE_CONCURRENCY:-1}
       # Test/integration only: "fake" returns a fixed manifest without loading
       # Docling. Keep the default "docling" in production.
@@ -225,6 +224,8 @@ services:
         condition: service_healthy
       pdf-parser:
         condition: service_started
+      debezium:
+        condition: service_started
     environment:
       RAG_SERVICE_TOKEN: ${RAG_SERVICE_TOKEN:-}
       RAG_SERVICE_HOST: "0.0.0.0"
@@ -238,7 +239,6 @@ services:
       RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
       RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
       RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
-      RAG_OUTBOX_BRIDGE: ${RAG_OUTBOX_BRIDGE:-relay}
       # PDF parsing: the default docling engine calls the pdf-parser sidecar
       # over HTTP (zip manifest + assets). Set RAG_PDF_ENGINE=go to use the
       # in-process text-only parser and drop the pdf-parser dependency.

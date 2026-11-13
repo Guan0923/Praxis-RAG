@@ -218,10 +218,10 @@ Go 镜像内包含 `/app/bin/` 下全部命令、`/app/web` Console 和 `/app/co
 MCP 客户端 -> /mcp（Streamable HTTP）-> rag-service
 REST /v1/* ------------------------> rag-service（同步搜索/管理/状态；上传默认异步受理）
 rag-service -> Qdrant（检索索引）、共享状态库（文档/KB/Key/任务/发件箱）、
-               Redis（读模型缓存 + 搜索快照；可选）、Kafka（outbox relay/搜索队列；可选）
+               Redis（读模型缓存 + 搜索快照；可选）、Kafka（Debezium 文档通知/搜索队列；可选）
 网页/REST 上传（默认）与 MCP add_document
                  -> 状态库单事务写入 document_jobs + document_job_outbox，返回 artifact_id
-                 -> 有 Kafka：relay（rag-service 内置）-> Kafka 通知 -> rag-document-worker
+                 -> 有 Kafka：Debezium（读取 binlog）-> Kafka 通知 -> rag-document-worker
                  -> 无 Kafka：rag-service 内嵌 worker 直接消费发件箱
                  -> 两种方式都完成解析/切分/Embedding/Qdrant 发布，用
                     GET /v1/document-jobs/{artifact_id} 轮询 status/stage
@@ -231,15 +231,15 @@ MCP search（配置 Kafka 时）-> search_task_outbox -> Kafka -> rag-search-wor
 
 - PDF 解析引擎可切换：默认 `docling` 走独立的 `pdf-parser` 微服务（版面/表格/OCR/公式），`go` 使用 Go 进程内纯文本引擎；`docling` 引擎下知识库未配置 VLM/OCR 时，PDF 上传会在受理阶段被拒绝并提示去「模型配置」页面配置（不进入队列）；pdf-parser 不可用或超时同样会让该次上传失败，可显式设 `RAG_PDF_ENGINE=go` 回退。
 - 搜索 worker、死信 worker 与 Kafka 模式的文档 worker 是**独立进程**；`rag-service` 只在无 Kafka 时内嵌文档 worker（`RAG_DOCUMENT_WORKER_INPROCESS`，默认 auto），Kafka 模式不内嵌消费者。
-- `rag-service` 在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用 in-process outbox relay 和排队搜索；未配置时 MCP 搜索同步，默认由内嵌文档 worker 直接消费发件箱（`RAG_DOCUMENT_WORKER_INPROCESS=0` 可关闭并改跑独立 worker），没有消费者时任务保持 `queued`。
-- **`RAG_OUTBOX_BRIDGE` 支持 `relay`（默认）与 `debezium`**：`relay` 由服务进程内发布发件箱；`debezium` 时服务**不发布**，由外部 Debezium Server 读取 MySQL binlog 投递。Debezium 部署链路已在真实 MySQL 8.0 + Debezium 3.7.1 + Kafka 3.9.0 上验证；Go 服务/worker 的完整异步链路也已实机跑通（debezium 与 relay 两种模式；脚本 `scripts/verify-debezium-e2e.py`），死信与排队搜索分别由 `scripts/verify-kafka-dlq.py`、`scripts/verify-kafka-search.py` 实机验证。两种模式不能同时启用，否则会重复投递。
+- `rag-service` 在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用 排队搜索（文档 outbox 由 Debezium 投递）；未配置时 MCP 搜索同步，默认由内嵌文档 worker 直接消费发件箱（`RAG_DOCUMENT_WORKER_INPROCESS=0` 可关闭并改跑独立 worker），没有消费者时任务保持 `queued`。
+- **文档通知统一由 Debezium 投递**：上传只提交 MySQL 的 `document_jobs` 与 `document_job_outbox`；Debezium 读取 binlog 并写入 Kafka，应用不轮询发布文档通知。部署与验证见 [Debezium 指南](deploy/debezium/README.md) 和 `scripts/verify-debezium-e2e.py`。
 
 ## 迁移状态
 
 - **Go 是目标后端**：`rag-service`、三个 worker、Console、OpenAPI、迁移/状态 CLI 与本地批量导入 CLI 均已落地；parity 审计的 P0（搜索资产投影、MCP 排队/同步选择、worker 可执行程序、已保存 `document.md` 预览）与主要 P1 已修复，`go build ./...` 与全量 `go test ./...` 通过。
 - **Python 后端已删除**：原 `src/rag_mcp`、`tests`、`pyproject.toml`、`uv.lock` 已移除；`python-workers/` 曾整体删除，2026-11-10 起以**独立 Docling PDF 解析微服务**（`python-workers/pdf-service`，仅 PDF、HTTP + zip 清单，清单版本 `docling-service-v1`）的形式恢复，不进入 Go 构建/镜像/测试依赖。PDF 默认调用该服务，也可切回 Go 内置纯文本引擎；DOCX 读取与 Word 图片描述在 Go 进程内完成；只有 .doc 转换需要外部 LibreOffice，VLM 通过 HTTP 调用。
 - **数据兼容**：Go 复用既有 MySQL 表结构、`enc:v1:` 凭据格式和配置文件位置（`~/.praxis-rag/config.toml`），不需要数据迁移；状态表用 `rag-state-migrate` 检查/建表，旧知识源用 `rag-service-migrate` 预览/导入（见已知差异）。
-- **已实机验证**：Kafka 3.9.0 + Debezium 3.7.1 + MySQL 8.0 + Redis + Qdrant 上的完整异步链路（debezium 与 relay 两种模式）、显式 DLQ topic、排队 MCP 搜索（search worker + Redis 快照）；脚本见 `scripts/verify-debezium-e2e.py`、`scripts/verify-kafka-dlq.py`、`scripts/verify-kafka-search.py`。
+- **已实机验证**：Kafka 3.9.0 + Debezium 3.7.1 + MySQL 8.0 + Redis + Qdrant 上的完整异步链路（Debezium 文档投递）、显式 DLQ topic、排队 MCP 搜索（search worker + Redis 快照）；脚本见 `scripts/verify-debezium-e2e.py`、`scripts/verify-kafka-dlq.py`、`scripts/verify-kafka-search.py`。
 - **仍待验证**（以 [GO_MIGRATION](docs/GO_MIGRATION.md) 为准）：Kafka SASL/TLS 外部集群、Docker 镜像/Compose `app` profile、pdf-parser 镜像与真实 Docling/CodeFormula 推理、systemd、真实 MySQL 多实例并发/故障切换、浏览器 E2E；黑盒 parity 差分改为固定预期（Python 对照已删除）。真实环境冒烟与未验证项见[使用与部署](docs/USAGE.md) 的验证边界。
 
 ## 测试

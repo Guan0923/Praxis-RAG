@@ -13,10 +13,9 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
-// BackgroundPublisher is one broker adapter that publishes both notification
-// kinds (mq.Publisher implements it with one Kafka producer).
+// BackgroundPublisher publishes queued-search notifications. Document outbox
+// events are delivered by Debezium independently of the application.
 type BackgroundPublisher interface {
-	state.DocumentNotificationPublisher
 	state.SearchNotificationPublisher
 }
 
@@ -71,12 +70,11 @@ var (
 	backgroundsByService = map[*Service]*serviceBackground{}
 )
 
-// StartBackground wires the durable queue dispatchers, starts the cache-sync and
-// document outbox relays when their transports are available, and launches the
-// periodic maintenance loop (upload recovery/cleanup, search expiry, document
+// StartBackground wires queued-search publishing and cache synchronization,
+// and launches the periodic maintenance loop (upload recovery/cleanup, search expiry, document
 // job sweep/GC, snapshot/artifact purges). It never blocks on broker
-// availability: a missing Kafka bootstrap server list simply leaves submissions
-// fail-closed until a publisher is injected.
+// availability: queued searches stay fail-closed without a publisher, while
+// document admission only needs its MySQL transaction.
 func (s *Service) StartBackground(ctx context.Context, options ...BackgroundOption) error {
 	configuration := backgroundOptions{
 		interval: defaultBackgroundInterval(),
@@ -108,27 +106,12 @@ func (s *Service) StartBackground(ctx context.Context, options ...BackgroundOpti
 	backgroundCtx, cancel := context.WithCancel(context.Background())
 	background.cancel = cancel
 
-	// The dispatchers are built by state.New without a transport; fill them in
-	// so admission can confirm broker acceptance.
+	// Search admission confirms broker acceptance through this publisher.
 	if s.stores.SearchDispatcher != nil {
 		s.stores.SearchDispatcher.Publisher = publisher
 		s.stores.SearchDispatcher.Start()
 	}
-	if s.stores.DocumentDispatcher != nil {
-		s.stores.DocumentDispatcher.Transport = publisher
-		bridgeMode := strings.TrimSpace(s.stores.DocumentDispatcher.Mode)
-		if bridgeMode == "" {
-			bridgeMode = "relay"
-		}
-		// Debezium streams the committed outbox rows to Kafka itself; the
-		// in-process relay must not double-publish them. Without a broker the
-		// relay stays idle so submissions remain fail-closed.
-		relayEnabled := publisher != nil && bridgeMode != "debezium"
-		log.Printf("Document outbox bridge mode=%s relay_enabled=%t", bridgeMode, relayEnabled)
-		if relayEnabled {
-			s.stores.DocumentDispatcher.Start()
-		}
-	}
+	log.Printf("Document outbox delivery=debezium")
 	if s.stores.CacheSync != nil && s.stores.CacheSync.Enabled() {
 		s.stores.CacheSync.Start()
 	}
@@ -141,7 +124,7 @@ func (s *Service) StartBackground(ctx context.Context, options ...BackgroundOpti
 	return nil
 }
 
-// StopBackground stops the relays and the maintenance loop. It is idempotent and
+// StopBackground stops cache synchronization and the maintenance loop. It is idempotent and
 // safe to call before Stores.Close (which owns final transport shutdown).
 func (s *Service) StopBackground() {
 	backgroundMu.Lock()
@@ -156,9 +139,6 @@ func (s *Service) StopBackground() {
 	background.once.Do(func() {
 		background.cancel()
 		<-background.done
-		if s.stores.DocumentDispatcher != nil {
-			s.stores.DocumentDispatcher.Stop()
-		}
 		if s.stores.CacheSync != nil {
 			s.stores.CacheSync.Stop()
 		}
@@ -181,16 +161,16 @@ func (s *Service) BackgroundRunning() bool {
 func (s *Service) newBrokerPublisher() BackgroundPublisher {
 	settings, err := mq.SettingsFromEnv()
 	if err != nil {
-		log.Printf("Kafka settings are invalid; async submissions stay fail-closed category=%s", errorTypeName(err))
+		log.Printf("Kafka settings are invalid; queued searches stay fail-closed category=%s", errorTypeName(err))
 		return nil
 	}
 	if !settings.Configured() {
-		log.Printf("Kafka bootstrap servers are not configured; async submissions stay fail-closed")
+		log.Printf("Kafka bootstrap servers are not configured; queued searches stay fail-closed")
 		return nil
 	}
 	publisher, err := mq.NewPublisher(settings)
 	if err != nil {
-		log.Printf("Kafka publisher unavailable; async submissions stay fail-closed category=%s", errorTypeName(err))
+		log.Printf("Kafka publisher unavailable; queued searches stay fail-closed category=%s", errorTypeName(err))
 		return nil
 	}
 	return publisher

@@ -229,6 +229,7 @@ table 的 `image_file` 为 null、`image_file` 是安全相对路径等），避
 | `RAG_PDF_SERVICE_HOST` | `0.0.0.0` | `python -m app.main` 的监听地址（uvicorn CLI 以命令行参数为准）|
 | `PORT` | `8091` | 服务端口 |
 | `RAG_PDF_SERVICE_TIMEOUT` | `900` | 单请求超时（秒）：排队等待与转换各自不超过该值，超时返回 504 |
+| `RAG_PDF_SERVICE_WORKERS` | `1` | `python -m app.main` 启动的 Uvicorn 服务进程数（正整数）；容器默认入口同样读取此变量，各进程共用监听端口 |
 | `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 进程内并发转换上限（信号量）；模型权重常驻共享，转换工作内存与 CPU 随并发线性增长，内存紧张保持 1 靠副本扩容 |
 | `RAG_PDF_SERVICE_CONVERTER` | `docling` | `docling` 真实解析；`fake` 固定清单（仅测试/联调）|
 | `RAG_PDF_MODELS_PATH` | 空 | Docling 模型目录（`artifacts_path`），容器内为 `/models` |
@@ -312,7 +313,7 @@ Hugging Face）。
 
 镜像要点：`python:3.11-slim`；`torch>=2.0` 从 `https://download.pytorch.org/whl/cpu` 装 CPU 轮子；
 模型不打进镜像，挂载 `/models`；非 root（uid 10001）运行；`HEALTHCHECK` 用 Python 标准库
-`urllib` 调 `http://127.0.0.1:$PORT/healthz`（镜像内没有 curl）。默认单 uvicorn worker，副本横向扩容。
+`urllib` 调 `http://127.0.0.1:$PORT/healthz`（镜像内没有 curl）。默认入口为 `python -m app.main`，通过 `RAG_PDF_SERVICE_WORKERS` 配置 Uvicorn 服务进程数，默认 1。各进程共享监听 socket，分别持有 `RAG_PDF_SERVICE_CONCURRENCY` 个解析名额；总解析容量上限为两者乘积，实际任务分布受连接复用和任务耗时影响。进程之间不共享模型内存；例如 `2 × 2` 和 `1 × 4` 都有最多 4 个解析名额，但前者多一个服务进程的模型内存开销。也可以通过多个容器副本扩容，此时需另行配置负载分配。
 
 ## 6. 本地开发与测试
 
@@ -332,8 +333,13 @@ fake 模式（无需任何模型，Go 端 live 测试/联调用）：
 
 ```powershell
 $env:RAG_PDF_SERVICE_CONVERTER='fake'
-..\..\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8091
+$env:RAG_PDF_SERVICE_HOST='127.0.0.1'
+$env:RAG_PDF_SERVICE_WORKERS='2'
+$env:RAG_PDF_SERVICE_CONCURRENCY='2'
+..\..\.venv\Scripts\python.exe -m app.main
 ```
+
+直接使用 `python -m uvicorn app.main:app` 时，应通过 `--workers 2` 指定服务进程数；Uvicorn CLI 不读取项目自定义的 `RAG_PDF_SERVICE_WORKERS`。每进程解析并发仍由应用读取 `RAG_PDF_SERVICE_CONCURRENCY`。
 
 fake 清单固定为：1 个 `text` 块、1 个 `formula` 块（latex `G = X_{basis}^{T} X_{basis}`）、
 1 个 `picture` 资产（真实 8x8 PNG，`pictures/picture-0.png`），版本 `docling-service-v1`。

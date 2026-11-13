@@ -30,8 +30,8 @@ func (s *Service) admitDocument(
 	content []byte,
 	idempotencyKey string,
 ) (state.DocumentAdmission, error) {
-	dispatcher := s.stores.DocumentDispatcher
-	if dispatcher == nil {
+	jobs := s.stores.DocumentJobs
+	if jobs == nil {
 		return state.DocumentAdmission{}, &apierrors.KnowledgeError{Message: asyncSubmissionFailedMessage}
 	}
 	// Docling PDF parsing needs the knowledge-base VLM/OCR configuration; reject
@@ -44,7 +44,7 @@ func (s *Service) admitDocument(
 	if idempotencyKey != "" {
 		key = &idempotencyKey
 	}
-	admission, err := dispatcher.Submit(ctx, namespace, name, content, key)
+	admission, err := jobs.Submit(ctx, namespace, name, content, key)
 	if err != nil {
 		return state.DocumentAdmission{}, asyncDocumentError(err)
 	}
@@ -64,7 +64,7 @@ func (s *Service) addDocumentAsync(
 	if err != nil {
 		return nil, err
 	}
-	// Python's DocumentJobDispatcher.submit returns exactly {"artifact_id": ...}.
+	// Admission returns the durable identifier; Debezium delivers the outbox event.
 	return map[string]any{"artifact_id": admission.ArtifactID}, nil
 }
 

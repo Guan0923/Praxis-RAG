@@ -172,7 +172,7 @@ func healthyOptions(t *testing.T) Options {
 		QdrantURL:             qdrant.URL,
 		Collection:            "knowledge",
 		KafkaBootstrapServers: []string{kafkaListener(t)},
-		OutboxBridge:          "relay",
+		OutboxBridge:          "debezium",
 		UploadMode:            "async",
 		DocumentWorker:        "in-process",
 		PDFEngine:             pdfEngineDocling,
@@ -205,7 +205,7 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 		service["backend"] != "go" || service["collection"] != "knowledge" {
 		t.Fatalf("service = %v", service)
 	}
-	if service["upload_mode"] != "async" || service["outbox_bridge"] != "relay" ||
+	if service["upload_mode"] != "async" || service["outbox_bridge"] != "debezium" ||
 		service["document_worker"] != "in-process" || service["pdf_engine"] != pdfEngineDocling {
 		t.Fatalf("service = %v", service)
 	}
@@ -292,7 +292,7 @@ func TestMonitorOverviewDegradedAndDisabled(t *testing.T) {
 		Collection:     "knowledge",
 		PDFEngine:      "go",
 		UploadMode:     "sync",
-		OutboxBridge:   "relay",
+		OutboxBridge:   "debezium",
 		DocumentWorker: "external",
 	}
 	overview := New(options).MonitorOverview(context.Background())
@@ -333,7 +333,7 @@ func TestMonitorOverviewErrors(t *testing.T) {
 		PDFEngine:      pdfEngineDocling,
 		PDFServiceURL:  "http://" + unreachable,
 		UploadMode:     "async",
-		OutboxBridge:   "relay",
+		OutboxBridge:   "debezium",
 		DocumentWorker: "in-process",
 	}
 	overview := New(options).MonitorOverview(context.Background())

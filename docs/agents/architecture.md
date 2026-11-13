@@ -12,12 +12,12 @@ REST 客户端 ──/v1/*────────────┴──> rag-ser
                                        ├─> Qdrant（dense + sparse 向量）
                                        ├─> MySQL（文档/KB/任务/API Key/模型配置/权限/发件箱）
                                        ├─> Redis（读模型缓存、搜索结果快照；可选）
-                                       ├─> Kafka（outbox relay / 搜索队列；可选）
+                                       ├─> Kafka（Debezium 文档通知 / 搜索队列；可选）
                                        └─> pdf-parser :8091（HTTP，PDF 版面/表格/OCR/公式）
 
 网页/REST 上传（默认异步）与 MCP add_document
   → MySQL 单事务写 document_jobs + document_job_outbox，返回 artifact_id
-  → 有 Kafka：relay（默认）或 Debezium → Kafka → rag-document-worker
+  → 有 Kafka：Debezium → Kafka → rag-document-worker
   → 无 Kafka：rag-service 内嵌文档 worker 直接轮询发件箱
   → 两条路径都完成 解析/切分/Embedding/Qdrant 发布
   → 客户端用 GET /v1/document-jobs/{artifact_id} 轮询 status/stage
@@ -43,7 +43,7 @@ MCP search（配置 Kafka 时）→ search_task_outbox → Kafka → rag-search-
 
 | 进程 | 作用 | 主要入口 |
 | --- | --- | --- |
-| `rag-service` | REST + MCP + Console + 进程内 outbox relay/维护循环；无 Kafka 时内嵌文档 worker | `cmd/rag-service/main.go` |
+| `rag-service` | REST + MCP + Console + 后台维护循环；无 Kafka 时内嵌文档 worker | `cmd/rag-service/main.go` |
 | `rag-document-worker` | 消费文档通知，执行解析/切分/Embedding/Qdrant 发布 | `cmd/rag-document-worker/main.go` |
 | `rag-search-worker` | 消费排队搜索请求，执行检索并写 Redis 快照 | `cmd/rag-search-worker/main.go` |
 | `rag-dead-letter-worker` | 消费显式 DLQ topic（`--kind document|search`），把可确认的失败写入终态并 ACK | `cmd/rag-dead-letter-worker/main.go` |

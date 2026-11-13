@@ -1,4 +1,4 @@
-"""Live end-to-end verification of RAG_OUTBOX_BRIDGE=debezium with the Go backend.
+"""Live end-to-end verification of Debezium document delivery with the Go backend.
 
 Pipeline under test:
   MCP add_document -> MySQL document_job_outbox COMMIT
@@ -8,7 +8,7 @@ Pipeline under test:
 
 It also proves the application never published the notification itself:
 the outbox row must still be unpublished (published_at IS NULL) while the
-worker processed it, and the service log must contain the debezium-mode line.
+worker processed it, and the service log identifies Debezium delivery.
 
 Requires the docker compose infra (MySQL 3307, Qdrant 6333, Redis 6379,
 Kafka 9092, Debezium) to be running, and dist/bin binaries built.
@@ -44,9 +44,6 @@ MYSQL_PORT = os.environ.get("RAG_MYSQL_PORT", "3307")
 MYSQL_PASSWORD = os.environ.get("RAG_MYSQL_PASSWORD", "praxis-dev-pw")
 MYSQL_DATABASE = os.environ.get("RAG_MYSQL_DATABASE", "praxis_rag")
 VECTOR_SIZE = int(os.environ.get("RAG_E2E_VECTOR_SIZE", "1024"))
-BRIDGE = os.environ.get("RAG_E2E_BRIDGE", "debezium")
-if BRIDGE not in ("relay", "debezium"):
-    raise SystemExit("RAG_E2E_BRIDGE must be relay or debezium")
 KAFKA_BOOTSTRAP = os.environ.get("RAG_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")
 CACHE_TOPIC = os.environ.get("RAG_CACHE_TOPIC", "praxis_state_cache_refresh")
 CACHE_GROUP = os.environ.get("RAG_CACHE_GROUP", "praxis_state_cache_refresh_workers")
@@ -285,7 +282,6 @@ def base_env() -> dict:
         "QDRANT_URL": "http://127.0.0.1:6333",
         "RAG_KAFKA_BOOTSTRAP_SERVERS": KAFKA_BOOTSTRAP,
         "RAG_KAFKA_CLIENT_ID": "praxis-rag-e2e",
-        "RAG_OUTBOX_BRIDGE": BRIDGE,
         "RAG_CACHE_TOPIC": CACHE_TOPIC,
         "RAG_CACHE_GROUP": CACHE_GROUP,
         "RAG_DOCUMENT_TOPIC": DOCUMENT_TOPIC,
@@ -414,7 +410,7 @@ def main() -> int:
         if not wait_health():
             print(tail(service_log))
             raise RuntimeError("rag-service did not become healthy")
-        check(True, f"rag-service healthy on {SERVICE} (state=mysql, bridge={BRIDGE})")
+        check(True, f"rag-service healthy on {SERVICE} (state=mysql, bridge=debezium)")
 
         worker_process, worker_log = start_process(
             "rag-document-worker", [str(BIN / "rag-document-worker.exe")], env)
@@ -469,11 +465,8 @@ def main() -> int:
         outbox_row = mysql_query(
             f"SELECT published_at IS NULL FROM {MYSQL_DATABASE}.document_job_outbox "
             f"WHERE artifact_id = '{artifact_id}';")
-        if BRIDGE == "debezium":
-            check(outbox_row.strip() == "1",
-                  "outbox row is still unpublished after admission (application did not publish)")
-        else:
-            print("INFO relay mode: the in-process relay publishes the notification instead of Debezium")
+        check(outbox_row.strip() == "1",
+              "outbox row is still unpublished after admission (application did not publish)")
 
         deadline = time.time() + 180
         status_payload: dict = {}
@@ -484,7 +477,7 @@ def main() -> int:
                 break
             time.sleep(1.5)
         check(status_payload.get("status") == "succeeded",
-              f"document job reached succeeded via {BRIDGE} delivery (stage={status_payload.get('stage')}, "
+              f"document job reached succeeded via debezium delivery (stage={status_payload.get('stage')}, "
               f"error={status_payload.get('error')})")
         if status_payload.get("status") != "succeeded":
             print("worker log tail:\n" + tail(worker_log))
@@ -497,12 +490,8 @@ def main() -> int:
         check(job_row.startswith("succeeded"), f"MySQL document_jobs row = {job_row}")
 
         service_text = tail(service_log, 400)
-        if BRIDGE == "debezium":
-            check("bridge mode=debezium" in service_text and "relay_enabled=false" in service_text,
-                  "service log confirms the in-process relay is disabled in debezium mode")
-        else:
-            check("bridge mode=relay" in service_text and "relay_enabled=true" in service_text,
-                  "service log confirms the in-process relay is enabled in relay mode")
+        check("Document outbox delivery=debezium" in service_text,
+              "service log identifies Debezium document delivery")
 
         # Qdrant indexing.
         status, _, info = http_json("GET", f"http://127.0.0.1:6333/collections/{collection}")
@@ -527,20 +516,12 @@ def main() -> int:
                   "for this probe; the PENDING outbox row plus the succeeded worker "
                   "are the conclusive evidence that only Debezium delivered it")
 
-        # Evidence about the outbox row: only Debezium publishes in debezium mode;
-        # the in-process relay marks it PUBLISHED in relay mode.
-        if BRIDGE == "debezium":
-            still_pending = mysql_query(
-                f"SELECT published_at IS NULL FROM {MYSQL_DATABASE}.document_job_outbox "
-                f"WHERE artifact_id = '{artifact_id}';")
-            check(still_pending.strip() == "1",
-                  "outbox row remained PENDING after processing (only Debezium published it)")
-        else:
-            published = mysql_query(
-                f"SELECT published_at IS NOT NULL FROM {MYSQL_DATABASE}.document_job_outbox "
-                f"WHERE artifact_id = '{artifact_id}';")
-            check(published.strip() == "1",
-                  "outbox row was marked PUBLISHED by the in-process relay")
+        # Debezium does not mark the application's outbox row as published.
+        still_pending = mysql_query(
+            f"SELECT published_at IS NULL FROM {MYSQL_DATABASE}.document_job_outbox "
+            f"WHERE artifact_id = '{artifact_id}';")
+        check(still_pending.strip() == "1",
+              "outbox row remained PENDING after processing (only Debezium published it)")
     except Exception as error:  # noqa: BLE001 - report and fail
         print(f"ERROR: {error}", flush=True)
         results.append((False, f"exception: {error}"))

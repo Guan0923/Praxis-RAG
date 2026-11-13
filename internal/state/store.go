@@ -85,11 +85,10 @@ type Stores struct {
 	Artifacts *ArtifactRegistry
 	Uploads   *UploadJournal
 
-	DocumentJobs       *DocumentJobs
-	DocumentBatches    *DocumentBatches
-	DocumentDispatcher *DocumentJobDispatcher
-	SearchTasks        *SearchTasks
-	SearchDispatcher   *SearchTaskDispatcher
+	DocumentJobs     *DocumentJobs
+	DocumentBatches  *DocumentBatches
+	SearchTasks      *SearchTasks
+	SearchDispatcher *SearchTaskDispatcher
 
 	closeOnce  sync.Once
 	closeError error
@@ -201,14 +200,12 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	}
 	stores.DocumentJobs = documentJobs
 	stores.DocumentBatches = NewDocumentBatches(stores)
-	documentDispatcher, err := NewDocumentJobDispatcher(stores, nil)
-	if err != nil {
+	if _, err := DocumentQueueSettingsFromEnv(); err != nil {
 		uploads.Close()
 		_ = cacheSync.Close()
 		_ = database.Close()
 		return nil, err
 	}
-	stores.DocumentDispatcher = documentDispatcher
 	stores.Views = NewCachedReadViews(stores)
 
 	snapshotSettings, err := SnapshotSettingsFromEnv()
@@ -235,7 +232,6 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.Artifacts = artifacts
 	searchTasks, err := NewSearchTasks(stores)
 	if err != nil {
-		_ = documentDispatcher.Close()
 		uploads.Close()
 		_ = cacheSync.Close()
 		_ = database.Close()
@@ -262,11 +258,6 @@ func (s *Stores) Ping(ctx context.Context) error {
 func (s *Stores) Close() error {
 	s.closeOnce.Do(func() {
 		var firstErr error
-		if s.DocumentDispatcher != nil {
-			if err := s.DocumentDispatcher.Close(); err != nil {
-				firstErr = err
-			}
-		}
 		if s.SearchDispatcher != nil {
 			if err := s.SearchDispatcher.Close(); err != nil && firstErr == nil {
 				firstErr = err

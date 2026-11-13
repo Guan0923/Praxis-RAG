@@ -53,8 +53,12 @@ func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
 	if len(oneNameStatuses) != 2 || oneNameStatuses[0] == oneNameStatuses[1] {
 		t.Fatalf("same-name outcomes = %v", oneNameStatuses)
 	}
-	if got := broker.documentNotificationCount(); got != 2 {
-		t.Fatalf("document notifications = %d, want 2", got)
+	if got := broker.documentNotificationCount(); got != 0 {
+		t.Fatalf("application document notifications = %d, want 0", got)
+	}
+	events, err := stores.DocumentJobs.PendingOutbox(ctx, 10)
+	if err != nil || len(events) != 2 {
+		t.Fatalf("committed outbox events for Debezium = %+v, %v", events, err)
 	}
 	var jobs int
 	if err := stores.DB.QueryRowContext(ctx,

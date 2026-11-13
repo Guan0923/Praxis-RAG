@@ -137,18 +137,13 @@ func TestMySQLG7StateMachines(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("KnowledgeBases.Create() error = %v", err)
 	}
-	documentPublisher := &fakeDocumentPublisher{}
-	documentDispatcher, err := NewDocumentJobDispatcher(stores, documentPublisher)
-	if err != nil {
-		t.Fatalf("NewDocumentJobDispatcher() error = %v", err)
-	}
-	defer func() { _ = documentDispatcher.Close() }()
-	admission, err := documentDispatcher.Submit(ctx, namespace, "mysql.txt", []byte("mysql"), nil)
+	admission, err := stores.DocumentJobs.Submit(ctx, namespace, "mysql.txt", []byte("mysql"), nil)
 	if err != nil {
 		t.Fatalf("document Submit() error = %v", err)
 	}
-	if len(documentPublisher.messages()) != 1 {
-		t.Fatalf("document notifications = %+v", documentPublisher.messages())
+	events, err := stores.DocumentJobs.PendingOutbox(ctx, 10)
+	if err != nil || len(events) != 1 || events[0].ArtifactID != admission.ArtifactID {
+		t.Fatalf("document outbox for Debezium = %+v, %v", events, err)
 	}
 	notification := documentNotification(t, stores, admission.ArtifactID)
 	task, err := stores.DocumentJobs.Claim(ctx, notification)

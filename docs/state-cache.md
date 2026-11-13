@@ -113,28 +113,27 @@ RAG_DOCUMENT_DLQ_TOPIC=praxis_document_ingest_dead_letters
 RAG_SEARCH_DLQ_TOPIC=praxis_search_dead_letters
 RAG_DOCUMENT_DLQ_GROUP=praxis_document_dead_letters
 RAG_SEARCH_DLQ_GROUP=praxis_search_dead_letters
-RAG_OUTBOX_BRIDGE=relay
 ```
 
-`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存，搜索任务与快照用 `RAG_RESULT_TTL_SECONDS=3600`。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis，但**不能使用排队搜索或可复用搜索结果快照**，不可将禁用缓存当作这些路径的降级方式。文档异步新增不依赖 Redis：禁用后仍可提交、查询状态并完成 MySQL 持久发布（默认 relay 模式仍需 Kafka 完成通知投递，但不影响受理与状态查询）。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；持久数据展示读取可回源 MySQL。多实例共享相同 Redis、前缀、MySQL 和各自的 cache/document/search topic/group（以及两个显式 DLQ topic）。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；Kafka SASL/TLS 凭据仅从 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*` 读取。
+`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存，搜索任务与快照用 `RAG_RESULT_TTL_SECONDS=3600`。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis，但**不能使用排队搜索或可复用搜索结果快照**，不可将禁用缓存当作这些路径的降级方式。文档异步新增不依赖 Redis：禁用后仍可提交、查询状态并完成 MySQL 持久发布（Kafka 部署需 Debezium 完成通知投递，但不影响受理与状态查询）。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；持久数据展示读取可回源 MySQL。多实例共享相同 Redis、前缀、MySQL 和各自的 cache/document/search topic/group（以及两个显式 DLQ topic）。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；Kafka SASL/TLS 凭据仅从 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*` 读取。
 
 ## Docker 与启动
 
-Compose 提供 Redis 7.4、单节点 KRaft Kafka（`apache/kafka:3.9.0`，宿主 `127.0.0.1:9092` / 容器 `kafka:9092`，4 partitions、自动创建 topic、`kafka_data` 持久卷）以及可选的 Debezium profile。Redis 开启 AOF 和 noeviction；Kafka 数据写入 `KAFKA_LOG_DIRS=/var/lib/kafka/data`。不再有旧 RocketMQ 组件或存储卷 UID 初始化。
+Compose 提供 Redis 7.4、单节点 KRaft Kafka（`apache/kafka:3.9.0`，宿主 `127.0.0.1:9092` / 容器 `kafka:9092`，4 partitions、自动创建 topic、`kafka_data` 持久卷）以及默认启动的 Debezium 服务。Redis 开启 AOF 和 noeviction；Kafka 数据写入 `KAFKA_LOG_DIRS=/var/lib/kafka/data`。不再有旧 RocketMQ 组件或存储卷 UID 初始化。
 
 ```powershell
 .\scripts\start-stack.ps1 -MigrateOnly -SkipMigrate
 .\scripts\start-stack.ps1 -SkipMigrate
 ```
 
-脚本启动依赖、等待 MySQL 与 Kafka healthy、显式创建 cache/document/search 与两个 DLQ topic（4 partitions、RF=1），随后运行服务；`RAG_OUTBOX_BRIDGE=relay`（默认）时服务进程内启动发件箱 relay，`debezium` 时等待 Debezium streaming 且应用不发布。Kafka 虽开启自动建 topic，仍建议由脚本或手动显式创建：
+脚本启动 MySQL、Kafka、Debezium 等依赖，创建 cache/document/search 与两个 DLQ topic（4 partitions、RF=1），然后运行服务。文档 outbox 的 Kafka 投递由 Debezium 承担。
 
 ```powershell
 docker exec praxis-rag-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 `
   --create --if-not-exists --topic praxis_state_cache_refresh --partitions 4 --replication-factor 1
 ```
 
-对持久读模型刷新，Redis/Kafka 失败不回滚已提交的 MySQL 业务操作，`cache_outbox` 保留待处理事件。对排队搜索，Redis/Kafka 是提交前置依赖；缺配置或连接失败直接报错，不通过 SQL task outbox 持久接收。对异步文档新增，MySQL 提交即受理，投递由发件箱 relay/Debezium 补足，Kafka 故障既不回滚也不阻塞受理。启动前确认 Redis、Kafka 连接、topic/group 和权限。
+对持久读模型刷新，Redis/Kafka 失败不回滚已提交的 MySQL 业务操作，`cache_outbox` 保留待处理事件。对排队搜索，Redis/Kafka 是提交前置依赖；缺配置或连接失败直接报错，不通过 SQL task outbox 持久接收。对异步文档新增，MySQL 提交即受理，投递由Debezium 补足，Kafka 故障既不回滚也不阻塞受理。启动前确认 Redis、Kafka 连接、topic/group 和权限。
 
 ## 运维与限制
 

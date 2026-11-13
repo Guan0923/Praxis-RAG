@@ -9,9 +9,9 @@ single source of truth for asynchronous document ingestion: the complete job
 (file bytes included), its status and the outbox notification commit in one
 transaction. Kafka carries identifiers only for documents; Redis holds
 transient MCP search task state and result snapshots plus display caches, and is
-not part of the document task-state or delivery path. Debezium is an optional
+not part of the document task-state or delivery path. Debezium is the Kafka document
 bridge that turns a committed `document_job_outbox` INSERT into the broker
-notification; without it, the in-process relay polls the outbox.
+notification. Document notifications are delivered exclusively by Debezium in Kafka deployments.
 
 ## What is stored where
 
@@ -25,7 +25,7 @@ notification; without it, the in-process relay polls the outbox.
 | MCP tool/prompt settings | `mcp_catalogs` |
 | Service API keys | `api_keys` |
 | Async document ingest jobs (complete request, file bytes, status, stage, lease) | `document_jobs` (MySQL, source of truth) |
-| Transactional outbox for document notifications | `document_job_outbox` (`PENDING` → `PUBLISHED`); relay or Debezium publishes it |
+| Transactional outbox for document notifications | `document_job_outbox` (`PENDING` → `PUBLISHED`); Debezium publishes committed changes |
 | MCP document notifications | Kafka schema 3 identifier-only notifications; no file content, no chunking and no Redis state |
 | MCP search requests | Kafka schema 2 complete query envelopes (unchanged path) |
 | Transient MCP search task states and result snapshots | Redis (required for queued search; no SQL fallback) |
@@ -126,7 +126,7 @@ one instance is picked up by the others without a restart.
 ## Local Docker stack
 
 The repository ships `docker-compose.yml` with MySQL 8, Qdrant, Redis and a
-single-node Kafka broker (plus an optional Debezium profile). Copy
+single-node Kafka broker and the Debezium service. Copy
 `.env.example` to `.env` (or let the start script do it), then fill in the
 passwords and `RAG_STATE_ENCRYPTION_KEY`. `.env` is gitignored.
 
@@ -157,18 +157,10 @@ from `document_jobs` and reuses the same upload journal to parse, index and publ
 
 ### Asynchronous notification delivery
 
-Delivery mode is chosen by `RAG_OUTBOX_BRIDGE` (two mutually exclusive modes):
-
-- `relay` (default; used for deployments without a CDC pipeline): the
-  API process runs `DocumentOutboxRelay`, which makes one best-effort publish
-  right after commit, then polls `PENDING` outbox rows every 2 seconds, publishes
-  each notification to Kafka and marks the row `PUBLISHED`. Failures leave the
-
-  accepted upload.
-- `debezium`: the in-process relay is disabled; Debezium reads the
-  `document_job_outbox` INSERT from the MySQL ROW binlog and publishes it to
-  `RAG_DOCUMENT_TOPIC`. This requires MySQL ROW binlog and a separately deployed
-  connector; see [deploy/debezium/README.md](../deploy/debezium/README.md).
+文档 Kafka 通知统一由 Debezium 投递。API 只在 MySQL 单事务中提交文档任务与
+`document_job_outbox`，Debezium 读取 MySQL ROW binlog 并发送到 `RAG_DOCUMENT_TOPIC`。
+应用没有文档 outbox 的轮询发布器或投递模式开关。
+连接器配置见 [deploy/debezium/README.md](../deploy/debezium/README.md)。
 
 The Kafka message contains identifiers only:
 `{"schema": 3, "artifact_id", "namespace", "name", "created_at"}`. No file bytes,
@@ -379,8 +371,7 @@ retry. HTTP response delivery itself is outside the publication transaction.
 
 - Share the same MySQL database, Qdrant endpoint, encryption key, Redis endpoint/
   prefix and Kafka document/search/cache topic/group and DLQ-topic configuration. Every
-  instance must use the same `RAG_OUTBOX_BRIDGE` mode; in `debezium` mode all
-  in-process relays stay off so only the CDC connector delivers notifications.
+  instance relies on the shared Debezium connector to deliver document notifications.
 - Document/name leases coordinate uploads and conflict with document deletion.
   Knowledge-base edits/reembedding take an exclusive namespace lease.
 - API keys are read on every request. Knowledge-base snapshots include their

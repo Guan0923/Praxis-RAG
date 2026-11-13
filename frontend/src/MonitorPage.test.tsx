@@ -32,7 +32,7 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
       started_at: "2026-11-11T12:00:00Z",
       uptime_seconds: 8400.2,
       upload_mode: "async",
-      outbox_bridge: "relay",
+      outbox_bridge: "debezium",
       document_worker: "in-process",
       pdf_engine: "docling",
     },

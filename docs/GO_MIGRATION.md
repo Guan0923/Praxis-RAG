@@ -1,5 +1,7 @@
 # 后端 Go 重构总纲
 
+当前文档 Kafka 通知只由 Debezium 投递；早期章节中的 relay 和双模式记录是历史实现，当前变更见文末 2026-11-12 的说明。
+
 ## REST 上传接口统一（2026-11-12）
 
 删除 `POST /v1/documents`，REST 上传统一迁移到 `POST /v1/document-batches`，包括只上传一个文件的请求。multipart 的 `files` 字段、认证和 `Idempotency-Key` 请求头不变；响应改为 `202`，通过 `batch_id` 和 `items`（每文件 `accepted/skipped/failed` 与受理成功后的 `artifact_id`）读取结果。轮询整个批次使用 `GET /v1/document-batches/{batch_id}`，单文件任务仍使用 `GET /v1/document-jobs/{artifact_id}`。
@@ -286,7 +288,7 @@ REST /v1/admin/tools -> 6 tools
 
 已提交 `feat(go): async admission, queued search and background maintenance`：
 
-- `async.go`：`addDocumentAsync`（DocumentDispatcher 单事务受理 + best-effort relay，返回 `{"artifact_id"}`，Python 冲突/校验错误映射）、`documentStatus`（4 键状态投影）。
+- `async.go`：`addDocumentAsync`（DocumentJobs 单事务受理 + Debezium CDC 投递，返回 `{"artifact_id"}`，Python 冲突/校验错误映射）、`documentStatus`（4 键状态投影）。
 - `queued_search.go`：`submitSearchTask`（无 broker 时 fail-closed；Submit+DispatchPending 确认发布）、`submitSearch`（wait_seconds 0..30 + 100ms 轮询；完成返回快照、超时只返回 `{"result_id"}`）、`getSearchResultOrdered`（先 SearchTasks 活动视图，再快照）。
 - `maintenance.go`：`StartBackground/StopBackground`（mq publisher 注入、cache-sync/document relay、10s 维护循环：上传恢复清理、SearchTasks.Expire、DocumentJobs.Sweep/GC、结果快照与 Artifact 过期清理；无 broker 时降级不阻塞启动）。
 - Lead 已完成 5 处 `service.go` 委托与 `main.go` `StartBackground`，`Close` 先 `StopBackground`。
@@ -332,7 +334,7 @@ REST /v1/admin/tools -> 6 tools
 ### 已切换 / 已验证
 
 - **用户文档已切换到 Go 后端**：[README](../README.md)、[USAGE](USAGE.md)、[DEPLOYMENT](DEPLOYMENT.md) 以 Go 服务 + 三个 worker 为主路径；新增 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 作为契约差异基线。本文历史记录保持原样。
-- **Go 目标后端已具备完整可运行面**：`rag-service`（REST `/v1/*`、MCP `/mcp`、Console `/console`、`/health`、OpenAPI `/openapi.json` + `/docs`、进程内 outbox relay、后台维护循环）、`rag-document-worker`、`rag-search-worker`、`rag-dead-letter-worker`，以及 `rag-service-migrate`、`rag-state-migrate`、`rag-mcp-debug` 和 `rag-mcp-ingest`（真实本地文件/目录批量导入，走运行时上传管线）。
+- **Go 目标后端已具备完整可运行面**：`rag-service`（REST `/v1/*`、MCP `/mcp`、Console `/console`、`/health`、OpenAPI `/openapi.json` + `/docs`、后台维护循环）、`rag-document-worker`、`rag-search-worker`、`rag-dead-letter-worker`，以及 `rag-service-migrate`、`rag-state-migrate`、`rag-mcp-debug` 和 `rag-mcp-ingest`（真实本地文件/目录批量导入，走运行时上传管线）。
 - **Parity P0 已关闭**：搜索资产投影（`pdf_assets.project_results` 移植）、MCP 排队/同步模式自动选择（按 `RAG_ROCKETMQ_ENDPOINT`）、三个 worker 可执行程序 + `ProcessDocumentJob`/`RecoverDocumentUploads`、已保存 `document.md` 预览；主要 P1（snapshot_context、`/v1/documents/check` 扩展名、KB HTTP 校验、delete annotation、md/txt UTF-8/长度、OpenAPI/docs）已修复并提交。
 - **验证边界**：`go build ./...` 与全量 `go test -count=1 ./...` 通过；`scripts/build-go.ps1` 本机构建 + 冒烟通过；worker 的 `--help`/无 broker/错误 backend/非法 `--kind`/本地 outbox 模式退出码行为已验证。**未连接真实 MySQL/Redis/RocketMQ/Qdrant**，未运行 Docker/Compose/systemd，未在 Go 环境实机验证 Docling/LibreOffice/视觉链路，也没有浏览器 E2E；真实 broker SDK 兼容性是已知风险（见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 与 [DEPLOYMENT](DEPLOYMENT.md)）。
 
@@ -402,3 +404,10 @@ REST /v1/admin/tools -> 6 tools
 - **文档**：README、USAGE、DEPLOYMENT 按「默认 docling + 可切回 go」重写 PDF 解析章节；本文件补充本节；PROGRESS 追加同日记录。
 - **限制**：`docling` 引擎需要 pdf-parser 服务与已预置的 Docling/CodeFormula 模型（CPU torch 镜像较大，首次使用前需联网下载模型并放入模型卷）；服务不可用或超时时 docling 上传会失败（安全可读错误），可显式 `RAG_PDF_ENGINE=go` 回退纯文本。公式识别需要远端 VLM（`RAG_VLM_*`）或本地 CodeFormula 模型，两者都没有时 `/v1/parse` 返回 503、解析失败；版面/表格/OCR 仍只有 Docling 提供。pdf-parser 未加认证，只应发布在 loopback/内网。`RAG_PDF_SERVICE_CONVERTER=fake` 仅用于联调测试。真实 Docling 推理、镜像构建与模型下载尚未在本仓库验证环境实机执行。
 - 本节之前的轮次记录保持原样；上方 G8 快照中「仓库不再包含 Python 代码」的表述由本节取代。
+
+### 2026-11-12：文档通知统一使用 Debezium
+
+- 删除 Go 文档 outbox relay 及 `DocumentJobDispatcher` 包装层；上传直接调用 `DocumentJobs.Submit`，任务与 outbox 在同一 MySQL 事务中提交。
+- 删除 `RAG_OUTBOX_BRIDGE` 模式选择参数及其旧模式测试，不保留配置兼容或旧值拒绝分支。监控的 `outbox_bridge` 字段固定报告 `debezium`。
+- Compose 默认启动 Debezium，启动脚本不再选择投递模式。Kafka 文档通知由独立连接器读取 binlog 产生，搜索与缓存事件继续使用各自发布机制。
+- MySQL 表结构、通知 schema、REST/MCP 契约不变，无数据迁移。本文早期章节中的 relay 与双模式验证记录仅描述当时实现，当前以本节为准。
