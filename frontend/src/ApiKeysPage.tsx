@@ -9,7 +9,7 @@ import {
   type BatchDeleteResult,
   type Role,
 } from "./api";
-import { apiKeyNamespaceOptions, apiKeyOwnerText, isAdminLike } from "./apiKeys";
+import { apiKeyNamespaceOptions, apiKeyOwnerText } from "./apiKeys";
 import { namespacePattern } from "./navigation";
 import { useDragSelection } from "./useDragSelection";
 
@@ -208,10 +208,6 @@ export function ApiKeysPage({
           <Button type="primary" icon={<PlusOutlined />} disabled={!authorized || busy || loading} onClick={() => edit()}>创建密钥</Button>
         </div>
       </div>
-      {!isAdminLike(role) && (
-        <Alert className="page-alert" type="info" showIcon
-          description="API Key 只能为本人创建的知识库创建，且只能查看/管理自己的密钥。" />
-      )}
       {error && <Alert className="page-alert" type="error" showIcon title="无法管理密钥" description={error} />}
       {batchFailures.length > 0 && (
         <Alert className="page-alert" type="warning" showIcon title="部分 API Key 删除失败"

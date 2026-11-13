@@ -183,13 +183,6 @@ function TenantKnowledgeBaseForm({ disabled, onCreated, connection }: {
   }
 
   return <div className="knowledge-base-form knowledge-base-form-wide">
-    <Alert
-      className="page-alert"
-      type="info"
-      showIcon
-      title="模型配置沿用管理员模板"
-      description="无需填写 Embedding / Reranker / VLM 配置：服务端会从管理员配置的默认知识库模板克隆模型、服务地址与向量维度。"
-    />
     {error && <Alert type="error" showIcon className="page-alert" title="知识库创建失败" description={error}
       action={!catalog ? <Button icon={<ReloadOutlined />} aria-label="重新读取切分配置" loading={loading} onClick={() => void loadCatalog()} /> : undefined} />}
     <Form<TenantValues>
