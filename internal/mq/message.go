@@ -48,6 +48,85 @@ func DecodeDocumentNotification(body []byte) (state.DocumentNotification, error)
 	return notification, nil
 }
 
+// DocumentMessageKind classifies one payload from the document topic.
+//
+// Debezium tails document_job_outbox, not only document_jobs: routine outbox
+// retention cleanup (state.DocumentJobs.GCOutbox) deletes expired rows from that
+// table too, and binlog row-image FULL publishes those DELETEs on the same
+// topic. Such records carry no job work, so consumers must acknowledge them
+// instead of retrying and dead-lettering them like a poisoned notification.
+type DocumentMessageKind int
+
+const (
+	// DocumentMessageJob is a document job notification: the native schema-3
+	// envelope or a Debezium insert/read/update (op c/r/u) envelope. It must be
+	// processed by the document worker's normal Claim/ingest path.
+	DocumentMessageJob DocumentMessageKind = iota
+	// DocumentMessageOutboxDeletion is a routine outbox-retention deletion:
+	// a Debezium delete event (op "d", or a before-image-only envelope), the
+	// Debezium Server tombstone (null/empty Kafka value), or a JSON null body.
+	// It must be acknowledged and must never change a document job.
+	DocumentMessageOutboxDeletion
+)
+
+// DecodeDocumentMessage classifies one document-topic payload and decodes it
+// when it is a job notification.
+//
+// Deletion records return the zero state.DocumentNotification, a nil error and
+// DocumentMessageOutboxDeletion; callers acknowledge them without retries or
+// dead letters. Genuinely malformed payloads stay DocumentMessageJob with an
+// ErrPayloadInvalid-wrapped error so the broker retry/dead-letter policy keeps
+// applying to real poison messages.
+func DecodeDocumentMessage(body []byte) (state.DocumentNotification, DocumentMessageKind, error) {
+	if isOutboxDeletionRecord(body) {
+		return state.DocumentNotification{}, DocumentMessageOutboxDeletion, nil
+	}
+	notification, err := DecodeDocumentNotification(body)
+	if err != nil {
+		return state.DocumentNotification{}, DocumentMessageJob, err
+	}
+	return notification, DocumentMessageJob, nil
+}
+
+// isOutboxDeletionRecord reports whether one payload is a routine outbox
+// deletion rather than a job notification. It accepts:
+//   - an empty/whitespace body, i.e. Debezium's null-value tombstone;
+//   - the JSON literal null (tombstone with a non-empty value);
+//   - a Debezium delete envelope carrying "op":"d" (with or without before);
+//   - a before-image-only envelope (after null or absent, before an object),
+//     which covers sinks or transformations that drop the op field.
+//
+// Malformed JSON and non-object JSON values are not deletions: they must keep
+// the existing invalid-payload behaviour (nack, broker retry, dead letter).
+func isOutboxDeletionRecord(body []byte) bool {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return true
+	}
+	var payload any
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return false
+	}
+	if payload == nil {
+		// json.Unmarshal maps the JSON literal null to a nil interface value.
+		return true
+	}
+	envelope, ok := payload.(map[string]any)
+	if !ok {
+		return false
+	}
+	if op, present := envelope["op"].(string); present && op == "d" {
+		return true
+	}
+	// A non-null object before image with no after image means the row was
+	// removed, regardless of whether the sink preserved the op field.
+	if _, hasBefore := envelope["before"].(map[string]any); !hasBefore {
+		return false
+	}
+	after, hasAfter := envelope["after"]
+	return !hasAfter || after == nil
+}
+
 // EncodeSearchEnvelope renders the exact schema-2 full-request JSON payload.
 func EncodeSearchEnvelope(envelope state.SearchEnvelope) ([]byte, string, error) {
 	validated, err := state.ValidateSearchEnvelope(map[string]any{

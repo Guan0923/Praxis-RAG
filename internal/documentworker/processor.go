@@ -346,15 +346,34 @@ func (p *Processor) terminalOrNack(ctx context.Context, artifactID string) bool 
 // MessageHandler adapts the processor to mq.PullConsumer. Malformed schema-3
 // payloads are nacked so the broker retry/DLQ policy applies, exactly like the
 // Python queue's validate-before-callback behaviour.
+//
+// Debezium also publishes routine document_job_outbox retention deletes on the
+// same topic (GCOutbox removes expired outbox rows). Those records carry no job
+// work and are acked immediately; treating them like invalid notifications
+// would retry and dead-letter normal cleanup.
 func (p *Processor) MessageHandler() mq.Handler {
 	return func(ctx context.Context, message mq.ReceivedMessage) bool {
-		notification, err := mq.DecodeDocumentNotification(message.Body)
+		notification, kind, err := mq.DecodeDocumentMessage(message.Body)
 		if err != nil {
 			p.logWarn("malformed document message ignored", "error_type", typeName(err))
 			return false
 		}
+		if kind == mq.DocumentMessageOutboxDeletion {
+			p.logOutboxDeletion("message_handler", message)
+			return true
+		}
 		return p.Handle(ctx, notification)
 	}
+}
+
+// logOutboxDeletion records one routine outbox-retention deletion. The message
+// stays stable and greppable for acceptance checks, and only bounded record
+// coordinates are attached: the payload holds outbox row values and must stay
+// out of logs.
+func (p *Processor) logOutboxDeletion(handler string, received mq.ReceivedMessage) {
+	p.logInfo("outbox cleanup event ignored",
+		"handler", handler,
+		"topic", received.Topic, "partition", received.Partition, "offset", received.Offset)
 }
 
 // DeadLetter records broker retry exhaustion as a durable terminal state.
@@ -372,11 +391,18 @@ func (p *Processor) DeadLetter(ctx context.Context, notification state.DocumentN
 }
 
 // DeadLetterMessage decodes one dead-letter delivery and records it.
+//
+// An outbox deletion record is already complete: replaying an old delete event
+// through the DLQ must ack it without touching any document job.
 func (p *Processor) DeadLetterMessage(ctx context.Context, message mq.ReceivedMessage) (bool, error) {
-	notification, err := mq.DecodeDocumentNotification(message.Body)
+	notification, kind, err := mq.DecodeDocumentMessage(message.Body)
 	if err != nil {
 		p.logWarn("malformed document dead-letter message ignored", "error_type", typeName(err))
 		return false, nil
+	}
+	if kind == mq.DocumentMessageOutboxDeletion {
+		p.logOutboxDeletion("dead_letter", message)
+		return true, nil
 	}
 	return p.DeadLetter(ctx, notification)
 }
