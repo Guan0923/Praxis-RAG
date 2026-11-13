@@ -3,12 +3,15 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
 	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 )
 
 // StatusProvider renders the secret-free service health payload.
@@ -193,10 +197,17 @@ func (s *Server) buildHandler() http.Handler {
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	started := time.Now()
+	// Every request carries one correlation id: a validated inbound value (proxy
+	// or tests) or a generated one. Handlers annotate the same context with the
+	// durable operation/artifact/batch ids they create, so one upload can be
+	// followed from this access line into the worker and the retry history.
+	requestID := requestIDFor(r)
+	w.Header().Set(requestIDHeader, requestID)
+	r = r.WithContext(logging.With(r.Context(), logging.FieldRequestID, requestID))
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			s.logger.Error("http handler panicked",
-				"error", fmt.Sprint(recovered),
+				"error_detail", logging.RedactLimit(fmt.Sprint(recovered), 300),
 				"method", r.Method,
 				"path", r.URL.Path,
 				"stack", string(debug.Stack()),
@@ -330,12 +341,40 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) logRequest(r *http.Request, recorder *statusRecorder, started time.Time) {
-	s.logger.Info("http request",
+	logger := s.logger.With(logging.Attrs(r.Context())...)
+	fields := []any{
 		"method", r.Method,
 		"path", r.URL.Path,
 		"status", recorder.status,
-		"duration_ms", float64(time.Since(started).Microseconds())/1000.0,
-	)
+		"duration_ms", float64(time.Since(started).Microseconds()) / 1000.0,
+	}
+	if namespace, ok := NamespaceFromContext(r.Context()); ok && namespace != "" {
+		fields = append(fields, logging.FieldNamespace, namespace)
+	}
+	logger.Info("http request", fields...)
+}
+
+// requestIDHeader is the inbound/outbound request correlation header.
+const requestIDHeader = "X-Request-ID"
+
+// requestIDPattern admits conservative proxy/test ids only: bounded length and
+// no whitespace or control characters, so a header value can never forge a log
+// record.
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+
+// requestIDFor reuses a valid inbound X-Request-ID or generates a 128-bit hex
+// id. Generated ids are opaque and carry no user data.
+func requestIDFor(r *http.Request) string {
+	if candidate := strings.TrimSpace(r.Header.Get(requestIDHeader)); requestIDPattern.MatchString(candidate) {
+		return candidate
+	}
+	var buffer [16]byte
+	if _, err := rand.Read(buffer[:]); err != nil {
+		// crypto/rand only fails in broken environments; a timestamp fallback
+		// still yields a unique-enough correlation id without failing the request.
+		return fmt.Sprintf("req-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buffer[:])
 }
 
 // namespaceContextKey carries the authenticated tenant namespace.

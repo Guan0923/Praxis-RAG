@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,6 +21,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/ingest"
 	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/modelapi"
 	"github.com/Guan0923/xinghe_rag/internal/qdrant"
 	"github.com/Guan0923/xinghe_rag/internal/sparse"
@@ -49,11 +49,11 @@ type documentOperationError struct {
 	OperationID string
 }
 
-// doclingPDFModelsRequiredMessage is the fixed Chinese rejection shown when a
-// PDF is uploaded under the Docling engine without the VLM/OCR configuration it
-// needs. It is raised while the upload is accepted, before any journal/queue
+// remotePDFModelsRequiredMessage is the fixed Chinese rejection shown when a
+// PDF is uploaded under the remote vision engine without the VLM configuration
+// it needs. It is raised while the upload is accepted, before any journal/queue
 // work, so users are sent to 模型配置 instead of seeing a parse failure later.
-const doclingPDFModelsRequiredMessage = "PDF 解析需要先在「模型配置」页添加 VLM 和 OCR 模型，并在知识库配置中选择后再上传。"
+const remotePDFModelsRequiredMessage = "PDF 解析需要先在「模型配置」页添加视觉模型（VLM），并在知识库配置中选择后再上传。"
 
 // Error implements error.
 func (e *documentOperationError) Error() string { return e.Err.Error() }
@@ -68,7 +68,6 @@ type uploadResources struct {
 	tokenizerModel string
 	embeddingModel string
 	vlm            document.VLMSettings
-	ocr            document.OCRSettings
 	collection     string
 	vectorSize     int
 	embedder       *modelapi.HTTPEmbedder
@@ -115,10 +114,6 @@ func (s *Service) resolveUploadResources(ctx context.Context, namespace string) 
 	if err != nil {
 		return nil, err
 	}
-	ocr, err := s.uploadOCR(settings)
-	if err != nil {
-		return nil, err
-	}
 	store, err := s.newDocumentStore(ctx, namespace, collection)
 	if err != nil {
 		return nil, &apierrors.KnowledgeError{Message: "Qdrant 索引不可用，请检查 Qdrant 服务配置"}
@@ -129,7 +124,6 @@ func (s *Service) resolveUploadResources(ctx context.Context, namespace string) 
 		tokenizerModel: tokenizerModel,
 		embeddingModel: embeddingModel,
 		vlm:            vlm,
-		ocr:            ocr,
 		collection:     collection,
 		vectorSize:     vectorSize,
 		embedder:       modelapi.NewHTTPEmbedder(embeddingConnection, modelapi.DefaultTimeout),
@@ -160,12 +154,12 @@ func (s *Service) validateUploads(files []UploadFile) error {
 	return nil
 }
 
-// validateDoclingPDFUpload rejects a PDF upload under the Docling engine before
-// any journal/queue work when the knowledge base has no VLM (Console knowledge
-// base setting or RAG_VLM_* environment) or no OCR engine configured. The
+// validateRemotePDFUpload rejects a PDF upload under the remote vision engine
+// before any journal/queue work when the knowledge base has no VLM (Console
+// knowledge base setting or RAG_VLM_* environment) with a model configured. The
 // message sends the user to 模型配置 instead of failing later at parse time.
-func (s *Service) validateDoclingPDFUpload(files []UploadFile, resources *uploadResources) error {
-	if s.config.PDFEngine != config.PDFEngineDocling || resources == nil {
+func (s *Service) validateRemotePDFUpload(files []UploadFile, resources *uploadResources) error {
+	if !config.IsRemotePDFEngine(s.config.PDFEngine) || resources == nil {
 		return nil
 	}
 	hasPDF := false
@@ -182,19 +176,19 @@ func (s *Service) validateDoclingPDFUpload(files []UploadFile, resources *upload
 	if !hasPDF {
 		return nil
 	}
-	if resources.vlm.Configured() && strings.TrimSpace(resources.vlm.Model) != "" && resources.ocr.Configured() {
+	if resources.vlm.Configured() && strings.TrimSpace(resources.vlm.Model) != "" {
 		return nil
 	}
-	return &apierrors.KnowledgeValidationError{Message: doclingPDFModelsRequiredMessage}
+	return &apierrors.KnowledgeValidationError{Message: remotePDFModelsRequiredMessage}
 }
 
-// validateDoclingPDFAdmission is the asynchronous counterpart of
-// validateDoclingPDFUpload: a PDF admitted to the document-job queue under the
-// Docling engine is rejected while the upload is admitted when the knowledge
-// base has no VLM or OCR configuration. The Console therefore shows the
+// validateRemotePDFAdmission is the asynchronous counterpart of
+// validateRemotePDFUpload: a PDF admitted to the document-job queue under the
+// remote vision engine is rejected while the upload is admitted when the
+// knowledge base has no VLM configuration. The Console therefore shows the
 // actionable Chinese message instead of a generic failed job after parsing.
-func (s *Service) validateDoclingPDFAdmission(ctx context.Context, namespace, name string) error {
-	if s.config.PDFEngine != config.PDFEngineDocling {
+func (s *Service) validateRemotePDFAdmission(ctx context.Context, namespace, name string) error {
+	if !config.IsRemotePDFEngine(s.config.PDFEngine) {
 		return nil
 	}
 	safeName, err := SanitizeName(name)
@@ -212,12 +206,8 @@ func (s *Service) validateDoclingPDFAdmission(ctx context.Context, namespace, na
 	if err != nil {
 		return err
 	}
-	ocr, err := s.uploadOCR(settings)
-	if err != nil {
-		return err
-	}
-	return s.validateDoclingPDFUpload(
-		[]UploadFile{{Name: safeName}}, &uploadResources{vlm: vlm, ocr: ocr})
+	return s.validateRemotePDFUpload(
+		[]UploadFile{{Name: safeName}}, &uploadResources{vlm: vlm})
 }
 
 // uploadDocuments is the real implementation behind Service.Upload: a batch of
@@ -236,7 +226,7 @@ func (s *Service) uploadDocuments(
 	if err := s.validateUploads(files); err != nil {
 		return nil, err
 	}
-	if err := s.validateDoclingPDFUpload(files, resources); err != nil {
+	if err := s.validateRemotePDFUpload(files, resources); err != nil {
 		return nil, err
 	}
 	imported := make([]map[string]any, 0, len(files))
@@ -332,7 +322,7 @@ func (s *Service) writeDocumentContent(
 	if err := s.validateUploads([]UploadFile{{Name: name, Content: content}}); err != nil {
 		return nil, err
 	}
-	if err := s.validateDoclingPDFUpload([]UploadFile{{Name: name, Content: content}}, resources); err != nil {
+	if err := s.validateRemotePDFUpload([]UploadFile{{Name: name, Content: content}}, resources); err != nil {
 		return nil, err
 	}
 	record, err := s.storeAndIndex(ctx, namespace, resources, storeIndexOptions{
@@ -498,6 +488,21 @@ func (s *Service) storeAndIndex(
 	if err != nil {
 		return nil, err
 	}
+	// Correlate every following log line and persisted reason with the durable
+	// operation (and, for a queued job, the artifact). Annotate extends the
+	// enclosing HTTP request's field set in place so its access log line can
+	// report the ids; it is a no-op outside a request context. Annotate must run
+	// on the incoming context: With forks the attribute set, so annotating the
+	// derived context would not reach the request.
+	annotations := []any{logging.FieldOperationID, operation.ID}
+	if options.Task != nil {
+		annotations = append(annotations, logging.FieldArtifactID, options.Task.ArtifactID)
+	}
+	logging.Annotate(ctx, annotations...)
+	ctx = logging.WithOperationID(ctx, operation.ID)
+	if options.Task != nil {
+		ctx = logging.WithArtifactID(ctx, options.Task.ArtifactID)
+	}
 	if operation.Status == state.UploadCommitted {
 		return replayCommittedUpload(operation, options.Content, name)
 	}
@@ -512,11 +517,13 @@ func (s *Service) storeAndIndex(
 	}
 	currentSettings, settingsErr := s.stores.KnowledgeBases.Get(ctx, namespace)
 	if settingsErr != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, settingsErr)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("configuration", settingsErr))
 	}
 	if collection, ok := currentSettings["collection"].(string); currentSettings != nil && ok && collection != resources.collection {
 		return s.failDocumentOperation(ctx, journal, coordinator, operation,
-			&state.UploadConflict{Message: "Knowledge-base index changed; retry with refreshed settings"})
+			logging.WrapStage("configuration",
+				&state.UploadConflict{Message: "Knowledge-base index changed; retry with refreshed settings"}))
 	}
 
 	sha256Value := sha256HexBytes(options.Content)
@@ -597,30 +604,36 @@ func (s *Service) storeAndIndex(
 			return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
 		}
 		if _, cleanupErr := coordinator.CleanupWorkspace(ctx, operation); cleanupErr != nil {
-			logUploadWarning("Committed workspace cleanup pending", operation.ID, cleanupErr)
+			logUploadWarning(ctx, "Committed workspace cleanup pending", operation.ID, cleanupErr)
 		}
 		return result, nil
 	}
 
 	if err := s.documentJobProgress(ctx, options.Task, "chunking"); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("chunking", err))
 	}
 	indexed, err := s.ingestDocument(ctx, journal, operation, workspace, temporary, name, resources)
 	if err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("parsing", err))
 	}
 	if err := s.documentJobProgress(ctx, options.Task, "staging"); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("staging", err))
 	}
 	if err := s.stageArtifacts(ctx, journal, operation, indexed); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("staging", err))
 	}
 	if err := s.documentJobProgress(ctx, options.Task, "embedding"); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("embedding", err))
 	}
 	vectors, sparseVectors, err := s.encodeDocumentVectors(ctx, journal, operation, indexed, resources)
 	if err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("embedding", err))
 	}
 	assetPayloads := make([]map[string]any, 0, len(indexed.result.Assets))
 	for _, asset := range indexed.result.Assets {
@@ -629,7 +642,8 @@ func (s *Service) storeAndIndex(
 		assetPayloads = append(assetPayloads, payload)
 	}
 	if err := s.documentJobProgress(ctx, options.Task, "indexing"); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("indexing", err))
 	}
 	stageValue, err := journal.RunStep(ctx, operation, "stage_qdrant", func() (any, error) {
 		count, stageErr := resources.store.StageVersion(ctx, indexed.qdrantChunks, vectors, sparseVectors,
@@ -639,10 +653,11 @@ func (s *Service) storeAndIndex(
 	if err != nil {
 		if current, currentErr := journal.Get(ctx, operation.ID); currentErr == nil && current.Status != state.UploadCommitted {
 			if deleteErr := resources.store.DeleteVersion(ctx, documentID, operation.ID); deleteErr != nil {
-				logUploadWarning("Version cleanup requires recovery", operation.ID, deleteErr)
+				logUploadWarning(ctx, "Version cleanup requires recovery", operation.ID, deleteErr)
 			}
 		}
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("indexing", err))
 	}
 	chunkCount := len(indexed.result.Chunks)
 	if staged, ok := stageValue.(int); ok {
@@ -668,17 +683,20 @@ func (s *Service) storeAndIndex(
 		metadata["task_artifact_id"] = options.Task.ArtifactID
 	}
 	if err := s.documentJobProgress(ctx, options.Task, "publishing"); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("publishing", err))
 	}
 	if err := journal.Intent(ctx, operation, "publish", map[string]any{"version": operation.ID}); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("publishing", err))
 	}
 	if err := s.publishDocument(ctx, operation, record, metadata, options.Content,
 		indexed.artifactBucket, indexed.result.StagingDir, options.Task); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("publishing", err))
 	}
 	if _, cleanupErr := coordinator.CleanupWorkspace(ctx, operation); cleanupErr != nil {
-		logUploadWarning("Committed workspace cleanup pending", operation.ID, cleanupErr)
+		logUploadWarning(ctx, "Committed workspace cleanup pending", operation.ID, cleanupErr)
 	}
 	return metadata, nil
 }
@@ -727,14 +745,16 @@ func (s *Service) ingestDocument(
 		})
 	}, nil)
 	if err != nil {
-		return nil, err
+		return nil, logging.WrapStage("parsing", err)
 	}
 	result, ok := value.(ingest.Result)
 	if !ok {
-		return nil, fmt.Errorf("document ingestion returned an unexpected result")
+		return nil, logging.WrapStage("chunking",
+			fmt.Errorf("document ingestion returned an unexpected result"))
 	}
 	if len(result.Chunks) == 0 {
-		return nil, &apierrors.KnowledgeValidationError{Message: "知识文件没有可索引的文本：" + name}
+		return nil, logging.WrapStage("chunking",
+			&apierrors.KnowledgeValidationError{Message: "知识文件没有可索引的文本：" + name})
 	}
 	qdrantChunks := make([]qdrant.Chunk, len(result.Chunks))
 	for index, chunk := range result.Chunks {
@@ -775,15 +795,15 @@ func (s *Service) ingestDocument(
 }
 
 // pdfOptions selects the PDF parser for the ingest step. The in-process pure-Go
-// engine stays the default (PDF.Parser nil); RAG_PDF_ENGINE=docling delegates to
-// the Docling microservice, whose base URL and timeout config already resolved.
-// The knowledge base's VLM and OCR configuration is forwarded with every parse
+// engine stays the default (PDF.Parser nil); RAG_PDF_ENGINE=vision delegates to
+// the remote vision parse service, whose base URL and timeout config already
+// resolved. The knowledge base's VLM configuration is forwarded with every parse
 // request so one service can serve deployments with different models.
 func (s *Service) pdfOptions(resources *uploadResources) ingest.PDFOptions {
-	if s.config.PDFEngine != config.PDFEngineDocling {
+	if !config.IsRemotePDFEngine(s.config.PDFEngine) {
 		return ingest.PDFOptions{}
 	}
-	parser := &document.DoclingServiceParser{
+	parser := &document.PDFServiceParser{
 		BaseURL: s.config.PDFServiceURL,
 		Client: &http.Client{
 			Timeout: time.Duration(s.config.PDFServiceTimeout) * time.Second,
@@ -791,7 +811,6 @@ func (s *Service) pdfOptions(resources *uploadResources) ingest.PDFOptions {
 	}
 	if resources != nil {
 		parser.VLM = resources.vlm
-		parser.OCR = resources.ocr
 	}
 	return ingest.PDFOptions{Parser: parser}
 }
@@ -850,7 +869,7 @@ func (s *Service) stageArtifacts(
 		}
 		return nil, nil
 	}, nil)
-	return err
+	return logging.WrapStage("staging", err)
 }
 
 // encodeDocumentVectors overlaps embedding requests with local BM25 encoding.
@@ -909,7 +928,7 @@ func (s *Service) encodeDocumentVectors(
 	})
 	<-denseDone
 	if err := context.Cause(workCtx); err != nil {
-		return nil, nil, err
+		return nil, nil, logging.WrapStage("embedding", err)
 	}
 	return vectors, sparseVectors, nil
 }
@@ -928,7 +947,7 @@ func (s *Service) failDocumentOperation(
 		// A committed journal row is the authority: the caller observes success
 		// even when the acknowledgement was lost.
 		if _, cleanupErr := coordinator.CleanupWorkspace(ctx, current); cleanupErr != nil {
-			logUploadWarning("Committed workspace cleanup pending", operation.ID, cleanupErr)
+			logUploadWarning(ctx, "Committed workspace cleanup pending", operation.ID, cleanupErr)
 		}
 		result := map[string]any{}
 		if stored, ok := current.Result.(map[string]any); ok {
@@ -939,8 +958,8 @@ func (s *Service) failDocumentOperation(
 		return result, nil
 	}
 	s.compensateUpload(ctx, coordinator, operation, cause)
-	log.Printf("Upload %s failed category=%s detail=%q",
-		operation.ID, errorTypeName(cause), truncateText(cause.Error(), 500))
+	logging.FromContext(ctx).Warn("document upload failed",
+		append([]any{"operation_id", operation.ID}, logging.ErrorAttrs(cause)...)...)
 	return nil, &documentOperationError{Err: cause, OperationID: operation.ID}
 }
 
@@ -1267,8 +1286,12 @@ func shortTypeName(err error) string {
 	return name
 }
 
-func logUploadWarning(message, operationID string, err error) {
-	log.Printf("%s operation_id=%s category=%s", message, operationID, errorTypeName(err))
+// logUploadWarning reports a best-effort upload cleanup/compensation problem.
+// The cause is classified and redacted: a raw message may embed credentials,
+// URLs or document text and must never reach the log sink verbatim.
+func logUploadWarning(ctx context.Context, message, operationID string, err error) {
+	logging.FromContext(ctx).Warn(message,
+		append([]any{"operation_id", operationID}, logging.ErrorAttrs(err)...)...)
 }
 
 func strconvFormatFloat(value float64) string {
@@ -1302,26 +1325,6 @@ func (s *Service) wordVisionWorker(vlm document.VLMSettings) *document.WordVisio
 		return nil
 	}
 	return &document.WordVisionWorker{VLM: vlm}
-}
-
-// uploadOCR resolves the OCR engine configured for one knowledge base. An empty
-// or absent "ocr_model" means "not configured" and yields an empty OCRSettings;
-// a stored value outside the engine whitelist is corrupt configuration rather
-// than a user-recoverable validation failure.
-func (s *Service) uploadOCR(settings map[string]any) (document.OCRSettings, error) {
-	raw, ok := settings["ocr_model"]
-	if !ok || raw == nil {
-		return document.OCRSettings{}, nil
-	}
-	text, ok := raw.(string)
-	if !ok {
-		return document.OCRSettings{}, &apierrors.KnowledgeError{Message: "知识库配置无效"}
-	}
-	engine, err := kbconfig.NormalizeOCREngine(text)
-	if err != nil {
-		return document.OCRSettings{}, &apierrors.KnowledgeError{Message: "知识库配置无效"}
-	}
-	return document.OCRSettings{Engine: engine}, nil
 }
 
 // uploadVLM prefers the knowledge base's own VLM provider and falls back to the

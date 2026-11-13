@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 )
 
 // ViewLoader loads one read-model value using only the supplied querier, which
@@ -61,11 +63,11 @@ func NewDefaultCacheSynchronizer(stores *Stores) (*CacheSynchronizer, error) {
 		loaders:  map[string]ViewLoader{},
 	}
 	if settings.backendEnabled() {
-		log.Printf("RAG_REDIS_URL/RAG_REDIS_ENABLED is set but the Go Redis state-cache client is not ported yet; " +
+		slog.Warn("RAG_REDIS_URL/RAG_REDIS_ENABLED is set but the Go Redis state-cache client is not ported yet; " +
 			"reads use the authoritative database (deferred to the async phase)")
 	}
 	if BrokerSettingsFromEnv().BootstrapServers != "" {
-		log.Printf("RAG_KAFKA_BOOTSTRAP_SERVERS is set but the Go Kafka transport is not ported yet; " +
+		slog.Warn("RAG_KAFKA_BOOTSTRAP_SERVERS is set but the Go Kafka transport is not ported yet; " +
 			"cache refresh events stay in the durable outbox (deferred to the async phase)")
 	}
 	return synchronizer, nil
@@ -197,7 +199,7 @@ func (c *CacheSynchronizer) recordAttempt(ctx context.Context, eventID string, c
 	if _, err := c.stores.DB.ExecContext(ctx,
 		"UPDATE cache_outbox SET attempts = attempts + 1, last_error = ? WHERE id = ? AND status != 'DONE'",
 		errorTypeName(cause), eventID); err != nil {
-		log.Printf("Cache refresh attempt record failed error_type=%s", errorTypeName(err))
+		logging.FromContext(ctx).Warn("Cache refresh attempt record failed", logging.ErrorAttrs(err)...)
 	}
 }
 
@@ -223,13 +225,13 @@ func (c *CacheSynchronizer) flushPending(ctx context.Context, limit int, keys []
 	}
 	ids, err := c.pendingEventIDs(ctx, limit, keys)
 	if err != nil {
-		log.Printf("Cache dispatch unavailable error_type=%s", errorTypeName(err))
+		logging.FromContext(ctx).Warn("Cache dispatch unavailable", logging.ErrorAttrs(err)...)
 		return nil
 	}
 	for _, eventID := range ids {
 		refreshed, err := c.RefreshEvent(ctx, eventID)
 		if err != nil {
-			log.Printf("Cache refresh pending event_id=%s error_type=%s", eventID, errorTypeName(err))
+			logging.FromContext(ctx).Warn("Cache refresh pending", append([]any{"event_id", eventID}, logging.ErrorAttrs(err)...)...)
 			continue
 		}
 		if !refreshed {
@@ -300,15 +302,15 @@ func (c *CacheSynchronizer) enqueue(ctx context.Context, eventID string) {
 		if _, updateErr := c.stores.DB.ExecContext(ctx,
 			"UPDATE cache_outbox SET retry_at = ?, last_error = ? WHERE id = ? AND status != 'DONE'",
 			unixSeconds()+5, errorTypeName(err), eventID); updateErr != nil {
-			log.Printf("Cache queue retry record failed error_type=%s", errorTypeName(updateErr))
+			logging.FromContext(ctx).Warn("Cache queue retry record failed", logging.ErrorAttrs(updateErr)...)
 		}
-		log.Printf("Cache queue publish pending event_id=%s error_type=%s", eventID, errorTypeName(err))
+		logging.FromContext(ctx).Warn("Cache queue publish pending", append([]any{"event_id", eventID}, logging.ErrorAttrs(err)...)...)
 		return
 	}
 	if _, err := c.stores.DB.ExecContext(ctx,
 		"UPDATE cache_outbox SET status = 'QUEUED', retry_at = ? WHERE id = ? AND status != 'DONE'",
 		unixSeconds()+60, eventID); err != nil {
-		log.Printf("Cache queue state record failed error_type=%s", errorTypeName(err))
+		logging.FromContext(ctx).Warn("Cache queue state record failed", logging.ErrorAttrs(err)...)
 	}
 }
 
@@ -372,13 +374,13 @@ func (c *CacheSynchronizer) Start() {
 			case <-ticker.C:
 				ctx := context.Background()
 				if err := c.RelayOnce(ctx); err != nil {
-					log.Printf("Cache worker will retry error_type=%s", errorTypeName(err))
+					logging.FromContext(ctx).Warn("Cache worker will retry", logging.ErrorAttrs(err)...)
 				}
 				if c.Transport != nil {
 					c.Transport.ConsumeOnce(func(eventID string) bool {
 						refreshed, err := c.RefreshEvent(ctx, eventID)
 						if err != nil {
-							log.Printf("Cache refresh failed error_type=%s", errorTypeName(err))
+							logging.FromContext(ctx).Warn("Cache refresh failed", logging.ErrorAttrs(err)...)
 							return false
 						}
 						return refreshed
@@ -414,7 +416,7 @@ func (c *CacheSynchronizer) Stop() {
 	}
 	if c.Transport != nil {
 		if err := c.Transport.Close(); err != nil {
-			log.Printf("Cache queue close failed error_type=%s", errorTypeName(err))
+			slog.Warn("Cache queue close failed", logging.ErrorAttrs(err)...)
 		}
 	}
 }

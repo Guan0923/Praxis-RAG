@@ -27,7 +27,9 @@ def test_main_starts_configured_processes(monkeypatch: pytest.MonkeyPatch, worke
     with patch("uvicorn.run") as run:
         main()
 
-    run.assert_called_once_with("app.main:app", host="127.0.0.1", port=9123, workers=workers)
+    run.assert_called_once_with(
+        "app.main:app", host="127.0.0.1", port=9123, workers=workers, log_config=None
+    )
     assert Settings.from_env().concurrency == 3
 
 
@@ -42,7 +44,7 @@ def test_invalid_process_count_is_reported(monkeypatch: pytest.MonkeyPatch, work
 
 
 def test_two_service_processes_serve_one_port(tmp_path: Path, sample_pdf: bytes) -> None:
-    # Use the real image entrypoint with fake conversion: no Docling models are
+    # Use the real image entrypoint with fake conversion: no vision endpoint is
     # needed to verify that two processes start and preserve the HTTP contract.
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))

@@ -250,9 +250,9 @@ func TestContentChunksMetadataAndWarnings(t *testing.T) {
 
 func TestContentChunksRecordsManifestParserVersion(t *testing.T) {
 	// Chunk metadata must follow the manifest that produced the content, not a
-	// package constant, so Docling content records its own parser version.
+	// package constant, so remote-service content records its own parser version.
 	for _, version := range []string{
-		document.PDFParserVersionDocling, "docling-formula-remote-v3", document.PDFParserVersion,
+		document.PDFParserVersionService, "docling-formula-remote-v3", document.PDFParserVersion,
 	} {
 		manifest := manifestFixture()
 		manifest.Version = version

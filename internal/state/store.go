@@ -5,9 +5,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -297,7 +298,7 @@ func (s *Stores) Close() error {
 // warnIfUnencrypted mirrors store._warn_if_unencrypted.
 func warnIfUnencrypted(settings StateSettings) {
 	if settings.EncryptionKey == "" {
-		log.Printf("RAG_STATE_ENCRYPTION_KEY is not set: provider and API keys may not be readable on other instances")
+		slog.Warn("RAG_STATE_ENCRYPTION_KEY is not set: provider and API keys may not be readable on other instances")
 	}
 }
 
@@ -434,7 +435,10 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	if err := s.migrateUserProfile(ctx); err != nil {
 		return err
 	}
-	return s.migrateDocumentOutbox(ctx)
+	if err := s.migrateDocumentOutbox(ctx); err != nil {
+		return err
+	}
+	return s.migrateVisionModelConfig(ctx)
 }
 
 // tableNames lists the current tables in one round trip; checking tables one by
@@ -654,6 +658,96 @@ func (s *Stores) migrateDocumentOutbox(ctx context.Context) error {
 		columns = append(columns, addition.name)
 	}
 	return nil
+}
+
+// migrateVisionModelConfig is the one-shot, idempotent upgrade that removes the
+// retired local OCR model configuration:
+//
+//   - delete saved model profiles of the retired "ocr" kind, which no longer
+//     exists in the Console model kinds;
+//   - strip the legacy "ocr"/"ocr_model" keys from knowledge_bases.settings.
+//     That column is a LONGTEXT JSON document rather than a JSON column, so the
+//     keys are parsed and rewritten in Go; rows with invalid JSON are skipped
+//     unchanged so one corrupt row cannot block startup.
+//
+// Re-running the migration is a no-op and concurrent startup is tolerated
+// because every statement is idempotent.
+func (s *Stores) migrateVisionModelConfig(ctx context.Context) error {
+	exists, err := s.hasTable(ctx, "model_profiles")
+	if err != nil {
+		return err
+	}
+	if exists {
+		if _, err := s.DB.ExecContext(ctx, "DELETE FROM model_profiles WHERE kind = 'ocr'"); err != nil {
+			return err
+		}
+	}
+	exists, err = s.hasTable(ctx, "knowledge_bases")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	rows, err := s.DB.QueryContext(ctx, "SELECT namespace, settings FROM knowledge_bases")
+	if err != nil {
+		return err
+	}
+	type settingsUpdate struct {
+		namespace string
+		settings  string
+	}
+	var updates []settingsUpdate
+	for rows.Next() {
+		var namespace, rawSettings string
+		if err := rows.Scan(&namespace, &rawSettings); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		cleaned, changed := stripLegacyOCRKeys(rawSettings)
+		if changed {
+			updates = append(updates, settingsUpdate{namespace: namespace, settings: cleaned})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	for _, update := range updates {
+		if _, err := s.DB.ExecContext(ctx,
+			"UPDATE knowledge_bases SET settings = ? WHERE namespace = ?",
+			update.settings, update.namespace); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stripLegacyOCRKeys removes the retired "ocr" and "ocr_model" keys from one
+// knowledge-base settings JSON document. It returns the original text unchanged
+// (and false) when the document is invalid or has no legacy keys, so the
+// migration only rewrites rows that need it.
+func stripLegacyOCRKeys(rawSettings string) (string, bool) {
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(rawSettings), &settings); err != nil {
+		return rawSettings, false
+	}
+	changed := false
+	for _, key := range []string{"ocr", "ocr_model"} {
+		if _, ok := settings[key]; ok {
+			delete(settings, key)
+			changed = true
+		}
+	}
+	if !changed {
+		return rawSettings, false
+	}
+	encoded, err := json.Marshal(settings)
+	if err != nil {
+		return rawSettings, false
+	}
+	return string(encoded), true
 }
 
 // migrateUserProfile adds the account profile columns (email/email_verified/

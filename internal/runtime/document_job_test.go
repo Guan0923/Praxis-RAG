@@ -173,7 +173,9 @@ func TestProcessDocumentJobTerminalFailureOnConfigurationChange(t *testing.T) {
 	if failed.Status != state.DocumentJobFailed || failed.Stage != "failed" {
 		t.Fatalf("failed job = %+v", failed)
 	}
-	if failed.Error == nil || *failed.Error != "Invalid document or changed knowledge-base configuration" {
+	if failed.Error == nil ||
+		!strings.HasPrefix(*failed.Error, "Invalid document or changed knowledge-base configuration") ||
+		len(*failed.Error) == len("Invalid document or changed knowledge-base configuration") {
 		t.Errorf("failed error = %v", failed.Error)
 	}
 	if len(qdrantFake.find("PUT", "/points")) != 0 {
@@ -244,7 +246,7 @@ func TestProcessDocumentJobValidatesPublicationInTransaction(t *testing.T) {
 		t.Fatalf("DocumentJobs.Get() = %v, %v", failed, err)
 	}
 	if failed.Status != state.DocumentJobFailed || failed.Error == nil ||
-		*failed.Error != "Invalid document or changed knowledge-base configuration" {
+		!strings.HasPrefix(*failed.Error, "Invalid document or changed knowledge-base configuration") {
 		t.Fatalf("failed job = %+v (error=%v)", failed, failed.Error)
 	}
 	if records, _ := stores.Documents.List(ctx, "alpha"); len(records) != 0 {
@@ -293,8 +295,16 @@ func TestProcessDocumentJobModelFailureIsRetryable(t *testing.T) {
 	if retried.Status != state.DocumentJobQueued || retried.Stage != "retry_wait" || retried.Attempts != 1 {
 		t.Fatalf("retried job = %+v", retried)
 	}
-	if retried.Error != nil {
-		t.Errorf("retryable failure stored an error message: %v", retried.Error)
+	// A retryable failure keeps the last reason on the job row: the retry-only
+	// row must say what failed (category), where (stage) and the upstream status
+	// instead of leaving the previous reason blank.
+	if retried.Error == nil {
+		t.Fatalf("retryable failure did not persist a reason")
+	}
+	for _, want := range []string{"Document processing failed", "model_api_error", "at embedding", "HTTP 401"} {
+		if !strings.Contains(*retried.Error, want) {
+			t.Fatalf("retried job error = %q, missing %q", *retried.Error, want)
+		}
 	}
 	if len(qdrantFake.find("PUT", "/points")) != 0 {
 		t.Errorf("failed model call staged Qdrant points")

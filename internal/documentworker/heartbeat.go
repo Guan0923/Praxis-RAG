@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 )
 
 const (
@@ -102,7 +104,7 @@ func StartHeartbeat(
 		beatContext, beatCancel := context.WithTimeout(runContext, heartbeatWriteTimeout)
 		defer beatCancel()
 		if err := recorder.Record(beatContext, role, instance, time.Now()); err != nil {
-			logger.Warn("文档 worker 心跳写入失败", "role", role, "instance", instance, "error", err)
+			logger.Warn("文档 worker 心跳写入失败", append([]any{"role", role, "instance", instance}, logging.ErrorAttrs(err)...)...)
 		}
 	}
 	// The first beat is written before returning so a freshly started worker is

@@ -5,7 +5,7 @@
 
 ## 1. 知识库（namespace）与租户隔离
 
-- 一个知识库 = 一个 namespace，命名规则 `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`；文档、切分配置、Embedding/Reranker/VLM/OCR 连接、Qdrant collection 与维度都按知识库保存。
+- 一个知识库 = 一个 namespace，命名规则 `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`；文档、切分配置、Embedding/Reranker/VLM 连接、Qdrant collection 与维度都按知识库保存。
 - 所有租户请求（REST `/v1/*`、MCP）必须携带 `X-RAG-Namespace`；Qdrant 查询按 payload 中的 `namespace` 过滤，不同知识库互不可见。
 - 知识库默认归创建者私有；共享通过「权限管理」页的邀请链接完成（见 §10）。
 - 每个知识库的 Qdrant 集合由配置决定，默认 `RAG_COLLECTION=mini_agent_knowledge_pdf_assets_v1`；dense 向量维度固定 1024（BGE-M3），其他维度启动即报错。
@@ -25,13 +25,13 @@
 
 | 格式 | 引擎 | 产物/说明 |
 | --- | --- | --- |
-| PDF（docling，默认） | 独立 `pdf-parser` 微服务 | 版面分析、表格结构（行列/表头/合并单元格）、OCR、公式 LaTeX；返回 zip：根 `manifest.json`（版本 `docling-service-v1`）+ 图片资产 |
+| PDF（vision，默认） | 独立 `pdf-parser` 微服务 + 远端视觉模型 | 本地 PyMuPDF 读取/渲染/裁图，版面分析、表格结构（行列/表头/合并单元格）、OCR、公式 LaTeX、图片描述统一由知识库配置的远端 OpenAI 兼容视觉模型完成；返回 zip：根 `manifest.json`（版本 `docling-service-v1`，证据格式契约）+ 图片资产 |
 | PDF（`RAG_PDF_ENGINE=go`） | Go 进程内纯文本引擎 | 按页抽正文、按基线分行、合并上标、去页眉页脚/页码、修复连字符换行；清单版本 `go-native-v1`；不支持版面/表格/OCR/公式/图片资产，扫描件会明确报“没有可索引的内容” |
 | DOCX | Go 进程内 OOXML 读取 | 保留内容控件、嵌套表格、合并单元格、原生公式（OMML→LaTeX）、图注/脚注关联；无法可靠读取的结构会明确拒绝入库 |
 | DOC | 外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）转换后再按 DOCX 处理 | 超时 `RAG_WORD_CONVERT_TIMEOUT`（默认 120s） |
 | Markdown/TXT | 直接读取 | 直接进入切分 |
 
-- **docling 引擎的强约束**：知识库必须已在 Console「模型配置」中添加并选中 VLM 与 OCR，否则 PDF 上传会在**受理阶段**被拒绝并提示配置，不进入队列；VLM 有 `RAG_VLM_*` 环境回退（OCR 没有）。VLM 同时用于公式识别与 Word 无图注图片描述。
+- **vision 引擎的强约束**：知识库必须已在 Console「模型配置」中添加并选中 VLM，否则 PDF 上传会在**受理阶段**被拒绝并提示配置，不进入队列；VLM 有 `RAG_VLM_*` 环境回退。同一个视觉模型同时承担 PDF 版面/OCR/表格/公式/图片描述与 Word 无图注图片描述。OCR 已并入视觉模型，不再有独立 OCR 模型类型；升级迁移会删除旧 `kind='ocr'` 配置并清除知识库中的 `ocr`/`ocr_model` 设置。旧值 `RAG_PDF_ENGINE=docling` 等价于 `vision`。
 - 解析上限：单文档最多 1000 页、解压后 50 MiB、最多 10000 个 zip 成员、500 万字符；pdf-parser 请求体默认上限 100 MiB。
 - 安全拒绝：非 `%PDF-` 文件、明显加密的 PDF、空抽取结果都会返回明确错误，不会静默入库垃圾文本。
 - 解析产物（`manifest.json`、`document.md`、图片、表格、图注/脚注）保存在共享状态库；检索命中时返回图片 Base64、表格行列/表头/合并信息与页码/版面或 Word 章节位置。
@@ -128,9 +128,9 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | `#/workspaces/search` | 检索调试 | 所有登录账号 | BM25/Embedding/Hybrid 检索、Cross-Encoder 重排开关、候选/Top-K 调整、三模式对比、耗时与证据状态、命中详情（分数、来源、页码/章节、图片、脚注） |
 | `#/workspaces/documents` | 知识文档 | 所有登录账号 | 文档列表（大小/块数/切分配置）、上传（批次受理：工具栏徽标 + 逐文件进度气泡，可失败重试；刷新后恢复未完成批次）、删除；只读授权时隐藏写操作 |
 | `#/workspaces/documents/{name}` | 文档详情 | 所有登录账号 | 正文预览、PDF 预览（pdfjs）、图片/表格资产查看 |
-| `#/workspaces/create` | 创建知识库 | 所有登录账号 | 管理员：namespace + 切分参数 + 从「模型配置」选择 Embedding/Reranker/VLM/OCR；VIP/普通用户：简化表单（从默认模板克隆模型配置） |
+| `#/workspaces/create` | 创建知识库 | 所有登录账号 | 管理员：namespace + 切分参数 + 从「模型配置」选择 Embedding/Reranker/VLM；VIP/普通用户：简化表单（从默认模板克隆模型配置） |
 | `#/knowledge-bases` | 知识库 | 管理员 | 知识库列表、编辑抽屉（模型/切分/重新向量化确认） |
-| `#/model-profiles` | 模型配置 | 管理员 | Embedding/Reranker/VLM/OCR 分页签，新增/编辑/删除、模型探测、Key 只写不读 |
+| `#/model-profiles` | 模型配置 | 管理员 | Embedding/Reranker/VLM/JEV 分页签，新增/编辑/删除、模型探测、Key 只写不读 |
 | `#/api-keys` | API Key | 所有登录账号 | 自己的密钥 CRUD/启停、一次性明文、复制 MCP 配置 |
 | `#/users` | 用户管理 | 管理员 | 角色（admin/vip/user）、启用/禁用、删除；服务端保证至少保留一名启用的管理员 |
 | `#/monitor` | 系统监控 | 管理员 | 只读监控快照：页头三态状态与降级告警、关键指标（有效文档/任务/上传/检索/结果快照）、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态（Kafka 校验元数据与主题、PDF 校验转换器）、`document_jobs`/`search_tasks` 队列与阶段、上传互斥分类、`document_job_outbox` 记录统计（明确标注不是未投递积压）、Debezium 运行检查与 Kafka 消费组滞后、文档 Worker 心跳（读不到显示「未知」）、服务信息；15 秒自动刷新，窄屏单列 |
@@ -151,8 +151,8 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 
 ## 11. 模型配置（model profiles）
 
-- 管理员在「模型配置」页维护可复用列表：`embedding` / `reranker` / `vlm` / `ocr`；`(kind, name)` 唯一。
-- Embedding/Reranker/VLM 保存 `base_url`、`model`、加密后的 API Key；Embedding 保存时会真实探测并记录 `vector_size`，Reranker 做一次有界探测，VLM 不探测；OCR 只选择引擎（`auto`/`easyocr`/`tesseract`/`rapidocr`）。
+- 管理员在「模型配置」页维护可复用列表：`embedding` / `reranker` / `vlm` / `jev`；`(kind, name)` 唯一。
+- Embedding/Reranker/VLM/JEV 保存 `base_url`、`model`、加密后的 API Key；Embedding 保存时会真实探测并记录 `vector_size`，Reranker 做一次有界探测，VLM 与 JEV 不探测。VLM 是唯一的远端视觉模型，PDF 版面/OCR/表格/公式/图片描述都由它完成；`ocr` 类型已删除（升级迁移会删除旧条目）。
 - 知识库保存的是**连接副本**（保存时把 profile 的 URL/模型/Key 复制进知识库配置），之后编辑/删除 profile 不影响已保存的知识库；知识库 REST 契约仍是内联连接对象。
 - 凭据加密格式 `enc:v1:`（AES-GCM，12 字节 nonce，`base64(nonce||ciphertext)`），密钥来自 `RAG_STATE_ENCRYPTION_KEY`（`base64:` 前缀的 32 字节）；旧 `dpapi:`/`private-file:` 记录只读兼容。
 

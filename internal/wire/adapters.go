@@ -245,7 +245,6 @@ func (a HTTPRuntime) CreateKnowledgeBase(ctx context.Context, input httpapi.Know
 		RerankerValues:  input.RerankerValues,
 		VLMModel:        input.VLMModel,
 		VLMValues:       input.VLMValues,
-		OCRModel:        input.OCRModel,
 		TokenizerModel:  a.Service.Config().ChunkTokenizerModel,
 	})
 }
@@ -275,9 +274,8 @@ func (a HTTPRuntime) CreateKnowledgeBaseForUser(
 // UpdateKnowledgeBase implements httpapi.KnowledgeBaseAdminRuntime.
 func (a HTTPRuntime) UpdateKnowledgeBase(ctx context.Context, namespace string, input httpapi.KnowledgeBaseUpdateInput) (map[string]any, error) {
 	return a.Service.UpdateKnowledgeBase(ctx, namespace, kbconfig.UpdateInput{
-		Values:   input.Values,
-		Reembed:  input.Reembed,
-		OCRModel: input.OCRModel,
+		Values:  input.Values,
+		Reembed: input.Reembed,
 	})
 }
 

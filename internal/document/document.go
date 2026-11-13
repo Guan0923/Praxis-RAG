@@ -6,7 +6,7 @@
 // Markdown/TXT are read in process; DOCX is parsed from the OOXML zip package
 // in process (including full caption/note association and skipped-object
 // diagnostics); PDF text is extracted in process by NativePDFParser, or by
-// DoclingServiceParser when a remote Docling parse service is configured.
+// PDFServiceParser when a remote vision parse service is configured.
 // Legacy .doc
 // files additionally require an external LibreOffice based converter, see
 // docconvert.go; uncaptioned Word pictures can be described by the remote VLM
@@ -91,6 +91,10 @@ func IsSupportedSuffix(suffix string) bool {
 type ReadError struct{ Message string }
 
 func (e *ReadError) Error() string { return e.Message }
+
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *ReadError) ErrorCategory() string { return "document_read_error" }
 
 // AsReadError extracts a ReadError from err, if any.
 func AsReadError(err error) (*ReadError, bool) {

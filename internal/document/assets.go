@@ -340,7 +340,7 @@ func ValidateWordParserVersion(version string) error {
 }
 
 // ValidatePDFParserVersion mirrors pdf_assets.read_pdf_content's parser version
-// guard. Manifests from either supported engine (and historical Docling
+// guard. Manifests from either supported engine (and historical remote
 // artifacts) pass; foreign version strings are rejected.
 func ValidatePDFParserVersion(version string) error {
 	if !IsSupportedPDFParserVersion(version) {

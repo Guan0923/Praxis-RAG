@@ -34,7 +34,7 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
       uptime_seconds: 8400.2,
       upload_mode: "async",
       outbox_bridge: "debezium",
-      pdf_engine: "docling",
+      pdf_engine: "vision",
     },
     dependencies: [
       { name: "mysql", label: "MySQL", status: "ok", latency_ms: 1.2, detail: "连接正常 pool open=1 in_use=0 idle=1 wait=0" },
@@ -241,7 +241,7 @@ describe("MonitorPage", () => {
     expect(within(serviceCard).getByText("praxis_chunks")).toBeTruthy();
     expect(within(serviceCard).getByText("async")).toBeTruthy();
     expect(within(serviceCard).getByText("debezium")).toBeTruthy();
-    expect(within(serviceCard).getByText("docling")).toBeTruthy();
+    expect(within(serviceCard).getByText("vision")).toBeTruthy();
 
     // 首次请求直接命中聚合接口且绕过缓存。
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/admin/monitor/overview");

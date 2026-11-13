@@ -38,6 +38,27 @@ type KnowledgeConflictError struct{ Message string }
 // Error implements error.
 func (e *KnowledgeConflictError) Error() string { return e.Message }
 
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package. The value is stable and
+// low-cardinality because it is persisted in job error text and log records.
+func (e *KnowledgeError) ErrorCategory() string { return "knowledge_error" }
+
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *KnowledgeValidationError) ErrorCategory() string { return "validation_error" }
+
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *SnapshotUnavailable) ErrorCategory() string { return "snapshot_unavailable" }
+
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *UploadConflict) ErrorCategory() string { return "upload_conflict" }
+
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *KnowledgeConflictError) ErrorCategory() string { return "knowledge_conflict" }
+
 // SnapshotUnavailableError builds a *SnapshotUnavailable.
 func SnapshotUnavailableError(message string) *SnapshotUnavailable {
 	return &SnapshotUnavailable{Message: message}

@@ -6,11 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
@@ -63,6 +63,9 @@ func (s *Service) SubmitDocumentBatch(
 	if batch == nil {
 		return nil, &apierrors.KnowledgeError{Message: asyncSubmissionFailedMessage}
 	}
+	// Annotate the enclosing HTTP request with the batch id: the Console can
+	// then join one upload request to every accepted artifact and worker log.
+	logging.Annotate(ctx, logging.FieldBatchID, batch.ID)
 	if reused {
 		// A retried request must show the original outcomes instead of
 		// admitting the same files a second time.
@@ -70,6 +73,7 @@ func (s *Service) SubmitDocumentBatch(
 	}
 	admissionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), documentBatchAdmissionBudget)
 	defer cancel()
+	admissionCtx = logging.WithBatchID(admissionCtx, batch.ID)
 	results := make([]state.DocumentBatchItemResult, len(files))
 	limit := documentBatchAdmissionConcurrency
 	if limit > len(files) {
@@ -92,8 +96,8 @@ func (s *Service) SubmitDocumentBatch(
 	if err := s.stores.DocumentBatches.Finish(admissionCtx, namespace, batch.ID, results); err != nil {
 		// The admissions are already durable; report the batch so the Console
 		// can keep polling instead of losing every accepted artifact id.
-		log.Printf("Document batch settle failed batch_id=%s error_type=%s",
-			batch.ID, runtimeErrorTypeName(err))
+		logging.FromContext(admissionCtx).Warn("Document batch settle failed",
+			append([]any{"batch_id", batch.ID}, logging.ErrorAttrs(err)...)...)
 		return documentBatchPayload(batch), nil
 	}
 	finished, err := s.stores.DocumentBatches.Get(admissionCtx, namespace, batch.ID)
@@ -159,7 +163,7 @@ func (s *Service) admitDocumentBatchFile(
 	idempotencyKey *string,
 ) state.DocumentBatchItemResult {
 	result := state.DocumentBatchItemResult{Position: position}
-	if err := s.validateDoclingPDFAdmission(ctx, namespace, file.Name); err != nil {
+	if err := s.validateRemotePDFAdmission(ctx, namespace, file.Name); err != nil {
 		result.Status = state.DocumentBatchItemFailed
 		result.Reason = state.DocumentBatchReasonConfig
 		result.Error = batchFailureText(err)
@@ -229,14 +233,6 @@ func documentBatchFileKey(batchKey string, position int) *string {
 	digest := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", batchKey, position)))
 	value := hex.EncodeToString(digest[:])
 	return &value
-}
-
-// runtimeErrorTypeName names an error type without leaking its message.
-func runtimeErrorTypeName(err error) string {
-	if err == nil {
-		return "none"
-	}
-	return fmt.Sprintf("%T", err)
 }
 
 // batchFailureText truncates a safe error message for one batch item.

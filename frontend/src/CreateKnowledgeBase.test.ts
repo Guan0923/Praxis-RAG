@@ -18,13 +18,13 @@ function profile(overrides: Partial<ModelProfile> = {}): ModelProfile {
   };
 }
 
-function ocrProfile(overrides: Partial<ModelProfile> = {}): ModelProfile {
+function vlmProfile(overrides: Partial<ModelProfile> = {}): ModelProfile {
   return {
-    id: "mp-ocr",
-    kind: "ocr",
-    name: "本地 OCR",
-    base_url: "",
-    model: "easyocr",
+    id: "mp-vlm",
+    kind: "vlm",
+    name: "视觉模型",
+    base_url: "https://vlm.example.com/v1",
+    model: "qwen2.5-vl-72b",
     api_key_set: false,
     vector_size: null,
     ...overrides,
@@ -68,7 +68,6 @@ function editInitial(overrides: Partial<KnowledgeBase> = {}): KnowledgeBase {
     embedding_model: "bge-m3",
     reranker_model: "",
     vlm_model: "",
-    ocr_model: "",
     vector_size: 1024,
     collection: "team_kb",
     tokenizer: "bge",
@@ -151,14 +150,14 @@ function installAntdBrowserStubs() {
 
 // mockApi answers the defaults, profile list and the create/update endpoints the
 // form talks to. Saved keys and remote model lists are deliberately unsupported:
-// the OCR path must never request them.
+// the VLM path must never request them.
 function mockApi(profiles: ModelProfile[], saved?: KnowledgeBase) {
   fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
     if (path === "/v1/admin/knowledge-bases/defaults") return jsonResponse(defaults);
     if (path === "/v1/admin/model-profiles") return jsonResponse({ model_profiles: profiles });
     const method = options.method || "GET";
     if (path === "/v1/admin/knowledge-bases" && method === "POST")
-      return jsonResponse({ ...editInitial(), namespace: "ocr-kb" }, 201);
+      return jsonResponse({ ...editInitial(), namespace: "vision-kb" }, 201);
     if (path.startsWith("/v1/admin/knowledge-bases/") && method === "PATCH")
       return jsonResponse({ ...editInitial(), ...saved, ...JSON.parse(String(options.body || "{}")) });
     return jsonResponse({});
@@ -200,7 +199,7 @@ async function selectProfile(label: string, optionText: RegExp) {
   fireEvent.click(option!);
 }
 
-describe("OCR settings in the knowledge-base form", () => {
+describe("optional model settings in the knowledge-base form", () => {
   beforeEach(() => {
     fetchMock.mockReset();
     vi.stubGlobal("fetch", fetchMock);
@@ -220,45 +219,45 @@ describe("OCR settings in the knowledge-base form", () => {
     renderForm({ initial: initialKb });
     await waitForAdminDefaults();
 
-    for (const name of ["启用 Reranker", "启用 VLM", "启用 OCR"]) {
+    for (const name of ["启用 Reranker", "启用 VLM"]) {
       expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("false");
     }
   });
 
-  it("submits the selected OCR engine as ocr_model", async () => {
-    mockApi([profile({ api_key_set: false }), ocrProfile()]);
+  it("submits the selected VLM connection and model", async () => {
+    mockApi([profile({ api_key_set: false }), vlmProfile()]);
     const { onSaved } = renderForm();
     await waitForAdminDefaults();
 
     fireEvent.change(screen.getByLabelText("知识库标识（Namespace）"), {
-      target: { value: "ocr-kb" },
+      target: { value: "vision-kb" },
     });
     await selectProfile("Embedding 模型", /默认 Embedding · bge-m3/);
-    // Reranker / VLM 在创建页默认开启，本用例只验证 OCR，先关闭这两个可选模型。
+    // Reranker 在创建页默认开启，本用例只验证 VLM，先关闭 Reranker。
     fireEvent.click(screen.getByRole("switch", { name: "启用 Reranker" }));
-    fireEvent.click(screen.getByRole("switch", { name: "启用 VLM" }));
-    await selectProfile("OCR 模型", /本地 OCR · easyocr/);
+    await selectProfile("VLM 模型", /视觉模型 · qwen2.5-vl-72b/);
     fireEvent.click(screen.getByRole("button", { name: /创建知识库/ }));
 
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
-    expect(requestBody("/v1/admin/knowledge-bases", "POST")).toMatchObject({
-      namespace: "ocr-kb",
+    const body = requestBody("/v1/admin/knowledge-bases", "POST");
+    expect(body).toMatchObject({
+      namespace: "vision-kb",
       embedding: { base_url: "https://api.example.com/v1" },
       embedding_model: "bge-m3",
-      vlm_model: "",
-      ocr_model: "easyocr",
+      vlm: { base_url: "https://vlm.example.com/v1" },
+      vlm_model: "qwen2.5-vl-72b",
     });
-    // OCR 配置没有 Key 可读取，也没有远端模型列表可探测。
+    // 无 Key 的视觉模型配置不会读取已保存 Key，也没有远端模型列表可探测。
     expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/key"))).toBe(false);
     expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/models"))).toBe(false);
   });
 
-  it("enables reranker, VLM and OCR by default on the create form", async () => {
-    mockApi([profile({ api_key_set: false }), ocrProfile()]);
+  it("enables reranker and VLM by default on the create form", async () => {
+    mockApi([profile({ api_key_set: false }), vlmProfile()]);
     renderForm();
     await waitForAdminDefaults();
 
-    for (const name of ["启用 Reranker", "启用 VLM", "启用 OCR"]) {
+    for (const name of ["启用 Reranker", "启用 VLM"]) {
       expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("true");
     }
   });
@@ -268,13 +267,12 @@ describe("OCR settings in the knowledge-base form", () => {
       draft_version: 2,
       reranker_enabled: false,
       vlm_enabled: false,
-      ocr_enabled: false,
     }));
-    mockApi([profile({ api_key_set: false }), ocrProfile()]);
+    mockApi([profile({ api_key_set: false }), vlmProfile()]);
     renderForm();
     await waitForAdminDefaults();
 
-    for (const name of ["启用 Reranker", "启用 VLM", "启用 OCR"]) {
+    for (const name of ["启用 Reranker", "启用 VLM"]) {
       expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("false");
     }
   });
@@ -285,20 +283,19 @@ describe("OCR settings in the knowledge-base form", () => {
       namespace: "legacy-draft",
       reranker_enabled: false,
       vlm_enabled: false,
-      ocr_enabled: false,
     }));
-    mockApi([profile({ api_key_set: false }), ocrProfile()]);
+    mockApi([profile({ api_key_set: false }), vlmProfile()]);
     renderForm();
     await waitForAdminDefaults();
 
     expect((screen.getByLabelText("知识库标识（Namespace）") as HTMLInputElement).value)
       .toBe("legacy-draft");
-    for (const name of ["启用 Reranker", "启用 VLM", "启用 OCR"]) {
+    for (const name of ["启用 Reranker", "启用 VLM"]) {
       expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("true");
     }
   });
 
-  it("submits an empty ocr_model while OCR stays disabled", async () => {
+  it("submits empty optional models while they stay disabled", async () => {
     mockApi([profile({ api_key_set: false })]);
     const { onSaved } = renderForm();
     await waitForAdminDefaults();
@@ -307,65 +304,72 @@ describe("OCR settings in the knowledge-base form", () => {
       target: { value: "plain-kb" },
     });
     await selectProfile("Embedding 模型", /默认 Embedding · bge-m3/);
-    // 三个可选模型默认开启；本用例验证关闭后提交空值。
+    // 两个可选模型默认开启；本用例验证关闭后提交空值。
     fireEvent.click(screen.getByRole("switch", { name: "启用 Reranker" }));
     fireEvent.click(screen.getByRole("switch", { name: "启用 VLM" }));
-    fireEvent.click(screen.getByRole("switch", { name: "启用 OCR" }));
     fireEvent.click(screen.getByRole("button", { name: /创建知识库/ }));
 
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
     const body = requestBody("/v1/admin/knowledge-bases", "POST");
-    expect(body.ocr_model).toBe("");
     expect(body.vlm_model).toBe("");
+    expect(body).not.toHaveProperty("ocr_model");
   });
 
-  it("guides to the model configuration page when no OCR profile exists", async () => {
+  it("guides to the model configuration page when no VLM profile exists", async () => {
     mockApi([profile({ api_key_set: false })]);
     const { onOpenModelProfiles } = renderForm();
     await waitForAdminDefaults();
 
-    // OCR 默认开启；没有 OCR 模型时表单直接给出提示。
-    expect(screen.getByRole("switch", { name: "启用 OCR" }).getAttribute("aria-checked")).toBe("true");
-    expect(await screen.findByText("暂无 OCR 模型")).toBeTruthy();
-    expect(screen.getByText(/创建知识库时只能选择已保存的 OCR 模型/)).toBeTruthy();
-    // Reranker / VLM / OCR 默认开启且都没有模型时，各自都有「前往模型配置」入口。
-    const ocrSection = screen.getByRole("region", { name: "OCR 配置" });
-    fireEvent.click(within(ocrSection).getByRole("button", { name: "前往模型配置" }));
+    // VLM 默认开启；没有 VLM 模型时表单直接给出提示。
+    expect(screen.getByRole("switch", { name: "启用 VLM" }).getAttribute("aria-checked")).toBe("true");
+    expect(await screen.findByText("暂无 VLM 模型")).toBeTruthy();
+    expect(screen.getByText(/创建知识库时只能选择已保存的 VLM 模型/)).toBeTruthy();
+    // Reranker / VLM 默认开启且都没有模型时，各自都有「前往模型配置」入口。
+    const vlmSection = screen.getByRole("region", { name: "VLM 配置" });
+    fireEvent.click(within(vlmSection).getByRole("button", { name: "前往模型配置" }));
     expect(onOpenModelProfiles).toHaveBeenCalledTimes(1);
   });
 
-  it("backfills initial.ocr_model on the edit form and PATCHes ocr_model", async () => {
-    const initialKb = editInitial({ ocr_model: "tesseract" });
-    mockApi([profile({ api_key_set: false }), ocrProfile({ model: "tesseract" })], initialKb);
+  it("backfills initial.vlm_model on the edit form and PATCHes vlm_model", async () => {
+    const initialKb = editInitial({
+      vlm: { base_url: "https://vlm.example.com/v1", api_key_set: false },
+      vlm_model: "qwen2.5-vl-72b",
+    });
+    mockApi([profile({ api_key_set: false }), vlmProfile()], initialKb);
     const { onSaved } = renderForm({ initial: initialKb });
     await waitForAdminDefaults();
 
-    expect(screen.getByRole("switch", { name: "启用 OCR" }).getAttribute("aria-checked"))
+    expect(screen.getByRole("switch", { name: "启用 VLM" }).getAttribute("aria-checked"))
       .toBe("true");
-    expect(await screen.findByText(/本地 OCR · tesseract/)).toBeTruthy();
+    expect(await screen.findByText(/视觉模型 · qwen2.5-vl-72b/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /保存配置/ }));
 
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
-    expect(requestBody("/v1/admin/knowledge-bases/team-kb", "PATCH")).toMatchObject({
-      ocr_model: "tesseract",
+    const body = requestBody("/v1/admin/knowledge-bases/team-kb", "PATCH");
+    expect(body).toMatchObject({
+      vlm_model: "qwen2.5-vl-72b",
       reembed: false,
     });
-    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/key"))).toBe(false);
+    expect(body).not.toHaveProperty("ocr_model");
   });
 
-  it("keeps the current OCR engine when no matching profile is listed", async () => {
-    const initialKb = editInitial({ ocr_model: "easyocr" });
+  it("keeps the current VLM when no matching profile is listed", async () => {
+    const initialKb = editInitial({
+      vlm: { base_url: "https://vlm.example.com/v1", api_key_set: false },
+      vlm_model: "qwen2.5-vl-72b",
+    });
     mockApi([profile({ api_key_set: false })], initialKb);
     const { onSaved } = renderForm({ initial: initialKb });
     await waitForAdminDefaults();
 
-    expect(await screen.findByText(/当前配置 · easyocr/)).toBeTruthy();
-    expect(screen.getByText("暂无 OCR 模型")).toBeTruthy();
+    expect(await screen.findByText(/当前配置 · qwen2.5-vl-72b/)).toBeTruthy();
+    expect(screen.getByText("暂无 VLM 模型")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /保存配置/ }));
 
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
     expect(requestBody("/v1/admin/knowledge-bases/team-kb", "PATCH")).toMatchObject({
-      ocr_model: "easyocr",
+      vlm_model: "qwen2.5-vl-72b",
+      reembed: false,
     });
   });
 });

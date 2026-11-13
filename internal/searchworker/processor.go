@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -136,16 +137,26 @@ func defaultRetryable(err error) bool {
 
 // Handle processes one full-request envelope and reports whether the broker
 // delivery may be acknowledged (true) or must be retried (false).
+//
+// The result id and namespace are attached to the context as soon as they are
+// known so retry, failure and capture logs can be joined with the durable task
+// row and the final result read.
 func (p *Processor) Handle(ctx context.Context, envelope state.SearchEnvelope) bool {
+	if envelope.ResultID != "" {
+		ctx = logging.With(ctx, "result_id", envelope.ResultID)
+	}
+	if envelope.Namespace != "" {
+		ctx = logging.WithNamespace(ctx, envelope.Namespace)
+	}
 	if p.searcher == nil {
 		// Dead-letter-only worker: execution must never run here.
-		p.logWarn("search worker has no searcher; leaving delivery retryable", "result_id", envelope.ResultID)
+		p.logWarn(ctx, "search worker has no searcher; leaving delivery retryable")
 		return false
 	}
 	task, err := p.tasks.Claim(ctx, envelope)
 	if err != nil {
 		// A malformed envelope or unavailable task state must not be acked.
-		p.logWarn("search claim unavailable", "result_id", envelope.ResultID, "error_type", typeName(err))
+		p.logWarn(ctx, "search claim unavailable", logging.ErrorAttrs(err)...)
 		return false
 	}
 	if task == nil {
@@ -176,10 +187,10 @@ func (p *Processor) Handle(ctx context.Context, envelope state.SearchEnvelope) b
 		retry := p.retryable(failure)
 		cause := "Search execution failed"
 		if _, failErr := p.tasks.Fail(ctx, task, retry, &cause); failErr != nil {
-			p.logWarn("search failure could not be recorded", "result_id", envelope.ResultID, "error_type", typeName(failErr))
+			p.logWarn(ctx, "search failure could not be recorded", logging.ErrorAttrs(failErr)...)
 		}
-		p.logWarn("search execution deferred", "result_id", envelope.ResultID, "retry", retry,
-			"error_type", typeName(failure))
+		p.logWarn(ctx, "search execution deferred",
+			append([]any{"retry", retry}, logging.ErrorAttrs(failure)...)...)
 	}
 	return p.terminalOrNack(ctx, envelope)
 }
@@ -252,7 +263,7 @@ func (p *Processor) capture(ctx context.Context, envelope state.SearchEnvelope, 
 	}
 	enriched, err := p.capturer.Capture(ctx, envelope.Namespace, payload, false)
 	if err != nil {
-		p.logWarn("search reference capture unavailable", "result_id", envelope.ResultID, "error_type", typeName(err))
+		p.logWarn(ctx, "search reference capture unavailable", logging.ErrorAttrs(err)...)
 		return payload
 	}
 	return enriched
@@ -261,7 +272,7 @@ func (p *Processor) capture(ctx context.Context, envelope state.SearchEnvelope, 
 func (p *Processor) terminalOrNack(ctx context.Context, envelope state.SearchEnvelope) bool {
 	terminal, err := p.tasks.Terminal(ctx, envelopeValues(envelope))
 	if err != nil {
-		p.logWarn("search terminal state unavailable", "result_id", envelope.ResultID, "error_type", typeName(err))
+		p.logWarn(ctx, "search terminal state unavailable", logging.ErrorAttrs(err)...)
 		return false
 	}
 	return terminal
@@ -288,7 +299,7 @@ func (p *Processor) MessageHandler() mq.Handler {
 	return func(ctx context.Context, message mq.ReceivedMessage) bool {
 		envelope, err := mq.DecodeSearchEnvelope(message.Body)
 		if err != nil {
-			p.logWarn("malformed search message ignored", "error_type", typeName(err))
+			p.logWarn(ctx, "malformed search message ignored", logging.ErrorAttrs(err)...)
 			return false
 		}
 		return p.Handle(ctx, envelope)
@@ -297,13 +308,19 @@ func (p *Processor) MessageHandler() mq.Handler {
 
 // DeadLetter records broker retry exhaustion as a durable terminal state.
 func (p *Processor) DeadLetter(ctx context.Context, envelope state.SearchEnvelope) (bool, error) {
+	if envelope.ResultID != "" {
+		ctx = logging.With(ctx, "result_id", envelope.ResultID)
+	}
+	if envelope.Namespace != "" {
+		ctx = logging.WithNamespace(ctx, envelope.Namespace)
+	}
 	complete, err := p.tasks.DeadLetter(ctx, envelopeValues(envelope))
 	if err != nil {
-		p.logWarn("search dead-letter failed", "result_id", envelope.ResultID, "error_type", typeName(err))
+		p.logWarn(ctx, "search dead-letter failed", logging.ErrorAttrs(err)...)
 		return false, err
 	}
 	if complete {
-		p.logInfo("search dead-letter outcome saved or task absent", "result_id", envelope.ResultID)
+		p.logInfo(ctx, "search dead-letter outcome saved or task absent")
 	}
 	return complete, nil
 }
@@ -312,7 +329,7 @@ func (p *Processor) DeadLetter(ctx context.Context, envelope state.SearchEnvelop
 func (p *Processor) DeadLetterMessage(ctx context.Context, message mq.ReceivedMessage) (bool, error) {
 	envelope, err := mq.DecodeSearchEnvelope(message.Body)
 	if err != nil {
-		p.logWarn("malformed search dead-letter message ignored", "error_type", typeName(err))
+		p.logWarn(ctx, "malformed search dead-letter message ignored", logging.ErrorAttrs(err)...)
 		return false, nil
 	}
 	return p.DeadLetter(ctx, envelope)
@@ -390,7 +407,7 @@ func (p *Processor) Run(ctx context.Context) error {
 		case <-timer.C:
 		}
 		if _, err := p.RunOnce(ctx); err != nil {
-			p.logWarn("search worker pass failed", "error_type", typeName(err))
+			p.logWarn(ctx, "search worker pass failed", logging.ErrorAttrs(err)...)
 		}
 		timer.Reset(p.pollInterval)
 	}
@@ -424,12 +441,16 @@ func (p *Processor) Close() error {
 	return nil
 }
 
-func (p *Processor) logWarn(message string, args ...any) {
-	p.logger.Warn(message, args...)
+// logWarn writes a warning enriched with the context correlation fields
+// (result_id, namespace) and redacted structured error attributes.
+func (p *Processor) logWarn(ctx context.Context, message string, args ...any) {
+	p.logger.Warn(message, append(logging.Attrs(ctx), args...)...)
 }
 
-func (p *Processor) logInfo(message string, args ...any) {
-	p.logger.Info(message, args...)
+// logInfo writes an informational line enriched with the context correlation
+// fields.
+func (p *Processor) logInfo(ctx context.Context, message string, args ...any) {
+	p.logger.Info(message, append(logging.Attrs(ctx), args...)...)
 }
 
 func durationSeconds(seconds float64) time.Duration {
@@ -437,11 +458,4 @@ func durationSeconds(seconds float64) time.Duration {
 		return 0
 	}
 	return time.Duration(seconds * float64(time.Second))
-}
-
-func typeName(err error) string {
-	if err == nil {
-		return ""
-	}
-	return fmt.Sprintf("%T", err)
 }

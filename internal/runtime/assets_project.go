@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log"
 	"reflect"
 	"strconv"
 
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
@@ -94,7 +94,7 @@ func projectAssetResults(
 	}
 	assets, err := fetcher.GetAssets(ctx, assetIDs)
 	if err != nil {
-		log.Printf("search asset projection unavailable; returning unprojected results error_type=%T", err)
+		logging.FromContext(ctx).Warn("search asset projection unavailable; returning unprojected results", logging.ErrorAttrs(err)...)
 		return plainCandidateResults(candidates)
 	}
 	results := make([]map[string]any, 0, len(candidates))

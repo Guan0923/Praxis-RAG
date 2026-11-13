@@ -113,7 +113,7 @@ func qdrantServer(t *testing.T, collection string, points int64, missing bool) *
 	return server
 }
 
-// pdfServer serves the Docling health endpoint with a healthy converter payload.
+// pdfServer serves the remote vision health endpoint with a healthy converter payload.
 func pdfServer(t *testing.T, status int) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -124,8 +124,8 @@ func pdfServer(t *testing.T, status int) *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write([]byte(`{"service":"praxis-rag-pdf-service","version":"1.0.0",` +
-			`"status":"ok","converter":"docling","converter_requested":"docling",` +
-			`"vlm_configured":false,"docling_installed":true}`))
+			`"status":"ok","converter":"vision","converter_requested":"vision",` +
+			`"vision_configured":false}`))
 	}))
 	t.Cleanup(server.Close)
 	return server
@@ -220,7 +220,7 @@ func healthyOptions(t *testing.T) Options {
 		},
 		OutboxBridge:  "debezium",
 		UploadMode:    "async",
-		PDFEngine:     pdfEngineDocling,
+		PDFEngine:     pdfEngineVision,
 		PDFServiceURL: pdf.URL,
 		StartedAt:     time.Now().Add(-90 * time.Second),
 	}
@@ -290,7 +290,7 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 		t.Fatalf("service = %v", service)
 	}
 	if service["upload_mode"] != "async" || service["outbox_bridge"] != "debezium" ||
-		service["pdf_engine"] != pdfEngineDocling {
+		service["pdf_engine"] != pdfEngineVision {
 		t.Fatalf("service = %v", service)
 	}
 	if uptime, _ := service["uptime_seconds"].(float64); uptime < 89 {
@@ -323,9 +323,9 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 		!strings.Contains(kafkaDependency.Detail, "3 个分区") {
 		t.Fatalf("kafka detail = %q", kafkaDependency.Detail)
 	}
-	// The Docling health payload selects the converter instead of trusting a 200.
+	// The remote vision health payload selects the converter instead of trusting a 200.
 	pdfDependency := dependencyByName(t, overview, "pdf-service")
-	if !strings.Contains(pdfDependency.Detail, "转换器 docling") {
+	if !strings.Contains(pdfDependency.Detail, "转换器 vision") {
 		t.Fatalf("pdf detail = %q", pdfDependency.Detail)
 	}
 
@@ -483,7 +483,7 @@ func TestMonitorOverviewErrors(t *testing.T) {
 		Redis:         fakeRedisProbe{enabled: true, err: errors.New("redis down")},
 		QdrantURL:     "http://" + unreachable,
 		Collection:    "knowledge",
-		PDFEngine:     pdfEngineDocling,
+		PDFEngine:     pdfEngineVision,
 		PDFServiceURL: "http://" + unreachable,
 		UploadMode:    "async",
 		OutboxBridge:  "debezium",
@@ -1169,43 +1169,43 @@ func TestMonitorKafkaMetadataProbe(t *testing.T) {
 	})
 }
 
-// TestMonitorPDFHealthPayload asserts the Docling probe reads the converter
+// TestMonitorPDFHealthPayload asserts the remote vision probe reads the converter
 // state instead of only the HTTP status code.
 func TestMonitorPDFHealthPayload(t *testing.T) {
-	doclingOptions := func(t *testing.T, server *httptest.Server) Options {
+	visionOptions := func(t *testing.T, server *httptest.Server) Options {
 		t.Helper()
 		options := healthyDependencyOptions(t)
-		options.PDFEngine = pdfEngineDocling
+		options.PDFEngine = pdfEngineVision
 		options.PDFServiceURL = server.URL
 		return options
 	}
 	t.Run("转换器就绪", func(t *testing.T) {
 		server := jsonServer(t, "/healthz", http.StatusOK,
-			`{"status":"ok","converter":"docling","version":"1.2.3","vlm_configured":true}`)
-		item := dependencyByName(t, New(doclingOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
-		if item.Status != statusOK || !strings.Contains(item.Detail, "转换器 docling") ||
-			!strings.Contains(item.Detail, "版本 1.2.3") || !strings.Contains(item.Detail, "VLM 已配置") {
+			`{"status":"ok","converter":"vision","version":"1.2.3","vision_configured":true}`)
+		item := dependencyByName(t, New(visionOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
+		if item.Status != statusOK || !strings.Contains(item.Detail, "转换器 vision") ||
+			!strings.Contains(item.Detail, "版本 1.2.3") || !strings.Contains(item.Detail, "视觉模型已配置") {
 			t.Fatalf("pdf-service = %+v", item)
 		}
 	})
 	t.Run("转换器不可用", func(t *testing.T) {
 		server := jsonServer(t, "/healthz", http.StatusOK,
-			`{"status":"degraded","converter":"unavailable","config_error":"models missing"}`)
-		item := dependencyByName(t, New(doclingOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
-		if item.Status != statusDegraded || !strings.Contains(item.Detail, "models missing") {
+			`{"status":"degraded","converter":"vision","config_error":"vision model missing"}`)
+		item := dependencyByName(t, New(visionOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
+		if item.Status != statusDegraded || !strings.Contains(item.Detail, "vision model missing") {
 			t.Fatalf("pdf-service = %+v", item)
 		}
 	})
 	t.Run("响应不可解析", func(t *testing.T) {
 		server := jsonServer(t, "/healthz", http.StatusOK, `<html>ok</html>`)
-		item := dependencyByName(t, New(doclingOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
+		item := dependencyByName(t, New(visionOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
 		if item.Status != statusDegraded || item.Detail != "健康检查响应无法解析" {
 			t.Fatalf("pdf-service = %+v", item)
 		}
 	})
 	t.Run("HTTP 失败", func(t *testing.T) {
 		server := jsonServer(t, "/healthz", http.StatusInternalServerError, `{}`)
-		item := dependencyByName(t, New(doclingOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
+		item := dependencyByName(t, New(visionOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
 		if item.Status != statusError || !strings.Contains(item.Detail, "HTTP 500") {
 			t.Fatalf("pdf-service = %+v", item)
 		}

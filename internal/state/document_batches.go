@@ -4,9 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"log"
 	"strings"
 	"time"
+
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 )
 
 // Document batch lifecycle. Only two statuses are stored: "saving" while the
@@ -377,7 +378,7 @@ func (d *DocumentBatches) RunRetention(ctx context.Context, olderThan, interval 
 	defer ticker.Stop()
 	for {
 		if _, err := d.Prune(context.Background(), d.now()-olderThan.Seconds()); err != nil {
-			log.Printf("Document batch retention failed error_type=%s", errorTypeName(err))
+			logging.FromContext(ctx).Warn("Document batch retention failed", logging.ErrorAttrs(err)...)
 		}
 		select {
 		case <-ctx.Done():

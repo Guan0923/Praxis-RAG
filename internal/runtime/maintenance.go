@@ -2,13 +2,14 @@ package runtime
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -111,7 +112,7 @@ func (s *Service) StartBackground(ctx context.Context, options ...BackgroundOpti
 		s.stores.SearchDispatcher.Publisher = publisher
 		s.stores.SearchDispatcher.Start()
 	}
-	log.Printf("Document outbox delivery=debezium")
+	logging.FromContext(ctx).Info("Document outbox delivery=debezium")
 	if s.stores.CacheSync != nil && s.stores.CacheSync.Enabled() {
 		s.stores.CacheSync.Start()
 	}
@@ -161,16 +162,16 @@ func (s *Service) BackgroundRunning() bool {
 func (s *Service) newBrokerPublisher() BackgroundPublisher {
 	settings, err := mq.SettingsFromEnv()
 	if err != nil {
-		log.Printf("Kafka settings are invalid; queued searches stay fail-closed category=%s", errorTypeName(err))
+		slog.Warn("Kafka settings are invalid; queued searches stay fail-closed", logging.ErrorAttrs(err)...)
 		return nil
 	}
 	if !settings.Configured() {
-		log.Printf("Kafka bootstrap servers are not configured; queued searches stay fail-closed")
+		slog.Warn("Kafka bootstrap servers are not configured; queued searches stay fail-closed")
 		return nil
 	}
 	publisher, err := mq.NewPublisher(settings)
 	if err != nil {
-		log.Printf("Kafka publisher unavailable; queued searches stay fail-closed category=%s", errorTypeName(err))
+		slog.Warn("Kafka publisher unavailable; queued searches stay fail-closed", logging.ErrorAttrs(err)...)
 		return nil
 	}
 	return publisher
@@ -184,7 +185,7 @@ func defaultBackgroundInterval() time.Duration {
 	}
 	seconds, err := strconv.ParseFloat(raw, 64)
 	if err != nil || seconds <= 0 {
-		log.Printf("Ignoring invalid %s; using the default maintenance interval", maintenanceIntervalEnv)
+		slog.Warn("Ignoring invalid maintenance interval; using the default", "env", maintenanceIntervalEnv)
 		return defaultMaintenanceInterval
 	}
 	return time.Duration(seconds * float64(time.Second))
@@ -236,33 +237,33 @@ func (s *Service) maintenancePass(ctx context.Context) {
 	s.recoverUploadsGlobal(ctx)
 	if s.stores.SearchTasks != nil {
 		if _, err := s.stores.SearchTasks.Expire(ctx, 20); err != nil {
-			logBackgroundFailure("search task expiry", err)
+			logBackgroundFailure(ctx, "search task expiry", err)
 		}
 	}
 	if s.stores.SearchDispatcher != nil && s.stores.SearchDispatcher.Publisher != nil {
 		if _, err := s.stores.SearchDispatcher.RunOnce(ctx); err != nil {
-			logBackgroundFailure("search outbox relay", err)
+			logBackgroundFailure(ctx, "search outbox relay", err)
 		}
 	}
 	if s.stores.DocumentJobs != nil {
 		if _, err := s.stores.DocumentJobs.Sweep(ctx, 50); err != nil {
-			logBackgroundFailure("document job sweep", err)
+			logBackgroundFailure(ctx, "document job sweep", err)
 		}
 		if _, err := s.stores.DocumentJobs.GCJobs(ctx, nil); err != nil {
-			logBackgroundFailure("document job GC", err)
+			logBackgroundFailure(ctx, "document job GC", err)
 		}
 		if _, err := s.stores.DocumentJobs.GCOutbox(ctx, nil); err != nil {
-			logBackgroundFailure("document outbox GC", err)
+			logBackgroundFailure(ctx, "document outbox GC", err)
 		}
 	}
 	if s.stores.Results != nil {
 		if _, err := s.stores.Results.PurgeExpired(100); err != nil {
-			logBackgroundFailure("result snapshot purge", err)
+			logBackgroundFailure(ctx, "result snapshot purge", err)
 		}
 	}
 	if s.stores.Artifacts != nil {
 		if _, err := s.stores.Artifacts.PurgeExpired(ctx, 100); err != nil {
-			logBackgroundFailure("artifact purge", err)
+			logBackgroundFailure(ctx, "artifact purge", err)
 		}
 	}
 }
@@ -272,15 +273,15 @@ func (s *Service) maintenancePass(ctx context.Context) {
 func (s *Service) recoverUploadsGlobal(ctx context.Context) {
 	coordinator, err := s.uploadCoordinator()
 	if err != nil {
-		logBackgroundFailure("upload coordinator", err)
+		logBackgroundFailure(ctx, "upload coordinator", err)
 		return
 	}
 	coordinator.Recover(ctx, s.indexStoreFactory, nil)
 }
 
-func logBackgroundFailure(stage string, err error) {
+func logBackgroundFailure(ctx context.Context, stage string, err error) {
 	if err == nil {
 		return
 	}
-	log.Printf("Background maintenance %s failed category=%s", stage, errorTypeName(err))
+	logging.FromContext(ctx).Warn("Background maintenance "+stage+" failed", logging.ErrorAttrs(err)...)
 }

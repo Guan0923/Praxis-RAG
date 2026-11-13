@@ -30,9 +30,9 @@ const (
 	probeTimeout = 1500 * time.Millisecond
 	// recentWindow is the activity window reported by the Console page.
 	recentWindow = 24 * time.Hour
-	// pdfEngineDocling mirrors config.PDFEngineDocling without importing the
+	// pdfEngineVision mirrors config.PDFEngineVision without importing the
 	// configuration package for one literal.
-	pdfEngineDocling = "docling"
+	pdfEngineVision = "vision"
 )
 
 // Dependency status values shared with the Console contract.
@@ -854,9 +854,10 @@ func (s *Service) probeKafka(ctx context.Context) probeResult {
 	return probeResult{status: statusOK, detail: "仅 TCP 可达，未验证认证/授权（" + brokers[0] + "）"}
 }
 
-// pdfHealth is the Docling service /healthz payload. The endpoint reports the
-// selected converter and any configuration problem, so the probe can tell a
-// healthy parser from a process that answers 200 but cannot parse.
+// pdfHealth is the remote vision parse service /healthz payload. The endpoint
+// reports the selected converter, whether a vision model is configured and any
+// configuration problem, so the probe can tell a healthy parser from a process
+// that answers 200 but cannot parse.
 type pdfHealth struct {
 	Service            string  `json:"service"`
 	Version            string  `json:"version"`
@@ -864,16 +865,16 @@ type pdfHealth struct {
 	Converter          string  `json:"converter"`
 	ConverterRequested string  `json:"converter_requested"`
 	ConfigError        *string `json:"config_error"`
-	VLMConfigured      *bool   `json:"vlm_configured"`
-	DoclingInstalled   *bool   `json:"docling_installed"`
+	VisionConfigured   *bool   `json:"vision_configured"`
+	VisionModel        *string `json:"vision_model"`
 }
 
-// probePDF checks the remote Docling parser health endpoint and the converter
+// probePDF checks the remote vision parser health endpoint and the converter
 // state it reports; the in-process Go engine has no external dependency. A 200
-// response alone is not proof the parser works (an unavailable converter still
-// answers), so the payload decides between ok and degraded.
+// response alone is not proof the parser works (an unconfigured vision model
+// still answers), so the payload decides between ok and degraded.
 func (s *Service) probePDF(ctx context.Context) probeResult {
-	if s.options.PDFEngine != pdfEngineDocling {
+	if s.options.PDFEngine != pdfEngineVision {
 		return probeResult{status: statusDisabled, detail: "Go 内置解析引擎"}
 	}
 	baseURL := strings.TrimRight(strings.TrimSpace(s.options.PDFServiceURL), "/")
@@ -910,8 +911,8 @@ func (s *Service) probePDF(ctx context.Context) probeResult {
 		if version := strings.TrimSpace(health.Version); version != "" {
 			detail += "，版本 " + boundedText(version, 40)
 		}
-		if health.VLMConfigured != nil && *health.VLMConfigured {
-			detail += "，VLM 已配置"
+		if health.VisionConfigured != nil && *health.VisionConfigured {
+			detail += "，视觉模型已配置"
 		}
 		return probeResult{status: statusOK, detail: detail}
 	case "degraded":

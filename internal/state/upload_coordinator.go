@@ -5,11 +5,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 )
 
 // IndexPublisher is the compensating index seam the runtime implements with
@@ -273,7 +274,7 @@ func (c *UploadCoordinator) rollbackOp(ctx context.Context, operation *UploadOpe
 	}
 	if result != nil {
 		if _, cleanupErr := c.CleanupWorkspace(ctx, result); cleanupErr != nil {
-			log.Printf("Upload %s workspace cleanup failed (%s); retry pending", operation.ID, errorTypeName(cleanupErr))
+			logging.FromContext(ctx).Warn("Upload workspace cleanup failed; retry pending", append([]any{"operation_id", operation.ID}, logging.ErrorAttrs(cleanupErr)...)...)
 		}
 	}
 	return c.Journal.Get(ctx, operation.ID)
@@ -390,7 +391,7 @@ func (c *UploadCoordinator) recordCleanupFailure(ctx context.Context, operation 
 			c.Journal.flushCache(ctx, operation.Namespace, &operation.ID, false, false)
 		}()
 	}
-	log.Printf("Upload %s cleanup failed (%s); retry pending", operation.ID, errorTypeName(cause))
+	logging.FromContext(ctx).Warn("Upload cleanup failed; retry pending", append([]any{"operation_id", operation.ID}, logging.ErrorAttrs(cause)...)...)
 	return c.Journal.Get(ctx, operation.ID)
 }
 
@@ -516,7 +517,7 @@ func (c *UploadCoordinator) Recover(ctx context.Context, factory IndexStoreFacto
 	for _, snapshot := range candidates {
 		result, err := c.recoverOne(ctx, snapshot, factory)
 		if err != nil {
-			log.Printf("Upload %s recovery failed (%s); retry pending", snapshot.ID, errorTypeName(err))
+			logging.FromContext(ctx).Warn("Upload recovery failed; retry pending", append([]any{"operation_id", snapshot.ID}, logging.ErrorAttrs(err)...)...)
 			continue
 		}
 		if result != nil {

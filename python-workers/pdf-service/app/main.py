@@ -1,19 +1,21 @@
-"""FastAPI application for the Praxis-RAG Docling PDF microservice.
+"""FastAPI application for the Praxis-RAG vision-based PDF microservice.
 
 Endpoints
 ---------
 ``GET /healthz``
     Liveness/configuration probe. Always answers 200 so a container healthcheck
     stays useful while the operator fixes a configuration problem; the body
-    reports ``status``, the selected converter and any ``config_error``.
+    reports ``status``, the selected converter, whether a vision endpoint is
+    configured and any ``config_error``.
 
 ``POST /v1/parse``
     ``multipart/form-data`` field ``file`` carrying one PDF plus the optional
-    text field ``options`` (JSON) with per-request VLM/OCR overrides. On success
-    the response is ``application/zip`` with ``manifest.json`` at the archive
-    root and every picture asset at its manifest-relative path (for example
-    ``pictures/picture-0.png``). Failures are JSON ``{"detail": "<safe text>"}``
-    that never quotes document content or request secrets.
+    text field ``options`` (JSON) with the per-knowledge-base vision endpoint
+    (``{"vision": {...}}``). On success the response is ``application/zip`` with
+    ``manifest.json`` at the archive root and every picture asset at its
+    manifest-relative path (for example ``pictures/picture-0.png``). Failures are
+    JSON ``{"detail": "<safe text>"}`` that never quotes document content or
+    request secrets.
 
 The Go backend downloads the zip into its parser staging directory and feeds
 ``manifest.json`` to ``document.BuildPDFContent``; the zip layout is therefore
@@ -27,31 +29,42 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
+import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
 from . import SERVICE_NAME, __version__
-from .parser import (
-    SERVICE_PARSER_VERSION,
+from .errors import (
     ParserConfigError,
     ParserConversionError,
     ParserError,
     ParserOptionsError,
+)
+from .parser import (
+    NOT_CONFIGURED_MESSAGE,
+    SERVICE_PARSER_VERSION,
     ParseOptions,
     PdfConverter,
-    VlmSettings,
     build_converter,
     parse_options_payload,
     validate_manifest,
-    vlm_settings_from_env,
+)
+from .pdfreader import DEFAULT_PAGE_DPI, MAX_PAGE_DPI, MIN_PAGE_DPI
+from .vision import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_PROMPT_VERSION,
+    VisionSettings,
+    vision_settings_from_env,
 )
 
 LOGGER = logging.getLogger(SERVICE_NAME)
@@ -64,6 +77,98 @@ DEFAULT_CONCURRENCY = 1
 DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 PDF_HEADER_WINDOW = 1024
+
+#: Structured logging knobs. ``RAG_DEBUG_TRACE`` stays the shared debug switch
+#: with the Go service when the level variable is unset.
+LOG_LEVEL_ENV = "RAG_PDF_SERVICE_LOG_LEVEL"
+LOG_FORMAT_ENV = "RAG_PDF_SERVICE_LOG_FORMAT"
+DEBUG_TRACE_ENV = "RAG_DEBUG_TRACE"
+REQUEST_ID_HEADER = "X-Request-ID"
+
+#: Bounded, log-safe request ids: no whitespace or control characters can forge
+#: a log record. Invalid inbound values are replaced with a generated id.
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+_TRUTHY_VALUES = {"1", "true", "yes", "on"}
+_LOG_LEVELS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warn": logging.WARNING,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in _TRUTHY_VALUES
+
+
+def _log_level_from_env() -> int:
+    """Resolve the configured log level, falling back to the debug switch."""
+    raw = os.environ.get(LOG_LEVEL_ENV, "").strip().lower()
+    if not raw:
+        return logging.DEBUG if _truthy(os.environ.get(DEBUG_TRACE_ENV)) else logging.INFO
+    level = _LOG_LEVELS.get(raw)
+    if level is None:
+        raise ValueError(
+            f"{LOG_LEVEL_ENV} must be one of debug, info, warning, error (got {raw!r})"
+        )
+    return level
+
+
+def _log_format_from_env() -> str:
+    """Resolve the log handler encoding: text (default) or json."""
+    raw = os.environ.get(LOG_FORMAT_ENV, "").strip().lower()
+    if not raw:
+        return "text"
+    if raw not in {"text", "json"}:
+        raise ValueError(f"{LOG_FORMAT_ENV} must be one of text, json (got {raw!r})")
+    return raw
+
+
+class _JsonLogFormatter(logging.Formatter):
+    """One JSON object per line; no request payloads or document text."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps(
+            {
+                "time": self.formatTime(record),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            },
+            ensure_ascii=False,
+        )
+
+
+def configure_logging() -> None:
+    """Install one process-wide handler matching the Go service conventions."""
+    level = _log_level_from_env()
+    log_format = _log_format_from_env()
+    handler = logging.StreamHandler(stream=sys.stderr)
+    if log_format == "json":
+        handler.setFormatter(_JsonLogFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+    root.setLevel(level)
+
+
+def _request_id_from_header(value: str | None) -> str:
+    candidate = (value or "").strip()
+    if _REQUEST_ID_PATTERN.fullmatch(candidate):
+        return candidate
+    return uuid4().hex
+
+
+def _request_id(request: Request) -> str:
+    """Return the request correlation id, empty outside the HTTP middleware."""
+    return getattr(request.state, "request_id", "") or "-"
 
 #: Error messages deliberately contain no document text: the Go backend shows
 #: ``detail`` to users, so it must stay safe for arbitrary uploads.
@@ -79,15 +184,21 @@ class Settings:
 
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
-    models_path: Path | None = None
     timeout: float = DEFAULT_TIMEOUT
     workers: int = DEFAULT_WORKERS
     concurrency: int = DEFAULT_CONCURRENCY
-    converter: str = "docling"
+    #: Effective converter name (``vision`` or ``fake``).
+    converter: str = "vision"
+    #: Raw ``RAG_PDF_SERVICE_CONVERTER`` value, reported by ``/healthz``.
+    converter_requested: str = "vision"
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
-    vlm: VlmSettings | None = None
-    #: ``RAG_VLM_*`` configuration problem (partial/invalid VLM settings). A
-    #: complete per-request ``options.vlm`` overrides it, so it is reported
+    page_dpi: int = DEFAULT_PAGE_DPI
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    prompt_version: str = DEFAULT_PROMPT_VERSION
+    #: ``RAG_VLM_*`` service-level fallback (both BASE_URL and MODEL, or None).
+    vlm: VisionSettings | None = None
+    #: ``RAG_VLM_*`` configuration problem (partial/invalid settings). A
+    #: complete per-request ``options.vision`` overrides it, so it is reported
     #: separately from :attr:`non_vlm_config_error`.
     vlm_error: str | None = None
     #: Deployment problems a request cannot fix (converter, port, ...).
@@ -99,11 +210,14 @@ class Settings:
     def from_env(cls) -> "Settings":
         errors: list[str] = []
 
-        converter = (os.environ.get("RAG_PDF_SERVICE_CONVERTER", "docling").strip().lower()
-                     or "docling")
-        if converter not in {"docling", "fake"}:
+        converter_requested = (
+            os.environ.get("RAG_PDF_SERVICE_CONVERTER", "").strip().lower() or "vision"
+        )
+        converter = "vision" if converter_requested == "docling" else converter_requested
+        if converter not in {"vision", "fake"}:
             errors.append(
-                f"RAG_PDF_SERVICE_CONVERTER must be 'docling' or 'fake', got {converter!r}"
+                "RAG_PDF_SERVICE_CONVERTER must be 'vision' or 'fake' "
+                f"(docling is accepted as a legacy alias), got {converter_requested!r}"
             )
 
         host = os.environ.get("RAG_PDF_SERVICE_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
@@ -114,14 +228,21 @@ class Settings:
                                errors=errors)
         max_upload_bytes = _int_env("RAG_PDF_SERVICE_MAX_BYTES", DEFAULT_MAX_UPLOAD_BYTES,
                                     minimum=1, errors=errors)
+        page_dpi = _int_env(
+            "RAG_PDF_PAGE_DPI", DEFAULT_PAGE_DPI, minimum=MIN_PAGE_DPI, errors=errors
+        )
+        if page_dpi > MAX_PAGE_DPI:
+            errors.append(f"RAG_PDF_PAGE_DPI must be <= {MAX_PAGE_DPI}")
+            page_dpi = DEFAULT_PAGE_DPI
+        max_tokens = _int_env("RAG_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS, minimum=1, errors=errors)
+        prompt_version = (
+            os.environ.get("RAG_VLM_PROMPT_VERSION", "").strip() or DEFAULT_PROMPT_VERSION
+        )
 
-        models_raw = os.environ.get("RAG_PDF_MODELS_PATH", "").strip()
-        models_path = Path(models_raw).expanduser() if models_raw else None
-
-        vlm: VlmSettings | None = None
+        vlm: VisionSettings | None = None
         vlm_error: str | None = None
         try:
-            vlm = vlm_settings_from_env()
+            vlm = vision_settings_from_env()
         except ParserConfigError as error:
             vlm_error = str(error)
 
@@ -130,12 +251,15 @@ class Settings:
         return cls(
             host=host,
             port=port,
-            models_path=models_path,
             timeout=timeout,
             workers=workers,
             concurrency=concurrency,
             converter=converter,
+            converter_requested=converter_requested,
             max_upload_bytes=max_upload_bytes,
+            page_dpi=page_dpi,
+            max_tokens=max_tokens,
+            prompt_version=prompt_version,
             vlm=vlm,
             vlm_error=vlm_error,
             non_vlm_config_error=non_vlm_error,
@@ -207,23 +331,36 @@ def create_app(
     else:
         try:
             selected = build_converter(
-                settings.converter, models_path=settings.models_path, vlm=settings.vlm
+                settings.converter,
+                vlm=settings.vlm,
+                page_dpi=settings.page_dpi,
+                max_tokens=settings.max_tokens,
+                prompt_version=settings.prompt_version,
             )
         except ParserConfigError as error:
             selected = _UnavailableConverter(str(error))  # type: ignore[assignment]
 
     app = FastAPI(
         title="Praxis-RAG PDF service",
-        summary="Docling PDF parsing microservice",
+        summary="Vision-backed PDF parsing microservice (local PyMuPDF + remote VLM)",
         version=__version__,
     )
     app.state.settings = settings
     app.state.converter = selected
     app.state.semaphore = asyncio.Semaphore(settings.concurrency)
 
+    @app.middleware("http")
+    async def request_correlation(request: Request, call_next):
+        """Attach one safe correlation id and echo it to the caller."""
+        request_id = _request_id_from_header(request.headers.get(REQUEST_ID_HEADER))
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers[REQUEST_ID_HEADER] = request_id
+        return response
+
     @app.get("/")
     async def root() -> dict[str, Any]:
-        return _service_info(app)
+        return _health(app)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -241,7 +378,23 @@ def create_app(
     async def on_validation_error(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        LOGGER.warning("Rejected invalid /v1/parse request: %s", exc.errors())
+        # Never render exc.errors()/exc.body verbatim: those objects include the
+        # submitted input values. Only field locations and error kinds are safe.
+        errors = exc.errors()
+        locations = sorted(
+            {
+                ".".join(str(part) for part in error.get("loc", ())) or "-"
+                for error in errors
+            }
+        )
+        kinds = sorted({str(error.get("type", "unknown")) for error in errors})
+        LOGGER.warning(
+            "Rejected invalid /v1/parse request request_id=%s error_count=%d fields=%s kinds=%s",
+            _request_id(request),
+            len(errors),
+            ",".join(locations),
+            ",".join(kinds),
+        )
         return JSONResponse(
             status_code=422,
             content={
@@ -252,7 +405,14 @@ def create_app(
 
     @app.exception_handler(Exception)
     async def on_unhandled(request: Request, exc: Exception) -> JSONResponse:
-        LOGGER.exception("Unhandled error while serving %s", request.url.path)
+        # The exception message and traceback may quote request input, so only
+        # the class name is logged.
+        LOGGER.error(
+            "Unhandled error while serving %s request_id=%s error_type=%s",
+            request.url.path,
+            _request_id(request),
+            type(exc).__name__,
+        )
         return JSONResponse(status_code=500, content={"detail": "PDF 解析服务内部错误，请查看服务端日志"})
 
     return app
@@ -263,15 +423,6 @@ def create_app(
 # ---------------------------------------------------------------------------
 
 
-def _docling_installed() -> bool:
-    try:
-        import importlib.util
-
-        return importlib.util.find_spec("docling") is not None
-    except Exception:  # a broken install must not break healthz
-        return False
-
-
 def _service_info(app: FastAPI) -> dict[str, Any]:
     settings: Settings = app.state.settings
     return {
@@ -279,9 +430,9 @@ def _service_info(app: FastAPI) -> dict[str, Any]:
         "version": __version__,
         "parser_version": SERVICE_PARSER_VERSION,
         "converter": getattr(app.state.converter, "name", "unknown"),
-        "converter_requested": settings.converter,
-        "models_configured": settings.models_path is not None,
-        "vlm_configured": settings.vlm is not None,
+        "converter_requested": settings.converter_requested,
+        "vision_configured": settings.vlm is not None,
+        "vision_model": settings.vlm.model if settings.vlm is not None else None,
         "max_upload_bytes": settings.max_upload_bytes,
         "timeout_seconds": settings.timeout,
         "concurrency": settings.concurrency,
@@ -291,8 +442,8 @@ def _service_info(app: FastAPI) -> dict[str, Any]:
 
 def _health(app: FastAPI) -> dict[str, Any]:
     info = _service_info(app)
-    info["status"] = "degraded" if info["converter"] == "unavailable" else "ok"
-    info["docling_installed"] = _docling_installed()
+    degraded = info["converter"] == "unavailable" or info["config_error"] is not None
+    info["status"] = "degraded" if degraded else "ok"
     return info
 
 
@@ -314,16 +465,22 @@ async def _handle_parse(
         LOGGER.warning("Rejected /v1/parse options: %s", error)
         raise HTTPException(status_code=422, detail=str(error)) from error
 
-    if getattr(app.state.converter, "name", "") != "fake":
-        # A complete per-request VLM overrides a broken RAG_VLM_* configuration;
-        # deployment problems (bad converter name, invalid PORT, ...) always 503.
+    converter_name = getattr(app.state.converter, "name", "")
+    if converter_name != "fake":
+        # A complete per-request vision endpoint overrides a broken RAG_VLM_*
+        # configuration; deployment problems (bad converter name, invalid PORT,
+        # ...) always 503.
         blocker = settings.config_error
-        if blocker and settings.vlm_error and options.vlm is not None:
+        if blocker and settings.vlm_error and options.vision is not None:
             blocker = settings.non_vlm_config_error
         if blocker:
             raise HTTPException(
                 status_code=503, detail=f"{UNKNOWN_CONVERTER_MESSAGE}: {blocker}"
             )
+        # The vision converter cannot run without an endpoint: either the
+        # request carries one or the service RAG_VLM_* fallback is configured.
+        if converter_name == "vision" and (options.vision or settings.vlm) is None:
+            raise HTTPException(status_code=503, detail=NOT_CONFIGURED_MESSAGE)
 
     workdir = Path(tempfile.mkdtemp(prefix="rag-pdf-service-"))
     try:
@@ -334,7 +491,9 @@ async def _handle_parse(
         if not _looks_like_pdf(source):
             raise HTTPException(status_code=400, detail=INVALID_PDF_MESSAGE)
 
-        payload = await _run_conversion(app, source, workdir, options)
+        payload = await _run_conversion(
+            app, source, workdir, options, request_id=_request_id(request)
+        )
         return Response(
             content=payload,
             media_type="application/zip",
@@ -380,15 +539,16 @@ async def _run_conversion(
     source: Path,
     workdir: Path,
     options: ParseOptions | None = None,
+    *,
+    request_id: str = "",
 ) -> bytes:
     """Queue and run one conversion in a worker thread.
 
-    The semaphore bounds concurrent Docling conversions and the request timeout
-    bounds both the queue wait and the conversion itself. Docling cannot be
-    interrupted, so a timed-out conversion keeps its semaphore slot until the
-    worker thread returns; the request already answered 504 and the worker's
-    result is discarded (the temporary directory may already be removed, so the
-    worker can fail after the response was sent).
+    The semaphore bounds concurrent conversions and the request timeout bounds
+    both the queue wait and the conversion itself. A timed-out conversion keeps
+    its semaphore slot until the worker thread returns; the request already
+    answered 504 and the worker's result is discarded (the temporary directory
+    may already be removed, so the worker can fail after the response was sent).
     """
     settings: Settings = app.state.settings
     semaphore: asyncio.Semaphore = app.state.semaphore
@@ -442,7 +602,13 @@ async def _run_conversion(
     except ParserError as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
     except Exception as error:
-        LOGGER.exception("Unexpected PDF conversion failure")
+        # The exception message/traceback may embed document text, so only the
+        # exception class name reaches the log sink.
+        LOGGER.error(
+            "Unexpected PDF conversion failure request_id=%s error_type=%s",
+            request_id or "-",
+            type(error).__name__,
+        )
         raise HTTPException(
             status_code=500,
             detail="PDF 解析失败，服务端日志包含详细信息",
@@ -463,6 +629,11 @@ def _archive_artifacts(artifacts: Path) -> bytes:
     return buffer.getvalue()
 
 
+# Uvicorn's multiprocess launcher re-imports this module in every worker, so
+# the handler setup must happen at import time as well: with log_config=None the
+# workers keep this root configuration instead of installing per-process uvicorn
+# handlers (and losing the "Started server process" diagnostics).
+configure_logging()
 app = create_app()
 
 
@@ -470,10 +641,19 @@ def main() -> None:
     """Start the configured Uvicorn processes on one shared listening port."""
     import uvicorn
 
+    configure_logging()
     settings = Settings.from_env()
     # An import string is required for Uvicorn's multiprocess launcher; passing
-    # the app object would prevent workers > 1 from starting.
-    uvicorn.run("app.main:app", host=settings.host, port=settings.port, workers=settings.workers)
+    # the app object would prevent workers > 1 from starting. log_config=None
+    # keeps the root handler installed above (same format/level for uvicorn's
+    # own loggers) instead of letting uvicorn replace it per worker.
+    uvicorn.run(
+        "app.main:app",
+        host=settings.host,
+        port=settings.port,
+        workers=settings.workers,
+        log_config=None,
+    )
 
 
 if __name__ == "__main__":

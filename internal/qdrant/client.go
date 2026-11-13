@@ -28,6 +28,14 @@ type APIError struct {
 
 func (e *APIError) Error() string { return e.Message }
 
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *APIError) ErrorCategory() string { return "qdrant_error" }
+
+// HTTPStatus returns the Qdrant HTTP status carried by the failure, or 0 for
+// local failures (transport errors, malformed responses without a status).
+func (e *APIError) HTTPStatus() int { return e.StatusCode }
+
 // Client is the minimal Qdrant REST transport.
 type Client struct {
 	baseURL    string

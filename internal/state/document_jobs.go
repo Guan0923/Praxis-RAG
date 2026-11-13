@@ -821,9 +821,10 @@ func (d *DocumentJobs) Fail(ctx context.Context, task *DocumentJobTask, retry bo
 		return newUploadConflict("Document execution is no longer current")
 	}
 	_, err = d.stores.DB.ExecContext(ctx,
-		"UPDATE document_jobs SET status = ?, stage = ?, owner = NULL, lease_until = 0, retry_at = ?, "+
+		"UPDATE document_jobs SET status = ?, stage = ?, error = COALESCE(?, error), "+
+			"owner = NULL, lease_until = 0, retry_at = ?, "+
 			"updated_at = ? WHERE artifact_id = ? AND execution_id = ? AND status = ?",
-		DocumentJobQueued, "retry_wait", now+d.Settings.SweepAfterSeconds, now,
+		DocumentJobQueued, "retry_wait", errorMessage, now+d.Settings.SweepAfterSeconds, now,
 		task.ArtifactID, *task.ExecutionID, DocumentJobProcessing)
 	return err
 }
@@ -869,7 +870,15 @@ func (d *DocumentJobs) DeadLetter(ctx context.Context, notification DocumentNoti
 	if busy {
 		return false, nil
 	}
+	// Keep the last recorded attempt reason in the terminal text: broker retry
+	// exhaustion alone ("Message retry limit reached") tells operators nothing
+	// about whether Qdrant, the model API or parsing failed.
 	message := "Message retry limit reached"
+	if job.Error != nil {
+		if lastError := strings.TrimSpace(*job.Error); lastError != "" {
+			message += "; last error: " + lastError
+		}
+	}
 	if err := d.finish(ctx, task, DocumentJobFailed, &message, nil); err != nil {
 		return false, err
 	}

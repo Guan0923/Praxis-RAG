@@ -297,14 +297,13 @@ describe("model-profile API contract", () => {
   };
 
   it("exposes the frozen model-kind vocabulary", () => {
-    // 知识库只能引用前四种；JEV 是 Console 专属的第五种配置类型。
-    expect(knowledgeBaseModelKinds).toEqual(["embedding", "reranker", "vlm", "ocr"]);
-    expect(modelKinds).toEqual(["embedding", "reranker", "vlm", "ocr", "jev"]);
+    // 知识库只能引用前三种；JEV 是 Console 专属的第四种配置类型。
+    expect(knowledgeBaseModelKinds).toEqual(["embedding", "reranker", "vlm"]);
+    expect(modelKinds).toEqual(["embedding", "reranker", "vlm", "jev"]);
     expect(modelKindLabels).toEqual({
       embedding: "Embedding",
       reranker: "Reranker",
       vlm: "VLM",
-      ocr: "OCR",
       jev: "JEV",
     });
   });
@@ -346,33 +345,32 @@ describe("model-profile API contract", () => {
     });
   });
 
-  it("creates an OCR profile whose model is the engine id and whose connection is empty", async () => {
-    const ocrProfile = {
+  it("creates a VLM profile with the remote vision connection", async () => {
+    const vlmProfile = {
       ...profile,
-      kind: "ocr" as const,
-      name: "本地 OCR",
-      base_url: "",
-      model: "easyocr",
-      api_key_set: false,
+      kind: "vlm" as const,
+      name: "视觉模型",
+      base_url: "https://vlm.example.com/v1",
+      model: "qwen2.5-vl-72b",
       vector_size: null,
     };
-    fetchMock.mockResolvedValue(jsonResponse({ profile: ocrProfile }, 201));
+    fetchMock.mockResolvedValue(jsonResponse({ profile: vlmProfile }, 201));
     const created = await createModelProfile({
-      kind: "ocr",
-      name: "本地 OCR",
-      base_url: "",
+      kind: "vlm",
+      name: "视觉模型",
+      base_url: "https://vlm.example.com/v1",
       apikey: "",
-      model: "easyocr",
+      model: "qwen2.5-vl-72b",
     });
-    expect(created.kind).toBe("ocr");
-    expect(created.model).toBe("easyocr");
+    expect(created.kind).toBe("vlm");
+    expect(created.model).toBe("qwen2.5-vl-72b");
     expect(created.vector_size).toBeNull();
     expect(JSON.parse(String(requestArgs(0)[1].body))).toEqual({
-      kind: "ocr",
-      name: "本地 OCR",
-      base_url: "",
+      kind: "vlm",
+      name: "视觉模型",
+      base_url: "https://vlm.example.com/v1",
       apikey: "",
-      model: "easyocr",
+      model: "qwen2.5-vl-72b",
     });
   });
 

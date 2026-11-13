@@ -3,6 +3,7 @@ package e2e
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,15 +81,18 @@ func TestDocumentDeadLetterExhaustion(t *testing.T) {
 	if err != nil || current == nil {
 		t.Fatalf("DocumentJobs.Get() = %v, %v", current, err)
 	}
-	if current.Status != state.DocumentJobFailed || current.Error == nil || *current.Error != "Message retry limit reached" {
+	// The dead-lettered job keeps the documented prefix; when a prior attempt
+	// recorded a failure, DeadLetter appends that last error after it.
+	if current.Status != state.DocumentJobFailed || current.Error == nil ||
+		!strings.HasPrefix(*current.Error, "Message retry limit reached") {
 		t.Fatalf("dead-lettered job = %+v", current)
 	}
 	status, err := h.Service.GetDocumentStatus(ctx, "alpha", artifactID)
 	if err != nil {
 		t.Fatalf("GetDocumentStatus() error = %v", err)
 	}
-	if status["status"] != state.DocumentJobFailed || status["error"] != "Message retry limit reached" {
-		t.Fatalf("document status = %v", status)
+	if status["status"] != state.DocumentJobFailed || status["error"] != *current.Error {
+		t.Fatalf("document status = %v (job error %q)", status, *current.Error)
 	}
 }
 

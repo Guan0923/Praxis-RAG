@@ -210,7 +210,7 @@ func (f *fakePDFParser) ParseInto(_ context.Context, _ string, staging string) (
 	return f.manifest, nil
 }
 
-// pdfManifestFixture mirrors the minimal Docling manifest used by the chunk tests.
+// pdfManifestFixture mirrors the minimal remote-service manifest used by the chunk tests.
 func pdfManifestFixture() document.PDFManifest {
 	blocks := []document.PDFBlock{
 		{Ref: "text-1", Kind: "text", Page: 1, Order: 0, Text: "First page paragraph."},

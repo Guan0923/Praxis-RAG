@@ -1,8 +1,9 @@
 # Start dependencies (MySQL, Qdrant, Redis, Kafka), optionally provision topics,
 # migrate, then run rag-service.
-# Also starts the Docling PDF parser microservice (pdf-parser, :8091) because the
-# default PDF engine in .env.example is RAG_PDF_ENGINE=docling. The first run
-# builds a large Python image (CPU torch + docling); use RAG_PDF_ENGINE=go, or
+# Also starts the PDF vision parser microservice (pdf-parser, :8091) because the
+# default PDF engine in .env.example is RAG_PDF_ENGINE=vision. It runs a small
+# Python image (PyMuPDF + httpx) with no local models; each request uses the
+# knowledge base's remote VLM. Use RAG_PDF_ENGINE=go, or
 # `docker compose up -d mysql qdrant redis kafka`, to skip it.
 # Kafka replaces the former RocketMQ stack; topics/consumer groups are created
 # explicitly below (auto-creation is also enabled on the broker).
@@ -140,7 +141,7 @@ if (-not $env:RAG_MYSQL_DEBEZIUM_PASSWORD) {
     throw "RAG_MYSQL_DEBEZIUM_PASSWORD must be set in .env for Debezium."
 }
 
-Write-Host "Starting MySQL, Qdrant, Redis, Kafka, Debezium and the Docling PDF parser (pdf-parser)..."
+Write-Host "Starting MySQL, Qdrant, Redis, Kafka, Debezium and the PDF vision parser (pdf-parser)..."
 Invoke-Compose -Arguments @("up", "-d")
 if ($LASTEXITCODE -ne 0) {
     throw "docker compose up failed. Is Docker Desktop running and this shell allowed to access it?"
@@ -174,14 +175,15 @@ if (-not $kafkaReady) {
     throw "Kafka did not become healthy. Run: docker compose logs kafka"
 }
 
-# The default PDF engine (docling) needs the pdf-parser container. Wait softly:
-# a cold model start is slow, and RAG_PDF_ENGINE=go deployments do not need it.
+# The default PDF engine (vision) needs the pdf-parser container. Wait softly:
+# RAG_PDF_ENGINE=go deployments do not need it, and the service itself stays up
+# even when the remote VLM is unreachable (parse requests then fail).
 $pdfEngine = $env:RAG_PDF_ENGINE
 if (-not $pdfEngine) {
-    if ($env:RAG_PDF_SERVICE_URL) { $pdfEngine = "docling" } else { $pdfEngine = "go" }
+    if ($env:RAG_PDF_SERVICE_URL) { $pdfEngine = "vision" } else { $pdfEngine = "go" }
 }
-if ($pdfEngine -eq "docling") {
-    Write-Host "Waiting for pdf-parser to become healthy (first build/start can take minutes)..."
+if ($pdfEngine -eq "vision" -or $pdfEngine -eq "docling") {
+    Write-Host "Waiting for pdf-parser to become healthy (first build/start can take a minute)..."
     $pdfReady = $false
     for ($attempt = 0; $attempt -lt 150; $attempt++) {
         $pdfHealth = docker inspect --format "{{.State.Health.Status}}" praxis-rag-pdf-parser 2>$null
@@ -195,7 +197,7 @@ if ($pdfEngine -eq "docling") {
         Write-Host "pdf-parser is healthy."
     }
     else {
-        Write-Warning "pdf-parser is not healthy yet; PDF uploads with RAG_PDF_ENGINE=docling fail until it is. Check: docker compose logs pdf-parser"
+        Write-Warning "pdf-parser is not healthy yet; PDF uploads with RAG_PDF_ENGINE=vision fail until it is. Check: docker compose logs pdf-parser"
     }
 }
 

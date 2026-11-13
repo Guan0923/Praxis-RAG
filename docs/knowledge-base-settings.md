@@ -72,3 +72,19 @@ inline provider objects). Consequently:
 Model-profile administration uses `/v1/admin/model-profiles` (list, create,
 details, PATCH, delete, plus `/{id}/key` and `/{id}/models`), restricted to local
 admin access or an administrator Console session.
+
+## Vision-model unification (2026-11-13)
+
+PDF parsing no longer has a separate OCR engine/model type. The `ocr` kind is
+removed from `model_profiles`; the saved-model vocabulary is now `embedding` /
+`reranker` / `vlm` / `jev`, and the knowledge-base `vlm` connection is the only
+PDF vision selection. Layout analysis, OCR, table structure, formula LaTeX and
+picture descriptions all run through that one remote OpenAI-compatible vision
+endpoint (the PDF service itself only reads/renders/crops locally).
+
+The startup schema migration deletes legacy `kind='ocr'` profiles and strips the
+`ocr`/`ocr_model` keys from `knowledge_bases.settings`; the write path also
+removes those keys on knowledge-base update. The REST contract for knowledge
+bases no longer carries `ocr_model`, and `/v1/admin/knowledge-bases/{namespace}`
+responses omit it. Historical sections above describe the earlier 2026-11-10
+state and are kept for migration context.

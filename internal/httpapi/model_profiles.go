@@ -238,7 +238,7 @@ func (s *Server) handleModelProfileModels(w http.ResponseWriter, r *http.Request
 // surface accepts. It is intentionally separate from knowledgeBaseKinds: "jev"
 // (TypeSafe System One decision model) is a Console-only configuration and is
 // not selectable as a knowledge-base model.
-var modelProfileKinds = map[string]struct{}{"embedding": {}, "reranker": {}, "vlm": {}, "ocr": {}, "jev": {}}
+var modelProfileKinds = map[string]struct{}{"embedding": {}, "reranker": {}, "vlm": {}, "jev": {}}
 
 // validateModelProfileBody reproduces the FastAPI validation order of the create
 // body: kind (required Literal), name (required, 1..80), model (required,
@@ -250,7 +250,7 @@ func validateModelProfileBody(kind string, name, baseURL, model *string) []valid
 	if _, ok := modelProfileKinds[kind]; !ok {
 		return []validationDetail{{
 			Type: "literal_error", Loc: []any{"body", "kind"},
-			Msg: "Input should be 'embedding', 'reranker', 'vlm', 'ocr' or 'jev'",
+			Msg: "Input should be 'embedding', 'reranker', 'vlm' or 'jev'",
 		}}
 	}
 	if name == nil {

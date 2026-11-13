@@ -111,14 +111,12 @@ type CreateInput struct {
 	// ({base_url, apikey}) validated by DraftConnection.
 	EmbeddingValues map[string]any
 	RerankerValues  map[string]any
-	// VLMModel/VLMValues are the optional remote vision-language endpoint used
-	// for PDF formula recognition and picture descriptions. Both empty disables
-	// it and lets the service environment (RAG_VLM_*) apply.
+	// VLMModel/VLMValues are the optional remote vision-language endpoint that
+	// powers PDF layout, OCR, table and formula recognition and picture
+	// descriptions. Both empty disables it and lets the service environment
+	// (RAG_VLM_*) apply.
 	VLMModel  string
 	VLMValues map[string]any
-	// OCRModel is the OCR engine id used by the Docling PDF parser
-	// (auto/easyocr/tesseract/rapidocr). Blank means "not configured".
-	OCRModel string
 	// TokenizerModel defaults to DefaultTokenizerModel when blank.
 	TokenizerModel string
 	// Collection overrides the generated collection name (tests/imports only).
@@ -198,10 +196,6 @@ func CreateSettings(ctx context.Context, input CreateInput, prober Prober) (map[
 	if err != nil {
 		return nil, err
 	}
-	ocrModel, err := NormalizeOCREngine(input.OCRModel)
-	if err != nil {
-		return nil, err
-	}
 	collection := input.Collection
 	if collection == "" {
 		collection, err = NewCollectionName()
@@ -226,7 +220,6 @@ func CreateSettings(ctx context.Context, input CreateInput, prober Prober) (map[
 		"reranker":        storedReranker,
 		"vlm":             storedVLM,
 		"vlm_model":       vlmConnection.Model,
-		"ocr_model":       ocrModel,
 		"collection":      collection,
 		"tokenizer":       tokenizer,
 		"strategy":        input.Chunking.Strategy,
@@ -238,12 +231,9 @@ func CreateSettings(ctx context.Context, input CreateInput, prober Prober) (map[
 
 // UpdateInput is the validated, client-supplied draft for one update.
 type UpdateInput struct {
-	// Values may contain embedding_model, reranker_model, embedding and
-	// reranker provider drafts. Absent keys keep the current values.
+	// Values may contain embedding_model, reranker_model, vlm_model, embedding,
+	// reranker and vlm provider drafts. Absent keys keep the current values.
 	Values map[string]any
-	// OCRModel sets the OCR engine id; nil keeps the stored value and an empty
-	// string clears it.
-	OCRModel *string
 	// Reembed confirms that a changed embedding URL/model/dimension may proceed
 	// by reindexing into a staging collection.
 	Reembed bool
@@ -379,23 +369,20 @@ func UpdateSettings(
 	if err != nil {
 		return UpdateResult{}, err
 	}
-	ocrModel := storedOCRModel(current)
-	if input.OCRModel != nil {
-		ocrModel, err = NormalizeOCREngine(*input.OCRModel)
-		if err != nil {
-			return UpdateResult{}, err
-		}
-	}
 	updatedAt := input.UpdatedAt
 	if updatedAt.IsZero() {
 		updatedAt = time.Now()
 	}
 	updated := copySettings(current)
+	// Legacy OCR settings are removed on write: OCR is part of the remote
+	// vision model now and the VLM settings above are the only PDF vision
+	// selection. The startup migration also strips them from stored rows.
+	delete(updated, "ocr")
+	delete(updated, "ocr_model")
 	updated["embedding"] = storedEmbedding
 	updated["reranker"] = storedReranker
 	updated["vlm"] = storedVLM
 	updated["vlm_model"] = vlm.Model
-	updated["ocr_model"] = ocrModel
 	updated["embedding_model"] = embedding.Model
 	updated["reranker_model"] = reranker.Model
 	updated["vector_size"] = vectorSize
@@ -454,21 +441,6 @@ func optionalString(values map[string]any, key, fallback string) (string, error)
 		return "", NewValidationError("模型名称必须是字符串")
 	}
 	return text, nil
-}
-
-// storedOCRModel reads the OCR engine id of a stored knowledge base. A missing
-// or non-string value means "not configured" (rows created before OCR existed
-// have no ocr_model key).
-func storedOCRModel(settings map[string]any) string {
-	raw, ok := settings["ocr_model"]
-	if !ok || raw == nil {
-		return ""
-	}
-	text, ok := raw.(string)
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(text)
 }
 
 func copySettings(settings map[string]any) map[string]any {

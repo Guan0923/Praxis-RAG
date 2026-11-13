@@ -175,17 +175,6 @@ func TestKnowledgeBaseAdminCreate(t *testing.T) {
 		t.Fatalf("vlm input = %+v values = %v", input, input.VLMValues)
 	}
 
-	ocrBody := `{"namespace":"gamma","embedding":{"base_url":"http://model.local/v1"},` +
-		`"embedding_model":"BAAI/bge-m3","ocr_model":"easyocr","strategy":"character",` +
-		`"chunk_size":700,"chunk_overlap":100}`
-	if created := performRequest(handler, testRequest{
-		method: "POST", target: "/v1/admin/knowledge-bases", remote: "127.0.0.1:5000", body: ocrBody,
-	}); created.Code != http.StatusCreated {
-		t.Fatalf("ocr create status = %d body = %s", created.Code, created.Body.String())
-	}
-	if input := runtime.createInput; input.OCRModel != "easyocr" {
-		t.Fatalf("ocr input = %+v", input)
-	}
 
 	invalidNamespace := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/admin/knowledge-bases", remote: "127.0.0.1:5000",
@@ -271,7 +260,7 @@ func TestKnowledgeBaseAdminUpdate(t *testing.T) {
 	updated := performRequest(handler, testRequest{
 		method: "PATCH", target: "/v1/admin/knowledge-bases/alpha", remote: "127.0.0.1:5000",
 		body: `{"embedding":{"base_url":"http://new.local/v1"},"embedding_model":"BAAI/bge-m3",` +
-			`"ocr_model":"tesseract","reembed":true}`,
+			`"reembed":true}`,
 	})
 	if updated.Code != http.StatusOK {
 		t.Fatalf("update status = %d body = %s", updated.Code, updated.Body.String())
@@ -279,9 +268,7 @@ func TestKnowledgeBaseAdminUpdate(t *testing.T) {
 	if runtime.updateNamespace != "alpha" || !runtime.updateInput.Reembed {
 		t.Fatalf("captured = %q %+v", runtime.updateNamespace, runtime.updateInput)
 	}
-	if runtime.updateInput.OCRModel == nil || *runtime.updateInput.OCRModel != "tesseract" {
-		t.Fatalf("captured OCRModel = %v", runtime.updateInput.OCRModel)
-	}
+
 	if runtime.updateInput.Values["embedding_model"] != "BAAI/bge-m3" {
 		t.Fatalf("values = %v", runtime.updateInput.Values)
 	}
@@ -322,13 +309,11 @@ func TestKnowledgeBaseAdminValidationParity(t *testing.T) {
 		{"empty embedding_model", `{"namespace":"alpha","embedding":{},"embedding_model":""}`, "embedding_model", "string_too_short", false},
 		{"long embedding_model", `{"namespace":"alpha","embedding":{},"embedding_model":"` + longText(513) + `"}`, "embedding_model", "string_too_long", false},
 		{"long reranker_model", `{"namespace":"alpha","embedding":{},"embedding_model":"m","reranker_model":"` + longText(513) + `"}`, "reranker_model", "string_too_long", false},
-		{"long ocr_model", `{"namespace":"alpha","embedding":{},"embedding_model":"m","ocr_model":"` + longText(513) + `"}`, "ocr_model", "string_too_long", false},
-		{"invalid ocr_model", `{"namespace":"alpha","embedding":{},"embedding_model":"m","ocr_model":"paddleocr"}`, "ocr_model", "literal_error", false},
+
 		{"patch empty embedding_model", `{"embedding_model":""}`, "embedding_model", "string_too_short", true},
 		{"patch long embedding_model", `{"embedding_model":"` + longText(513) + `"}`, "embedding_model", "string_too_long", true},
 		{"patch long reranker_model", `{"reranker_model":"` + longText(513) + `"}`, "reranker_model", "string_too_long", true},
-		{"patch long ocr_model", `{"ocr_model":"` + longText(513) + `"}`, "ocr_model", "string_too_long", true},
-		{"patch invalid ocr_model", `{"ocr_model":"paddleocr"}`, "ocr_model", "literal_error", true},
+
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

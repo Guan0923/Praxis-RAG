@@ -14,19 +14,22 @@ import (
 )
 
 // PDF parser versions. PDFParserVersion identifies manifests written by the
-// in-process NativePDFParser; PDFParserVersionDocling identifies manifests
-// written by the remote Docling parse service. Readers accept both so imports
-// from either engine stay ingestible.
+// in-process NativePDFParser; PDFParserVersionService identifies manifests
+// written by the remote vision parse service (PDFServiceParser). Readers accept
+// both so imports from either engine stay ingestible.
 const (
 	// PDFParserVersion is the manifest contract of NativePDFParser.
 	PDFParserVersion = "go-native-v1"
-	// PDFParserVersionDocling is the manifest contract of the remote Docling
-	// parse service (DoclingServiceParser).
-	PDFParserVersionDocling = "docling-service-v1"
-	// legacyPDFParserVersionDocling is the manifest version written by the
-	// former external Docling worker. It is no longer produced but stays
-	// readable so stored artifacts remain usable.
-	legacyPDFParserVersionDocling = "docling-formula-remote-v3"
+	// PDFParserVersionService is the manifest contract of the remote vision
+	// parse service (PDFServiceParser). The "docling-service-v1" string is the
+	// stable evidence-format contract and is independent of the implementation
+	// that writes it (PyMuPDF reads/renders locally, a remote OpenAI-compatible
+	// vision model does layout/OCR/tables/formulas).
+	PDFParserVersionService = "docling-service-v1"
+	// legacyPDFParserVersion is the manifest version written by the former
+	// external Docling worker. It is no longer produced but stays readable so
+	// stored artifacts remain usable.
+	legacyPDFParserVersion = "docling-formula-remote-v3"
 )
 
 // IsSupportedPDFParserVersion reports whether version is a manifest contract
@@ -34,7 +37,7 @@ const (
 // reimport with a compatible parser.
 func IsSupportedPDFParserVersion(version string) bool {
 	switch version {
-	case PDFParserVersion, PDFParserVersionDocling, legacyPDFParserVersionDocling:
+	case PDFParserVersion, PDFParserVersionService, legacyPDFParserVersion:
 		return true
 	default:
 		return false
@@ -43,12 +46,15 @@ func IsSupportedPDFParserVersion(version string) bool {
 
 // PDFParserVersionForEngine maps a configured PDF engine name to the manifest
 // version that engine writes. Empty and unknown engine names map to the
-// in-process Go parser.
+// in-process Go parser; "vision" and its legacy "docling" alias both map to the
+// remote service contract.
 func PDFParserVersionForEngine(engine string) string {
-	if strings.EqualFold(strings.TrimSpace(engine), "docling") {
-		return PDFParserVersionDocling
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case "vision", "docling":
+		return PDFParserVersionService
+	default:
+		return PDFParserVersion
 	}
-	return PDFParserVersion
 }
 
 // Page is one PDF page of plain text (1-based page number).
@@ -59,7 +65,7 @@ type Page struct {
 
 // PDFPages extracts bounded per-page plain text for document text extraction
 // and chunk_document parity. NativePDFParser is the in-process implementation,
-// DoclingServiceParser calls the remote parse service; tests inject doubles.
+// PDFServiceParser calls the remote parse service; tests inject doubles.
 type PDFPages interface {
 	Pages(ctx context.Context, source string) ([]Page, error)
 }
@@ -245,6 +251,11 @@ func ValidatePDFFile(path, name string) error {
 // show it instead of a bare error category.
 type PDFParseError struct {
 	Message string
+	// StatusCode carries the parse service HTTP status when the failure was a
+	// non-200 response, and 0 for local failures (validation, transport,
+	// timeout) so logs can distinguish "the service said no" from "the service
+	// was unreachable".
+	StatusCode int
 	// cause keeps the classified underlying error (a context deadline or
 	// cancel reason, or a transport failure) discoverable through errors.Is
 	// without changing or extending the displayed message.
@@ -253,6 +264,14 @@ type PDFParseError struct {
 
 // Error implements error.
 func (e *PDFParseError) Error() string { return e.Message }
+
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *PDFParseError) ErrorCategory() string { return "pdf_parse_error" }
+
+// HTTPStatus returns the parse service HTTP status when the failure was a
+// non-200 response, or 0 for local failures.
+func (e *PDFParseError) HTTPStatus() int { return e.StatusCode }
 
 // Unwrap exposes the classified cause to errors.Is/errors.As. It never
 // contributes to the message returned by Error.

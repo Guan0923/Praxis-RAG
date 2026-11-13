@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/Guan0923/xinghe_rag/internal/access"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 )
 
 // modernProtocolVersion is the first protocol era the SDK only serves over a
@@ -142,7 +143,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	transport, err := h.endpoint.transportFor(namespace)
 	if err != nil {
-		h.logger.Error("mcp: cannot initialize namespace server", "namespace", namespace, "error", err)
+		h.logger.Error("mcp: cannot initialize namespace server", append([]any{"namespace", namespace}, logging.ErrorAttrs(err)...)...)
 		writeJSONDetail(w, http.StatusInternalServerError, "Internal Server Error")
 		return
 	}

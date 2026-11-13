@@ -18,9 +18,9 @@ import (
 )
 
 // NativePDFParser parses PDF text in-process with a pure-Go PDF reader. It is
-// the default PDF engine; a remote Docling service can be selected instead
-// through DoclingServiceParser. It does not start processes and does not
-// require Python or Docling.
+// the default PDF engine; a remote vision parse service can be selected instead
+// through PDFServiceParser. It does not start processes and does not
+// require Python or a GPU.
 // The output is the manifest contract defined in pdf.go, restricted to ordered
 // text blocks. Layout models, table structure, OCR and formula/picture assets
 // are not produced by this engine.

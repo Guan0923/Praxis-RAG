@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"strconv"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
@@ -76,6 +76,10 @@ func main() {
 }
 
 func run() error {
+	logger, err := logging.Setup()
+	if err != nil {
+		return configError(err)
+	}
 	if _, err := config.LoadStartupConfig(); err != nil {
 		return configError(err)
 	}
@@ -115,7 +119,6 @@ func run() error {
 		return err
 	}
 	defer func() { _ = stores.Close() }()
-	logger := newLogger()
 
 	cache, err := redisstate.NewFromEnv()
 	if err != nil {
@@ -175,14 +178,6 @@ func shutdown(worker *searchworker.Processor, service *runtime.Service) error {
 	return service.Close(ctx)
 }
 
-func newLogger() *slog.Logger {
-	level := slog.LevelInfo
-	if isTruthy(os.Getenv("RAG_DEBUG_TRACE")) {
-		level = slog.LevelDebug
-	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-}
-
 func positiveIntEnv(name string, fallback int) (int, error) {
 	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
@@ -207,20 +202,4 @@ func workerConcurrencyEnv(name string) (int, error) {
 		return 0, fmt.Errorf("%s must be an integer between 1 and %d", name, mq.MaxConsumerConcurrency)
 	}
 	return value, nil
-}
-
-func isTruthy(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
-}
-
-func errorTypeName(err error) string {
-	if err == nil {
-		return ""
-	}
-	return fmt.Sprintf("%T", err)
 }

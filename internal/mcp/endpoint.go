@@ -12,6 +12,7 @@ import (
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/version"
 )
 
@@ -104,7 +105,7 @@ func (e *Endpoint) transportFor(namespace string) (*namespaceTransport, error) {
 	}
 	e.transports[namespace] = transport
 	if err := e.syncPrompts(context.Background(), transport); err != nil {
-		e.logger.Warn("mcp: cannot load prompts", "namespace", namespace, "error", err)
+		e.logger.Warn("mcp: cannot load prompts", append([]any{"namespace", namespace}, logging.ErrorAttrs(err)...)...)
 	}
 	return transport, nil
 }
@@ -347,7 +348,7 @@ func (e *Endpoint) refreshTools(namespace string) error {
 // ToolsChanged implements internal/httpapi.ChangeNotifier.
 func (e *Endpoint) ToolsChanged(namespace string) {
 	if err := e.refreshTools(namespace); err != nil {
-		e.logger.Warn("mcp: cannot refresh tools", "namespace", namespace, "error", err)
+		e.logger.Warn("mcp: cannot refresh tools", append([]any{"namespace", namespace}, logging.ErrorAttrs(err)...)...)
 	}
 }
 
@@ -360,7 +361,7 @@ func (e *Endpoint) PromptsChanged(namespace string) {
 		return
 	}
 	if err := e.syncPrompts(context.Background(), transport); err != nil {
-		e.logger.Warn("mcp: cannot refresh prompts", "namespace", namespace, "error", err)
+		e.logger.Warn("mcp: cannot refresh prompts", append([]any{"namespace", namespace}, logging.ErrorAttrs(err)...)...)
 	}
 }
 

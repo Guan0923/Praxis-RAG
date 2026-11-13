@@ -14,6 +14,7 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/access"
 	"github.com/Guan0923/xinghe_rag/internal/contracts"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/resources"
 )
 
@@ -421,7 +422,7 @@ func (e *Endpoint) DocumentsChanged(namespace string, before, after []DocumentRe
 		if err := transport.server.ResourceUpdated(ctx, &sdk.ResourceUpdatedNotificationParams{
 			URI: resources.DocumentURI(namespace, name),
 		}); err != nil {
-			e.logger.Warn("mcp: cannot publish resource update", "namespace", namespace, "uri", name, "error", err)
+			e.logger.Warn("mcp: cannot publish resource update", append([]any{"namespace", namespace, "uri", name}, logging.ErrorAttrs(err)...)...)
 		}
 	}
 }

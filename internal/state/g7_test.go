@@ -202,12 +202,18 @@ func TestDocumentJobClaimHeartbeatProgressAndTerminal(t *testing.T) {
 	} else {
 		mustBeError[*UploadConflict](t, err)
 	}
-	if err := stores.DocumentJobs.Fail(ctx, task, true, nil); err != nil {
+	retryReason := "Document processing failed: qdrant_error at indexing (HTTP 500): boom"
+	if err := stores.DocumentJobs.Fail(ctx, task, true, &retryReason); err != nil {
 		t.Fatalf("Fail(retry) error = %v", err)
 	}
 	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
 	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" || job.RetryAt <= 0 {
 		t.Fatalf("job after retry = %+v, %v", job, err)
+	}
+	// The retry branch keeps the last recorded failure reason visible while the
+	// job waits for its next attempt.
+	if job.Error == nil || *job.Error != retryReason {
+		t.Fatalf("job after retry lost the failure reason: %+v", job)
 	}
 	task, err = stores.DocumentJobs.Claim(ctx, notification)
 	if err != nil || task == nil || task.Attempts != 2 {
@@ -231,6 +237,43 @@ func TestDocumentJobClaimHeartbeatProgressAndTerminal(t *testing.T) {
 	}
 	if _, err := stores.DocumentJobs.Get(ctx, "not-a-uuid", nil); err == nil {
 		t.Fatal("noncanonical artifact id accepted")
+	}
+}
+
+func TestDocumentJobRetryFailureReasonPersistsThenSuccessClears(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+	configureTestNamespace(t, stores, "manuals")
+	admission := submitTestDocument(t, stores, "manuals", "retry.txt", []byte("bytes"), nil)
+	notification := documentNotification(t, stores, admission.ArtifactID)
+	task, err := stores.DocumentJobs.Claim(ctx, notification)
+	if err != nil || task == nil {
+		t.Fatalf("Claim() = %+v, %v", task, err)
+	}
+	reason := "Document processing failed: model_api_error at embedding (HTTP 429): rate limited"
+	if err := stores.DocumentJobs.Fail(ctx, task, true, &reason); err != nil {
+		t.Fatalf("Fail(retry) error = %v", err)
+	}
+	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
+	if err != nil || job.Error == nil || *job.Error != reason {
+		t.Fatalf("retry_wait job error = %+v, %v; want %q", job, err, reason)
+	}
+	task, err = stores.DocumentJobs.Claim(ctx, notification)
+	if err != nil || task == nil {
+		t.Fatalf("second Claim() = %+v, %v", task, err)
+	}
+	// Column-level check of the success path: finish() is what Succeed() calls
+	// after Reconcile proves the publication; a terminal success must not keep
+	// the previous attempt's reason.
+	if err := stores.DocumentJobs.finish(ctx, task, DocumentJobSucceeded, nil, nil); err != nil {
+		t.Fatalf("finish(success) error = %v", err)
+	}
+	status, err := stores.DocumentJobs.Status(ctx, "manuals", admission.ArtifactID)
+	if err != nil || status.Status != DocumentJobSucceeded || status.Stage != "completed" {
+		t.Fatalf("status after success = %+v, %v", status, err)
+	}
+	if status.Error != nil {
+		t.Fatalf("success kept the retry failure reason: %q", *status.Error)
 	}
 }
 
@@ -273,12 +316,16 @@ func TestDocumentJobDeadLetterAndValidationEnvelope(t *testing.T) {
 		"UPDATE document_jobs SET lease_until = 0 WHERE artifact_id = ?", admission.ArtifactID); err != nil {
 		t.Fatalf("lease expiry update error = %v", err)
 	}
+	lastFailure := "Document processing failed: pdf_parse_error at parsing (HTTP 502): upstream parse failed"
+	if err := stores.DocumentJobs.Fail(ctx, task, true, &lastFailure); err != nil {
+		t.Fatalf("Fail(retry) error = %v", err)
+	}
 	if acked, err := stores.DocumentJobs.DeadLetter(ctx, notification); err != nil || !acked {
 		t.Fatalf("DeadLetter() = %v, %v", acked, err)
 	}
 	status, err := stores.DocumentJobs.Status(ctx, "manuals", admission.ArtifactID)
 	if err != nil || status.Status != DocumentJobFailed || status.Error == nil ||
-		*status.Error != "Message retry limit reached" {
+		*status.Error != "Message retry limit reached; last error: "+lastFailure {
 		t.Fatalf("status = %+v, %v", status, err)
 	}
 	unknown := notification
