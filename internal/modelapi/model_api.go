@@ -38,6 +38,14 @@ type ModelAPIError struct {
 
 func (e *ModelAPIError) Error() string { return e.Message }
 
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *ModelAPIError) ErrorCategory() string { return "model_api_error" }
+
+// HTTPStatus returns the provider HTTP status carried by the failure, or 0 for
+// local failures (timeouts, transport errors, invalid configuration).
+func (e *ModelAPIError) HTTPStatus() int { return e.Status }
+
 func modelError(message string) *ModelAPIError { return &ModelAPIError{Message: message} }
 
 // ModelConnection is the immutable endpoint configuration for one model kind.

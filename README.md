@@ -273,7 +273,9 @@ npm run build
 - 默认只监听 `127.0.0.1`。远程部署必须设置 `RAG_SERVICE_TOKEN` 与 MCP Host/Origin 白名单，并在前面配置 HTTPS 与访问控制。
 - PDF 解析引擎默认是 `docling`：Go 服务调用独立的 `pdf-parser` 微服务（版面分析、表格结构、OCR、公式 LaTeX；公式识别依赖 `RAG_VLM_*` 远端 VLM 或模型卷内的本地 CodeFormula）。该服务未启动或超时（默认 900 秒）时 docling 上传会失败，可显式 `RAG_PDF_ENGINE=go` 切回 Go 内置纯文本引擎（文字型 PDF；不含版面/表格/OCR/公式与图片资产，扫描件请先 OCR）。Word 无图注图片可调用远端 VLM（`RAG_VLM_*`），文档裁图会发送到该端点；未配置 VLM 时图片保留占位描述。.doc 转换依赖外部 LibreOffice。
 - Redis 搜索快照有 TTL（`RAG_RESULT_TTL_SECONDS`，默认 3600 秒），丢失或到期后 `result_id` 不可用，无 SQL 回放。异步文档任务状态在 MySQL，不受 Redis TTL 影响。
-- 日志仅记录任务/操作 ID 和安全错误类别，不记录查询、文件内容、消息正文或凭据。
+- 日志统一为结构化日志（Go 服务与 3 个 worker 共用 `slog`，`RAG_LOG_LEVEL`/`RAG_LOG_FORMAT` 控制级别与 `text`/`json` 编码，`RAG_DEBUG_TRACE` 保持旧开关兼容）；只记录任务/操作 ID、失败阶段与安全错误类别，不记录查询、文件内容、消息正文或凭据。
+- 每个 HTTP 请求接受或回写 `X-Request-ID`，上传/后台任务日志带 `operation_id`、`artifact_id`、`batch_id`：一次上传可从请求日志追到入队、重试与最终失败。
+- 文档任务失败时 `document_jobs.error` 保留最近一次失败摘要（错误类别、失败阶段、上游 HTTP 状态与脱敏详情）；重试耗尽进入终态或死信时提示会附带该摘要，不再只有统一提示。
 
 ## 项目文档
 

@@ -232,6 +232,8 @@ table 的 `image_file` 为 null、`image_file` 是安全相对路径等），避
 | `RAG_PDF_SERVICE_WORKERS` | `1` | `python -m app.main` 启动的 Uvicorn 服务进程数（正整数）；容器默认入口同样读取此变量，各进程共用监听端口 |
 | `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 进程内并发转换上限（信号量）；模型权重常驻共享，转换工作内存与 CPU 随并发线性增长，内存紧张保持 1 靠副本扩容 |
 | `RAG_PDF_SERVICE_CONVERTER` | `docling` | `docling` 真实解析；`fake` 固定清单（仅测试/联调）|
+| `RAG_PDF_SERVICE_LOG_LEVEL` | `info` | 日志级别：`debug`/`info`/`warning`/`error`；未设置时回退共享调试开关 `RAG_DEBUG_TRACE` |
+| `RAG_PDF_SERVICE_LOG_FORMAT` | `text` | `text`（默认，`时间 级别 名称 消息`）或 `json`（每行一个 JSON 对象）|
 | `RAG_PDF_MODELS_PATH` | 空 | Docling 模型目录（`artifacts_path`），容器内为 `/models` |
 | `RAG_PDF_SERVICE_MAX_BYTES` | `104857600` | 上传大小上限（字节），超限 413 |
 | `RAG_VLM_BASE_URL` | 空 | OpenAI 兼容 VLM 的 base URL（如 `http://host:8000/v1`）|
@@ -241,6 +243,8 @@ table 的 `image_file` 为 null、`image_file` 是安全相对路径等），避
 | `RAG_VLM_CONCURRENCY` | `4` | VLM 并发（Docling API engine 的 concurrency）|
 
 模型选择规则：
+
+- **结构化日志与请求关联**：`python -m app.main` 安装统一 root handler（`RAG_PDF_SERVICE_LOG_LEVEL`/`RAG_PDF_SERVICE_LOG_FORMAT`，`log_config=None` 让 Uvicorn 复用该配置）；每个请求接受或生成 `X-Request-ID` 并在响应头回写，Go 后端上传时会把同一个 ID 透传过来。422 校验失败只记录字段位置、错误数量与错误类型，500 只记录异常类名，均不记录请求值、文档正文或凭据。
 
 - `RAG_VLM_BASE_URL` + `RAG_VLM_MODEL` **同时配置** → 公式识别使用远端 VLM
   （`ApiVlmEngineOptions`，temperature 0、max_tokens 1024）；无 caption 的图片/表格也会调用该 VLM 生成

@@ -342,6 +342,20 @@ PDF 总解析容量上限为 `RAG_PDF_SERVICE_WORKERS × RAG_PDF_SERVICE_CONCURR
 
 该值是未经过真实 PDF 压测的起点；实际容量取决于容器可用资源和文档复杂度。未设置环境变量时，代码中的两项并发默认值仍为 1；示例配置显式设置为 4。修改 `.env` 后，需重新运行启动脚本以重启文档 worker，并由 Compose 更新 pdf-parser 容器，已有进程不会热加载这些值。
 
+### 日志与请求关联
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_LOG_LEVEL` | `info` | Go 服务与 3 个 worker 的统一日志级别：`debug`/`info`/`warning`/`error`（`warn` 同义）；未设置时回退 `RAG_DEBUG_TRACE` |
+| `RAG_LOG_FORMAT` | `text` | `text`（默认，单行键值）或 `json`（每行一个 JSON 对象，便于采集）|
+| `RAG_DEBUG_TRACE` | `false` | 兼容旧调试开关；为真且未设置 `RAG_LOG_LEVEL` 时日志为 `debug`，同时控制模型 API 的调试输出 |
+| `RAG_PDF_SERVICE_LOG_LEVEL` | `info` | pdf-parser（Python）日志级别：`debug`/`info`/`warning`/`error` |
+| `RAG_PDF_SERVICE_LOG_FORMAT` | `text` | pdf-parser 日志编码：`text`/`json` |
+
+- **一次上传从请求追到任务**：`rag-service` 为每个 HTTP 请求接受或生成 `X-Request-ID`（响应头回写）；上传日志携带 `operation_id`/`artifact_id`/`batch_id`，`rag-document-worker` 与搜索 worker 的日志携带 `artifact_id`/`operation_id`/`attempt`；上传路径调用 pdf-parser 时也会转发同一个 `X-Request-ID`，两边日志可按该 ID 关联。
+- **失败原因可诊断**：文档任务失败时 `document_jobs.error` 写入最近一次失败摘要（`<类别> at <阶段> (HTTP <状态>): <脱敏详情>`）；重试耗尽的终态提示为 `Message retry limit reached; last error: ...`，死信日志同样保留该摘要。
+- **统一脱敏**：日志只记录任务/操作 ID、失败阶段与安全错误类别，不记录查询、文件正文、消息正文与凭据；错误详情经 `enc:v1:`、URL 用户信息、Bearer/API Key 与查询参数脱敏后截断。
+
 ### 排队搜索任务环境
 
 | 变量 | 默认值 | 说明 |

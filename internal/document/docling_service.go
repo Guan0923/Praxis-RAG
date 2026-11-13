@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 )
 
 // The Docling parse microservice exposes one fixed HTTP contract:
@@ -117,6 +119,12 @@ func (p *DoclingServiceParser) ParseInto(ctx context.Context, source, staging st
 		return PDFManifest{}, &PDFParseError{Message: "PDF 解析服务地址无效"}
 	}
 	request.Header.Set("Content-Type", contentType)
+	// Forward the request correlation id so the parse service can join its
+	// structured log lines to this backend request. It is optional: a
+	// background parse without a request id sends the header unchanged.
+	if requestID := logging.CorrelationID(ctx); requestID != "" {
+		request.Header.Set("X-Request-ID", requestID)
+	}
 	client := p.Client
 	if client == nil {
 		client = &http.Client{}
@@ -127,8 +135,11 @@ func (p *DoclingServiceParser) ParseInto(ctx context.Context, source, staging st
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf(
-			"PDF 解析服务返回错误（HTTP %d）：%s", response.StatusCode, name)}
+		return PDFManifest{}, &PDFParseError{
+			Message: fmt.Sprintf(
+				"PDF 解析服务返回错误（HTTP %d）：%s", response.StatusCode, name),
+			StatusCode: response.StatusCode,
+		}
 	}
 	if err := checkDoclingResponseType(response.Header.Get("Content-Type")); err != nil {
 		return PDFManifest{}, &PDFParseError{Message: fmt.Sprintf("PDF 解析服务返回了非 ZIP 响应：%s", name)}

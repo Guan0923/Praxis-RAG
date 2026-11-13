@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -151,10 +152,14 @@ func defaultTerminalError(err error) bool {
 
 // Handle processes one identifier-only notification and reports whether the
 // broker delivery may be acknowledged (true) or must be retried (false).
+//
+// After the durable job is loaded, the context carries the job's correlation
+// fields (artifact_id, namespace, operation_id, attempt) so every failure log
+// line can be joined with the job row and the Console status view.
 func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotification) bool {
 	if p.ingester == nil {
 		// Dead-letter-only worker: ingestion must never run here.
-		p.logWarn("document worker has no ingester; leaving delivery retryable",
+		p.logWarn(ctx, "document worker has no ingester; leaving delivery retryable",
 			"artifact_id", notification.ArtifactID)
 		return false
 	}
@@ -166,25 +171,32 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 		"created_at":  notification.CreatedAt,
 	})
 	if err != nil {
-		p.logWarn("document notification invalid", "error_type", typeName(err))
+		p.logWarn(ctx, "document notification invalid", logging.ErrorAttrs(err)...)
 		return false
 	}
 	notification = validated
+	ctx = logging.With(ctx,
+		logging.FieldArtifactID, notification.ArtifactID,
+		logging.FieldNamespace, notification.Namespace)
 	job, err := p.jobs.Get(ctx, notification.ArtifactID, &notification.Namespace)
 	if err != nil {
-		p.logWarn("document job unavailable", "artifact_id", notification.ArtifactID, "error_type", typeName(err))
+		p.logWarn(ctx, "document job unavailable", logging.ErrorAttrs(err)...)
 		return false
 	}
 	if job == nil {
 		// An unknown or purged job cannot become processable by retrying.
-		p.logInfo("document job unknown; acknowledging", "artifact_id", notification.ArtifactID)
+		p.logInfo(ctx, "document job unknown; acknowledging")
 		return true
 	}
+	if job.OperationID != nil && *job.OperationID != "" {
+		ctx = logging.WithOperationID(ctx, *job.OperationID)
+	}
+	ctx = logging.With(ctx, "attempt", job.Attempts)
 	if isTerminalStatus(job.Status) {
 		return true
 	}
 	if reconciled, err := p.jobs.Reconcile(ctx, &state.DocumentJobTask{DocumentJob: *job}); err != nil {
-		p.logWarn("document reconcile unavailable", "artifact_id", notification.ArtifactID, "error_type", typeName(err))
+		p.logWarn(ctx, "document reconcile unavailable", logging.ErrorAttrs(err)...)
 		return false
 	} else if reconciled {
 		return true
@@ -192,7 +204,7 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 
 	task, err := p.jobs.Claim(ctx, notification)
 	if err != nil {
-		p.logWarn("document claim unavailable", "artifact_id", notification.ArtifactID, "error_type", typeName(err))
+		p.logWarn(ctx, "document claim unavailable", logging.ErrorAttrs(err)...)
 		return false
 	}
 	if task == nil {
@@ -200,18 +212,18 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 		return p.terminalOrNack(ctx, notification.ArtifactID)
 	}
 
-	stopHeartbeat := p.startHeartbeat(task)
+	stopHeartbeat := p.startHeartbeat(ctx, task)
 	defer stopHeartbeat()
 
 	if reconciled, err := p.jobs.Reconcile(ctx, task); err != nil {
-		p.logWarn("document reconcile unavailable", "artifact_id", notification.ArtifactID, "error_type", typeName(err))
+		p.logWarn(ctx, "document reconcile unavailable", logging.ErrorAttrs(err)...)
 		return false
 	} else if reconciled {
 		return true
 	}
 	busy, err := p.jobs.ExecutionBusy(ctx, task)
 	if err != nil {
-		p.logWarn("document execution state unavailable", "artifact_id", notification.ArtifactID, "error_type", typeName(err))
+		p.logWarn(ctx, "document execution state unavailable", logging.ErrorAttrs(err)...)
 		return false
 	}
 	if busy {
@@ -230,7 +242,7 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 			// Best-effort requeue so the next delivery can reconcile immediately
 			// instead of waiting for the lease to expire.
 			_ = p.jobs.Fail(ctx, task, true, &retryCause)
-			p.logWarn("document reconcile unavailable", "artifact_id", notification.ArtifactID, "error_type", typeName(err))
+			p.logWarn(ctx, "document reconcile unavailable", logging.ErrorAttrs(err)...)
 			return false
 		}
 		if !reconciled {
@@ -242,27 +254,33 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 			return true
 		}
 		retry := !p.terminalError(ingestErr)
-		message := "Document processing failed (" + typeName(ingestErr) + ")"
+		// The persisted message stays recognizable for the Console and for
+		// users, while the structured summary adds the safe category/stage/
+		// status/detail that makes the failure diagnosable without secrets.
+		message := "Document processing failed"
 		if !retry {
 			message = "Invalid document or changed knowledge-base configuration"
+		}
+		if summary := logging.ErrorSummary(ingestErr); summary != "" {
+			message += ": " + summary
 		}
 		if failErr := p.jobs.Fail(ctx, task, retry, &message); failErr != nil {
 			// UploadConflict is expected when another worker won the lease.
 			var conflict *state.UploadConflict
 			if !errors.As(failErr, &conflict) {
-				p.logWarn("document failure could not be recorded", "artifact_id", notification.ArtifactID, "error_type", typeName(failErr))
+				p.logWarn(ctx, "document failure could not be recorded", logging.ErrorAttrs(failErr)...)
 				return false
 			}
 		}
-		p.logWarn("document processing deferred", "artifact_id", notification.ArtifactID,
-			"retry", retry, "error_type", typeName(ingestErr))
+		p.logWarn(ctx, "document processing deferred",
+			append([]any{"retry", retry}, logging.ErrorAttrs(ingestErr)...)...)
 	}
 	return p.terminalOrNack(ctx, notification.ArtifactID)
 }
 
 // startHeartbeat renews the lease while ingestion runs. A failed heartbeat ends
 // the goroutine and lets lease expiry recover the job, like the Python worker.
-func (p *Processor) startHeartbeat(task *state.DocumentJobTask) func() {
+func (p *Processor) startHeartbeat(ctx context.Context, task *state.DocumentJobTask) func() {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
@@ -275,7 +293,7 @@ func (p *Processor) startHeartbeat(task *state.DocumentJobTask) func() {
 				return
 			case <-ticker.C:
 				if err := p.jobs.Heartbeat(context.Background(), task); err != nil {
-					p.logWarn("document lease heartbeat failed", "artifact_id", task.ArtifactID, "error_type", typeName(err))
+					p.logWarn(ctx, "document lease heartbeat failed", logging.ErrorAttrs(err)...)
 					return
 				}
 			}
@@ -293,7 +311,7 @@ func (p *Processor) startHeartbeat(task *state.DocumentJobTask) func() {
 func (p *Processor) terminalOrNack(ctx context.Context, artifactID string) bool {
 	terminal, err := p.jobs.Terminal(ctx, artifactID)
 	if err != nil {
-		p.logWarn("document terminal state unavailable", "artifact_id", artifactID, "error_type", typeName(err))
+		p.logWarn(ctx, "document terminal state unavailable", logging.ErrorAttrs(err)...)
 		return false
 	}
 	return terminal
@@ -311,11 +329,11 @@ func (p *Processor) MessageHandler() mq.Handler {
 	return func(ctx context.Context, message mq.ReceivedMessage) bool {
 		notification, kind, err := mq.DecodeDocumentMessage(message.Body)
 		if err != nil {
-			p.logWarn("malformed document message ignored", "error_type", typeName(err))
+			p.logWarn(ctx, "malformed document message ignored", logging.ErrorAttrs(err)...)
 			return false
 		}
 		if kind == mq.DocumentMessageOutboxDeletion {
-			p.logOutboxDeletion("message_handler", message)
+			p.logOutboxDeletion(ctx, "message_handler", message)
 			return true
 		}
 		return p.Handle(ctx, notification)
@@ -326,8 +344,8 @@ func (p *Processor) MessageHandler() mq.Handler {
 // stays stable and greppable for acceptance checks, and only bounded record
 // coordinates are attached: the payload holds outbox row values and must stay
 // out of logs.
-func (p *Processor) logOutboxDeletion(handler string, received mq.ReceivedMessage) {
-	p.logInfo("outbox cleanup event ignored",
+func (p *Processor) logOutboxDeletion(ctx context.Context, handler string, received mq.ReceivedMessage) {
+	p.logInfo(ctx, "outbox cleanup event ignored",
 		"handler", handler,
 		"topic", received.Topic, "partition", received.Partition, "offset", received.Offset)
 }
@@ -336,11 +354,12 @@ func (p *Processor) logOutboxDeletion(handler string, received mq.ReceivedMessag
 func (p *Processor) DeadLetter(ctx context.Context, notification state.DocumentNotification) (bool, error) {
 	complete, err := p.jobs.DeadLetter(ctx, notification)
 	if err != nil {
-		p.logWarn("document dead-letter failed", "artifact_id", notification.ArtifactID, "error_type", typeName(err))
+		p.logWarn(ctx, "document dead-letter failed",
+			append([]any{"artifact_id", notification.ArtifactID}, logging.ErrorAttrs(err)...)...)
 		return false, err
 	}
 	if complete {
-		p.logInfo("document dead-letter outcome saved or job absent/terminal",
+		p.logInfo(ctx, "document dead-letter outcome saved or job absent/terminal",
 			"artifact_id", notification.ArtifactID)
 	}
 	return complete, nil
@@ -353,11 +372,11 @@ func (p *Processor) DeadLetter(ctx context.Context, notification state.DocumentN
 func (p *Processor) DeadLetterMessage(ctx context.Context, message mq.ReceivedMessage) (bool, error) {
 	notification, kind, err := mq.DecodeDocumentMessage(message.Body)
 	if err != nil {
-		p.logWarn("malformed document dead-letter message ignored", "error_type", typeName(err))
+		p.logWarn(ctx, "malformed document dead-letter message ignored", logging.ErrorAttrs(err)...)
 		return false, nil
 	}
 	if kind == mq.DocumentMessageOutboxDeletion {
-		p.logOutboxDeletion("dead_letter", message)
+		p.logOutboxDeletion(ctx, "dead_letter", message)
 		return true, nil
 	}
 	return p.DeadLetter(ctx, notification)
@@ -387,28 +406,28 @@ func (p *Processor) ExhaustedHandler() func(ctx context.Context, message mq.Rece
 func (p *Processor) Recover(ctx context.Context) error {
 	var firstErr error
 	if swept, err := p.jobs.Sweep(ctx, p.sweepLimit); err != nil {
-		p.logWarn("document job sweep failed", "error_type", typeName(err))
+		p.logWarn(ctx, "document job sweep failed", logging.ErrorAttrs(err)...)
 		if firstErr == nil {
 			firstErr = err
 		}
 	} else if swept > 0 {
-		p.logInfo("document jobs re-emitted", "count", swept)
+		p.logInfo(ctx, "document jobs re-emitted", "count", swept)
 	}
 	if _, err := p.jobs.GCJobs(ctx, nil); err != nil {
-		p.logWarn("document terminal GC failed", "error_type", typeName(err))
+		p.logWarn(ctx, "document terminal GC failed", logging.ErrorAttrs(err)...)
 		if firstErr == nil {
 			firstErr = err
 		}
 	}
 	if _, err := p.jobs.GCOutbox(ctx, nil); err != nil {
-		p.logWarn("document outbox GC failed", "error_type", typeName(err))
+		p.logWarn(ctx, "document outbox GC failed", logging.ErrorAttrs(err)...)
 		if firstErr == nil {
 			firstErr = err
 		}
 	}
 	if p.journalRecovery != nil {
 		if err := p.journalRecovery.RecoverDocumentUploads(ctx); err != nil {
-			p.logWarn("document upload journal recovery failed", "error_type", typeName(err))
+			p.logWarn(ctx, "document upload journal recovery failed", logging.ErrorAttrs(err)...)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -435,17 +454,13 @@ func isTerminalStatus(status string) bool {
 	return status == state.DocumentJobSucceeded || status == state.DocumentJobFailed
 }
 
-func (p *Processor) logWarn(message string, args ...any) {
-	p.logger.Warn(message, args...)
+// logWarn writes a warning enriched with the context correlation fields.
+func (p *Processor) logWarn(ctx context.Context, message string, args ...any) {
+	p.logger.Warn(message, append(logging.Attrs(ctx), args...)...)
 }
 
-func (p *Processor) logInfo(message string, args ...any) {
-	p.logger.Info(message, args...)
-}
-
-func typeName(err error) string {
-	if err == nil {
-		return ""
-	}
-	return fmt.Sprintf("%T", err)
+// logInfo writes an informational line enriched with the context correlation
+// fields.
+func (p *Processor) logInfo(ctx context.Context, message string, args ...any) {
+	p.logger.Info(message, append(logging.Attrs(ctx), args...)...)
 }

@@ -27,7 +27,9 @@ def test_main_starts_configured_processes(monkeypatch: pytest.MonkeyPatch, worke
     with patch("uvicorn.run") as run:
         main()
 
-    run.assert_called_once_with("app.main:app", host="127.0.0.1", port=9123, workers=workers)
+    run.assert_called_once_with(
+        "app.main:app", host="127.0.0.1", port=9123, workers=workers, log_config=None
+    )
     assert Settings.from_env().concurrency == 3
 
 

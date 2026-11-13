@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -243,9 +244,14 @@ func TestHandleValidationFailureIsTerminal(t *testing.T) {
 		t.Fatalf("validation failure must be acknowledged as terminal")
 	}
 	job := jobStatus(t, stores, notification.ArtifactID)
-	if job.Status != state.DocumentJobFailed || job.Error == nil ||
-		*job.Error != "Invalid document or changed knowledge-base configuration" {
+	// The persisted terminal text keeps the documented prefix and appends the
+	// structured failure summary (category/stage/status/detail).
+	const terminalPrefix = "Invalid document or changed knowledge-base configuration"
+	if job.Status != state.DocumentJobFailed || job.Error == nil || !strings.HasPrefix(*job.Error, terminalPrefix) {
 		t.Fatalf("failed job = %+v", job)
+	}
+	if len(*job.Error) <= len(terminalPrefix) {
+		t.Fatalf("failed job error lost the structured summary: %q", *job.Error)
 	}
 	if terminal, err := stores.DocumentJobs.Terminal(context.Background(), notification.ArtifactID); err != nil || !terminal {
 		t.Fatalf("Terminal() = %v, %v", terminal, err)
@@ -389,8 +395,15 @@ func TestDeadLetterAndExhaustion(t *testing.T) {
 		t.Fatalf("DeadLetter() = %v, %v", complete, err)
 	}
 	job := jobStatus(t, stores, notification.ArtifactID)
-	if job.Status != state.DocumentJobFailed || job.Error == nil || *job.Error != "Message retry limit reached" {
+	// DeadLetter keeps the documented prefix and, when the retry branch recorded
+	// a failure, appends that last error so the operator sees the real cause.
+	if job.Status != state.DocumentJobFailed || job.Error == nil ||
+		!strings.HasPrefix(*job.Error, "Message retry limit reached") {
 		t.Fatalf("dead-lettered job = %+v", job)
+	}
+	if !strings.Contains(*job.Error, "last error:") ||
+		!strings.Contains(*job.Error, "Document processing failed") {
+		t.Fatalf("dead-lettered job lost the last recorded failure: %q", *job.Error)
 	}
 
 	body, _, err := mq.EncodeDocumentNotification(notification)

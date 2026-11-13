@@ -48,6 +48,11 @@ type SearchValidationError struct{ Message string }
 
 func (e *SearchValidationError) Error() string { return e.Message }
 
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package. Untrusted arguments fail
+// as validation errors, the same category HTTP/MCP input checks use.
+func (e *SearchValidationError) ErrorCategory() string { return "validation_error" }
+
 func validationError(format string, args ...any) *SearchValidationError {
 	return &SearchValidationError{Message: fmt.Sprintf(format, args...)}
 }
@@ -57,6 +62,10 @@ func validationError(format string, args ...any) *SearchValidationError {
 type RagOperationError struct{ Message string }
 
 func (e *RagOperationError) Error() string { return e.Message }
+
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *RagOperationError) ErrorCategory() string { return "rag_operation_error" }
 
 // NewRagOperationError builds a RagOperationError with a fixed message.
 func NewRagOperationError(message string) *RagOperationError {

@@ -2,11 +2,10 @@ package runtime
 
 import (
 	"context"
-	"fmt"
-	"log"
 	"net/http"
 	"os"
 
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/qdrant"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -78,7 +77,7 @@ func (s *Service) uploadCoordinator() (*state.UploadCoordinator, error) {
 func (s *Service) recoverUploads(ctx context.Context, namespace string) {
 	coordinator, err := s.uploadCoordinator()
 	if err != nil {
-		log.Printf("Upload coordinator unavailable for recovery: %s", errorTypeName(err))
+		logging.FromContext(ctx).Warn("Upload coordinator unavailable for recovery", logging.ErrorAttrs(err)...)
 		return
 	}
 	coordinator.Recover(ctx, s.indexStoreFactory, &namespace)
@@ -89,16 +88,16 @@ func (s *Service) recoverUploads(ctx context.Context, namespace string) {
 // replace the original upload error.
 func (s *Service) compensateUpload(ctx context.Context, coordinator *state.UploadCoordinator, operation *state.UploadOperation, cause error) {
 	if err := s.stores.Uploads.Fail(ctx, operation, cause, nil); err != nil {
-		log.Printf("Upload %s failure record pending: %s", operation.ID, errorTypeName(err))
+		logging.FromContext(ctx).Warn("Upload failure record pending", append([]any{"operation_id", operation.ID}, logging.ErrorAttrs(err)...)...)
 	}
 	var publisher state.IndexPublisher
 	if store, err := s.indexStoreFactory(operation); err == nil {
 		publisher = store
 	} else {
-		log.Printf("Upload %s compensation store unavailable: %s", operation.ID, errorTypeName(err))
+		logging.FromContext(ctx).Warn("Upload compensation store unavailable", append([]any{"operation_id", operation.ID}, logging.ErrorAttrs(err)...)...)
 	}
 	if _, err := coordinator.Compensate(ctx, operation, publisher); err != nil {
-		log.Printf("Upload recovery pending operation_id=%s category=%s", operation.ID, errorTypeName(err))
+		logging.FromContext(ctx).Warn("Upload recovery pending", append([]any{"operation_id", operation.ID}, logging.ErrorAttrs(err)...)...)
 	}
 }
 
@@ -160,13 +159,4 @@ func (s *Service) publishDocument(
 	// document lists and search snapshots see the published head immediately.
 	s.stores.Documents.FlushViews(ctx, operation.Namespace)
 	return nil
-}
-
-// errorTypeName renders a safe error category for logs, mirroring Python's
-// type(exc).__name__ based diagnostics (never message contents).
-func errorTypeName(err error) string {
-	if err == nil {
-		return "nil"
-	}
-	return fmt.Sprintf("%T", err)
 }

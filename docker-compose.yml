@@ -180,6 +180,10 @@ services:
       # Test/integration only: "fake" returns a fixed manifest without loading
       # Docling. Keep the default "docling" in production.
       RAG_PDF_SERVICE_CONVERTER: ${RAG_PDF_SERVICE_CONVERTER:-docling}
+      # Structured logging: info/debug/warning/error and text/json. RAG_DEBUG_TRACE
+      # remains the shared debug switch when the level is unset.
+      RAG_PDF_SERVICE_LOG_LEVEL: ${RAG_PDF_SERVICE_LOG_LEVEL:-info}
+      RAG_PDF_SERVICE_LOG_FORMAT: ${RAG_PDF_SERVICE_LOG_FORMAT:-text}
       # Parse deadline on the service side as well; the Go client uses the same
       # value as its HTTP timeout.
       RAG_PDF_SERVICE_TIMEOUT: ${RAG_PDF_SERVICE_TIMEOUT:-900}
@@ -234,6 +238,10 @@ services:
       RAG_SERVICE_TOKEN: ${RAG_SERVICE_TOKEN:-}
       RAG_SERVICE_HOST: "0.0.0.0"
       RAG_SERVICE_PORT: "8011"
+      # Structured logging for the service and every worker process it launches.
+      RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-info}
+      RAG_LOG_FORMAT: ${RAG_LOG_FORMAT:-text}
+      RAG_DEBUG_TRACE: ${RAG_DEBUG_TRACE:-false}
       RAG_WEB_ROOT: /app/web
       QDRANT_URL: ${RAG_APP_QDRANT_URL:-http://qdrant:6333}
       RAG_MYSQL_HOST: ${RAG_APP_MYSQL_HOST:-mysql}

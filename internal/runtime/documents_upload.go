@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,6 +21,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/ingest"
 	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/modelapi"
 	"github.com/Guan0923/xinghe_rag/internal/qdrant"
 	"github.com/Guan0923/xinghe_rag/internal/sparse"
@@ -498,6 +498,21 @@ func (s *Service) storeAndIndex(
 	if err != nil {
 		return nil, err
 	}
+	// Correlate every following log line and persisted reason with the durable
+	// operation (and, for a queued job, the artifact). Annotate extends the
+	// enclosing HTTP request's field set in place so its access log line can
+	// report the ids; it is a no-op outside a request context. Annotate must run
+	// on the incoming context: With forks the attribute set, so annotating the
+	// derived context would not reach the request.
+	annotations := []any{logging.FieldOperationID, operation.ID}
+	if options.Task != nil {
+		annotations = append(annotations, logging.FieldArtifactID, options.Task.ArtifactID)
+	}
+	logging.Annotate(ctx, annotations...)
+	ctx = logging.WithOperationID(ctx, operation.ID)
+	if options.Task != nil {
+		ctx = logging.WithArtifactID(ctx, options.Task.ArtifactID)
+	}
 	if operation.Status == state.UploadCommitted {
 		return replayCommittedUpload(operation, options.Content, name)
 	}
@@ -512,11 +527,13 @@ func (s *Service) storeAndIndex(
 	}
 	currentSettings, settingsErr := s.stores.KnowledgeBases.Get(ctx, namespace)
 	if settingsErr != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, settingsErr)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("configuration", settingsErr))
 	}
 	if collection, ok := currentSettings["collection"].(string); currentSettings != nil && ok && collection != resources.collection {
 		return s.failDocumentOperation(ctx, journal, coordinator, operation,
-			&state.UploadConflict{Message: "Knowledge-base index changed; retry with refreshed settings"})
+			logging.WrapStage("configuration",
+				&state.UploadConflict{Message: "Knowledge-base index changed; retry with refreshed settings"}))
 	}
 
 	sha256Value := sha256HexBytes(options.Content)
@@ -597,30 +614,36 @@ func (s *Service) storeAndIndex(
 			return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
 		}
 		if _, cleanupErr := coordinator.CleanupWorkspace(ctx, operation); cleanupErr != nil {
-			logUploadWarning("Committed workspace cleanup pending", operation.ID, cleanupErr)
+			logUploadWarning(ctx, "Committed workspace cleanup pending", operation.ID, cleanupErr)
 		}
 		return result, nil
 	}
 
 	if err := s.documentJobProgress(ctx, options.Task, "chunking"); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("chunking", err))
 	}
 	indexed, err := s.ingestDocument(ctx, journal, operation, workspace, temporary, name, resources)
 	if err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("parsing", err))
 	}
 	if err := s.documentJobProgress(ctx, options.Task, "staging"); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("staging", err))
 	}
 	if err := s.stageArtifacts(ctx, journal, operation, indexed); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("staging", err))
 	}
 	if err := s.documentJobProgress(ctx, options.Task, "embedding"); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("embedding", err))
 	}
 	vectors, sparseVectors, err := s.encodeDocumentVectors(ctx, journal, operation, indexed, resources)
 	if err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("embedding", err))
 	}
 	assetPayloads := make([]map[string]any, 0, len(indexed.result.Assets))
 	for _, asset := range indexed.result.Assets {
@@ -629,7 +652,8 @@ func (s *Service) storeAndIndex(
 		assetPayloads = append(assetPayloads, payload)
 	}
 	if err := s.documentJobProgress(ctx, options.Task, "indexing"); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("indexing", err))
 	}
 	stageValue, err := journal.RunStep(ctx, operation, "stage_qdrant", func() (any, error) {
 		count, stageErr := resources.store.StageVersion(ctx, indexed.qdrantChunks, vectors, sparseVectors,
@@ -639,10 +663,11 @@ func (s *Service) storeAndIndex(
 	if err != nil {
 		if current, currentErr := journal.Get(ctx, operation.ID); currentErr == nil && current.Status != state.UploadCommitted {
 			if deleteErr := resources.store.DeleteVersion(ctx, documentID, operation.ID); deleteErr != nil {
-				logUploadWarning("Version cleanup requires recovery", operation.ID, deleteErr)
+				logUploadWarning(ctx, "Version cleanup requires recovery", operation.ID, deleteErr)
 			}
 		}
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("indexing", err))
 	}
 	chunkCount := len(indexed.result.Chunks)
 	if staged, ok := stageValue.(int); ok {
@@ -668,17 +693,20 @@ func (s *Service) storeAndIndex(
 		metadata["task_artifact_id"] = options.Task.ArtifactID
 	}
 	if err := s.documentJobProgress(ctx, options.Task, "publishing"); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("publishing", err))
 	}
 	if err := journal.Intent(ctx, operation, "publish", map[string]any{"version": operation.ID}); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("publishing", err))
 	}
 	if err := s.publishDocument(ctx, operation, record, metadata, options.Content,
 		indexed.artifactBucket, indexed.result.StagingDir, options.Task); err != nil {
-		return s.failDocumentOperation(ctx, journal, coordinator, operation, err)
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("publishing", err))
 	}
 	if _, cleanupErr := coordinator.CleanupWorkspace(ctx, operation); cleanupErr != nil {
-		logUploadWarning("Committed workspace cleanup pending", operation.ID, cleanupErr)
+		logUploadWarning(ctx, "Committed workspace cleanup pending", operation.ID, cleanupErr)
 	}
 	return metadata, nil
 }
@@ -727,14 +755,16 @@ func (s *Service) ingestDocument(
 		})
 	}, nil)
 	if err != nil {
-		return nil, err
+		return nil, logging.WrapStage("parsing", err)
 	}
 	result, ok := value.(ingest.Result)
 	if !ok {
-		return nil, fmt.Errorf("document ingestion returned an unexpected result")
+		return nil, logging.WrapStage("chunking",
+			fmt.Errorf("document ingestion returned an unexpected result"))
 	}
 	if len(result.Chunks) == 0 {
-		return nil, &apierrors.KnowledgeValidationError{Message: "知识文件没有可索引的文本：" + name}
+		return nil, logging.WrapStage("chunking",
+			&apierrors.KnowledgeValidationError{Message: "知识文件没有可索引的文本：" + name})
 	}
 	qdrantChunks := make([]qdrant.Chunk, len(result.Chunks))
 	for index, chunk := range result.Chunks {
@@ -850,7 +880,7 @@ func (s *Service) stageArtifacts(
 		}
 		return nil, nil
 	}, nil)
-	return err
+	return logging.WrapStage("staging", err)
 }
 
 // encodeDocumentVectors overlaps embedding requests with local BM25 encoding.
@@ -909,7 +939,7 @@ func (s *Service) encodeDocumentVectors(
 	})
 	<-denseDone
 	if err := context.Cause(workCtx); err != nil {
-		return nil, nil, err
+		return nil, nil, logging.WrapStage("embedding", err)
 	}
 	return vectors, sparseVectors, nil
 }
@@ -928,7 +958,7 @@ func (s *Service) failDocumentOperation(
 		// A committed journal row is the authority: the caller observes success
 		// even when the acknowledgement was lost.
 		if _, cleanupErr := coordinator.CleanupWorkspace(ctx, current); cleanupErr != nil {
-			logUploadWarning("Committed workspace cleanup pending", operation.ID, cleanupErr)
+			logUploadWarning(ctx, "Committed workspace cleanup pending", operation.ID, cleanupErr)
 		}
 		result := map[string]any{}
 		if stored, ok := current.Result.(map[string]any); ok {
@@ -939,8 +969,8 @@ func (s *Service) failDocumentOperation(
 		return result, nil
 	}
 	s.compensateUpload(ctx, coordinator, operation, cause)
-	log.Printf("Upload %s failed category=%s detail=%q",
-		operation.ID, errorTypeName(cause), truncateText(cause.Error(), 500))
+	logging.FromContext(ctx).Warn("document upload failed",
+		append([]any{"operation_id", operation.ID}, logging.ErrorAttrs(cause)...)...)
 	return nil, &documentOperationError{Err: cause, OperationID: operation.ID}
 }
 
@@ -1267,8 +1297,12 @@ func shortTypeName(err error) string {
 	return name
 }
 
-func logUploadWarning(message, operationID string, err error) {
-	log.Printf("%s operation_id=%s category=%s", message, operationID, errorTypeName(err))
+// logUploadWarning reports a best-effort upload cleanup/compensation problem.
+// The cause is classified and redacted: a raw message may embed credentials,
+// URLs or document text and must never reach the log sink verbatim.
+func logUploadWarning(ctx context.Context, message, operationID string, err error) {
+	logging.FromContext(ctx).Warn(message,
+		append([]any{"operation_id", operationID}, logging.ErrorAttrs(err)...)...)
 }
 
 func strconvFormatFloat(value float64) string {

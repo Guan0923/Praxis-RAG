@@ -28,6 +28,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
@@ -104,6 +105,9 @@ func (c *Capture) Capture(ctx context.Context, namespace string, payload map[str
 	if c.Stores == nil {
 		return nil, fmt.Errorf("searchrefs: state stores are required")
 	}
+	if namespace != "" {
+		ctx = logging.WithNamespace(ctx, namespace)
+	}
 	original := deepCopyMap(payload)
 	result := deepCopyMap(payload)
 	if result == nil {
@@ -124,7 +128,7 @@ func (c *Capture) Capture(ctx context.Context, namespace string, payload map[str
 	}
 
 	if err := session.project(namespace, result); err != nil {
-		c.logger().Warn("search reference capture unavailable", "error_type", typeName(err))
+		c.warn(ctx, "search reference capture unavailable", logging.ErrorAttrs(err)...)
 		degraded := deepCopyMap(original)
 		if degraded == nil {
 			degraded = map[string]any{}
@@ -138,15 +142,15 @@ func (c *Capture) Capture(ctx context.Context, namespace string, payload map[str
 		return result, nil
 	}
 	if c.Stores.Results == nil {
-		return c.degradeSnapshot(result, &state.SnapshotUnavailable{Message: "Search result storage is unavailable"}), nil
+		return c.degradeSnapshot(ctx, result, &state.SnapshotUnavailable{Message: "Search result storage is unavailable"}), nil
 	}
 	resultID, err := uuid4String()
 	if err != nil {
-		return c.degradeSnapshot(result, err), nil
+		return c.degradeSnapshot(ctx, result, err), nil
 	}
 	saved, err := c.Stores.Results.Save(namespace, result, &resultID, &created)
 	if err != nil {
-		return c.degradeSnapshot(result, err), nil
+		return c.degradeSnapshot(ctx, result, err), nil
 	}
 	return saved, nil
 }
@@ -154,8 +158,8 @@ func (c *Capture) Capture(ctx context.Context, namespace string, payload map[str
 // degradeSnapshot ports the SnapshotUnavailable branch of capture: the enriched
 // payload is returned with snapshot_available=false. Unexpected snapshot errors
 // fall back to the same safe message as a full capture failure.
-func (c *Capture) degradeSnapshot(result map[string]any, cause error) map[string]any {
-	c.logger().Warn("search snapshot unavailable", "error_type", typeName(cause))
+func (c *Capture) degradeSnapshot(ctx context.Context, result map[string]any, cause error) map[string]any {
+	c.warn(ctx, "search snapshot unavailable", logging.ErrorAttrs(cause)...)
 	degraded := deepCopyMap(result)
 	if degraded == nil {
 		degraded = map[string]any{}
@@ -175,6 +179,12 @@ func (c *Capture) logger() *slog.Logger {
 		return slog.Default()
 	}
 	return c.Logger
+}
+
+// warn records one tolerated capture failure with the context correlation
+// fields and the redacted structured error classification.
+func (c *Capture) warn(ctx context.Context, message string, args ...any) {
+	c.logger().Warn(message, append(logging.Attrs(ctx), args...)...)
 }
 
 func (c *Capture) now() float64 {
@@ -619,11 +629,4 @@ func uuid4String() (string, error) {
 	buffer[8] = (buffer[8] & 0x3f) | 0x80
 	encoded := hex.EncodeToString(buffer)
 	return encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32], nil
-}
-
-func typeName(err error) string {
-	if err == nil {
-		return ""
-	}
-	return fmt.Sprintf("%T", err)
 }

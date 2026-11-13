@@ -122,6 +122,10 @@ func (e *NoIndexableTextError) Error() string { return e.Message }
 // Unwrap supports errors.Is(err, ErrNoIndexableText).
 func (e *NoIndexableTextError) Unwrap() error { return ErrNoIndexableText }
 
+// ErrorCategory implements the logging classifier seam so runtime logs and
+// persisted job reasons report a stable category instead of the Go type name.
+func (e *NoIndexableTextError) ErrorCategory() string { return "no_indexable_text" }
+
 // Prepare parses one supported document into chunks, assets and artifacts.
 // sourcePath is the file on disk; options.SourceName is the display name used
 // for ids and metadata. The returned staging directory is never removed by

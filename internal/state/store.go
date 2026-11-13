@@ -7,7 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -297,7 +297,7 @@ func (s *Stores) Close() error {
 // warnIfUnencrypted mirrors store._warn_if_unencrypted.
 func warnIfUnencrypted(settings StateSettings) {
 	if settings.EncryptionKey == "" {
-		log.Printf("RAG_STATE_ENCRYPTION_KEY is not set: provider and API keys may not be readable on other instances")
+		slog.Warn("RAG_STATE_ENCRYPTION_KEY is not set: provider and API keys may not be readable on other instances")
 	}
 }
 

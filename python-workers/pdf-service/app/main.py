@@ -27,12 +27,15 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
+import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
@@ -64,6 +67,98 @@ DEFAULT_CONCURRENCY = 1
 DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 PDF_HEADER_WINDOW = 1024
+
+#: Structured logging knobs. ``RAG_DEBUG_TRACE`` stays the shared debug switch
+#: with the Go service when the level variable is unset.
+LOG_LEVEL_ENV = "RAG_PDF_SERVICE_LOG_LEVEL"
+LOG_FORMAT_ENV = "RAG_PDF_SERVICE_LOG_FORMAT"
+DEBUG_TRACE_ENV = "RAG_DEBUG_TRACE"
+REQUEST_ID_HEADER = "X-Request-ID"
+
+#: Bounded, log-safe request ids: no whitespace or control characters can forge
+#: a log record. Invalid inbound values are replaced with a generated id.
+_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+
+_TRUTHY_VALUES = {"1", "true", "yes", "on"}
+_LOG_LEVELS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warn": logging.WARNING,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in _TRUTHY_VALUES
+
+
+def _log_level_from_env() -> int:
+    """Resolve the configured log level, falling back to the debug switch."""
+    raw = os.environ.get(LOG_LEVEL_ENV, "").strip().lower()
+    if not raw:
+        return logging.DEBUG if _truthy(os.environ.get(DEBUG_TRACE_ENV)) else logging.INFO
+    level = _LOG_LEVELS.get(raw)
+    if level is None:
+        raise ValueError(
+            f"{LOG_LEVEL_ENV} must be one of debug, info, warning, error (got {raw!r})"
+        )
+    return level
+
+
+def _log_format_from_env() -> str:
+    """Resolve the log handler encoding: text (default) or json."""
+    raw = os.environ.get(LOG_FORMAT_ENV, "").strip().lower()
+    if not raw:
+        return "text"
+    if raw not in {"text", "json"}:
+        raise ValueError(f"{LOG_FORMAT_ENV} must be one of text, json (got {raw!r})")
+    return raw
+
+
+class _JsonLogFormatter(logging.Formatter):
+    """One JSON object per line; no request payloads or document text."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps(
+            {
+                "time": self.formatTime(record),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            },
+            ensure_ascii=False,
+        )
+
+
+def configure_logging() -> None:
+    """Install one process-wide handler matching the Go service conventions."""
+    level = _log_level_from_env()
+    log_format = _log_format_from_env()
+    handler = logging.StreamHandler(stream=sys.stderr)
+    if log_format == "json":
+        handler.setFormatter(_JsonLogFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        )
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        root.removeHandler(existing)
+    root.addHandler(handler)
+    root.setLevel(level)
+
+
+def _request_id_from_header(value: str | None) -> str:
+    candidate = (value or "").strip()
+    if _REQUEST_ID_PATTERN.fullmatch(candidate):
+        return candidate
+    return uuid4().hex
+
+
+def _request_id(request: Request) -> str:
+    """Return the request correlation id, empty outside the HTTP middleware."""
+    return getattr(request.state, "request_id", "") or "-"
 
 #: Error messages deliberately contain no document text: the Go backend shows
 #: ``detail`` to users, so it must stay safe for arbitrary uploads.
@@ -221,6 +316,15 @@ def create_app(
     app.state.converter = selected
     app.state.semaphore = asyncio.Semaphore(settings.concurrency)
 
+    @app.middleware("http")
+    async def request_correlation(request: Request, call_next):
+        """Attach one safe correlation id and echo it to the caller."""
+        request_id = _request_id_from_header(request.headers.get(REQUEST_ID_HEADER))
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers[REQUEST_ID_HEADER] = request_id
+        return response
+
     @app.get("/")
     async def root() -> dict[str, Any]:
         return _service_info(app)
@@ -241,7 +345,23 @@ def create_app(
     async def on_validation_error(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        LOGGER.warning("Rejected invalid /v1/parse request: %s", exc.errors())
+        # Never render exc.errors()/exc.body verbatim: those objects include the
+        # submitted input values. Only field locations and error kinds are safe.
+        errors = exc.errors()
+        locations = sorted(
+            {
+                ".".join(str(part) for part in error.get("loc", ())) or "-"
+                for error in errors
+            }
+        )
+        kinds = sorted({str(error.get("type", "unknown")) for error in errors})
+        LOGGER.warning(
+            "Rejected invalid /v1/parse request request_id=%s error_count=%d fields=%s kinds=%s",
+            _request_id(request),
+            len(errors),
+            ",".join(locations),
+            ",".join(kinds),
+        )
         return JSONResponse(
             status_code=422,
             content={
@@ -252,7 +372,14 @@ def create_app(
 
     @app.exception_handler(Exception)
     async def on_unhandled(request: Request, exc: Exception) -> JSONResponse:
-        LOGGER.exception("Unhandled error while serving %s", request.url.path)
+        # The exception message and traceback may quote request input, so only
+        # the class name is logged.
+        LOGGER.error(
+            "Unhandled error while serving %s request_id=%s error_type=%s",
+            request.url.path,
+            _request_id(request),
+            type(exc).__name__,
+        )
         return JSONResponse(status_code=500, content={"detail": "PDF 解析服务内部错误，请查看服务端日志"})
 
     return app
@@ -334,7 +461,9 @@ async def _handle_parse(
         if not _looks_like_pdf(source):
             raise HTTPException(status_code=400, detail=INVALID_PDF_MESSAGE)
 
-        payload = await _run_conversion(app, source, workdir, options)
+        payload = await _run_conversion(
+            app, source, workdir, options, request_id=_request_id(request)
+        )
         return Response(
             content=payload,
             media_type="application/zip",
@@ -380,6 +509,8 @@ async def _run_conversion(
     source: Path,
     workdir: Path,
     options: ParseOptions | None = None,
+    *,
+    request_id: str = "",
 ) -> bytes:
     """Queue and run one conversion in a worker thread.
 
@@ -442,7 +573,13 @@ async def _run_conversion(
     except ParserError as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
     except Exception as error:
-        LOGGER.exception("Unexpected PDF conversion failure")
+        # The exception message/traceback may embed document text, so only the
+        # exception class name reaches the log sink.
+        LOGGER.error(
+            "Unexpected PDF conversion failure request_id=%s error_type=%s",
+            request_id or "-",
+            type(error).__name__,
+        )
         raise HTTPException(
             status_code=500,
             detail="PDF 解析失败，服务端日志包含详细信息",
@@ -463,6 +600,11 @@ def _archive_artifacts(artifacts: Path) -> bytes:
     return buffer.getvalue()
 
 
+# Uvicorn's multiprocess launcher re-imports this module in every worker, so
+# the handler setup must happen at import time as well: with log_config=None the
+# workers keep this root configuration instead of installing per-process uvicorn
+# handlers (and losing the "Started server process" diagnostics).
+configure_logging()
 app = create_app()
 
 
@@ -470,10 +612,19 @@ def main() -> None:
     """Start the configured Uvicorn processes on one shared listening port."""
     import uvicorn
 
+    configure_logging()
     settings = Settings.from_env()
     # An import string is required for Uvicorn's multiprocess launcher; passing
-    # the app object would prevent workers > 1 from starting.
-    uvicorn.run("app.main:app", host=settings.host, port=settings.port, workers=settings.workers)
+    # the app object would prevent workers > 1 from starting. log_config=None
+    # keeps the root handler installed above (same format/level for uvicorn's
+    # own loggers) instead of letting uvicorn replace it per worker.
+    uvicorn.run(
+        "app.main:app",
+        host=settings.host,
+        port=settings.port,
+        workers=settings.workers,
+        log_config=None,
+    )
 
 
 if __name__ == "__main__":

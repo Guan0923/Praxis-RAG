@@ -19,6 +19,7 @@
 | Kafka | `RAG_KAFKA_BOOTSTRAP_SERVERS`、`RAG_KAFKA_SECURITY_PROTOCOL`、`RAG_KAFKA_SASL_*`、`RAG_KAFKA_TLS_*`、`RAG_*_TOPIC`/`RAG_*_GROUP`、`RAG_*_DLQ_TOPIC`、`RAG_DOCUMENT_WORKER_CONCURRENCY`/`RAG_SEARCH_WORKER_CONCURRENCY`（默认 `1`） |
 | 文档投递/监控 | `RAG_DOCUMENT_OUTBOX_RETENTION_SECONDS`（默认 604800）、`RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS`（默认 5）、`RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS`（Worker 心跳间隔，默认 15；监控页 60 秒无心跳判降级）、`RAG_DEBEZIUM_HEALTH_URL`（可选只读健康探测；采集位点不可读，监控显示「未知」）、`RAG_APP_DEBEZIUM_HEALTH_URL`（compose app profile 覆盖用）、`RAG_DEBEZIUM_PORT`（宿主机健康端口，默认 8083） |
 | PDF/Word | `RAG_PDF_ENGINE`（`docling`/`go`）、`RAG_PDF_SERVICE_URL`、`RAG_PDF_SERVICE_TIMEOUT`（900）、`RAG_WORD_CONVERTER_PATH`、`RAG_WORD_CONVERT_TIMEOUT` |
+| 日志 | `RAG_LOG_LEVEL`（`info`）、`RAG_LOG_FORMAT`（`text`/`json`）、`RAG_DEBUG_TRACE`（兼容旧调试开关；未设级别时为 `debug`）、`RAG_PDF_SERVICE_LOG_LEVEL`/`RAG_PDF_SERVICE_LOG_FORMAT` |
 | VLM | `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`、`RAG_VLM_TIMEOUT`、`RAG_VLM_CONCURRENCY`（Console 知识库配置优先，环境变量是回退） |
 | 默认知识库模板 | `RAG_DEFAULT_KB_TEMPLATE`（默认 `default`，VIP/普通用户建库时克隆其模型配置） |
 
@@ -27,6 +28,7 @@
 - `RAG_BACKEND` 在配置层默认是 `mock`，但 `rag-service` 启动时**只接受 `qdrant`**（`mock` 仅供 `rag-mcp-debug`）。
 - `QDRANT_PATH`（Qdrant 本地文件模式）会被拒绝，只用 `QDRANT_URL`。
 - 状态库只有 MySQL；未配置 `RAG_STATE_URL` / `RAG_MYSQL_*` 时服务直接启动失败，没有本地文件回退。
+- 日志统一走 `internal/logging`（`slog` + 上下文关联 + 脱敏）；入口/worker 安装默认 logger，新代码不要再用 `log.Printf`，也不要只记录 `%T` 错误类型。HTTP 入口统一接受/回显 `X-Request-ID`，上传与后台任务日志带 `operation_id`/`artifact_id`/`batch_id`。
 
 ## 2. 构建
 

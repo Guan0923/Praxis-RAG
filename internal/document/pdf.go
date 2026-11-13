@@ -245,6 +245,11 @@ func ValidatePDFFile(path, name string) error {
 // show it instead of a bare error category.
 type PDFParseError struct {
 	Message string
+	// StatusCode carries the parse service HTTP status when the failure was a
+	// non-200 response, and 0 for local failures (validation, transport,
+	// timeout) so logs can distinguish "the service said no" from "the service
+	// was unreachable".
+	StatusCode int
 	// cause keeps the classified underlying error (a context deadline or
 	// cancel reason, or a transport failure) discoverable through errors.Is
 	// without changing or extending the displayed message.
@@ -253,6 +258,14 @@ type PDFParseError struct {
 
 // Error implements error.
 func (e *PDFParseError) Error() string { return e.Message }
+
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *PDFParseError) ErrorCategory() string { return "pdf_parse_error" }
+
+// HTTPStatus returns the parse service HTTP status when the failure was a
+// non-200 response, or 0 for local failures.
+func (e *PDFParseError) HTTPStatus() int { return e.StatusCode }
 
 // Unwrap exposes the classified cause to errors.Is/errors.As. It never
 // contributes to the message returned by Error.

@@ -6,13 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +20,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/mail"
 	"github.com/Guan0923/xinghe_rag/internal/mcp"
 	"github.com/Guan0923/xinghe_rag/internal/monitor"
@@ -45,6 +44,10 @@ func main() {
 }
 
 func run() error {
+	logger, err := logging.Setup()
+	if err != nil {
+		return err
+	}
 	if _, err := config.LoadStartupConfig(); err != nil {
 		return err
 	}
@@ -72,7 +75,6 @@ func run() error {
 	if stores.DocumentBatches != nil {
 		go stores.DocumentBatches.RunRetention(retentionContext, documentBatchRetention, time.Hour)
 	}
-	logger := newLogger()
 	mqSettings, err := mq.SettingsFromEnv()
 	if err != nil {
 		return err
@@ -278,21 +280,4 @@ func run() error {
 		return err
 	}
 	return nil
-}
-
-func newLogger() *slog.Logger {
-	level := slog.LevelInfo
-	if isTruthy(os.Getenv("RAG_DEBUG_TRACE")) {
-		level = slog.LevelDebug
-	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-}
-
-func isTruthy(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
 }

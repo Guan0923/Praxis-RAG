@@ -44,6 +44,12 @@ func (e *SafeError) Unwrap() error { return e.Kind }
 // must not be logged or returned to clients.
 func (e *SafeError) Cause() error { return e.cause }
 
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package. It is deliberately a
+// single stable category: Kind and Cause may carry broker text or credentials,
+// so they are never rendered into log lines through this method.
+func (e *SafeError) ErrorCategory() string { return "kafka_transport_error" }
+
 func newSafeError(kind error, op string, cause error) *SafeError {
 	return &SafeError{Kind: kind, Op: op, cause: cause}
 }

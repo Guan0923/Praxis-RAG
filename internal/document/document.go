@@ -92,6 +92,10 @@ type ReadError struct{ Message string }
 
 func (e *ReadError) Error() string { return e.Message }
 
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *ReadError) ErrorCategory() string { return "document_read_error" }
+
 // AsReadError extracts a ReadError from err, if any.
 func AsReadError(err error) (*ReadError, bool) {
 	typed, ok := err.(*ReadError)
