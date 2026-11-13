@@ -536,15 +536,15 @@ export function PermissionsPage({
           </Tooltip>
         </div>
       </div>
-      <Alert
-        className="page-alert"
-        type="info"
-        showIcon
-        title={role === "admin" ? "管理员权限" : "VIP 权限"}
-        description={role === "admin"
-          ? "管理员可管理全部知识库的授权与邀请。"
-          : "VIP 只能管理自己创建的知识库的授权与邀请；其他被邀请的知识库仅可按授权使用。"}
-      />
+      {role !== "admin" && (
+        <Alert
+          className="page-alert"
+          type="info"
+          showIcon
+          title="VIP 权限"
+          description="VIP 只能管理自己创建的知识库的授权与邀请；其他被邀请的知识库仅可按授权使用。"
+        />
+      )}
       {namespacesError && (
         <Alert className="page-alert" type="error" showIcon title="知识库列表加载失败" description={namespacesError} />
       )}
