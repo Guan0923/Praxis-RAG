@@ -163,7 +163,7 @@ func (s *Service) admitDocumentBatchFile(
 	idempotencyKey *string,
 ) state.DocumentBatchItemResult {
 	result := state.DocumentBatchItemResult{Position: position}
-	if err := s.validateDoclingPDFAdmission(ctx, namespace, file.Name); err != nil {
+	if err := s.validateRemotePDFAdmission(ctx, namespace, file.Name); err != nil {
 		result.Status = state.DocumentBatchItemFailed
 		result.Reason = state.DocumentBatchReasonConfig
 		result.Error = batchFailureText(err)

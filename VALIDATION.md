@@ -1502,3 +1502,55 @@ jsdom 测试覆盖）；结果快照索引只覆盖上线后保存且在 TTL 内
 `status:"degraded"`（同一缺失集合）、`pipeline.worker` 正常、`documents=8`、
 Kafka 元数据与 PDF 转换器检查正常；`/console` 提供的新 bundle
 `index-Dsbwy_6w.js` 包含「关键指标」「存在降级」「未完成操作」文案。
+
+## PDF 解析统一为远端视觉模型 — 2026-11-13
+
+工作树 `dsh-c1c4018e-d12f`（Windows 11，Go 1.27.3，Node v26.13.0 / npm 12.2.2，Python 3.11）。
+目标：移除 PDF 本地推理（docling / torch / easyocr / CodeFormula / 模型卷），改为**一个按知识库
+选择的远端 OpenAI 兼容视觉模型**统一承担版面、OCR、表格、公式与图片描述；本地只做 PDF 读取、
+渲染、裁图与清单组装；证据格式与接口保持稳定。
+
+**改动范围**
+
+- `python-workers/pdf-service`：重写为 PyMuPDF 读取/渲染/裁图 + 视觉客户端 + 清单组装；删除
+  docling/torch/easyocr/CodeFormula 依赖与 `RAG_PDF_MODELS_PATH`/`pdf_parser_models` 模型卷；
+  `RAG_PDF_SERVICE_CONVERTER` 默认 `vision`（旧值 `docling` 作为兼容别名）；`options` 键名规范为
+  `vision`（`vlm` 兼容别名，`ocr` 键废除 → 422）；`manifest.version` 仍是 `docling-service-v1`
+  （证据格式契约）。
+- Go：新增 `internal/document/pdf_service.go`（替换 `docling_service.go`），`RAG_PDF_ENGINE=vision`
+  默认（`docling` 兼容别名）/`go`；vision 引擎下知识库未配置 VLM 时受理阶段返回固定中文提示；
+  配置迁移删除 `kind='ocr'` 模型配置并清除知识库遗留 `ocr`/`ocr_model` 设置。
+- 前端：模型类型收敛为 `embedding` / `reranker` / `vlm` / `jev`；「模型配置」页删除 OCR 页签与
+  引擎下拉，创建知识库删除 OCR 开关/字段（可选模型为 Reranker / VLM），模型卡片改为自适应三列；
+  `api.test.ts`、`CreateKnowledgeBase.test.ts`、`ModelProfilesPage.test.tsx`、`MonitorPage.test.tsx`
+  同步更新。
+- 部署与文档：`docker-compose.yml` 的 `pdf-parser` 删除 torch 构建参数与模型卷、默认 converter 改
+  `vision`；`scripts/start-stack.ps1`、`.env.example` 同步；README、USAGE、DEPLOYMENT、
+  pdf-service README、agents 文档、`AGENTS.md`、GO_MIGRATION/GO_PARITY_AUDIT 的迁移说明更新。
+
+**验证（本工作树实际执行）**
+
+- `cd python-workers/pdf-service && python -m pytest -q`：**176 passed**（离线；视觉客户端注入
+  fake / mock transport，不访问网络）。
+- `go build ./...`：通过。
+- 改动范围定向测试：
+  `go test -count=1 ./internal/config/... ./internal/document/... ./internal/kbconfig/... ./internal/monitor/... ./internal/ingest/...`
+  → `config` / `document` / `document/pdfcontent` / `kbconfig` / `monitor` / `ingest` 全部 **ok**。
+- `internal/runtime`、`internal/httpapi`、`internal/state`、`internal/documentworker` 含依赖真实
+  MySQL 的用例（需 `RAG_TEST_MYSQL_URL`），本次未在该环境执行完整包；其中的纯逻辑用例由 Go 实现
+  方单独确认通过。
+- 前端：`cd frontend && npm run typecheck` 通过；`npm test` → **14 个测试文件 / 188 个用例全部通过**
+  （含本次更新的 api / CreateKnowledgeBase / ModelProfilesPage / MonitorPage 用例）。
+- 文档一致性：在 `README.md`、`docs/**`、`AGENTS.md`、`docker-compose.yml`、`scripts/**`、
+  `.env.example` 中检索 `docling|torch|easyocr|CodeFormula|pdf_parser_models`，剩余命中仅为
+  「兼容别名」「证据契约名（docling-service-v1）」或明确标注「已移除/已废弃」的历史说明。
+
+**未验证 / 限制**
+
+- **真实视觉端点端到端**：未用真实 OpenAI 兼容端点 + 真实 API Key 跑通上传→解析→检索（含限流、
+  超时、失败重试行为）。
+- **真实 PDF 解析质量**：未验证真实扫描件/复杂排版 PDF 的版面、OCR、表格与公式准确率。
+- **Docker**：未构建 `pdf-parser` 镜像，未执行 `docker compose up` / `app` profile。
+- **MySQL 相关测试与迁移**：未在真实 MySQL 上执行依赖 `RAG_TEST_MYSQL_URL` 的测试，也未实机执行
+  升级迁移（`kind='ocr'` 删除、`ocr`/`ocr_model` 清理）的验证与回滚演练。
+- 前端仅有 jsdom/Vitest，没有浏览器 E2E；三张模型卡片的自适应网格窄屏断点未人工点检。

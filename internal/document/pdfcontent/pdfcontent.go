@@ -85,7 +85,7 @@ func ContentChunks(manifest document.PDFManifest, options Options) ([]chunking.C
 			"document_suffix": document.SuffixPDF,
 			"chunking":        config.Metadata(options.TokenizerModel),
 			// The version comes from the parsed manifest so chunks record the
-			// engine that produced the content (Go native or Docling service).
+			// engine that produced the content (Go native or remote vision service).
 			"pdf_parser_version": manifest.Version,
 		},
 		result: make([]chunking.Chunk, 0, 16),

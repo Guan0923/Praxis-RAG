@@ -140,20 +140,20 @@ services:
       - ./deploy/debezium/application.properties:/debezium/config/application.properties:ro
       - debezium_data:/debezium/data
 
-  # PDF parsing microservice: Docling layout/table/OCR/formula pipeline exposed
-  # as an internal HTTP service (FastAPI on :8091). The Go app calls it over
-  # HTTP only when RAG_PDF_ENGINE=docling, so the Go image itself stays
+  # PDF parsing microservice: PyMuPDF reads/renders/crops the PDF locally and
+  # delegates layout, OCR, tables, formulas and picture descriptions to one
+  # remote OpenAI-compatible vision model, exposed as an internal HTTP service
+  # (FastAPI on :8091). The Go app calls it over HTTP only when
+  # RAG_PDF_ENGINE=vision (legacy alias: docling), so the Go image itself stays
   # Python-free. No profile: `docker compose up -d` starts it together with the
-  # infrastructure. Pure-Go text parsing needs no Python/Docling, so deployments
-  # that always use RAG_PDF_ENGINE=go can skip it with
+  # infrastructure. Pure-Go text parsing needs no Python, so deployments that
+  # always use RAG_PDF_ENGINE=go can skip it with
   #   docker compose up -d mysql qdrant redis kafka
   # and/or `docker compose stop pdf-parser`.
-  # First build pulls CPU torch + docling (large image). Formula recognition
-  # needs either RAG_VLM_* (remote OpenAI-compatible VLM, BASE_URL and MODEL
-  # together) or local CodeFormulaV2 weights in the pdf_parser_models volume;
-  # pre-seed the volume with `docling-tools models download --output-dir /models`
-  # plus the CodeFormulaV2 snapshot described in the service README.
-  # See python-workers/pdf-service/README.md.
+  # The image installs no local model weights and needs no model volume. Each
+  # request carries the knowledge base's VLM config; RAG_VLM_* (BASE_URL and
+  # MODEL together) is the service-level fallback. See
+  # python-workers/pdf-service/README.md.
   pdf-parser:
     build:
       context: ./python-workers/pdf-service
@@ -162,10 +162,6 @@ services:
         BASE_IMAGE: ${RAG_PDF_BASE_IMAGE:-python:3.11-slim}
         APT_MIRROR: ${RAG_PDF_APT_MIRROR:-http://deb.debian.org}
         PIP_INDEX_URL: ${RAG_PDF_PIP_INDEX_URL:-https://pypi.org/simple}
-        TORCH_INDEX_URL: ${RAG_PDF_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
-        # Direct wheel mirrors, e.g. https://mirrors.aliyun.com/pytorch-wheels/cpu/...
-        TORCH_WHEEL_URL: ${RAG_PDF_TORCH_WHEEL_URL:-}
-        TORCHVISION_WHEEL_URL: ${RAG_PDF_TORCHVISION_WHEEL_URL:-}
     image: ${RAG_PDF_PARSER_IMAGE:-praxis-rag-pdf-parser:local}
     container_name: praxis-rag-pdf-parser
     restart: unless-stopped
@@ -174,12 +170,12 @@ services:
       # mapping below (sync it with RAG_PDF_SERVICE_URL when overriding).
       RAG_PDF_SERVICE_HOST: "0.0.0.0"
       RAG_PDF_SERVICE_PORT: "8091"
-      RAG_PDF_MODELS_PATH: ${RAG_PDF_MODELS_PATH:-/models}
       RAG_PDF_SERVICE_WORKERS: ${RAG_PDF_SERVICE_WORKERS:-1}
       RAG_PDF_SERVICE_CONCURRENCY: ${RAG_PDF_SERVICE_CONCURRENCY:-1}
-      # Test/integration only: "fake" returns a fixed manifest without loading
-      # Docling. Keep the default "docling" in production.
-      RAG_PDF_SERVICE_CONVERTER: ${RAG_PDF_SERVICE_CONVERTER:-docling}
+      # Test/integration only: "fake" returns a fixed manifest without calling
+      # the vision model. Keep the default "vision" in production.
+      # RAG_PDF_SERVICE_CONVERTER=docling is accepted as a legacy alias.
+      RAG_PDF_SERVICE_CONVERTER: ${RAG_PDF_SERVICE_CONVERTER:-vision}
       # Structured logging: info/debug/warning/error and text/json. RAG_DEBUG_TRACE
       # remains the shared debug switch when the level is unset.
       RAG_PDF_SERVICE_LOG_LEVEL: ${RAG_PDF_SERVICE_LOG_LEVEL:-info}
@@ -187,9 +183,9 @@ services:
       # Parse deadline on the service side as well; the Go client uses the same
       # value as its HTTP timeout.
       RAG_PDF_SERVICE_TIMEOUT: ${RAG_PDF_SERVICE_TIMEOUT:-900}
-      # Formula recognition reuses the same OpenAI-compatible VLM endpoint as
-      # Word picture descriptions; without it pdf-parser falls back to the
-      # local CodeFormula model under RAG_PDF_MODELS_PATH.
+      # Fallback vision model when a request carries no options.vision. PDF
+      # parsing uses the same per-knowledge-base VLM as Word picture
+      # descriptions; BASE_URL and MODEL must be configured together.
       RAG_VLM_BASE_URL: ${RAG_VLM_BASE_URL:-}
       RAG_VLM_API_KEY: ${RAG_VLM_API_KEY:-}
       RAG_VLM_MODEL: ${RAG_VLM_MODEL:-}
@@ -198,14 +194,12 @@ services:
     ports:
       # Internal service with no auth: publish on loopback only.
       - "127.0.0.1:${RAG_PDF_SERVICE_PORT:-8091}:8091"
-    volumes:
-      - pdf_parser_models:/models
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8091/healthz').read()"]
       interval: 15s
       timeout: 5s
       retries: 10
-      start_period: 60s
+      start_period: 30s
 
   # Go backend service. Kept out of the default (infra-only) profile:
   #   docker compose --profile app up -d --build
@@ -255,10 +249,12 @@ services:
       # proves the connector process is up; the binlog capture offset lives in
       # Debezium, so the page still reports capture progress as 未知.
       RAG_DEBEZIUM_HEALTH_URL: ${RAG_APP_DEBEZIUM_HEALTH_URL:-http://debezium:8080/q/health}
-      # PDF parsing: the default docling engine calls the pdf-parser sidecar
-      # over HTTP (zip manifest + assets). Set RAG_PDF_ENGINE=go to use the
-      # in-process text-only parser and drop the pdf-parser dependency.
-      RAG_PDF_ENGINE: ${RAG_PDF_ENGINE:-docling}
+      # PDF parsing: the default vision engine calls the pdf-parser sidecar
+      # over HTTP (zip manifest + assets); the sidecar delegates layout/OCR/
+      # tables/formulas/pictures to the knowledge base's remote VLM. Set
+      # RAG_PDF_ENGINE=go to use the in-process text-only parser and drop the
+      # pdf-parser dependency. Legacy alias: docling == vision.
+      RAG_PDF_ENGINE: ${RAG_PDF_ENGINE:-vision}
       RAG_PDF_SERVICE_URL: ${RAG_PDF_SERVICE_URL:-http://pdf-parser:8091}
       RAG_PDF_SERVICE_TIMEOUT: ${RAG_PDF_SERVICE_TIMEOUT:-900}
       RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
@@ -286,7 +282,6 @@ services:
 volumes:
   kafka_data:
   mysql_data:
-  pdf_parser_models:
   praxis_app_data:
   qdrant_data:
   redis_data:

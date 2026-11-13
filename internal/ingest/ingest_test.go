@@ -294,7 +294,7 @@ func TestPreparePDFInjectedParserAssetsAndArtifacts(t *testing.T) {
 }
 
 func TestPreparePDFRecordsManifestParserVersion(t *testing.T) {
-	for _, version := range []string{document.PDFParserVersionDocling, "docling-formula-remote-v3"} {
+	for _, version := range []string{document.PDFParserVersionService, "docling-formula-remote-v3"} {
 		t.Run(version, func(t *testing.T) {
 			manifest := pdfManifestFixture()
 			manifest.Version = version

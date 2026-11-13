@@ -337,7 +337,7 @@ func preparePDF(ctx context.Context, sourcePath string, options Options) (Result
 }
 
 // pdfMetadata records the parser version carried by the parsed manifest, so
-// documents imported through the Docling engine keep their own version instead
+// documents imported through the remote vision engine keep their own version instead
 // of the in-process default.
 func pdfMetadata(options Options, parserVersion string) map[string]any {
 	return map[string]any{

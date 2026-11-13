@@ -3,8 +3,8 @@ package kbconfig
 // PublicSettings returns the credential-free projection of stored settings
 // (rag_mcp.knowledge_bases.public_settings): the protected provider objects are
 // replaced with {base_url, api_key_set} per kind while every other field
-// (namespace, collection, vector_size, model names including ocr_model,
-// tokenizer, strategy, chunk fields, timestamps, version) is preserved exactly.
+// (namespace, collection, vector_size, model names, tokenizer, strategy, chunk
+// fields, timestamps, version) is preserved exactly.
 //
 // internal/state.CachedReadViews keeps an equivalent copy for cached read
 // models; the two projections must stay in sync.

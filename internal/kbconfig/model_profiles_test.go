@@ -59,25 +59,7 @@ func TestDraftModelProfileValidation(t *testing.T) {
 			draft:   ModelProfileDraft{Model: "BAAI/bge-m3"},
 			message: MessageModelServiceURLRequired,
 		},
-		{
-			name: "ocr empty engine", kind: "ocr", profileName: "ocr",
-			draft:   ModelProfileDraft{Model: " "},
-			message: MessageOCREngineRequired,
-		},
-		{
-			name: "ocr unsupported engine", kind: "ocr", profileName: "ocr",
-			draft:   ModelProfileDraft{Model: "paddleocr"},
-			message: MessageOCREngineInvalid,
-		},
-		{
-			name: "ocr long engine", kind: "ocr", profileName: "ocr",
-			draft:   ModelProfileDraft{Model: longModel},
-			message: MessageModelModelTooLong,
-		},
-		{
-			name: "ocr long name", kind: "ocr", profileName: longName,
-			draft: ModelProfileDraft{Model: "easyocr"}, message: MessageModelProfileNameTooLong,
-		},
+
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -179,38 +161,6 @@ func TestDraftModelProfileKeyPreservation(t *testing.T) {
 	}
 }
 
-func TestDraftModelProfileOCREngine(t *testing.T) {
-	// An OCR draft needs no service URL and no API key: the engine id is stored
-	// as the model, lowercased and trimmed.
-	draft := ModelProfileDraft{Kind: "ocr", Name: " easyocr ", BaseURL: " ", Model: " EasyOCR "}
-	connection, name, err := DraftModelProfile(modelapi.ModelConnection{}, "ocr", draft.Name, draft)
-	if err != nil {
-		t.Fatalf("DraftModelProfile(ocr) error = %v", err)
-	}
-	if name != "easyocr" {
-		t.Fatalf("name = %q", name)
-	}
-	if connection.BaseURL != "" || connection.APIKey != "" || connection.Model != "easyocr" {
-		t.Fatalf("ocr connection = %+v", connection)
-	}
-	if connection.VectorSize != nil {
-		t.Fatalf("ocr connection carries a vector size: %+v", connection)
-	}
-
-	// An update keeps the stored base URL when the form omits it, and drops a
-	// stored API key because OCR has no credential.
-	current := modelapi.ModelConnection{BaseURL: "http://legacy.local/v1", APIKey: "stale-key"}
-	updated, _, err := DraftModelProfile(current, "ocr", "ocr", ModelProfileDraft{
-		Model: "tesseract", APIKey: "ignored", HasAPIKey: true,
-	})
-	if err != nil {
-		t.Fatalf("DraftModelProfile(ocr update) error = %v", err)
-	}
-	if updated.BaseURL != "http://legacy.local/v1" || updated.Model != "tesseract" || updated.APIKey != "" {
-		t.Fatalf("updated ocr connection = %+v", updated)
-	}
-}
-
 func TestProbeModelProfile(t *testing.T) {
 	ctx := context.Background()
 	connection := modelapi.ModelConnection{BaseURL: "http://model.local/v1", Model: "embed-a"}
@@ -234,19 +184,15 @@ func TestProbeModelProfile(t *testing.T) {
 		t.Fatalf("reranker probe calls = %d", prober.rerankerCalls)
 	}
 
-	// VLM, OCR and JEV configurations are never probed: no provider call may
-	// happen.
+	// VLM and JEV configurations are never probed: no provider call may happen.
 	if vectorSize, err := ProbeModelProfile(ctx, connection, "vlm", prober); err != nil || vectorSize != nil {
 		t.Fatalf("vlm probe = %v, %v", vectorSize, err)
-	}
-	if vectorSize, err := ProbeModelProfile(ctx, connection, "ocr", prober); err != nil || vectorSize != nil {
-		t.Fatalf("ocr probe = %v, %v", vectorSize, err)
 	}
 	if vectorSize, err := ProbeModelProfile(ctx, connection, "jev", prober); err != nil || vectorSize != nil {
 		t.Fatalf("jev probe = %v, %v", vectorSize, err)
 	}
 	if prober.embeddingCalls != 1 || prober.rerankerCalls != 1 {
-		t.Fatalf("vlm/ocr/jev probe called the provider: %d/%d", prober.embeddingCalls, prober.rerankerCalls)
+		t.Fatalf("vlm/jev probe called the provider: %d/%d", prober.embeddingCalls, prober.rerankerCalls)
 	}
 
 	if _, err := ProbeModelProfile(ctx, connection, "sql", prober); err == nil {

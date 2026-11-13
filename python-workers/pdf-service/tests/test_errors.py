@@ -11,10 +11,11 @@ from conftest import MINIMAL_PDF, parse_files
 from app.main import (
     EMPTY_FILE_MESSAGE,
     INVALID_PDF_MESSAGE,
+    UNKNOWN_CONVERTER_MESSAGE,
     Settings,
     create_app,
 )
-from app.parser import ParserConversionError, fake_manifest
+from app.parser import NOT_CONFIGURED_MESSAGE, ParserConversionError, fake_manifest
 
 
 class FailingConverter:
@@ -102,10 +103,19 @@ def test_parser_conversion_error_is_returned_safely() -> None:
     assert response.json()["detail"] == "公式为空，文档未索引"
 
 
-def test_unconfigured_converter_returns_503_with_readable_config_error(
+def test_vision_converter_without_any_endpoint_returns_503() -> None:
+    """No options.vision and no RAG_VLM_* -> the documented Chinese 503."""
+    client = TestClient(create_app())
+
+    response = client.post("/v1/parse", files=parse_files(MINIMAL_PDF))
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == NOT_CONFIGURED_MESSAGE
+
+
+def test_partial_vlm_configuration_returns_503_with_readable_config_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("RAG_PDF_SERVICE_CONVERTER", "docling")
     monkeypatch.setenv("RAG_VLM_BASE_URL", "http://vlm.example/v1")
     client = TestClient(create_app())
 
@@ -116,26 +126,20 @@ def test_unconfigured_converter_returns_503_with_readable_config_error(
     assert "RAG_VLM_MODEL" in detail
 
 
-def test_docling_mode_without_docling_returns_readable_503(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import importlib.util
-
-    if importlib.util.find_spec("docling") is not None:
-        pytest.skip("docling is installed; this asserts the missing-dependency message")
-    monkeypatch.setenv("RAG_PDF_SERVICE_CONVERTER", "docling")
-    monkeypatch.setenv("RAG_PDF_MODELS_PATH", "/nonexistent-models")
+def test_invalid_converter_is_a_readable_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RAG_PDF_SERVICE_CONVERTER", "onnx")
     client = TestClient(create_app())
 
     response = client.post("/v1/parse", files=parse_files(MINIMAL_PDF))
 
     assert response.status_code == 503
     detail = response.json()["detail"]
-    assert "Docling is not installed" in detail
+    assert detail.startswith(UNKNOWN_CONVERTER_MESSAGE)
+    assert "RAG_PDF_SERVICE_CONVERTER" in detail
 
 
 def test_conversion_timeout_returns_504() -> None:
-    settings = Settings(converter="docling", timeout=0.05)
+    settings = Settings(converter="vision", timeout=0.05)
     client = TestClient(create_app(settings=settings, converter=SlowConverter()))
 
     response = client.post("/v1/parse", files=parse_files(MINIMAL_PDF))

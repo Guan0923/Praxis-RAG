@@ -852,8 +852,8 @@ h3 {
 }
 .knowledge-provider-grid {
   display: grid;
-  /* Embedding / Reranker / VLM / OCR 四张卡片按 2×2 排列。 */
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  /* Embedding / Reranker / VLM 三张卡片，宽屏一行三列，窄屏逐级降为一列。 */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0 24px;
   border-top: 1px solid var(--line);
   padding: 20px 0 4px;
@@ -861,11 +861,6 @@ h3 {
 .knowledge-provider-grid > .knowledge-provider {
   border-top: 0;
   padding: 0;
-}
-/* 2×2 网格的第二行卡片需要自己的分隔线与上内边距。 */
-.knowledge-provider-grid > .knowledge-provider:nth-child(n + 3) {
-  border-top: 1px solid var(--line);
-  padding-top: 20px;
 }
 .knowledge-base-form-wide .knowledge-chunk-row {
   display: grid;
@@ -881,8 +876,14 @@ h3 {
   min-width: 0;
 }
 @media (max-width: 1023px) {
-  .knowledge-base-form-wide .knowledge-chunk-row {
+  .knowledge-base-form-wide .knowledge-chunk-row,
+  .knowledge-provider-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  /* 2 列时第三张模型卡片换行，需要自己的分隔线与上内边距。 */
+  .knowledge-provider-grid > .knowledge-provider:nth-child(n + 3) {
+    border-top: 1px solid var(--line);
+    padding-top: 20px;
   }
 }
 @media (max-width: 767px) {

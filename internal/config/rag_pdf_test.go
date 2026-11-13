@@ -30,11 +30,13 @@ func TestRagConfigPDFEngineResolution(t *testing.T) {
 		wantEngine string
 		wantURL    string
 	}{
-		{name: "url_selects_docling", serviceURL: "https://docling.internal:8091", wantEngine: PDFEngineDocling, wantURL: "https://docling.internal:8091"},
-		{name: "explicit_go_with_url", engine: "go", serviceURL: "https://docling.internal", wantEngine: PDFEngineGo, wantURL: "https://docling.internal"},
-		{name: "explicit_docling_defaults_url", engine: "docling", wantEngine: PDFEngineDocling, wantURL: DefaultPDFServiceURL},
-		{name: "explicit_docling_keeps_url", engine: "docling", serviceURL: "http://127.0.0.1:9000/", wantEngine: PDFEngineDocling, wantURL: "http://127.0.0.1:9000"},
-		{name: "uppercase_engine", engine: "DOCLING", wantEngine: PDFEngineDocling, wantURL: DefaultPDFServiceURL},
+		{name: "url_selects_vision", serviceURL: "https://vision.internal:8091", wantEngine: PDFEngineVision, wantURL: "https://vision.internal:8091"},
+		{name: "explicit_go_with_url", engine: "go", serviceURL: "https://vision.internal", wantEngine: PDFEngineGo, wantURL: "https://vision.internal"},
+		{name: "explicit_vision_defaults_url", engine: "vision", wantEngine: PDFEngineVision, wantURL: DefaultPDFServiceURL},
+		{name: "explicit_vision_keeps_url", engine: "vision", serviceURL: "http://127.0.0.1:9000/", wantEngine: PDFEngineVision, wantURL: "http://127.0.0.1:9000"},
+		{name: "legacy_docling_alias", engine: "docling", wantEngine: PDFEngineVision, wantURL: DefaultPDFServiceURL},
+		{name: "legacy_docling_alias_keeps_url", engine: "docling", serviceURL: "http://127.0.0.1:9000/", wantEngine: PDFEngineVision, wantURL: "http://127.0.0.1:9000"},
+		{name: "uppercase_engine", engine: "VISION", wantEngine: PDFEngineVision, wantURL: DefaultPDFServiceURL},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -63,7 +65,7 @@ func TestRagConfigRejectsInvalidPDFEngine(t *testing.T) {
 	isolateEnv(t)
 	t.Setenv("RAG_PDF_ENGINE", "poppler")
 	if _, err := RagConfigFromEnv(); err == nil ||
-		err.Error() != "RAG_PDF_ENGINE must be go or docling" {
+		err.Error() != "RAG_PDF_ENGINE must be go or vision (docling is accepted as a legacy alias)" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -71,17 +73,17 @@ func TestRagConfigRejectsInvalidPDFEngine(t *testing.T) {
 func TestRagConfigRejectsInvalidPDFServiceURL(t *testing.T) {
 	isolateEnv(t)
 	for _, invalid := range []string{
-		"ftp://docling.internal:8091",
-		"docling.internal:8091",
-		"http://docling.internal:8091/v1/parse?x=1",
-		"http://docling.internal:8091/path#fragment",
+		"ftp://vision.internal:8091",
+		"vision.internal:8091",
+		"http://vision.internal:8091/v1/parse?x=1",
+		"http://vision.internal:8091/path#fragment",
 	} {
 		t.Setenv("RAG_PDF_SERVICE_URL", invalid)
 		if _, err := RagConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "RAG_PDF_SERVICE_URL") {
 			t.Fatalf("URL %q error = %v", invalid, err)
 		}
 	}
-	t.Setenv("RAG_PDF_SERVICE_URL", "https://docling.internal:8091")
+	t.Setenv("RAG_PDF_SERVICE_URL", "https://vision.internal:8091")
 	if _, err := RagConfigFromEnv(); err != nil {
 		t.Fatalf("valid URL error = %v", err)
 	}
@@ -102,5 +104,17 @@ func TestRagConfigPDFServiceTimeoutBounds(t *testing.T) {
 	}
 	if cfg.PDFServiceTimeout != 7200 {
 		t.Fatalf("PDFServiceTimeout = %d, want 7200", cfg.PDFServiceTimeout)
+	}
+}
+
+func TestIsRemotePDFEngine(t *testing.T) {
+	cases := map[string]bool{
+		PDFEngineGo: false, "": false, "other": false,
+		PDFEngineVision: true, "VISION": true, PDFEngineDocling: true, " Docling ": true,
+	}
+	for engine, want := range cases {
+		if got := IsRemotePDFEngine(engine); got != want {
+			t.Fatalf("IsRemotePDFEngine(%q) = %v, want %v", engine, got, want)
+		}
 	}
 }

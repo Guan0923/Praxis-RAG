@@ -13,7 +13,8 @@ REST 客户端 ──/v1/*────────────┴──> rag-ser
                                        ├─> MySQL（文档/KB/任务/API Key/模型配置/权限/发件箱）
                                        ├─> Redis（读模型缓存、搜索结果快照；可选）
                                        ├─> Kafka（Debezium 文档通知 / 搜索队列；文档处理必需）
-                                       └─> pdf-parser :8091（HTTP，PDF 版面/表格/OCR/公式）
+                                       └─> pdf-parser :8091（HTTP；本地 PyMuPDF 读取/渲染/裁图，
+                                              版面/OCR/表格/公式/图片描述交远端视觉模型）
 
 网页/REST 上传（默认异步）与 MCP add_document
   → MySQL 单事务写 document_jobs + document_job_outbox，返回 artifact_id
@@ -38,7 +39,7 @@ MCP search（配置 Kafka 时）→ search_task_outbox → Kafka → rag-search-
 - **上传默认异步受理**：HTTP 提交点是“任务 + 发件箱”事务提交，而不是解析完成；`add_document` 返回 `artifact_id` 不代表已可检索，只有 `succeeded` 才算发布完成。
 - **检索默认同步**（REST/Console），只有配置了 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时 MCP `search` 才切换为排队模式。
 - **文档解析必须走 Kafka**：`rag-service` 不内嵌文档消费者；未配置 Kafka + Debezium + `rag-document-worker` 时，上传仍会受理，但文档任务停留在 `queued`。
-- **PDF 双引擎**：`RAG_PDF_ENGINE=docling`（compose `app` 默认；为空时按是否配置 `RAG_PDF_SERVICE_URL` 决定）走 pdf-parser；`go` 使用 Go 进程内纯文本引擎。
+- **PDF 双引擎**：`RAG_PDF_ENGINE=vision`（compose `app` 默认；为空时按是否配置 `RAG_PDF_SERVICE_URL` 决定）走 pdf-parser，由远端 OpenAI 兼容视觉模型完成版面/OCR/表格/公式/图片描述；旧值 `docling` 作为兼容别名等价于 `vision`；`go` 使用 Go 进程内纯文本引擎。pdf-service 本地不加载任何模型权重。
 
 ## 2. 进程与可执行文件
 
@@ -52,7 +53,7 @@ MCP search（配置 Kafka 时）→ search_task_outbox → Kafka → rag-search-
 | `rag-service-migrate` | 旧知识源（`~/.mini_agent`）预览/导入（**不重建向量**） | `cmd/rag-service-migrate/main.go` |
 | `rag-mcp-ingest` | 本地文件/目录批量导入（走运行时上传管线） | `cmd/rag-mcp-ingest/main.go` |
 | `rag-mcp-debug` | 无 Qdrant/模型的 mock 检索调试 | `cmd/rag-mcp-debug/main.go` |
-| `pdf-parser`（容器） | Docling PDF 解析微服务，`POST /v1/parse` 返回 zip（`manifest.json` + 图片资产） | `python-workers/pdf-service/app/main.py` |
+| `pdf-parser`（容器） | PDF 视觉解析微服务：本地 PyMuPDF 读取/渲染/裁图，远端视觉模型完成版面/OCR/表格/公式/图片描述，`POST /v1/parse` 返回 zip（`manifest.json` + 图片资产） | `python-workers/pdf-service/app/main.py` |
 
 退出码约定：`0` 正常停止 / `1` 运行时失败 / `2` 配置或用法错误。
 
@@ -62,7 +63,7 @@ MCP search（配置 Kafka 时）→ search_task_outbox → Kafka → rag-search-
 cmd/                        各可执行入口（见上表）
 internal/                   Go 业务实现（按包见下表）
 frontend/                   Console（React + Vite，测试与源文件同目录）
-python-workers/pdf-service/  Docling PDF 解析微服务（独立镜像，不在 Go 构建内）
+python-workers/pdf-service/  PDF 视觉解析微服务（独立镜像，本地无模型，不在 Go 构建内）
 deploy/                     compose 用容器配置、Debezium 配置、MySQL 初始化脚本
 scripts/                    build-go.ps1/.sh、start-stack、stop-stack、verify-*.py
 docs/                       使用、部署、权限、迁移、状态存储、缓存等文档
@@ -83,11 +84,11 @@ examples/knowledge/         示例知识文档（可直接上传试用）
 | `chunking` | 五类切分策略、参数校验与切分实现 |
 | `config` | 环境变量、`~/.praxis-rag/config.toml`、启动校验 |
 | `contracts` | 检索/MCP 请求契约、JSON Schema、错误语义 |
-| `document` | PDF 原生解析、Docling 客户端、DOCX、DOC 转换、公式、VLM、图片/表格资产 |
+| `document` | PDF 原生解析、PDF 视觉服务客户端、DOCX、DOC 转换、公式、VLM、图片/表格资产 |
 | `documentworker` | 文档任务处理器（仅由 Kafka 消费者 `rag-document-worker` 调用） |
 | `httpapi` | REST 路由、认证中间件、OpenAPI、Console 静态资源 |
 | `ingest` | “解析 → 切分 → Embedding → Qdrant 发布”管线 |
-| `kbconfig` | 知识库模型连接、模型配置（profiles）、OCR 配置 |
+| `kbconfig` | 知识库模型连接、模型配置（profiles；kind 为 embedding/reranker/vlm/jev，无 ocr） |
 | `mcp` | MCP 端点、工具、资源、提示词、权限 scope |
 | `migrate` | 旧知识源导入与状态迁移 |
 | `modelapi` | Embedding / Reranker HTTP 客户端 |

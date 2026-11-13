@@ -67,9 +67,9 @@ func (s *Service) ModelProfile(ctx context.Context, id string) (map[string]any, 
 
 // CreateModelProfile validates one saved model configuration, probes the
 // provider (embedding records the dense dimension, reranker validates access,
-// VLM, OCR and JEV are not probed), then persists it. Duplicate (kind, name)
-// pairs are a conflict; the key is stored protected with the shared state
-// encryption key.
+// VLM and JEV are not probed), then persists it. Duplicate (kind, name) pairs
+// are a conflict; the key is stored protected with the shared state encryption
+// key.
 func (s *Service) CreateModelProfile(ctx context.Context, draft kbconfig.ModelProfileDraft) (map[string]any, error) {
 	connection, name, err := kbconfig.DraftModelProfile(modelapi.ModelConnection{}, draft.Kind, draft.Name, draft)
 	if err != nil {

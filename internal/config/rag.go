@@ -19,15 +19,20 @@ const DefaultRerankerModel = "BAAI/bge-reranker-base"
 // tenant-created knowledge bases when RAG_DEFAULT_KB_TEMPLATE is not set.
 const DefaultKBTemplateNamespace = "default"
 
-// PDF engines accepted by RAG_PDF_ENGINE.
+// PDF engines accepted by RAG_PDF_ENGINE. PDFEngineVision selects the remote
+// vision parse service; PDFEngineDocling is its legacy configuration alias and
+// is canonicalized to PDFEngineVision when configuration is loaded.
 const (
 	// PDFEngineGo parses PDF text in-process with the pure-Go reader.
 	PDFEngineGo = "go"
-	// PDFEngineDocling parses PDFs through the remote Docling service.
+	// PDFEngineVision parses PDFs through the remote vision parse service.
+	PDFEngineVision = "vision"
+	// PDFEngineDocling is the legacy name of PDFEngineVision, accepted as a
+	// compatibility alias for RAG_PDF_ENGINE.
 	PDFEngineDocling = "docling"
 )
 
-// DefaultPDFServiceURL is used when the Docling engine is selected without an
+// DefaultPDFServiceURL is used when the vision engine is selected without an
 // explicit RAG_PDF_SERVICE_URL, so host-local deployments start without extra
 // configuration.
 const DefaultPDFServiceURL = "http://127.0.0.1:8091"
@@ -73,10 +78,11 @@ type RagConfig struct {
 	WordConverterPath  string
 	WordConvertTimeout int
 	// PDFEngine selects the PDF parser: "go" (in-process pure-Go text
-	// extraction) or "docling" (remote Docling parse service).
+	// extraction) or "vision" (remote vision parse service). The legacy
+	// "docling" value is canonicalized to "vision" on load.
 	PDFEngine string
-	// PDFServiceURL is the base URL of the remote Docling parse service
-	// (RAG_PDF_SERVICE_URL). When the Docling engine is selected without an
+	// PDFServiceURL is the base URL of the remote vision parse service
+	// (RAG_PDF_SERVICE_URL). When the vision engine is selected without an
 	// explicit URL it defaults to DefaultPDFServiceURL.
 	PDFServiceURL string
 	// PDFServiceTimeout bounds one remote parse call in seconds
@@ -178,7 +184,7 @@ func RagConfigFromEnv() (RagConfig, error) {
 	if err != nil {
 		return RagConfig{}, err
 	}
-	if pdfEngine == PDFEngineDocling && pdfServiceURL == "" {
+	if pdfEngine == PDFEngineVision && pdfServiceURL == "" {
 		pdfServiceURL = DefaultPDFServiceURL
 	}
 	pdfServiceTimeout, err := integerEnv("RAG_PDF_SERVICE_TIMEOUT", 900, 1, 7200)
@@ -254,7 +260,7 @@ func parseVLMBaseURL(raw string) (string, error) {
 	return strings.TrimRight(value, "/"), nil
 }
 
-// parsePDFServiceURL validates the remote Docling parse service base URL. It
+// parsePDFServiceURL validates the remote vision parse service base URL. It
 // must be an absolute http(s) URL without a query or fragment because the
 // client appends the fixed /v1/parse path. Empty means "not configured".
 func parsePDFServiceURL(raw string) (string, error) {
@@ -272,19 +278,36 @@ func parsePDFServiceURL(raw string) (string, error) {
 	return strings.TrimRight(value, "/"), nil
 }
 
-// parsePDFEngine validates RAG_PDF_ENGINE. An empty value selects the Docling
-// service when a service URL is configured and the in-process parser otherwise.
+// parsePDFEngine validates RAG_PDF_ENGINE. "vision" selects the remote vision
+// parse service; the legacy "docling" value is accepted as an alias and
+// canonicalized to "vision". An empty value selects the vision service when a
+// service URL is configured and the in-process parser otherwise.
 func parsePDFEngine(raw, serviceURL string) (string, error) {
 	switch value := strings.ToLower(strings.TrimSpace(raw)); value {
 	case "":
 		if serviceURL != "" {
-			return PDFEngineDocling, nil
+			return PDFEngineVision, nil
 		}
 		return PDFEngineGo, nil
-	case PDFEngineGo, PDFEngineDocling:
+	case PDFEngineGo, PDFEngineVision:
 		return value, nil
+	case PDFEngineDocling:
+		return PDFEngineVision, nil
 	default:
-		return "", fmt.Errorf("RAG_PDF_ENGINE must be go or docling")
+		return "", fmt.Errorf("RAG_PDF_ENGINE must be go or vision (docling is accepted as a legacy alias)")
+	}
+}
+
+// IsRemotePDFEngine reports whether engine names the remote PDF parse service.
+// The legacy "docling" alias is accepted so callers can compare without
+// normalizing the value themselves; configuration loading already canonicalizes
+// it to "vision".
+func IsRemotePDFEngine(engine string) bool {
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case PDFEngineVision, PDFEngineDocling:
+		return true
+	default:
+		return false
 	}
 }
 
