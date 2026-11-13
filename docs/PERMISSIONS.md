@@ -80,6 +80,14 @@ GET /v1/namespaces                       # 当前账号可用的知识库列表
 GET /v1/knowledge-bases/{namespace}/access
 ```
 
+`GET /v1/namespaces` 返回 `{"namespaces": [...], "owned_namespaces": [...]}`，响应带 `Cache-Control: no-store`：
+
+- 登录会话：`namespaces` 是本人创建的与被邀请授权的知识库（管理员为全部）；`owned_namespaces` 是其中本人创建的子集（管理员同样只包含本人创建的）。
+- API Key（`Authorization: Bearer <key>`；`X-RAG-Namespace` 可选且在此端点被忽略）：只返回该凭据绑定的知识库范围，`namespaces` 与 `owned_namespaces` 都是这一范围，不会返回凭据之外的知识库。
+- `RAG_SERVICE_TOKEN` 与本机无会话直连：沿用管理凭证语义，返回全部知识库。
+- 权限服务不可用或权限查询失败时返回 HTTP 500 与明确的 `detail`（`知识库权限服务异常` / `知识库权限服务未配置`），不会回退成全部知识库。
+- 该端点不要求 `X-RAG-Namespace`：浏览器记住的 namespace 已失效、或 API Key 被改绑到其它知识库时，仍能拿到该凭据当前的授权范围，Console 据此自动纠正选择；其他 `/v1/*` 租户接口仍要求 header 属于凭据绑定范围（否则返回 HTTP 403 `API Key 未获授权访问此 Namespace`）。
+
 `access` 返回：
 
 ```json
@@ -166,12 +174,12 @@ POST /v1/invitations/decline            # {"token": "..."}
   - 管理员：看到全部密钥（含历史无主密钥），「所有者」列显示账号名，历史密钥显示「—（未绑定）」；可以管理任意密钥、为任意知识库创建密钥。
   - VIP / 普通用户：只看到自己创建的密钥；查看/修改/删除/导出其他账号的密钥返回 HTTP 404 `API Key 不存在`。
 - **创建与管理**：任意登录角色都可以打开 Console 的「API Key」页管理自己的密钥。非管理员只能把密钥绑定到**本人拥有**的知识库（`knowledge_bases.owner_user_id` 等于本人）；绑定他人的知识库返回 HTTP 403，detail 为 `只能为本人创建的知识库创建 API Key`。管理员不受此限制。
-- **可用知识库列表**：`GET /v1/namespaces` 增加附加字段 `owned_namespaces`：会话账号返回本人拥有的知识库（管理员返回的是管理员自己拥有的，而不是全部）；本机无会话模式等于全部。控制台 API Key 页用它限制普通账号可选的 Namespace。
+- **可用知识库列表**：`GET /v1/namespaces` 增加附加字段 `owned_namespaces`：会话账号返回本人拥有的知识库（管理员返回的是管理员自己拥有的，而不是全部）；本机无会话模式等于全部。控制台 API Key 页用它限制普通账号可选的 Namespace。会话的 `namespaces` 始终只包含自有与获授权知识库；API Key 调用该接口时 `namespaces`/`owned_namespaces` 都收敛为密钥自身的授权范围。
 - **本机 break-glass**：没有登录会话时，本机 loopback 直连仍可管理凭证（保留旧行为）：可以看到全部密钥，并创建无主密钥（`owner_user_id` 为空，之后只有管理员或本机管理能看到）。
 - **账号删除级联**：删除账号时一并删除该账号拥有的 API Key，正在使用这些密钥的应用立即失效。
 - **账号禁用与角色降级**：禁用账号会吊销登录会话，但不会自动停用其已签发的 API Key；如需立即吊销请删除账号（级联删除），或由管理员/本机删除、停用相关密钥。管理员被降级为普通账号后，其在管理员任期内签发的密钥仍然有效（含绑定他人知识库的密钥）；这类密钥可以改名、停用或删除，但更新时只校验**新增**的 Namespace，不能再把密钥扩大到非本人知识库。
 - **兼容性**：五条管理路由路径保持不变——`GET/POST /v1/admin/api-keys`、`PUT/DELETE /v1/admin/api-keys/{key_id}`、`GET /v1/admin/api-keys/{key_id}/mcp-config`；但鉴权不再是"仅本机或管理员"：任意角色的登录会话都可管理自己的密钥（Cookie 写操作需 `X-CSRF-Token`），无会话时仅接受可信本机管理。这些响应均为 `Cache-Control: no-store`。
-- **租户认证不变**：API Key 用于 `/v1/*` 与 `/mcp` 时仍按 `Authorization: Bearer <key>` + `X-RAG-Namespace` 校验，密钥自身的 namespace 白名单照旧生效，请求时不再做额外的知识库归属校验。
+- **租户认证不变（唯一例外：知识库列表）**：API Key 用于 `/v1/*` 与 `/mcp` 时仍按 `Authorization: Bearer <key>` + `X-RAG-Namespace` 校验，密钥自身的 namespace 白名单照旧生效，请求时不再做额外的知识库归属校验。`GET /v1/namespaces` 例外：它只校验凭据本身，不要求也不校验 `X-RAG-Namespace`，这样改绑或轮换后的密钥仍能读出自己的授权范围（详见第 7.1 节）。
 
 ## 10. 已知限制
 

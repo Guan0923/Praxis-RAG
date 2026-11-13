@@ -418,7 +418,11 @@ export async function apiResponse(
   const headers = new Headers(options.headers);
   if (!headers.has("Accept")) headers.set("Accept", "application/json");
   if (connection) {
-    headers.set("X-RAG-Namespace", connection.namespace);
+    // An empty namespace means "this request is not namespace-scoped" (used by
+    // the namespace listing, which must keep working with a stale remembered
+    // namespace); omit the header instead of sending an invalid empty value.
+    if (connection.namespace)
+      headers.set("X-RAG-Namespace", connection.namespace);
     if (connection.token)
       headers.set("Authorization", `Bearer ${connection.token}`);
   }
@@ -1138,11 +1142,13 @@ function normalizeInvitation(invitation: InvitationView): InvitationView {
 }
 
 // fetchInvitationInbox lists the current account's invitations (pending first).
-export async function fetchInvitationInbox(): Promise<InvitationView[]> {
+export async function fetchInvitationInbox(
+  options: { signal?: AbortSignal } = {},
+): Promise<InvitationView[]> {
   const payload = await api<{ invitations: InvitationView[] }>(
     "/v1/invitations",
     undefined,
-    { cache: "no-store" },
+    { cache: "no-store", signal: options.signal },
   );
   return (payload.invitations || []).map(normalizeInvitation);
 }

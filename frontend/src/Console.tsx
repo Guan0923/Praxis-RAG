@@ -60,10 +60,12 @@ import { PermissionsPage } from "./PermissionsPage";
 import {
   canViewConsolePage,
   readStoredInviteToken,
+  routeForNamespace,
   storeInviteToken,
   useConsoleRoute,
   type ConsolePage,
 } from "./navigation";
+import { useWorkspaces, workspacePagesAccessible } from "./workspaces";
 
 const pages = [
   { key: "search", label: "检索调试", icon: <SearchOutlined /> },
@@ -111,15 +113,35 @@ export function Console({
   const [healthError, setHealthError] = useState("");
   const [checking, setChecking] = useState(false);
   const healthRequest = useRef<AbortController | null>(null);
-  const [workspaceNames, setWorkspaceNames] = useState<string[]>([]);
-  const [ownedNamespaces, setOwnedNamespaces] = useState<string[]>([]);
-  const [loadingWorkspaces, setLoadingWorkspaces] = useState(false);
-  const [workspaceError, setWorkspaceError] = useState(false);
-  const workspaceRequest = useRef<AbortController | null>(null);
   const [inbox, setInbox] = useState<InvitationView[]>([]);
   const [inboxLoading, setInboxLoading] = useState(false);
   const [inboxError, setInboxError] = useState("");
   const [inboxRevision, setInboxRevision] = useState(0);
+  // inboxRequest aborts the previous inbox fetch and inboxGeneration drops a
+  // response that belongs to an account which already signed out; both keep one
+  // user's invitations from landing in another user's notification bell.
+  const inboxRequest = useRef<AbortController | null>(null);
+  const inboxGeneration = useRef(0);
+  // The identity the route namespace was last synced for: a change means the
+  // account switched rather than an initial/auto-corrected namespace, which
+  // decides whether a stale document detail route has to be dropped.
+  const syncedWorkspaceIdentity = useRef<string | null>(null);
+  // The workspace-selection lifecycle: load GET /v1/namespaces once the
+  // session identity is known, validate/restore/auto-correct the selection,
+  // persist it per user and drop everything when the account changes. Legacy
+  // API-key mode keeps the historical shared key and falls back to the old
+  // namespace-driven behaviour while loading or after a list error.
+  const workspaceIdentityReady = authReady && (!sessionMode || Boolean(authUser));
+  const workspaces = useWorkspaces({
+    enabled: workspaceIdentityReady,
+    sessionMode,
+    userId: authUser?.id,
+    connection,
+  });
+  const workspaceNames = workspaces.namespaces;
+  const ownedNamespaces = workspaces.ownedNamespaces;
+  const workspaceError = Boolean(workspaces.error);
+  const workspaceEmpty = workspaces.empty;
 
   async function loadAuth() {
     setAuthReady(false);
@@ -156,31 +178,53 @@ export function Console({
   // The invitation inbox drives the header notification bell. It only exists
   // for console sessions; legacy API-key mode has no per-user inbox.
   const loadInbox = useCallback(async () => {
+    // Invalidate every earlier response before starting: the identity or the
+    // revision may have changed while the previous request was in flight.
+    const generation = ++inboxGeneration.current;
+    inboxRequest.current?.abort();
     if (!sessionMode || !authUser) {
+      inboxRequest.current = null;
       setInbox([]);
+      setInboxError("");
+      setInboxLoading(false);
       return;
     }
+    const controller = new AbortController();
+    inboxRequest.current = controller;
     setInboxLoading(true);
     try {
-      const rows = await fetchInvitationInbox();
+      const rows = await fetchInvitationInbox({ signal: controller.signal });
+      if (controller.signal.aborted || generation !== inboxGeneration.current) return;
       setInbox(rows);
       setInboxError("");
     } catch (error) {
+      if (controller.signal.aborted || generation !== inboxGeneration.current) return;
       setInboxError(errorText(error));
     } finally {
-      setInboxLoading(false);
+      if (!controller.signal.aborted && generation === inboxGeneration.current)
+        setInboxLoading(false);
     }
   }, [sessionMode, authUser]);
 
   useEffect(() => {
     if (!sessionMode || !authUser) {
+      inboxGeneration.current += 1;
+      inboxRequest.current?.abort();
+      inboxRequest.current = null;
       setInbox([]);
       setInboxError("");
+      setInboxLoading(false);
       return;
     }
     void loadInbox();
     const timer = setInterval(() => void loadInbox(), inviteBellPollMs);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      // Account switch/unmount: a response from the previous identity must not
+      // reach the next account's bell.
+      inboxGeneration.current += 1;
+      inboxRequest.current?.abort();
+    };
   }, [sessionMode, authUser, inboxRevision, loadInbox]);
 
   // Keep the raw invitation token while the visitor authenticates: the login
@@ -212,48 +256,23 @@ export function Console({
     void message.success("已退出登录");
   }
 
-  async function loadWorkspaces() {
-    workspaceRequest.current?.abort();
-    const controller = new AbortController();
-    workspaceRequest.current = controller;
-    setLoadingWorkspaces(true);
-    setWorkspaceError(false);
-    setWorkspaceNames([]);
-    setOwnedNamespaces([]);
-    try {
-      const data = await api<{ namespaces: string[]; owned_namespaces?: string[] }>(
-        "/v1/namespaces", connection, { signal: controller.signal, cache: "no-store" },
-      );
-      if (!controller.signal.aborted) {
-        setWorkspaceNames(data.namespaces);
-        // Legacy/no-session responses have no owned_namespaces field: there the
-        // caller may bind every namespace, exactly like the namespaces list.
-        setOwnedNamespaces(data.owned_namespaces ?? data.namespaces);
-      }
-    } catch (error) {
-      if (!controller.signal.aborted) {
-        setWorkspaceError(true);
-        void message.error(errorText(error));
-      }
-    } finally {
-      if (!controller.signal.aborted) setLoadingWorkspaces(false);
-    }
-  }
-
+  // Keep the route namespace in sync with the validated selection: a restored
+  // or auto-corrected namespace must also drive the page connection, while an
+  // explicit workspace switch sets both sides at once. `replace` avoids a
+  // history entry per correction and never fights a user selection. The same
+  // rule applies to legacy no-session mode, where a remembered namespace can be
+  // invalid too.
   useEffect(() => {
-    // A direct link to #/api-keys can mount before the login state is known:
-    // reload once the account (or legacy no-session mode) is available.
-    if (view === "api-keys" && (!sessionMode || authUser)) void loadWorkspaces();
-    return () => workspaceRequest.current?.abort();
-  }, [view, sessionMode, authUser]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem("rag.namespace", namespace);
-    } catch {
-      void message.error("浏览器无法保存工作区，请检查存储权限");
-    }
-  }, [namespace, message]);
+    if (!workspaces.settled || workspaces.error || !workspaces.namespace) return;
+    // The first settled identity is not a switch: a deep link opened by the
+    // same account keeps its document detail. A later identity means the
+    // previous account's document detail route must be dropped.
+    const identityChanged = syncedWorkspaceIdentity.current !== null
+      && syncedWorkspaceIdentity.current !== workspaces.identity;
+    syncedWorkspaceIdentity.current = workspaces.identity;
+    if (!identityChanged && route.namespace === workspaces.namespace) return;
+    navigate(routeForNamespace(route, workspaces.namespace, identityChanged), true);
+  }, [workspaces.settled, workspaces.error, workspaces.namespace, workspaces.identity, route, navigate]);
 
   async function refreshHealth() {
     healthRequest.current?.abort();
@@ -300,15 +319,53 @@ export function Console({
     void message.success(notice);
     return true;
   }
-  function switchWorkspace(namespace: string) {
-    saveConnection({ ...connection, namespace }, "知识库已切换");
+  function switchWorkspace(next: string) {
+    // Persist the per-user selection immediately, then drive the route so the
+    // existing namespace/remount behaviour is preserved.
+    workspaces.select(next);
+    saveConnection({ ...connection, namespace: next }, "知识库已切换");
   }
+  // workspaceSelected prefers the validated selection over the route: the route
+  // correction runs in an effect, one render later, so the selector must never
+  // briefly show the previous account's namespace.
+  const workspaceSelected = workspaces.namespace || namespace;
+  // workspaceLabel annotates the selector while the accessible list is not
+  // usable yet instead of showing a stale/guessed namespace. Once settled it
+  // prefers the hook's validated namespace over the route, which is corrected
+  // in an effect one render later.
+  const workspaceLabel = !workspaces.settled
+    ? sessionMode ? "加载中…" : namespace
+    : workspaces.error
+      ? sessionMode ? "加载失败" : namespace
+      : workspaceEmpty
+        ? workspaces.loading ? "加载中…" : "暂无可访问的知识库"
+        : workspaces.namespace || namespace;
+  // Namespace-dependent pages stay unmounted until access is proven: with a
+  // console session we must not fire /v1/documents or search requests against a
+  // namespace the account may no longer access. Legacy mode only falls back to
+  // historical behaviour while loading/after an error; an empty settled list
+  // stops the pages there too.
+  const workspaceSyncing = Boolean(
+    workspaces.settled && !workspaces.error && !workspaceEmpty
+    && workspaces.namespace && route.namespace !== workspaces.namespace,
+  );
+  const namespaceAccessible = workspacePagesAccessible({
+    sessionMode,
+    settled: workspaces.settled,
+    error: workspaces.error,
+    empty: workspaceEmpty,
+    syncing: workspaceSyncing,
+  });
+  const workspaceGateVisible = Boolean(
+    (view === "search" || view === "documents") && !namespaceAccessible
+    && (sessionMode || workspaces.settled),
+  );
   const themeLabel = dark ? "切换浅色主题" : "切换深色主题";
 
   if (!authReady) {
     return (
       <div className="auth-shell">
-        <Spin size="large" tip="正在检查登录状态…" />
+        <Spin size="large" description="正在检查登录状态…" />
       </div>
     );
   }
@@ -359,6 +416,25 @@ export function Console({
   ];
   const visiblePages = pages.filter((page) =>
     canViewConsolePage(page.key, sessionMode, authUser?.role));
+  // The selector's menu doubles as its status display: loading, explicit
+  // failure + retry, the exact "no accessible knowledge base" copy, or the
+  // accessible list.
+  const workspaceMenuItems: MenuProps["items"] =
+    workspaces.loading && (workspaceEmpty || !workspaces.settled)
+      ? [{ key: ":status", disabled: true, label: "加载中…" }]
+      : workspaces.error
+        ? [
+            { key: ":status", disabled: true, label: "知识库列表加载失败" },
+            { key: ":retry", label: "重试", icon: <ReloadOutlined /> },
+          ]
+        : workspaceEmpty
+          ? [{ key: ":status", disabled: true, label: "暂无可访问的知识库" }]
+          : !workspaces.settled
+            ? [{ key: ":status", disabled: true, label: "加载中…" }]
+            : workspaces.namespaces.map((name) => ({
+                key: name,
+                label: <span className="workspace-option">{name}</span>,
+              }));
 
   return (
     <div className="console-shell">
@@ -398,26 +474,29 @@ export function Console({
           {(view === "search" || view === "documents") && (
             <Dropdown
               trigger={["click"]}
-              onOpenChange={(open) => { if (open) void loadWorkspaces(); }}
+              onOpenChange={(open) => { if (open) void workspaces.reload(); }}
               disabled={uploading}
               menu={{
                 selectable: true,
-                selectedKeys: [connection.namespace],
-                items: loadingWorkspaces || workspaceError || workspaceNames.length === 0 ? [{
-                  key: ":status",
-                  label: loadingWorkspaces ? "加载中…" : workspaceError ? "知识库列表加载失败" : "暂无知识库",
-                  disabled: true,
-                }] : workspaceNames.map((name) => ({
-                  key: name,
-                  label: <span className="workspace-option">{name}</span>,
-                })),
+                selectedKeys: workspaceSelected ? [workspaceSelected] : [],
+                items: workspaceMenuItems,
                 onClick: ({ key }) => {
-                  if (key !== connection.namespace) switchWorkspace(key);
+                  if (key === ":retry") {
+                    void workspaces.reload();
+                    return;
+                  }
+                  if (key.startsWith(":")) return;
+                  if (key !== workspaceSelected) switchWorkspace(key);
                 },
               }}
             >
-              <Button className="workspace-switch" aria-label="选择知识库" disabled={uploading}>
-                <span className="workspace-name">{connection.namespace}</span>
+              <Button
+                className="workspace-switch"
+                aria-label="选择知识库"
+                disabled={uploading}
+                title={workspaceLabel}
+              >
+                <span className="workspace-name">{workspaceLabel}</span>
                 <DownOutlined />
               </Button>
             </Dropdown>
@@ -501,41 +580,82 @@ export function Console({
               description={healthError}
             />
           )}
-          <div key={`${namespace}:${revision}`}>
-            <section hidden={view !== "search"} aria-label="检索调试页面">
-              <SearchPage connection={connection} onHealth={refreshHealth} />
-            </section>
-            <section hidden={view !== "documents" || documentName !== undefined} aria-label="知识文档页面">
-              <DocumentsPage
-                connection={connection}
-                active={view === "documents" && documentName === undefined}
-                authEnabled={sessionMode}
-                onOpenDocument={(name) => navigate({ namespace, page: "documents", documentName: name })}
-                uploading={uploading}
-                onUploading={setUploading}
-                onHealth={refreshHealth}
-              />
-            </section>
-            {view === "documents" && documentName !== undefined && (
-              <section aria-label="文档详情页面">
-                <div className="page-heading document-heading">
-                  <Tooltip title="返回知识文档">
-                    <Button
-                      aria-label="返回知识文档"
-                      icon={<ArrowLeftOutlined />}
-                      onClick={() => navigate({ namespace, page: "documents" })}
-                    />
-                  </Tooltip>
-                  <h1>{documentName}</h1>
+          {sessionMode && workspaces.error && !workspaceGateVisible && (
+            <Alert
+              className="page-alert"
+              type="error"
+              showIcon
+              title="知识库列表加载失败"
+              description={workspaces.error}
+              action={<Button size="small" onClick={() => void workspaces.reload()}>重试</Button>}
+            />
+          )}
+          {workspaceGateVisible && (
+            <section aria-label="知识库访问状态">
+              {workspaceError ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  title="知识库列表加载失败"
+                  description={workspaces.error}
+                  action={<Button onClick={() => void workspaces.reload()}>重试</Button>}
+                />
+              ) : workspaceEmpty ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  title="暂无可访问的知识库"
+                  description="你还没有可访问的知识库。请先创建一个知识库，或联系管理员为你分配访问权限。"
+                  action={(
+                    <Button type="primary" onClick={() => navigate({ namespace, page: "create" })}>
+                      创建知识库
+                    </Button>
+                  )}
+                />
+              ) : (
+                <div className="auth-shell">
+                  <Spin size="large" description="正在加载知识库…" />
                 </div>
-                <DocumentPreview
-                  key={`${revision}:${documentName}`}
-                  name={documentName}
+              )}
+            </section>
+          )}
+          {namespaceAccessible && (
+            <div key={`${authUser?.id ?? "legacy"}:${namespace}:${revision}`}>
+              <section hidden={view !== "search"} aria-label="检索调试页面">
+                <SearchPage connection={connection} onHealth={refreshHealth} />
+              </section>
+              <section hidden={view !== "documents" || documentName !== undefined} aria-label="知识文档页面">
+                <DocumentsPage
                   connection={connection}
+                  active={view === "documents" && documentName === undefined}
+                  authEnabled={sessionMode}
+                  onOpenDocument={(name) => navigate({ namespace, page: "documents", documentName: name })}
+                  uploading={uploading}
+                  onUploading={setUploading}
+                  onHealth={refreshHealth}
                 />
               </section>
-            )}
-          </div>
+              {view === "documents" && documentName !== undefined && (
+                <section aria-label="文档详情页面">
+                  <div className="page-heading document-heading">
+                    <Tooltip title="返回知识文档">
+                      <Button
+                        aria-label="返回知识文档"
+                        icon={<ArrowLeftOutlined />}
+                        onClick={() => navigate({ namespace, page: "documents" })}
+                      />
+                    </Tooltip>
+                    <h1>{documentName}</h1>
+                  </div>
+                  <DocumentPreview
+                    key={`${revision}:${documentName}`}
+                    name={documentName}
+                    connection={connection}
+                  />
+                </section>
+              )}
+            </div>
+          )}
           {view === "api-keys" && (!sessionMode || authUser) && (
             <ApiKeysPage
               namespaces={workspaceNames}
@@ -579,7 +699,11 @@ export function Console({
               authEnabled={sessionMode}
               onHandled={() => setInboxRevision((value) => value + 1)}
               onOpenNamespace={(next) => {
+                // Accepting an invitation can expose a new namespace: select it
+                // before the route change and refresh the accessible list.
+                workspaces.select(next);
                 saveConnection({ ...connection, namespace: next }, "已切换到知识库", "documents");
+                void workspaces.reload();
               }}
               onBack={() => navigate({ namespace, page: "invitations" })}
             />
@@ -591,9 +715,13 @@ export function Console({
             <CreateKnowledgeBase active={view === "create"} disabled={uploading}
               connection={connection} role={authUser?.role}
               onOpenModelProfiles={() => navigate({ namespace, page: "model-profiles" })}
-              onCreated={(namespace) => {
-                if (saveConnection({ ...connection, namespace }, "已切换到新知识库")) {
-                  navigate({ namespace, page: "documents" });
+              onCreated={(next) => {
+                // Select the freshly created namespace and refresh the list so
+                // the selector/correction logic sees it as accessible.
+                workspaces.select(next);
+                if (saveConnection({ ...connection, namespace: next }, "已切换到新知识库")) {
+                  navigate({ namespace: next, page: "documents" });
+                  void workspaces.reload();
                 }
               }} />
           </section>

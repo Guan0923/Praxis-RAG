@@ -30,16 +30,42 @@ func namespaceFromHeader(r *http.Request) (string, bool) {
 	return value, true
 }
 
+// tenantIdentity is the authenticated caller of one tenant route. session is set
+// for Console login sessions; keyNamespaces carries the namespaces bound to an
+// API-key credential (kept from the authentication lookup so handlers such as
+// the namespace list can filter without resolving the secret twice).
+type tenantIdentity struct {
+	namespace     string
+	session       *auth.SessionUser
+	keyNamespaces []string
+}
+
 // tenantFromHeaders resolves the tenant namespace for a request. It returns the
 // namespace, or writes the HTTP error and returns ok=false.
 func (s *Server) tenantFromHeaders(w http.ResponseWriter, r *http.Request) (string, bool) {
-	namespace, _, ok := s.tenantFromRequest(w, r)
-	return namespace, ok
+	identity, ok := s.tenantFromRequest(w, r)
+	return identity.namespace, ok
 }
 
-// tenantFromRequest is tenantFromHeaders plus the login session that
-// authenticated the request (nil for API-key/service-token/loopback access).
-func (s *Server) tenantFromRequest(w http.ResponseWriter, r *http.Request) (string, *auth.SessionUser, bool) {
+// tenantFromRequest is tenantFromHeaders plus the credential identity: the login
+// session for Console sessions, or the namespaces an API key is bound to.
+func (s *Server) tenantFromRequest(w http.ResponseWriter, r *http.Request) (tenantIdentity, bool) {
+	return s.tenantFromRequestWith(w, r, false)
+}
+
+// tenantFromListingRequest authenticates GET /v1/namespaces: the endpoint
+// reports the credential's own accessible scope, so it must not require an
+// X-RAG-Namespace that is still authorized. Otherwise a rotated API key (or a
+// namespace remembered from another account in legacy Console mode) could never
+// read the list again and the Console could not recover. Credential checks are
+// identical to tenantFromRequest; only the namespace header is optional and,
+// when present, ignored.
+func (s *Server) tenantFromListingRequest(w http.ResponseWriter, r *http.Request) (tenantIdentity, bool) {
+	return s.tenantFromRequestWith(w, r, true)
+}
+
+// tenantFromRequestWith implements both tenant authentication variants.
+func (s *Server) tenantFromRequestWith(w http.ResponseWriter, r *http.Request, namespaceOptional bool) (tenantIdentity, bool) {
 	authorization := r.Header.Get("Authorization")
 
 	// Console login sessions (cookies, or a bearer session token) take
@@ -50,63 +76,78 @@ func (s *Server) tenantFromRequest(w http.ResponseWriter, r *http.Request) (stri
 			if err == nil && session != nil {
 				if !s.validateCSRF(r, session, viaCookie) {
 					writeDetail(w, http.StatusForbidden, "CSRF 校验失败，请刷新页面后重试")
-					return "", nil, false
+					return tenantIdentity{}, false
+				}
+				if namespaceOptional {
+					return tenantIdentity{session: session}, true
 				}
 				namespace, ok := namespaceFromHeader(r)
 				if !ok {
 					writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
-					return "", nil, false
+					return tenantIdentity{}, false
 				}
-				return namespace, session, true
+				return tenantIdentity{namespace: namespace, session: session}, true
 			}
 		}
 	}
 
 	if s.settings.Token != "" && secureEqual(authorization, "Bearer "+s.settings.Token) {
+		if namespaceOptional {
+			return tenantIdentity{}, true
+		}
 		namespace, ok := namespaceFromHeader(r)
 		if !ok {
 			writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
-			return "", nil, false
+			return tenantIdentity{}, false
 		}
-		return namespace, nil, true
+		return tenantIdentity{namespace: namespace}, true
 	}
 
 	if strings.HasPrefix(authorization, "Bearer ") {
 		secret := strings.TrimPrefix(authorization, "Bearer ")
 		if s.keys == nil {
 			writeDetail(w, http.StatusUnauthorized, "RAG service authentication failed.")
-			return "", nil, false
+			return tenantIdentity{}, false
 		}
 		namespaces, err := s.keys.NamespacesForKey(r.Context(), secret)
 		if err != nil {
 			writeDetail(w, http.StatusUnauthorized, err.Error())
-			return "", nil, false
+			return tenantIdentity{}, false
+		}
+		// The list endpoint answers with the credential's binding itself: a
+		// stale header is ignored instead of rejected so a rotated key can
+		// recover through the Console.
+		if namespaceOptional {
+			return tenantIdentity{keyNamespaces: namespaces}, true
 		}
 		namespace, ok := namespaceFromHeader(r)
 		if !ok {
 			writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
-			return "", nil, false
+			return tenantIdentity{}, false
 		}
 		for _, candidate := range namespaces {
 			if candidate == namespace {
-				return namespace, nil, true
+				return tenantIdentity{namespace: namespace, keyNamespaces: namespaces}, true
 			}
 		}
 		writeDetail(w, http.StatusForbidden, "API Key 未获授权访问此 Namespace")
-		return "", nil, false
+		return tenantIdentity{}, false
 	}
 
 	if authorization == "" && s.settings.Token == "" && localModelRequest(r) {
+		if namespaceOptional {
+			return tenantIdentity{}, true
+		}
 		namespace, ok := namespaceFromHeader(r)
 		if !ok {
 			writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
-			return "", nil, false
+			return tenantIdentity{}, false
 		}
-		return namespace, nil, true
+		return tenantIdentity{namespace: namespace}, true
 	}
 
 	writeDetail(w, http.StatusUnauthorized, "RAG service authentication failed.")
-	return "", nil, false
+	return tenantIdentity{}, false
 }
 
 // requireAdmin protects the management endpoints. An explicit login session is

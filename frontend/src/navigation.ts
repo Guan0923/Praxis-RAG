@@ -125,6 +125,22 @@ export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRout
   }
 }
 
+// routeForNamespace mirrors one validated workspace selection into the route.
+// When the selection changed because another account signed in
+// (identityChanged), a document detail name from the previous account is
+// dropped: that document belongs to the previous account, so the new session
+// lands on its own document list instead of a stale detail URL.
+export function routeForNamespace(
+  route: ConsoleRoute,
+  namespace: string,
+  identityChanged: boolean,
+): ConsoleRoute {
+  if (identityChanged && route.page === "documents" && route.documentName !== undefined) {
+    return { namespace, page: "documents" };
+  }
+  return { ...route, namespace };
+}
+
 export function routeHash(route: ConsoleRoute) {
   if (
     route.page === "api-keys" ||

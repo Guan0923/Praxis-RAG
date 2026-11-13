@@ -100,48 +100,56 @@ func (s *Server) handleNamespaceList(w http.ResponseWriter, r *http.Request) {
 			namespaces = append(namespaces, name)
 		}
 	}
-	// A login session only sees knowledge bases it owns or holds grants in;
-	// management credentials keep the full list. `owned_namespaces` is the
-	// stricter binding set used by the per-account API-key page (a normal
-	// account may only scope a key to knowledge bases it created).
+	// A login session only sees knowledge bases it owns or holds grants in and
+	// fails closed when ownership enforcement is not wired; an API key only sees
+	// the namespaces bound to the credential. Management credentials (the
+	// service token and session-less loopback requests) keep the full list.
+	// `owned_namespaces` is the stricter binding set used by the per-account
+	// API-key page (a normal account may only scope a key to knowledge bases it
+	// created).
 	response := map[string]any{"namespaces": namespaces, "owned_namespaces": namespaces}
-	if session, ok := sessionUserFromContext(r.Context()); ok && s.access != nil {
+	if session, ok := sessionUserFromContext(r.Context()); ok {
+		if s.access == nil {
+			writeDetail(w, http.StatusInternalServerError, "知识库权限服务未配置")
+			return
+		}
 		visible, err := s.access.VisibleNamespaces(r.Context(), session.User)
 		if err != nil {
 			writeDetail(w, http.StatusInternalServerError, "知识库权限服务异常")
 			return
 		}
-		allowed := make(map[string]struct{}, len(visible))
-		for _, name := range visible {
-			allowed[name] = struct{}{}
-		}
-		filtered := make([]string, 0, len(visible))
-		for _, name := range namespaces {
-			if _, ok := allowed[name]; ok {
-				filtered = append(filtered, name)
-			}
-		}
-		namespaces = filtered
 		owned, err := s.access.OwnedNamespaces(r.Context(), session.User)
 		if err != nil {
 			writeDetail(w, http.StatusInternalServerError, "知识库权限服务异常")
 			return
 		}
-		ownedAllowed := make(map[string]struct{}, len(owned))
-		for _, name := range owned {
-			ownedAllowed[name] = struct{}{}
-		}
-		ownedVisible := make([]string, 0, len(owned))
-		for _, name := range namespaces {
-			if _, ok := ownedAllowed[name]; ok {
-				ownedVisible = append(ownedVisible, name)
-			}
-		}
-		response["namespaces"] = namespaces
-		response["owned_namespaces"] = ownedVisible
+		visible = filterNamespaceNames(namespaces, visible)
+		response["namespaces"] = visible
+		response["owned_namespaces"] = filterNamespaceNames(visible, owned)
+	} else if keyNamespaces, ok := apiKeyNamespacesFromContext(r.Context()); ok {
+		scoped := filterNamespaceNames(namespaces, keyNamespaces)
+		response["namespaces"] = scoped
+		response["owned_namespaces"] = scoped
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, response)
+}
+
+// filterNamespaceNames keeps the merged knowledge-base list order and drops
+// names outside the allowed set, so concurrent credential scope and merged-list
+// changes never reorder the response.
+func filterNamespaceNames(namespaces, allowed []string) []string {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, name := range allowed {
+		allowedSet[name] = struct{}{}
+	}
+	filtered := make([]string, 0, len(namespaces))
+	for _, name := range namespaces {
+		if _, ok := allowedSet[name]; ok {
+			filtered = append(filtered, name)
+		}
+	}
+	return filtered
 }
 
 type createKnowledgeBaseBody struct {

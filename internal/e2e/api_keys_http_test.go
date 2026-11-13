@@ -45,7 +45,10 @@ func apiKeysHandler(t *testing.T, h *harness) http.Handler {
 		SessionTTL:          time.Hour,
 	})
 	sharing := access.NewService(h.Stores, access.Options{InvitationTTL: time.Hour})
-	server := httpapi.New(settings, nil, nil, testLogger(),
+	// The stored-credential service is wired both as the management store and as
+	// the tenant KeyLookup, so Bearer API keys authenticate and scope tenant
+	// routes exactly like the real service does.
+	server := httpapi.New(settings, nil, apikeys.New(h.Stores.APIKeys), testLogger(),
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: h.Service}),
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: h.Service}),
 		httpapi.WithKnowledgeBaseSelfCreateRuntime(wire.HTTPRuntime{Service: h.Service}),
@@ -54,6 +57,31 @@ func apiKeysHandler(t *testing.T, h *harness) http.Handler {
 		httpapi.WithAPIKeyStore(apikeys.New(h.Stores.APIKeys)),
 	)
 	return server.Handler()
+}
+
+// apiKeyBearerRequest performs one tenant request authenticated with a stored
+// API-key secret. The remote address is deliberately non-loopback so the
+// assertion proves the credential path instead of the local break-glass route.
+func apiKeyBearerRequest(
+	t *testing.T, handler http.Handler, method, target, secret string, headers map[string]string,
+) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	request := httptest.NewRequest(method, target, nil)
+	request.RemoteAddr = "10.0.0.9:5000"
+	request.Host = "127.0.0.1:8011"
+	request.Header.Set("Authorization", "Bearer "+secret)
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	decoded := map[string]any{}
+	if recorder.Body.Len() > 0 {
+		if err := json.Unmarshal(recorder.Body.Bytes(), &decoded); err != nil {
+			t.Fatalf("decode %s %s (%d): %v body=%s", method, target, recorder.Code, err, recorder.Body.String())
+		}
+	}
+	return recorder, decoded
 }
 
 // localAPIKeysRequest performs one session-less loopback management request.
@@ -187,6 +215,36 @@ func TestAPIKeyIsolationEndToEnd(t *testing.T) {
 	}
 	if payload["owner_user_id"] != alice.id {
 		t.Fatalf("alice key owner_user_id = %v, want %q", payload["owner_user_id"], alice.id)
+	}
+
+	// The Bearer credential only sees the knowledge bases it is bound to: the
+	// namespace list is intersected with the key binding in both fields, so the
+	// full tenant list never leaks through owned_namespaces.
+	recorder, payload = apiKeyBearerRequest(t, handler, http.MethodGet, "/v1/namespaces",
+		aliceSecret, map[string]string{"X-RAG-Namespace": "alice-kb"})
+	requireStatus(t, recorder, http.StatusOK, "alice key namespace list")
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("alice key namespace list Cache-Control = %q", got)
+	}
+	assertAPIKeysStringSet(t, apiKeysStringArray(t, payload["namespaces"]),
+		[]string{"alice-kb"}, "alice key namespaces")
+	assertAPIKeysStringSet(t, apiKeysStringArray(t, payload["owned_namespaces"]),
+		[]string{"alice-kb"}, "alice key owned_namespaces")
+	// The list is namespace-agnostic: no X-RAG-Namespace (or a stale one) still
+	// returns exactly the credential binding, so a rotated key can recover.
+	recorder, payload = apiKeyBearerRequest(t, handler, http.MethodGet, "/v1/namespaces",
+		aliceSecret, nil)
+	requireStatus(t, recorder, http.StatusOK, "alice key headerless namespace list")
+	assertAPIKeysStringSet(t, apiKeysStringArray(t, payload["namespaces"]),
+		[]string{"alice-kb"}, "alice key headerless namespaces")
+	assertAPIKeysStringSet(t, apiKeysStringArray(t, payload["owned_namespaces"]),
+		[]string{"alice-kb"}, "alice key headerless owned_namespaces")
+	// Tenant routes keep the strict namespace binding: only the listing is exempt.
+	recorder, payload = apiKeyBearerRequest(t, handler, http.MethodGet, "/v1/documents",
+		aliceSecret, map[string]string{"X-RAG-Namespace": "bob-kb"})
+	requireStatus(t, recorder, http.StatusForbidden, "alice key reaches bob-kb")
+	if detail := detailOf(payload); detail != "API Key 未获授权访问此 Namespace" {
+		t.Fatalf("alice key foreign namespace detail = %q", detail)
 	}
 
 	// Both accounts only see their own list.

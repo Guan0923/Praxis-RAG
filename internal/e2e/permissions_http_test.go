@@ -237,6 +237,15 @@ func TestPermissionsInvitationFlowEndToEnd(t *testing.T) {
 	if containsString(payload["namespaces"], "team") {
 		t.Fatalf("vip sees an unshared knowledge base: %v", payload)
 	}
+	// An account with no owned or granted knowledge base gets empty lists.
+	recorder, payload = plain.json(http.MethodGet, "/v1/namespaces", "alpha", nil)
+	requireStatus(t, recorder, http.StatusOK, "unaffiliated namespace list")
+	if namespaces, _ := payload["namespaces"].([]any); len(namespaces) != 0 {
+		t.Fatalf("unaffiliated account sees namespaces: %v", payload)
+	}
+	if owned, _ := payload["owned_namespaces"].([]any); len(owned) != 0 {
+		t.Fatalf("unaffiliated account owns namespaces: %v", payload)
+	}
 	recorder, payload = vip.json(http.MethodGet, "/v1/knowledge-bases/team/access", "", nil)
 	requireStatus(t, recorder, http.StatusForbidden, "vip access before invite")
 	if detail := detailOf(payload); detail != access.MessageKnowledgeAccess {

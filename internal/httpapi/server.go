@@ -163,7 +163,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/documents/{name}/content", authTenant, s.handleDocumentContent)
 	s.router.add("DELETE", "/v1/documents/{name}", authTenant, s.handleDeleteDocument)
 	s.router.add("GET", "/v1/knowledge-base", authTenant, s.handleKnowledgeBase)
-	s.router.add("GET", "/v1/namespaces", authTenant, s.handleNamespaceList)
+	s.router.add("GET", "/v1/namespaces", authTenantList, s.handleNamespaceList)
 	s.router.add("GET", "/v1/uploads", authTenant, s.handleUploadStatusList)
 	s.router.add("GET", "/v1/uploads/{operation_id}", authTenant, s.handleUploadStatusDetail)
 	s.router.add("GET", "/v1/admin/published-versions", authNone, s.handlePublishedVersions)
@@ -234,19 +234,40 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch result.route.policy {
 	case authTenant:
-		namespace, session, ok := s.tenantFromRequest(recorder, r)
+		identity, ok := s.tenantFromRequest(recorder, r)
 		if !ok {
 			return
 		}
-		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, namespace))
-		if session != nil {
+		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, identity.namespace))
+		if identity.session != nil {
 			// Login sessions are subject to knowledge-base ownership/permission
 			// filtering; API keys, the service token and session-less loopback
 			// requests stay unrestricted.
-			r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, session))
-			if r = s.withAccessScope(recorder, r, session.User, namespace); r == nil {
+			r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, identity.session))
+			if r = s.withAccessScope(recorder, r, identity.session.User, identity.namespace); r == nil {
 				return
 			}
+		} else if identity.keyNamespaces != nil {
+			// API keys keep their bound namespace set in the request context so
+			// list endpoints such as /v1/namespaces can narrow the merged list
+			// instead of exposing every knowledge base to the credential.
+			r = r.WithContext(context.WithValue(r.Context(), apiKeyNamespacesContextKey{}, identity.keyNamespaces))
+		}
+	case authTenantList:
+		// GET /v1/namespaces is namespace-agnostic: it only needs the caller's
+		// credential identity, because it reports that credential's own scope.
+		// A stale/revoked remembered X-RAG-Namespace must not block it, or an
+		// API key rotated to new namespaces could never recover in the Console.
+		// The handler filters by session/API-key itself, so no access scope is
+		// installed here.
+		identity, ok := s.tenantFromListingRequest(recorder, r)
+		if !ok {
+			return
+		}
+		if identity.session != nil {
+			r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, identity.session))
+		} else if identity.keyNamespaces != nil {
+			r = r.WithContext(context.WithValue(r.Context(), apiKeyNamespacesContextKey{}, identity.keyNamespaces))
 		}
 	case authSession:
 		// The sharing endpoints always act for one Console account and never use
@@ -288,15 +309,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			writeDetail(recorder, http.StatusUnauthorized, "MCP 请求必须提供 Authorization: Bearer <API_KEY>")
 			return
 		}
-		namespace, session, ok := s.tenantFromRequest(recorder, r)
+		identity, ok := s.tenantFromRequest(recorder, r)
 		if !ok {
 			return
 		}
-		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, namespace))
-		if session != nil {
+		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, identity.namespace))
+		if identity.session != nil {
 			// A session bearer token resolves the same scope REST uses, and the
 			// MCP layer reads it through access.ScopeFromContext.
-			if r = s.withAccessScope(recorder, r, session.User, namespace); r == nil {
+			if r = s.withAccessScope(recorder, r, identity.session.User, identity.namespace); r == nil {
 				return
 			}
 		}

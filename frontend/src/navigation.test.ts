@@ -4,6 +4,7 @@ import {
   namespacePattern,
   parseInviteToken,
   parseRoute,
+  routeForNamespace,
   routeHash,
 } from "./navigation";
 
@@ -136,6 +137,40 @@ describe("routeHash", () => {
     for (const route of routes) {
       expect(parseRoute(routeHash(route), route.namespace)).toEqual(route);
     }
+  });
+});
+
+describe("routeForNamespace", () => {
+  it("mirrors the validated namespace while keeping the current page", () => {
+    expect(routeForNamespace({ namespace: "old", page: "search" }, "new", false)).toEqual({
+      namespace: "new",
+      page: "search",
+    });
+    expect(
+      routeForNamespace({ namespace: "old", page: "documents", documentName: "a.md" }, "new", false),
+    ).toEqual({ namespace: "new", page: "documents", documentName: "a.md" });
+  });
+
+  it("drops a document detail name when the account identity changed", () => {
+    expect(
+      routeForNamespace({ namespace: "old", page: "documents", documentName: "a.md" }, "new", true),
+    ).toEqual({ namespace: "new", page: "documents" });
+    expect(routeForNamespace({ namespace: "old", page: "documents" }, "new", true)).toEqual({
+      namespace: "new",
+      page: "documents",
+    });
+  });
+
+  it("keeps invite tokens and unrelated pages intact", () => {
+    expect(routeForNamespace({ namespace: "old", page: "invite", token: "t" }, "new", true)).toEqual({
+      namespace: "new",
+      page: "invite",
+      token: "t",
+    });
+    expect(routeForNamespace({ namespace: "old", page: "permissions" }, "new", true)).toEqual({
+      namespace: "new",
+      page: "permissions",
+    });
   });
 });
 

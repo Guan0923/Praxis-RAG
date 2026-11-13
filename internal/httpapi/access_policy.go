@@ -68,6 +68,18 @@ func sessionUserFromContext(ctx context.Context) (*auth.SessionUser, bool) {
 	return session, ok
 }
 
+// apiKeyNamespacesContextKey carries the namespaces bound to the API-key
+// credential that authenticated a tenant route.
+type apiKeyNamespacesContextKey struct{}
+
+// apiKeyNamespacesFromContext returns the API-key binding set attached by
+// serveHTTP. The boolean reports whether an API key authenticated the request;
+// it is absent for login sessions, the service token and session-less loopback.
+func apiKeyNamespacesFromContext(ctx context.Context) ([]string, bool) {
+	namespaces, ok := ctx.Value(apiKeyNamespacesContextKey{}).([]string)
+	return namespaces, ok
+}
+
 // requireSession authenticates the Console login session for an authSession
 // route. Unlike the legacy tenant/admin policies there is no loopback fallback:
 // the sharing endpoints always act on behalf of one account.

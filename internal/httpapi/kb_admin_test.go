@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -386,9 +387,14 @@ func TestNamespaceListReturnsNamesForTenantSessions(t *testing.T) {
 	users := &fakeUserAuth{
 		sessions: map[string]*auth.SessionUser{"user-token": userSession("user-token")},
 	}
+	control := &fakeAccessControl{
+		visible: map[string][]string{"u-user": {"alpha", "beta"}},
+		owned:   map[string][]string{"u-user": {"alpha"}},
+	}
 	handler := New(settings, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		WithKnowledgeBaseAdminRuntime(adminRuntime),
 		WithUserAuth(users),
+		WithAccessControl(control),
 	).Handler()
 
 	anonymous := performRequest(handler, testRequest{
@@ -406,8 +412,274 @@ func TestNamespaceListReturnsNamesForTenantSessions(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
 	}
-	namespaces, _ := decodeBody(t, response)["namespaces"].([]any)
+	body := decodeBody(t, response)
+	namespaces, _ := body["namespaces"].([]any)
 	if len(namespaces) != 2 || namespaces[0] != "alpha" || namespaces[1] != "beta" {
-		t.Fatalf("namespaces = %v", decodeBody(t, response)["namespaces"])
+		t.Fatalf("namespaces = %v", body["namespaces"])
+	}
+	owned, _ := body["owned_namespaces"].([]any)
+	if len(owned) != 1 || owned[0] != "alpha" {
+		t.Fatalf("owned_namespaces = %v", body["owned_namespaces"])
+	}
+	if got := response.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	// Sessions also list without X-RAG-Namespace: the route only needs the
+	// session identity, so a stale remembered namespace cannot block the list.
+	headerless := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "10.0.0.9:5000",
+		headers: cookieFor("user-token"),
+	})
+	if headerless.Code != http.StatusOK {
+		t.Fatalf("headerless session status = %d body = %s", headerless.Code, headerless.Body.String())
+	}
+	headerlessBody := decodeBody(t, headerless)
+	if namespaces, _ := headerlessBody["namespaces"].([]any); len(namespaces) != 2 ||
+		namespaces[0] != "alpha" || namespaces[1] != "beta" {
+		t.Fatalf("headerless session namespaces = %v", headerlessBody["namespaces"])
+	}
+	if owned, _ := headerlessBody["owned_namespaces"].([]any); len(owned) != 1 || owned[0] != "alpha" {
+		t.Fatalf("headerless session owned_namespaces = %v", headerlessBody["owned_namespaces"])
+	}
+}
+
+// namespaceListRuntime builds the knowledge-base list used by the /v1/namespaces
+// credential-scope tests.
+func namespaceListRuntime() *fakeKBAdminRuntime {
+	return &fakeKBAdminRuntime{
+		fakeDocRuntime: newFakeDocRuntime(),
+		listPayload: []map[string]any{
+			{"namespace": "alpha"},
+			{"namespace": "beta"},
+			{"namespace": "gamma"},
+		},
+	}
+}
+
+func namespaceListStrings(t *testing.T, raw any) []string {
+	t.Helper()
+	values, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("expected a string array, got %v", raw)
+	}
+	decoded := make([]string, 0, len(values))
+	for _, value := range values {
+		text, ok := value.(string)
+		if !ok {
+			t.Fatalf("expected a string array, got %v", raw)
+		}
+		decoded = append(decoded, text)
+	}
+	return decoded
+}
+
+// TestNamespaceListAPIKeyScope covers the API-key branch: a Bearer credential
+// only sees the knowledge bases it is bound to in both fields.
+func TestNamespaceListAPIKeyScope(t *testing.T) {
+	adminRuntime := namespaceListRuntime()
+	keys := fakeKeys{"prk_alice": {"gamma", "alpha", "missing-kb"}}
+	handler := New(testSettings(""), nil, keys, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithKnowledgeBaseAdminRuntime(adminRuntime),
+	).Handler()
+
+	scoped := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "10.0.0.9:5000",
+		headers: map[string]string{
+			"Authorization":   "Bearer prk_alice",
+			"X-RAG-Namespace": "alpha",
+		},
+	})
+	if scoped.Code != http.StatusOK {
+		t.Fatalf("scoped status = %d body = %s", scoped.Code, scoped.Body.String())
+	}
+	if got := scoped.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	body := decodeBody(t, scoped)
+	if namespaces := namespaceListStrings(t, body["namespaces"]); len(namespaces) != 2 ||
+		namespaces[0] != "alpha" || namespaces[1] != "gamma" {
+		t.Fatalf("namespaces = %v, want merged-list order of the key binding", body["namespaces"])
+	}
+	if owned := namespaceListStrings(t, body["owned_namespaces"]); len(owned) != 2 ||
+		owned[0] != "alpha" || owned[1] != "gamma" {
+		t.Fatalf("owned_namespaces = %v, want the key binding", body["owned_namespaces"])
+	}
+
+	// GET /v1/namespaces is namespace-agnostic: it must answer without
+	// X-RAG-Namespace (and ignore a stale one), otherwise a rotated API key
+	// could never recover its scope in the Console.
+	headerless := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "10.0.0.9:5000",
+		headers: map[string]string{"Authorization": "Bearer prk_alice"},
+	})
+	if headerless.Code != http.StatusOK {
+		t.Fatalf("headerless status = %d body = %s", headerless.Code, headerless.Body.String())
+	}
+	headerlessBody := decodeBody(t, headerless)
+	if namespaces := namespaceListStrings(t, headerlessBody["namespaces"]); len(namespaces) != 2 ||
+		namespaces[0] != "alpha" || namespaces[1] != "gamma" {
+		t.Fatalf("headerless namespaces = %v, want the key binding", headerlessBody["namespaces"])
+	}
+
+	stale := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "10.0.0.9:5000",
+		headers: map[string]string{
+			"Authorization":   "Bearer prk_alice",
+			"X-RAG-Namespace": "beta",
+		},
+	})
+	if stale.Code != http.StatusOK {
+		t.Fatalf("stale-header status = %d body = %s", stale.Code, stale.Body.String())
+	}
+	staleBody := decodeBody(t, stale)
+	if namespaces := namespaceListStrings(t, staleBody["namespaces"]); len(namespaces) != 2 ||
+		namespaces[0] != "alpha" || namespaces[1] != "gamma" {
+		t.Fatalf("stale-header namespaces = %v, want the key binding", staleBody["namespaces"])
+	}
+
+	// Tenant routes keep the strict header binding; only the namespace listing
+	// is exempt, so the credential still cannot authenticate a foreign namespace.
+	denied := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/documents", remote: "10.0.0.9:5000",
+		headers: map[string]string{
+			"Authorization":   "Bearer prk_alice",
+			"X-RAG-Namespace": "beta",
+		},
+	})
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("denied status = %d body = %s", denied.Code, denied.Body.String())
+	}
+	if detail := decodeBody(t, denied)["detail"]; detail != "API Key 未获授权访问此 Namespace" {
+		t.Fatalf("denied detail = %v", detail)
+	}
+}
+
+// TestNamespaceListManagementCredentialsUnfiltered keeps the service token and
+// session-less loopback behaviour: both fields list every merged knowledge base.
+func TestNamespaceListManagementCredentialsUnfiltered(t *testing.T) {
+	adminRuntime := namespaceListRuntime()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	tokenHandler := New(testSettings("test-token"), nil, nil, logger,
+		WithKnowledgeBaseAdminRuntime(adminRuntime)).Handler()
+	tokenList := performRequest(tokenHandler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "10.0.0.9:5000",
+		headers: map[string]string{
+			"Authorization":   "Bearer test-token",
+			"X-RAG-Namespace": "alpha",
+		},
+	})
+	if tokenList.Code != http.StatusOK {
+		t.Fatalf("service-token status = %d body = %s", tokenList.Code, tokenList.Body.String())
+	}
+	tokenBody := decodeBody(t, tokenList)
+	for _, field := range []string{"namespaces", "owned_namespaces"} {
+		if namespaces := namespaceListStrings(t, tokenBody[field]); len(namespaces) != 3 ||
+			namespaces[0] != "alpha" || namespaces[1] != "beta" || namespaces[2] != "gamma" {
+			t.Fatalf("service-token %s = %v, want the full merged list", field, tokenBody[field])
+		}
+	}
+
+	loopbackHandler := New(testSettings(""), nil, nil, logger,
+		WithKnowledgeBaseAdminRuntime(adminRuntime)).Handler()
+	loopbackList := performRequest(loopbackHandler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "127.0.0.1:5000",
+		headers: map[string]string{"X-RAG-Namespace": "alpha"},
+	})
+	if loopbackList.Code != http.StatusOK {
+		t.Fatalf("loopback status = %d body = %s", loopbackList.Code, loopbackList.Body.String())
+	}
+	loopbackBody := decodeBody(t, loopbackList)
+	for _, field := range []string{"namespaces", "owned_namespaces"} {
+		if namespaces := namespaceListStrings(t, loopbackBody[field]); len(namespaces) != 3 {
+			t.Fatalf("loopback %s = %v, want the full merged list", field, loopbackBody[field])
+		}
+	}
+
+	// Management credentials also work without X-RAG-Namespace.
+	tokenHeaderless := performRequest(tokenHandler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "10.0.0.9:5000",
+		headers: map[string]string{"Authorization": "Bearer test-token"},
+	})
+	if tokenHeaderless.Code != http.StatusOK {
+		t.Fatalf("service-token headerless status = %d body = %s", tokenHeaderless.Code, tokenHeaderless.Body.String())
+	}
+	for _, field := range []string{"namespaces", "owned_namespaces"} {
+		if namespaces := namespaceListStrings(t, decodeBody(t, tokenHeaderless)[field]); len(namespaces) != 3 {
+			t.Fatalf("service-token headerless %s = %v, want the full merged list", field, namespaces)
+		}
+	}
+	loopbackHeaderless := performRequest(loopbackHandler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "127.0.0.1:5000",
+	})
+	if loopbackHeaderless.Code != http.StatusOK {
+		t.Fatalf("loopback headerless status = %d body = %s", loopbackHeaderless.Code, loopbackHeaderless.Body.String())
+	}
+	for _, field := range []string{"namespaces", "owned_namespaces"} {
+		if namespaces := namespaceListStrings(t, decodeBody(t, loopbackHeaderless)[field]); len(namespaces) != 3 {
+			t.Fatalf("loopback headerless %s = %v, want the full merged list", field, namespaces)
+		}
+	}
+}
+
+// TestNamespaceListFailsClosedWithoutAccessControl pins the explicit 500 when a
+// login session reaches the namespace list without the ownership service.
+func TestNamespaceListFailsClosedWithoutAccessControl(t *testing.T) {
+	users := &fakeUserAuth{sessions: map[string]*auth.SessionUser{"user-token": userSession("user-token")}}
+	handler := New(authTestSettings(), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WithKnowledgeBaseAdminRuntime(namespaceListRuntime()),
+		WithUserAuth(users),
+	).Handler()
+
+	response := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/namespaces", remote: "10.0.0.9:5000",
+		headers: sessionHeaders("user-token", "alpha"),
+	})
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+	if detail := decodeBody(t, response)["detail"]; detail != "知识库权限服务未配置" {
+		t.Fatalf("detail = %v", detail)
+	}
+}
+
+// TestNamespaceListAccessServiceErrors pins the explicit 500 for both
+// permission-service lookups instead of silently returning the full list.
+func TestNamespaceListAccessServiceErrors(t *testing.T) {
+	users := &fakeUserAuth{sessions: map[string]*auth.SessionUser{"user-token": userSession("user-token")}}
+	cases := []struct {
+		name    string
+		control *fakeAccessControl
+	}{
+		{
+			name:    "visible namespaces error",
+			control: &fakeAccessControl{visibleErr: errors.New("visible failed")},
+		},
+		{
+			name: "owned namespaces error",
+			control: &fakeAccessControl{
+				visible:  map[string][]string{"u-user": {"alpha"}},
+				ownedErr: errors.New("owned failed"),
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			handler := New(authTestSettings(), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+				WithKnowledgeBaseAdminRuntime(namespaceListRuntime()),
+				WithUserAuth(users),
+				WithAccessControl(testCase.control),
+			).Handler()
+			response := performRequest(handler, testRequest{
+				method: "GET", target: "/v1/namespaces", remote: "10.0.0.9:5000",
+				headers: sessionHeaders("user-token", "alpha"),
+			})
+			if response.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+			}
+			if detail := decodeBody(t, response)["detail"]; detail != "知识库权限服务异常" {
+				t.Fatalf("detail = %v", detail)
+			}
+		})
 	}
 }

@@ -22,6 +22,11 @@ const (
 	// management break-glass. It protects the per-account API-key management
 	// routes, which every signed-in account uses for its own credentials.
 	authSessionOrLocal
+	// authTenantList is authTenant for the namespace listing only: the
+	// credentials are checked the same way, but X-RAG-Namespace is optional
+	// because the endpoint reports the credential's own scope
+	// (see tenantFromListingRequest).
+	authTenantList
 )
 
 // route is one method+path registration. Patterns use "{name}" for a single
