@@ -113,6 +113,11 @@ migration CLI.
 | `search_tasks` | `result_id` | **legacy, inactive** search parameters, deadline and task state |
 | `search_task_outbox` | `result_id` | **legacy, inactive** initial search-message delivery |
 | `search_result_snapshots` | `result_id` | **legacy, inactive** SQL search snapshots; not a Redis fallback |
+| `users` | `id`, unique `username`, unique nullable `email` | Console accounts: PBKDF2 password hash, role/enabled, profile columns `email_verified`/`age`/`gender` |
+| `user_sessions` | `id`, unique `token_digest` | issued login sessions; only the token digest and CSRF token are stored |
+| `user_avatars` | `user_id` | one profile image per account (`LONGBLOB`, ≤2 MiB); the users projection only joins its `updated_at` |
+| `email_verification_codes` | `id` | registration / e-mail-change codes: SHA-256 digest, purpose, attempts, expiry; issued codes invalidate older ones |
+| `app_settings` | `setting_key` | Console-editable settings; the `mail` row holds the SMTP configuration with its password protected as `enc:v1:` |
 
 Identifier columns (`namespace`, document `name`, `digest`, blob `key`) use a
 binary collation in MySQL so `Alpha` and `alpha` do not collapse into one row.

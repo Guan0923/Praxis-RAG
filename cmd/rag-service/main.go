@@ -22,6 +22,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
+	"github.com/Guan0923/xinghe_rag/internal/mail"
 	"github.com/Guan0923/xinghe_rag/internal/mcp"
 	"github.com/Guan0923/xinghe_rag/internal/monitor"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
@@ -164,6 +165,11 @@ func run() error {
 	userAuth := auth.NewService(stores.Users, stores.Sessions, auth.Options{
 		RegistrationEnabled: serviceSettings.RegistrationEnabled,
 		SessionTTL:          serviceSettings.SessionTTL,
+		// The mail server is configured from the Console and stored in
+		// app_settings; without it e-mail verification stays disabled.
+		Mail:    mail.NewService(stores.AppSettings),
+		Codes:   stores.EmailCodes,
+		Avatars: stores.Avatars,
 	})
 	// Knowledge-base ownership and the invite-based sharing rules are enforced
 	// by the access service; httpapi only maps its typed errors to HTTP.
@@ -184,6 +190,8 @@ func run() error {
 		httpapi.WithDocumentNotifier(wire.Notifier{Endpoint: mcpEndpoint}),
 		httpapi.WithMCPHandler(mcpHandler),
 		httpapi.WithUserAuth(userAuth),
+		httpapi.WithAccountProfile(userAuth),
+		httpapi.WithMailAdmin(userAuth),
 	)
 
 	address := net.JoinHostPort(serviceSettings.Host, strconv.Itoa(serviceSettings.Port))

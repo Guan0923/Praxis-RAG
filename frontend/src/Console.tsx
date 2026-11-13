@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Alert, App, Badge, Button, Dropdown, Spin, Tooltip, type MenuProps,
+  Alert, App, Avatar, Badge, Button, Dropdown, Spin, Tooltip, type MenuProps,
 } from "antd";
 import {
   ApiOutlined,
@@ -11,7 +11,9 @@ import {
   DashboardOutlined,
   DatabaseOutlined,
   DownOutlined,
+  IdcardOutlined,
   LogoutOutlined,
+  MailOutlined,
   MoonOutlined,
   KeyOutlined,
   SafetyOutlined,
@@ -24,6 +26,7 @@ import {
 } from "@ant-design/icons";
 import {
   api,
+  avatarUrl,
   errorText,
   fetchAuthStatus,
   fetchCurrentUser,
@@ -49,6 +52,8 @@ import { MonitorPage } from "./MonitorPage";
 import { ApiKeysPage } from "./ApiKeysPage";
 import { CreateKnowledgeBase } from "./CreateKnowledgeBase";
 import { LoginPage } from "./LoginPage";
+import { ProfileModal } from "./ProfileModal";
+import { SystemSettingsPage } from "./SystemSettingsPage";
 import { UsersPage } from "./UsersPage";
 import { InvitationsPage, InvitePage } from "./InvitationsPage";
 import { PermissionsPage } from "./PermissionsPage";
@@ -69,6 +74,7 @@ const pages = [
   { key: "model-profiles", label: "模型配置", icon: <AppstoreOutlined /> },
   { key: "knowledge-bases", label: "知识库", icon: <SettingOutlined /> },
   { key: "users", label: "用户管理", icon: <TeamOutlined /> },
+  { key: "system-settings", label: "系统设置", icon: <MailOutlined /> },
   { key: "monitor", label: "系统监控", icon: <DashboardOutlined /> },
 ] as const;
 
@@ -92,6 +98,7 @@ export function Console({
   const [token, setToken] = useState(() => readStorage(sessionStorage, "rag.token"));
   const [auth, setAuth] = useState<AuthStatus>();
   const [authUser, setAuthUser] = useState<AuthUser>();
+  const [profileOpen, setProfileOpen] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState("");
   const sessionMode = Boolean(auth?.auth_enabled);
@@ -309,6 +316,7 @@ export function Console({
     return (
       <LoginPage
         registrationEnabled={Boolean(auth?.registration_enabled)}
+        emailVerificationEnabled={Boolean(auth?.email_verification_enabled)}
         onAuthenticated={(user) => {
           setAuthUser(user);
           setAuth((current) => current
@@ -460,15 +468,23 @@ export function Console({
                       disabled: true,
                       label: `${authUser.username} · ${roleLabel(authUser.role)}`,
                     },
+                    { key: "profile", icon: <IdcardOutlined />, label: "个人信息" },
                     { type: "divider" },
                     { key: "logout", icon: <LogoutOutlined />, label: "退出登录" },
                   ],
                   onClick: ({ key }) => {
+                    if (key === "profile") setProfileOpen(true);
                     if (key === "logout") void handleLogout();
                   },
                 }}
               >
-                <Button aria-label="账号菜单" className="account-button" icon={<UserOutlined />}>
+                <Button
+                  aria-label="账号菜单"
+                  className="account-button"
+                  icon={authUser.has_avatar
+                    ? <Avatar size={22} src={avatarUrl(authUser.avatar_updated_at)} />
+                    : <UserOutlined />}
+                >
                   {authUser.username}
                 </Button>
               </Dropdown>
@@ -538,6 +554,9 @@ export function Console({
           {view === "users" && authUser?.role === "admin" && (
             <UsersPage currentUserId={authUser.id} />
           )}
+          {view === "system-settings" && authUser?.role === "admin" && (
+            <SystemSettingsPage />
+          )}
           {view === "monitor" && canViewConsolePage("monitor", sessionMode, authUser?.role) && (
             <MonitorPage />
           )}
@@ -580,6 +599,14 @@ export function Console({
           </section>
         </div>
       </main>
+      {sessionMode && authUser && (
+        <ProfileModal
+          open={profileOpen}
+          user={authUser}
+          onUpdated={setAuthUser}
+          onClose={() => setProfileOpen(false)}
+        />
+      )}
     </div>
   );
 }

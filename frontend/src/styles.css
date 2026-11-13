@@ -954,6 +954,30 @@ h3 {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Personal-info dialog and the admin mail settings page. */
+.profile-avatar-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.profile-avatar-hint {
+  font-size: 12px;
+}
+.profile-section-title {
+  margin: 0 0 8px !important;
+}
+.profile-email-tag {
+  margin-inline-start: 8px;
+}
+.settings-subtitle {
+  margin-top: 0 !important;
+}
+.settings-mail-state {
+  margin-top: 16px !important;
+  margin-bottom: 0 !important;
+}
 /* Invitation bell, share links and permission-management screens. */
 .page-heading-title {
   display: flex;

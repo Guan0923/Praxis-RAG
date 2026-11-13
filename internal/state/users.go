@@ -23,6 +23,17 @@ type User struct {
 	CreatedAt   string
 	UpdatedAt   string
 	LastLoginAt *string
+	// Email is the normalized (lower case) account address; empty when the
+	// account has none. MySQL keeps the unique index NULL-tolerant, so any
+	// number of accounts may omit it.
+	Email         string
+	EmailVerified bool
+	// Age and Gender are optional profile fields; nil/empty means "not set".
+	Age    *int
+	Gender string
+	// AvatarUpdatedAt is the avatar row timestamp (the bytes are not loaded with
+	// the account); nil means the account has no avatar.
+	AvatarUpdatedAt *string
 }
 
 // IsAdmin reports whether the account may administer users and configuration.
@@ -45,9 +56,27 @@ type UserRepository struct{ db *sql.DB }
 
 func newUserRepository(db *sql.DB) *UserRepository { return &UserRepository{db: db} }
 
+// userSelectColumns is the projection shared by every users read. The avatar
+// join only contributes updated_at: avatar bytes are always read on demand so a
+// user list never carries image data.
+const userSelectColumns = "u.id, u.username, u.password_hash, u.role, u.enabled, " +
+	"u.created_at, u.updated_at, u.last_login_at, u.email, u.email_verified, " +
+	"u.age, u.gender, a.updated_at"
+
+// userFromClause is the FROM/JOIN clause shared by every users read.
+const userFromClause = " FROM users u LEFT JOIN user_avatars a ON a.user_id = u.id"
+
 // Create inserts one account. The first account in an empty table becomes the
 // administrator, so a fresh deployment is bootstrappable without manual SQL.
 func (r *UserRepository) Create(ctx context.Context, username, passwordHash string) (User, error) {
+	return r.CreateWithProfile(ctx, username, passwordHash, "")
+}
+
+// CreateWithProfile inserts one account with an optional e-mail address. An
+// empty email stores NULL, which keeps the unique index satisfied for accounts
+// that never configured one. The first account in an empty table becomes the
+// administrator, exactly like Create.
+func (r *UserRepository) CreateWithProfile(ctx context.Context, username, passwordHash, email string) (User, error) {
 	transaction, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return User{}, newStateError("用户无法保存")
@@ -69,12 +98,17 @@ func (r *UserRepository) Create(ctx context.Context, username, passwordHash stri
 	}
 	timestamp := nowISO()
 	user := User{ID: id, Username: username, Role: role, Enabled: true, CreatedAt: timestamp, UpdatedAt: timestamp}
+	var emailValue any
+	if email != "" {
+		emailValue = email
+		user.Email = email
+	}
 	if _, err := transaction.ExecContext(ctx,
-		"INSERT INTO users (id, username, password_hash, role, enabled, created_at, updated_at) "+
-			"VALUES (?, ?, ?, ?, ?, ?, ?)",
-		id, username, passwordHash, role, true, timestamp, timestamp); err != nil {
+		"INSERT INTO users (id, username, password_hash, role, enabled, created_at, updated_at, email) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		id, username, passwordHash, role, true, timestamp, timestamp, emailValue); err != nil {
 		if isUniqueViolation(err) {
-			return User{}, newStateConflict("用户名已存在")
+			return User{}, newStateConflict("用户名或邮箱已存在")
 		}
 		return User{}, newStateError("用户无法保存")
 	}
@@ -87,16 +121,29 @@ func (r *UserRepository) Create(ctx context.Context, username, passwordHash stri
 // ByUsername returns one account and its password hash for login.
 func (r *UserRepository) ByUsername(ctx context.Context, username string) (*User, string, error) {
 	row := r.db.QueryRowContext(ctx,
-		"SELECT id, username, password_hash, role, enabled, created_at, updated_at, last_login_at "+
-			"FROM users WHERE username = ?", username)
+		"SELECT "+userSelectColumns+userFromClause+" WHERE u.username = ?", username)
 	return scanUser(row, true)
 }
 
 // ByID returns one account, or nil when it does not exist.
 func (r *UserRepository) ByID(ctx context.Context, id string) (*User, error) {
 	row := r.db.QueryRowContext(ctx,
-		"SELECT id, username, password_hash, role, enabled, created_at, updated_at, last_login_at "+
-			"FROM users WHERE id = ?", id)
+		"SELECT "+userSelectColumns+userFromClause+" WHERE u.id = ?", id)
+	user, _, err := scanUser(row, false)
+	if err != nil || user == nil {
+		return user, err
+	}
+	return user, nil
+}
+
+// ByEmail returns the account owning an e-mail address, or nil when none does.
+// The caller normalizes the address to lower case first.
+func (r *UserRepository) ByEmail(ctx context.Context, email string) (*User, error) {
+	if email == "" {
+		return nil, nil
+	}
+	row := r.db.QueryRowContext(ctx,
+		"SELECT "+userSelectColumns+userFromClause+" WHERE u.email = ?", email)
 	user, _, err := scanUser(row, false)
 	if err != nil || user == nil {
 		return user, err
@@ -107,8 +154,7 @@ func (r *UserRepository) ByID(ctx context.Context, id string) (*User, error) {
 // List returns every account, oldest first.
 func (r *UserRepository) List(ctx context.Context) ([]User, error) {
 	rows, err := r.db.QueryContext(ctx,
-		"SELECT id, username, password_hash, role, enabled, created_at, updated_at, last_login_at "+
-			"FROM users ORDER BY created_at, username")
+		"SELECT "+userSelectColumns+userFromClause+" ORDER BY u.created_at, u.username")
 	if err != nil {
 		return nil, newStateError("用户列表读取失败")
 	}
@@ -167,6 +213,74 @@ func (r *UserRepository) Update(ctx context.Context, id, role string, enabled bo
 	return r.ByID(ctx, id)
 }
 
+// UpdateProfile replaces the editable profile fields of one account. An empty
+// username keeps the stored one; a nil age and an empty gender clear the
+// optional fields. A username collision is reported as StateConflict and a
+// missing account as (nil, nil).
+func (r *UserRepository) UpdateProfile(ctx context.Context, id, username string, age *int, gender string) (*User, error) {
+	var ageValue any
+	if age != nil {
+		ageValue = *age
+	}
+	var genderValue any
+	if gender != "" {
+		genderValue = gender
+	}
+	result, err := r.db.ExecContext(ctx,
+		"UPDATE users SET username = CASE WHEN ? = '' THEN username ELSE ? END, "+
+			"age = ?, gender = ?, updated_at = ? WHERE id = ?",
+		username, username, ageValue, genderValue, nowISO(), id)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return nil, newStateConflict("用户名已存在")
+		}
+		return nil, newStateError("用户无法保存")
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return nil, newStateError("用户无法保存")
+	}
+	if affected == 0 {
+		// updated_at always changes, so no affected row means the account is gone.
+		return nil, nil
+	}
+	return r.ByID(ctx, id)
+}
+
+// UpdatePassword replaces the PBKDF2 hash of one account.
+func (r *UserRepository) UpdatePassword(ctx context.Context, id, passwordHash string) error {
+	if _, err := r.db.ExecContext(ctx,
+		"UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+		passwordHash, nowISO(), id); err != nil {
+		return newStateError("密码无法保存")
+	}
+	return nil
+}
+
+// UpdateEmail sets the account e-mail address and its verified flag, reporting
+// whether the account existed. A collision with another account is reported as
+// StateConflict.
+func (r *UserRepository) UpdateEmail(ctx context.Context, id, email string, verified bool) (bool, error) {
+	var emailValue any
+	if email != "" {
+		emailValue = email
+	}
+	result, err := r.db.ExecContext(ctx,
+		"UPDATE users SET email = ?, email_verified = ?, updated_at = ? WHERE id = ?",
+		emailValue, verified, nowISO(), id)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return false, newStateConflict("该邮箱已被其他账号使用")
+		}
+		return false, newStateError("邮箱无法保存")
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, newStateError("邮箱无法保存")
+	}
+	return affected > 0, nil
+}
+
 // Delete removes one account and reports whether it existed. The transaction
 // also drops the account's sessions, the API keys it issued, the knowledge-base
 // permissions granted to it, and the invitations it issued or received;
@@ -198,6 +312,14 @@ func (r *UserRepository) Delete(ctx context.Context, id string) (bool, error) {
 	}
 	if _, err := transaction.ExecContext(ctx,
 		"UPDATE knowledge_bases SET owner_user_id = NULL WHERE owner_user_id = ?", id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	// The avatar and pending verification codes belong to the account and would
+	// otherwise leak rows after it disappears.
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM user_avatars WHERE user_id = ?", id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM email_verification_codes WHERE email = (SELECT email FROM users WHERE id = ?)", id); err != nil {
 		return false, newStateError("用户无法删除")
 	}
 	result, err := transaction.ExecContext(ctx, "DELETE FROM users WHERE id = ?", id)
@@ -315,12 +437,17 @@ func (r *UserSessionRepository) DeleteExpired(ctx context.Context, before string
 // scanner.
 func scanUser(row interface{ Scan(dest ...any) error }, withPassword bool) (*User, string, error) {
 	var (
-		user         User
-		passwordHash string
-		lastLogin    sql.NullString
+		user          User
+		passwordHash  string
+		lastLogin     sql.NullString
+		email         sql.NullString
+		age           sql.NullInt64
+		gender        sql.NullString
+		avatarUpdated sql.NullString
 	)
 	if err := row.Scan(&user.ID, &user.Username, &passwordHash, &user.Role, &user.Enabled,
-		&user.CreatedAt, &user.UpdatedAt, &lastLogin); err != nil {
+		&user.CreatedAt, &user.UpdatedAt, &lastLogin, &email, &user.EmailVerified,
+		&age, &gender, &avatarUpdated); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, "", nil
 		}
@@ -329,6 +456,20 @@ func scanUser(row interface{ Scan(dest ...any) error }, withPassword bool) (*Use
 	if lastLogin.Valid {
 		value := lastLogin.String
 		user.LastLoginAt = &value
+	}
+	if email.Valid {
+		user.Email = email.String
+	}
+	if age.Valid {
+		value := int(age.Int64)
+		user.Age = &value
+	}
+	if gender.Valid {
+		user.Gender = gender.String
+	}
+	if avatarUpdated.Valid {
+		value := avatarUpdated.String
+		user.AvatarUpdatedAt = &value
 	}
 	if !withPassword {
 		passwordHash = ""

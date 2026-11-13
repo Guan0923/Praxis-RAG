@@ -11,15 +11,18 @@ import (
 // single table so new handlers only need one row here; the document is rebuilt
 // deterministically on every request.
 type openAPIRoute struct {
-	Method      string
-	Path        string
-	Summary     string
-	Tag         string
-	Request     string   // component schema name for the JSON body
-	Query       []string // query parameter names
-	Response    string   // success status code
-	Multipart   bool     // request body is multipart/form-data
-	RequestBody bool
+	Method    string
+	Path      string
+	Summary   string
+	Tag       string
+	Request   string   // component schema name for the JSON body
+	Query     []string // query parameter names
+	Response  string   // success status code
+	Multipart bool     // request body is multipart/form-data
+	// MultipartField is the single binary field of a multipart request. When
+	// empty, the legacy multi-file "files" array schema is generated.
+	MultipartField string
+	RequestBody    bool
 }
 
 var openAPIRoutes = []openAPIRoute{
@@ -54,9 +57,20 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "GET", Path: "/v1/admin/api-keys/{key_id}/mcp-config", Summary: "MCP client configuration", Tag: "api-keys", Response: "200"},
 	{Method: "GET", Path: "/v1/auth/status", Summary: "Console authentication status", Tag: "auth", Response: "200"},
 	{Method: "POST", Path: "/v1/auth/register", Summary: "Register an account", Tag: "auth", Request: "AuthBody", Response: "201"},
+	{Method: "POST", Path: "/v1/auth/register/code", Summary: "Send a registration verification code", Tag: "auth", Request: "RegisterCodeBody", Response: "204"},
 	{Method: "POST", Path: "/v1/auth/login", Summary: "Log in", Tag: "auth", Request: "AuthBody", Response: "200"},
 	{Method: "POST", Path: "/v1/auth/logout", Summary: "Log out", Tag: "auth", Response: "204"},
 	{Method: "GET", Path: "/v1/auth/me", Summary: "Current account and CSRF token", Tag: "auth", Response: "200"},
+	{Method: "PATCH", Path: "/v1/auth/profile", Summary: "Update the current account profile", Tag: "auth", Request: "AccountProfileBody", Response: "200"},
+	{Method: "POST", Path: "/v1/auth/password", Summary: "Change the current account password", Tag: "auth", Request: "PasswordBody", Response: "204"},
+	{Method: "POST", Path: "/v1/auth/email/change/code", Summary: "Send an e-mail change verification code", Tag: "auth", Request: "EmailChangeCodeBody", Response: "204"},
+	{Method: "POST", Path: "/v1/auth/email/change", Summary: "Apply a verified e-mail change", Tag: "auth", Request: "EmailChangeBody", Response: "200"},
+	{Method: "PUT", Path: "/v1/auth/avatar", Summary: "Upload the account avatar", Tag: "auth", Response: "200", Multipart: true, MultipartField: "avatar"},
+	{Method: "GET", Path: "/v1/auth/avatar", Summary: "Read the account avatar", Tag: "auth", Response: "200"},
+	{Method: "DELETE", Path: "/v1/auth/avatar", Summary: "Remove the account avatar", Tag: "auth", Response: "204"},
+	{Method: "GET", Path: "/v1/admin/mail-settings", Summary: "Read the mail server settings", Tag: "admin", Response: "200"},
+	{Method: "PUT", Path: "/v1/admin/mail-settings", Summary: "Update the mail server settings", Tag: "admin", Request: "MailSettingsBody", Response: "200"},
+	{Method: "POST", Path: "/v1/admin/mail-settings/test", Summary: "Send a test mail", Tag: "admin", Request: "MailTestBody", Response: "204"},
 	{Method: "GET", Path: "/v1/admin/users", Summary: "List accounts", Tag: "users", Response: "200"},
 	{Method: "PATCH", Path: "/v1/admin/users/{user_id}", Summary: "Update an account", Tag: "users", Request: "UserUpdateBody", Response: "200"},
 	{Method: "DELETE", Path: "/v1/admin/users/{user_id}", Summary: "Delete an account", Tag: "users", Response: "204"},
@@ -147,6 +161,73 @@ func openAPISchemas() map[string]any {
 			"properties": map[string]any{
 				"username": map[string]any{"type": "string", "minLength": 3, "maxLength": 64, "title": "Username"},
 				"password": map[string]any{"type": "string", "minLength": 8, "maxLength": 128, "title": "Password"},
+				"email":    map[string]any{"type": "string", "maxLength": 254, "title": "Email"},
+				"code":     map[string]any{"type": "string", "maxLength": 16, "title": "Code"},
+			},
+		},
+		"RegisterCodeBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"email"},
+			"properties": map[string]any{
+				"email": map[string]any{"type": "string", "maxLength": 254, "title": "Email"},
+			},
+		},
+		"AccountProfileBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"username": map[string]any{"type": "string", "minLength": 3, "maxLength": 64, "title": "Username"},
+				"age":      map[string]any{"type": "integer", "minimum": 1, "maximum": 150, "nullable": true, "title": "Age"},
+				"gender":   map[string]any{"type": "string", "enum": []any{"", "male", "female", "other"}, "title": "Gender"},
+			},
+		},
+		"PasswordBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"current_password", "new_password"},
+			"properties": map[string]any{
+				"current_password": map[string]any{"type": "string", "title": "Current Password"},
+				"new_password":     map[string]any{"type": "string", "minLength": 8, "maxLength": 128, "title": "New Password"},
+			},
+		},
+		"EmailChangeCodeBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"email", "password"},
+			"properties": map[string]any{
+				"email":    map[string]any{"type": "string", "maxLength": 254, "title": "Email"},
+				"password": map[string]any{"type": "string", "title": "Password"},
+			},
+		},
+		"EmailChangeBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"email", "code"},
+			"properties": map[string]any{
+				"email": map[string]any{"type": "string", "maxLength": 254, "title": "Email"},
+				"code":  map[string]any{"type": "string", "maxLength": 16, "title": "Code"},
+			},
+		},
+		"MailSettingsBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"enabled":  map[string]any{"type": "boolean", "title": "Enabled"},
+				"host":     map[string]any{"type": "string", "maxLength": 255, "title": "Host"},
+				"port":     map[string]any{"type": "integer", "minimum": 1, "maximum": 65535, "default": 587, "title": "Port"},
+				"username": map[string]any{"type": "string", "title": "Username"},
+				"password": map[string]any{"type": "string", "title": "Password"},
+				"from":     map[string]any{"type": "string", "maxLength": 254, "title": "From"},
+				"tls":      map[string]any{"type": "string", "enum": []any{"none", "starttls", "tls"}, "default": "starttls", "title": "Tls"},
+			},
+		},
+		"MailTestBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"to"},
+			"properties": map[string]any{
+				"to": map[string]any{"type": "string", "maxLength": 254, "title": "To"},
 			},
 		},
 		"UserUpdateBody": map[string]any{
@@ -315,15 +396,25 @@ func buildOpenAPIDocument() map[string]any {
 			}
 			if route.Multipart {
 				contentType = "multipart/form-data"
-				schema = map[string]any{
-					"type":     "object",
-					"required": []any{"files"},
-					"properties": map[string]any{
-						"files": map[string]any{
-							"type":  "array",
-							"items": map[string]any{"type": "string", "format": "binary"},
+				if route.MultipartField != "" {
+					schema = map[string]any{
+						"type":     "object",
+						"required": []any{route.MultipartField},
+						"properties": map[string]any{
+							route.MultipartField: map[string]any{"type": "string", "format": "binary"},
 						},
-					},
+					}
+				} else {
+					schema = map[string]any{
+						"type":     "object",
+						"required": []any{"files"},
+						"properties": map[string]any{
+							"files": map[string]any{
+								"type":  "array",
+								"items": map[string]any{"type": "string", "format": "binary"},
+							},
+						},
+					}
 				}
 			}
 			operation["requestBody"] = map[string]any{
