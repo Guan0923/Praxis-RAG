@@ -7,7 +7,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -27,9 +26,9 @@ func entryByName(t *testing.T, endpoint *Endpoint, name string) toolEntry {
 }
 
 func TestToolRegistryShape(t *testing.T) {
-	endpoint := newTestEndpoint(t, newFakeRuntime(), Options{QueuedSearch: true})
+	endpoint := newTestEndpoint(t, newFakeRuntime(), Options{})
 	wantNames := []string{
-		"search", "get_search_result", "add_document", "update_document", "delete_document", "get_document_status",
+		"search", "add_document", "update_document", "delete_document", "get_document_status",
 	}
 	if len(endpoint.entries) != len(wantNames) {
 		t.Fatalf("tools = %d, want %d", len(endpoint.entries), len(wantNames))
@@ -39,16 +38,25 @@ func TestToolRegistryShape(t *testing.T) {
 			t.Fatalf("tool[%d] = %q, want %q", index, endpoint.entries[index].name, name)
 		}
 	}
+	for _, name := range []string{"get_search_result", "submit_search"} {
+		for _, entry := range endpoint.entries {
+			if entry.name == name {
+				t.Fatalf("removed tool %q is still registered", name)
+			}
+		}
+	}
 
 	search := entryByName(t, endpoint, searchToolName).definition
-	if !strings.Contains(search.Description, "Searches are queued.") {
-		t.Fatalf("queued search description missing suffix: %q", search.Description)
+	if strings.Contains(search.Description, "queued") || strings.Contains(search.Description, "wait_seconds") {
+		t.Fatalf("search description still advertises the removed queued flow: %q", search.Description)
+	}
+	if search.Description != contracts.SearchToolDescription {
+		t.Fatalf("search description = %q", search.Description)
 	}
 	schema := search.InputSchema.(map[string]any)
 	properties := schema["properties"].(map[string]any)
-	wait := properties["wait_seconds"].(map[string]any)
-	if wait["default"] != 10 || wait["minimum"] != 0 || wait["maximum"] != 30 || wait["type"] != "number" {
-		t.Fatalf("wait_seconds schema = %#v", wait)
+	if _, ok := properties["wait_seconds"]; ok {
+		t.Fatalf("synchronous search must not expose wait_seconds")
 	}
 	if required := schema["required"].([]string); len(required) != 1 || required[0] != "query" {
 		t.Fatalf("required = %#v", schema["required"])
@@ -283,82 +291,55 @@ func TestRenderPayloadExtractsImageAssets(t *testing.T) {
 	}
 }
 
-func TestQueuedSearchWaitSemantics(t *testing.T) {
-	t.Run("zero wait returns only result id", func(t *testing.T) {
-		runtime := newFakeRuntime()
-		runtime.searchResults = []map[string]any{{"status": "queued"}}
-		endpoint := newTestEndpoint(t, runtime, Options{QueuedSearch: true})
-		payload, err := endpoint.executeQueuedSearch(context.Background(), "manuals", contracts.QueuedSearchRequest{
-			Search:      contracts.SearchRequest{Query: "manual"},
-			WaitSeconds: 0,
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(payload) != 1 || payload["result_id"] != runtime.submitResultID {
-			t.Fatalf("payload = %#v", payload)
-		}
-		if runtime.getResultCalls != 0 {
-			t.Fatalf("zero wait must not poll results")
-		}
-		if len(runtime.submitted) != 1 || len(runtime.namespaces) != 1 || runtime.namespaces[0] != "manuals" {
-			t.Fatalf("submission = %#v namespaces = %#v", runtime.submitted, runtime.namespaces)
-		}
-	})
+// TestSearchToolReturnsEvidenceSynchronously pins the synchronous search
+// contract: one tool call runs retrieval and returns the evidence payload, and
+// the removed wait_seconds argument is rejected as unknown.
+func TestSearchToolReturnsEvidenceSynchronously(t *testing.T) {
+	runtime := newFakeRuntime()
+	runtime.searchPayload = map[string]any{
+		"query":           "manual",
+		"evidence_status": "found",
+		"results": []any{
+			map[string]any{"rank": 1, "document_id": "doc-1", "chunk_id": "chunk-1", "text": "evidence text"},
+		},
+	}
+	endpoint := newTestEndpoint(t, runtime, Options{})
+	entry := entryByName(t, endpoint, searchToolName)
 
-	t.Run("completion within wait returns results", func(t *testing.T) {
-		runtime := newFakeRuntime()
-		runtime.searchResults = []map[string]any{
-			{"status": "queued"},
-			{"status": "succeeded", "query": "manual", "results": []any{}},
-		}
-		endpoint := newTestEndpoint(t, runtime, Options{QueuedSearch: true})
-		payload, err := endpoint.executeQueuedSearch(context.Background(), "manuals", contracts.QueuedSearchRequest{
-			Search:      contracts.SearchRequest{Query: "manual"},
-			WaitSeconds: 1,
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if payload["status"] != "succeeded" || payload["query"] != "manual" {
-			t.Fatalf("payload = %#v", payload)
-		}
-	})
+	input, err := entry.validate(map[string]any{"query": "manual"})
+	if err != nil {
+		t.Fatalf("validate() error = %v", err)
+	}
+	payload, err := entry.execute(context.Background(), "manuals", input)
+	if err != nil {
+		t.Fatalf("execute() error = %v", err)
+	}
+	if payload["evidence_status"] != "found" {
+		t.Fatalf("search payload = %#v", payload)
+	}
+	results, _ := payload["results"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("results = %#v", payload["results"])
+	}
+	if len(runtime.searchCalls) != 1 || runtime.searchCalls[0].Query != "manual" {
+		t.Fatalf("search calls = %#v", runtime.searchCalls)
+	}
+	if len(runtime.namespaces) != 1 || runtime.namespaces[0] != "manuals" {
+		t.Fatalf("namespaces = %#v", runtime.namespaces)
+	}
 
-	t.Run("wait expiry degrades to result id", func(t *testing.T) {
-		runtime := newFakeRuntime()
-		runtime.searchResults = []map[string]any{{"status": "queued"}}
-		endpoint := newTestEndpoint(t, runtime, Options{QueuedSearch: true})
-		started := time.Now()
-		payload, err := endpoint.executeQueuedSearch(context.Background(), "manuals", contracts.QueuedSearchRequest{
-			Search:      contracts.SearchRequest{Query: "manual"},
-			WaitSeconds: 0.05,
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if time.Since(started) > time.Second {
-			t.Fatalf("wait was not bounded")
-		}
-		if len(payload) != 1 || payload["result_id"] != runtime.submitResultID {
-			t.Fatalf("payload = %#v", payload)
-		}
-		if len(runtime.submitted) != 1 {
-			t.Fatalf("submissions = %d, want 1", len(runtime.submitted))
-		}
-	})
+	// wait_seconds was removed with the queued flow; it is now unknown.
+	if _, err := entry.validate(map[string]any{"query": "manual", "wait_seconds": 5}); err == nil ||
+		!strings.Contains(err.Error(), "wait_seconds") {
+		t.Fatalf("wait_seconds validation error = %v", err)
+	}
 
-	t.Run("submission error is a tool error", func(t *testing.T) {
-		runtime := newFakeRuntime()
-		runtime.submitErr = errors.New("Search task exceeded its execution deadline")
-		endpoint := newTestEndpoint(t, runtime, Options{QueuedSearch: true})
-		if _, err := endpoint.executeQueuedSearch(context.Background(), "manuals", contracts.QueuedSearchRequest{
-			Search:      contracts.SearchRequest{Query: "manual"},
-			WaitSeconds: 1,
-		}); err == nil || !strings.Contains(err.Error(), "deadline") {
-			t.Fatalf("error = %v", err)
-		}
-	})
+	// A runtime failure is surfaced as a tool error, not a queued result id.
+	runtime.searchErr = errors.New("Search timed out")
+	if _, err := entry.execute(context.Background(), "manuals", input); err == nil ||
+		!strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("search runtime error = %v", err)
+	}
 }
 
 func TestDocumentOperationResults(t *testing.T) {
@@ -475,7 +456,7 @@ func TestDisabledToolIsHiddenAndRejected(t *testing.T) {
 		t.Fatalf("PatchTool: %v", err)
 	}
 	runtime := newFakeRuntime()
-	endpoint := newTestEndpoint(t, runtime, Options{QueuedSearch: true, Catalog: store})
+	endpoint := newTestEndpoint(t, runtime, Options{Catalog: store})
 
 	result, err := endpoint.listTools(context.Background(), "manuals", nil)
 	if err != nil {
@@ -486,8 +467,8 @@ func TestDisabledToolIsHiddenAndRejected(t *testing.T) {
 			t.Fatalf("disabled search tool must not be listed")
 		}
 	}
-	if len(result.Tools) != 5 {
-		t.Fatalf("listed %d tools, want 5", len(result.Tools))
+	if len(result.Tools) != 4 {
+		t.Fatalf("listed %d tools, want 4", len(result.Tools))
 	}
 
 	entry := entryByName(t, endpoint, searchToolName)

@@ -9,7 +9,7 @@ the official Go SDK `github.com/modelcontextprotocol/go-sdk/mcp v1.7.0`.
 | File | Responsibility |
 | --- | --- |
 | `runtime.go` | Consumer-side `Runtime` interface (no `internal/runtime` import), `DocumentRecord`, `Options`, namespace context helpers, shared error sentinels/constants. |
-| `tools.go` | Ordered tool registry (search, get_search_result, add/update/delete_document, get_document_status), argument validation ported from `server.py`/`document_tools.py`, tool-error rendering and image-asset extraction. Update/delete publish document change notifications. |
+| `tools.go` | Ordered tool registry (`search`, `add_document`, `update_document`, `delete_document`, `get_document_status` — 5 tools, fixed order), argument validation ported from `server.py`/`document_tools.py`, synchronous search execution, tool-error rendering and image-asset extraction. Update/delete publish document change notifications. |
 | `prompts.go` | Python-compatible `prompts/list` pagination (numeric cursor, 9 digits, page size 50) and `prompts/get` template rendering. |
 | `resources.go` | `resources/list` + `resources/templates/list` + `resources/read` (paragraph pages and artifact byte chunks), artifact URI parsing, subscription validation and `Endpoint.DocumentsChanged(before, after)` notifications. |
 | `endpoint.go` | `Endpoint`: lazily builds one `*mcp.Server` + stateful/stateless `StreamableHTTPHandler` pair per namespace, catalog-aware listing middleware, change-notification refresh, `internal/httpapi.ToolRegistry`/`ChangeNotifier` implementations. |
@@ -47,14 +47,17 @@ legacy `Mcp-Session-Id` used with another namespace's headers resolves to
 
 ## Tools / prompts / resources
 
-* Tool names, descriptions, JSON Schemas, annotations and tool ordering are the
-  Python contract (`search`, `get_search_result`, `add_document`,
-  `update_document`, `delete_document`, `get_document_status`). Validation and
+* Tool names, descriptions, JSON Schemas, annotations and tool ordering come
+  from the Go contract: `search`, `add_document`, `update_document`,
+  `delete_document`, `get_document_status` (5 tools). Validation and
   runtime failures are `CallToolResult.IsError` text, never protocol errors;
-  unknown or disabled tools are tool errors with the Python message.
-* Queued search: submission is shielded from client cancellation, the result is
-  polled for at most `wait_seconds`, and a wait timeout returns only
-  `{"result_id": ...}`.
+  unknown or disabled tools are tool errors with the Python-compatible message.
+* Search is **always synchronous**: one `tools/call` runs retrieval + rerank and
+  returns evidence (`results`/`artifacts`/`evidence_status`/`answer_guidance`/
+  `debug`) directly. There is no `wait_seconds`, no `result_id`, no polling and
+  no `get_search_result` tool (removed 2026-11-13). Scope filtering still returns
+  `DocumentIDs` to the runtime; restricted scopes now execute the synchronous
+  search instead of being rejected.
 * `prompts/list` keeps Python pagination (numeric cursor `"50"`, page size 50)
   and `prompts/get` renders `{{argument}}` placeholders with the Python error
   semantics.
@@ -105,10 +108,10 @@ legacy `Mcp-Session-Id` used with another namespace's headers resolves to
 5. **Artifact offset range**: the offset/length are decoded with `strconv.Atoi`
    (64-bit); Python accepts arbitrary precision integers. Values beyond int64 are
    rejected as invalid chunk parameters.
-6. **Cancellation**: `StreamableHTTPOptions.PropagateRequestCancellation` is left
-   off (default), so a cancelled POST does not cancel a running tool handler;
-   queued search bounds its own wait and shields admission with
-   `context.WithoutCancel`.
+6. **Cancellation**: `StreamableHTTPOptions.PropagateRequestCancellation` is
+   enabled for synchronous search, so a cancelled POST cancels the running
+   handler; the service derives a bounded deadline from `RAG_SEARCH_TIMEOUT_SECONDS`
+   and propagates cancellation to Qdrant and model calls.
 7. **Legacy session lifecycle**: the SDK handler has no exported "forget session"
    hook; stateful sessions are dropped by DELETE/idle timeout only, and stale
    entries in the SDK's resource-subscription map are pruned only by session
@@ -123,7 +126,9 @@ legacy `Mcp-Session-Id` used with another namespace's headers resolves to
   `"documents"` lists; REST document upload/delete routes must call
   `Endpoint.DocumentsChanged(before, after)` (the HTTP API layer has no
   document-change notifier hook yet).
-* Cancellation semantics for synchronous inference already running in the
-  runtime (mirror Python's "cancelling the wait never terminates the work").
+* Verify end-to-end cancellation of synchronous inference now that
+  `PropagateRequestCancellation` is enabled (the service derives its deadline
+  from `RAG_SEARCH_TIMEOUT_SECONDS` and forwards cancellation to Qdrant/model
+  calls; no in-process work shielding remains).
 * Optimize `DocumentsChanged` resource re-registration for very large document
   sets (currently every change re-registers the full document set).

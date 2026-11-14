@@ -3,13 +3,10 @@ package e2e
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -94,66 +91,5 @@ func TestDocumentDeadLetterExhaustion(t *testing.T) {
 	}
 	if status["status"] != state.DocumentJobFailed || status["error"] != *current.Error {
 		t.Fatalf("document status = %v (job error %q)", status, *current.Error)
-	}
-}
-
-// TestSearchDeadLetterExhaustion is the queued-search counterpart: the retry
-// budget is exhausted, the dead-letter worker records a durable failure, and the
-// Python-safe failure message is exposed by the result read.
-func TestSearchDeadLetterExhaustion(t *testing.T) {
-	h := newHarness(t, "")
-	ctx := context.Background()
-
-	resultID, err := h.Service.SubmitSearch(ctx, "alpha", contracts.SearchRequest{
-		Query:      "E03 供水不足",
-		Retrieval:  contracts.RetrievalHybrid,
-		Rerank:     contracts.RerankCrossEncoder,
-		CandidateK: 10,
-		TopK:       5,
-	})
-	if err != nil {
-		t.Fatalf("SubmitSearch() error = %v", err)
-	}
-	body := encodeNotification(t, searchNotification(resultID, "alpha"))
-
-	worker := newSearchDeadLetterProcessor(t, h)
-	transport := &fakePullTransport{}
-	transport.push(mq.ReceivedMessage{Topic: "praxis_search", Body: body, DeliveryAttempt: 1})
-	consumerConfig := consumerConfig("praxis_search", "praxis_search_workers")
-	consumerConfig.MaxAttempts = 1
-	consumer := mq.NewPullConsumer(consumerConfig, transport, worker.MessageHandler())
-	consumer.OnExhausted = worker.ExhaustedHandler()
-	runCtx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- worker.RunConsumer(runCtx, consumer) }()
-
-	waitFor(t, 10*time.Second, "search task failed by dead-letter", func() bool {
-		terminal, terminalErr := h.Stores.SearchTasks.Terminal(context.Background(), resultID)
-		return terminalErr == nil && terminal
-	})
-	waitFor(t, 5*time.Second, "search dead-letter committed", func() bool { return transport.ackCount() == 1 })
-	cancel()
-	select {
-	case runErr := <-done:
-		if runErr != nil {
-			t.Fatalf("RunConsumer() error = %v", runErr)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("dead-letter consumer did not stop")
-	}
-	if err := worker.Close(); err != nil {
-		t.Fatalf("worker.Close() error = %v", err)
-	}
-	if transport.ackCount() != 1 {
-		t.Fatalf("ack count = %d, want 1 (ack only after the durable outcome)", transport.ackCount())
-	}
-
-	_, err = h.Service.GetSearchResult(ctx, "alpha", resultID, 1, 10)
-	var unavailable *apierrors.SnapshotUnavailable
-	if !errors.As(err, &unavailable) {
-		t.Fatalf("GetSearchResult() error = %v, want SnapshotUnavailable", err)
-	}
-	if unavailable.Message != "Search failed; submit a new search" {
-		t.Fatalf("failure message = %q", unavailable.Message)
 	}
 }

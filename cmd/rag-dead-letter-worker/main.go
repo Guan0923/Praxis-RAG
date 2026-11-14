@@ -1,20 +1,20 @@
 // Command rag-dead-letter-worker records broker retry exhaustion as a durable
 // terminal state. It never re-runs inference and never re-enqueues: a
-// dead-lettered document job becomes "failed" in document_jobs and a dead
-// lettered search task becomes failed in search_tasks, which clients observe
-// through the normal status endpoints.
+// dead-lettered document job becomes "failed" in document_jobs and clients
+// observe that through the normal status endpoints. Search is synchronous and
+// has no queue, so it has no dead-letter lane.
 //
 // Usage:
 //
-//	rag-dead-letter-worker --kind search|document|cache
+//	rag-dead-letter-worker --kind document|cache
 //
 // The consumer listens on an explicit Kafka dead-letter topic
-// (RAG_DOCUMENT_DLQ_TOPIC / RAG_SEARCH_DLQ_TOPIC / RAG_CACHE_DLQ_TOPIC) with an
-// independent RAG_*_DLQ_GROUP. Document/search dead letters ack only after the
-// durable terminal outcome is saved (or the task is already absent/terminal); a
-// live lease or an uncommitted journal publication returns false so the record
-// stays uncommitted and is redelivered. Malformed document/search dead-letter
-// payloads are logged by safe category and left unacked.
+// (RAG_DOCUMENT_DLQ_TOPIC / RAG_CACHE_DLQ_TOPIC) with an independent
+// RAG_*_DLQ_GROUP. Document dead letters ack only after the durable terminal
+// outcome is saved (or the job is already absent/terminal); a live lease or an
+// uncommitted journal publication returns false so the record stays uncommitted
+// and is redelivered. Malformed document dead-letter payloads are logged by safe
+// category and left unacked.
 //
 // Cache changes are derived state: the affected keys stay dirty in MySQL
 // (cache_revisions) and the cache worker's compensation pass converges once the
@@ -40,7 +40,6 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/documentworker"
 	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
-	"github.com/Guan0923/xinghe_rag/internal/searchworker"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 	"github.com/Guan0923/xinghe_rag/internal/version"
 )
@@ -128,18 +127,7 @@ func run(args []string) error {
 	defer func() { _ = stores.Close() }()
 
 	var handler mq.Handler
-	var closeWorker func() error
 	switch kind {
-	case "search":
-		worker, err := searchworker.New(searchworker.Options{
-			Tasks:  stores.SearchTasks,
-			Logger: logger,
-		})
-		if err != nil {
-			return err
-		}
-		handler = worker.DeadLetterHandler()
-		closeWorker = worker.Close
 	case "document":
 		worker, err := documentworker.New(documentworker.Options{
 			Jobs:   stores.DocumentJobs,
@@ -155,7 +143,7 @@ func run(args []string) error {
 		// the delivery is always acknowledged so poison records cannot loop.
 		handler = cacheDeadLetterHandler(logger)
 	default:
-		return usagef(`--kind must be "search", "document" or "cache"`)
+		return usagef(`--kind must be "document" or "cache"`)
 	}
 
 	consumerConfig := mq.DefaultConsumerConfig(target.topic, target.group)
@@ -183,14 +171,10 @@ func run(args []string) error {
 	logger.Info("Praxis-RAG dead-letter worker stopping", "kind", kind)
 
 	stopErr := consumer.Stop()
-	var workerErr error
-	if closeWorker != nil {
-		workerErr = closeWorker()
-	}
 	if stopErr != nil {
 		return stopErr
 	}
-	return workerErr
+	return nil
 }
 
 type consumerTarget struct {
@@ -202,7 +186,7 @@ type consumerTarget struct {
 func parseKind(args []string) (string, error) {
 	flags := flag.NewFlagSet("rag-dead-letter-worker", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	kind := flags.String("kind", "", "dead-letter source kind: search, document or cache")
+	kind := flags.String("kind", "", "dead-letter source kind: document or cache")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return "", err
@@ -213,8 +197,8 @@ func parseKind(args []string) (string, error) {
 		return "", usagef("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
 	value := strings.ToLower(strings.TrimSpace(*kind))
-	if value != "search" && value != "document" && value != "cache" {
-		return "", usagef(`--kind is required and must be "search", "document" or "cache"`)
+	if value != "document" && value != "cache" {
+		return "", usagef(`--kind is required and must be "document" or "cache"`)
 	}
 	return value, nil
 }
@@ -222,12 +206,10 @@ func parseKind(args []string) (string, error) {
 func deadLetterTarget(kind string, settings mq.Settings) (consumerTarget, error) {
 	sources := map[string]string{
 		"document": settings.DocumentGroup,
-		"search":   settings.SearchGroup,
 		"cache":    settings.CacheGroup,
 	}
 	topics := map[string]string{
 		"document": settings.DocumentDLQTopic,
-		"search":   settings.SearchDLQTopic,
 		"cache":    settings.CacheDLQTopic,
 	}
 	cacheGroup := strings.TrimSpace(settings.CacheDLQGroup)
@@ -236,30 +218,25 @@ func deadLetterTarget(kind string, settings mq.Settings) (consumerTarget, error)
 	}
 	groups := map[string]string{
 		"document": strings.TrimSpace(envOr("RAG_DOCUMENT_DLQ_GROUP", defaultDeadLetterGroup("document"))),
-		"search":   strings.TrimSpace(envOr("RAG_SEARCH_DLQ_GROUP", defaultDeadLetterGroup("search"))),
 		"cache":    cacheGroup,
 	}
 	source, ok := sources[kind]
 	if !ok {
-		return consumerTarget{}, usagef(`--kind is required and must be "search", "document" or "cache"`)
+		return consumerTarget{}, usagef(`--kind is required and must be "document" or "cache"`)
 	}
 	topic := strings.TrimSpace(topics[kind])
 	if topic == "" {
 		return consumerTarget{}, usagef("RAG_%s_DLQ_TOPIC must not be empty", strings.ToUpper(kind))
 	}
-	// The three dead-letter groups must be valid and mutually independent: two
+	// The two dead-letter groups must be valid and mutually independent: two
 	// DLQ consumers sharing a group would split one topic's records.
 	if !deadLetterGroupPattern.MatchString(groups["document"]) ||
-		!deadLetterGroupPattern.MatchString(groups["search"]) ||
 		!deadLetterGroupPattern.MatchString(groups["cache"]) ||
-		groups["document"] == groups["search"] ||
-		groups["document"] == groups["cache"] ||
-		groups["search"] == groups["cache"] {
+		groups["document"] == groups["cache"] {
 		return consumerTarget{}, usagef("Dead-letter consumer groups must be valid, independent groups")
 	}
 	reserved := map[string]struct{}{
 		settings.DocumentGroup: {},
-		settings.SearchGroup:   {},
 		settings.CacheGroup:    {},
 	}
 	for _, group := range groups {
@@ -304,10 +281,8 @@ func defaultDeadLetterGroup(kind string) string {
 	switch kind {
 	case "document":
 		return "praxis_document_dead_letters"
-	case "cache":
-		return mq.DefaultCacheDLQGroup
 	default:
-		return "praxis_search_dead_letters"
+		return mq.DefaultCacheDLQGroup
 	}
 }
 func dataRootFromEnv() (string, error) {

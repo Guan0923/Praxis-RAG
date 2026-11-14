@@ -92,9 +92,9 @@ func run() error {
 		return err
 	}
 	service.SearchEngine().SetReferenceCapture(searchrefs.New(stores, logger))
-	// Every retrieval execution (synchronous REST/MCP and queued search worker)
-	// passes through the runtime search path, so one counter here covers all of
-	// them for the Console activity card.
+	// Every retrieval execution (synchronous REST/MCP) passes through the
+	// runtime search path, so one counter here covers all of them for the
+	// Console activity card.
 	service.SetActivityRecorder(stores.Activity)
 	if err := service.StartBackground(context.Background()); err != nil {
 		return err
@@ -108,8 +108,9 @@ func run() error {
 	// The Console monitoring page is read-only: one state aggregate plus the
 	// bounded dependency probes assembled per request by internal/monitor.
 	// Task delivery is owned by Debezium, so the pipeline view reports the two
-	// capture connectors' health and three independent business consumer
-	// groups; the service never fabricates an in-process outbox row.
+	// capture connectors' health and two independent business consumer groups
+	// (documents and cache); search is synchronous and has no queue. The service
+	// never fabricates an in-process outbox row.
 	progressSettings := mqSettings
 	kafkaGroupProgress := func(ctx context.Context, topic, group string) (monitor.KafkaProgress, error) {
 		progress, progressErr := mq.ConsumerProgressFor(ctx, progressSettings, topic, group)
@@ -166,8 +167,6 @@ func run() error {
 		DebeziumCacheHealthURL: os.Getenv("RAG_DEBEZIUM_CACHE_HEALTH_URL"),
 		DocumentTopic:          mqSettings.DocumentTopic,
 		DocumentGroup:          mqSettings.DocumentGroup,
-		SearchTopic:            mqSettings.SearchTopic,
-		SearchGroup:            mqSettings.SearchGroup,
 		CacheTopic:             mqSettings.CacheTopic,
 		CacheGroup:             mqSettings.CacheGroup,
 		KafkaGroupProgress:     kafkaGroupProgress,
@@ -180,10 +179,9 @@ func run() error {
 	})
 	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{
-		Runtime:      wire.MCPRuntime{Service: service},
-		Catalog:      catalogStore,
-		QueuedSearch: mqSettings.Configured(),
-		Logger:       logger,
+		Runtime: wire.MCPRuntime{Service: service},
+		Catalog: catalogStore,
+		Logger:  logger,
 	})
 	if err != nil {
 		return err

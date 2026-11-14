@@ -21,9 +21,11 @@ import (
 
 // SearchEngine owns the retrieval half of the service runtime: the per-namespace
 // tenant cache (model connections + Qdrant store + orchestrator), synchronous
-// search, public knowledge-base settings, and stored search-result reads. It is
-// a port of the corresponding RagServiceRuntime methods in
-// rag_mcp/service_knowledge.py.
+// search and public knowledge-base settings. It is a port of the corresponding
+// RagServiceRuntime methods in rag_mcp/service_knowledge.py.
+//
+// Search always runs synchronously and returns the evidence payload directly;
+// there is no queued mode, stored result snapshot or result-id read path.
 //
 // The engine is safe for concurrent use. Tenant construction and invalidation
 // are serialized by mu; retrieval itself runs outside the lock and relies on the
@@ -76,8 +78,8 @@ func (e *SearchEngine) Search(
 		return nil, searchError(err)
 	}
 	// Python snapshots the tenant configuration *before* retrieval and merges it
-	// into the payload, so saved references/result snapshots record which
-	// collection/config version produced the evidence.
+	// into the payload, so callers record which collection/config version
+	// produced the evidence.
 	snapshot := snapshotContext(tenant)
 	payload, err := searchTenant(ctx, tenant, request)
 	if err != nil {
@@ -86,7 +88,7 @@ func (e *SearchEngine) Search(
 	payload["snapshot_context"] = snapshot
 	payload = normalizeSearchPayload(payload)
 	if e.references != nil {
-		payload, _ = e.references.Capture(ctx, namespace, payload, true)
+		payload, _ = e.references.Capture(ctx, namespace, payload)
 	}
 	return payload, nil
 }
@@ -245,35 +247,6 @@ func (e *SearchEngine) PublicKnowledgeBase(ctx context.Context, namespace string
 	return kbconfig.PublicSettings(settings), nil
 }
 
-// GetSearchResult reads one bounded page of a stored search result without
-// re-running retrieval (state.ResultSnapshots.Get). Missing, expired, or
-// unavailable snapshots become *apierrors.SnapshotUnavailable (HTTP 410); an
-// out-of-range page becomes *contracts.SearchValidationError (Python raises
-// ValueError, which the HTTP/MCP boundaries surface as a 400/tool error).
-func (e *SearchEngine) GetSearchResult(
-	ctx context.Context,
-	namespace, resultID string,
-	page, pageSize int,
-) (map[string]any, error) {
-	_ = ctx
-	if e.stores.Results == nil {
-		return nil, apierrors.SnapshotUnavailableError("Search result expired or unavailable")
-	}
-	payload, err := e.stores.Results.Get(namespace, resultID, page, pageSize)
-	if err != nil {
-		var unavailable *state.SnapshotUnavailable
-		if errors.As(err, &unavailable) {
-			return nil, apierrors.SnapshotUnavailableError(unavailable.Message)
-		}
-		var valueError *state.ValueError
-		if errors.As(err, &valueError) {
-			return nil, &contracts.SearchValidationError{Message: valueError.Message}
-		}
-		return nil, err
-	}
-	return payload, nil
-}
-
 // Invalidate drops one cached tenant so the next search rebuilds it from the
 // current knowledge-base row. The runtime calls it after configuration changes.
 func (e *SearchEngine) Invalidate(namespace string) {
@@ -325,18 +298,18 @@ func searchError(err error) error {
 	return err
 }
 
-// SetReferenceCapture attaches the search-reference/result-snapshot capture
-// stage (internal/searchrefs). Capture absorbs its own failures, so retrieval
-// results are never lost.
+// SetReferenceCapture attaches the artifact-reference capture stage
+// (internal/searchrefs). Capture absorbs its own failures, so retrieval results
+// are never lost.
 func (e *SearchEngine) SetReferenceCapture(capture *searchrefs.Capture) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.references = capture
 }
 
-// SearchRaw runs one retrieval action without capturing references or saving a
-// result snapshot. Worker binaries use it so the durable task owns the snapshot
-// (searchrefs.Capture + SearchTasks.Complete) instead of the API process.
+// SearchRaw runs one retrieval action without projecting artifact references.
+// It shares the same validation, visibility filtering and payload normalization
+// as Search; it exists for internal callers that need the bare evidence payload.
 func (e *SearchEngine) SearchRaw(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error) {
 	tenant, err := e.tenant(ctx, namespace)
 	if err != nil {
@@ -352,14 +325,12 @@ func (e *SearchEngine) SearchRaw(ctx context.Context, namespace string, request 
 }
 
 // normalizeSearchPayload renders the orchestrator payload as the JSON-shaped
-// contract consumed by reference capture and result snapshots.
+// contract consumed by reference capture and the HTTP/MCP response encoders.
 //
 // Python's retrieval returns a list of dicts; the Go projector returns
-// []map[string]any. internal/searchrefs.project iterates only []any (so typed
-// results would silently skip artifact registration) and
-// state.ResultSnapshots.Prepare rejects any other slice type (so snapshots would
-// degrade to snapshot_available=false). Normalizing once at the runtime boundary
-// keeps synchronous HTTP/MCP search and the async worker path on the same shape.
+// []map[string]any. internal/searchrefs.project iterates only []any, so typed
+// results would silently skip artifact registration. Normalizing once at the
+// runtime boundary keeps synchronous HTTP and MCP search on the same shape.
 func normalizeSearchPayload(payload map[string]any) map[string]any {
 	if payload == nil {
 		return nil

@@ -3,11 +3,9 @@ package cdcacceptance
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
 	"github.com/Guan0923/xinghe_rag/internal/documentworker"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -29,98 +27,8 @@ func cloneJSONValue(value any) (any, error) {
 	return detached, nil
 }
 
-// ---------------------------------------------------------------------------
-// fakeTransient: the expiring search-result cache (Redis stand-in).
-
-type fakeTransient struct {
-	mu       sync.Mutex
-	values   map[string]any
-	failPuts int
-	gets     int
-	puts     int
-}
-
-func newFakeTransient() *fakeTransient {
-	return &fakeTransient{values: map[string]any{}}
-}
-
-func transientKey(kind, identity string) string { return kind + "\x00" + identity }
-
-func (f *fakeTransient) Get(kind, identity string) (any, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.gets++
-	value, found := f.values[transientKey(kind, identity)]
-	return value, found, nil
-}
-
-func (f *fakeTransient) Put(kind, identity string, value any, _ float64, nx bool) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.puts++
-	if f.failPuts > 0 {
-		f.failPuts--
-		return false, errors.New("redis write failed")
-	}
-	key := transientKey(kind, identity)
-	if nx {
-		if _, exists := f.values[key]; exists {
-			return false, nil
-		}
-	}
-	detached, err := cloneJSONValue(value)
-	if err != nil {
-		return false, err
-	}
-	f.values[key] = detached
-	return true, nil
-}
-
-func (f *fakeTransient) Delete(kind, identity string) (int64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	key := transientKey(kind, identity)
-	if _, exists := f.values[key]; !exists {
-		return 0, nil
-	}
-	delete(f.values, key)
-	return 1, nil
-}
-
-// clear drops every cached result (a total Redis data loss).
-func (f *fakeTransient) clear() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.values = map[string]any{}
-}
-
-// has reports whether one cached result is present.
-func (f *fakeTransient) has(kind, identity string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, found := f.values[transientKey(kind, identity)]
-	return found
-}
-
-// poison overwrites one cached value with an arbitrary (corrupt) payload.
-func (f *fakeTransient) poison(kind, identity string, value any) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.values[transientKey(kind, identity)] = value
-}
-
-// failNextPuts makes the next n Put calls fail with a Redis outage.
-func (f *fakeTransient) failNextPuts(count int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.failPuts = count
-}
-
-func (f *fakeTransient) putCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.puts
-}
+// transientKey joins one cache kind/scope pair into a stable map key.
+func transientKey(kind, scope string) string { return kind + "\x00" + scope }
 
 // ---------------------------------------------------------------------------
 // fakeStateCache: the read-model snapshot cache (Redis StateCache stand-in),
@@ -296,55 +204,4 @@ func (i *journalIngester) callCount() int {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	return i.calls
-}
-
-// ---------------------------------------------------------------------------
-// fakeSearcher: the retrieval seam.
-
-type fakeSearcher struct {
-	mu       sync.Mutex
-	calls    int
-	requests []contracts.SearchRequest
-	failures []error
-}
-
-func (s *fakeSearcher) Search(_ context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error) {
-	s.mu.Lock()
-	s.calls++
-	s.requests = append(s.requests, request)
-	var injected error
-	if len(s.failures) > 0 {
-		injected = s.failures[0]
-		s.failures = s.failures[1:]
-	}
-	s.mu.Unlock()
-	if injected != nil {
-		return nil, injected
-	}
-	return map[string]any{
-		"results": []any{
-			map[string]any{
-				"rank":     1,
-				"text":     "evidence for " + request.Query,
-				"score":    0.93,
-				"document": "guide.txt",
-			},
-		},
-		"debug": map[string]any{"retrieval": "hybrid", "namespace": namespace},
-	}, nil
-}
-
-func (s *fakeSearcher) callCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.calls
-}
-
-func (s *fakeSearcher) lastRequest() contracts.SearchRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.requests) == 0 {
-		return contracts.SearchRequest{}
-	}
-	return s.requests[len(s.requests)-1]
 }

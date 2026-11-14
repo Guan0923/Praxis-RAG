@@ -137,9 +137,9 @@ func TestSnapshotSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SnapshotSettingsFromEnv() error = %v", err)
 	}
-	if settings.TTLSeconds != 3600 || settings.MaxResultBytes != 16*1024*1024 ||
-		settings.MaxArtifactBytes != 64*1024*1024 || settings.MaxArtifactsPerSearch != 100 {
-		t.Fatalf("unexpected snapshot defaults: %+v", settings)
+	if settings.TTLSeconds != 3600 || settings.MaxArtifactBytes != 64*1024*1024 ||
+		settings.MaxArtifactsPerSearch != 100 {
+		t.Fatalf("unexpected artifact defaults: %+v", settings)
 	}
 	t.Setenv("RAG_RESULT_TTL_SECONDS", "19")
 	t.Setenv("RAG_RESULT_MAX_BYTES", "123")
@@ -149,12 +149,17 @@ func TestSnapshotSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SnapshotSettingsFromEnv() error = %v", err)
 	}
-	if settings.TTLSeconds != 19 || settings.MaxResultBytes != 123 ||
-		settings.MaxArtifactBytes != 456 || settings.MaxArtifactsPerSearch != 7 {
-		t.Fatalf("unexpected snapshot settings: %+v", settings)
+	// RAG_RESULT_MAX_BYTES is a legacy key: it is ignored, not parsed.
+	if settings.TTLSeconds != 19 || settings.MaxArtifactBytes != 456 ||
+		settings.MaxArtifactsPerSearch != 7 {
+		t.Fatalf("unexpected artifact settings: %+v", settings)
+	}
+	t.Setenv("RAG_RESULT_MAX_BYTES", "0")
+	if _, err := SnapshotSettingsFromEnv(); err != nil {
+		t.Fatalf("legacy RAG_RESULT_MAX_BYTES must be ignored, error = %v", err)
 	}
 	for _, name := range []string{
-		"RAG_RESULT_TTL_SECONDS", "RAG_RESULT_MAX_BYTES", "RAG_ARTIFACT_MAX_BYTES", "RAG_RESULT_MAX_ARTIFACTS",
+		"RAG_RESULT_TTL_SECONDS", "RAG_ARTIFACT_MAX_BYTES", "RAG_RESULT_MAX_ARTIFACTS",
 	} {
 		isolateStateEnv(t)
 		t.Setenv(name, "0")

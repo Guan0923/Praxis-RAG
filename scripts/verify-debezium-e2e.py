@@ -8,12 +8,11 @@ Pipeline under test (no transactional outbox any more):
   The same write is captured by the cache Debezium connector as a locator-only
   event on RAG_CACHE_TOPIC (documents table, no body), and the cache revision
   row advances.
-  A queued MCP search is admitted immediately (result_id returned without
-  waiting for a broker ack); rag-search-worker consumes the schema-3
-  search_tasks notification and the result snapshot is readable from MySQL.
+  Search is synchronous now (MCP/REST return evidence in one call): there is no
+  search worker, result_id or result snapshot to poll in this pipeline check.
 
 Also asserts the Console monitor contract: pipeline.debezium.tasks/cache,
-pipeline.kafka.groups (document/search/cache), pipeline.cache and
+pipeline.kafka.groups (document/cache), pipeline.cache and
 service.delivery=debezium; pipeline.outbox must be gone.
 
 Requires the docker compose infra (MySQL 3307, Qdrant 6333, Redis 6379,
@@ -56,16 +55,12 @@ CACHE_TOPIC = os.environ.get("RAG_CACHE_TOPIC", "praxis_state_cache_refresh")
 CACHE_GROUP = os.environ.get("RAG_CACHE_GROUP", "praxis_state_cache_refresh_workers")
 DOCUMENT_TOPIC = os.environ.get("RAG_DOCUMENT_TOPIC", "praxis_document_ingest")
 DOCUMENT_GROUP = os.environ.get("RAG_DOCUMENT_GROUP", "praxis_document_ingest_workers")
-SEARCH_TOPIC = os.environ.get("RAG_SEARCH_TOPIC", "praxis_search")
-SEARCH_GROUP = os.environ.get("RAG_SEARCH_GROUP", "praxis_search_workers")
 DOCUMENT_DLQ_TOPIC = os.environ.get(
     "RAG_DOCUMENT_DLQ_TOPIC", "praxis_document_ingest_dead_letters")
-SEARCH_DLQ_TOPIC = os.environ.get("RAG_SEARCH_DLQ_TOPIC", "praxis_search_dead_letters")
 CACHE_DLQ_TOPIC = os.environ.get(
     "RAG_CACHE_DLQ_TOPIC", "praxis_state_cache_refresh_dead_letters")
 DOCUMENT_DLQ_GROUP = os.environ.get(
     "RAG_DOCUMENT_DLQ_GROUP", "praxis_document_dead_letters")
-SEARCH_DLQ_GROUP = os.environ.get("RAG_SEARCH_DLQ_GROUP", "praxis_search_dead_letters")
 CACHE_DLQ_GROUP = os.environ.get(
     "RAG_CACHE_DLQ_GROUP", "praxis_state_cache_refresh_dead_letters")
 # Loopback health endpoints published by compose for the two connectors.
@@ -302,13 +297,9 @@ def base_env() -> dict:
         "RAG_CACHE_GROUP": CACHE_GROUP,
         "RAG_DOCUMENT_TOPIC": DOCUMENT_TOPIC,
         "RAG_DOCUMENT_GROUP": DOCUMENT_GROUP,
-        "RAG_SEARCH_TOPIC": SEARCH_TOPIC,
-        "RAG_SEARCH_GROUP": SEARCH_GROUP,
         "RAG_DOCUMENT_DLQ_TOPIC": DOCUMENT_DLQ_TOPIC,
-        "RAG_SEARCH_DLQ_TOPIC": SEARCH_DLQ_TOPIC,
         "RAG_CACHE_DLQ_TOPIC": CACHE_DLQ_TOPIC,
         "RAG_DOCUMENT_DLQ_GROUP": DOCUMENT_DLQ_GROUP,
-        "RAG_SEARCH_DLQ_GROUP": SEARCH_DLQ_GROUP,
         "RAG_CACHE_DLQ_GROUP": CACHE_DLQ_GROUP,
         # Compose publishes one health port per connector on loopback; without
         # them the monitor page reports capture progress as unknown (never
@@ -604,38 +595,6 @@ def main() -> int:
         check(revision.isdigit() and int(revision) > 0,
               f"cache revision for documents('{namespace}') advanced (revision={revision})")
 
-        # ------------------------------------------------------------------ #
-        # Acceptance 2: a queued MCP search is admitted immediately (no broker
-        # ack) and rag-search-worker consumes the schema-3 search_tasks
-        # notification; the result snapshot is readable from MySQL.
-        # ------------------------------------------------------------------ #
-        search_worker_log = None
-        if (BIN / "rag-search-worker.exe").exists():
-            search_worker_process, search_worker_log = start_process(
-                "rag-search-worker", [str(BIN / "rag-search-worker.exe")], env)
-        else:
-            print("INFO dist/bin/rag-search-worker.exe missing; queued-search consumption not exercised")
-        queued = mcp.call_tool("search", {"query": "debezium bridge task", "wait_seconds": 0})
-        result_id = queued.get("result_id", "")
-        check(bool(result_id) or queued.get("results") is not None,
-              f"MCP search submitted without waiting for a broker ack (result_id={mask(result_id)})")
-        if result_id and search_worker_log is not None:
-            search_deadline = time.time() + 90
-            search_result: dict = {}
-            while time.time() < search_deadline:
-                search_result = mcp.call_tool("get_search_result", {"result_id": result_id})
-                if search_result.get("results") is not None:
-                    break
-                time.sleep(1)
-            check(search_result.get("results") is not None,
-                  f"search worker consumed the search_tasks event and produced result {mask(result_id)}")
-            snapshot = mysql_query(
-                f"SELECT COUNT(*) FROM {MYSQL_DATABASE}.search_result_snapshots "
-                f"WHERE id = '{result_id}';")
-            check(snapshot.strip() == "1",
-                  "search result snapshot is persisted in MySQL (fact source)")
-            if search_result.get("results") is None:
-                print("search worker log tail:\n" + tail(search_worker_log))
 
         # Business document deletion remains a separate path and must still work.
         second_name = f"bridge-after-cache-{int(time.time())}.md"
@@ -662,8 +621,8 @@ def main() -> int:
 
         # ------------------------------------------------------------------ #
         # Acceptance 3: the monitor contract exposes both Debezium connectors,
-        # the three Kafka consumer groups, the cache dirty state and the new
-        # search counters; pipeline.outbox is gone and unknown stays null.
+        # the two Kafka consumer groups, the cache dirty state and the cache
+        # counters; pipeline.outbox is gone and unknown stays null.
         # ------------------------------------------------------------------ #
         status, _, overview = http_json("GET", SERVICE + "/v1/admin/monitor/overview", timeout=20)
         check(status == 200 and isinstance(overview, dict), f"monitor overview HTTP {status}")
@@ -701,8 +660,8 @@ def main() -> int:
               f"failures={refresh_failures})")
         kafka_section = pipeline_section.get("kafka") or {}
         groups = kafka_section.get("groups") or {}
-        check(all(name in groups for name in ("document", "search", "cache")),
-              f"pipeline.kafka.groups carries document/search/cache ({sorted(groups.keys())})")
+        check(all(name in groups for name in ("document", "cache")),
+              f"pipeline.kafka.groups carries document/cache ({sorted(groups.keys())})")
         document_group = groups.get("document") or {}
         check(document_group.get("topic") == DOCUMENT_TOPIC and
               document_group.get("group") == DOCUMENT_GROUP,
@@ -713,19 +672,10 @@ def main() -> int:
               (lag is None or isinstance(lag, int)),
               f"consumer lag is numeric or explicitly unknown "
               f"(status={document_group.get('status')}, lag={lag})")
-        search_tasks = queues_section.get("search_tasks") or {}
-        check("timed_out_recent" in search_tasks and "overdue_active" in search_tasks,
-              f"queues.search_tasks exposes timed_out_recent/overdue_active ({sorted(search_tasks.keys())})")
-        library = overview.get("library") or {}
-        check(library.get("result_snapshots") is None or
-              isinstance(library.get("result_snapshots"), int),
-              f"library.result_snapshots is the MySQL snapshot count "
-              f"(value={library.get('result_snapshots')})")
     except Exception as error:  # noqa: BLE001 - report and fail
         print(f"ERROR: {error}", flush=True)
         results.append((False, f"exception: {error}"))
     finally:
-        stop_process(search_worker_process)
         stop_process(worker_process)
         stop_process(service_process)
         model_server.shutdown()

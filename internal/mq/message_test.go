@@ -15,7 +15,6 @@ import (
 
 const (
 	testDocumentID = "d1feec53-1036-4af0-8035-86ef6990fa6a"
-	testSearchID   = "0d6f2c9a-58d3-4f4e-9a3e-6f6f3c2f9b11"
 )
 
 // TestDecodeDocumentNotification covers the schema-4 contract: the native
@@ -82,39 +81,6 @@ func TestDecodeDocumentNotification(t *testing.T) {
 		if _, err := DecodeDocumentNotification(item.body); !errors.Is(err, ErrPayloadInvalid) {
 			t.Fatalf("%s: error = %v, want ErrPayloadInvalid", item.name, err)
 		}
-	}
-}
-
-// TestDecodeSearchNotification covers the schema-3 contract.
-func TestDecodeSearchNotification(t *testing.T) {
-	native := []byte(`{"schema":3,"result_id":"` + testSearchID +
-		`","namespace":"manuals","schedule_version":2}`)
-	notification, err := DecodeSearchNotification(native)
-	if err != nil {
-		t.Fatalf("native decode error = %v", err)
-	}
-	if notification.Schema != state.SearchEnvelopeSchema ||
-		notification.ResultID != testSearchID || notification.Namespace != "manuals" ||
-		notification.ScheduleVersion != 2 {
-		t.Fatalf("native notification = %+v", notification)
-	}
-
-	cdc := []byte(`{"before":null,"after":{"result_id":"` + testSearchID +
-		`","namespace":"manuals","schedule_version":4},"source":{"table":"search_tasks"},"op":"u"}`)
-	decoded, err := DecodeSearchNotification(cdc)
-	if err != nil || decoded.ResultID != testSearchID || decoded.ScheduleVersion != 4 {
-		t.Fatalf("Debezium decode = %+v, %v", decoded, err)
-	}
-
-	if _, err := DecodeSearchNotification([]byte(`{"before":{},"after":null,"op":"d"}`)); !state.IgnorableCDCChange(err) {
-		t.Fatalf("delete error = %v, want ignorable", err)
-	}
-	if _, err := DecodeSearchNotification([]byte(`{"schema":2,"result_id":"` + testSearchID +
-		`","namespace":"manuals","arguments":{}}`)); !errors.Is(err, ErrPayloadInvalid) {
-		t.Fatalf("schema-2 decode error = %v, want ErrPayloadInvalid", err)
-	}
-	if _, err := DecodeSearchNotification([]byte(`{"schema":3}`)); !errors.Is(err, ErrPayloadInvalid) {
-		t.Fatalf("missing result_id error = %v, want ErrPayloadInvalid", err)
 	}
 }
 
@@ -311,7 +277,6 @@ func TestTaskConnectorPropertiesCaptureOnlyLocators(t *testing.T) {
 	}
 	expected := map[string]map[string]bool{
 		"document_jobs": {"artifact_id": true, "namespace": true, "schedule_version": true},
-		"search_tasks":  {"result_id": true, "namespace": true, "schedule_version": true},
 	}
 	captured := map[string]map[string]bool{}
 	for _, qualified := range splitPropertyList(properties["debezium.source.column.include.list"]) {
@@ -338,8 +303,8 @@ func TestTaskConnectorPropertiesCaptureOnlyLocators(t *testing.T) {
 		}
 	}
 	transformNames := splitPropertyList(properties["debezium.source.transforms"])
-	if len(transformNames) != 2 {
-		t.Fatalf("transforms = %v", transformNames)
+	if len(transformNames) != 1 || transformNames[0] != "RouteDocumentJobs" {
+		t.Fatalf("transforms = %v, want only RouteDocumentJobs", transformNames)
 	}
 	replacements := make([]string, 0, len(transformNames))
 	for _, name := range transformNames {
@@ -353,7 +318,7 @@ func TestTaskConnectorPropertiesCaptureOnlyLocators(t *testing.T) {
 		replacements = append(replacements, properties[prefix+"topic.replacement"])
 	}
 	if !strings.Contains(strings.Join(replacements, ","), "RAG_DOCUMENT_TOPIC") ||
-		!strings.Contains(strings.Join(replacements, ","), "RAG_SEARCH_TOPIC") {
+		strings.Contains(strings.Join(replacements, ","), "RAG_SEARCH_TOPIC") {
 		t.Fatalf("topic replacements = %v", replacements)
 	}
 }

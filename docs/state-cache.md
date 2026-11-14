@@ -1,14 +1,15 @@
-# Redis 短期搜索状态与持久读模型缓存
+# Redis 持久读模型缓存
 > **历史设计文档**：对应的 Python 后端实现已删除；当前 Go 实现位于 `internal/` 对应包，迁移状态与差异见 [GO_MIGRATION](GO_MIGRATION.md)。本文的 schema/契约描述仍作为共享状态层的设计参考。
 
 > **传输层更新（2026-11-09）**：旧 RocketMQ 传输已全部替换为 Kafka；本文的队列/topic 示例按当前 `RAG_KAFKA_*` 与显式 `RAG_*_DLQ_TOPIC` 契约阅读，历史验证命令仅作记录。
+> **搜索同步化（2026-11-13）**：搜索已改为一次调用同步返回证据，不再有搜索任务、结果快照、搜索 topic/worker/DLQ，也不再使用 Redis 短期搜索状态。`search_tasks`/`search_result_snapshots` 表保留历史数据、不再读写。本文只描述**持久读模型展示缓存**；artifact 引用见 [UUID 引用](result-references.md)。
 
 
 ## 范围
 
-Redis 有两种不同职责，不能混用其故障语义：
+Redis 只承担**持久数据展示缓存**（另有可选的临时锁/租约工具，若实现保留则仅供运行时内部使用，不属于搜索状态）：
 
-- **短期搜索状态（2026-11-13 起以 MySQL 为事实来源）**：排队搜索的任务状态与结果快照保存在 MySQL（`search_tasks`、`search_result_snapshots`）。Redis 只是读取缓存：未命中/不可用时回源 MySQL 并尽力回填；超过 `RAG_RESULT_TTL_SECONDS=3600` 后 MySQL 快照会被有界清理。**异步文档入库的任务状态与文件字节也保存在 MySQL**：没有 Redis TTL，不会因 Redis 丢失、过期或不可用而失效。
+- **异步文档入库的任务状态与文件字节保存在 MySQL**（`document_jobs`、`blobs`）：没有 Redis TTL，不会因 Redis 丢失、过期或不可用而失效；进度只由 Debezium 任务连接器 → `rag-document-worker` 推进。
 - **持久数据展示缓存**：MySQL 继续保存异步文档任务、已发布文档/源文件/解析产物、KB/API Key/catalog、artifact 快照和 UploadJournal 操作/租约；Qdrant 继续检索。下面第一、二批读模型仍可在 Redis 故障时回源 MySQL；缓存刷新由 Debezium 表级事件驱动 revision 水位，`cache_outbox` 已于 2026-11-13 下线（下文的 outbox 描述仅作历史）。
 
 第一批缓存四种读模型（MCP 工具和提示词共用一份 catalog）：
@@ -34,23 +35,17 @@ Redis 有两种不同职责，不能混用其故障语义：
 
 租约 owner 原始所有权 token 不放 Redis；holder_id 是 token 的短哈希，仅用于区分执行者。操作详情不缓存 idempotency_key、workspace、fingerprint、result 原文、步骤输入 details、文件内容或密钥。upload_status 的返回值再次验证 namespace，UUID 不授予访问权。API Key 列表按账号可见（管理员/本机管理为全部，普通账号仅本人；见 [权限管理](PERMISSIONS.md) §9）。
 
-上述**展示读模型**不缓存原始文件、图片、解析产物、查询/重排结果或模型密钥。排队搜索任务与结果快照以 MySQL 为事实来源（见下节），Redis 只作读取缓存：未命中/不可用时回源 MySQL，清空 Redis 不需要客户端重新提交；文档原本文件不写入 Redis，只保留在 MySQL 的 `document_jobs` 与 `blobs` 中。事务/步骤的展示投影可缓存，MySQL 原始 UploadJournal 始终是恢复依据；不迁移发布/恢复日志或业务租约权威到 Redis。文档列表中的 operation_id 也仅为展示元数据。
+上述**展示读模型**不缓存原始文件、图片、解析产物、查询/重排结果或模型密钥。搜索响应不写入 Redis：检索结果在请求内同步返回，artifact 事实在 MySQL（见 [产物引用](result-references.md)）；文档原本文件不写入 Redis，只保留在 MySQL 的 `document_jobs` 与 `blobs` 中。事务/步骤的展示投影可缓存，MySQL 原始 UploadJournal 始终是恢复依据；不迁移发布/恢复日志或业务租约权威到 Redis。文档列表中的 operation_id 也仅为展示元数据。
 
 公开配置和列表命中 Redis 时直接返回，不额外查 MySQL 版本，也不构建 tenant 或调用模型。上传、去重、覆盖/删除检查、reembedding、鉴权、版本发布与恢复仍使用 MySQL 权威读取。工具列表允许缓存，但真正执行工具时直接校验 MySQL 的 enabled 状态，避免停用被旧缓存绕过。
 
-## MCP 短期搜索任务与结果快照
+## 搜索不再使用 Redis 短期状态
 
-搜索受理已改为**提交即受理**：`SearchTasks.Submit` 只向 MySQL `search_tasks` 写一个事务并返回 `result_id`，不再等待 Kafka 确认；通知由 Debezium 任务连接器采集任务表后投递。`wait_seconds` 只是客户端等待结果的时间。**文档入库同样不依赖 Redis**：`add_document` 只提交一个 MySQL 事务（`document_jobs` 完整任务），Kafka 只传 schema 4 纯通知。
-
-搜索不再有“Kafka/Redis 发送确认”前置依赖：MySQL 提交即受理，Kafka/Debezium 暂停时任务保持 `queued`，恢复后补投；逾期由 `Expire`/`Claim`/`Get` 收敛为 `timed_out`。重试应保留原 idempotency_key、内容和参数。Redis 丢失/淘汰只影响读取性能，结果可从 MySQL `search_result_snapshots` 回源重建；超过 `RAG_RESULT_TTL_SECONDS` 后 MySQL 快照被有界清理，`result_id` 才不可用，不自动重新搜索来伪造原快照。
-
-结果快照以 MySQL `search_result_snapshots` 为事实来源，Console 监控页的「当前结果快照」直接统计 MySQL 未过期快照数（`MonitorStats.SearchResultSnapshotsActive`），统计失败时整个 `library` 为 `null`、页面显示「未知」。Redis 只是读取缓存：未命中或不可用时按 `result_id` 回源 MySQL 并尽力回填，不影响该计数；旧的 Redis ZSET 索引已随本次改造下线。
-
-搜索由独立 worker、独立 topic/group 消费；缓存刷新使用第三组独立 topic/group，文档任务使用文档 topic/group；三类事件均由 Debezium 从 MySQL 表级采集（应用不写 outbox）。Kafka 消费语义为 ack=提交 offset、nack=同一进程内指数退避重试同一条记录、达到 `MaxAttempts` 后写入显式 `RAG_*_DLQ_TOPIC` 并提交、`MaxAttempts=0` 无限重试（至少一次）。**搜索临时故障不提交；成功时在同一 MySQL 事务写 `search_result_snapshots` 并把任务置 `succeeded`，提交后才提交 offset**；重复消息按 `schedule_version` 校验，旧版本/终态安全跳过，不覆盖仍存在的终态。Redis 丢失后可从 MySQL 重建，不依赖 Redis 去重。
+搜索已改为**同步直返**：`POST /v1/search` 与 MCP `search` 一次调用完成检索 + 重排并直接返回证据，没有任务 ID、`wait_seconds`、轮询、结果快照或 Redis 短期缓存。原 `search_tasks`/`search_result_snapshots` 表保留历史数据、不再读写；搜索 topic/消费组/DLQ 与 `rag-search-worker` 已下线（见 [部署指南 §12](DEPLOYMENT.md#12-搜索同步化迁移与切换)）。**文档入库同样不依赖 Redis**：`add_document` 只提交一个 MySQL 事务（`document_jobs` 完整任务），Kafka 只传 schema 4 纯通知。
 
 文档侧没有 Redis 参与：任务状态、租约与终态全部由 MySQL 提供，worker 用 SQL 租约 claim 并心跳续租，只有 MySQL 记录领取/终态后才 ACK；`get_document_status` 直接读 MySQL，无 TTL。UploadJournal 继续保障文档发布版本一致性，不存在 Redis+MySQL 原子事务问题，也没有 Redis 回源。事务 outbox 已于 2026-11-13 下线：重发只通过 `schedule_version + 1`，不再有 outbox 行或保留期清理。日志仅记录任务/操作 ID 与安全错误类别，不记录查询、文件/消息正文或凭据。
 
-2026-11-13 切换：停旧入口并排空旧 worker/消息，API 与 worker 一起部署；文档通知为 schema 4、搜索通知为 schema 3，旧 schema 不兼容。旧 outbox 表在切换完成前保留，确认无需回滚后执行 `rag-service-migrate --retire-outbox --yes` 删除；`document_tasks` 作为历史表保留但不再读写。结果与 MySQL artifact 保留边界见 [UUID 引用](result-references.md)，切换步骤见 [CDC 迁移契约](cdc-migration.md) §8。
+2026-11-13 搜索同步化：搜索不再有 Kafka 通知（原 schema 3 搜索消息、`praxis_search` topic、搜索消费组与搜索 DLQ 一并下线），文档通知仍为 schema 4。切换步骤见 [部署指南 §12](DEPLOYMENT.md#12-搜索同步化迁移与切换)；`search_tasks`/`search_result_snapshots` 保留历史数据、不再读写，artifact 保留边界见 [产物引用](result-references.md)。旧 outbox 表仍可由 `rag-service-migrate --retire-outbox --yes` 删除；`document_tasks` 作为历史表保留但不再读写。
 
 ## 持久读模型的读写与可靠同步
 
@@ -109,19 +104,15 @@ RAG_CACHE_TOPIC=praxis_state_cache_refresh
 RAG_CACHE_GROUP=praxis_state_cache_refresh_workers
 RAG_DOCUMENT_TOPIC=praxis_document_ingest
 RAG_DOCUMENT_GROUP=praxis_document_ingest_workers
-RAG_SEARCH_TOPIC=praxis_search
-RAG_SEARCH_GROUP=praxis_search_workers
 RAG_DOCUMENT_DLQ_TOPIC=praxis_document_ingest_dead_letters
-RAG_SEARCH_DLQ_TOPIC=praxis_search_dead_letters
 RAG_CACHE_DLQ_TOPIC=praxis_state_cache_refresh_dead_letters
 RAG_DOCUMENT_DLQ_GROUP=praxis_document_dead_letters
-RAG_SEARCH_DLQ_GROUP=praxis_search_dead_letters
 RAG_CACHE_DLQ_GROUP=praxis_state_cache_refresh_dead_letters
 RAG_CACHE_WORKER_RECOVER_SECONDS=30
 # RAG_DEBEZIUM_HEALTH_URL / RAG_DEBEZIUM_CACHE_HEALTH_URL 为可选只读健康探测
 ```
 
-`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存，结果快照用 `RAG_RESULT_TTL_SECONDS=3600`。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis：**排队搜索仍可受理并从 MySQL 读取结果**（只是没有读取缓存），结果快照 TTL 与 MySQL 有界清理不受影响。文档异步新增不依赖 Redis：禁用后仍可提交、查询状态并完成 MySQL 持久发布（Kafka 部署需 Debezium 完成通知投递，但不影响受理与状态查询）。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；持久数据展示读取可回源 MySQL。多实例共享相同 Redis、前缀、MySQL 和各自的 cache/document/search topic/group（以及三个显式 DLQ topic）。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；Kafka SASL/TLS 凭据仅从 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*` 读取。
+`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存；artifact 保留期用 `RAG_RESULT_TTL_SECONDS=3600`（变量名保留，语义已更正为 artifact TTL）。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis：**搜索同步直返、artifact 按 ID 从 MySQL 读取，均不依赖 Redis**；被禁用的只是读模型展示缓存（读取回源 MySQL）。文档异步新增不依赖 Redis：禁用后仍可提交、查询状态并完成 MySQL 持久发布（Kafka 部署需 Debezium 完成通知投递，但不影响受理与状态查询）。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；持久数据展示读取可回源 MySQL。多实例共享相同 Redis、前缀、MySQL 和各自的 cache/document topic/group（以及两个显式 DLQ topic）。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；Kafka SASL/TLS 凭据仅从 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*` 读取。
 
 ## Docker 与启动
 
@@ -132,22 +123,22 @@ Compose 提供 Redis 7.4、单节点 KRaft Kafka（`apache/kafka:3.9.0`，宿主
 .\scripts\start-stack.ps1 -SkipMigrate
 ```
 
-脚本启动 MySQL、Kafka、两个 Debezium 连接器等依赖，创建 document/search/cache 与三个 DLQ topic（4 partitions、RF=1），然后运行服务。三类通知的 Kafka 投递由两个 Debezium 连接器承担；应用不写事务 outbox。
+脚本启动 MySQL、Kafka、两个 Debezium 连接器等依赖，创建 document/cache 与两个 DLQ topic（4 partitions、RF=1），然后运行服务。两类通知的 Kafka 投递由两个 Debezium 连接器承担；应用不写事务 outbox。搜索不经过 Kafka。
 
 ```powershell
 docker exec praxis-rag-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 `
   --create --if-not-exists --topic praxis_state_cache_refresh --partitions 4 --replication-factor 1
 ```
 
-对持久读模型刷新，Redis/Kafka 失败不回滚已提交的 MySQL 业务操作：revision 已递增，脏状态保留在 `cache_revisions`，由 `rag-cache-worker` 周期重试。对排队搜索，MySQL 提交即受理（不等待 Kafka/Redis），投递由 Debezium 任务连接器补足；结果以 MySQL 快照为准。对异步文档新增，MySQL 提交即受理，Kafka 故障既不回滚也不阻塞受理。启动前确认 MySQL、Redis（可选）、Kafka 连接、topic/group 与两个连接器权限。
+对持久读模型刷新，Redis/Kafka 失败不回滚已提交的 MySQL 业务操作：revision 已递增，脏状态保留在 `cache_revisions`，由 `rag-cache-worker` 周期重试。搜索为同步执行，不写 Kafka/Redis；对异步文档新增，MySQL 提交即受理，Kafka 故障既不回滚也不阻塞受理。启动前确认 MySQL、Redis（可选）、Kafka 连接、topic/group 与两个连接器权限。
 
 ## 运维与限制
 
 `cache_revisions` 已扩展为 revision 水位（`revision`、`refreshed_revision`、`attempts`、`last_error`、`updated_at`），正常自动 schema 会幂等追加缺失列；`cache_outbox` 已下线并由迁移 CLI 删除。禁用自动 schema 的部署需先使用有 DDL 权限的账号执行同样的增量迁移。
 
-展示缓存水位不独立淘汰；内存用量随缓存 kind/scope 增长。不要删除水位却保留 payload，或在旧 worker 仍回填时 FLUSHDB。清空/换库前先停入口并排空 worker，再停所有实例；新前缀可从 MySQL 重建**展示缓存**，排队搜索任务与结果也能从 MySQL 回源/重建（超过 TTL 的快照已清理则不可恢复，客户端需重新提交）；异步文档任务与文件字节在 MySQL，仍可查询并继续投递。Redis 持续不可用时脏状态保留在 `cache_revisions`，`RefreshDirty` 会持续重试；不要清理 revision 水位行。
+展示缓存水位不独立淘汰；内存用量随缓存 kind/scope 增长。不要删除水位却保留 payload，或在旧 worker 仍回填时 FLUSHDB。清空/换库前先停入口并排空 worker，再停所有实例；新前缀可从 MySQL 重建**展示缓存**；异步文档任务与文件字节在 MySQL，仍可查询并继续投递；搜索无持久缓存，重新检索即可。Redis 持续不可用时脏状态保留在 `cache_revisions`，`RefreshDirty` 会持续重试；不要清理 revision 水位行。
 
-本批不实现跨实例 MCP 订阅通知总线；配置缓存同步不等于通知可重放。UUID 搜索结果以 MySQL `search_result_snapshots` 为事实来源、Redis 为读取缓存；产物快照仍在 MySQL。文档任务状态使用 MySQL `document_jobs`，不进入 Redis 短期存储。见 [UUID 引用](result-references.md)。
+本批不实现跨实例 MCP 订阅通知总线；配置缓存同步不等于通知可重放。artifact 快照保存在 MySQL，按 ID 独立读取（见 [产物引用](result-references.md)）；`search_tasks`/`search_result_snapshots` 为历史表、不再读写。文档任务状态使用 MySQL `document_jobs`，不进入 Redis 短期存储。
 
 ## 验证
 
@@ -155,4 +146,4 @@ docker exec praxis-rag-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server k
 go test -count=1 ./internal/state/ ./internal/redisstate/...
 ```
 
-历史 Python 测试已随 Python 后端删除；当前 Go 状态层的缓存/Redis 测试使用上述命令。2026-11-13 的缓存消费者改造（Debezium 缓存连接器 + revision 水位 + MarkAllDirty/RefreshDirty）以 `internal/state` 与 `internal/cacheconsumer` 单测覆盖；真实 Redis/SASL/TLS 集群与双连接器实链路未验证，见 [VALIDATION](../VALIDATION.md)。
+历史 Python 测试已随 Python 后端删除；当前 Go 状态层的缓存/Redis 测试使用上述命令。2026-11-13 的缓存消费者改造（Debezium 缓存连接器 + revision 水位 + MarkAllDirty/RefreshDirty）以 `internal/state` 与 `internal/cacheconsumer` 单测覆盖；搜索结果快照/搜索任务相关用例已随同步化改造删除。真实 Redis/SASL/TLS 集群与双连接器实链路未验证，见 [VALIDATION](../VALIDATION.md)。

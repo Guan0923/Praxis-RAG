@@ -44,7 +44,6 @@ type CutoverTaskInventory struct {
 // `rag-cdc-cutover --inventory`.
 type CutoverInventory struct {
 	DocumentJobs CutoverTaskInventory
-	SearchTasks  CutoverTaskInventory
 	// CacheKeys is the number of tracked read-model keys (cache_revisions rows).
 	CacheKeys int
 	// CacheDirtyKeys is the number of tracked keys whose Redis value is behind
@@ -145,11 +144,6 @@ func (s *Stores) CutoverInventory(ctx context.Context, now time.Time) (*CutoverI
 	if err != nil {
 		return nil, fmt.Errorf("document_jobs 盘点失败：%w", err)
 	}
-	searchTasks, err := s.cutoverTaskInventory(ctx, now,
-		"search_tasks", "result_id", searchActiveStatuses)
-	if err != nil {
-		return nil, fmt.Errorf("search_tasks 盘点失败：%w", err)
-	}
 	cacheKeys, err := s.monitorCount(ctx, "SELECT COUNT(*) FROM cache_revisions")
 	if err != nil {
 		return nil, fmt.Errorf("cache_revisions 盘点失败：%w", err)
@@ -161,7 +155,6 @@ func (s *Stores) CutoverInventory(ctx context.Context, now time.Time) (*CutoverI
 	}
 	return &CutoverInventory{
 		DocumentJobs:   documentJobs,
-		SearchTasks:    searchTasks,
 		CacheKeys:      cacheKeys,
 		CacheDirtyKeys: cacheDirty,
 	}, nil
@@ -238,12 +231,6 @@ func joinPlaceholders(placeholders []string) string {
 func (d *DocumentJobs) RequeueActive(ctx context.Context, limit int, baseline int64) (int, error) {
 	return requeueActive(ctx, d.stores.DB, "document_jobs", "artifact_id",
 		documentJobActiveStatuses, limit, baseline, "execution_id = NULL, ")
-}
-
-// RequeueActive is the search-task variant of DocumentJobs.RequeueActive.
-func (s *SearchTasks) RequeueActive(ctx context.Context, limit int, baseline int64) (int, error) {
-	return requeueActive(ctx, s.stores.DB, "search_tasks", "result_id",
-		searchActiveStatuses, limit, baseline, "")
 }
 
 // requeueActive is the shared cutover backfill statement.

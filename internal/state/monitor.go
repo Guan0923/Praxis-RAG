@@ -26,21 +26,9 @@ type MonitorStats struct {
 	// JobsSucceededRecent counts succeeded jobs updated inside the recent window.
 	JobsSucceededRecent int
 
-	// SearchByStatus counts search_tasks per status with the five known states
-	// always present (zero when absent).
-	SearchByStatus map[string]int
-	// OldestActiveSearchSeconds is the age of the oldest queued/processing task.
-	OldestActiveSearchSeconds float64
-	// SearchTimedOutRecent counts tasks converged to timed_out inside the recent
-	// window (deadline expiry is a terminal outcome, not a worker failure).
-	SearchTimedOutRecent int
-	// SearchOverdueActive counts active tasks whose deadline already passed but
-	// which have not been converged to timed_out yet (Expire/Claim/Get lag).
-	SearchOverdueActive int
-	// SearchesRecent counts every retrieval execution inside the recent window:
-	// synchronous REST/MCP searches and queued search worker runs all pass
-	// through runtime.Service.Search and are counted by the activity counter.
-	// search_tasks only holds queued searches, so it is not the source here.
+	// SearchesRecent counts every retrieval execution inside the recent window.
+	// Search is synchronous: REST and MCP calls both pass through
+	// runtime.Service.Search and are counted by the activity counter.
 	SearchesRecent int
 
 	// CacheDirtyKeys counts read-model keys whose Redis value is behind the
@@ -74,12 +62,11 @@ type MonitorStats struct {
 
 	// Documents counts live (not soft-deleted) document records.
 	// KnowledgeBases and ArtifactSnapshots are plain table counts of the library
-	// state. SearchResultSnapshotsActive counts unexpired search-result fact
-	// rows (search_result_snapshots; Redis is only their read cache).
-	Documents                   int
-	KnowledgeBases              int
-	ArtifactSnapshots           int
-	SearchResultSnapshotsActive int
+	// state. Artifact snapshots back the independently readable evidence files
+	// attached to search responses.
+	Documents         int
+	KnowledgeBases    int
+	ArtifactSnapshots int
 }
 
 // MonitorStats aggregates the monitoring counters in one call. The caller
@@ -137,38 +124,8 @@ func (s *Stores) MonitorStats(ctx context.Context, now time.Time, recentWindow t
 		return nil, fmt.Errorf("document_jobs 近期成功统计失败：%w", err)
 	}
 
-	searchByStatus, err := s.monitorGroupCounts(ctx,
-		"SELECT status, COUNT(*) FROM search_tasks GROUP BY status")
-	if err != nil {
-		return nil, fmt.Errorf("search_tasks 状态聚合失败：%w", err)
-	}
-	stats.SearchByStatus = monitorWithFallbackKeys(searchByStatus,
-		SearchTaskQueued, SearchTaskProcessing, SearchTaskSucceeded, SearchTaskFailed, SearchTaskTimedOut)
-
-	stats.OldestActiveSearchSeconds, err = s.monitorOldestAgeSeconds(ctx,
-		"SELECT MIN(created_at) FROM search_tasks WHERE status IN (?, ?)",
-		now, SearchTaskQueued, SearchTaskProcessing)
-	if err != nil {
-		return nil, fmt.Errorf("search_tasks 最旧活动任务查询失败：%w", err)
-	}
-
-	stats.SearchTimedOutRecent, err = s.monitorCount(ctx,
-		"SELECT COUNT(*) FROM search_tasks WHERE status = ? AND updated_at >= ?",
-		SearchTaskTimedOut, recentStartSeconds)
-	if err != nil {
-		return nil, fmt.Errorf("search_tasks 近期超时统计失败：%w", err)
-	}
-
-	stats.SearchOverdueActive, err = s.monitorCount(ctx,
-		"SELECT COUNT(*) FROM search_tasks WHERE status IN (?, ?) AND deadline <= ?",
-		SearchTaskQueued, SearchTaskProcessing, nowSeconds)
-	if err != nil {
-		return nil, fmt.Errorf("search_tasks 逾期未收敛统计失败：%w", err)
-	}
-
 	// Every retrieval execution is counted by the hourly activity counter, so
-	// synchronous searches (REST/MCP) are included; search_tasks only holds the
-	// queued subset and must not feed this number.
+	// synchronous searches (REST/MCP) are included.
 	if s.Activity == nil {
 		return nil, newStateError("活动计数器未装配")
 	}
@@ -204,14 +161,12 @@ func (s *Stores) MonitorStats(ctx context.Context, now time.Time, recentWindow t
 	stats.UnfinishedUploads = uploadCounts.unfinished
 
 	// Soft-deleted documents (del_flag = 1) are tombstones, so the library count
-	// must only include live records. Search-result snapshots are MySQL fact
-	// rows now, so the live count comes from the same aggregate.
+	// must only include live records. Artifact snapshots are the independently
+	// readable evidence files; search results are no longer stored.
 	if err := s.DB.QueryRowContext(ctx,
 		"SELECT (SELECT COUNT(*) FROM documents WHERE del_flag = 0), "+
-			"(SELECT COUNT(*) FROM knowledge_bases), (SELECT COUNT(*) FROM artifact_snapshots), "+
-			"(SELECT COUNT(*) FROM search_result_snapshots WHERE expires_at > ?)", nowSeconds).
-		Scan(&stats.Documents, &stats.KnowledgeBases, &stats.ArtifactSnapshots,
-			&stats.SearchResultSnapshotsActive); err != nil {
+			"(SELECT COUNT(*) FROM knowledge_bases), (SELECT COUNT(*) FROM artifact_snapshots)").
+		Scan(&stats.Documents, &stats.KnowledgeBases, &stats.ArtifactSnapshots); err != nil {
 		return nil, fmt.Errorf("资料库计数查询失败：%w", err)
 	}
 	return stats, nil

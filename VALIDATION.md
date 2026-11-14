@@ -8,6 +8,53 @@
 >
 > **Superseded (2026-11-13):** 事务 outbox 与单 Debezium 连接器已下线，当前为
 > 两个 Debezium 连接器表级采集；下方 outbox/relay 记录均为历史。
+>
+> **Superseded (2026-11-13, 搜索同步化):** 排队搜索、结果快照、`get_search_result`、
+> 搜索 topic/worker/DLQ 已下线。下方涉及 `search_result_snapshots`、
+> `internal/redisstate/snapshot_index.go`（ZSET）、结果快照计数/ZADD、排队搜索与
+> `verify-kafka-search.py` 的记录均为历史存档，不代表当前实现；`search_tasks`/
+> `search_result_snapshots` 表保留数据但不再读写。当前搜索验证以同步检索、超时/取消与
+> artifact 独立读取为准（见 [产物引用](docs/result-references.md)）。
+
+## 当前验证范围：搜索同步化（MCP/REST 一次调用直返证据）— 2026-11-13
+
+工作树 `dsh-07b26c03-826a`（Windows 11，Go 1.27.3）。本轮验证目标是**搜索同步化改造**：MCP `search` 与 REST `POST /v1/search` 一次调用返回证据；删除搜索任务、结果快照、轮询、SQL 任务逻辑、搜索队列/worker/DLQ 与 Debezium 搜索采集；artifact 独立读取与缓存同步链路保留。代码/文档/Console 变更范围见 [PROGRESS.md](PROGRESS.md) 最后一轮。
+
+### 已验证（可复核）
+
+```powershell
+# 全体 Go 包（生产代码）构建
+$env:GOCACHE = '.test-tmp\gocache'; go build ./...                       # exit 0
+
+# 全部包（含测试文件）编译检查
+go vet ./...                                                             # exit 0（12 个此前编译阻塞的包已清理）
+
+# 不依赖外部服务的单元测试
+go test -p 1 -count=1 ./internal/mcp ./internal/redisstate ./internal/mq `
+  ./internal/monitor ./internal/contracts ./internal/cacheconsumer       # 全部 ok
+
+# 同步搜索专项
+go test -p 1 -count=1 ./internal/mcp -run 'TestTool|TestSearch|TestRestricted|TestScope'   # ok
+go test -p 1 -count=1 ./internal/httpapi -run 'TestSearch|TestArtifact|TestOpenAPI|TestServerNoStore'  # ok（含 TestSearchResultEndpointRemoved）
+go test -p 1 -count=1 ./internal/runtime -run 'TestSearchTimeout|TestServiceSearchPropagatesClientCancellation'  # ok
+go test -p 1 -count=1 ./internal/e2e ./internal/cdcacceptance -run '^$'    # 测试二进制编译 ok
+
+# 前端
+cd frontend; npm run typecheck                                            # 通过
+npx vitest run                                                           # 17 files / 224 tests 全通过
+
+# 缓存同步链路（与搜索快照无关的独立专项）
+go test -p 1 -count=1 ./internal/cacheconsumer                           # 12/12 PASS（含新增 4 例：8 表 DELETE 映射、跨 scope、重放幂等、生产 decoder）
+```
+
+覆盖点：MCP 恰好 5 个工具且顺序固定（`search`、`add_document`、`update_document`、`delete_document`、`get_document_status`）；`search` 一次调用返回 `results`/`artifacts`/`evidence_status`；`wait_seconds` 报未知参数；受限 scope 同步检索仍按文档过滤；REST `POST /v1/search` 响应无 `result_id`/`created_at`/`expires_at`/`snapshot_available`/`snapshot_error`；`GET /v1/search-results/{id}` 返回 404；artifact 独立读取保留；`RAG_SEARCH_TIMEOUT_SECONDS` 默认 120s、非法值启动失败、超时映射 `Search timed out`、客户端取消可向下传播。
+
+### 环境限制与未验证项
+
+- 本机无 `RAG_TEST_MYSQL_URL`、Redis、Kafka 与 docker：`internal/state`、`internal/runtime`、`internal/httpapi`（api_keys）、`internal/searchrefs`、`internal/e2e`、`internal/cdcacceptance` 中依赖 MySQL 的用例由 `internal/statetest` **Fatalf（环境失败，不是 skip）**；未在本机实跑。
+- 未执行真实 Docker/Debezium/Kafka/Redis 端到端切换演练；未验证真实 Qdrant + 模型的同步搜索时延分布。
+- Cache 链路四类场景（接口写、手工 SQL 写、删除、故障恢复）由 `internal/cacheconsumer` 与 `internal/cdcacceptance/cache_chain_test.go`（新增 DELETE 后 `kb_list.document_count` 递减、跨 namespace 收敛）覆盖；MySQL/Redis/Kafka 实跑仍需在具备依赖的环境执行。
+- 历史表 `search_tasks`/`search_result_snapshots` 数据保留、未 DROP；物理删除按单独运维安排执行。
 
 ## 当前验证范围：Debezium 双连接器（事务 outbox 已下线）— 2026-11-13
 

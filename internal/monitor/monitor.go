@@ -83,12 +83,12 @@ type Options struct {
 	// offset: the service cannot observe that from its own state database.
 	DebeziumHealthURL      string
 	DebeziumCacheHealthURL string
-	// Document/Search/Cache Topic+Group label the three independent business
-	// consumer groups. They are reported even when a progress read is unavailable.
+	// Document/Cache Topic+Group label the two independent business consumer
+	// groups (document ingestion and cache refresh). Search is synchronous and
+	// has no consumer group. They are reported even when a progress read is
+	// unavailable.
 	DocumentTopic string
 	DocumentGroup string
-	SearchTopic   string
-	SearchGroup   string
 	CacheTopic    string
 	CacheGroup    string
 	// KafkaGroupProgress reads one consumer group's committed offsets against its
@@ -240,7 +240,7 @@ type pipelineConnector struct {
 	CaptureProgress *int64 `json:"capture_progress"`
 }
 
-// pipelineKafka reports the three independent consumer groups. The document
+// pipelineKafka reports the two independent consumer groups. The document
 // group is also mirrored into the legacy top-level Topic/Group/offset fields so
 // an older Console build still labels the row; groups is authoritative.
 type pipelineKafka struct {
@@ -257,7 +257,6 @@ type pipelineKafka struct {
 // pipelineKafkaGroups holds one progress row per business consumer group.
 type pipelineKafkaGroups struct {
 	Document pipelineKafkaGroup `json:"document"`
-	Search   pipelineKafkaGroup `json:"search"`
 	Cache    pipelineKafkaGroup `json:"cache"`
 }
 
@@ -402,12 +401,6 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 				"stuck_processing":      stats.StuckProcessing,
 				"failed_recent":         stats.FailedRecent,
 			},
-			"search_tasks": map[string]any{
-				"by_status":             stats.SearchByStatus,
-				"oldest_active_seconds": roundOneDecimal(stats.OldestActiveSearchSeconds),
-				"timed_out_recent":      stats.SearchTimedOutRecent,
-				"overdue_active":        stats.SearchOverdueActive,
-			},
 			"uploads": monitorUploadsView(stats),
 		}
 		library = monitorLibraryView(stats)
@@ -471,15 +464,14 @@ func monitorUploadsView(stats *state.MonitorStats) map[string]any {
 	}
 }
 
-// monitorLibraryView renders the library counters. result_snapshots is the
-// MySQL search_result_snapshots count (the fact source): the cached copy in
-// Redis may be evicted, so it is never the denominator. Stats availability is
-// handled by the caller, which leaves the whole library object null on failure.
+// monitorLibraryView renders the library counters. Search results are returned
+// inline and are no longer stored; artifact_snapshots backs the independently
+// readable evidence files. Stats availability is handled by the caller, which
+// leaves the whole library object null on failure.
 func monitorLibraryView(stats *state.MonitorStats) map[string]any {
 	return map[string]any{
 		"documents":          stats.Documents,
 		"knowledge_bases":    stats.KnowledgeBases,
-		"result_snapshots":   stats.SearchResultSnapshotsActive,
 		"artifact_snapshots": stats.ArtifactSnapshots,
 	}
 }
@@ -714,9 +706,9 @@ func (s *Service) probeDebeziumConnector(ctx context.Context, healthURL, label s
 	}
 }
 
-// probeKafkaGroups reads the three independent business consumer groups (one
-// row each) concurrently and aggregates them into pipeline.kafka. The document
-// row is mirrored into the legacy top-level fields; groups is authoritative.
+// probeKafkaGroups reads the two independent business consumer groups (one row
+// each) concurrently and aggregates them into pipeline.kafka. The document row
+// is mirrored into the legacy top-level fields; groups is authoritative.
 func (s *Service) probeKafkaGroups(ctx context.Context) pipelineKafka {
 	var groups pipelineKafkaGroups
 	probes := []struct {
@@ -726,7 +718,6 @@ func (s *Service) probeKafkaGroups(ctx context.Context) pipelineKafka {
 		target *pipelineKafkaGroup
 	}{
 		{label: "文档任务", topic: s.options.DocumentTopic, group: s.options.DocumentGroup, target: &groups.Document},
-		{label: "搜索任务", topic: s.options.SearchTopic, group: s.options.SearchGroup, target: &groups.Search},
 		{label: "缓存刷新", topic: s.options.CacheTopic, group: s.options.CacheGroup, target: &groups.Cache},
 	}
 	var wait sync.WaitGroup
@@ -748,26 +739,21 @@ func (s *Service) probeKafkaGroups(ctx context.Context) pipelineKafka {
 	view.ConsumerLag = groups.Document.ConsumerLag
 
 	switch {
-	case groups.Document.Status == statusDisabled && groups.Search.Status == statusDisabled &&
-		groups.Cache.Status == statusDisabled:
+	case groups.Document.Status == statusDisabled && groups.Cache.Status == statusDisabled:
 		view.Status = statusDisabled
 		view.Detail = "未配置 Kafka：任务/缓存通知不会投递"
-	case groups.Document.Status == statusError || groups.Search.Status == statusError ||
-		groups.Cache.Status == statusError:
+	case groups.Document.Status == statusError || groups.Cache.Status == statusError:
 		view.Status = statusError
 		view.Detail = "Kafka 消费进度读取失败"
-	case groups.Document.Status == statusUnknown || groups.Search.Status == statusUnknown ||
-		groups.Cache.Status == statusUnknown:
+	case groups.Document.Status == statusUnknown || groups.Cache.Status == statusUnknown:
 		view.Status = statusUnknown
-		view.Detail = fmt.Sprintf("文档组滞后 %s；搜索组滞后 %s；缓存组滞后 %s",
+		view.Detail = fmt.Sprintf("文档组滞后 %s；缓存组滞后 %s",
 			consumerLagText(groups.Document.ConsumerLag),
-			consumerLagText(groups.Search.ConsumerLag),
 			consumerLagText(groups.Cache.ConsumerLag))
 	default:
 		view.Status = statusOK
-		view.Detail = fmt.Sprintf("文档组滞后 %s；搜索组滞后 %s；缓存组滞后 %s",
+		view.Detail = fmt.Sprintf("文档组滞后 %s；缓存组滞后 %s",
 			consumerLagText(groups.Document.ConsumerLag),
-			consumerLagText(groups.Search.ConsumerLag),
 			consumerLagText(groups.Cache.ConsumerLag))
 	}
 	return view

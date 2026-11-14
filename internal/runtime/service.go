@@ -1,7 +1,7 @@
 // Package runtime owns the long-lived service runtime: configuration, the
 // shared state database, the search engine (Qdrant/model orchestration), and the
-// document/artifact read paths. Upload transactions and queued search are wired
-// in later phases; the HTTP and MCP layers already see a complete Service.
+// document/artifact read paths. Search is synchronous: every call runs retrieval
+// and returns evidence directly. The HTTP and MCP layers see the same Service.
 package runtime
 
 import (
@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -31,10 +32,11 @@ var windowsReserved = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
 
 // Service is the process-wide RAG service runtime.
 type Service struct {
-	config   config.RagConfig
-	stores   *state.Stores
-	dataRoot string
-	search   *SearchEngine
+	config        config.RagConfig
+	stores        *state.Stores
+	dataRoot      string
+	search        *SearchEngine
+	searchTimeout time.Duration
 	// activityRecorder is the optional monitoring counter recorded once per
 	// Search call. It is set once at startup, before the service serves traffic.
 	activityRecorder ActivityRecorder
@@ -87,11 +89,38 @@ func New(cfg config.RagConfig, stores *state.Stores, dataRoot string) (*Service,
 	if err != nil {
 		return nil, err
 	}
-	service := &Service{config: cfg, stores: stores, dataRoot: root, search: search}
+	searchTimeout, err := searchTimeoutFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	service := &Service{config: cfg, stores: stores, dataRoot: root, search: search, searchTimeout: searchTimeout}
 	if stores.Views != nil {
 		service.views = stores.Views
 	}
 	return service, nil
+}
+
+// searchTimeoutEnvName is the synchronous search budget. Before the queued
+// search flow was removed the same variable bounded one queued task's deadline;
+// it now bounds a single synchronous retrieval call.
+const searchTimeoutEnvName = "RAG_SEARCH_TIMEOUT_SECONDS"
+
+// defaultSearchTimeoutSeconds keeps the historical 120-second default.
+const defaultSearchTimeoutSeconds = 120
+
+// searchTimeoutFromEnv resolves the per-call search budget. An invalid value
+// fails startup instead of silently running unbounded, matching the previous
+// queued-search task setting.
+func searchTimeoutFromEnv() (time.Duration, error) {
+	raw, ok := os.LookupEnv(searchTimeoutEnvName)
+	if !ok {
+		return defaultSearchTimeoutSeconds * time.Second, nil
+	}
+	seconds, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || seconds <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", searchTimeoutEnvName)
+	}
+	return time.Duration(seconds) * time.Second, nil
 }
 
 // DataRoot returns the resolved data root.
@@ -131,9 +160,23 @@ func (s *Service) Close(ctx context.Context) error {
 // change, so the next search rebuilds connections and collection references.
 func (s *Service) Invalidate(namespace string) { s.search.Invalidate(namespace) }
 
-// Search runs one synchronous retrieval action.
+// Search runs one synchronous retrieval action. The call is bounded by the
+// server-side search budget (RAG_SEARCH_TIMEOUT_SECONDS) so a slow Qdrant or
+// model service cannot hold the request open indefinitely; client cancellation
+// still propagates through the request context.
 func (s *Service) Search(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error) {
+	if s.searchTimeout > 0 {
+		timeoutCtx, cancel := context.WithTimeout(ctx, s.searchTimeout)
+		defer cancel()
+		ctx = timeoutCtx
+	}
 	result, err := s.search.Search(ctx, namespace, request)
+	if errors.Is(err, context.DeadlineExceeded) {
+		// The search budget (or an earlier parent deadline) expired. Report the
+		// same operational category as a model/Qdrant outage so HTTP answers 503
+		// and MCP answers a tool error instead of a generic internal error.
+		err = contracts.NewRagOperationError("Search timed out")
+	}
 	// Every retrieval execution counts, including a failed one: the Console
 	// activity card reports usage, not success. Counting failures are silently
 	// ignored so a monitoring write can never change the retrieval outcome, and
@@ -147,20 +190,6 @@ func (s *Service) Search(ctx context.Context, namespace string, request contract
 // PublicKnowledgeBase returns the secret-free knowledge-base settings.
 func (s *Service) PublicKnowledgeBase(ctx context.Context, namespace string) (map[string]any, error) {
 	return s.search.PublicKnowledgeBase(ctx, namespace)
-}
-
-// GetSearchResult reads one stored search-result page.
-func (s *Service) GetSearchResult(ctx context.Context, namespace, resultID string, page, pageSize int) (map[string]any, error) {
-	return s.getSearchResultOrdered(ctx, namespace, resultID, page, pageSize)
-}
-
-// SubmitSearch enqueues a retrieval action. Queued search (Redis + Kafka)
-// arrives in G7; until then the service reports the limitation safely instead
-// of silently running retrieval.
-// SubmitSearch enqueues one retrieval action and returns its result UUID.
-func (s *Service) SubmitSearch(ctx context.Context, namespace string, request contracts.SearchRequest) (string, error) {
-	result, err := s.submitSearchTask(ctx, namespace, request)
-	return result, err
 }
 
 // ListDocuments returns the namespace's document records. The shape matches
@@ -597,7 +626,8 @@ func sameChunking(stored any, configuration map[string]any) bool {
 	return true
 }
 
-// SearchRaw runs retrieval without snapshot capture (search worker seam).
+// SearchRaw runs retrieval without projecting artifact references. It is an
+// internal seam for callers that only need the bare evidence payload.
 func (s *Service) SearchRaw(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error) {
 	return s.search.SearchRaw(ctx, namespace, request)
 }

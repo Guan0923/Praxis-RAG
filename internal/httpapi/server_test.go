@@ -298,13 +298,18 @@ func TestLocalAdminBoundary(t *testing.T) {
 	}
 }
 
-func TestSnapshotPathsAreNoStore(t *testing.T) {
+func TestSearchPathsAreNoStore(t *testing.T) {
 	server := newTestServer(t, testSettings("test-token"), nil)
-	for _, target := range []string{"/v1/search", "/mcp", "/v1/search-results/abc", "/v1/artifacts/abc/content"} {
+	for _, target := range []string{"/v1/search", "/mcp", "/v1/artifacts/abc/content"} {
 		response := performRequest(server.Handler(), testRequest{method: "GET", target: target})
 		if got := response.Header().Get("Cache-Control"); got != "no-store" {
 			t.Fatalf("%s Cache-Control = %q, want no-store", target, got)
 		}
+	}
+	// The removed result-snapshot path is not routed anymore.
+	removed := performRequest(server.Handler(), testRequest{method: "GET", target: "/v1/search-results/abc"})
+	if removed.Code != http.StatusNotFound {
+		t.Fatalf("/v1/search-results/abc status = %d, want 404", removed.Code)
 	}
 	health := performRequest(server.Handler(), testRequest{method: "GET", target: "/health"})
 	if got := health.Header().Get("Cache-Control"); got != "" {
@@ -557,8 +562,8 @@ func enabledPtr(value bool) *bool { return &value }
 func TestAdminToolSettings(t *testing.T) {
 	registry := fakeToolRegistry{
 		defaults: map[string]catalog.ToolSettings{
-			"search":            {Enabled: enabledPtr(true), Description: strPtr("Search the knowledge base.")},
-			"get_search_result": {Enabled: enabledPtr(true), Description: strPtr("Read a search result.")},
+			"search":       {Enabled: enabledPtr(true), Description: strPtr("Search the knowledge base.")},
+			"add_document": {Enabled: enabledPtr(true), Description: strPtr("Upload one new file.")},
 		},
 	}
 	notifier := &fakeNotifier{}

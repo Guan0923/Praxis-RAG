@@ -18,10 +18,8 @@ func TestSettingsFromEnvDefaultsAndValidation(t *testing.T) {
 		t.Fatalf("expected brokerless settings: %+v", settings)
 	}
 	if settings.DocumentTopic != DefaultDocumentTopic || settings.DocumentGroup != DefaultDocumentGroup ||
-		settings.SearchTopic != DefaultSearchTopic || settings.SearchGroup != DefaultSearchGroup ||
 		settings.CacheTopic != DefaultCacheTopic || settings.CacheGroup != DefaultCacheGroup ||
 		settings.DocumentDLQTopic != DefaultDocumentDLQTopic ||
-		settings.SearchDLQTopic != DefaultSearchDLQTopic ||
 		settings.CacheDLQTopic != DefaultCacheDLQTopic ||
 		settings.CacheDLQGroup != DefaultCacheDLQGroup {
 		t.Fatalf("unexpected defaults: %+v", settings)
@@ -54,13 +52,15 @@ func TestSettingsFromEnvDefaultsAndValidation(t *testing.T) {
 
 	isolateEnv(t)
 	t.Setenv("RAG_SEARCH_TOPIC", "praxis_document_ingest")
-	if _, err := SettingsFromEnv(); err == nil || !strings.Contains(err.Error(), "Search topic/group must be separate") {
-		t.Fatalf("search separation error = %v", err)
-	}
-	isolateEnv(t)
 	t.Setenv("RAG_SEARCH_GROUP", "")
-	if _, err := SettingsFromEnv(); err == nil || !strings.Contains(err.Error(), "must not be empty") {
-		t.Fatalf("empty search group error = %v", err)
+	t.Setenv("RAG_SEARCH_DLQ_TOPIC", "praxis_search_dead_letters")
+	t.Setenv("RAG_SEARCH_DLQ_GROUP", "praxis_search_dead_letters")
+	legacy, err := SettingsFromEnv()
+	if err != nil {
+		t.Fatalf("legacy RAG_SEARCH_* keys must be ignored, error = %v", err)
+	}
+	if legacy.DocumentTopic != DefaultDocumentTopic || legacy.DocumentDLQTopic != DefaultDocumentDLQTopic {
+		t.Fatalf("legacy RAG_SEARCH_* keys leaked into settings: %+v", legacy)
 	}
 	isolateEnv(t)
 	t.Setenv("RAG_KAFKA_PUBLISH_TIMEOUT_SECONDS", "0")
@@ -83,11 +83,6 @@ func TestSettingsFromEnvDefaultsAndValidation(t *testing.T) {
 		t.Fatalf("invalid SASL mechanism error = %v", err)
 	}
 	isolateEnv(t)
-	t.Setenv("RAG_SEARCH_DLQ_TOPIC", "praxis_search")
-	if _, err := SettingsFromEnv(); err == nil || !strings.Contains(err.Error(), "dead-letter topic must be separate") {
-		t.Fatalf("DLQ collision error = %v", err)
-	}
-	isolateEnv(t)
 	t.Setenv("RAG_CACHE_DLQ_TOPIC", "praxis_state_cache_refresh")
 	if _, err := SettingsFromEnv(); err == nil || !strings.Contains(err.Error(), "Cache dead-letter topic") {
 		t.Fatalf("cache DLQ collision error = %v", err)
@@ -100,7 +95,7 @@ func TestSettingsFromEnvDefaultsAndValidation(t *testing.T) {
 }
 
 // TestSettingsValidateAndDLQTopicFor pins the topic/group separation rules and
-// the topic -> DLQ mapping for all three business queues.
+// the topic -> DLQ mapping for the document and cache queues.
 func TestSettingsValidateAndDLQTopicFor(t *testing.T) {
 	settings := testSettings(true)
 	if err := settings.Validate(); err != nil {
@@ -112,7 +107,6 @@ func TestSettingsValidateAndDLQTopicFor(t *testing.T) {
 		want     string
 	}{
 		{Settings{DocumentTopic: "doc", DocumentDLQTopic: "doc-dlq"}, "doc", "doc-dlq"},
-		{Settings{SearchTopic: "search", SearchDLQTopic: "search-dlq"}, "search", "search-dlq"},
 		{Settings{CacheTopic: "cache", CacheDLQTopic: "cache-dlq"}, "cache", "cache-dlq"},
 		{testSettings(true), "other", ""},
 	}
@@ -122,17 +116,17 @@ func TestSettingsValidateAndDLQTopicFor(t *testing.T) {
 		}
 	}
 	missing := testSettings(true)
-	missing.SearchTopic = ""
-	if err := missing.Validate(); err == nil || !strings.Contains(err.Error(), "Search topic and consumer group must not be empty") {
-		t.Fatalf("missing search topic error = %v", err)
+	missing.DocumentTopic = ""
+	if err := missing.Validate(); err == nil || !strings.Contains(err.Error(), "Document topic and consumer group must not be empty") {
+		t.Fatalf("missing document topic error = %v", err)
 	}
 	cacheClash := testSettings(true)
-	cacheClash.CacheGroup = "search-group"
+	cacheClash.CacheGroup = cacheClash.DocumentGroup
 	if err := cacheClash.Validate(); err == nil || !strings.Contains(err.Error(), "Cache topic/group must be separate") {
 		t.Fatalf("cache separation error = %v", err)
 	}
 	sameDLQ := testSettings(true)
-	sameDLQ.DocumentDLQTopic = "search-topic"
+	sameDLQ.DocumentDLQTopic = sameDLQ.CacheTopic
 	if err := sameDLQ.Validate(); err == nil || !strings.Contains(err.Error(), "Document dead-letter topic") {
 		t.Fatalf("DLQ validation error = %v", err)
 	}

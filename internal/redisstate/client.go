@@ -1,12 +1,11 @@
-// Package redisstate provides the concrete Redis backends behind the
-// internal/state cache interfaces: a read-through state cache (StateCache) and
-// the expiring transient store used for search-result snapshots and queued
-// search state.
+// Package redisstate provides the concrete Redis backend behind the internal/state
+// cache interface: a read-through display cache (StateCache) for the document,
+// knowledge-base and catalog read models.
 //
-// It is a port of rag_mcp/state/cache.py and rag_mcp/state/transient.py. MySQL
-// remains authoritative; every cache failure is reported as
-// *state.CacheUnavailable (or *TransientUnavailable for transient task state) so
-// callers fall back to the database instead of failing a request.
+// It is a port of rag_mcp/state/cache.py. MySQL remains authoritative; every
+// cache failure is reported as *state.CacheUnavailable so callers fall back to
+// the database instead of failing a request. Search results are synchronous and
+// are not cached or stored here.
 package redisstate
 
 import (
@@ -16,7 +15,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,18 +24,6 @@ import (
 
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
-
-// TransientUnavailable reports that transient task state cannot be read or
-// written. It mirrors rag_mcp.state.transient.TransientUnavailable; no
-// credentials or request data are ever exposed.
-type TransientUnavailable struct{ Message string }
-
-// Error implements error.
-func (e *TransientUnavailable) Error() string { return e.Message }
-
-func newTransientUnavailable(message string) *TransientUnavailable {
-	return &TransientUnavailable{Message: message}
-}
 
 // Option customizes a Client, primarily for tests that inject a client backed by
 // an in-process Redis.
@@ -53,7 +39,7 @@ func WithRedisClient(client *redis.Client) Option {
 	return func(options *clientOptions) { options.redisClient = client }
 }
 
-// Client is the Redis StateCache + TransientProvider implementation.
+// Client is the Redis StateCache implementation.
 //
 // Construction is lazy: unreachable Redis cannot prevent database startup, and
 // the no-op mode (RAG_REDIS_ENABLED=false) never dials. All methods are safe for
@@ -65,15 +51,10 @@ type Client struct {
 	mutex  sync.Mutex
 	redis  *redis.Client
 	closed bool
-
-	transient *Transient
 }
 
 // Compile-time interface checks.
-var (
-	_ state.StateCache        = (*Client)(nil)
-	_ state.TransientProvider = (*Client)(nil)
-)
+var _ state.StateCache = (*Client)(nil)
 
 // New builds the Redis backend from explicit cache settings. It validates the
 // settings exactly like RedisStateCache.__init__ and never dials.
@@ -96,7 +77,6 @@ func New(settings state.CacheSettings, options ...Option) (*Client, error) {
 	if enabled && resolved.redisClient != nil {
 		client.redis = resolved.redisClient
 	}
-	client.transient = newTransient(client, defaultTransientTTL())
 	return client, nil
 }
 
@@ -111,14 +91,12 @@ func NewFromEnv(options ...Option) (*Client, error) {
 }
 
 // NewDisabled returns the no-op backend: reads miss, writes are refused and
-// transient state reports "Redis is required for queued operations".
+// cache operations report "Redis is required for cached reads".
 func NewDisabled() *Client {
 	settings := state.DefaultCacheSettings()
 	disabled := false
 	settings.Enabled = &disabled
-	client := &Client{settings: settings, enabled: false}
-	client.transient = newTransient(client, defaultTransientTTL())
-	return client
+	return &Client{settings: settings, enabled: false}
 }
 
 // Settings returns the effective cache settings (secrets are not redacted here;
@@ -129,12 +107,6 @@ func (c *Client) Settings() state.CacheSettings { return c.settings }
 // RedisStateCache.enabled: an explicit setting wins, otherwise a URL or an
 // injected client enables it.
 func (c *Client) Enabled() bool { return c.enabled }
-
-// Transient returns the expiring transient store view of this backend.
-func (c *Client) Transient() *Transient { return c.transient }
-
-// TransientStore implements state.TransientProvider.
-func (c *Client) TransientStore() state.TransientStore { return c.transient }
 
 // connection lazily creates the go-redis client.
 func (c *Client) connection() (*redis.Client, error) {
@@ -445,10 +417,10 @@ func encodeCacheEnvelope(envelope cacheEnvelope) (string, error) {
 	return strings.TrimRight(buffer.String(), "\n"), nil
 }
 
-// Attach wires the backend into the shared state stores: read-through snapshot
-// reads use it as the StateCache backend and result snapshots use its expiring
-// transient store. It is the one-line integration point for cmd/rag-service
-// after state.New, because internal/state cannot import this package.
+// Attach wires the backend into the shared state stores: read-through display
+// cache reads use it as the StateCache backend. It is the one-line integration
+// point for cmd/rag-service after state.New, because internal/state cannot
+// import this package. Search results are no longer cached here.
 func Attach(stores *state.Stores, client *Client) error {
 	if stores == nil {
 		return fmt.Errorf("redisstate: state stores are required")
@@ -459,46 +431,5 @@ func Attach(stores *state.Stores, client *Client) error {
 	if stores.CacheSync != nil {
 		stores.CacheSync.Backend = client
 	}
-	if stores.Results != nil {
-		stores.Results.Transient = client.TransientStore()
-		// 结果快照以 sha256 哈希 key 存放，监控无法按前缀统计，因此同时装配
-		// 过期索引：Save 成功后会补记身份，CountActive 可清过期并计数。
-		stores.Results.Index = client.ResultSnapshotIndex()
-	}
 	return nil
-}
-
-// ---- transient key helpers -------------------------------------------------
-
-// transientKey mirrors TransientStore._key: the prefix, the literal
-// ":transient:" marker and sha256(json([kind, identity])).
-func transientKey(prefix, kind, identity string) string {
-	return prefix + ":transient:{" + identityDigest(kind, identity) + "}"
-}
-
-// ceilTTL mirrors TransientStore._ttl: a positive finite TTL rounded up to at
-// least one second; a non-positive value selects the default snapshot TTL.
-func ceilTTL(value float64, fallback float64) (time.Duration, error) {
-	ttl := value
-	if ttl == 0 {
-		ttl = fallback
-	}
-	if math.IsNaN(ttl) || math.IsInf(ttl, 0) || ttl <= 0 {
-		return 0, &state.ValueError{Message: "Redis task TTL must be positive"}
-	}
-	seconds := math.Ceil(ttl)
-	if seconds < 1 {
-		seconds = 1
-	}
-	return time.Duration(seconds) * time.Second, nil
-}
-
-// defaultTransientTTL mirrors TransientStore._ttl(None): the snapshot TTL from
-// the environment, falling back to the dataclass default when invalid.
-func defaultTransientTTL() float64 {
-	settings, err := state.SnapshotSettingsFromEnv()
-	if err != nil {
-		return float64(state.DefaultSnapshotSettings().TTLSeconds)
-	}
-	return float64(settings.TTLSeconds)
 }

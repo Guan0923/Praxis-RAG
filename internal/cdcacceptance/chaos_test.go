@@ -9,22 +9,19 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
-// TestChaosPausedConnectorsResumeWithEveryTaskProcessed covers the
-// Debezium-pause/resume row for both task topics: submissions while the
+// TestChaosPausedTaskConnectorResumesWithEveryDocumentProcessed covers the
+// Debezium-pause/resume row for the document task topic: submissions while the
 // connector is paused stay in MySQL, the document sweep re-emits a new
-// generation, and every unfinished task is processed exactly once after resume.
-func TestChaosPausedConnectorsResumeWithEveryTaskProcessed(t *testing.T) {
+// generation, and every unfinished job is processed exactly once after resume.
+func TestChaosPausedTaskConnectorResumesWithEveryDocumentProcessed(t *testing.T) {
 	stores := newStores(t)
 	ctx := context.Background()
 	namespace := uniqueNamespace(t, "acc-chaos-pause")
 	createKnowledgeBase(t, stores, namespace, "acceptance-collection")
 	ingester := &journalIngester{stores: stores}
 	documentWorker := newDocumentProcessor(t, stores, ingester)
-	searcher := &fakeSearcher{}
-	searchWorker := newSearchProcessor(t, stores, searcher)
-	stores.Results.Transient = newFakeTransient()
 
-	// The connectors are paused: only MySQL writes happen.
+	// The connector is paused: only MySQL writes happen.
 	firstDoc, err := stores.DocumentJobs.Submit(ctx, namespace, "paused-a.txt", []byte("a"), nil)
 	if err != nil {
 		t.Fatalf("Submit(paused-a) error = %v", err)
@@ -33,12 +30,8 @@ func TestChaosPausedConnectorsResumeWithEveryTaskProcessed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Submit(paused-b) error = %v", err)
 	}
-	search, err := stores.SearchTasks.Submit(ctx, namespace, map[string]any{"query": "paused"}, nil)
-	if err != nil {
-		t.Fatalf("SearchTasks.Submit() error = %v", err)
-	}
-	if ingester.callCount() != 0 || searcher.callCount() != 0 {
-		t.Fatal("paused connectors still executed work")
+	if ingester.callCount() != 0 {
+		t.Fatal("paused connector still executed work")
 	}
 	// Document recovery while paused: the sweep emits new generations.
 	stores.DocumentJobs.Settings.SweepAfterSeconds = -1
@@ -65,21 +58,11 @@ func TestChaosPausedConnectorsResumeWithEveryTaskProcessed(t *testing.T) {
 	if ingester.callCount() != 2 {
 		t.Fatalf("ingester calls = %d, want 2 (one per document)", ingester.callCount())
 	}
-	// The search backlog is delivered from its initial insert event.
-	if acked := deliver(t, searchWorker.MessageHandler(), "praxis_search_tasks",
-		rawSearchEvent(t, search.ResultID, namespace, 1, "c")); !acked {
-		t.Fatal("search backlog delivery was not acknowledged")
-	}
-	requireSearchTask(t, stores, search.ResultID, state.SearchTaskSucceeded, "completed", 1)
-	if searcher.callCount() != 1 {
-		t.Fatalf("searcher calls = %d, want 1", searcher.callCount())
-	}
 }
 
 // TestChaosCrashAndDuplicateDeliveryConverge covers the worker-crash and
-// duplicate-delivery rows: every duplicate is ACKed, a crashed lease is
-// recovered by sweep (documents) or by re-claiming (search), and terminal state
-// is recorded exactly once.
+// duplicate-delivery rows for documents: every duplicate is ACKed, a crashed
+// lease is recovered by sweep, and terminal state is recorded exactly once.
 func TestChaosCrashAndDuplicateDeliveryConverge(t *testing.T) {
 	stores := newStores(t)
 	ctx := context.Background()
@@ -87,9 +70,6 @@ func TestChaosCrashAndDuplicateDeliveryConverge(t *testing.T) {
 	createKnowledgeBase(t, stores, namespace, "acceptance-collection")
 	ingester := &journalIngester{stores: stores}
 	documentWorker := newDocumentProcessor(t, stores, ingester)
-	searcher := &fakeSearcher{}
-	searchWorker := newSearchProcessor(t, stores, searcher)
-	stores.Results.Transient = newFakeTransient()
 
 	// --- Document: crash after claim, recovered by the sweep.
 	docBase := float64(time.Now().Unix())
@@ -131,44 +111,6 @@ func TestChaosCrashAndDuplicateDeliveryConverge(t *testing.T) {
 		t.Fatalf("document ingester calls = %d, want 1", ingester.callCount())
 	}
 
-	// --- Search: crash after claim is recovered by re-claiming on redelivery.
-	// A short lease lets it expire before the task deadline (production default
-	// lease is longer than the search timeout, so a crash converges timed_out).
-	stores.SearchTasks.Settings.LeaseSeconds = 5
-	search, err := stores.SearchTasks.Submit(ctx, namespace, map[string]any{"query": "crash"}, nil)
-	if err != nil {
-		t.Fatalf("SearchTasks.Submit() error = %v", err)
-	}
-	searchNotification := state.SearchNotification{
-		Schema: state.SearchEnvelopeSchema, ResultID: search.ResultID,
-		Namespace: namespace, ScheduleVersion: 1,
-	}
-	claimed, err := stores.SearchTasks.Claim(ctx, searchNotification)
-	if err != nil || claimed == nil {
-		t.Fatalf("SearchTasks.Claim(crash) = %+v, %v", claimed, err)
-	}
-	// The worker dies; the lease expires, and the redelivery re-claims.
-	stores.SearchTasks.Clock = func() float64 { return float64(time.Now().Unix()) + 31 }
-	if acked := deliver(t, searchWorker.MessageHandler(), "praxis_search_tasks",
-		rawSearchEvent(t, search.ResultID, namespace, 1, "c")); !acked {
-		t.Fatal("search redelivery after crash was not acknowledged")
-	}
-	requireSearchTask(t, stores, search.ResultID, state.SearchTaskSucceeded, "completed", 1)
-	// Duplicate terminal deliveries are ACKed and never re-run retrieval.
-	for attempt := 0; attempt < 2; attempt++ {
-		if acked := deliver(t, searchWorker.MessageHandler(), "praxis_search_tasks",
-			rawSearchEvent(t, search.ResultID, namespace, 1, "r")); !acked {
-			t.Fatalf("terminal duplicate %d was not acknowledged", attempt)
-		}
-	}
-	if searcher.callCount() != 1 {
-		t.Fatalf("searcher calls = %d, want 1", searcher.callCount())
-	}
-	if countRows(t, stores, "SELECT COUNT(*) FROM search_result_snapshots WHERE id = ?",
-		search.ResultID) != 1 {
-		t.Fatal("crash recovery wrote more than one result snapshot")
-	}
-
 	// --- Document: a retryable failure + duplicate stale generations ACK.
 	retryDoc, err := stores.DocumentJobs.Submit(ctx, namespace, "retry-dupes.txt", []byte("r"), nil)
 	if err != nil {
@@ -195,40 +137,13 @@ func TestChaosCrashAndDuplicateDeliveryConverge(t *testing.T) {
 	requireDocumentJob(t, stores, retryDoc.ArtifactID, state.DocumentJobSucceeded, "completed", 2)
 }
 
-// TestChaosRedisFailuresDoNotAffectTaskTerminalStates covers the Redis-outage
-// row for both consumers: a failed search-result cache write does not fail the
-// search, and a failed cache-view publish is recorded on the watermark and
-// recovered by the dirty-key sweep.
-func TestChaosRedisFailuresDoNotAffectTaskTerminalStates(t *testing.T) {
+// TestChaosCacheWriteFailureRecovers covers the Redis-outage row for the cache
+// consumer: a failed read-model write is ACKed, recorded on the revision
+// watermark, and recovered by the dirty-key sweep.
+func TestChaosCacheWriteFailureRecovers(t *testing.T) {
 	stores := newStores(t)
 	ctx := context.Background()
 
-	// --- Search: the result cache write fails, the task still succeeds.
-	searchNamespace := uniqueNamespace(t, "acc-chaos-search")
-	transient := newFakeTransient()
-	stores.Results.Transient = transient
-	searcher := &fakeSearcher{}
-	searchWorker := newSearchProcessor(t, stores, searcher)
-	search, err := stores.SearchTasks.Submit(ctx, searchNamespace, map[string]any{"query": "cache outage"}, nil)
-	if err != nil {
-		t.Fatalf("SearchTasks.Submit() error = %v", err)
-	}
-	transient.failNextPuts(1)
-	if acked := deliver(t, searchWorker.MessageHandler(), "praxis_search_tasks",
-		rawSearchEvent(t, search.ResultID, searchNamespace, 1, "c")); !acked {
-		t.Fatal("search with a cache write failure was not acknowledged")
-	}
-	requireSearchTask(t, stores, search.ResultID, state.SearchTaskSucceeded, "completed", 1)
-	if !transient.has("search-result", search.ResultID) {
-		// The failed Put was only the first attempt; the completed task's cache
-		// may legitimately be missing, so verify the MySQL fallback read.
-		page, err := stores.Results.Get(searchNamespace, search.ResultID, 1, 10)
-		if err != nil || page == nil {
-			t.Fatalf("Results.Get(after cache write failure) = %+v, %v", page, err)
-		}
-	}
-
-	// --- Cache: the view publish fails, the change is ACKed and recovered.
 	cacheNamespace := uniqueNamespace(t, "acc-chaos-cache")
 	backend := newFakeStateCache()
 	stores.CacheSync.Backend = backend

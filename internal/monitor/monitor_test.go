@@ -22,8 +22,6 @@ import (
 const (
 	mqDocumentTopic = "praxis_document_ingest"
 	mqDocumentGroup = "praxis_document_ingest_workers"
-	mqSearchTopic   = "praxis_search"
-	mqSearchGroup   = "praxis_search_workers"
 	mqCacheTopic    = "praxis_state_cache_refresh"
 	mqCacheGroup    = "praxis_state_cache_refresh_workers"
 )
@@ -63,23 +61,14 @@ func sampleStats() *state.MonitorStats {
 			state.DocumentJobQueued: 2, state.DocumentJobProcessing: 1,
 			state.DocumentJobSucceeded: 5, state.DocumentJobFailed: 1,
 		},
-		DocumentJobsByStage: map[string]int{"parse": 1},
-		OldestQueuedSeconds: 42.5,
-		StuckProcessing:     1,
-		FailedRecent:        1,
-		JobsSucceededRecent: 3,
-		SearchByStatus: map[string]int{
-			state.SearchTaskQueued: 1, state.SearchTaskProcessing: 2,
-			state.SearchTaskSucceeded: 3, state.SearchTaskFailed: 0,
-			state.SearchTaskTimedOut: 1,
-		},
-		OldestActiveSearchSeconds:   5,
-		SearchesRecent:              7,
-		SearchTimedOutRecent:        2,
-		SearchOverdueActive:         1,
-		CacheDirtyKeys:              0,
-		CacheRefreshFailures:        0,
-		SearchResultSnapshotsActive: 4,
+		DocumentJobsByStage:  map[string]int{"parse": 1},
+		OldestQueuedSeconds:  42.5,
+		StuckProcessing:      1,
+		FailedRecent:         1,
+		JobsSucceededRecent:  3,
+		SearchesRecent:       7,
+		CacheDirtyKeys:       0,
+		CacheRefreshFailures: 0,
 		UploadsByStatus: map[string]int{
 			state.UploadIntent: 1, state.UploadRunning: 1,
 			state.UploadFailed: 0, state.UploadRollingBack: 0, state.UploadRollbackFailed: 0,
@@ -221,8 +210,6 @@ func healthyOptions(t *testing.T) Options {
 		DebeziumCacheHealthURL: healthyDebeziumServer(t).URL,
 		DocumentTopic:          mqDocumentTopic,
 		DocumentGroup:          mqDocumentGroup,
-		SearchTopic:            mqSearchTopic,
-		SearchGroup:            mqSearchGroup,
 		CacheTopic:             mqCacheTopic,
 		CacheGroup:             mqCacheGroup,
 		KafkaGroupProgress: func(_ context.Context, topic, _ string) (KafkaProgress, error) {
@@ -240,12 +227,10 @@ func healthyOptions(t *testing.T) Options {
 }
 
 // fakeGroupProgress returns a deterministic committed/end snapshot per topic so
-// the three-group assertions need no broker.
+// the two-group assertions need no broker.
 func fakeGroupProgress(topic string) KafkaProgress {
 	committed, end := int64(90), int64(95)
 	switch topic {
-	case mqSearchTopic:
-		committed, end = 10, 10
 	case mqCacheTopic:
 		committed, end = 3, 7
 	}
@@ -385,11 +370,6 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 	if stages, _ := jobs["by_stage"].(map[string]int); stages["parse"] != 1 {
 		t.Fatalf("document_jobs.by_stage = %v", jobs["by_stage"])
 	}
-	searches, _ := queues["search_tasks"].(map[string]any)
-	if searches == nil || searches["oldest_active_seconds"] != 5.0 ||
-		searches["timed_out_recent"] != 2 || searches["overdue_active"] != 1 {
-		t.Fatalf("search_tasks = %v", queues["search_tasks"])
-	}
 	uploads, _ := queues["uploads"].(map[string]any)
 	if uploads == nil || uploads["unfinished"] != 3 || uploads["in_progress"] != 2 ||
 		uploads["failed"] != 0 || uploads["rolling_back"] != 0 ||
@@ -405,8 +385,8 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 	if _, present := queues["document_outbox"]; present {
 		t.Fatalf("queues.document_outbox still present: %v", queues["document_outbox"])
 	}
-	if len(queues) != 3 {
-		t.Fatalf("queues = %v, want exactly document_jobs/search_tasks/uploads", queues)
+	if len(queues) != 2 {
+		t.Fatalf("queues = %v, want exactly document_jobs/uploads", queues)
 	}
 
 	pipeline := pipelineOf(t, overview)
@@ -445,25 +425,22 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 	}
 	if pipeline.Kafka.Status != statusOK ||
 		!strings.Contains(pipeline.Kafka.Detail, "文档组滞后 5") ||
-		!strings.Contains(pipeline.Kafka.Detail, "搜索组滞后 0") ||
 		!strings.Contains(pipeline.Kafka.Detail, "缓存组滞后 4") {
 		t.Fatalf("pipeline.kafka = %+v", pipeline.Kafka)
 	}
 	if pipeline.Kafka.Groups.Document.ConsumerLag == nil || *pipeline.Kafka.Groups.Document.ConsumerLag != 5 ||
-		pipeline.Kafka.Groups.Search.ConsumerLag == nil || *pipeline.Kafka.Groups.Search.ConsumerLag != 0 ||
 		pipeline.Kafka.Groups.Cache.ConsumerLag == nil || *pipeline.Kafka.Groups.Cache.ConsumerLag != 4 {
 		t.Fatalf("pipeline.kafka.groups = %+v", pipeline.Kafka.Groups)
 	}
 	if pipeline.Kafka.Groups.Document.Topic != mqDocumentTopic ||
 		pipeline.Kafka.Groups.Document.Group != mqDocumentGroup ||
-		pipeline.Kafka.Groups.Search.Topic != mqSearchTopic ||
 		pipeline.Kafka.Groups.Cache.Topic != mqCacheTopic {
 		t.Fatalf("pipeline.kafka.groups labels = %+v", pipeline.Kafka.Groups)
 	}
 
 	library, _ := overview["library"].(map[string]any)
 	if library == nil || library["documents"] != 10 || library["knowledge_bases"] != 2 ||
-		library["result_snapshots"] != 4 || library["artifact_snapshots"] != 6 {
+		library["artifact_snapshots"] != 6 {
 		t.Fatalf("library = %v", overview["library"])
 	}
 	activity, _ := overview["activity"].(map[string]any)
@@ -715,7 +692,7 @@ func TestMonitorPipelineDocumentJobsDegraded(t *testing.T) {
 }
 
 // TestMonitorPipelineDebezium covers the health states of BOTH capture
-// connectors. The task connector drives document/search delivery, the cache
+// connectors. The task connector drives document delivery, the cache
 // connector drives read-model convergence; capture progress is always null
 // because the application cannot read the binlog offset.
 func TestMonitorPipelineDebezium(t *testing.T) {
@@ -792,15 +769,13 @@ func TestMonitorPipelineDebezium(t *testing.T) {
 	})
 }
 
-// TestMonitorPipelineKafka covers the three independent consumer-group rows:
+// TestMonitorPipelineKafka covers the two independent consumer-group rows:
 // disabled without a broker, unknown when the reader is not wired or the group
 // has not committed, ok with per-group lag, and an error that nulls the numbers.
 func TestMonitorPipelineKafka(t *testing.T) {
 	labels := func(options Options) Options {
 		options.DocumentTopic = mqDocumentTopic
 		options.DocumentGroup = mqDocumentGroup
-		options.SearchTopic = mqSearchTopic
-		options.SearchGroup = mqSearchGroup
 		options.CacheTopic = mqCacheTopic
 		options.CacheGroup = mqCacheGroup
 		return options
@@ -819,7 +794,7 @@ func TestMonitorPipelineKafka(t *testing.T) {
 			view.Kafka.ConsumerLag != nil {
 			t.Fatalf("pipeline.kafka = %+v, want null numbers", view.Kafka)
 		}
-		for _, name := range []string{"document", "search", "cache"} {
+		for _, name := range []string{"document", "cache"} {
 			row := pipelineKafkaGroupByName(view.Kafka.Groups, name)
 			if row.Status != statusDisabled {
 				t.Fatalf("pipeline.kafka.groups.%s = %+v", name, row)
@@ -839,7 +814,7 @@ func TestMonitorPipelineKafka(t *testing.T) {
 			t.Fatalf("pipeline.kafka = %+v, want null numbers", view.Kafka)
 		}
 	})
-	t.Run("三组进度正常", func(t *testing.T) {
+	t.Run("两组进度正常", func(t *testing.T) {
 		options := labels(pipelineTestOptions(sampleStats()))
 		options.KafkaBootstrapServers = []string{kafkaListener(t)}
 		options.KafkaGroupProgress = func(_ context.Context, topic, _ string) (KafkaProgress, error) {
@@ -847,7 +822,6 @@ func TestMonitorPipelineKafka(t *testing.T) {
 		}
 		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
 		if view.Kafka.Status != statusOK || !strings.Contains(view.Kafka.Detail, "文档组滞后 5") ||
-			!strings.Contains(view.Kafka.Detail, "搜索组滞后 0") ||
 			!strings.Contains(view.Kafka.Detail, "缓存组滞后 4") {
 			t.Fatalf("pipeline.kafka = %+v", view.Kafka)
 		}
@@ -855,8 +829,7 @@ func TestMonitorPipelineKafka(t *testing.T) {
 			view.Kafka.ConsumerLag == nil || *view.Kafka.ConsumerLag != 5 {
 			t.Fatalf("document mirror = %+v", view.Kafka)
 		}
-		if view.Kafka.Groups.Search.ConsumerLag == nil || *view.Kafka.Groups.Search.ConsumerLag != 0 ||
-			view.Kafka.Groups.Cache.ConsumerLag == nil || *view.Kafka.Groups.Cache.ConsumerLag != 4 {
+		if view.Kafka.Groups.Cache.ConsumerLag == nil || *view.Kafka.Groups.Cache.ConsumerLag != 4 {
 			t.Fatalf("groups = %+v", view.Kafka.Groups)
 		}
 	})
@@ -895,8 +868,6 @@ func pipelineKafkaGroupByName(groups pipelineKafkaGroups, name string) pipelineK
 	switch name {
 	case "document":
 		return groups.Document
-	case "search":
-		return groups.Search
 	default:
 		return groups.Cache
 	}
@@ -951,15 +922,15 @@ func TestMonitorPipelineWireShape(t *testing.T) {
 	requireKeys(t, "queues.uploads", uploads, "unfinished", "by_status", "in_progress",
 		"failed", "rolling_back", "cleanup_pending")
 
-	// The result-snapshot count comes from MySQL via the state aggregate, so the
-	// available sample reports its real active count (not a Redis index total).
+	// Search results are returned inline and never stored, so the library only
+	// exposes the durable counters (documents/knowledge_bases/artifact_snapshots).
 	library, ok := document["library"].(map[string]any)
 	if !ok {
 		t.Fatalf("library has type %T", document["library"])
 	}
-	if library["result_snapshots"] != 4.0 {
-		t.Fatalf("library.result_snapshots = %v, want the MySQL count 4",
-			library["result_snapshots"])
+	requireKeys(t, "library", library, "documents", "knowledge_bases", "artifact_snapshots")
+	if library["artifact_snapshots"] != 6.0 {
+		t.Fatalf("library.artifact_snapshots = %v, want 6", library["artifact_snapshots"])
 	}
 	pipeline, ok := document["pipeline"].(map[string]any)
 	if !ok {
@@ -1006,8 +977,8 @@ func TestMonitorPipelineWireShape(t *testing.T) {
 	if !ok {
 		t.Fatalf("pipeline.kafka.groups has type %T", kafka["groups"])
 	}
-	requireKeys(t, "pipeline.kafka.groups", groups, "document", "search", "cache")
-	for _, name := range []string{"document", "search", "cache"} {
+	requireKeys(t, "pipeline.kafka.groups", groups, "document", "cache")
+	for _, name := range []string{"document", "cache"} {
 		group, ok := groups[name].(map[string]any)
 		if !ok {
 			t.Fatalf("pipeline.kafka.groups.%s has type %T", name, groups[name])
@@ -1125,8 +1096,6 @@ func TestMonitorOverallStatusAggregation(t *testing.T) {
 		options.KafkaBootstrapServers = []string{kafkaListener(t)}
 		options.DocumentTopic = mqDocumentTopic
 		options.DocumentGroup = mqDocumentGroup
-		options.SearchTopic = mqSearchTopic
-		options.SearchGroup = mqSearchGroup
 		options.CacheTopic = mqCacheTopic
 		options.CacheGroup = mqCacheGroup
 		options.KafkaGroupProgress = func(context.Context, string, string) (KafkaProgress, error) {
@@ -1176,15 +1145,20 @@ func TestMonitorPipelineWorker(t *testing.T) {
 	}
 }
 
-// TestMonitorLibraryResultSnapshots asserts the snapshot count comes from the
-// MySQL state aggregate (the fact source) and disappears when statistics fail.
-func TestMonitorLibraryResultSnapshots(t *testing.T) {
+// TestMonitorLibraryCounters asserts the library counters come from the MySQL
+// state aggregate and disappear when statistics fail. Search results are no
+// longer stored, so the library exposes only durable counters.
+func TestMonitorLibraryCounters(t *testing.T) {
 	t.Run("有计数", func(t *testing.T) {
 		options := healthyDependencyOptions(t)
 		options.Stats = &fakeStatsProvider{stats: sampleStats()}
 		library, _ := New(options).MonitorOverview(context.Background())["library"].(map[string]any)
-		if library["result_snapshots"] != 4 {
-			t.Fatalf("library.result_snapshots = %v", library["result_snapshots"])
+		if library["documents"] != 10 || library["knowledge_bases"] != 2 ||
+			library["artifact_snapshots"] != 6 {
+			t.Fatalf("library = %v", library)
+		}
+		if _, present := library["result_snapshots"]; present {
+			t.Fatalf("library.result_snapshots should be removed: %v", library)
 		}
 	})
 	t.Run("统计不可用", func(t *testing.T) {

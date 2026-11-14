@@ -180,22 +180,12 @@ func (s *Service) maintenancePass(ctx context.Context) {
 	default:
 	}
 	s.recoverUploadsGlobal(ctx)
-	if s.stores.SearchTasks != nil {
-		if _, err := s.stores.SearchTasks.Expire(ctx, 20); err != nil {
-			logBackgroundFailure(ctx, "search task expiry", err)
-		}
-	}
 	if s.stores.DocumentJobs != nil {
 		if _, err := s.stores.DocumentJobs.Sweep(ctx, 50); err != nil {
 			logBackgroundFailure(ctx, "document job sweep", err)
 		}
 		if _, err := s.stores.DocumentJobs.GCJobs(ctx, nil); err != nil {
 			logBackgroundFailure(ctx, "document job GC", err)
-		}
-	}
-	if s.stores.Results != nil {
-		if _, err := s.stores.Results.PurgeExpired(100); err != nil {
-			logBackgroundFailure(ctx, "result snapshot purge", err)
 		}
 	}
 	if s.stores.Artifacts != nil {

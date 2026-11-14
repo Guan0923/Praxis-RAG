@@ -142,6 +142,13 @@ func callToolScoped(t *testing.T, rpc *rawRPC, scopeKey, name string, arguments 
 
 func TestScopeSearchRestrictsDocumentIDs(t *testing.T) {
 	runtime := newFakeRuntime()
+	runtime.searchPayload = map[string]any{
+		"query":           "hello",
+		"evidence_status": "found",
+		"results": []any{
+			map[string]any{"rank": 1, "document_id": "doc:a.md", "chunk_id": "c1", "text": "A"},
+		},
+	}
 	scopes := map[string]access.ScopeSet{
 		"full":  testWholeScope(),
 		"files": testFileScope([]string{"a.md"}, []string{"a.md"}),
@@ -155,8 +162,19 @@ func TestScopeSearchRestrictsDocumentIDs(t *testing.T) {
 	// the core reason the HTTP adapter transports the scope per request.
 	initializeScoped(t, rpc, "full")
 
-	if payload := callToolScoped(t, rpc, "files", searchToolName, map[string]any{"query": "hello"}); len(runtime.searchCalls) != 1 {
-		t.Fatalf("restricted search did not reach the runtime: %#v", payload)
+	// A restricted caller now really searches: the document ids are resolved and
+	// handed to retrieval, and the evidence payload is returned by that same call.
+	restricted := callToolScoped(t, rpc, "files", searchToolName, map[string]any{"query": "hello"})
+	if len(runtime.searchCalls) != 1 {
+		t.Fatalf("restricted search did not reach the runtime: %#v", restricted)
+	}
+	result, _ := restricted["result"].(map[string]any)
+	content, _ := result["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("restricted search content = %#v", restricted)
+	}
+	if text, _ := content[0].(map[string]any)["text"].(string); !strings.Contains(text, `"evidence_status":"found"`) {
+		t.Fatalf("restricted search must return the evidence payload: %q", text)
 	}
 	if got := runtime.searchCalls[0].DocumentIDs; !reflect.DeepEqual(got, []string{"doc:a.md"}) {
 		t.Fatalf("restricted DocumentIDs = %#v, want [doc:a.md]", got)
@@ -202,87 +220,6 @@ func TestScopeSearchCannotBeForgedByClientHeader(t *testing.T) {
 	}
 	if got := runtime.searchCalls[0].DocumentIDs; !reflect.DeepEqual(got, []string{"doc:a.md"}) {
 		t.Fatalf("spoofed DocumentIDs = %#v, want [doc:a.md]", got)
-	}
-}
-
-func TestScopeQueuedSearchRejected(t *testing.T) {
-	runtime := newFakeRuntime()
-	scopes := map[string]access.ScopeSet{
-		"full":  testWholeScope(),
-		"files": testFileScope([]string{"a.md"}, nil),
-	}
-	_, server := newScopeTestServer(t, runtime, Options{QueuedSearch: true}, scopes)
-	rpc := newRawRPC(t, server.URL, manualsNS)
-	initializeScoped(t, rpc, "full")
-
-	rejected := callToolScoped(t, rpc, "files", searchToolName, map[string]any{"query": "x", "wait_seconds": 0})
-	if text := toolErrorText(t, rejected); text != messageRestrictedSearchQueued {
-		t.Fatalf("queued tool error = %q", text)
-	}
-	if len(runtime.submitted) != 0 {
-		t.Fatalf("restricted queued search must not be submitted: %#v", runtime.submitted)
-	}
-
-	admitted := callToolScoped(t, rpc, "full", searchToolName, map[string]any{"query": "x", "wait_seconds": 0})
-	if admitted == nil || len(runtime.submitted) != 1 {
-		t.Fatalf("whole-knowledge-base queued search must be admitted: %#v", admitted)
-	}
-}
-
-func TestScopeGetSearchResultFiltersResults(t *testing.T) {
-	runtime := newFakeRuntime()
-	runtime.searchResults = []map[string]any{{
-		"result_id": searchResult,
-		"namespace": manualsNS,
-		"status":    "succeeded",
-		"results": []any{
-			map[string]any{"rank": 1, "document_id": "doc:a.md", "chunk_id": "c1", "text": "A"},
-			map[string]any{"rank": 2, "document_id": "doc:b.md", "chunk_id": "c2", "text": "B"},
-		},
-	}}
-	endpoint := newTestEndpoint(t, runtime, Options{QueuedSearch: true})
-	entry := entryByName(t, endpoint, getSearchResultToolName)
-	request := contracts.SearchResultRequest{ResultID: searchResult, Page: 1, PageSize: 10}
-
-	restricted, err := entry.execute(
-		access.ContextWithScope(context.Background(), testFileScope([]string{"a.md"}, nil)), manualsNS, request)
-	if err != nil {
-		t.Fatalf("restricted get_search_result: %v", err)
-	}
-	results, _ := restricted["results"].([]any)
-	if len(results) != 1 {
-		t.Fatalf("restricted results = %#v", restricted["results"])
-	}
-	first, _ := results[0].(map[string]any)
-	if first["document_id"] != "doc:a.md" || first["rank"] != 1 {
-		t.Fatalf("restricted result = %#v", first)
-	}
-
-	unrestricted, err := entry.execute(context.Background(), manualsNS, request)
-	if err != nil {
-		t.Fatalf("unrestricted get_search_result: %v", err)
-	}
-	if results, _ := unrestricted["results"].([]any); len(results) != 2 {
-		t.Fatalf("unrestricted results = %#v", unrestricted["results"])
-	}
-
-	// In-process runtimes may build []map[string]any payloads instead of the
-	// JSON-decoded []any shape.
-	runtime.searchResults = []map[string]any{{
-		"status": "succeeded",
-		"results": []map[string]any{
-			{"rank": 1, "document_id": "doc:a.md"},
-			{"rank": 2, "document_id": "doc:b.md"},
-		},
-	}}
-	typed, err := entry.execute(
-		access.ContextWithScope(context.Background(), testFileScope([]string{"a.md"}, nil)), manualsNS, request)
-	if err != nil {
-		t.Fatalf("typed restricted get_search_result: %v", err)
-	}
-	typedResults, _ := typed["results"].([]any)
-	if len(typedResults) != 1 || typedResults[0].(map[string]any)["document_id"] != "doc:a.md" {
-		t.Fatalf("typed restricted results = %#v", typed["results"])
 	}
 }
 

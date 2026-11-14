@@ -75,7 +75,6 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "PATCH", Path: "/v1/admin/users/{user_id}", Summary: "Update an account", Tag: "users", Request: "UserUpdateBody", Response: "200"},
 	{Method: "DELETE", Path: "/v1/admin/users/{user_id}", Summary: "Delete an account", Tag: "users", Response: "204"},
 	{Method: "POST", Path: "/v1/search", Summary: "Search a knowledge base", Tag: "search", Request: "SearchBody", Response: "200"},
-	{Method: "GET", Path: "/v1/search-results/{result_id}", Summary: "Read a stored search result", Tag: "search", Query: []string{"page", "page_size"}, Response: "200"},
 	{Method: "GET", Path: "/v1/artifacts/{artifact_id}", Summary: "Read an artifact", Tag: "search", Response: "200"},
 	{Method: "GET", Path: "/v1/artifacts/{artifact_id}/content", Summary: "Download artifact content", Tag: "search", Response: "200"},
 	{Method: "GET", Path: "/v1/documents", Summary: "List documents", Tag: "documents", Response: "200"},

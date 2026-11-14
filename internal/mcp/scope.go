@@ -37,9 +37,6 @@ const (
 	// key, service token, session-less loopback): legacy unrestricted behavior.
 	scopeHeaderNone = "none"
 
-	// messageRestrictedSearchQueued is the queued-search failure for callers
-	// restricted to an explicit document set.
-	messageRestrictedSearchQueued = "受限权限不支持异步检索"
 	// messageDocumentWriteRequired rejects a write tool targeting a document the
 	// caller may not modify.
 	messageDocumentWriteRequired = "没有该文档的修改权限"
@@ -172,44 +169,6 @@ func (e *Endpoint) resolvedDocumentIDs(ctx context.Context, namespace string, sc
 		ids = []string{}
 	}
 	return ids, nil
-}
-
-// filterSearchResults defensively drops stored search results the caller may not
-// see. The runtime already applies SearchRequest.DocumentIDs when creating a
-// snapshot, but a snapshot written before a grant was revoked (or by a runtime
-// adapter that ignored the restriction) must not leak content through
-// get_search_result.
-func filterSearchResults(payload map[string]any, allowedIDs []string) map[string]any {
-	if payload == nil {
-		return nil
-	}
-	allowed := make(map[string]struct{}, len(allowedIDs))
-	for _, documentID := range allowedIDs {
-		allowed[documentID] = struct{}{}
-	}
-	results, ok := payload["results"]
-	if !ok {
-		return payload
-	}
-	filtered := make([]any, 0, len(allowed))
-	for _, item := range searchResultItems(results) {
-		documentID, _ := item["document_id"].(string)
-		if _, visible := allowed[documentID]; !visible {
-			continue
-		}
-		copied := make(map[string]any, len(item))
-		for key, value := range item {
-			copied[key] = value
-		}
-		copied["rank"] = len(filtered) + 1
-		filtered = append(filtered, copied)
-	}
-	updated := make(map[string]any, len(payload))
-	for key, value := range payload {
-		updated[key] = value
-	}
-	updated["results"] = filtered
-	return updated
 }
 
 // searchResultItems normalizes the result list shapes runtime adapters return:

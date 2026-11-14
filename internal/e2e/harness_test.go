@@ -2,15 +2,15 @@ package e2e
 
 // Harness for the end-to-end pipeline tests: a real MySQL test state store, a
 // real runtime.Service talking to fake model/Qdrant HTTP servers, an in-process
-// Redis (miniredis) for result snapshots/transient state, and an in-process fake
-// Kafka transport standing in for Debezium-delivered notifications. No network,
-// real broker, Qdrant or model server is required.
+// Redis (miniredis) backing the read-model cache, and an in-process fake Kafka
+// transport standing in for Debezium-delivered document notifications. No
+// network, real broker, Qdrant or model server is required.
 //
 // Task delivery is owned by Debezium in production. The tests therefore build
-// the identifier-only notifications (schema 4 for document_jobs, schema 3 for
-// search_tasks) that Debezium emits and feed them to the worker handlers either
-// directly (Handle) or through mq.PullConsumer over the fake transport, exactly
-// like the deployed workers do.
+// the identifier-only schema-4 document_jobs notifications that Debezium emits
+// and feed them to the worker handlers either directly (Handle) or through
+// mq.PullConsumer over the fake transport, exactly like the deployed workers
+// do. Search runs synchronously in rag-service and has no notification path.
 
 import (
 	"context"
@@ -34,8 +34,6 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/mq"
 	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
-	"github.com/Guan0923/xinghe_rag/internal/searchrefs"
-	"github.com/Guan0923/xinghe_rag/internal/searchworker"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
@@ -306,7 +304,7 @@ type harness struct {
 	Model   *httpRecorder
 	Cache   *redisstate.Client
 	// Redis is the in-process miniredis backing Cache; FlushAll() proves the
-	// MySQL fact source can rebuild a search result after a cache loss.
+	// MySQL fact source can rebuild a read-model view after a cache loss.
 	Redis *miniredis.Miniredis
 
 	mutex sync.Mutex
@@ -339,7 +337,7 @@ func (h *harness) trackedDocumentArtifacts() []string {
 }
 
 // newHarness builds the real runtime over fake model/Qdrant servers, a real
-// MySQL test store and an in-process Redis for snapshots.
+// MySQL test store and an in-process Redis for the read-model cache.
 func newHarness(t *testing.T, queryPoints string) *harness {
 	t.Helper()
 	modelURL, modelRecorder := newFakeModelServer(t)
@@ -416,36 +414,6 @@ func newDocumentDeadLetterProcessor(t *testing.T, h *harness) *documentworker.Pr
 	return worker
 }
 
-// newSearchProcessor builds the real search worker the rag-search-worker binary
-// runs: the runtime retrieval stack plus expiring artifact references.
-func newSearchProcessor(t *testing.T, h *harness) *searchworker.Processor {
-	t.Helper()
-	worker, err := searchworker.New(searchworker.Options{
-		Tasks:    h.Stores.SearchTasks,
-		Searcher: h.Service,
-		Capturer: searchrefs.New(h.Stores, testLogger()),
-		Logger:   testLogger(),
-	})
-	if err != nil {
-		t.Fatalf("searchworker.New() error = %v", err)
-	}
-	return worker
-}
-
-// newSearchDeadLetterProcessor builds the execution-less processor the
-// dead-letter worker runs.
-func newSearchDeadLetterProcessor(t *testing.T, h *harness) *searchworker.Processor {
-	t.Helper()
-	worker, err := searchworker.New(searchworker.Options{
-		Tasks:  h.Stores.SearchTasks,
-		Logger: testLogger(),
-	})
-	if err != nil {
-		t.Fatalf("searchworker.New() error = %v", err)
-	}
-	return worker
-}
-
 // documentNotification returns the identifier-only schema-4 notification
 // Debezium emits for the job's current schedule_version.
 func documentNotification(t *testing.T, h *harness, artifactID string) state.DocumentNotification {
@@ -462,17 +430,6 @@ func documentNotification(t *testing.T, h *harness, artifactID string) state.Doc
 		t.Fatalf("DocumentJobEnvelope() error = %v", err)
 	}
 	return notification
-}
-
-// searchNotification returns the identifier-only schema-3 notification Debezium
-// emits when a search task is admitted (schedule_version starts at 1).
-func searchNotification(resultID, namespace string) state.SearchNotification {
-	return state.SearchNotification{
-		Schema:          state.SearchEnvelopeSchema,
-		ResultID:        resultID,
-		Namespace:       namespace,
-		ScheduleVersion: 1,
-	}
 }
 
 // encodeNotification renders the application-native envelope, which is exactly

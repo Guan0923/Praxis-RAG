@@ -2,20 +2,13 @@ package searchrefs
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"strings"
 	"testing"
 
-	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
-
-	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
@@ -40,22 +33,6 @@ func newTestStores(t *testing.T) *state.Stores {
 	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return stores
-}
-
-// useRedis sets a miniredis-backed transient store and returns the server.
-func useRedis(t *testing.T, stores *state.Stores) *miniredis.Miniredis {
-	t.Helper()
-	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
-	settings := state.DefaultCacheSettings()
-	settings.URL = "redis://" + server.Addr() + "/0"
-	backend, err := redisstate.New(settings, redisstate.WithRedisClient(client))
-	if err != nil {
-		t.Fatalf("redisstate.New: %v", err)
-	}
-	t.Cleanup(func() { _ = backend.Close() })
-	stores.Results.Transient = backend.TransientStore()
-	return server
 }
 
 func testLogger() *slog.Logger {
@@ -163,28 +140,23 @@ func assertNumeric(t *testing.T, value any) {
 	}
 }
 
-func TestCaptureRegistersSourceAndSnapshot(t *testing.T) {
+func TestCaptureRegistersSourceArtifacts(t *testing.T) {
 	stores := newTestStores(t)
-	server := useRedis(t, stores)
 	ctx := context.Background()
 	addDocument(t, stores, testNamespace, "manual.txt", "doc-1")
 	addBlob(t, stores, testNamespace, state.SourceBucket, "manual.txt", []byte("hello source"), "doc-1")
 
 	payload := capturePayload(hitFor("doc-1", nil))
 	capture := New(stores, testLogger())
-	result, err := capture.Capture(ctx, testNamespace, payload, true)
+	result, err := capture.Capture(ctx, testNamespace, payload)
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
-	if result["snapshot_available"] != true {
-		t.Fatalf("snapshot_available = %#v", result["snapshot_available"])
-	}
-	resultID, _ := result["result_id"].(string)
-	if len(resultID) != 36 {
-		t.Fatalf("result_id = %q", resultID)
-	}
-	if rawTTL := server.TTL(transientKeyForTest(stores, resultID)); rawTTL <= 0 {
-		t.Fatalf("snapshot key has no TTL")
+	// Capture must not persist a search result anymore: no snapshot fields.
+	for _, field := range []string{"result_id", "created_at", "expires_at", "snapshot_available", "snapshot_error"} {
+		if _, present := result[field]; present {
+			t.Fatalf("Capture returned removed snapshot field %q: %#v", field, result[field])
+		}
 	}
 
 	items := artifactsOf(t, result)
@@ -213,17 +185,10 @@ func TestCaptureRegistersSourceAndSnapshot(t *testing.T) {
 		t.Fatalf("hit artifacts = %#v", hits[0])
 	}
 
-	// Artifact bytes are readable and the snapshot is pageable.
+	// Artifact bytes are readable and the projected references stay usable.
 	artifact, content, err := stores.Artifacts.Read(ctx, testNamespace, artifactID)
 	if err != nil || string(content) != "hello source" {
 		t.Fatalf("artifact read = (%#v, %q, %v)", artifact, content, err)
-	}
-	stored, err := stores.Results.Get(testNamespace, resultID, 1, 10)
-	if err != nil {
-		t.Fatalf("snapshot Get: %v", err)
-	}
-	if stored["total_results"] != 1 || stored["snapshot_available"] != true {
-		t.Fatalf("stored snapshot = %#v", stored)
 	}
 
 	// The input payload must not be mutated.
@@ -235,7 +200,6 @@ func TestCaptureRegistersSourceAndSnapshot(t *testing.T) {
 
 func TestCaptureProjectsImageAndTableAssets(t *testing.T) {
 	stores := newTestStores(t)
-	useRedis(t, stores)
 	ctx := context.Background()
 	addDocument(t, stores, testNamespace, "manual.txt", "doc-1")
 	addBlob(t, stores, testNamespace, state.SourceBucket, "manual.txt", []byte("source"), "doc-1")
@@ -254,12 +218,9 @@ func TestCaptureProjectsImageAndTableAssets(t *testing.T) {
 		},
 	})
 	capture := New(stores, testLogger())
-	result, err := capture.Capture(ctx, testNamespace, capturePayload(imageHit, tableHit), false)
+	result, err := capture.Capture(ctx, testNamespace, capturePayload(imageHit, tableHit))
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
-	}
-	if _, hasSnapshot := result["result_id"]; hasSnapshot {
-		t.Fatalf("saveSnapshot=false must not save a snapshot")
 	}
 	items := artifactsOf(t, result)
 	kinds := map[string]map[string]any{}
@@ -298,14 +259,13 @@ func TestCaptureProjectsImageAndTableAssets(t *testing.T) {
 
 func TestCaptureDeduplicatesPerDocument(t *testing.T) {
 	stores := newTestStores(t)
-	useRedis(t, stores)
 	ctx := context.Background()
 	addDocument(t, stores, testNamespace, "manual.txt", "doc-1")
 	addBlob(t, stores, testNamespace, state.SourceBucket, "manual.txt", []byte("source"), "doc-1")
 
 	first := hitFor("doc-1", map[string]any{"chunk_id": "chunk-1"})
 	second := hitFor("doc-1", map[string]any{"chunk_id": "chunk-2"})
-	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(first, second), true)
+	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(first, second))
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
@@ -322,14 +282,13 @@ func TestCaptureDeduplicatesPerDocument(t *testing.T) {
 
 func TestCapturePdfSideCarsAndLimits(t *testing.T) {
 	stores := newTestStores(t)
-	useRedis(t, stores)
 	ctx := context.Background()
 	addDocument(t, stores, testNamespace, "manual.pdf", "doc-pdf")
 	addBlob(t, stores, testNamespace, state.SourceBucket, "manual.pdf", []byte("%PDF"), "doc-pdf")
 	addBlob(t, stores, testNamespace, state.PDFAssetBucket, "doc-pdf/document.md", []byte("# page"), "doc-pdf")
 	addBlob(t, stores, testNamespace, state.PDFAssetBucket, "doc-pdf/manifest.json", []byte("{}"), "doc-pdf")
 
-	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hitFor("doc-pdf", nil)), true)
+	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hitFor("doc-pdf", nil)))
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
@@ -344,23 +303,23 @@ func TestCapturePdfSideCarsAndLimits(t *testing.T) {
 	if kinds["source"] != "application/pdf" || kinds["markdown"] != "text/markdown" || kinds["manifest"] != "application/json" {
 		t.Fatalf("artifact kinds = %#v", kinds)
 	}
-	if count, ok := numericInt(result["artifact_limits"].(map[string]any)["max_count"]); !ok || count != stores.Results.Settings.MaxArtifactsPerSearch {
+	if count, ok := numericInt(result["artifact_limits"].(map[string]any)["max_count"]); !ok ||
+		count != state.DefaultSnapshotSettings().MaxArtifactsPerSearch {
 		t.Fatalf("artifact limits = %#v", result["artifact_limits"])
 	}
 }
 
 func TestCaptureArtifactLimitWarnsAndKeepsResults(t *testing.T) {
 	stores := newTestStores(t)
-	useRedis(t, stores)
+	t.Setenv("RAG_RESULT_MAX_ARTIFACTS", "1")
 	ctx := context.Background()
-	stores.Results.Settings.MaxArtifactsPerSearch = 1
 	addDocument(t, stores, testNamespace, "manual.txt", "doc-1")
 	addBlob(t, stores, testNamespace, state.SourceBucket, "manual.txt", []byte("source"), "doc-1")
 	imageData := base64.StdEncoding.EncodeToString([]byte("png"))
 	hit := hitFor("doc-1", map[string]any{
 		"asset": map[string]any{"type": "image", "mime_type": "image/png", "data": imageData},
 	})
-	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hit), true)
+	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hit))
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
@@ -381,7 +340,6 @@ func TestCaptureArtifactLimitWarnsAndKeepsResults(t *testing.T) {
 
 func TestCaptureArtifactRegistryFailureIsTolerated(t *testing.T) {
 	stores := newTestStores(t)
-	useRedis(t, stores)
 	ctx := context.Background()
 	zero := int64(0)
 	failing, err := state.NewArtifactRegistry(stores, 3600, nil, &zero)
@@ -392,12 +350,12 @@ func TestCaptureArtifactRegistryFailureIsTolerated(t *testing.T) {
 	addDocument(t, stores, testNamespace, "manual.txt", "doc-1")
 	addBlob(t, stores, testNamespace, state.SourceBucket, "manual.txt", []byte("source"), "doc-1")
 
-	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hitFor("doc-1", nil)), true)
+	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hitFor("doc-1", nil)))
 	if err != nil {
 		t.Fatalf("artifact failures must not fail capture: %v", err)
 	}
-	if result["snapshot_available"] != true {
-		t.Fatalf("retrieval results/snapshot must survive artifact failure: %#v", result)
+	if _, present := result["snapshot_available"]; present {
+		t.Fatalf("capture must not report snapshot fields: %#v", result)
 	}
 	if len(artifactsOf(t, result)) != 0 || result["artifact_warning"] == nil {
 		t.Fatalf("expected an artifact warning: %#v", result)
@@ -407,42 +365,8 @@ func TestCaptureArtifactRegistryFailureIsTolerated(t *testing.T) {
 	}
 }
 
-type failingTransient struct{ err error }
-
-func (f failingTransient) Get(string, string) (any, bool, error) { return nil, false, f.err }
-func (f failingTransient) Put(string, string, any, float64, bool) (bool, error) {
-	return false, f.err
-}
-func (f failingTransient) Delete(string, string) (int64, error) { return 0, f.err }
-
-func TestCaptureSnapshotFailureDegrades(t *testing.T) {
-	stores := newTestStores(t)
-	ctx := context.Background()
-	stores.Results.Transient = failingTransient{err: errors.New("redis down")}
-	addDocument(t, stores, testNamespace, "manual.txt", "doc-1")
-	addBlob(t, stores, testNamespace, state.SourceBucket, "manual.txt", []byte("source"), "doc-1")
-
-	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hitFor("doc-1", nil)), true)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
-	if result["snapshot_available"] != false {
-		t.Fatalf("snapshot_available = %#v", result["snapshot_available"])
-	}
-	if result["snapshot_error"] != MessageSnapshotUnavailable {
-		t.Fatalf("snapshot_error = %#v", result["snapshot_error"])
-	}
-	if len(artifactsOf(t, result)) != 1 {
-		t.Fatalf("artifacts must survive snapshot failure: %#v", result)
-	}
-	if len(result["results"].([]any)) != 1 {
-		t.Fatalf("results must survive snapshot failure")
-	}
-}
-
 func TestCaptureUnexpectedFailureReturnsOriginalPayload(t *testing.T) {
 	stores := newTestStores(t)
-	useRedis(t, stores)
 	ctx := context.Background()
 	addDocument(t, stores, testNamespace, "manual.txt", "doc-1")
 	addBlob(t, stores, testNamespace, state.SourceBucket, "manual.txt", []byte("source"), "doc-1")
@@ -450,12 +374,16 @@ func TestCaptureUnexpectedFailureReturnsOriginalPayload(t *testing.T) {
 	payload := capturePayload(hitFor("doc-1", map[string]any{
 		"asset": map[string]any{"type": "image", "mime_type": "image/png", "data": "not-base64!"},
 	}))
-	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, payload, true)
+	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, payload)
 	if err != nil {
 		t.Fatalf("Capture must absorb unexpected failures: %v", err)
 	}
-	if result["snapshot_available"] != false || result["snapshot_error"] != MessageSearchResultReferencesUnavailable {
-		t.Fatalf("degraded result = %#v", result)
+	// A projection failure returns the original retrieval payload verbatim:
+	// no artifacts and no snapshot_* fields.
+	for _, field := range []string{"snapshot_available", "snapshot_error", "artifacts", "artifact_limits"} {
+		if _, present := result[field]; present {
+			t.Fatalf("degraded result must not carry %q: %#v", field, result[field])
+		}
 	}
 	degradedHits := result["results"].([]any)
 	if _, projected := degradedHits[0].(map[string]any)["artifacts"]; projected {
@@ -465,7 +393,6 @@ func TestCaptureUnexpectedFailureReturnsOriginalPayload(t *testing.T) {
 
 func TestCaptureLegacyHitWithoutVersionIsNotLinked(t *testing.T) {
 	stores := newTestStores(t)
-	useRedis(t, stores)
 	ctx := context.Background()
 	addDocument(t, stores, testNamespace, "manual.txt", "doc-1")
 	addBlob(t, stores, testNamespace, state.SourceBucket, "manual.txt", []byte("source"), "doc-1")
@@ -479,7 +406,7 @@ func TestCaptureLegacyHitWithoutVersionIsNotLinked(t *testing.T) {
 	hit := hitFor("doc-1", map[string]any{
 		"asset": map[string]any{"type": "image", "mime_type": "image/png", "data": imageData},
 	})
-	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hit), true)
+	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hit))
 	if err != nil {
 		t.Fatalf("Capture: %v", err)
 	}
@@ -490,49 +417,6 @@ func TestCaptureLegacyHitWithoutVersionIsNotLinked(t *testing.T) {
 	if _, referenced := hitResult["asset"].(map[string]any)["artifact_id"]; referenced {
 		t.Fatalf("legacy hit asset must not be referenced")
 	}
-}
-
-func TestCaptureSnapshotPagingHandoff(t *testing.T) {
-	stores := newTestStores(t)
-	useRedis(t, stores)
-	ctx := context.Background()
-	addDocument(t, stores, testNamespace, "manual.txt", "doc-1")
-	addBlob(t, stores, testNamespace, state.SourceBucket, "manual.txt", []byte("source"), "doc-1")
-	hits := make([]map[string]any, 0, 15)
-	for index := 0; index < 15; index++ {
-		hits = append(hits, hitFor("doc-1", map[string]any{"chunk_id": "chunk-" + string(rune('a'+index))}))
-	}
-	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hits...), true)
-	if err != nil {
-		t.Fatalf("Capture: %v", err)
-	}
-	resultID := result["result_id"].(string)
-	first, err := stores.Results.Get(testNamespace, resultID, 1, 10)
-	if err != nil {
-		t.Fatalf("page 1: %v", err)
-	}
-	if first["total_results"] != 15 || first["next_page"] != 2 {
-		t.Fatalf("page 1 = %#v", first)
-	}
-	second, err := stores.Results.Get(testNamespace, resultID, 2, 10)
-	if err != nil {
-		t.Fatalf("page 2: %v", err)
-	}
-	if len(second["results"].([]any)) != 5 || second["next_page"] != nil {
-		t.Fatalf("page 2 = %#v", second)
-	}
-}
-
-// transientKeyForTest reconstructs the Redis key used by the snapshot handoff.
-func transientKeyForTest(stores *state.Stores, resultID string) string {
-	_ = stores
-	return "rag:state:v1:transient:{" + digestForTest("search-result", resultID) + "}"
-}
-
-func digestForTest(kind, identity string) string {
-	encoded, _ := json.Marshal([]string{kind, identity})
-	sum := sha256.Sum256(encoded)
-	return hex.EncodeToString(sum[:])
 }
 
 func numericInt(value any) (int, bool) {

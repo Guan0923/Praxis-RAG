@@ -55,11 +55,6 @@ func TestCutoverInventoryReportsUnfinishedWork(t *testing.T) {
 	if task, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, documentProcessing.ArtifactID)); err != nil || task == nil {
 		t.Fatalf("document Claim() = %+v, %v", task, err)
 	}
-	submitTestSearch(t, stores, "manuals", map[string]any{"query": "queued"})
-	searchProcessing := submitTestSearch(t, stores, "manuals", map[string]any{"query": "processing"})
-	if task, err := stores.SearchTasks.Claim(ctx, searchProcessing); err != nil || task == nil {
-		t.Fatalf("search Claim() = %+v, %v", task, err)
-	}
 	cacheKeys, err := stores.monitorCount(ctx, "SELECT COUNT(*) FROM cache_revisions")
 	if err != nil {
 		t.Fatalf("cache key count error = %v", err)
@@ -79,10 +74,6 @@ func TestCutoverInventoryReportsUnfinishedWork(t *testing.T) {
 	}
 	if inventory.DocumentJobs.MinActiveScheduleVersion != 1 || inventory.DocumentJobs.OldestActiveSeconds < 0 {
 		t.Fatalf("document version/age = %+v", inventory.DocumentJobs)
-	}
-	if inventory.SearchTasks.Active != 2 || inventory.SearchTasks.ByStatus[SearchTaskQueued] != 1 ||
-		inventory.SearchTasks.ByStatus[SearchTaskProcessing] != 1 {
-		t.Fatalf("search inventory = %+v", inventory.SearchTasks)
 	}
 	if inventory.CacheKeys != cacheKeys || inventory.CacheDirtyKeys != dirtyKeys {
 		t.Fatalf("cache inventory = keys %d/%d, dirty %d/%d",
@@ -161,46 +152,5 @@ func TestRequeueActiveDocumentJobsBumpsBaselineIdempotently(t *testing.T) {
 	// Rows newer than the baseline are never rewritten.
 	if requeued, err := stores.DocumentJobs.RequeueActive(ctx, 10, 2); err != nil || requeued != 0 {
 		t.Fatalf("stale-baseline RequeueActive() = %d, %v", requeued, err)
-	}
-}
-
-func TestRequeueActiveSearchTasksBumpsBaseline(t *testing.T) {
-	stores := newTestStores(t)
-	ctx := context.Background()
-	first := submitTestSearch(t, stores, "alpha", map[string]any{"query": "first"})
-	second := submitTestSearch(t, stores, "alpha", map[string]any{"query": "second"})
-	if task, err := stores.SearchTasks.Claim(ctx, second); err != nil || task == nil {
-		t.Fatalf("Claim() = %+v, %v", task, err)
-	}
-	requeued, err := stores.SearchTasks.RequeueActive(ctx, 10, 2)
-	if err != nil || requeued != 2 {
-		t.Fatalf("RequeueActive() = %d, %v", requeued, err)
-	}
-	for _, resultID := range []string{first.ResultID, second.ResultID} {
-		task, err := stores.SearchTasks.read(ctx, resultID)
-		if err != nil || task == nil {
-			t.Fatalf("read(%s) = %+v, %v", resultID, task, err)
-		}
-		if task.ScheduleVersion != 3 || task.Status != SearchTaskQueued || task.Stage != "retry_wait" ||
-			task.Owner != nil || task.LeaseUntil != 0 || task.RetryAt <= 0 {
-			t.Fatalf("requeued search task = %+v", task)
-		}
-	}
-	if requeued, err := stores.SearchTasks.RequeueActive(ctx, 10, 2); err != nil || requeued != 0 {
-		t.Fatalf("second RequeueActive() = %d, %v", requeued, err)
-	}
-	// The old generation is skipped, the baseline generation is claimable.
-	if task, err := stores.SearchTasks.Claim(ctx, first); err != nil || task != nil {
-		t.Fatalf("stale generation Claim() = %+v, %v", task, err)
-	}
-	backfilled := SearchNotification{Schema: SearchEnvelopeSchema, ResultID: first.ResultID,
-		Namespace: "alpha", ScheduleVersion: 3}
-	if task, err := stores.SearchTasks.Claim(ctx, backfilled); err != nil || task == nil {
-		t.Fatalf("backfilled Claim() = %+v, %v", task, err)
-	}
-	inventory, err := stores.CutoverInventory(ctx, time.Now())
-	if err != nil || inventory.SearchTasks.Active != 2 ||
-		inventory.SearchTasks.MinActiveScheduleVersion != 3 {
-		t.Fatalf("search inventory = %+v, %v", inventory, err)
 	}
 }

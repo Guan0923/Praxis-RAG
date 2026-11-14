@@ -1,10 +1,10 @@
 package e2e
 
-// Synchronous-search regression: the orchestrator returns results as
-// []map[string]any, and before the runtime-boundary normalization searchrefs
-// skipped artifact registration and ResultSnapshots rejected the payload, so
-// rag-service synchronous HTTP/MCP search returned snapshot_available=false and
-// no artifact references. These tests pin the JSON-shaped contract end to end.
+// Synchronous-search contract: one Service.Search call performs retrieval and
+// reranking and returns the evidence directly. The response has no result_id,
+// no snapshot/task metadata and no polling path; artifacts are registered on
+// the same call and remain readable by id through GetArtifact. SearchRaw is the
+// internal/worker-facing entry point and never captures artifact references.
 
 import (
 	"context"
@@ -24,6 +24,17 @@ const syncQueryPoints = `[
 		"text":"错误代码 E03 表示水路供水不足","title":"e03","source":"e03.md",
 		"metadata":{"kind":"test"}}}
 ]`
+
+// retiredSearchPayloadFields are the queued-search/snapshot keys the synchronous
+// contract must never emit.
+var retiredSearchPayloadFields = []string{
+	"result_id",
+	"created_at",
+	"expires_at",
+	"snapshot_available",
+	"snapshot_error",
+	"wait_seconds",
+}
 
 // seedLegacyDocument inserts the document row and source blob reference capture
 // reads for a versionless (legacy) chunk hit.
@@ -61,6 +72,17 @@ func artifactReferences(value any) []map[string]any {
 	}
 }
 
+// requireNoSnapshotFields asserts the synchronous payload does not expose any
+// queued-search/snapshot key.
+func requireNoSnapshotFields(t *testing.T, payload map[string]any) {
+	t.Helper()
+	for _, field := range retiredSearchPayloadFields {
+		if value, present := payload[field]; present {
+			t.Fatalf("synchronous search payload must not expose %q: %v", field, value)
+		}
+	}
+}
+
 func syncSearchRequest() contracts.SearchRequest {
 	return contracts.SearchRequest{
 		Query:      "E03 供水不足",
@@ -71,10 +93,11 @@ func syncSearchRequest() contracts.SearchRequest {
 	}
 }
 
-// TestSyncSearchReturnsArtifactsAndSnapshot is the reported-bug regression:
-// Service.Search must return a stored snapshot (snapshot_available=true) and
-// artifact references for the returned chunks.
-func TestSyncSearchReturnsArtifactsAndSnapshot(t *testing.T) {
+// TestSyncSearchReturnsArtifacts pins the synchronous contract end to end:
+// Service.Search returns results plus projected artifact references in one
+// call, exposes no snapshot/result_id fields, and the referenced artifact is
+// independently readable by id.
+func TestSyncSearchReturnsArtifacts(t *testing.T) {
 	h := newHarness(t, syncQueryPoints)
 	ctx := context.Background()
 	seedLegacyDocument(t, h, "doc-e03", "e03.md", []byte("E03 水路供水不足的处理步骤"))
@@ -84,19 +107,7 @@ func TestSyncSearchReturnsArtifactsAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
 	}
-	if payload["snapshot_available"] != true {
-		t.Fatalf("snapshot_available = %v, want true (payload=%v)", payload["snapshot_available"], payload)
-	}
-	resultID, _ := payload["result_id"].(string)
-	if len(resultID) != 36 {
-		t.Fatalf("result_id = %v", payload["result_id"])
-	}
-	if _, present := payload["created_at"]; !present {
-		t.Fatalf("snapshot payload missing created_at: %v", payload)
-	}
-	if _, present := payload["expires_at"]; !present {
-		t.Fatalf("snapshot payload missing expires_at: %v", payload)
-	}
+	requireNoSnapshotFields(t, payload)
 	results, ok := payload["results"].([]any)
 	if !ok || len(results) == 0 {
 		t.Fatalf("payload results = %#v, want non-empty []any", payload["results"])
@@ -106,7 +117,8 @@ func TestSyncSearchReturnsArtifactsAndSnapshot(t *testing.T) {
 		t.Fatalf("first result = %#v", results[0])
 	}
 
-	// Schema-2 reference shape: top-level artifact list plus per-hit references.
+	// Top-level artifact list plus per-hit references; the artifact is the only
+	// durable reference surface for a synchronous response.
 	references := artifactReferences(payload["artifacts"])
 	if len(references) == 0 {
 		t.Fatalf("payload artifacts empty, want at least the source reference: %v", payload["artifacts"])
@@ -115,50 +127,85 @@ func TestSyncSearchReturnsArtifactsAndSnapshot(t *testing.T) {
 	if source["kind"] != "source" || source["name"] != "e03.md" || source["document_id"] != "doc-e03" {
 		t.Fatalf("source artifact reference = %v", source)
 	}
-	if artifactID, _ := source["artifact_id"].(string); artifactID == "" {
+	artifactID, _ := source["artifact_id"].(string)
+	if artifactID == "" {
 		t.Fatalf("artifact reference has no artifact_id: %v", source)
 	}
 	if resourceURI, _ := source["resource_uri"].(string); resourceURI == "" {
 		t.Fatalf("artifact reference has no resource_uri: %v", source)
 	}
-	hitReferences := artifactReferences(firstHit["artifacts"])
-	if len(hitReferences) == 0 {
+	if hitReferences := artifactReferences(firstHit["artifacts"]); len(hitReferences) == 0 {
 		t.Fatalf("first hit has no artifacts: %v", firstHit)
 	}
 	if limits, ok := payload["artifact_limits"].(map[string]any); !ok || limits["max_count"] == nil {
 		t.Fatalf("payload artifact_limits = %v", payload["artifact_limits"])
 	}
 
-	// The snapshot is readable through the same client read path.
-	stored, err := h.Service.GetSearchResult(ctx, "alpha", resultID, 1, 10)
+	// The artifact referenced by the response is readable by id afterwards.
+	chunk, err := h.Service.GetArtifact(ctx, "alpha", artifactID, 0, 64)
 	if err != nil {
-		t.Fatalf("GetSearchResult() error = %v", err)
+		t.Fatalf("GetArtifact(%s) error = %v", artifactID, err)
 	}
-	if stored["result_id"] != resultID || stored["snapshot_available"] != true {
-		t.Fatalf("stored snapshot = %v", stored)
-	}
-	storedResults, ok := stored["results"].([]any)
-	if !ok || len(storedResults) == 0 {
-		t.Fatalf("stored results = %#v", stored["results"])
+	if chunk["artifact_id"] != artifactID || chunk["document_id"] != "doc-e03" {
+		t.Fatalf("artifact chunk = %v", chunk)
 	}
 
-	// SearchRaw shares the normalization but never captures or snapshots.
+	// SearchRaw shares the synchronous shape but never captures references.
 	raw, err := h.Service.SearchRaw(ctx, "alpha", syncSearchRequest())
 	if err != nil {
 		t.Fatalf("SearchRaw() error = %v", err)
 	}
+	requireNoSnapshotFields(t, raw)
 	rawResults, ok := raw["results"].([]any)
 	if !ok || len(rawResults) == 0 {
 		t.Fatalf("SearchRaw results = %#v, want non-empty []any", raw["results"])
 	}
-	if _, present := raw["snapshot_available"]; present {
-		t.Fatalf("SearchRaw must not snapshot: %v", raw["snapshot_available"])
+	if references := artifactReferences(raw["artifacts"]); len(references) != 0 {
+		t.Fatalf("SearchRaw must not capture artifacts: %v", raw["artifacts"])
 	}
 }
 
-// TestSyncSearchEmptyResultsSnapshot covers the empty-result case: the payload
-// must keep a non-nil empty results list and still store/read a snapshot.
-func TestSyncSearchEmptyResultsSnapshot(t *testing.T) {
+// TestSyncSearchHonorsDocumentIDs covers the restricted-scope path: the
+// transport sets DocumentIDs and the synchronous engine still executes retrieval
+// while returning only visible documents (an empty non-nil list means nothing is
+// visible).
+func TestSyncSearchHonorsDocumentIDs(t *testing.T) {
+	h := newHarness(t, syncQueryPoints)
+	ctx := context.Background()
+	seedLegacyDocument(t, h, "doc-e03", "e03.md", []byte("E03 水路供水不足的处理步骤"))
+	h.Service.SearchEngine().SetReferenceCapture(searchrefs.New(h.Stores, testLogger()))
+
+	visible := syncSearchRequest()
+	visible.DocumentIDs = []string{"doc-e03"}
+	payload, err := h.Service.Search(ctx, "alpha", visible)
+	if err != nil {
+		t.Fatalf("Search(visible) error = %v", err)
+	}
+	if results, ok := payload["results"].([]any); !ok || len(results) == 0 {
+		t.Fatalf("restricted-visible results = %#v, want the allowed document", payload["results"])
+	}
+
+	hidden := syncSearchRequest()
+	hidden.DocumentIDs = []string{"doc-other"}
+	payload, err = h.Service.Search(ctx, "alpha", hidden)
+	if err != nil {
+		t.Fatalf("Search(hidden) error = %v", err)
+	}
+	requireNoSnapshotFields(t, payload)
+	if results, ok := payload["results"].([]any); !ok || len(results) != 0 {
+		t.Fatalf("restricted-hidden results = %#v, want none", payload["results"])
+	}
+	if references := artifactReferences(payload["artifacts"]); len(references) != 0 {
+		t.Fatalf("restricted-hidden artifacts = %v, want none", payload["artifacts"])
+	}
+	if payload["evidence_status"] != "no_evidence" {
+		t.Fatalf("restricted-hidden evidence_status = %v, want no_evidence", payload["evidence_status"])
+	}
+}
+
+// TestSyncSearchEmptyResults covers the empty-result case: the payload keeps a
+// non-nil empty results list, no artifact references and no snapshot fields.
+func TestSyncSearchEmptyResults(t *testing.T) {
 	h := newHarness(t, "") // fake Qdrant answers with no points
 	ctx := context.Background()
 	h.Service.SearchEngine().SetReferenceCapture(searchrefs.New(h.Stores, testLogger()))
@@ -167,9 +214,7 @@ func TestSyncSearchEmptyResultsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
 	}
-	if payload["snapshot_available"] != true {
-		t.Fatalf("snapshot_available = %v, want true", payload["snapshot_available"])
-	}
+	requireNoSnapshotFields(t, payload)
 	results, ok := payload["results"].([]any)
 	if !ok || results == nil || len(results) != 0 {
 		t.Fatalf("empty payload results = %#v, want non-nil []any{}", payload["results"])
@@ -177,19 +222,7 @@ func TestSyncSearchEmptyResultsSnapshot(t *testing.T) {
 	if references := artifactReferences(payload["artifacts"]); len(references) != 0 {
 		t.Fatalf("empty search artifacts = %v", payload["artifacts"])
 	}
-	resultID, _ := payload["result_id"].(string)
-	if len(resultID) != 36 {
-		t.Fatalf("result_id = %v", payload["result_id"])
-	}
-	stored, err := h.Service.GetSearchResult(ctx, "alpha", resultID, 1, 10)
-	if err != nil {
-		t.Fatalf("GetSearchResult() error = %v", err)
-	}
-	storedResults, ok := stored["results"].([]any)
-	if !ok || len(storedResults) != 0 {
-		t.Fatalf("stored empty results = %#v", stored["results"])
-	}
-	if total, _ := stored["total_results"].(float64); total != 0 {
-		t.Fatalf("stored total_results = %v", stored["total_results"])
+	if evidence, _ := payload["evidence_status"].(string); evidence == "" {
+		t.Fatalf("empty search payload missing evidence_status: %v", payload)
 	}
 }

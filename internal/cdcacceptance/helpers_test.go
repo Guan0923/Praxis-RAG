@@ -1,7 +1,7 @@
 // Package cdcacceptance validates the Debezium/CDC acceptance matrix of
 // docs/cdc-migration.md §11 without a real Kafka/Debezium deployment.
 //
-// The tests drive the production state repositories, the document/search/cache
+// The tests drive the production state repositories, the document/cache
 // consumers and the cache synchronizer against the disposable MySQL test schema
 // (statetest / RAG_TEST_MYSQL_URL). Broker delivery is simulated by feeding the
 // raw Debezium JSON change events through the mq decoders and the workers'
@@ -22,7 +22,6 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/cacheconsumer"
 	"github.com/Guan0923/xinghe_rag/internal/documentworker"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
-	"github.com/Guan0923/xinghe_rag/internal/searchworker"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
@@ -43,12 +42,7 @@ var stateEnvNames = []string{
 	"RAG_DOCUMENT_JOB_SWEEP_SECONDS",
 	"RAG_DOCUMENT_JOB_RETENTION_SECONDS",
 	"RAG_SEARCH_TIMEOUT_SECONDS",
-	"RAG_SEARCH_TASK_LEASE_SECONDS",
-	"RAG_SEARCH_TOPIC",
-	"RAG_SEARCH_GROUP",
-	"RAG_SEARCH_DLQ_TOPIC",
 	"RAG_RESULT_TTL_SECONDS",
-	"RAG_RESULT_MAX_BYTES",
 	"RAG_ARTIFACT_MAX_BYTES",
 	"RAG_RESULT_MAX_ARTIFACTS",
 }
@@ -136,20 +130,6 @@ func newDocumentProcessor(t *testing.T, stores *state.Stores, ingester documentw
 	return processor
 }
 
-// newSearchProcessor builds the production search consumer over a fake retriever.
-func newSearchProcessor(t *testing.T, stores *state.Stores, searcher searchworker.Searcher) *searchworker.Processor {
-	t.Helper()
-	processor, err := searchworker.New(searchworker.Options{
-		Tasks:    stores.SearchTasks,
-		Searcher: searcher,
-		Logger:   testLogger(),
-	})
-	if err != nil {
-		t.Fatalf("searchworker.New() error = %v", err)
-	}
-	return processor
-}
-
 // newCacheProcessor builds the production cache consumer over the real
 // CacheSynchronizer (its loaders were registered by state.New).
 func newCacheProcessor(t *testing.T, stores *state.Stores) *cacheconsumer.Processor {
@@ -195,14 +175,6 @@ func rawDocumentEvent(t *testing.T, artifactID, namespace string, version int64,
 	return rawChangeEvent(t, "document_jobs", op,
 		map[string]any{"artifact_id": artifactID, "namespace": namespace, "schedule_version": version},
 		map[string]any{"artifact_id": artifactID, "namespace": namespace, "schedule_version": version})
-}
-
-// rawSearchEvent renders one raw Debezium search_tasks change event.
-func rawSearchEvent(t *testing.T, resultID, namespace string, version int64, op string) []byte {
-	t.Helper()
-	return rawChangeEvent(t, "search_tasks", op,
-		map[string]any{"result_id": resultID, "namespace": namespace, "schedule_version": version},
-		map[string]any{"result_id": resultID, "namespace": namespace, "schedule_version": version})
 }
 
 // rawCacheEvent renders one raw Debezium cache-connector change event for one
@@ -259,29 +231,6 @@ func requireDocumentJob(t *testing.T, stores *state.Stores, artifactID, status, 
 			artifactID, job.Status, job.Stage, job.ScheduleVersion, status, stage, version)
 	}
 	return job
-}
-
-// searchTaskRow reads the internal scheduling columns of one search task; the
-// repository's Get intentionally exposes only the public view.
-func searchTaskRow(t *testing.T, stores *state.Stores, resultID string) (version int64, status, stage string) {
-	t.Helper()
-	err := stores.DB.QueryRowContext(context.Background(),
-		"SELECT schedule_version, status, stage FROM search_tasks WHERE result_id = ?",
-		resultID).Scan(&version, &status, &stage)
-	if err != nil {
-		t.Fatalf("select search task %s: %v", resultID, err)
-	}
-	return version, status, stage
-}
-
-// requireSearchTask asserts one task's scheduling columns.
-func requireSearchTask(t *testing.T, stores *state.Stores, resultID, status, stage string, version int64) {
-	t.Helper()
-	gotVersion, gotStatus, gotStage := searchTaskRow(t, stores, resultID)
-	if gotVersion != version || gotStatus != status || gotStage != stage {
-		t.Fatalf("search task %s = version %d status %q stage %q, want %d/%q/%q",
-			resultID, gotVersion, gotStatus, gotStage, version, status, stage)
-	}
 }
 
 // countRows runs one fixed count query (test-owned SQL only).

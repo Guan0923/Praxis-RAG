@@ -9,7 +9,7 @@ import (
 const cdcTestResultID = "d1feec53-1036-4af0-8035-86ef6990fa6a"
 
 func TestNotificationDecodeAcceptsNativeAndDebeziumFormats(t *testing.T) {
-	// The application-native schema-4/schema-3 envelopes.
+	// The application-native schema-4 document envelope.
 	document, err := ValidateDocumentNotification(map[string]any{
 		"schema": float64(DocumentEnvelopeSchema), "artifact_id": cdcTestResultID,
 		"namespace": "manuals", "schedule_version": float64(3),
@@ -18,29 +18,13 @@ func TestNotificationDecodeAcceptsNativeAndDebeziumFormats(t *testing.T) {
 		document.Schema != 4 || document.Namespace != "manuals" {
 		t.Fatalf("document native envelope = %+v, %v", document, err)
 	}
-	search, err := ValidateSearchNotification(map[string]any{
-		"schema": float64(SearchEnvelopeSchema), "result_id": cdcTestResultID,
-		"namespace": "alpha", "schedule_version": float64(2),
-	})
-	if err != nil || search.ResultID != cdcTestResultID || search.ScheduleVersion != 2 ||
-		search.Schema != 3 {
-		t.Fatalf("search native envelope = %+v, %v", search, err)
-	}
 	// Raw Debezium JSON change events (schemas.enable=false); op r/c/u are the
 	// only task-producing operations. json.Number is what UseNumber produces.
-	for name, after := range map[string]map[string]any{
-		"artifact_id": {"artifact_id": cdcTestResultID, "namespace": "manuals", "schedule_version": json.Number("7")},
-		"result_id":   {"result_id": cdcTestResultID, "namespace": "alpha", "schedule_version": json.Number("7")},
-	} {
-		for _, op := range []string{"c", "r", "u"} {
-			payload := map[string]any{"before": nil, "after": after, "op": op, "ts_ms": json.Number("1700000000000")}
-			if name == "artifact_id" {
-				if notification, err := ValidateDocumentNotification(payload); err != nil || notification.ScheduleVersion != 7 {
-					t.Fatalf("document op %q = %+v, %v", op, notification, err)
-				}
-			} else if notification, err := ValidateSearchNotification(payload); err != nil || notification.ScheduleVersion != 7 {
-				t.Fatalf("search op %q = %+v, %v", op, notification, err)
-			}
+	for _, op := range []string{"c", "r", "u"} {
+		payload := map[string]any{"before": nil, "op": op, "ts_ms": json.Number("1700000000000"),
+			"after": map[string]any{"artifact_id": cdcTestResultID, "namespace": "manuals", "schedule_version": json.Number("7")}}
+		if notification, err := ValidateDocumentNotification(payload); err != nil || notification.ScheduleVersion != 7 {
+			t.Fatalf("document op %q = %+v, %v", op, notification, err)
 		}
 	}
 	// Integer coding variants are normalized to int64.
@@ -105,9 +89,6 @@ func TestNotificationDecodeClassifiesIgnorableChanges(t *testing.T) {
 		if _, err := ValidateDocumentNotification(payload); !IgnorableCDCChange(err) {
 			t.Fatalf("%s: document error = %v, want ignorable", name, err)
 		}
-		if _, err := ValidateSearchNotification(payload); !IgnorableCDCChange(err) {
-			t.Fatalf("%s: search error = %v, want ignorable", name, err)
-		}
 	}
 	if IgnorableCDCChange(nil) {
 		t.Fatal("nil is not an ignorable change")
@@ -137,17 +118,6 @@ func TestNotificationDecodeRejectsMalformedMessages(t *testing.T) {
 			t.Fatalf("%s: document payload accepted (err=%v)", name, err)
 		}
 	}
-	searchCases := map[string]any{
-		"old schema two":   map[string]any{"schema": float64(2), "result_id": cdcTestResultID, "namespace": "alpha", "schedule_version": float64(1)},
-		"wrong schema":     map[string]any{"schema": float64(4), "result_id": cdcTestResultID, "namespace": "alpha", "schedule_version": float64(1)},
-		"bad result id":    map[string]any{"schema": float64(3), "result_id": "x", "namespace": "alpha", "schedule_version": float64(1)},
-		"namespace absent": map[string]any{"schema": float64(3), "result_id": cdcTestResultID, "schedule_version": float64(1)},
-	}
-	for name, payload := range searchCases {
-		if _, err := ValidateSearchNotification(payload); err == nil || IgnorableCDCChange(err) {
-			t.Fatalf("%s: search payload accepted (err=%v)", name, err)
-		}
-	}
 }
 
 func TestNotificationEnvelopeBuilders(t *testing.T) {
@@ -166,23 +136,8 @@ func TestNotificationEnvelopeBuilders(t *testing.T) {
 	if containsStringText(encoded, "secret bytes") || containsStringText(encoded, "a.txt") {
 		t.Fatalf("document notification leaked job content: %s", encoded)
 	}
-	task := &SearchTask{
-		ResultID: cdcTestResultID, Namespace: "alpha", ScheduleVersion: 4,
-		Arguments: map[string]any{"query": "secret query"},
-	}
-	search, err := SearchTaskEnvelope(task)
-	if err != nil || search.Schema != SearchEnvelopeSchema || search.ScheduleVersion != 4 {
-		t.Fatalf("SearchTaskEnvelope() = %+v, %v", search, err)
-	}
-	encoded, err = marshalJSON(search)
-	if err != nil || containsStringText(encoded, "secret query") {
-		t.Fatalf("search notification leaked arguments: %s, %v", encoded, err)
-	}
 	if _, err := DocumentJobEnvelope(nil); err == nil {
 		t.Fatal("nil job produced a notification")
-	}
-	if _, err := SearchTaskEnvelope(nil); err == nil {
-		t.Fatal("nil task produced a notification")
 	}
 }
 

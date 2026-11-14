@@ -55,10 +55,10 @@ func isAlreadyExists(err error) bool {
 // process. It mirrors rag_mcp.state.store.StateStores.
 //
 // TODO(G2/G7) still deferred from the state-layer port:
-//   - Concrete Kafka notification publishers and the Redis StateCache/Transient
-//     clients; the durable task state machines are in place for the worker
-//     binaries, while Debezium owns notification delivery (no outbox relay).
-//   - Worker main packages (rag-document-worker / rag-search-worker /
+//   - Concrete Kafka notification publishers; the durable task state machines
+//     are in place for the worker binaries, while Debezium owns notification
+//     delivery (no outbox relay).
+//   - Worker main packages (rag-document-worker / rag-cache-worker /
 //     rag-dead-letter-worker), broker-side DLQ consumption and deployment.
 //   - KnowledgeBaseRepository.publish/confirm_publication (needs the lease
 //     journal) and the schema migrate CLI (migrate.py).
@@ -85,13 +85,11 @@ type Stores struct {
 	CacheSync *CacheSynchronizer
 	Blobs     *BlobStore
 	Views     *CachedReadViews
-	Results   *ResultSnapshots
 	Artifacts *ArtifactRegistry
 	Uploads   *UploadJournal
 
 	DocumentJobs    *DocumentJobs
 	DocumentBatches *DocumentBatches
-	SearchTasks     *SearchTasks
 
 	// Activity and Heartbeats are the Go-only monitoring data sources: hourly
 	// activity counters (every retrieval execution) and Worker liveness rows.
@@ -226,12 +224,6 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 		_ = database.Close()
 		return nil, err
 	}
-	stores.Results = NewResultSnapshots(stores, snapshotSettings, nil)
-	// When the async phase injects the Redis backend it can also provide the
-	// expiring TransientStore that owns search-result snapshots.
-	if provider, ok := cacheSync.Backend.(TransientProvider); ok {
-		stores.Results.Transient = provider.TransientStore()
-	}
 	maxArtifactBytes := int64(snapshotSettings.MaxArtifactBytes)
 	artifacts, err := NewArtifactRegistry(stores, float64(snapshotSettings.TTLSeconds), nil, &maxArtifactBytes)
 	if err != nil {
@@ -241,14 +233,6 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 		return nil, err
 	}
 	stores.Artifacts = artifacts
-	searchTasks, err := NewSearchTasks(stores)
-	if err != nil {
-		uploads.Close()
-		_ = cacheSync.Close()
-		_ = database.Close()
-		return nil, err
-	}
-	stores.SearchTasks = searchTasks
 	// Monitoring data sources need no cache flush: they are write-mostly
 	// counters/heartbeats read by the Console monitor page only.
 	stores.Activity = newActivityCounters(database)
@@ -666,12 +650,11 @@ func (s *Stores) migrateAddColumns(ctx context.Context, additions map[string][]c
 }
 
 // migrateScheduleVersions adds the Debezium scheduling generation to existing
-// document_jobs/search_tasks tables. New rows default to 1; existing rows get 1
-// as well, which is the correct starting generation for the cutover backfill.
+// document_jobs tables. New rows default to 1; existing rows get 1 as well,
+// which is the correct starting generation for the cutover backfill.
 func (s *Stores) migrateScheduleVersions(ctx context.Context) error {
 	return s.migrateAddColumns(ctx, map[string][]columnAddition{
 		"document_jobs": {{name: "schedule_version", definition: "BIGINT NOT NULL DEFAULT 1"}},
-		"search_tasks":  {{name: "schedule_version", definition: "BIGINT NOT NULL DEFAULT 1"}},
 	})
 }
 

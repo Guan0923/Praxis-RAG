@@ -84,7 +84,7 @@ func TestListResourcesPagination(t *testing.T) {
 			"name": "document-" + strconv.Itoa(index) + ".txt",
 		})
 	}
-	endpoint := newTestEndpoint(t, runtime, Options{QueuedSearch: true})
+	endpoint := newTestEndpoint(t, runtime, Options{})
 
 	first, err := endpoint.listResources(context.Background(), manualsNS, nil)
 	if err != nil {

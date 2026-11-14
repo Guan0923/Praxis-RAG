@@ -43,7 +43,7 @@ func TestModernResourcesAndDocumentPages(t *testing.T) {
 	runtime := newFakeRuntime()
 	runtime.listDocuments = []DocumentRecord{{"name": "manual.txt"}, {"name": "guide.md"}}
 	runtime.readDocument = DocumentContent{Text: documentPagesText(), Version: "v1"}
-	_, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	_, server := newTestHTTPHandler(t, runtime, Options{})
 	session := newModernClient(t, server, manualsNS)
 	ctx := context.Background()
 
@@ -109,7 +109,7 @@ func TestModernArtifactResource(t *testing.T) {
 		"data":        "YWJj",
 		"next_offset": 3,
 	}
-	_, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	_, server := newTestHTTPHandler(t, runtime, Options{})
 	session := newModernClient(t, server, manualsNS)
 	ctx := context.Background()
 
@@ -152,7 +152,7 @@ func TestModernResourceErrorsMatchSEP2575(t *testing.T) {
 	runtime := newFakeRuntime()
 	runtime.listDocuments = []DocumentRecord{{"name": "manual.txt"}}
 	runtime.readDocument = DocumentContent{Text: "hello world", Version: "v1"}
-	_, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	_, server := newTestHTTPHandler(t, runtime, Options{})
 	documentURI := resources.DocumentURI(manualsNS, "manual.txt")
 
 	cases := []struct {
@@ -225,7 +225,7 @@ func TestLegacyResourceSubscriptions(t *testing.T) {
 	runtime := newFakeRuntime()
 	runtime.listDocuments = []DocumentRecord{{"name": "manual.txt"}}
 	runtime.readDocument = DocumentContent{Text: "hello world", Version: "v1"}
-	endpoint, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	endpoint, server := newTestHTTPHandler(t, runtime, Options{})
 	client := newRawRPC(t, server.URL, manualsNS)
 	client.initialize()
 	uri := resources.DocumentURI(manualsNS, "manual.txt")
@@ -335,7 +335,7 @@ func TestDocumentToolsPublishResourceNotifications(t *testing.T) {
 			deliver("updated:" + request.Params.URI)
 		},
 	}
-	_, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	_, server := newTestHTTPHandler(t, runtime, Options{})
 	session := newModernClientWithOptions(t, server, manualsNS, clientOptions)
 	ctx := context.Background()
 	uri := resources.DocumentURI(manualsNS, "a.txt")
@@ -407,7 +407,7 @@ func TestModernResourceSubscriptions(t *testing.T) {
 			deliver("updated:" + request.Params.URI)
 		},
 	})
-	endpoint := newTestEndpoint(t, runtime, Options{QueuedSearch: true})
+	endpoint := newTestEndpoint(t, runtime, Options{})
 	server := httptest.NewServer(newTestHandlerFor(t, endpoint))
 	defer server.Close()
 	transport := &sdk.StreamableClientTransport{

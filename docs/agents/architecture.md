@@ -10,9 +10,9 @@
 MCP 客户端 ──/mcp──────────────┤
 REST 客户端 ──/v1/*────────────┴──> rag-service
                                        ├─> Qdrant（dense + sparse 向量）
-                                       ├─> MySQL（文档/KB/任务/结果快照/API Key/模型配置/权限/缓存水位）
-                                       ├─> Redis（读模型缓存、搜索结果快照；可选）
-                                       ├─> Kafka（Debezium 文档通知 / 搜索队列；文档处理必需）
+                                       ├─> MySQL（文档/KB/任务/artifact/API Key/模型配置/权限/缓存水位）
+                                       ├─> Redis（读模型展示缓存；可选）
+                                       ├─> Kafka（Debezium 文档通知 / 缓存变更；文档入库必需）
                                        └─> pdf-parser :8091（HTTP；本地 PyMuPDF 读取/渲染/裁图，
                                               版面/OCR/表格/公式/图片描述交远端视觉模型）
 
@@ -29,9 +29,10 @@ Console 批次上传（POST /v1/document-batches）
   → 结果写回 items 与计数，202 返回 batch_id；GET /v1/document-batches/{batch_id}
     同时给出保存结果与已入队任务的 status/stage
 
-MCP search（配置 Kafka 时）→ MySQL search_tasks 提交即受理（返回 result_id）
-  → Debezium 任务连接器 → Kafka → rag-search-worker
-  → 检索结果写入 MySQL search_result_snapshots + Redis 读取缓存 → get_search_result 分页读取
+MCP search / REST /v1/search（同步）→ runtime.Service.Search → SearchEngine
+  → 检索 + 重排 + artifact 投影（不落结果快照）
+  → 同一次响应返回 results / artifacts / evidence_status / answer_guidance
+  → 无任务 ID、无轮询、无搜索 topic；总预算 RAG_SEARCH_TIMEOUT_SECONDS
 
 业务表变更（含手工 SQL）→ Debezium 缓存连接器 → praxis_state_cache_refresh
   → rag-cache-worker 递增 cache_revisions.revision 并重建 Redis（失败由 RefreshDirty 补偿）
@@ -39,10 +40,9 @@ MCP search（配置 Kafka 时）→ MySQL search_tasks 提交即受理（返回 
 
 关键点：
 
-- **MySQL 是事实来源**：文档任务、知识库配置、API Key、权限、模型配置、排队搜索任务与搜索结果快照都在 MySQL；Kafka 只传通知（三类事件，只含定位标识），不是状态存储。
+- **MySQL 是事实来源**：文档任务、知识库配置、API Key、权限、模型配置、artifact 快照都在 MySQL；Kafka 只传通知（两类事件，只含定位标识），不是状态存储。`search_tasks`/`search_result_snapshots` 为历史表、不再读写。
 - **上传默认异步受理**：HTTP 提交点是 `document_jobs` 任务事务提交（不再有发件箱），而不是解析完成；`add_document` 返回 `artifact_id` 不代表已可检索，只有 `succeeded` 才算发布完成。
-- **搜索提交即受理**：排队搜索的受理点是 MySQL `search_tasks` 事务提交，不等待 Kafka 确认；结果以 MySQL 快照为准，Redis 可重建。
-- **检索默认同步**（REST/Console），只有配置了 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时 MCP `search` 才切换为排队模式。
+- **搜索永远同步**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，没有任务 ID、`wait_seconds` 或轮询；artifact 按 ID 独立读取（保留期 `RAG_RESULT_TTL_SECONDS`）。
 - **文档解析必须走 Kafka**：`rag-service` 不内嵌文档消费者；未配置 Kafka + Debezium + `rag-document-worker` 时，上传仍会受理，但文档任务停留在 `queued`。
 - **PDF 双引擎**：`RAG_PDF_ENGINE=vision`（compose `app` 默认；为空时按是否配置 `RAG_PDF_SERVICE_URL` 决定）走 pdf-parser，由远端 OpenAI 兼容视觉模型完成版面/OCR/表格/公式/图片描述；旧值 `docling` 作为兼容别名等价于 `vision`；`go` 使用 Go 进程内纯文本引擎。pdf-service 本地不加载任何模型权重。
 
@@ -52,9 +52,8 @@ MCP search（配置 Kafka 时）→ MySQL search_tasks 提交即受理（返回 
 | --- | --- | --- |
 | `rag-service` | REST + MCP + Console + 后台维护循环；只受理上传，不解析文档 | `cmd/rag-service/main.go` |
 | `rag-document-worker` | 消费文档通知，执行解析/切分/Embedding/Qdrant 发布 | `cmd/rag-document-worker/main.go` |
-| `rag-search-worker` | 消费排队搜索请求，执行检索并写 Redis 快照 | `cmd/rag-search-worker/main.go` |
 | `rag-cache-worker` | 消费 Debezium 缓存连接器投递的业务表变更，按 revision 水位重建 Redis；周期性 `RefreshDirty` 补偿 | `cmd/rag-cache-worker/main.go` |
-| `rag-dead-letter-worker` | 消费显式 DLQ topic（`--kind document|search|cache`），把可确认的失败写入终态并 ACK | `cmd/rag-dead-letter-worker/main.go` |
+| `rag-dead-letter-worker` | 消费显式 DLQ topic（`--kind document|cache`），把可确认的失败写入终态并 ACK | `cmd/rag-dead-letter-worker/main.go` |
 | `rag-state-migrate` | 状态库表结构检查/创建 | `cmd/rag-state-migrate/main.go` |
 | `rag-service-migrate` | 旧知识源（`~/.mini_agent`）预览/导入（**不重建向量**）；`--retire-outbox` 删除已下线的 outbox 表 | `cmd/rag-service-migrate/main.go` |
 | `rag-cdc-cutover` | CDC 存量切换：盘点、记录 binlog 位点、补投、缓存基线、核对 | `cmd/rag-cdc-cutover/main.go` |
@@ -99,17 +98,16 @@ examples/knowledge/         示例知识文档（可直接上传试用）
 | `mcp` | MCP 端点、工具、资源、提示词、权限 scope |
 | `migrate` | 旧知识源导入与状态迁移 |
 | `modelapi` | Embedding / Reranker HTTP 客户端 |
-| `monitor` | 只读监控快照：状态库聚合（文档任务/检索任务/上传分类、缓存 dirty/failures、有效文档与结果快照计数、活动计数器）与 MySQL/Redis/Qdrant/Kafka/pdf-service 依赖探测；另单独汇总任务/缓存两个 Debezium 连接器健康、三组 Kafka 消费组进度和文档 Worker 心跳（应用读不到的采集位点产生显式「未知」），并按三态聚合页头总体状态，供 Console「系统监控」页与 `GET /v1/admin/monitor/overview` 使用 |
-| `mq` | Kafka 生产/消费、三类 Debezium 事件解码（文档/搜索/缓存）、进程内重试、DLQ 发布 |
+| `monitor` | 只读监控快照：状态库聚合（文档任务/上传分类、缓存 dirty/failures、有效文档计数、活动计数器）与 MySQL/Redis/Qdrant/Kafka/pdf-service 依赖探测；另单独汇总任务/缓存两个 Debezium 连接器健康、两组 Kafka 消费组进度和文档 Worker 心跳（应用读不到的采集位点产生显式「未知」），并按三态聚合页头总体状态，供 Console「系统监控」页与 `GET /v1/admin/monitor/overview` 使用 |
+| `mq` | Kafka 生产/消费、两类 Debezium 事件解码（文档/缓存）、进程内重试、DLQ 发布 |
 | `qdrant` | Qdrant HTTP 客户端（collection、向量、过滤、RRF 查询） |
-| `redisstate` | Redis 读模型缓存与搜索任务/快照 |
+| `redisstate` | Redis 读模型展示缓存与水位 |
 | `resources` | MCP 文档资源 URI 与分页 |
 | `retrieval` | BM25 / Dense / Hybrid 检索、Cross-Encoder 重排、Orchestrator |
-| `runtime` | 业务运行时：知识库、文档 CRUD、搜索、上传事务、任务状态、维护恢复 |
-| `searchrefs` | 搜索结果投影、artifact 引用与快照写入 |
-| `searchworker` | 排队搜索处理器 |
+| `runtime` | 业务运行时：知识库、文档 CRUD、同步搜索（含总预算/取消）、上传事务、任务状态、维护恢复 |
+| `searchrefs` | 搜索结果投影与 artifact 引用（不再写结果快照） |
 | `sparse` | BM25 sparse 编码（确定性哈希词表） |
-| `state` | MySQL schema、仓储、`enc:v1:` 加密、上传日志、任务（`schedule_version`）、缓存 revision 水位、结果快照、CDC 切换状态 |
+| `state` | MySQL schema、仓储、`enc:v1:` 加密、上传日志、任务（`schedule_version`）、缓存 revision 水位、artifact 快照、CDC 切换状态 |
 | `statetest` | 测试用共享 schema 与 advisory lock |
 | `version` | 版本常量 |
 | `wire` | 依赖装配（adapters） |

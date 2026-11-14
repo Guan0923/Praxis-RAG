@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -20,12 +19,11 @@ import (
 
 // Tool names are part of the stable MCP contract; never rename them.
 const (
-	searchToolName          = "search"
-	getSearchResultToolName = "get_search_result"
-	addDocumentToolName     = "add_document"
-	updateDocumentToolName  = "update_document"
-	deleteDocumentToolName  = "delete_document"
-	documentStatusToolName  = "get_document_status"
+	searchToolName         = "search"
+	addDocumentToolName    = "add_document"
+	updateDocumentToolName = "update_document"
+	deleteDocumentToolName = "delete_document"
+	documentStatusToolName = "get_document_status"
 )
 
 // supportedExtensions mirrors service_knowledge.SUPPORTED_EXTENSIONS.
@@ -53,7 +51,7 @@ type toolEntry struct {
 	execute    func(ctx context.Context, namespace string, input any) (map[string]any, error)
 }
 
-// readOnlyAnnotations mirrors the Python search/get_search_result annotations.
+// readOnlyAnnotations mirrors the Python search tool annotations.
 func readOnlyAnnotations() *sdk.ToolAnnotations {
 	destructive := false
 	openWorld := false
@@ -68,37 +66,20 @@ func readOnlyAnnotations() *sdk.ToolAnnotations {
 // buildToolEntries assembles the ordered tool registry. The order is part of
 // the legacy tools/list contract observed by existing clients.
 func (e *Endpoint) buildToolEntries() []toolEntry {
-	entries := make([]toolEntry, 0, 6)
-	queued := e.opts.QueuedSearch
+	entries := make([]toolEntry, 0, 5)
 
-	searchDescription := contracts.SearchToolDescription
-	if queued {
-		searchDescription += contracts.QueuedSearchToolDescriptionSuffix
-	}
 	entries = append(entries, toolEntry{
 		name: searchToolName,
 		definition: &sdk.Tool{
 			Name:        searchToolName,
-			Description: searchDescription,
-			InputSchema: contracts.SearchToolSchema(queued),
+			Description: contracts.SearchToolDescription,
+			InputSchema: contracts.SearchToolSchema(),
 			Annotations: readOnlyAnnotations(),
 		},
 		validate: func(arguments map[string]any) (any, error) {
-			if queued {
-				return contracts.QueuedSearchRequestFromArguments(arguments)
-			}
 			return contracts.SearchRequestFromArguments(arguments)
 		},
 		execute: func(ctx context.Context, namespace string, input any) (map[string]any, error) {
-			if queued {
-				// A queued search runs outside this request and snapshots its
-				// results, so a per-request visibility restriction cannot be
-				// applied consistently. Reject it instead of leaking evidence.
-				if _, restricted := restrictedScope(ctx); restricted {
-					return nil, fmt.Errorf(messageRestrictedSearchQueued)
-				}
-				return e.executeQueuedSearch(ctx, namespace, input.(contracts.QueuedSearchRequest))
-			}
 			request := input.(contracts.SearchRequest)
 			if scope, restricted := restrictedScope(ctx); restricted {
 				documentIDs, err := e.resolvedDocumentIDs(ctx, namespace, scope)
@@ -108,51 +89,6 @@ func (e *Endpoint) buildToolEntries() []toolEntry {
 				request.DocumentIDs = documentIDs
 			}
 			return e.opts.Runtime.Search(ctx, namespace, request)
-		},
-	})
-
-	entries = append(entries, toolEntry{
-		name: getSearchResultToolName,
-		definition: &sdk.Tool{
-			Name: getSearchResultToolName,
-			Description: "Read a search by result_id UUID without running retrieval again. Pending queued " +
-				"searches return status queued and their stage; completed searches return frozen results. " +
-				"Failed, timed-out or expired searches return errors.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"result_id": map[string]any{
-						"type": "string", "format": "uuid", "minLength": 36, "maxLength": 36,
-					},
-					"page": map[string]any{
-						"type": "integer", "minimum": 1, "maximum": contracts.MaxResultPage, "default": 1,
-					},
-					"page_size": map[string]any{
-						"type": "integer", "minimum": 1, "maximum": 100, "default": 10,
-					},
-				},
-				"required":             []string{"result_id"},
-				"additionalProperties": false,
-			},
-			Annotations: readOnlyAnnotations(),
-		},
-		validate: func(arguments map[string]any) (any, error) {
-			return contracts.ValidateSearchResultArguments(arguments)
-		},
-		execute: func(ctx context.Context, namespace string, input any) (map[string]any, error) {
-			request := input.(contracts.SearchResultRequest)
-			payload, err := e.opts.Runtime.GetSearchResult(ctx, namespace, request.ResultID, request.Page, request.PageSize)
-			if err != nil {
-				return nil, err
-			}
-			if scope, restricted := restrictedScope(ctx); restricted {
-				documentIDs, resolveErr := e.resolvedDocumentIDs(ctx, namespace, scope)
-				if resolveErr != nil {
-					return nil, resolveErr
-				}
-				payload = filterSearchResults(payload, documentIDs)
-			}
-			return payload, nil
 		},
 	})
 
@@ -272,63 +208,6 @@ func (e *Endpoint) documentEntry(name, description string) toolEntry {
 			request := input.(documentRequest)
 			return e.executeDocumentOperation(ctx, namespace, name, request)
 		},
-	}
-}
-
-// executeQueuedSearch ports McpHttpEndpoint.search_queued: the submission is
-// shielded from client cancellation, then the result is polled for at most
-// wait_seconds. A wait timeout is a success that only carries result_id.
-func (e *Endpoint) executeQueuedSearch(ctx context.Context, namespace string, request contracts.QueuedSearchRequest) (map[string]any, error) {
-	resultID, err := e.opts.Runtime.SubmitSearch(context.WithoutCancel(ctx), namespace, request.Search)
-	if err != nil {
-		return nil, err
-	}
-	response := map[string]any{"result_id": resultID}
-	if request.WaitSeconds <= 0 {
-		return response, nil
-	}
-	deadline := time.Now().Add(time.Duration(request.WaitSeconds * float64(time.Second)))
-	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return response, nil
-		}
-		type readResult struct {
-			payload map[string]any
-			err     error
-		}
-		reads := make(chan readResult, 1)
-		go func() {
-			payload, readErr := e.opts.Runtime.GetSearchResult(ctx, namespace, resultID, 1, 10)
-			reads <- readResult{payload: payload, err: readErr}
-		}()
-		select {
-		case read := <-reads:
-			if read.err != nil {
-				return nil, read.err
-			}
-			status, _ := read.payload["status"].(string)
-			if status != "queued" {
-				return read.payload, nil
-			}
-			pause := 100 * time.Millisecond
-			if left := time.Until(deadline); left < pause {
-				pause = left
-			}
-			if pause > 0 {
-				sleep := time.NewTimer(pause)
-				select {
-				case <-sleep.C:
-				case <-ctx.Done():
-					sleep.Stop()
-					return response, nil
-				}
-			}
-		case <-time.After(remaining):
-			return response, nil
-		case <-ctx.Done():
-			return response, nil
-		}
 	}
 }
 

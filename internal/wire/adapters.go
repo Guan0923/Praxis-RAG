@@ -31,11 +31,6 @@ func (a HTTPRuntime) Search(ctx context.Context, namespace string, request contr
 	return a.Service.Search(ctx, namespace, request)
 }
 
-// GetSearchResult implements httpapi.ResultRuntime.
-func (a HTTPRuntime) GetSearchResult(ctx context.Context, namespace, resultID string, page, pageSize int) (map[string]any, error) {
-	return a.Service.GetSearchResult(ctx, namespace, resultID, page, pageSize)
-}
-
 // GetArtifact implements httpapi.ArtifactRuntime.
 func (a HTTPRuntime) GetArtifact(ctx context.Context, namespace, artifactID string, offset, length int) (map[string]any, error) {
 	return a.Service.GetArtifact(ctx, namespace, artifactID, offset, length)
@@ -138,16 +133,6 @@ func (a MCPRuntime) ReadDocument(ctx context.Context, namespace, name string) (m
 // Search implements mcp.Runtime.
 func (a MCPRuntime) Search(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error) {
 	return a.Service.Search(ctx, namespace, request)
-}
-
-// SubmitSearch implements mcp.Runtime.
-func (a MCPRuntime) SubmitSearch(ctx context.Context, namespace string, request contracts.SearchRequest) (string, error) {
-	return a.Service.SubmitSearch(ctx, namespace, request)
-}
-
-// GetSearchResult implements mcp.Runtime.
-func (a MCPRuntime) GetSearchResult(ctx context.Context, namespace, resultID string, page, pageSize int) (map[string]any, error) {
-	return a.Service.GetSearchResult(ctx, namespace, resultID, page, pageSize)
 }
 
 // GetArtifact implements mcp.Runtime.

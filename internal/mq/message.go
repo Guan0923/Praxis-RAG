@@ -48,27 +48,6 @@ func DecodeDocumentNotification(body []byte) (state.DocumentNotification, error)
 	return notification, nil
 }
 
-// DecodeSearchNotification decodes one search-task topic payload.
-//
-// It accepts the application-native schema-3 envelope
-// {"schema":3,"result_id":...,"namespace":...,"schedule_version":...} and the
-// raw Debezium JSON change event of search_tasks. The ignorable/invalid rules
-// are identical to DecodeDocumentNotification.
-func DecodeSearchNotification(body []byte) (state.SearchNotification, error) {
-	payload, err := decodeCDCPayload(body)
-	if err != nil {
-		return state.SearchNotification{}, newSafeError(ErrPayloadInvalid, "decode search notification", err)
-	}
-	notification, err := state.ValidateSearchNotification(payload)
-	if err != nil {
-		if state.IgnorableCDCChange(err) {
-			return state.SearchNotification{}, err
-		}
-		return state.SearchNotification{}, newSafeError(ErrPayloadInvalid, "decode search notification", err)
-	}
-	return notification, nil
-}
-
 // CacheChange is one cache read-model change derived from a Debezium event.
 //
 // Before/After only ever contain the locator columns declared in
