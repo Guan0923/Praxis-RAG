@@ -153,3 +153,14 @@ func (e *SearchEngine) sag2ScorerResolver() func(context.Context) (retrieval.Jev
 		return client, nil
 	}
 }
+
+// errorTypeName renders a safe error category for logs and user-facing failure
+// summaries, mirroring Python's type(exc).__name__ based diagnostics (never
+// message contents). The helper used to live in documents_publish.go; it is
+// kept here for the SAG2 resolver after that file was retired.
+func errorTypeName(err error) string {
+	if err == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("%T", err)
+}
