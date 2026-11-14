@@ -109,7 +109,7 @@
 | 管理：模型配置 | `GET|POST /v1/admin/model-profiles`、`GET|PATCH|DELETE /v1/admin/model-profiles/{profile_id}`、`GET /v1/admin/model-profiles/{profile_id}/key`、`POST /v1/admin/model-profiles/{profile_id}/models` |
 | 管理：MCP 配置 | `GET /v1/admin/tools`、`PATCH /v1/admin/tools/{name}`、`GET /v1/admin/prompts`、`PUT|DELETE /v1/admin/prompts/{name}` |
 | 管理：展示/只读 | `GET /v1/admin/published-versions`、`GET /v1/admin/upload-leases`（注册为无认证，但 handler 内二次校验管理员+本机边界） |
-| 管理：监控 | `GET /v1/admin/monitor/overview`（只读聚合：三态总体状态、服务信息、依赖探测（Kafka 元数据 / PDF 健康负载）、文档任务/上传分类队列、两个 Debezium 连接器健康、两组 Kafka 消费组积压、缓存 dirty/failures、文档 Worker 心跳、有效文档计数、24 小时检索活动；不可得的数字显式为 `null`/未知；本机直连或管理员会话） |
+| 管理：监控 | `GET /v1/admin/monitor/overview`（只读聚合：三态总体状态、服务信息、依赖探测（Kafka 元数据 / PDF 健康负载）、文档任务/上传分类队列、两个 Debezium 连接器健康、两组 Kafka 消费组积压、缓存 dirty/failures、文档 Worker 心跳、有效文档计数、24 小时检索活动，以及顶层 `system` 主机资源（CPU/内存/网络/进程；采集不可用为 `null` 并追加到 `errors`，不影响健康判定）；不可得的数字显式为 `null`/未知；本机直连或管理员会话）、`GET /v1/admin/monitor/logs`（组件日志查询：`source=memory|file`、`component`、最低 `level`、`query`、`limit`/`offset`，按最新在前分页，返回各组件条数（「全部日志」组件筛选用）与文件元信息；未配置 `RAG_LOG_FILE` 时 `available=false` 仍返回 200，参数非法返回 400；本机直连或管理员会话） |
 | 每账号 API Key | `GET|POST /v1/admin/api-keys`、`PUT|DELETE /v1/admin/api-keys/{key_id}`、`GET /v1/admin/api-keys/{key_id}/mcp-config` |
 | MCP | `POST|GET|DELETE /mcp` |
 
@@ -134,7 +134,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | `#/model-profiles` | 模型配置 | 管理员 | Embedding/Reranker/VLM/JEV 分页签，新增/编辑/删除、模型探测、Key 只写不读 |
 | `#/api-keys` | API Key | 所有登录账号 | 自己的密钥 CRUD/启停、一次性明文、复制 MCP 配置 |
 | `#/users` | 用户管理 | 管理员 | 角色（admin/vip/user）、启用/禁用、删除；服务端保证至少保留一名启用的管理员 |
-| `#/monitor` | 系统监控 | 管理员 | 只读监控快照：页头三态状态与降级告警、关键指标（有效文档/任务/上传/检索）、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态（Kafka 校验元数据与主题、PDF 校验转换器）、`document_jobs` 队列与阶段、上传互斥分类、Debezium 任务/缓存两个连接器健康、两组 Kafka 消费组滞后、缓存 dirty/failures、文档 Worker 心跳（读不到显示「未知」）、服务信息；15 秒自动刷新，窄屏单列 |
+| `#/monitor` | 系统监控 | 管理员 | 只读监控：顶部标签栏 = `概览` + `MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` + `全部日志`，组件标签含该组件既有内容与该组件日志，`全部日志` 的组件筛选显示各组件日志条数。概览：页头三态状态与降级告警、主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络速率与最忙网卡、进程 RSS/VMS/goroutine/heap；首次采样与 Windows load 显示「—」）、关键指标（有效文档/任务/上传/检索）、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态（Kafka 校验元数据与主题、PDF 校验转换器）、`document_jobs` 队列与阶段、上传互斥分类、Debezium 任务/缓存两个连接器健康、两组 Kafka 消费组滞后、缓存 dirty/failures、文档 Worker 心跳（读不到显示「未知」）、服务信息；全部日志支持内存/文件来源、最低级别、关键字过滤与分页；15 秒自动刷新，窄屏单列 |
 | `#/permissions` | 权限管理 | 管理员 / VIP | 选择知识库、按用户聚合授权、创建邀请（可读/可修改 × 全库/若干文件）、复制链接、撤销授权/邀请 |
 | `#/invitations` | 邀请中心 | 登录账号 | 待处理邀请、粘贴邀请链接、接受/拒绝（顶部铃铛轮询） |
 | `#/invite?token=` | 受邀预览 | 登录账号 | 预览邀请并接受/拒绝，随后切换到该知识库 |

@@ -19,14 +19,19 @@ import {
   fetchMailSettings,
   fetchModelProfileModels,
   fetchModelProfiles,
+  fetchMonitorLogs,
   formatBytes,
   formatDateTime,
+  formatPercent,
+  formatRate,
   formatScore,
   invitationLink,
   invitationStatus,
   invitationStatusLabels,
   knowledgeBaseModelKinds,
   modelKindLabels,
+  monitorComponentLabels,
+  monitorTabComponents,
   modelKinds,
   permissionLabels,
   registerAccount,
@@ -191,10 +196,105 @@ describe("small formatting helpers", () => {
     expect(formatBytes(512)).toBe("512 B");
     expect(formatBytes(2048)).toBe("2.0 KB");
     expect(formatBytes(2 * 1048576)).toBe("2.0 MB");
+    expect(formatBytes(3 * 1024 ** 3)).toBe("3.0 GB");
     expect(formatDateTime("")).toBe("—");
     expect(formatDateTime("2026-11-09T10:00:00Z")).not.toBe("—");
     expect(errorText(new Error("boom"))).toBe("boom");
     expect(errorText("plain")).toBe("plain");
+  });
+
+  it("renders monitor percentages and byte rates with an honest 未知", () => {
+    expect(formatPercent(37.5)).toBe("37.5%");
+    expect(formatPercent(0)).toBe("0.0%");
+    expect(formatPercent(null)).toBe("未知");
+    expect(formatPercent(undefined)).toBe("未知");
+    expect(formatRate(2048)).toBe("2.0 KB/s");
+    expect(formatRate(12.3 * 1048576)).toBe("12.3 MB/s");
+    expect(formatRate(null)).toBe("未知");
+    expect(formatRate(undefined)).toBe("未知");
+  });
+});
+
+describe("monitor logs transport", () => {
+  const logPayload = {
+    generated_at: "2026-11-14T06:00:03Z",
+    source: "memory",
+    available: true,
+    entries: [
+      {
+        seq: 7,
+        time: "2026-11-14T06:00:02Z",
+        level: "warn",
+        component: "mysql",
+        component_label: "MySQL",
+        message: "连接池等待",
+        attrs: { wait: "3" },
+        source: "memory",
+      },
+    ],
+    total: 1,
+    has_more: false,
+    components: [{ id: "mysql", label: "MySQL", count: 1 }],
+    file: { configured: false, path: "", size_bytes: 0, truncated: false, note: "" },
+    notes: [],
+  };
+
+  it("builds the query from the selected filters only", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(logPayload));
+    const page = await fetchMonitorLogs({
+      source: "file",
+      component: "mysql",
+      level: "warn",
+      query: "连接 超时",
+      limit: 50,
+      offset: 100,
+    });
+
+    const [url, options] = requestArgs(0);
+    const expected = new URLSearchParams({
+      source: "file",
+      component: "mysql",
+      level: "warn",
+      query: "连接 超时",
+      limit: "50",
+      offset: "100",
+    }).toString();
+    expect(url).toBe(`/v1/admin/monitor/logs?${expected}`);
+    expect(url).toContain("query=%E8%BF%9E%E6%8E%A5+%E8%B6%85%E6%97%B6");
+    expect(options.cache).toBe("no-store");
+    expect(page.entries[0].message).toBe("连接池等待");
+    expect(page.entries[0].attrs.wait).toBe("3");
+  });
+
+  it("omits empty filters, zero bounds and keeps the frozen component vocabulary", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(logPayload));
+    await fetchMonitorLogs({ source: "memory", component: "", level: "", query: "", limit: 0, offset: 0 });
+
+    expect(requestArgs(0)[0]).toBe("/v1/admin/monitor/logs?source=memory");
+    expect(monitorTabComponents).toEqual([
+      "mysql",
+      "redis",
+      "qdrant",
+      "kafka",
+      "pdf",
+      "worker",
+      "debezium",
+    ]);
+    expect(monitorComponentLabels.mysql).toBe("MySQL");
+    expect(monitorComponentLabels.pdf).toBe("PDF 解析服务");
+    expect(monitorComponentLabels.worker).toBe("文档 Worker");
+    expect(monitorComponentLabels.debezium).toBe("Debezium");
+  });
+
+  it("passes the abort signal through and surfaces the backend Chinese detail on 400", async () => {
+    fetchMock.mockResolvedValueOnce(
+      textResponse(JSON.stringify({ detail: "limit 超出上限" }), 400),
+    );
+    const controller = new AbortController();
+    await expect(fetchMonitorLogs({ limit: 50 }, controller.signal)).rejects.toThrow(
+      /HTTP 400：limit 超出上限/,
+    );
+    expect((requestArgs(0)[1].signal as AbortSignal)).toBe(controller.signal);
   });
 });
 

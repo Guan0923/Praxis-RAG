@@ -247,7 +247,7 @@ MCP search / REST /v1/search（同步）-> runtime.Service.Search -> 检索 + �
 - **重发只在 MySQL 事务内发生**：长期 `queued`、租约过期或可重试失败通过 `schedule_version + 1` 重排，消费者只处理与数据库当前版本相等的通知；任务表初始快照的 `op=r` 事件用于存量切换补投。
 - **搜索永远同步**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，没有 `result_id`/`wait_seconds`/轮询；artifact 按 ID 独立读取，保留期由 `RAG_RESULT_TTL_SECONDS`（默认 3600 秒）控制。原排队搜索链路（`search_tasks`、`search_result_snapshots`、`praxis_search` topic、`rag-search-worker`、搜索 DLQ）已于 2026-11-13 下线，两张历史表保留数据但不再读写。
 - **缓存消费者 revision 水位**：业务表变更（包括手工 SQL）由缓存连接器投递，消费者递增 `cache_revisions.revision` 后重建并写 Redis；失败记录 `attempts/last_error`，由周期 `RefreshDirty` 收敛，不再有 `cache_outbox` 补发；因此 Redis 写失败不会把事件反复送进 DLQ。
-- Console「系统监控」展示两个 Debezium 连接器健康、两组 Kafka 消费组积压、缓存 dirty/failures 以及文档任务指标，读不到的进度显示「未知」。搜索同步化迁移与切换步骤见 [CDC 迁移契约](docs/cdc-migration.md) §12 与 [部署指南](docs/DEPLOYMENT.md) §12。
+- Console「系统监控」采用顶部标签栏：`概览` 展示总体状态、关键指标、依赖探测、文档任务/上传、Debezium 两个连接器、两组 Kafka 消费组、缓存水位与 Worker 心跳，并新增主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络总速率与最忙网卡、进程 RSS/VMS/goroutine/heap）；`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` 标签展示该组件既有内容与该组件日志；`全部日志` 提供来源（内存/文件）、级别、关键字过滤与分页。读不到的进度显示「未知」。搜索同步化迁移与切换步骤见 [CDC 迁移契约](docs/cdc-migration.md) §12 与 [部署指南](docs/DEPLOYMENT.md) §12。
 
 ## 迁移状态
 
@@ -286,7 +286,7 @@ npm run build
 - PDF 解析引擎默认是 `vision`：Go 服务调用独立的 `pdf-parser` 微服务，后者把版面分析、表格结构、OCR 与公式 LaTeX（以及图片描述）统一交给知识库配置的远端视觉模型（VLM）。该服务未启动或超时（默认 900 秒）时 vision 上传会失败，可显式 `RAG_PDF_ENGINE=go` 切回 Go 内置纯文本引擎（文字型 PDF；不含版面/表格/OCR/公式与图片资产，扫描件请先 OCR）。旧值 `docling` 等价于 `vision`。Word 无图注图片可调用同一个远端 VLM（`RAG_VLM_*`），文档裁图会发送到该端点；未配置 VLM 时图片保留占位描述。.doc 转换依赖外部 LibreOffice。
 - 搜索**同步直返**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并返回证据（`results`/`artifacts`/`evidence_status`/`answer_guidance`），没有 `result_id`、`wait_seconds`、轮询或搜索结果快照；`GET /v1/search-results/{result_id}` 与 MCP `get_search_result` 已删除。总预算由 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120 秒）约束，超过返回错误，客户端重试等于重新检索。
 - artifact 引用独立保留：以 MySQL `artifact_snapshots` 为事实来源，按 ID 读取（`GET /v1/artifacts/{artifact_id}` 与 `/content`），保留期由 `RAG_RESULT_TTL_SECONDS`（默认 3600 秒，语义为 artifact TTL）控制；`search_tasks`/`search_result_snapshots` 两张历史表保留数据但不再读写。
-- 日志统一为结构化日志（Go 服务与 3 个 worker 共用 `slog`，`RAG_LOG_LEVEL`/`RAG_LOG_FORMAT` 控制级别与 `text`/`json` 编码，`RAG_DEBUG_TRACE` 保持旧开关兼容）；只记录任务/操作 ID、失败阶段与安全错误类别，不记录查询、文件内容、消息正文或凭据。
+- 日志统一为结构化日志（Go 服务与 3 个 worker 共用 `slog`，`RAG_LOG_LEVEL`/`RAG_LOG_FORMAT` 控制级别与 `text`/`json` 编码，`RAG_DEBUG_TRACE` 保持旧开关兼容）；只记录任务/操作 ID、失败阶段与安全错误类别，不记录查询、文件内容、消息正文或凭据。Console「系统监控」的日志视图由 `RAG_LOG_BUFFER_SIZE`（进程内环形缓冲，默认 1000 条）与可选 `RAG_LOG_FILE`（所有 Go 进程追加同一个 JSON Lines 文件，供多进程日志汇总）提供；两者均为只读展示，日志正文与属性在输出前经统一脱敏。
 - 每个 HTTP 请求接受或回写 `X-Request-ID`，上传/后台任务日志带 `operation_id`、`artifact_id`、`batch_id`：一次上传可从请求日志追到入队、重试与最终失败。
 - 文档任务失败时 `document_jobs.error` 保留最近一次失败摘要（错误类别、失败阶段、上游 HTTP 状态与脱敏详情）；重试耗尽进入终态或死信时提示会附带该摘要，不再只有统一提示。
 
