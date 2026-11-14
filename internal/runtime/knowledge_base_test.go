@@ -736,18 +736,19 @@ func TestPurgeKnowledgeBaseDeletesDocumentsThenConfiguration(t *testing.T) {
 	}
 }
 
-func TestPurgeKnowledgeBaseKeepsConfigurationWhenDocumentDeleteFails(t *testing.T) {
+func TestPurgeKnowledgeBaseKeepsConfigurationWhenUploadLeaseIsActive(t *testing.T) {
 	modelURL, _ := newFakeModelAPI(t, kbModelHandler(nil))
 	service, stores := newKBService(t, "http://127.0.0.1:1")
 	ctx := context.Background()
 	if _, err := service.CreateKnowledgeBase(ctx, testCreateInput("alpha", modelURL)); err != nil {
 		t.Fatalf("CreateKnowledgeBase() error = %v", err)
 	}
-	// A record without a document id cannot be deleted through the journal, so
-	// the purge must report it and keep the configuration row for a retry.
-	broken := state.DocumentRecord{Name: "broken.txt", ChunkCount: 0, Chunking: map[string]any{}}
-	if err := stores.Documents.Upsert(ctx, "alpha", broken); err != nil {
-		t.Fatalf("Documents.Upsert() error = %v", err)
+	// A live upload lease blocks the purge: the namespace is reported as failed
+	// and the configuration row is kept for a retry once the upload finishes.
+	if _, err := stores.DB.ExecContext(ctx,
+		"INSERT INTO document_leases (namespace, resource, owner, operation_id, expires_at) VALUES (?, ?, ?, NULL, ?)",
+		"alpha", state.UploadNamespaceResource, "owner", float64(time.Now().Unix()+60)); err != nil {
+		t.Fatalf("inserting lease: %v", err)
 	}
 
 	result, err := service.PurgeKnowledgeBase(ctx, "alpha")
@@ -755,9 +756,9 @@ func TestPurgeKnowledgeBaseKeepsConfigurationWhenDocumentDeleteFails(t *testing.
 		t.Fatalf("PurgeKnowledgeBase() error = %v", err)
 	}
 	if result.ConfigurationDeleted {
-		t.Fatalf("configuration row was deleted despite a failed document: %+v", result)
+		t.Fatalf("configuration row was deleted despite an active upload lease: %+v", result)
 	}
-	if len(result.FailedDocuments) != 1 || result.FailedDocuments[0]["name"] != "broken.txt" {
+	if len(result.FailedDocuments) != 1 {
 		t.Fatalf("failed documents = %v", result.FailedDocuments)
 	}
 	if stored, _ := stores.KnowledgeBases.Get(ctx, "alpha"); stored == nil {

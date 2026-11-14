@@ -1097,8 +1097,16 @@ func (r *DocumentRepository) Delete(ctx context.Context, namespace, name string)
 	return changed, nil
 }
 
-// DeleteTx soft-deletes one document inside the caller's transaction.
+// DeleteTx soft-deletes one document inside the caller's transaction and drops
+// the content reference rows owned by that document. The payload rows in
+// content_objects are removed by the maintenance GC once nothing references them.
 func (r *DocumentRepository) DeleteTx(ctx context.Context, tx *sql.Tx, namespace, name string) (bool, error) {
+	var documentID string
+	err := tx.QueryRowContext(ctx,
+		"SELECT document_id FROM documents WHERE namespace = ? AND name = ?", namespace, name).Scan(&documentID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
 	if _, err := touch(ctx, tx, documentKeys(namespace)...); err != nil {
 		return false, err
 	}
@@ -1110,6 +1118,11 @@ func (r *DocumentRepository) DeleteTx(ctx context.Context, tx *sql.Tx, namespace
 	changed, err := result.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	if changed > 0 {
+		if err := deleteDocumentContentRefsTx(ctx, tx, namespace, documentID); err != nil {
+			return false, err
+		}
 	}
 	return changed > 0, nil
 }

@@ -92,9 +92,7 @@ func TestPurgeKnowledgeBasePartialFailureKeepsConfiguration(t *testing.T) {
 
 func TestPurgeKnowledgeBaseRuntimeErrorMapsToServiceUnavailable(t *testing.T) {
 	runtime := &fakeKBAdminRuntime{
-		purgeErrors: map[string]error{
-			"alpha": &apierrors.KnowledgeError{Message: "知识库文档无法读取"},
-		},
+		purgeBatchErr: &apierrors.KnowledgeError{Message: "知识库文档无法读取"},
 	}
 	handler := newPurgeKBHandler(t, runtime)
 	response := performRequest(handler, testRequest{
@@ -155,8 +153,16 @@ func TestBatchDeleteKnowledgeBasesSeparatesDeletedMissingAndFailed(t *testing.T)
 		t.Fatalf("beta failed_documents = %v", beta["failed_documents"])
 	}
 	gamma, _ := failed[1].(map[string]any)
-	if gamma["namespace"] != "gamma" || gamma["error"] != "知识库文档无法读取" {
+	if gamma["namespace"] != "gamma" || gamma["error"] != messageKnowledgeBasePurgePartial {
 		t.Fatalf("gamma failure = %v", gamma)
+	}
+	gammaDocuments, _ := gamma["failed_documents"].([]any)
+	if len(gammaDocuments) != 1 {
+		t.Fatalf("gamma failed_documents = %v", gamma["failed_documents"])
+	}
+	gammaItem, _ := gammaDocuments[0].(map[string]any)
+	if gammaItem["error"] != "知识库文档无法读取" {
+		t.Fatalf("gamma failed document = %v", gammaItem)
 	}
 	if body["documents_deleted"] != float64(2) {
 		t.Fatalf("documents_deleted = %v", body["documents_deleted"])

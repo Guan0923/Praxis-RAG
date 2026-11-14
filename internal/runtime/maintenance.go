@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/logging"
+	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
 // maintenanceIntervalEnv optionally overrides the maintenance cadence. Python's
@@ -192,6 +193,12 @@ func (s *Service) maintenancePass(ctx context.Context) {
 		if _, err := s.stores.Artifacts.PurgeExpired(ctx, 100); err != nil {
 			logBackgroundFailure(ctx, "artifact purge", err)
 		}
+	}
+	if _, err := s.stores.BackfillContentObjects(ctx, 100); err != nil {
+		logBackgroundFailure(ctx, "content backfill", err)
+	}
+	if _, err := s.stores.PurgeUnreferencedContent(ctx, state.ContentObjectRetentionSeconds, 100); err != nil {
+		logBackgroundFailure(ctx, "content purge", err)
 	}
 }
 

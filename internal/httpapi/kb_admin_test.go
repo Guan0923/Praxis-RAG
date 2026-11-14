@@ -36,9 +36,10 @@ type fakeKBAdminRuntime struct {
 	modelsPayload   []string
 	modelsErr       error
 
-	purgeResults map[string]KnowledgeBasePurgeResult
-	purgeErrors  map[string]error
-	purgeCalls   []string
+	purgeResults  map[string]KnowledgeBasePurgeResult
+	purgeErrors   map[string]error
+	purgeBatchErr error
+	purgeCalls    []string
 }
 
 func (f *fakeKBAdminRuntime) ListKnowledgeBases(context.Context) ([]map[string]any, error) {
@@ -67,14 +68,30 @@ func (f *fakeKBAdminRuntime) KnowledgeBaseModels(_ context.Context, kind string,
 	return f.modelsPayload, f.modelsErr
 }
 
-func (f *fakeKBAdminRuntime) PurgeKnowledgeBase(_ context.Context, namespace string) (KnowledgeBasePurgeResult, error) {
-	f.purgeCalls = append(f.purgeCalls, namespace)
-	if err := f.purgeErrors[namespace]; err != nil {
-		return KnowledgeBasePurgeResult{}, err
+func (f *fakeKBAdminRuntime) PurgeKnowledgeBases(_ context.Context, namespaces []string) ([]KnowledgeBasePurgeResult, error) {
+	for _, namespace := range namespaces {
+		f.purgeCalls = append(f.purgeCalls, namespace)
 	}
-	result := f.purgeResults[namespace]
-	result.Namespace = namespace
-	return result, nil
+	if f.purgeBatchErr != nil {
+		return nil, f.purgeBatchErr
+	}
+	results := make([]KnowledgeBasePurgeResult, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		result := f.purgeResults[namespace]
+		result.Namespace = namespace
+		if err := f.purgeErrors[namespace]; err != nil {
+			message := "知识库删除失败"
+			var knowledge *apierrors.KnowledgeError
+			if errors.As(err, &knowledge) {
+				message = knowledge.Message
+			}
+			result.FailedDocuments = append(result.FailedDocuments, map[string]string{
+				"name": "", "error": message,
+			})
+		}
+		results = append(results, result)
+	}
+	return results, nil
 }
 
 func newKBAdminServer(t *testing.T, runtime *fakeKBAdminRuntime) http.Handler {

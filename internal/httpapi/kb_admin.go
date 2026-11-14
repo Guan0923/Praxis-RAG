@@ -53,11 +53,11 @@ type KnowledgeBaseAdminRuntime interface {
 	UpdateKnowledgeBase(ctx context.Context, namespace string, input KnowledgeBaseUpdateInput) (map[string]any, error)
 	KnowledgeBaseKey(ctx context.Context, namespace, kind string) (string, error)
 	KnowledgeBaseModels(ctx context.Context, kind string, values map[string]any, namespace *string) ([]string, error)
-	// PurgeKnowledgeBase deletes every document logically and then the
-	// configuration row, so the merged Console list no longer shows the
-	// namespace. FailedDocuments reports per-document failures; when it is
-	// non-empty the configuration row is intentionally kept.
-	PurgeKnowledgeBase(ctx context.Context, namespace string) (KnowledgeBasePurgeResult, error)
+	// PurgeKnowledgeBases deletes every document logically and then the
+	// configuration rows in one batched transaction, so the merged Console list
+	// no longer shows the namespaces. FailedDocuments reports per-namespace
+	// failures (an active upload), whose data stays untouched.
+	PurgeKnowledgeBases(ctx context.Context, namespaces []string) ([]KnowledgeBasePurgeResult, error)
 }
 
 // KnowledgeBasePurgeResult is the transport-neutral outcome of purging one
@@ -558,18 +558,23 @@ func cleanKnowledgeBaseNamespaces(namespaces *[]string) ([]string, []validationD
 }
 
 // handlePurgeKnowledgeBase implements DELETE /v1/admin/knowledge-bases/{namespace}.
-// It removes every document logically and then the configuration row; 204 means
-// the namespace is gone from the merged list. A partially failed purge keeps the
-// configuration row and answers 409 with the per-document failures.
+// It removes every namespace-scoped row in one transaction and then the
+// configuration row; 204 means the namespace is gone from the merged list. A
+// namespace whose upload lease is active is left untouched and answers 409.
 func (s *Server) handlePurgeKnowledgeBase(w http.ResponseWriter, r *http.Request) {
 	if !s.requireKBAdmin(w) {
 		return
 	}
-	result, err := s.kbAdmin.PurgeKnowledgeBase(r.Context(), pathParam(r, "namespace"))
+	results, err := s.kbAdmin.PurgeKnowledgeBases(r.Context(), []string{pathParam(r, "namespace")})
 	if err != nil {
 		writeRuntimeError(w, err, true)
 		return
 	}
+	if len(results) != 1 {
+		writeDetail(w, http.StatusInternalServerError, "知识库删除结果缺失")
+		return
+	}
+	result := results[0]
 	if len(result.FailedDocuments) > 0 {
 		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusConflict, map[string]any{
@@ -588,7 +593,7 @@ func (s *Server) handlePurgeKnowledgeBase(w http.ResponseWriter, r *http.Request
 }
 
 // handleBatchDeleteKnowledgeBases implements POST /v1/admin/knowledge-bases/batch-delete.
-// Every namespace is purged independently; the response separates deleted,
+// The whole request is one batched purge call; the response separates deleted,
 // already-missing and failed namespaces so the Console can keep only the failed
 // rows selected.
 func (s *Server) handleBatchDeleteKnowledgeBases(w http.ResponseWriter, r *http.Request) {
@@ -610,29 +615,30 @@ func (s *Server) handleBatchDeleteKnowledgeBases(w http.ResponseWriter, r *http.
 	failed := make([]map[string]any, 0)
 	documentsDeleted := 0
 	configurationsDeleted := 0
-	for _, namespace := range namespaces {
-		result, err := s.kbAdmin.PurgeKnowledgeBase(r.Context(), namespace)
-		if err != nil {
-			_, detail := runtimeErrorStatus(err)
+	results, err := s.kbAdmin.PurgeKnowledgeBases(r.Context(), namespaces)
+	if err != nil {
+		_, detail := runtimeErrorStatus(err)
+		for _, namespace := range namespaces {
 			failed = append(failed, map[string]any{"namespace": namespace, "error": detail})
-			continue
 		}
-		if len(result.FailedDocuments) > 0 {
-			failed = append(failed, map[string]any{
-				"namespace":        namespace,
-				"error":            messageKnowledgeBasePurgePartial,
-				"failed_documents": result.FailedDocuments,
-			})
-			continue
-		}
-		if result.DocumentsDeleted == 0 && !result.ConfigurationDeleted {
-			missing = append(missing, namespace)
-			continue
-		}
-		deleted = append(deleted, namespace)
-		documentsDeleted += result.DocumentsDeleted
-		if result.ConfigurationDeleted {
-			configurationsDeleted++
+	} else {
+		for _, result := range results {
+			switch {
+			case len(result.FailedDocuments) > 0:
+				failed = append(failed, map[string]any{
+					"namespace":        result.Namespace,
+					"error":            messageKnowledgeBasePurgePartial,
+					"failed_documents": result.FailedDocuments,
+				})
+			case result.DocumentsDeleted == 0 && !result.ConfigurationDeleted:
+				missing = append(missing, result.Namespace)
+			default:
+				deleted = append(deleted, result.Namespace)
+				documentsDeleted += result.DocumentsDeleted
+				if result.ConfigurationDeleted {
+					configurationsDeleted++
+				}
+			}
 		}
 	}
 	w.Header().Set("Cache-Control", "no-store")
