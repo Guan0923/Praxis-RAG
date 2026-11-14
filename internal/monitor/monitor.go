@@ -14,7 +14,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,8 +71,17 @@ type Options struct {
 	DBStats func() sql.DBStats
 	Redis   RedisProbe
 
-	QdrantURL  string
-	Collection string
+	QdrantURL string
+	// FallbackCollection is the configured RAG_COLLECTION name. It is reported
+	// in the service information only: ingestion and search resolve the
+	// per-knowledge-base collection from the state database, so a deployment
+	// that never creates this fallback collection is still healthy.
+	FallbackCollection string
+	// IndexedCollections reads the Qdrant collections that live document records
+	// are indexed into. The Qdrant probe requires exactly those collections to
+	// exist. nil means the state store is not wired, so the probe only verifies
+	// connectivity instead of inventing a target collection.
+	IndexedCollections func(context.Context) ([]string, error)
 
 	KafkaBootstrapServers []string
 
@@ -142,7 +150,11 @@ type dependency struct {
 	Status    string  `json:"status"`
 	LatencyMS float64 `json:"latency_ms"`
 	Detail    string  `json:"detail"`
-	Points    *int64  `json:"points,omitempty"`
+	// Points is kept for compatibility with older Console builds that still read
+	// the optional field; the probe no longer sets it. A knowledge-base
+	// deployment indexes into one generated collection per knowledge base, so
+	// there is no single aggregate point count to report.
+	Points *int64 `json:"points,omitempty"`
 }
 
 // dependencyLabels are the display labels of the fixed dependency rows.
@@ -161,7 +173,6 @@ var dependencyLabels = []struct {
 type probeResult struct {
 	status    string
 	detail    string
-	points    *int64
 	latencyMS float64
 }
 
@@ -369,7 +380,6 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 			Status:    result.status,
 			LatencyMS: roundOneDecimal(result.latencyMS),
 			Detail:    result.detail,
-			Points:    result.points,
 		})
 	}
 
@@ -430,7 +440,7 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 			"name":           version.ServiceName,
 			"version":        version.Version,
 			"backend":        "go",
-			"collection":     s.options.Collection,
+			"collection":     s.options.FallbackCollection,
 			"started_at":     startedAt.UTC().Format(time.RFC3339),
 			"uptime_seconds": roundOneDecimal(uptime),
 			"upload_mode":    s.options.UploadMode,
@@ -880,8 +890,13 @@ func (s *Service) probeRedis(ctx context.Context) probeResult {
 	return probeResult{status: statusOK, detail: "已启用"}
 }
 
-// probeQdrant lists the collections and reads the configured collection's point
-// count. A missing collection is a degraded state, not a connectivity error.
+// probeQdrant lists the collections and verifies that every collection the live
+// document records are indexed into still exists. The configured RAG_COLLECTION
+// is only the fallback name: normal deployments create one generated
+// knowledge_* collection per knowledge base, so requiring the fallback itself
+// used to report every such deployment as degraded while ingestion and search
+// were healthy. A knowledge base without documents has no collection yet, so
+// only collections that actually hold indexed documents are required.
 func (s *Service) probeQdrant(ctx context.Context) probeResult {
 	client := qdrant.NewClient(s.options.QdrantURL, "", s.httpClient)
 	var collections struct {
@@ -893,29 +908,67 @@ func (s *Service) probeQdrant(ctx context.Context) probeResult {
 		return probeResult{status: statusError, detail: "Qdrant 连接失败"}
 	}
 	total := len(collections.Collections)
-	collection := strings.TrimSpace(s.options.Collection)
-	if collection == "" {
-		return probeResult{status: statusOK, detail: fmt.Sprintf("集合 %d 个；未指定集合", total)}
+	if s.options.IndexedCollections == nil {
+		return probeResult{status: statusOK, detail: fmt.Sprintf("集合 %d 个；未装配入库集合探测", total)}
 	}
-	var info struct {
-		PointsCount *int64 `json:"points_count"`
-	}
-	err := client.Do(ctx, http.MethodGet, "/collections/"+url.PathEscape(collection), nil, nil, &info)
+	expected, err := s.options.IndexedCollections(ctx)
 	if err != nil {
-		var apiError *qdrant.APIError
-		if errors.As(err, &apiError) && apiError.StatusCode == http.StatusNotFound {
-			return probeResult{status: statusDegraded, detail: "集合 " + collection + " 不存在"}
+		// The state database is the source of the expected names; an unreadable
+		// aggregate must not be reported as a Qdrant failure.
+		return probeResult{status: statusUnknown, detail: fmt.Sprintf("集合 %d 个；入库集合读取失败", total)}
+	}
+	seen := make(map[string]struct{}, len(expected))
+	names := make([]string, 0, len(expected))
+	for _, raw := range expected {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
 		}
-		return probeResult{status: statusError, detail: "Qdrant 集合信息读取失败"}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
 	}
-	if info.PointsCount == nil {
-		return probeResult{status: statusOK, detail: fmt.Sprintf("集合 %d 个；%s 已就绪", total, collection)}
+	existing := make(map[string]struct{}, len(collections.Collections))
+	for _, item := range collections.Collections {
+		existing[item.Name] = struct{}{}
 	}
-	points := *info.PointsCount
-	return probeResult{
-		status: statusOK,
-		detail: fmt.Sprintf("集合 %d 个；%s 共 %d 个点", total, collection, points),
-		points: &points,
+	missing := make([]string, 0)
+	for _, name := range names {
+		if _, present := existing[name]; !present {
+			missing = append(missing, name)
+		}
+	}
+	switch len(missing) {
+	case 0:
+		switch len(names) {
+		case 0:
+			return probeResult{status: statusOK, detail: fmt.Sprintf("集合 %d 个；暂无入库集合", total)}
+		case 1:
+			return probeResult{status: statusOK, detail: fmt.Sprintf("集合 %d 个；%s 已就绪", total, boundedText(names[0], 80))}
+		default:
+			return probeResult{status: statusOK, detail: fmt.Sprintf("集合 %d 个；%d 个入库集合均已就绪", total, len(names))}
+		}
+	case 1:
+		return probeResult{
+			status: statusDegraded,
+			detail: fmt.Sprintf("集合 %d 个；入库集合 %s 不存在", total, boundedText(missing[0], 80)),
+		}
+	default:
+		shown := missing
+		if len(shown) > 3 {
+			shown = shown[:3]
+		}
+		display := make([]string, 0, len(shown))
+		for _, name := range shown {
+			display = append(display, boundedText(name, 80))
+		}
+		detail := fmt.Sprintf("集合 %d 个；%d 个入库集合不存在：%s", total, len(missing), strings.Join(display, "、"))
+		if len(missing) > len(shown) {
+			detail += " 等"
+		}
+		return probeResult{status: statusDegraded, detail: detail}
 	}
 }
 

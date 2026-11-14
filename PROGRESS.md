@@ -673,3 +673,30 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 测试：后端 `go build ./...`、`go vet ./internal/httpapi` 通过；`go test ./internal/httpapi -run 'TestDocumentBatch|TestUpload' -count=1` 通过（含 httptest 真流式 SSE 端到端：`ready`→逐文件 `progress`→`result`→`done`）；同一组用例 `-race` 通过。前端 `npm run typecheck` 通过；`npx vitest run src/uploadBatches.test.ts src/api.test.ts` 2 文件 60 用例通过；全量 `npx vitest run` 17 文件 235 用例通过（LoginPage 仍有既有 jsdom teardown 噪声，用例本身通过）。详见 `VALIDATION.md`。
 - [x] 文档：README、`docs/USAGE.md`、`docs/agents/features.md` 同步；`VALIDATION.md` 追加本轮记录。
 - 已知边界：SSE hub 是**进程内**的，订阅与 POST 必须落在同一个 `rag-service` 实例（多实例部署需会话粘滞，事件不跨实例转发）；没有订阅者时事件直接丢弃；`progress` 只表示请求体接收字节（不含 multipart 头），不含解析/索引进度；**上传面板不再展示解析进度**（解析进度不在本轮范围，仍可用 `GET /v1/document-jobs/{artifact_id}` 或批次状态接口查询）；未做真实浏览器、真实 MySQL/Kafka 与真实大文件实测。
+
+
+## 2026-11-14 系统监控 Qdrant 集合判定对齐知识库实际入库集合
+
+本轮修复监控页 Qdrant 依赖行的误报：此前服务启动时把全局 `RAG_COLLECTION`（默认
+`mini_agent_knowledge_pdf_assets_v1`）传给监控，监控每次要求该集合存在；而正常创建/使用
+知识库会在配置里生成 `knowledge_*` 集合名、由入库代码写入并在首次入库时创建 Qdrant
+集合，并不要求回退名存在。结果是 Qdrant 中已有 26 个 `knowledge_*` 集合、检索/入库均
+正常时，监控仍报"集合 mini_agent_knowledge_pdf_assets_v1 不存在"并把页头降级。
+
+- [x] 状态读取：新增 `state.Stores.MonitorIndexedCollections`，从 `documents` 读取
+  `del_flag = 0` 且 `collection <> ''` 的去重集合名（按名称排序）；软删除文档不要求
+  集合保留。
+- [x] 监控判定：`monitor.Options.Collection` 改名 `FallbackCollection`（仅服务信息展示，
+  永不要求存在）；新增 `IndexedCollections` 回调；`probeQdrant` 改为校验有效文档实际
+  入库的每个集合是否仍在 Qdrant 列表里。空知识库（尚无文档/集合）不算异常；集合读取
+  失败只把该依赖记为 `unknown`（不误报 Qdrant 故障）；缺失集合才 `degraded` 并点名。
+- [x] 聚合点数：`dependencies[].points` 保留为兼容字段但不再返回——每个知识库一个集合，
+  没有单一聚合点数（Console 类型仍声明为可选）。
+- [x] 服务装配：`cmd/rag-service/main.go` 注入 `stores.MonitorIndexedCollections`。
+- [x] 测试：`internal/monitor` 新增/改写 Qdrant 用例（回退集合未创建不降级、入库集合缺失
+  降级、多集合缺失点名、无入库集合、状态读取失败仅未知）；`internal/state` 新增
+  `TestMonitorIndexedCollections`（去重、排序、软删除与空集合名排除）。
+- [x] 文档：`docs/USAGE.md`（监控语义与 `RAG_COLLECTION` 说明）、
+  `docs/agents/features.md` 同步；`VALIDATION.md` 追加本轮记录。
+- 已知边界：期望集合来自 `documents` 读模型，读模型滞后时缺失集合最多晚一轮（15s）被发现；
+  不再展示单一"向量点"聚合数；未在真实浏览器中人工点检 Console 页面。

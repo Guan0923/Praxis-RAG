@@ -296,3 +296,59 @@ func TestMonitorStatsQueryFailure(t *testing.T) {
 		t.Fatalf("MonitorStats() returned partial stats: %+v", stats)
 	}
 }
+
+// TestMonitorIndexedCollections asserts the Qdrant probe input: every live
+// document's non-empty collection is required, tombstones and empty collection
+// names are ignored, duplicates collapse and the names stay ordered.
+func TestMonitorIndexedCollections(t *testing.T) {
+	stores := openMySQLTestStores(t)
+	ctx := context.Background()
+	suffix := monitorTestID(t, 12)
+	namespace := "go-monitor-collections-" + suffix
+	collectionA := "knowledge_a_" + suffix
+	collectionB := "knowledge_b_" + suffix
+	documentStatement := "INSERT INTO documents (namespace, name, document_id, size, sha256, " +
+		"chunking, collection, chunk_count, modified_at, indexed_at, diagnostics, " +
+		"skipped_object_count, del_flag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	insert := func(name, collection string, deleted bool) {
+		t.Helper()
+		monitorTestExec(t, stores, documentStatement, namespace, name, "doc-"+name+"-"+suffix,
+			3, "sha-"+name+"-"+suffix, "{}", collection, 1, "", "", "[]", 0, deleted)
+	}
+	insert("a.txt", collectionB, false)
+	insert("b.txt", collectionA, false)
+	insert("c.txt", collectionB, false) // duplicate collection collapses
+	insert("deleted.txt", "knowledge_deleted_"+suffix, true)
+	insert("empty.txt", "", false)
+	t.Cleanup(func() {
+		if _, err := stores.DB.ExecContext(context.Background(),
+			"DELETE FROM documents WHERE namespace = ?", namespace); err != nil {
+			t.Logf("cleanup documents error = %v", err)
+		}
+	})
+
+	collections, err := stores.MonitorIndexedCollections(ctx)
+	if err != nil {
+		t.Fatalf("MonitorIndexedCollections() error = %v", err)
+	}
+	// The shared test schema may hold rows from other tests, so the assertions
+	// are about membership and ordering rather than an exact slice.
+	seen := make(map[string]int, len(collections))
+	for _, collection := range collections {
+		seen[collection]++
+	}
+	if seen[collectionA] != 1 || seen[collectionB] != 1 {
+		t.Fatalf("collections = %v, want %q and %q once", collections, collectionA, collectionB)
+	}
+	if _, present := seen["knowledge_deleted_"+suffix]; present {
+		t.Fatalf("soft-deleted document collection leaked: %v", collections)
+	}
+	if _, present := seen[""]; present {
+		t.Fatalf("empty collection name leaked: %v", collections)
+	}
+	for index := 1; index < len(collections); index++ {
+		if collections[index-1] >= collections[index] {
+			t.Fatalf("collections are not ordered: %v", collections)
+		}
+	}
+}

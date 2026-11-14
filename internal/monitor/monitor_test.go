@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -84,29 +83,46 @@ func sampleStats() *state.MonitorStats {
 	}
 }
 
-// qdrantServer serves the two endpoints the probe reads.
-func qdrantServer(t *testing.T, collection string, points int64, missing bool) *httptest.Server {
+// qdrantServer serves the collections listing the Qdrant probe reads.
+func qdrantServer(t *testing.T, collections ...string) *httptest.Server {
 	t.Helper()
+	names := make([]string, 0, len(collections))
+	for _, collection := range collections {
+		names = append(names, `{"name":"`+collection+`"}`)
+	}
+	body := `{"result":{"collections":[` + strings.Join(names, ",") + `]}}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/collections":
-			_, _ = w.Write([]byte(`{"result":{"collections":[{"name":"alpha"},{"name":"beta"}]}}`))
-		case r.Method == http.MethodGet && r.URL.Path == "/collections/"+collection:
-			if missing {
-				w.WriteHeader(http.StatusNotFound)
-				_, _ = w.Write([]byte(`{"status":{"error":"Not found: Collection ` + collection + ` doesn't exist!"}}`))
-				return
-			}
-			_, _ = w.Write([]byte(`{"result":{"status":"green","points_count":` +
-				strconv.FormatInt(points, 10) + `}}`))
-		default:
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{}`))
+		if r.Method == http.MethodGet && r.URL.Path == "/collections" {
+			_, _ = w.Write([]byte(body))
+			return
 		}
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{}`))
 	}))
 	t.Cleanup(server.Close)
 	return server
+}
+
+// indexedCollectionsFunc returns a fixed indexed-collection list for the probe.
+func indexedCollectionsFunc(collections ...string) func(context.Context) ([]string, error) {
+	return func(context.Context) ([]string, error) {
+		return append([]string(nil), collections...), nil
+	}
+}
+
+// qdrantProbeOptions builds a snapshot whose only inspected dependency is Qdrant.
+func qdrantProbeOptions(t *testing.T, url string) Options {
+	t.Helper()
+	return Options{
+		Stats:      &fakeStatsProvider{stats: sampleStats()},
+		MySQL:      fakeMySQLPinger{},
+		Redis:      fakeRedisProbe{enabled: false},
+		QdrantURL:  url,
+		PDFEngine:  "go",
+		UploadMode: "async",
+		Delivery:   "debezium",
+	}
 }
 
 // pdfServer serves the remote vision health endpoint with a healthy converter payload.
@@ -193,7 +209,7 @@ func dependencyByName(t *testing.T, overview map[string]any, name string) depend
 
 func healthyOptions(t *testing.T) Options {
 	t.Helper()
-	qdrant := qdrantServer(t, "knowledge", 123, false)
+	qdrant := qdrantServer(t, "alpha", "knowledge")
 	pdf := pdfServer(t, http.StatusOK)
 	return Options{
 		Stats:                 &fakeStatsProvider{stats: sampleStats()},
@@ -201,7 +217,8 @@ func healthyOptions(t *testing.T) Options {
 		DBStats:               func() sql.DBStats { return sql.DBStats{OpenConnections: 4, InUse: 1, Idle: 3, MaxOpenConnections: 20} },
 		Redis:                 fakeRedisProbe{enabled: true},
 		QdrantURL:             qdrant.URL,
-		Collection:            "knowledge",
+		FallbackCollection:    "knowledge",
+		IndexedCollections:    indexedCollectionsFunc("knowledge"),
 		KafkaBootstrapServers: []string{kafkaListener(t)},
 		KafkaProbe: func(context.Context) (KafkaStatus, error) {
 			return KafkaStatus{Brokers: 1, Topic: mqDocumentTopic, TopicExists: true, Partitions: 3}, nil
@@ -331,11 +348,10 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 			t.Fatalf("dependency %q latency = %v", name, item.LatencyMS)
 		}
 	}
+	// The Qdrant row reports the collections the pipeline actually writes to.
 	qdrantDependency := dependencyByName(t, overview, "qdrant")
-	if qdrantDependency.Points == nil || *qdrantDependency.Points != 123 {
-		t.Fatalf("qdrant points = %v", qdrantDependency.Points)
-	}
-	if !strings.Contains(qdrantDependency.Detail, "集合 2 个") {
+	if !strings.Contains(qdrantDependency.Detail, "集合 2 个") ||
+		!strings.Contains(qdrantDependency.Detail, "knowledge 已就绪") {
 		t.Fatalf("qdrant detail = %q", qdrantDependency.Detail)
 	}
 	// Kafka is verified with a metadata round trip, not a raw TCP dial.
@@ -454,18 +470,107 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 	}
 }
 
+// TestMonitorQdrantUsesIndexedCollections pins the collection rule of the
+// Qdrant dependency row: it requires the collections that live documents are
+// actually indexed into and never the RAG_COLLECTION fallback. Normal
+// deployments store one generated knowledge_* collection per knowledge base
+// and never create the fallback name, so requiring the fallback reported a
+// healthy service as degraded.
+func TestMonitorQdrantUsesIndexedCollections(t *testing.T) {
+	const fallback = "mini_agent_knowledge_pdf_assets_v1"
+	const indexed = "knowledge_e0fd7ba996b0e4d3adeb72b1bde6e853"
+
+	t.Run("回退集合未创建不降级", func(t *testing.T) {
+		options := qdrantProbeOptions(t, qdrantServer(t, indexed).URL)
+		options.FallbackCollection = fallback
+		options.IndexedCollections = indexedCollectionsFunc(indexed)
+		overview := New(options).MonitorOverview(context.Background())
+		item := dependencyByName(t, overview, "qdrant")
+		if item.Status != statusOK || overview["status"] != statusOK {
+			t.Fatalf("qdrant = %+v, status = %v", item, overview["status"])
+		}
+		if !strings.Contains(item.Detail, "集合 1 个") ||
+			!strings.Contains(item.Detail, indexed+" 已就绪") {
+			t.Fatalf("detail = %q", item.Detail)
+		}
+	})
+
+	t.Run("入库集合缺失降级", func(t *testing.T) {
+		options := qdrantProbeOptions(t, qdrantServer(t, fallback).URL)
+		options.FallbackCollection = fallback
+		options.IndexedCollections = indexedCollectionsFunc(indexed)
+		overview := New(options).MonitorOverview(context.Background())
+		item := dependencyByName(t, overview, "qdrant")
+		if item.Status != statusDegraded ||
+			!strings.Contains(item.Detail, "入库集合 "+indexed+" 不存在") {
+			t.Fatalf("qdrant = %+v", item)
+		}
+		if overview["status"] != statusDegraded {
+			t.Fatalf("status = %v", overview["status"])
+		}
+	})
+
+	t.Run("多个入库集合缺失点名部分", func(t *testing.T) {
+		options := qdrantProbeOptions(t, qdrantServer(t, "knowledge_a").URL)
+		options.IndexedCollections = indexedCollectionsFunc(
+			"knowledge_a", "knowledge_b", "knowledge_c", "knowledge_d", "knowledge_e")
+		overview := New(options).MonitorOverview(context.Background())
+		item := dependencyByName(t, overview, "qdrant")
+		if item.Status != statusDegraded ||
+			!strings.Contains(item.Detail, "4 个入库集合不存在") ||
+			!strings.Contains(item.Detail, "knowledge_b、knowledge_c、knowledge_d 等") {
+			t.Fatalf("qdrant = %+v", item)
+		}
+	})
+
+	t.Run("没有已入库文档集合", func(t *testing.T) {
+		options := qdrantProbeOptions(t, qdrantServer(t).URL)
+		options.FallbackCollection = fallback
+		options.IndexedCollections = indexedCollectionsFunc()
+		overview := New(options).MonitorOverview(context.Background())
+		item := dependencyByName(t, overview, "qdrant")
+		if item.Status != statusOK || !strings.Contains(item.Detail, "集合 0 个；暂无入库集合") {
+			t.Fatalf("qdrant = %+v, status = %v", item, overview["status"])
+		}
+	})
+
+	t.Run("入库集合读取失败只记为未知", func(t *testing.T) {
+		options := qdrantProbeOptions(t, qdrantServer(t, indexed).URL)
+		options.IndexedCollections = func(context.Context) ([]string, error) {
+			return nil, errors.New("state query failed")
+		}
+		overview := New(options).MonitorOverview(context.Background())
+		item := dependencyByName(t, overview, "qdrant")
+		if item.Status != statusUnknown || overview["status"] != statusOK {
+			t.Fatalf("qdrant = %+v, status = %v", item, overview["status"])
+		}
+	})
+
+	t.Run("空白与重复名称归一", func(t *testing.T) {
+		options := qdrantProbeOptions(t, qdrantServer(t, "knowledge_a").URL)
+		options.IndexedCollections = indexedCollectionsFunc(
+			" knowledge_a ", "", "knowledge_a", "knowledge_a")
+		overview := New(options).MonitorOverview(context.Background())
+		item := dependencyByName(t, overview, "qdrant")
+		if item.Status != statusOK || !strings.Contains(item.Detail, "knowledge_a 已就绪") {
+			t.Fatalf("qdrant = %+v", item)
+		}
+	})
+}
+
 // TestMonitorOverviewDegradedAndDisabled covers the non-error states: a missing
 // Qdrant collection degrades and unconfigured optional services disable.
 func TestMonitorOverviewDegradedAndDisabled(t *testing.T) {
-	qdrant := qdrantServer(t, "knowledge", 0, true)
+	qdrant := qdrantServer(t, "alpha", "beta")
 	options := Options{
-		Stats:      &fakeStatsProvider{stats: sampleStats()},
-		MySQL:      fakeMySQLPinger{},
-		QdrantURL:  qdrant.URL,
-		Collection: "knowledge",
-		PDFEngine:  "go",
-		UploadMode: "sync",
-		Delivery:   "debezium",
+		Stats:              &fakeStatsProvider{stats: sampleStats()},
+		MySQL:              fakeMySQLPinger{},
+		QdrantURL:          qdrant.URL,
+		FallbackCollection: "knowledge",
+		IndexedCollections: indexedCollectionsFunc("knowledge"),
+		PDFEngine:          "go",
+		UploadMode:         "sync",
+		Delivery:           "debezium",
 	}
 	overview := New(options).MonitorOverview(context.Background())
 
@@ -474,7 +579,8 @@ func TestMonitorOverviewDegradedAndDisabled(t *testing.T) {
 	if overview["status"] != statusDegraded || overview["ok"] != false {
 		t.Fatalf("status/ok = %v/%v, want degraded/false", overview["status"], overview["ok"])
 	}
-	if item := dependencyByName(t, overview, "qdrant"); item.Status != statusDegraded {
+	if item := dependencyByName(t, overview, "qdrant"); item.Status != statusDegraded ||
+		!strings.Contains(item.Detail, "入库集合 knowledge 不存在") {
 		t.Fatalf("qdrant status = %q detail = %q", item.Status, item.Detail)
 	}
 	if item := dependencyByName(t, overview, "redis"); item.Status != statusDisabled ||
@@ -516,7 +622,6 @@ func TestMonitorOverviewErrors(t *testing.T) {
 		MySQL:         fakeMySQLPinger{err: errors.New("db down")},
 		Redis:         fakeRedisProbe{enabled: true, err: errors.New("redis down")},
 		QdrantURL:     "http://" + unreachable,
-		Collection:    "knowledge",
 		PDFEngine:     pdfEngineVision,
 		PDFServiceURL: "http://" + unreachable,
 		UploadMode:    "async",
@@ -609,12 +714,12 @@ func TestMonitorOverviewProbeTimeout(t *testing.T) {
 	}))
 	t.Cleanup(slow.Close)
 	options := Options{
-		Stats:      &fakeStatsProvider{stats: sampleStats()},
-		MySQL:      fakeMySQLPinger{},
-		Redis:      fakeRedisProbe{enabled: false},
-		QdrantURL:  slow.URL,
-		Collection: "knowledge",
-		PDFEngine:  "go",
+		Stats:              &fakeStatsProvider{stats: sampleStats()},
+		MySQL:              fakeMySQLPinger{},
+		Redis:              fakeRedisProbe{enabled: false},
+		QdrantURL:          slow.URL,
+		FallbackCollection: "knowledge",
+		PDFEngine:          "go",
 	}
 	started := time.Now()
 	overview := New(options).MonitorOverview(context.Background())
@@ -1034,14 +1139,15 @@ func TestMonitorPipelineWireShape(t *testing.T) {
 // worker/debezium/heartbeat views stay unknown.
 func healthyDependencyOptions(t *testing.T) Options {
 	t.Helper()
-	qdrant := qdrantServer(t, "knowledge", 5, false)
+	qdrant := qdrantServer(t, "knowledge")
 	return Options{
-		Stats:      &fakeStatsProvider{stats: sampleStats()},
-		MySQL:      fakeMySQLPinger{},
-		Redis:      fakeRedisProbe{enabled: false},
-		QdrantURL:  qdrant.URL,
-		Collection: "knowledge",
-		PDFEngine:  "go",
+		Stats:              &fakeStatsProvider{stats: sampleStats()},
+		MySQL:              fakeMySQLPinger{},
+		Redis:              fakeRedisProbe{enabled: false},
+		QdrantURL:          qdrant.URL,
+		FallbackCollection: "knowledge",
+		IndexedCollections: indexedCollectionsFunc("knowledge"),
+		PDFEngine:          "go",
 	}
 }
 
@@ -1056,7 +1162,7 @@ func TestMonitorOverallStatusAggregation(t *testing.T) {
 	})
 	t.Run("依赖降级", func(t *testing.T) {
 		options := healthyDependencyOptions(t)
-		options.QdrantURL = qdrantServer(t, "knowledge", 0, true).URL
+		options.QdrantURL = qdrantServer(t, "other").URL
 		overview := New(options).MonitorOverview(context.Background())
 		if overview["status"] != statusDegraded || overview["ok"] != false {
 			t.Fatalf("status/ok = %v/%v, want degraded/false", overview["status"], overview["ok"])
