@@ -223,11 +223,6 @@ export type Hit = {
     captions?: { text: string }[]; footnotes?: { text: string }[] };
 };
 export type SearchResult = {
-  result_id?: string;
-  created_at?: number;
-  expires_at?: number;
-  snapshot_available?: boolean;
-  snapshot_error?: string;
   artifact_warning?: string;
   artifacts?: ArtifactReference[];
   retrieval: Retrieval;
@@ -917,16 +912,6 @@ export type MonitorDocumentJobs = {
   stuck_processing: number;
   failed_recent: number;
 };
-export type MonitorSearchTasks = {
-  by_status: Record<string, number>;
-  oldest_active_seconds: number;
-  // timed_out_recent counts search tasks that converged to timed_out in the
-  // last 24h; overdue_active counts active tasks past their deadline that have
-  // not converged yet. Both are null when the state database could not be read,
-  // never a fake zero.
-  timed_out_recent: number | null;
-  overdue_active: number | null;
-};
 // MonitorUploads counts upload *operations*, not files currently uploading.
 // unfinished stays for compatibility and unions the four disjoint buckets:
 // in_progress (INTENT/RUNNING), failed (FAILED/ROLLBACK_FAILED), rolling_back
@@ -942,14 +927,12 @@ export type MonitorUploads = {
 };
 export type MonitorQueues = {
   document_jobs: MonitorDocumentJobs;
-  search_tasks: MonitorSearchTasks;
   uploads: MonitorUploads;
 };
 // MonitorQueueState addresses one queue of the snapshot without naming the
 // whole MonitorQueues object.
 export type MonitorQueueState =
   | MonitorDocumentJobs
-  | MonitorSearchTasks
   | MonitorUploads;
 // MonitorPipelineConnector reports one Debezium connector health. The task and
 // cache connectors are separate processes with independent offset/schema
@@ -973,13 +956,13 @@ export type MonitorPipelineWorker = {
   detail: string;
 };
 export type MonitorPipelineDebezium = {
-  // tasks captures document_jobs/search_tasks (INSERT + schedule_version
-  // changes); cache captures the read-model business tables (all c/u/d).
+  // tasks captures document_jobs (INSERT + schedule_version changes); cache
+  // captures the read-model business tables (all c/u/d).
   tasks: MonitorPipelineConnector;
   cache: MonitorPipelineConnector;
 };
-// MonitorPipelineKafkaGroup is one consumer group of the three independent
-// pipelines: document, search and cache. Offsets stay null when Kafka does not
+// MonitorPipelineKafkaGroup is one consumer group of the independent
+// pipelines: document and cache. Offsets stay null when Kafka does not
 // report them, so the page prints 未知 instead of 0.
 export type MonitorPipelineKafkaGroup = {
   status: MonitorDependencyStatus;
@@ -1002,7 +985,6 @@ export type MonitorPipelineKafka = {
   consumer_lag: number | null;
   groups: {
     document: MonitorPipelineKafkaGroup;
-    search: MonitorPipelineKafkaGroup;
     cache: MonitorPipelineKafkaGroup;
   };
 };
@@ -1015,7 +997,7 @@ export type MonitorPipelineCache = {
   refresh_failures: number | null;
 };
 // MonitorPipeline keeps the delivery/consumption views apart: document job
-// processing, worker heartbeat, the two Debezium connectors, the three Kafka
+// processing, worker heartbeat, the two Debezium connectors, the Kafka
 // consumer groups and the cache revision watermark. A null field means unknown,
 // never zero.
 export type MonitorPipeline = {
@@ -1030,9 +1012,6 @@ export type MonitorPipeline = {
 export type MonitorLibrary = {
   documents: number;
   knowledge_bases: number;
-  // result_snapshots is the live count in the Redis transient store. It is null
-  // when the count could not be read, so the page prints 未知 rather than zero.
-  result_snapshots: number | null;
   artifact_snapshots: number;
 };
 export type MonitorActivity = {

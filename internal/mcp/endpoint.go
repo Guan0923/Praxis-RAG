@@ -157,6 +157,10 @@ func (e *Endpoint) newNamespaceTransport(namespace string) (*namespaceTransport,
 		&sdk.StreamableHTTPOptions{
 			Logger:              e.logger,
 			MaxRequestBodyBytes: maxRequestBodyBytes,
+			// Search runs synchronously inside the POST, so a client disconnect
+			// (or its request deadline) must cancel retrieval instead of
+			// leaving Qdrant/model work running for a gone caller.
+			PropagateRequestCancellation: true,
 			// The Python service enforces its own Host/Origin allowlist in
 			// mcp_http.py; internal/mcp's HTTP handler ports that allowlist, so
 			// the SDK's localhost-only heuristic must not preempt it.
@@ -165,10 +169,11 @@ func (e *Endpoint) newNamespaceTransport(namespace string) (*namespaceTransport,
 	transport.stateless = sdk.NewStreamableHTTPHandler(
 		func(*http.Request) *sdk.Server { return server },
 		&sdk.StreamableHTTPOptions{
-			Stateless:                  true,
-			Logger:                     e.logger,
-			MaxRequestBodyBytes:        maxRequestBodyBytes,
-			DisableLocalhostProtection: true,
+			Stateless:                    true,
+			Logger:                       e.logger,
+			MaxRequestBodyBytes:          maxRequestBodyBytes,
+			PropagateRequestCancellation: true,
+			DisableLocalhostProtection:   true,
 		})
 	return transport, nil
 }

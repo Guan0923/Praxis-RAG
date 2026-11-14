@@ -16,11 +16,6 @@ type SearchRuntime interface {
 	Search(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error)
 }
 
-// ResultRuntime reads stored search-result snapshots.
-type ResultRuntime interface {
-	GetSearchResult(ctx context.Context, namespace, resultID string, page, pageSize int) (map[string]any, error)
-}
-
 // ArtifactRuntime reads expiring artifacts.
 type ArtifactRuntime interface {
 	GetArtifact(ctx context.Context, namespace, artifactID string, offset, length int) (map[string]any, error)
@@ -35,7 +30,6 @@ type KnowledgeBaseRuntime interface {
 // Runtime is the HTTP-facing service runtime. It grows as endpoints are ported.
 type Runtime interface {
 	SearchRuntime
-	ResultRuntime
 	ArtifactRuntime
 	DocumentRuntime
 	KnowledgeBaseRuntime
@@ -152,48 +146,6 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, payload)
-}
-
-func (s *Server) handleGetSearchResult(w http.ResponseWriter, r *http.Request) {
-	namespace, ok := s.tenantNamespace(w, r)
-	if !ok {
-		return
-	}
-	if s.runtime == nil {
-		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
-		return
-	}
-	if _, ok := s.requireScopeRead(w, r); !ok {
-		return
-	}
-	resultID, err := contracts.ValidateUUID(pathParam(r, "result_id"))
-	if err != nil {
-		writeDetail(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	page, pageSize, details := resultPageQuery(r)
-	if details != nil {
-		writeValidation(w, http.StatusBadRequest, details)
-		return
-	}
-	payload, err := s.runtime.GetSearchResult(r.Context(), namespace, resultID, page, pageSize)
-	if err != nil {
-		writeRuntimeError(w, err, true)
-		return
-	}
-	writeJSON(w, http.StatusOK, payload)
-}
-
-func resultPageQuery(r *http.Request) (int, int, []validationDetail) {
-	page, details := intQuery(r, "page", 1, 1, contracts.MaxResultPage)
-	if details != nil {
-		return 0, 0, details
-	}
-	pageSize, details := intQuery(r, "page_size", 10, 1, 100)
-	if details != nil {
-		return 0, 0, details
-	}
-	return page, pageSize, nil
 }
 
 func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request) {

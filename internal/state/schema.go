@@ -426,6 +426,10 @@ var schemaTables = []*SchemaTable{
 			double("updated_at").Default("0"),
 		},
 	},
+	// search_result_snapshots is a retained historical table: search results are
+	// returned inline since the synchronous-search change and are no longer read
+	// or written. The DDL is kept so existing databases and audit data are not
+	// altered; physical removal is a separate operation, like document_tasks.
 	{
 		Name: "search_result_snapshots",
 		Columns: []SchemaColumn{
@@ -528,6 +532,10 @@ var schemaTables = []*SchemaTable{
 			index("ix_document_job_recovery", "status", "lease_until"),
 		},
 	},
+	// search_tasks is a retained historical table: search is synchronous and no
+	// longer queues tasks. The DDL is kept so existing databases and audit data
+	// are not altered; physical removal is a separate operation (same precedent
+	// as document_tasks).
 	{
 		Name: "search_tasks",
 		Columns: []SchemaColumn{

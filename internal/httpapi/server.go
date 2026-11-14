@@ -155,7 +155,6 @@ func (s *Server) registerRoutes() {
 	s.router.add("DELETE", "/v1/admin/api-keys/{key_id}", authSessionOrLocal, s.handleDeleteAPIKey)
 	s.router.add("GET", "/v1/admin/api-keys/{key_id}/mcp-config", authSessionOrLocal, s.handleAPIKeyMCPConfig)
 	s.router.add("POST", "/v1/search", authTenant, s.handleSearch)
-	s.router.add("GET", "/v1/search-results/{result_id}", authTenant, s.handleGetSearchResult)
 	s.router.add("GET", "/v1/artifacts/{artifact_id}", authTenant, s.handleDownloadArtifact)
 	s.router.add("GET", "/v1/artifacts/{artifact_id}/content", authTenant, s.handleGetArtifactContent)
 	s.router.add("GET", "/v1/documents", authTenant, s.handleListDocuments)
@@ -427,7 +426,7 @@ func isSnapshotPath(path string) bool {
 	if path == "/mcp" || path == "/v1/search" {
 		return true
 	}
-	return strings.HasPrefix(path, "/v1/search-results/") || strings.HasPrefix(path, "/v1/artifacts/")
+	return strings.HasPrefix(path, "/v1/artifacts/")
 }
 
 // consoleAssetFile reports whether the request maps to a regular file under the

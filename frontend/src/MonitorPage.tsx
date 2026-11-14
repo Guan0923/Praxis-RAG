@@ -52,20 +52,12 @@ function overallStatusOf(overview: MonitorOverview): MonitorOverallStatus {
   return overview.status ?? (overview.ok ? "ok" : "error");
 }
 
-// Queue statuses are rendered as compact count tags. document_jobs and
-// search_tasks share the first four states.
+// Queue statuses are rendered as compact count tags.
 const documentJobStatusLabels: Record<string, string> = {
   queued: "排队中",
   processing: "处理中",
   succeeded: "成功",
   failed: "失败",
-};
-const searchTaskStatusLabels: Record<string, string> = {
-  queued: "排队中",
-  processing: "处理中",
-  succeeded: "成功",
-  failed: "失败",
-  timed_out: "超时",
 };
 
 // unknownOrNumber keeps absent counters out of the page instead of printing a
@@ -254,10 +246,8 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
   const debeziumCache = pipeline?.debezium?.cache;
   const kafkaGroups = pipeline?.kafka?.groups;
   const kafkaDocument = kafkaGroups?.document;
-  const kafkaSearch = kafkaGroups?.search;
   const kafkaCache = kafkaGroups?.cache;
   const cache = pipeline?.cache;
-  const searchTasks = queues?.search_tasks;
   const uploads = queues?.uploads;
   const stages = Object.entries(jobs?.by_stage || {}).map(([stage, count]) => ({ stage, count }));
 
@@ -291,11 +281,6 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
       key: "searches",
       title: `近 ${activity?.window_hours ?? 24} 小时检索次数`,
       value: activity ? unknownOrNumber(activity.searches) : "未知",
-    },
-    {
-      key: "result_snapshots",
-      title: "当前结果快照",
-      value: library ? unknownOrNumber(library.result_snapshots) : "未知",
     },
   ];
 
@@ -341,7 +326,6 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
                 </div>
                 {([
                   ["Kafka 文档消费", kafkaDocument],
-                  ["Kafka 搜索消费", kafkaSearch],
                   ["Kafka 缓存消费", kafkaCache],
                 ] as const).map(([label, group]) => (
                   <div className="monitor-progress-row" key={label}>
@@ -434,19 +418,6 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
                 <p className="secondary monitor-note">
                   脏 key = refreshed_revision 小于 revision；刷新失败 = last_error 非空。数字未知表示状态库或统计不可读。
                 </p>
-              </section>
-              <section className="monitor-block" aria-label="检索任务队列">
-                <h3>检索任务</h3>
-                <StatusCountTags counts={searchTasks?.by_status} labels={searchTaskStatusLabels} />
-                <Descriptions
-                  size="small"
-                  column={1}
-                  items={[
-                    { key: "oldest", label: "最老活跃", children: queues ? formatDuration(searchTasks?.oldest_active_seconds) : "未知" },
-                    { key: "timeout", label: "近 24 小时超时", children: queues ? `${searchTasks?.timed_out_recent ?? 0} 个` : "未知" },
-                    { key: "overdue", label: "逾期未收敛", children: queues ? `${searchTasks?.overdue_active ?? 0} 个` : "未知" },
-                  ]}
-                />
               </section>
             </Flex>
           </Col>

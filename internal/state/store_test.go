@@ -174,7 +174,6 @@ func TestMigrationsAddMissingLegacyColumns(t *testing.T) {
 	for _, statement := range []string{
 		"ALTER TABLE documents DROP COLUMN del_flag",
 		"ALTER TABLE document_jobs DROP COLUMN schedule_version",
-		"ALTER TABLE search_tasks DROP COLUMN schedule_version",
 		"ALTER TABLE cache_revisions DROP COLUMN refreshed_revision",
 		"ALTER TABLE cache_revisions DROP COLUMN attempts",
 		"ALTER TABLE cache_revisions DROP COLUMN last_error",
@@ -193,7 +192,6 @@ func TestMigrationsAddMissingLegacyColumns(t *testing.T) {
 	for _, wanted := range []struct{ table, column string }{
 		{"documents", "del_flag"},
 		{"document_jobs", "schedule_version"},
-		{"search_tasks", "schedule_version"},
 		{"cache_revisions", "refreshed_revision"},
 		{"cache_revisions", "attempts"},
 		{"cache_revisions", "last_error"},
@@ -202,6 +200,11 @@ func TestMigrationsAddMissingLegacyColumns(t *testing.T) {
 		if !columnExists(t, reopened, wanted.table, wanted.column) {
 			t.Fatalf("reopen did not add %s.%s", wanted.table, wanted.column)
 		}
+	}
+	// search_tasks is a retired historical table: the scheduler migration only
+	// backfills document_jobs, so the dropped generated column stays dropped.
+	if columnExists(t, reopened, "search_tasks", "schedule_version") {
+		t.Fatal("search_tasks.schedule_version must not be migrated back")
 	}
 	if exists, err := reopened.hasTable(ctx, "cdc_cutover_state"); err != nil || !exists {
 		t.Fatalf("reopen did not recreate cdc_cutover_state: %v, %v", exists, err)

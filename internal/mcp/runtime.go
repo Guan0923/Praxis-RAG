@@ -80,18 +80,13 @@ type Runtime interface {
 	// ResolveDocumentIDs maps document names to the document ids stored in
 	// retrieval payloads. Names without a document row are skipped. MCP uses it
 	// to translate the caller's readable names into the server-side
-	// contracts.SearchRequest.DocumentIDs visibility restriction, and to
-	// defensively filter stored search results.
+	// contracts.SearchRequest.DocumentIDs visibility restriction.
 	ResolveDocumentIDs(ctx context.Context, namespace string, names []string) ([]string, error)
 
-	// Search runs one retrieval action synchronously (legacy/mock mode).
+	// Search runs one retrieval action synchronously and returns the evidence
+	// payload directly. It is the only search entry: MCP never queues, polls or
+	// reads stored results.
 	Search(ctx context.Context, namespace string, request contracts.SearchRequest) (map[string]any, error)
-
-	// SubmitSearch enqueues one retrieval action and returns the result UUID.
-	SubmitSearch(ctx context.Context, namespace string, request contracts.SearchRequest) (string, error)
-	// GetSearchResult reads a stored search result page without re-running
-	// retrieval. Queued searches report status "queued".
-	GetSearchResult(ctx context.Context, namespace, resultID string, page, pageSize int) (map[string]any, error)
 
 	// GetArtifact reads one bounded byte chunk of an expiring artifact.
 	GetArtifact(ctx context.Context, namespace, artifactID string, offset, length int) (map[string]any, error)
@@ -117,11 +112,6 @@ type Options struct {
 	Runtime Runtime
 	// Catalog is required; it persists per-namespace tool overrides and prompts.
 	Catalog catalog.Store
-	// QueuedSearch selects the queued search tool contract (wait_seconds +
-	// get_search_result polling) instead of the synchronous search tool.
-	// The real service uses queued search; mocks and local-only executors use
-	// the synchronous form.
-	QueuedSearch bool
 	// ServerName overrides the MCP implementation name ("Praxis-RAG").
 	ServerName string
 	// Version overrides the reported MCP implementation version.

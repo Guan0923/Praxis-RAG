@@ -1,26 +1,23 @@
 // Package searchrefs projects immutable artifact references onto an
-// already-executed search and saves the immutable result snapshot.
+// already-executed search response.
 //
 // It is a port of rag_mcp/state/search_references.py: search results are copied
-// defensively, image/table assets and document sources become expiring
+// defensively and image/table assets and document sources become expiring
 // state.ArtifactRegistry snapshots (artifact references are attached without
-// removing the inline data the MCP renderer consumes), and the enriched payload
-// is stored through state.ResultSnapshots.
+// removing the inline data the MCP renderer consumes). Search responses are no
+// longer stored: the captured payload is returned to the caller directly.
 //
-// The capture is failure tolerant: artifact or Redis problems never discard the
+// The capture is failure tolerant: artifact problems never discard the
 // retrieval results. Failures are logged by category only (no credentials or
-// request data) and the original payload is returned with snapshot_available
-// false, matching the outer error handling of RagServiceRuntime.search.
+// request data) and the original payload is returned unchanged.
 package searchrefs
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -31,14 +28,6 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
-
-// MessageSearchResultReferencesUnavailable mirrors the safe error text emitted
-// when the whole capture fails.
-const MessageSearchResultReferencesUnavailable = "Search result references are unavailable"
-
-// MessageSnapshotUnavailable mirrors the degraded result returned when only the
-// immutable snapshot could not be saved.
-const MessageSnapshotUnavailable = "Search result snapshot unavailable; original results are returned"
 
 // artifactAssetNames are the parser side-car files projected from PDF/Word
 // document storage, matching search_references.py.
@@ -97,11 +86,13 @@ func New(stores *state.Stores, logger *slog.Logger) *Capture {
 }
 
 // Capture returns the payload enriched with artifact references, the expiring
-// artifact list and (when saveSnapshot is true) the immutable snapshot fields.
+// artifact list and the artifact limits. The response is returned to the caller
+// directly; nothing is persisted as a search result.
 //
-// An error is returned only for invalid input (nil stores). Artifact and Redis
-// failures are tolerated and reported in the payload, never as a Go error.
-func (c *Capture) Capture(ctx context.Context, namespace string, payload map[string]any, saveSnapshot bool) (map[string]any, error) {
+// An error is returned only for invalid input (nil stores). Artifact failures
+// are tolerated: the original retrieval payload is returned and the failure is
+// logged, never surfaced as a Go error.
+func (c *Capture) Capture(ctx context.Context, namespace string, payload map[string]any) (map[string]any, error) {
 	if c.Stores == nil {
 		return nil, fmt.Errorf("searchrefs: state stores are required")
 	}
@@ -114,7 +105,7 @@ func (c *Capture) Capture(ctx context.Context, namespace string, payload map[str
 		result = map[string]any{}
 	}
 	created := c.now()
-	settings := snapshotSettings(c.Stores)
+	settings := artifactSettings()
 	expires := created + float64(settings.TTLSeconds)
 
 	session := &captureSession{
@@ -128,50 +119,14 @@ func (c *Capture) Capture(ctx context.Context, namespace string, payload map[str
 	}
 
 	if err := session.project(namespace, result); err != nil {
-		c.warn(ctx, "search reference capture unavailable", logging.ErrorAttrs(err)...)
+		c.warn(ctx, "search artifact capture unavailable", logging.ErrorAttrs(err)...)
 		degraded := deepCopyMap(original)
 		if degraded == nil {
 			degraded = map[string]any{}
 		}
-		degraded["snapshot_available"] = false
-		degraded["snapshot_error"] = MessageSearchResultReferencesUnavailable
 		return degraded, nil
 	}
-
-	if !saveSnapshot {
-		return result, nil
-	}
-	if c.Stores.Results == nil {
-		return c.degradeSnapshot(ctx, result, &state.SnapshotUnavailable{Message: "Search result storage is unavailable"}), nil
-	}
-	resultID, err := uuid4String()
-	if err != nil {
-		return c.degradeSnapshot(ctx, result, err), nil
-	}
-	saved, err := c.Stores.Results.Save(namespace, result, &resultID, &created)
-	if err != nil {
-		return c.degradeSnapshot(ctx, result, err), nil
-	}
-	return saved, nil
-}
-
-// degradeSnapshot ports the SnapshotUnavailable branch of capture: the enriched
-// payload is returned with snapshot_available=false. Unexpected snapshot errors
-// fall back to the same safe message as a full capture failure.
-func (c *Capture) degradeSnapshot(ctx context.Context, result map[string]any, cause error) map[string]any {
-	c.warn(ctx, "search snapshot unavailable", logging.ErrorAttrs(cause)...)
-	degraded := deepCopyMap(result)
-	if degraded == nil {
-		degraded = map[string]any{}
-	}
-	degraded["snapshot_available"] = false
-	var unavailable *state.SnapshotUnavailable
-	if errors.As(cause, &unavailable) {
-		degraded["snapshot_error"] = MessageSnapshotUnavailable
-	} else {
-		degraded["snapshot_error"] = MessageSearchResultReferencesUnavailable
-	}
-	return degraded
+	return result, nil
 }
 
 func (c *Capture) logger() *slog.Logger {
@@ -506,11 +461,17 @@ func artifactVersion(version *string) any {
 
 // ---- helpers ---------------------------------------------------------------
 
-func snapshotSettings(stores *state.Stores) state.SnapshotSettings {
-	if stores != nil && stores.Results != nil {
-		return stores.Results.Settings
+// artifactSettings returns the artifact retention settings. Search responses no
+// longer persist a result snapshot, so the only remaining settings are the
+// artifact TTL and limits (RAG_RESULT_TTL_SECONDS / RAG_ARTIFACT_MAX_BYTES /
+// RAG_RESULT_MAX_ARTIFACTS). Startup already validates them; invalid values fall
+// back to the defaults here.
+func artifactSettings() state.SnapshotSettings {
+	settings, err := state.SnapshotSettingsFromEnv()
+	if err != nil {
+		return state.DefaultSnapshotSettings()
 	}
-	return state.DefaultSnapshotSettings()
+	return settings
 }
 
 func documentIDText(value any) string {
@@ -617,16 +578,4 @@ func encodeJSON(value any) ([]byte, error) {
 		return nil, err
 	}
 	return []byte(strings.TrimRight(buffer.String(), "\n")), nil
-}
-
-// uuid4String mirrors str(uuid4()).
-func uuid4String() (string, error) {
-	buffer := make([]byte, 16)
-	if _, err := rand.Read(buffer); err != nil {
-		return "", err
-	}
-	buffer[6] = (buffer[6] & 0x0f) | 0x40
-	buffer[8] = (buffer[8] & 0x3f) | 0x80
-	encoded := hex.EncodeToString(buffer)
-	return encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32], nil
 }

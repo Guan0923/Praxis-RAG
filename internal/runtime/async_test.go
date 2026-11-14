@@ -5,7 +5,6 @@ import (
 	"errors"
 	"regexp"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
@@ -15,50 +14,9 @@ import (
 
 var canonicalUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
-// memoryTransient is an in-memory state.TransientStore for result snapshots.
-type memoryTransient struct {
-	mu     sync.Mutex
-	values map[string]any
-}
-
-func newMemoryTransient() *memoryTransient {
-	return &memoryTransient{values: map[string]any{}}
-}
-
-func transientKey(kind, identity string) string { return kind + ":" + identity }
-
-func (m *memoryTransient) Get(kind, identity string) (any, bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	value, found := m.values[transientKey(kind, identity)]
-	return value, found, nil
-}
-
-func (m *memoryTransient) Put(kind, identity string, value any, _ float64, nx bool) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := transientKey(kind, identity)
-	if _, exists := m.values[key]; exists && nx {
-		return false, nil
-	}
-	m.values[key] = value
-	return true, nil
-}
-
-func (m *memoryTransient) Delete(kind, identity string) (int64, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := transientKey(kind, identity)
-	if _, exists := m.values[key]; !exists {
-		return 0, nil
-	}
-	delete(m.values, key)
-	return 1, nil
-}
-
-// newAsyncService builds a runtime with a committed knowledge-base row and an
-// in-memory result snapshot store. Delivery itself is owned by Debezium, so the
-// service starts without any broker publisher.
+// newAsyncService builds a runtime with a committed knowledge-base row.
+// Delivery itself is owned by Debezium, so the service starts without any
+// broker publisher.
 func newAsyncService(t *testing.T) (*Service, *state.Stores) {
 	t.Helper()
 	service, stores := newKBService(t, "http://127.0.0.1:1")
@@ -67,7 +25,6 @@ func newAsyncService(t *testing.T) (*Service, *state.Stores) {
 		testKnowledgeBaseSettings(t, "alpha", "http://127.0.0.1:1", "knowledge_test")); err != nil {
 		t.Fatalf("KnowledgeBases.Create() error = %v", err)
 	}
-	stores.Results.Transient = newMemoryTransient()
 	if err := service.StartBackground(ctx,
 		WithMaintenanceInterval(0),
 		WithInitialMaintenancePass(false),

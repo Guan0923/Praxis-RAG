@@ -642,7 +642,6 @@ func TestTenantRoutesRejectAccountWithoutRead(t *testing.T) {
 	for _, request := range []testRequest{
 		{method: "GET", target: "/v1/documents", headers: sessionHeaders("user-token", "alpha")},
 		{method: "GET", target: "/v1/knowledge-base", headers: sessionHeaders("user-token", "alpha")},
-		{method: "GET", target: "/v1/search-results/123e4567-e89b-12d3-a456-426614174000", headers: sessionHeaders("user-token", "alpha")},
 		{method: "GET", target: "/v1/uploads", headers: sessionHeaders("user-token", "alpha")},
 	} {
 		request.remote = "10.0.0.9:5000"

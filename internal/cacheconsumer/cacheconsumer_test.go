@@ -291,3 +291,209 @@ func TestKeysForChangeCrossNamespaceUpdate(t *testing.T) {
 		}
 	}
 }
+
+// documentLocators returns the locator columns the cache connector captures for
+// one documents row (deploy/debezium/application-cache.properties:54).
+func documentLocators(namespace, name, documentID string) map[string]any {
+	return map[string]any{
+		"namespace":   namespace,
+		"name":        name,
+		"document_id": documentID,
+		"del_flag":    false,
+	}
+}
+
+// requireCacheKeys asserts the exact key sequence one change must invalidate.
+func requireCacheKeys(t *testing.T, got, want []state.CacheKey) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("keys = %+v, want %+v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("keys[%d] = %+v, want %+v", index, got[index], want[index])
+		}
+	}
+}
+
+// TestKeysForChangeDeleteCoversEveryCapturedTable pins the delete (op=d) mapping
+// for all eight read-model tables captured by the cache connector. Every one of
+// them must invalidate at least one cache key, otherwise a direct DELETE in MySQL
+// (the scenario the connector exists for) could never converge the Redis view.
+func TestKeysForChangeDeleteCoversEveryCapturedTable(t *testing.T) {
+	cases := []struct {
+		name   string
+		change Change
+		want   []state.CacheKey
+	}{
+		{
+			name:   "knowledge_bases",
+			change: change("knowledge_bases", "d", map[string]any{"namespace": "manuals"}, nil),
+			want: []state.CacheKey{
+				{Kind: "kb_list", Scope: ""},
+				{Kind: "kb_public", Scope: "manuals"},
+				{Kind: "documents", Scope: "manuals"},
+			},
+		},
+		{
+			// The count-bearing key: kb_list.document_count must drop when the row
+			// disappears, so the delete has to invalidate both kb_list and the
+			// namespace documents view.
+			name:   "documents",
+			change: change("documents", "d", documentLocators("manuals", "a.pdf", "doc-a"), nil),
+			want: []state.CacheKey{
+				{Kind: "kb_list", Scope: ""},
+				{Kind: "documents", Scope: "manuals"},
+			},
+		},
+		{
+			name:   "mcp_catalogs",
+			change: change("mcp_catalogs", "d", map[string]any{"namespace": "manuals"}, nil),
+			want:   []state.CacheKey{{Kind: "catalog", Scope: "manuals"}},
+		},
+		{
+			name:   "api_keys",
+			change: change("api_keys", "d", map[string]any{"id": "k1", "owner_user_id": "u1", "enabled": true}, nil),
+			want:   []state.CacheKey{{Kind: "api_keys", Scope: ""}},
+		},
+		{
+			name:   "document_heads",
+			change: change("document_heads", "d", map[string]any{"namespace": "manuals", "document_id": "doc-a"}, nil),
+			want: []state.CacheKey{
+				{Kind: "heads", Scope: "manuals"},
+				{Kind: "documents", Scope: "manuals"},
+			},
+		},
+		{
+			name:   "document_leases",
+			change: change("document_leases", "d", map[string]any{"namespace": "manuals", "resource": "doc"}, nil),
+			want:   []state.CacheKey{{Kind: "leases", Scope: "manuals"}},
+		},
+		{
+			name:   "upload_operations",
+			change: change("upload_operations", "d", map[string]any{"namespace": "manuals", "id": "op1"}, nil),
+			want: []state.CacheKey{
+				{Kind: "upload_list", Scope: "manuals"},
+				{Kind: "upload_status", Scope: "op1"},
+			},
+		},
+		{
+			name:   "upload_steps",
+			change: change("upload_steps", "d", map[string]any{"operation_id": "op1"}, nil),
+			want:   []state.CacheKey{{Kind: "upload_status", Scope: "op1"}},
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			requireCacheKeys(t, KeysForChange(test.change), test.want)
+		})
+	}
+}
+
+// TestHandleCrossNamespaceUpdateRefreshesBothScopes drives a scope move through
+// Handle: a directly executed UPDATE that changes documents.namespace must
+// rebuild both the old and the new namespace view, not just the new one.
+func TestHandleCrossNamespaceUpdateRefreshesBothScopes(t *testing.T) {
+	refresher := &fakeRefresher{}
+	processor, err := New(Options{Refresher: refresher, Decoder: ignorableDecoder()})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ok := processor.Handle(context.Background(), change("documents", "u",
+		map[string]any{"namespace": "archive", "name": "a.pdf", "document_id": "doc-a", "del_flag": false},
+		map[string]any{"namespace": "manuals", "name": "a.pdf", "document_id": "doc-a", "del_flag": false}))
+	if !ok {
+		t.Fatal("Handle() = false, want true")
+	}
+	if len(refresher.revalidated) != 1 {
+		t.Fatalf("revalidated = %+v", refresher.revalidated)
+	}
+	requireCacheKeys(t, refresher.revalidated[0], []state.CacheKey{
+		{Kind: "kb_list", Scope: ""},
+		{Kind: "documents", Scope: "manuals"},
+		{Kind: "documents", Scope: "archive"},
+	})
+}
+
+// TestHandleReplayedDeliveryIsIdempotent covers the cache-connector pause→resume
+// shape: when the connector resumes, the broker may redeliver events that were
+// already applied. A replayed change must map to the same keys and be ACKed
+// again, so convergence only re-bumps the same revisions (no duplicate scopes,
+// no nack loop that would dead-letter derived state).
+func TestHandleReplayedDeliveryIsIdempotent(t *testing.T) {
+	refresher := &fakeRefresher{}
+	processor, err := New(Options{Refresher: refresher, Decoder: ignorableDecoder()})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	deleted := change("documents", "d", documentLocators("manuals", "a.pdf", "doc-a"), nil)
+	for attempt := 0; attempt < 2; attempt++ {
+		if !processor.Handle(context.Background(), deleted) {
+			t.Fatalf("Handle(attempt %d) = false, want true", attempt)
+		}
+	}
+	want := []state.CacheKey{
+		{Kind: "kb_list", Scope: ""},
+		{Kind: "documents", Scope: "manuals"},
+	}
+	if len(refresher.revalidated) != 2 {
+		t.Fatalf("revalidated = %+v, want two deliveries", refresher.revalidated)
+	}
+	for index := range refresher.revalidated {
+		requireCacheKeys(t, refresher.revalidated[index], want)
+	}
+}
+
+// TestMessageHandlerUsesProductionDecoderForDebeziumDelete wires the production
+// mq.DecodeCacheChange adapter into the consumer and replays a raw Debezium row
+// event (source.table + before image, locator columns only, extra columns
+// stripped by the whitelist). This exercises the connector→topic→consumer
+// contract without Kafka or MySQL.
+func TestMessageHandlerUsesProductionDecoderForDebeziumDelete(t *testing.T) {
+	refresher := &fakeRefresher{}
+	processor, err := New(Options{
+		Refresher: refresher,
+		Decoder: func(body []byte) (Change, error) {
+			decoded, err := mq.DecodeCacheChange(body)
+			if err != nil {
+				return Change{}, err
+			}
+			return Change{Table: decoded.Table, Op: decoded.Op, Before: decoded.Before, After: decoded.After}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	handler := processor.MessageHandler()
+	// Debezium renders the before image of a DELETE with every captured column;
+	// sha256 is not in column.include.list and must be dropped by the decoder.
+	body := []byte(`{"source":{"connector":"mysql","table":"documents"},` +
+		`"op":"d","before":{"namespace":"manuals","name":"a.pdf","document_id":"doc-a",` +
+		`"del_flag":false,"sha256":"not-captured"}}`)
+	if !handler(context.Background(), mq.ReceivedMessage{Body: body}) {
+		t.Fatal("Debezium documents delete was nacked")
+	}
+	want := []state.CacheKey{
+		{Kind: "kb_list", Scope: ""},
+		{Kind: "documents", Scope: "manuals"},
+	}
+	if len(refresher.revalidated) != 1 {
+		t.Fatalf("revalidated = %+v", refresher.revalidated)
+	}
+	requireCacheKeys(t, refresher.revalidated[0], want)
+
+	// A tombstone (JSON null value) carries no row image: ACK without work.
+	if !handler(context.Background(), mq.ReceivedMessage{Body: []byte("null")}) {
+		t.Fatal("tombstone was nacked")
+	}
+	if len(refresher.revalidated) != 1 {
+		t.Fatalf("tombstone produced cache work: %+v", refresher.revalidated)
+	}
+
+	// A DELETE without a before image cannot be located: the decoder reports it
+	// as invalid, so the handler must nack for the broker retry/dead-letter path.
+	if handler(context.Background(), mq.ReceivedMessage{Body: []byte(
+		`{"source":{"connector":"mysql","table":"documents"},"op":"d"}`)}) {
+		t.Fatal("delete without before image was acked")
+	}
+}

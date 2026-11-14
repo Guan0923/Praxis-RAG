@@ -121,8 +121,8 @@ func TestMySQLStoreRoundTrip(t *testing.T) {
 
 // cleanupMySQLRows removes the rows a MySQL test case created; the shared test
 // database is never dropped.
-// TestMySQLG7StateMachines gates the document-job and search-task state
-// machines on RAG_TEST_MYSQL_URL.
+// TestMySQLG7StateMachines gates the document-job state machine on
+// RAG_TEST_MYSQL_URL. Search is synchronous and has no table-backed task state.
 func TestMySQLG7StateMachines(t *testing.T) {
 	stores := openMySQLTestStores(t)
 	ctx := context.Background()
@@ -142,11 +142,8 @@ func TestMySQLG7StateMachines(t *testing.T) {
 	}
 	// Debezium watches document_jobs directly: the scheduling generation is the
 	// only delivery signal and the retired outbox table no longer exists.
-	for _, column := range []string{"schedule_version"} {
-		if !columnExists(t, stores, "document_jobs", column) ||
-			!columnExists(t, stores, "search_tasks", column) {
-			t.Fatalf("column %q is missing from the task tables", column)
-		}
+	if !columnExists(t, stores, "document_jobs", "schedule_version") {
+		t.Fatal("document_jobs.schedule_version is missing")
 	}
 	for _, column := range []string{"refreshed_revision", "attempts", "last_error", "updated_at"} {
 		if !columnExists(t, stores, "cache_revisions", column) {
@@ -167,21 +164,10 @@ func TestMySQLG7StateMachines(t *testing.T) {
 	if err := stores.DocumentJobs.Fail(ctx, task, false, stringPtr("test")); err != nil {
 		t.Fatalf("Fail() error = %v", err)
 	}
-	searchNotification, err := stores.SearchTasks.Submit(ctx, namespace, map[string]any{"query": "mysql"}, nil)
-	if err != nil {
-		t.Fatalf("search Submit() error = %v", err)
-	}
-	if searchNotification.Schema != SearchEnvelopeSchema || searchNotification.ScheduleVersion != 1 {
-		t.Fatalf("search notification = %+v", searchNotification)
-	}
-	if _, err := stores.SearchTasks.Claim(ctx, searchNotification); err != nil {
-		t.Fatalf("search Claim() error = %v", err)
-	}
 	t.Cleanup(func() {
 		jc := context.Background()
 		for _, statement := range []string{
 			"DELETE FROM document_jobs WHERE namespace = ?",
-			"DELETE FROM search_tasks WHERE namespace = ?",
 		} {
 			if _, err := stores.DB.ExecContext(jc, statement, namespace); err != nil {
 				t.Logf("cleanup %q error = %v", statement, err)

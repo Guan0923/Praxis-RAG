@@ -18,12 +18,6 @@ type fakeServiceRuntime struct {
 	searchPayload   map[string]any
 	searchErr       error
 
-	resultPage      int
-	resultPageSize  int
-	resultNamespace string
-	resultPayload   map[string]any
-	resultErr       error
-
 	artifactOffset  int
 	artifactLength  int
 	artifactPayload map[string]any
@@ -39,13 +33,6 @@ func (f *fakeServiceRuntime) Search(_ context.Context, namespace string, request
 	f.searchNamespace = namespace
 	f.searchRequest = request
 	return f.searchPayload, f.searchErr
-}
-
-func (f *fakeServiceRuntime) GetSearchResult(_ context.Context, namespace, _ string, page, pageSize int) (map[string]any, error) {
-	f.resultNamespace = namespace
-	f.resultPage = page
-	f.resultPageSize = pageSize
-	return f.resultPayload, f.resultErr
 }
 
 func (f *fakeServiceRuntime) GetArtifact(_ context.Context, _, _ string, offset, length int) (map[string]any, error) {
@@ -88,7 +75,11 @@ func tenantAuth() map[string]string {
 }
 
 func TestSearchEndpoint(t *testing.T) {
-	runtime := &fakeServiceRuntime{searchPayload: map[string]any{"evidence_status": "found", "results": []any{}}}
+	runtime := &fakeServiceRuntime{searchPayload: map[string]any{
+		"evidence_status": "found",
+		"results":         []any{},
+		"artifacts":       []any{},
+	}}
 	handler := newRuntimeServer(t, runtime).Handler()
 
 	response := performRequest(handler, testRequest{
@@ -110,6 +101,23 @@ func TestSearchEndpoint(t *testing.T) {
 	}
 	if request.Filters["document_id"] != "doc-1" {
 		t.Fatalf("filters = %v", request.Filters)
+	}
+	// The synchronous response is the evidence payload itself: no result id, no
+	// snapshot availability fields, and the artifact list is returned inline.
+	body := decodeBody(t, response)
+	for _, field := range []string{"result_id", "created_at", "expires_at", "snapshot_available", "snapshot_error"} {
+		if _, present := body[field]; present {
+			t.Fatalf("search response still carries removed field %q: %s", field, response.Body.String())
+		}
+	}
+	if body["evidence_status"] != "found" {
+		t.Fatalf("search body = %s", response.Body.String())
+	}
+	if _, ok := body["results"]; !ok {
+		t.Fatalf("search response has no results: %s", response.Body.String())
+	}
+	if _, ok := body["artifacts"]; !ok {
+		t.Fatalf("search response has no artifacts: %s", response.Body.String())
 	}
 
 	invalidRerank := performRequest(handler, testRequest{
@@ -155,10 +163,8 @@ func TestSearchEndpoint(t *testing.T) {
 }
 
 func TestSearchEndpointRuntimeErrors(t *testing.T) {
-	resultID := "123e4567-e89b-12d3-a456-426614174000"
 	runtime := &fakeServiceRuntime{
 		searchErr: &contracts.RagOperationError{Message: "Qdrant is unavailable"},
-		resultErr: apierrors.SnapshotUnavailableError("Search result snapshot is unavailable"),
 	}
 	handler := newRuntimeServer(t, runtime).Handler()
 
@@ -169,50 +175,33 @@ func TestSearchEndpointRuntimeErrors(t *testing.T) {
 		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
 	}
 
-	snapshot := performRequest(handler, testRequest{
-		method: "GET", target: "/v1/search-results/" + resultID, headers: tenantAuth(),
+	// The result-snapshot read path was removed: the URL is not routed anymore.
+	removed := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/search-results/123e4567-e89b-12d3-a456-426614174000", headers: tenantAuth(),
 	})
-	if snapshot.Code != http.StatusGone {
-		t.Fatalf("snapshot status = %d body = %s", snapshot.Code, snapshot.Body.String())
-	}
-	if got := snapshot.Header().Get("Cache-Control"); got != "no-store" {
-		t.Fatalf("Cache-Control = %q", got)
+	if removed.Code != http.StatusNotFound {
+		t.Fatalf("removed search-results status = %d, want 404", removed.Code)
 	}
 }
 
-func TestSearchResultEndpoint(t *testing.T) {
-	resultID := "123e4567-e89b-12d3-a456-426614174000"
-	runtime := &fakeServiceRuntime{resultPayload: map[string]any{"status": "succeeded", "results": []any{}}}
+// TestSearchResultEndpointRemoved pins that GET /v1/search-results/{id} no
+// longer exists: both a well-formed id and a malformed one are unrouted 404s.
+func TestSearchResultEndpointRemoved(t *testing.T) {
+	runtime := &fakeServiceRuntime{}
 	handler := newRuntimeServer(t, runtime).Handler()
 
-	ok := performRequest(handler, testRequest{
-		method: "GET", target: "/v1/search-results/" + resultID + "?page=2&page_size=5", headers: tenantAuth(),
-	})
-	if ok.Code != http.StatusOK {
-		t.Fatalf("status = %d body = %s", ok.Code, ok.Body.String())
-	}
-	if runtime.resultPage != 2 || runtime.resultPageSize != 5 || runtime.resultNamespace != "alpha" {
-		t.Fatalf("page/pageSize/ns = %d/%d/%q", runtime.resultPage, runtime.resultPageSize, runtime.resultNamespace)
-	}
-
-	badID := performRequest(handler, testRequest{
-		method: "GET", target: "/v1/search-results/not-a-uuid", headers: tenantAuth(),
-	})
-	if badID.Code != http.StatusBadRequest {
-		t.Fatalf("bad id status = %d", badID.Code)
-	}
-	if detail := decodeBody(t, badID)["detail"]; detail != "Expected a dashed UUID string" {
-		t.Fatalf("detail = %v", detail)
-	}
-
-	badPage := performRequest(handler, testRequest{
-		method: "GET", target: "/v1/search-results/" + resultID + "?page=0", headers: tenantAuth(),
-	})
-	if badPage.Code != http.StatusBadRequest {
-		t.Fatalf("bad page status = %d", badPage.Code)
-	}
-	if _, ok := decodeBody(t, badPage)["detail"].([]any); !ok {
-		t.Fatalf("bad page detail = %s", badPage.Body.String())
+	for _, target := range []string{
+		"/v1/search-results/123e4567-e89b-12d3-a456-426614174000",
+		"/v1/search-results/123e4567-e89b-12d3-a456-426614174000?page=2&page_size=5",
+		"/v1/search-results/not-a-uuid",
+		"/v1/search-results/123e4567-e89b-12d3-a456-426614174000?page=0",
+	} {
+		response := performRequest(handler, testRequest{
+			method: "GET", target: target, headers: tenantAuth(),
+		})
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", target, response.Code)
+		}
 	}
 }
 

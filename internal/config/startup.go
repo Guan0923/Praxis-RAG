@@ -50,7 +50,7 @@ var observedKeys = []string{
 	"RAG_STATE_URL", "RAG_MYSQL_HOST", "RAG_MYSQL_PORT", "RAG_MYSQL_USER",
 	"RAG_MYSQL_DATABASE", "RAG_MYSQL_SSL_CA", "RAG_STATE_POOL_SIZE",
 	"RAG_STATE_MAX_OVERFLOW", "RAG_STATE_POOL_RECYCLE", "RAG_STATE_POOL_TIMEOUT",
-	"RAG_RESULT_TTL_SECONDS", "RAG_RESULT_MAX_BYTES", "RAG_ARTIFACT_MAX_BYTES", "RAG_RESULT_MAX_ARTIFACTS",
+	"RAG_RESULT_TTL_SECONDS", "RAG_ARTIFACT_MAX_BYTES", "RAG_RESULT_MAX_ARTIFACTS",
 	"RAG_REDIS_ENABLED", "RAG_REDIS_URL", "RAG_REDIS_PREFIX", "RAG_REDIS_TTL_SECONDS",
 	"RAG_REDIS_TIMEOUT_SECONDS",
 	"RAG_KAFKA_BOOTSTRAP_SERVERS", "RAG_KAFKA_CLIENT_ID", "RAG_KAFKA_SECURITY_PROTOCOL",
@@ -62,9 +62,7 @@ var observedKeys = []string{
 	"RAG_DOCUMENT_TOPIC", "RAG_DOCUMENT_GROUP", "RAG_DOCUMENT_DLQ_TOPIC",
 	"RAG_DOCUMENT_DLQ_GROUP",
 	"RAG_DOCUMENT_BROKER_MAX_RETRIES",
-	"RAG_SEARCH_TOPIC", "RAG_SEARCH_GROUP", "RAG_SEARCH_DLQ_TOPIC",
-	"RAG_SEARCH_DLQ_GROUP", "RAG_SEARCH_TIMEOUT_SECONDS",
-	"RAG_SEARCH_MAX_ATTEMPTS", "RAG_SEARCH_LEASE_SECONDS", "RAG_SEARCH_RETRY_SECONDS",
+	"RAG_SEARCH_TIMEOUT_SECONDS",
 	"RAG_EMBEDDING_MODEL", "RAG_EMBEDDING_DEVICE", "RAG_CHUNK_TOKENIZER_MODEL",
 	"RAG_DENSE_VECTOR_SIZE", "RAG_PRELOAD_MODEL", "RAG_NAMESPACE", "RAG_RERANKER_MODEL",
 	"RAG_RERANKER_DEVICE", "RAG_RERANKER_BATCH_SIZE", "RAG_RERANKER_MAX_CANDIDATES",
@@ -85,12 +83,41 @@ var ignoredDocumentKeys = map[string]struct{}{
 	"RAG_DOCUMENT_DISPATCH_ALERT_SECONDS":     {},
 }
 
+// ignoredSearchKeys are the retired queued-search settings. Search is
+// synchronous: it has no Kafka topic/group, durable task deadline, retry policy
+// or result-snapshot payload bound. The keys stay accepted (and are recorded as
+// ignored) so an existing config.toml keeps loading after an upgrade; see
+// docs/DEPLOYMENT.md for the migration notes. RAG_SEARCH_TIMEOUT_SECONDS stays
+// active as the synchronous search budget and is therefore not listed here.
+var ignoredSearchKeys = map[string]struct{}{
+	"RAG_SEARCH_TOPIC":         {},
+	"RAG_SEARCH_GROUP":         {},
+	"RAG_SEARCH_DLQ_TOPIC":     {},
+	"RAG_SEARCH_DLQ_GROUP":     {},
+	"RAG_SEARCH_MAX_ATTEMPTS":  {},
+	"RAG_SEARCH_LEASE_SECONDS": {},
+	"RAG_SEARCH_RETRY_SECONDS": {},
+	"RAG_RESULT_MAX_BYTES":     {},
+}
+
+// ignoredSetting reports a key that is accepted but never applied.
+func ignoredSetting(key string) bool {
+	if _, ignored := ignoredDocumentKeys[key]; ignored {
+		return true
+	}
+	_, ignored := ignoredSearchKeys[key]
+	return ignored
+}
+
 var allowedConfigKeys = func() map[string]struct{} {
-	keys := make(map[string]struct{}, len(observedKeys)+len(ignoredDocumentKeys))
+	keys := make(map[string]struct{}, len(observedKeys)+len(ignoredDocumentKeys)+len(ignoredSearchKeys))
 	for _, key := range observedKeys {
 		keys[key] = struct{}{}
 	}
 	for key := range ignoredDocumentKeys {
+		keys[key] = struct{}{}
+	}
+	for key := range ignoredSearchKeys {
 		keys[key] = struct{}{}
 	}
 	return keys
@@ -151,7 +178,7 @@ func LoadStartupConfig() (string, error) {
 
 	databaseOverride := os.Getenv("QDRANT_URL") != "" || os.Getenv("QDRANT_PATH") != ""
 	for key, value := range environment {
-		if _, ignored := ignoredDocumentKeys[key]; ignored {
+		if ignoredSetting(key) {
 			continue
 		}
 		if databaseOverride && (key == "QDRANT_URL" || key == "QDRANT_PATH") {

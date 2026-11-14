@@ -24,14 +24,8 @@ func (e *UploadConflict) ErrorCategory() string { return "upload_conflict" }
 // ErrorCategory labels encryption key failures.
 func (e *CryptoError) ErrorCategory() string { return "crypto_error" }
 
-// ErrorCategory labels unavailable search-task state.
-func (e *SearchTaskUnavailable) ErrorCategory() string { return "search_unavailable" }
-
 // ErrorCategory labels an unavailable transient cache.
 func (e *CacheUnavailable) ErrorCategory() string { return "cache_unavailable" }
 
 // ErrorCategory labels an unavailable stored artifact.
 func (e *ArtifactUnavailable) ErrorCategory() string { return "artifact_unavailable" }
-
-// ErrorCategory labels an expired or missing stored result snapshot.
-func (e *SnapshotUnavailable) ErrorCategory() string { return "snapshot_unavailable" }

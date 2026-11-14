@@ -16,7 +16,6 @@ var mqEnvKeys = []string{
 	"RAG_KAFKA_TLS_CA", "RAG_KAFKA_TLS_INSECURE", "RAG_KAFKA_PUBLISH_TIMEOUT_SECONDS",
 	"RAG_CACHE_TOPIC", "RAG_CACHE_GROUP",
 	"RAG_DOCUMENT_TOPIC", "RAG_DOCUMENT_GROUP", "RAG_DOCUMENT_DLQ_TOPIC", "RAG_DOCUMENT_DLQ_GROUP",
-	"RAG_SEARCH_TOPIC", "RAG_SEARCH_GROUP", "RAG_SEARCH_DLQ_TOPIC", "RAG_SEARCH_DLQ_GROUP",
 	"RAG_CACHE_DLQ_TOPIC", "RAG_CACHE_DLQ_GROUP",
 }
 
@@ -47,12 +46,9 @@ func testSettings(configured bool) Settings {
 	settings := Settings{
 		DocumentTopic:    "doc-topic",
 		DocumentGroup:    "doc-group",
-		SearchTopic:      "search-topic",
-		SearchGroup:      "search-group",
 		CacheTopic:       "cache-topic",
 		CacheGroup:       "cache-group",
 		DocumentDLQTopic: "doc-dlq",
-		SearchDLQTopic:   "search-dlq",
 		CacheDLQTopic:    "cache-dlq",
 		CacheDLQGroup:    "cache-dlq-group",
 		PublishTimeout:   time.Second,

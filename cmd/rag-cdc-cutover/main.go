@@ -69,7 +69,7 @@ func run(args []string) int {
 	flags := flag.NewFlagSet("rag-cdc-cutover", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	inventory := flags.Bool("inventory", false,
-		"只读盘点未完成的文档/搜索任务、缓存 key 与各 key revision，并打印 SHOW MASTER STATUS 指引")
+		"只读盘点未完成的文档任务、缓存 key 与各 key revision，并打印 SHOW MASTER STATUS 指引")
 	recordPosition := flags.Bool("record-position", false,
 		"把 SHOW MASTER STATUS 的 File/Position 写入 cdc_cutover_state（需要 --file/--pos）")
 	backfill := flags.Bool("backfill", false,
@@ -214,15 +214,13 @@ func runInventory(ctx context.Context, stores *state.Stores) int {
 	})
 	printTaskInventory("document_jobs", inventory.DocumentJobs,
 		state.DocumentJobQueued, state.DocumentJobProcessing)
-	printTaskInventory("search_tasks", inventory.SearchTasks,
-		state.SearchTaskQueued, state.SearchTaskProcessing)
 	fmt.Printf("cache_revisions：key=%d dirty=%d（dirty 表示 refreshed_revision < revision，等待缓存消费者收敛）\n",
 		inventory.CacheKeys, inventory.CacheDirtyKeys)
 	if code := printCacheRevisions(ctx, stores); code != exitOK {
 		return code
 	}
-	if inventory.DocumentJobs.Active == 0 && inventory.SearchTasks.Active == 0 {
-		fmt.Println("未完成文档/搜索任务：0（--backfill 仍建议执行以记录基线，返回 0 次重排属正常）")
+	if inventory.DocumentJobs.Active == 0 {
+		fmt.Println("未完成文档任务：0（--backfill 仍建议执行以记录基线，返回 0 次重排属正常）")
 	}
 	fmt.Println()
 	fmt.Println("SHOW MASTER STATUS 指引（必须在停写窗口内完成）：")
@@ -374,22 +372,16 @@ func runBackfill(ctx context.Context, stores *state.Stores, baseline int64, batc
 		fmt.Fprintf(os.Stderr, "rag-cdc-cutover: 写入 schedule_baseline 失败：%v\n", err)
 		return exitFailure
 	}
-	var documents, searches int
+	var documents int
 	for round := 1; ; round++ {
 		documentCount, err := stores.DocumentJobs.RequeueActive(ctx, batch, baseline)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "rag-cdc-cutover: document_jobs 回填失败：%v\n", err)
 			return exitFailure
 		}
-		searchCount, err := stores.SearchTasks.RequeueActive(ctx, batch, baseline)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "rag-cdc-cutover: search_tasks 回填失败：%v\n", err)
-			return exitFailure
-		}
 		documents += documentCount
-		searches += searchCount
-		fmt.Printf("  第 %d 批：document_jobs=%d search_tasks=%d\n", round, documentCount, searchCount)
-		if documentCount == 0 && searchCount == 0 {
+		fmt.Printf("  第 %d 批：document_jobs=%d\n", round, documentCount)
+		if documentCount == 0 {
 			break
 		}
 		if round >= 10000 {
@@ -401,7 +393,7 @@ func runBackfill(ctx context.Context, stores *state.Stores, baseline int64, batc
 		fmt.Fprintf(os.Stderr, "rag-cdc-cutover: 写入 phase 失败：%v\n", err)
 		return exitFailure
 	}
-	fmt.Printf("回填完成：document_jobs=%d search_tasks=%d（可重复执行，第二次返回 0）\n", documents, searches)
+	fmt.Printf("回填完成：document_jobs=%d（可重复执行，第二次返回 0）\n", documents)
 	return exitOK
 }
 
@@ -455,7 +447,6 @@ func runVerify(ctx context.Context, stores *state.Stores, baseline int64) int {
 	}
 
 	failures += verifyTaskInventory("document_jobs", inventory.DocumentJobs, baseline)
-	failures += verifyTaskInventory("search_tasks", inventory.SearchTasks, baseline)
 
 	switch {
 	case inventory.CacheDirtyKeys == 0:

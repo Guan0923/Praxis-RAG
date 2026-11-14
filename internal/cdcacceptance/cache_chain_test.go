@@ -164,6 +164,13 @@ func TestCacheChainDirectSQLConverges(t *testing.T) {
 		t.Fatal("delete change was not acknowledged")
 	}
 	requireDocumentNames(t, backend, namespace)
+	// The delete must converge the count-bearing aggregate too: kb_list's
+	// document_count is recomputed from MySQL, so the same event has to drop it
+	// from 1 to 0 (previously only the insert direction was asserted).
+	if item := knowledgeBaseListItem(backend.value("kb_list", ""), namespace); item == nil ||
+		item["document_count"] != float64(0) {
+		t.Fatalf("kb_list(%s) after delete = %+v, want document_count 0", namespace, item)
+	}
 	insertDocumentSQL(t, stores, namespace, "a.txt", "doc-b", "sha-rebuilt")
 	if acked := deliver(t, processor.MessageHandler(), "praxis_cache_change",
 		rawCacheEvent(t, "documents", "c", nil, documentLocators(namespace, "a.txt", "doc-b"))); !acked {
@@ -205,6 +212,55 @@ func TestCacheChainDirectSQLConverges(t *testing.T) {
 	encoded, err := json.Marshal(backend.value("documents", namespace))
 	if err != nil || len(encoded) == 0 {
 		t.Fatalf("cached documents view is not JSON marshable: %v", err)
+	}
+}
+
+// TestCacheChainCrossNamespaceMoveConverges covers the scope-move row: a direct
+// UPDATE that moves a documents row between namespaces must rebuild both the old
+// and the new documents view, and move the kb_list document_count with the row.
+func TestCacheChainCrossNamespaceMoveConverges(t *testing.T) {
+	stores := newStores(t)
+	ctx := context.Background()
+	backend := newFakeStateCache()
+	stores.CacheSync.Backend = backend
+	processor := newCacheProcessor(t, stores)
+	from := uniqueNamespace(t, "acc-move-from")
+	to := uniqueNamespace(t, "acc-move-to")
+	createKnowledgeBase(t, stores, from, "acceptance-collection")
+	createKnowledgeBase(t, stores, to, "acceptance-collection")
+	if err := stores.CacheSync.RefreshDirty(ctx, 1000); err != nil {
+		t.Fatalf("RefreshDirty(baseline) error = %v", err)
+	}
+	insertDocumentSQL(t, stores, from, "moved.txt", "doc-moved", "sha-moved")
+	if acked := deliver(t, processor.MessageHandler(), "praxis_cache_change",
+		rawCacheEvent(t, "documents", "c", nil, documentLocators(from, "moved.txt", "doc-moved"))); !acked {
+		t.Fatal("insert change was not acknowledged")
+	}
+	requireDocumentNames(t, backend, from, "moved.txt")
+	if item := knowledgeBaseListItem(backend.value("kb_list", ""), from); item == nil ||
+		item["document_count"] != float64(1) {
+		t.Fatalf("kb_list(%s) before move = %+v, want document_count 1", from, item)
+	}
+
+	// A row moved between scopes outside the application is announced with both
+	// the old and the new locator image; both scopes must converge immediately.
+	execSQL(t, stores, "UPDATE documents SET namespace = ? WHERE namespace = ? AND name = ?",
+		to, from, "moved.txt")
+	if acked := deliver(t, processor.MessageHandler(), "praxis_cache_change",
+		rawCacheEvent(t, "documents", "u",
+			documentLocators(from, "moved.txt", "doc-moved"),
+			documentLocators(to, "moved.txt", "doc-moved"))); !acked {
+		t.Fatal("cross-namespace update was not acknowledged")
+	}
+	requireDocumentNames(t, backend, from)
+	requireDocumentNames(t, backend, to, "moved.txt")
+	if item := knowledgeBaseListItem(backend.value("kb_list", ""), from); item == nil ||
+		item["document_count"] != float64(0) {
+		t.Fatalf("kb_list(%s) after move = %+v, want document_count 0", from, item)
+	}
+	if item := knowledgeBaseListItem(backend.value("kb_list", ""), to); item == nil ||
+		item["document_count"] != float64(1) {
+		t.Fatalf("kb_list(%s) after move = %+v, want document_count 1", to, item)
 	}
 }
 

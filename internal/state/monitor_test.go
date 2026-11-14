@@ -42,8 +42,7 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	now := time.Now()
 	recentWindow := 24 * time.Hour
 	nowUnix := float64(now.Unix())
-	queuedAge := 2 * 60 * 60.0   // 2h
-	activeSearchAge := 20 * 60.0 // 20m
+	queuedAge := 2 * 60 * 60.0 // 2h
 
 	artifactQuota := monitorTestArtifactID(t)
 	jobStatement := "INSERT INTO document_jobs (artifact_id, namespace, name, name_key, size, " +
@@ -71,24 +70,6 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	insertJob(monitorTestArtifactID(t), "failed-old.txt", DocumentJobFailed, "parse",
 		0, nowUnix-172800, nowUnix-172800)
 
-	searchStatement := "INSERT INTO search_tasks (result_id, namespace, arguments, status, " +
-		"stage, attempts, lease_until, retry_at, deadline, created_at, updated_at) " +
-		"VALUES (?, ?, ?, ?, ?, 1, 0, 0, ?, ?, ?)"
-	insertSearch := func(status, stage string, createdAt, deadline, updatedAt float64) {
-		t.Helper()
-		monitorTestExec(t, stores, searchStatement,
-			monitorTestArtifactID(t), namespace, "{}",
-			status, stage, deadline, createdAt, updatedAt)
-	}
-	// Two active queued tasks: one healthy (future deadline) and one overdue
-	// (deadline already passed, not converged yet), plus one active processing.
-	insertSearch(SearchTaskQueued, "admission", nowUnix-600, nowUnix+600, nowUnix-600)
-	insertSearch(SearchTaskQueued, "admission", nowUnix-300, nowUnix-60, nowUnix-300)
-	insertSearch(SearchTaskProcessing, "retrieve", nowUnix-activeSearchAge, nowUnix+300, nowUnix-30)
-	insertSearch(SearchTaskSucceeded, "done", nowUnix-600, nowUnix-480, nowUnix-60)
-	insertSearch(SearchTaskFailed, "done", nowUnix-600, nowUnix-480, nowUnix-60)
-	insertSearch(SearchTaskTimedOut, "done", nowUnix-600, nowUnix-480, nowUnix-60)
-
 	// cache_revisions: one clean key (watermark caught up), one dirty key
 	// (watermark behind revision) and one failed key (last refresh recorded an
 	// error while the watermark itself is current). No cache_outbox exists.
@@ -98,17 +79,6 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	monitorTestExec(t, stores, cacheStatement, "documents", "dirty-"+suffix, 5, 4, 0, nil, nowUnix-60)
 	monitorTestExec(t, stores, cacheStatement, "documents", "failed-"+suffix, 2, 2, 3,
 		"CacheUnavailable: redis timeout", nowUnix-60)
-
-	// One unexpired and one expired search-result fact row: only the live one is
-	// reported.
-	monitorTestExec(t, stores,
-		"INSERT INTO search_result_snapshots (id, namespace, content, created_at, expires_at) "+
-			"VALUES (?, ?, ?, ?, ?)",
-		monitorTestArtifactID(t), namespace, "{}", nowUnix-60, nowUnix+600)
-	monitorTestExec(t, stores,
-		"INSERT INTO search_result_snapshots (id, namespace, content, created_at, expires_at) "+
-			"VALUES (?, ?, ?, ?, ?)",
-		monitorTestArtifactID(t), namespace, "{}", nowUnix-1200, nowUnix-600)
 
 	// Uploads cover every category: two in progress, one failed, one rolling
 	// back and one failed rollback, plus a committed operation whose old-version
@@ -150,8 +120,8 @@ func TestMonitorStatsAggregates(t *testing.T) {
 		monitorTestArtifactID(t), namespace, "identity-"+suffix, "doc-"+suffix,
 		nil, "image", "a.png", "image/png", []byte("png"), nowUnix, nowUnix+600)
 
-	// The activity counter is the only source of the recent-search number: the
-	// recent terminal search_tasks rows must not be added on top of it.
+	// The activity counter is the only source of the recent-search number: search
+	// runs synchronously, so no queue rows can be added on top of it.
 	for attempt := 0; attempt < 3; attempt++ {
 		if err := stores.Activity.Record(ctx, ActivitySearch, now); err != nil {
 			t.Fatalf("Activity.Record() error = %v", err)
@@ -165,8 +135,6 @@ func TestMonitorStatsAggregates(t *testing.T) {
 		cleanup := context.Background()
 		for _, statement := range []string{
 			"DELETE FROM document_jobs WHERE namespace = ?",
-			"DELETE FROM search_tasks WHERE namespace = ?",
-			"DELETE FROM search_result_snapshots WHERE namespace = ?",
 			"DELETE FROM cache_revisions WHERE scope = ?",
 			"DELETE FROM upload_operations WHERE namespace = ?",
 			"DELETE FROM artifact_snapshots WHERE namespace = ?",
@@ -229,28 +197,8 @@ func TestMonitorStatsAggregates(t *testing.T) {
 		t.Fatalf("JobsSucceededRecent = %d, want 1", stats.JobsSucceededRecent)
 	}
 
-	wantSearchStatuses := map[string]int{
-		SearchTaskQueued: 2, SearchTaskProcessing: 1, SearchTaskSucceeded: 1,
-		SearchTaskFailed: 1, SearchTaskTimedOut: 1,
-	}
-	for status, want := range wantSearchStatuses {
-		if got := stats.SearchByStatus[status]; got != want {
-			t.Fatalf("SearchByStatus[%q] = %d, want %d (map %v)",
-				status, got, want, stats.SearchByStatus)
-		}
-	}
-	if math.Abs(stats.OldestActiveSearchSeconds-activeSearchAge) > 5 {
-		t.Fatalf("OldestActiveSearchSeconds = %f, want ~%f",
-			stats.OldestActiveSearchSeconds, activeSearchAge)
-	}
-	if stats.SearchTimedOutRecent != 1 {
-		t.Fatalf("SearchTimedOutRecent = %d, want 1", stats.SearchTimedOutRecent)
-	}
-	if stats.SearchOverdueActive != 1 {
-		t.Fatalf("SearchOverdueActive = %d, want 1", stats.SearchOverdueActive)
-	}
-	// Only the three recorded activity counts are inside the window; the recent
-	// terminal search_tasks rows are queue records and must not leak in.
+	// Only the three recorded activity counts are inside the window; search is
+	// synchronous and has no queue rows that could leak into the counter.
 	if stats.SearchesRecent != 3 {
 		t.Fatalf("SearchesRecent = %d, want 3 (activity counter only)", stats.SearchesRecent)
 	}
@@ -259,9 +207,6 @@ func TestMonitorStatsAggregates(t *testing.T) {
 	}
 	if stats.CacheRefreshFailures != 1 {
 		t.Fatalf("CacheRefreshFailures = %d, want 1", stats.CacheRefreshFailures)
-	}
-	if stats.SearchResultSnapshotsActive != 1 {
-		t.Fatalf("SearchResultSnapshotsActive = %d, want 1", stats.SearchResultSnapshotsActive)
 	}
 
 	wantUploadStatuses := map[string]int{
@@ -310,14 +255,6 @@ func TestMonitorStatsEmptyState(t *testing.T) {
 			t.Fatalf("DocumentJobsByStatus[%q] = %d, present = %v", status, got, present)
 		}
 	}
-	for _, status := range []string{
-		SearchTaskQueued, SearchTaskProcessing, SearchTaskSucceeded,
-		SearchTaskFailed, SearchTaskTimedOut,
-	} {
-		if got, present := stats.SearchByStatus[status]; !present || got != 0 {
-			t.Fatalf("SearchByStatus[%q] = %d, present = %v", status, got, present)
-		}
-	}
 	// The five unfinished upload states stay present so the Console renders a
 	// complete category row on an empty database.
 	for _, status := range []string{
@@ -334,12 +271,9 @@ func TestMonitorStatsEmptyState(t *testing.T) {
 			stats.UploadsInProgress, stats.UploadsFailed, stats.UploadsRollingBack,
 			stats.UploadsCleanupPending, stats.UnfinishedUploads)
 	}
-	if stats.CacheDirtyKeys != 0 || stats.CacheRefreshFailures != 0 ||
-		stats.SearchTimedOutRecent != 0 || stats.SearchOverdueActive != 0 ||
-		stats.SearchResultSnapshotsActive != 0 {
-		t.Fatalf("empty CDC counters = dirty %d, failures %d, timed_out %d, overdue %d, snapshots %d",
-			stats.CacheDirtyKeys, stats.CacheRefreshFailures, stats.SearchTimedOutRecent,
-			stats.SearchOverdueActive, stats.SearchResultSnapshotsActive)
+	if stats.CacheDirtyKeys != 0 || stats.CacheRefreshFailures != 0 {
+		t.Fatalf("empty CDC counters = dirty %d, failures %d",
+			stats.CacheDirtyKeys, stats.CacheRefreshFailures)
 	}
 	if stats.Documents != 0 || stats.KnowledgeBases != 0 || stats.ArtifactSnapshots != 0 {
 		t.Fatalf("library counts = %d/%d/%d, want 0/0/0",

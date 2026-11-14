@@ -8,7 +8,7 @@ source of truth and Debezium publishes one identifier-only notification per
 committed INSERT (or `schedule_version` bump). The application writes no
 transactional outbox, and the worker never polls a queue table.
 
-## Event source: two Debezium connectors, three topics/groups
+## Event source: two Debezium connectors, two topics/groups
 
 `docs/cdc-migration.md` is the contract. The deployment runs two Debezium Server
 instances against the same MySQL (different `database.server.id`, offset and
@@ -17,14 +17,14 @@ schema-history storage, health port):
 | Connector | Captures | Topic (env) | Consumer group (env) | Consumer binary |
 | --- | --- | --- | --- | --- |
 | task connector | `document_jobs` (INSERT + `schedule_version` changes only; `column.include.list=artifact_id,namespace,schedule_version`, `skip.messages.without.change=true`, `skipped.operations=d`) | `RAG_DOCUMENT_TOPIC` (default `praxis_document_ingest`) | `RAG_DOCUMENT_GROUP` (default `praxis_document_ingest_workers`) | `cmd/rag-document-worker` |
-| task connector | `search_tasks` (same column/skip rules) | `RAG_SEARCH_TOPIC` (default `praxis_search`) | `RAG_SEARCH_GROUP` (default `praxis_search_workers`) | `cmd/rag-search-worker` |
 | cache connector | 8 cache read-model tables (all c/u/d) | `RAG_CACHE_TOPIC` (default `praxis_state_cache_refresh`) | `RAG_CACHE_GROUP` (default `praxis_state_cache_refresh_workers`) | `cmd/rag-cache-worker` |
 
 Topics/consumer groups are never reused. Each stream has its own DLQ topic and
 group (`RAG_DOCUMENT_DLQ_TOPIC` / `RAG_DOCUMENT_DLQ_GROUP`,
-`RAG_SEARCH_DLQ_TOPIC` / `RAG_SEARCH_DLQ_GROUP`,
-`RAG_CACHE_DLQ_TOPIC` / `RAG_CACHE_DLQ_GROUP`); this document worker consumes only
-the document DLQ via `cmd/rag-dead-letter-worker --kind document`.
+`RAG_CACHE_DLQ_TOPIC` / `RAG_CACHE_DLQ_GROUP`); this document worker consumes
+only the document DLQ via `cmd/rag-dead-letter-worker --kind document`.
+Search is synchronous and never flows through Kafka, so the task connector does
+not capture `search_tasks` and there is no search topic/group or DLQ lane.
 
 ### Document notification (schema 4)
 

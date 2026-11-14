@@ -36,11 +36,8 @@ var AllowedFilters = map[string]struct{}{
 	"title":       {},
 }
 
-// MaxResultPage and MaxArtifactLength mirror server.py constants.
-const (
-	MaxResultPage     = 2_147_483_647
-	MaxArtifactLength = 1024 * 1024
-)
+// MaxArtifactLength mirrors server.py constants.
+const MaxArtifactLength = 1024 * 1024
 
 // SearchValidationError marks untrusted MCP/HTTP arguments that violate the
 // search contract.
@@ -210,35 +207,6 @@ func SearchRequestFromArguments(arguments map[string]any) (SearchRequest, error)
 	}, nil
 }
 
-// QueuedSearchRequest wraps a search with a bounded completion wait.
-type QueuedSearchRequest struct {
-	Search      SearchRequest
-	WaitSeconds float64
-}
-
-// QueuedSearchRequestFromArguments validates queued MCP input.
-func QueuedSearchRequestFromArguments(arguments map[string]any) (QueuedSearchRequest, error) {
-	values := make(map[string]any, len(arguments))
-	for key, value := range arguments {
-		values[key] = value
-	}
-	rawWait, exists := values["wait_seconds"]
-	delete(values, "wait_seconds")
-	wait := 10.0
-	if exists {
-		parsed, ok := finiteNumber(rawWait)
-		if !ok || parsed < 0 || parsed > 30 {
-			return QueuedSearchRequest{}, validationError("wait_seconds must be a finite number between 0 and 30")
-		}
-		wait = parsed
-	}
-	search, err := SearchRequestFromArguments(values)
-	if err != nil {
-		return QueuedSearchRequest{}, err
-	}
-	return QueuedSearchRequest{Search: search, WaitSeconds: wait}, nil
-}
-
 func boundedInteger(value any, fallback int, name string, minimum, maximum int) (int, error) {
 	if value == nil {
 		return fallback, nil
@@ -300,58 +268,6 @@ func parseFilters(value any) (map[string]any, error) {
 	return result, nil
 }
 
-func finiteNumber(value any) (float64, bool) {
-	switch typed := value.(type) {
-	case int:
-		return float64(typed), true
-	case int64:
-		return float64(typed), true
-	case float64:
-		if math.IsNaN(typed) || math.IsInf(typed, 0) {
-			return 0, false
-		}
-		return typed, true
-	case json.Number:
-		parsed, err := typed.Float64()
-		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
-			return 0, false
-		}
-		return parsed, true
-	default:
-		return 0, false
-	}
-}
-
-// SearchResultRequest is a validated get_search_result argument set.
-type SearchResultRequest struct {
-	ResultID string
-	Page     int
-	PageSize int
-}
-
-// ValidateSearchResultArguments mirrors server.validate_search_result.
-func ValidateSearchResultArguments(arguments map[string]any) (SearchResultRequest, error) {
-	allowed := map[string]struct{}{"result_id": {}, "page": {}, "page_size": {}}
-	for key := range arguments {
-		if _, ok := allowed[key]; !ok {
-			return SearchResultRequest{}, validationError("Unknown search-result arguments")
-		}
-	}
-	resultID, err := ValidateUUID(arguments["result_id"])
-	if err != nil {
-		return SearchResultRequest{}, err
-	}
-	page, err := boundedInteger(arguments["page"], 1, "page", 1, MaxResultPage)
-	if err != nil {
-		return SearchResultRequest{}, err
-	}
-	pageSize, err := boundedInteger(arguments["page_size"], 10, "page_size", 1, 100)
-	if err != nil {
-		return SearchResultRequest{}, err
-	}
-	return SearchResultRequest{ResultID: resultID, Page: page, PageSize: pageSize}, nil
-}
-
 // ValidateArtifactRange mirrors server.validate_artifact_range.
 func ValidateArtifactRange(offset, length int) error {
 	if offset < 0 {
@@ -391,11 +307,6 @@ const SearchToolDescription = "Search user-uploaded/local knowledge for manuals,
 	"If evidence_status is no_evidence, rewrite the query once when useful, otherwise say the knowledge " +
 	"base is insufficient. Do not use this tool for greetings or unrelated general tasks."
 
-// QueuedSearchToolDescriptionSuffix is appended for queued MCP search.
-const QueuedSearchToolDescriptionSuffix = " Searches are queued. Set wait_seconds (0..30, default 10). If only result_id is returned, " +
-	"poll get_search_result with that UUID; status queued means still waiting or processing. " +
-	"Do not submit the same search again merely because the wait ended."
-
 // ToolAnnotations describes MCP tool safety hints.
 type ToolAnnotations struct {
 	ReadOnlyHint    bool
@@ -413,7 +324,9 @@ var SearchToolAnnotations = ToolAnnotations{
 }
 
 // SearchToolSchema returns the stable JSON schema exposed to MCP clients.
-func SearchToolSchema(queued bool) map[string]any {
+// Search always executes synchronously: one call runs retrieval and reranking
+// and returns the evidence payload directly.
+func SearchToolSchema() map[string]any {
 	properties := map[string]any{
 		"query": map[string]any{"type": "string", "minLength": 1, "maxLength": 2000},
 		"retrieval": map[string]any{
@@ -434,12 +347,6 @@ func SearchToolSchema(queued bool) map[string]any {
 			"additionalProperties": false,
 			"default":              map[string]any{},
 		},
-	}
-	if queued {
-		properties["wait_seconds"] = map[string]any{
-			"type": "number", "minimum": 0, "maximum": 30, "default": 10,
-			"description": "Maximum seconds to wait for this call (not the task deadline). Use 0 to enqueue without waiting.",
-		}
 	}
 	return map[string]any{
 		"type":                 "object",

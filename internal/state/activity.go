@@ -10,9 +10,8 @@ import (
 )
 
 // ActivitySearch is the activity counter metric for one retrieval execution.
-// Every synchronous REST/MCP search and every queued search worker run goes
-// through runtime.Service.Search, so this counter covers all of them while
-// search_tasks only holds the queued subset.
+// Every synchronous REST/MCP search goes through runtime.Service.Search, so
+// this counter covers all retrieval executions; search has no queued subset.
 const ActivitySearch = "search"
 
 const (

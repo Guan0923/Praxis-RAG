@@ -50,15 +50,6 @@ type fakeRuntime struct {
 	searchErr     error
 	searchCalls   []contracts.SearchRequest
 
-	submitResultID string
-	submitErr      error
-	submitted      []contracts.SearchRequest
-	lastSearch     string
-
-	searchResults  []map[string]any
-	getResultErr   error
-	getResultCalls int
-
 	artifactPayload map[string]any
 	artifactErr     error
 	artifactCalls   []fakeArtifactCall
@@ -80,9 +71,7 @@ type fakeRuntime struct {
 }
 
 func newFakeRuntime() *fakeRuntime {
-	return &fakeRuntime{
-		submitResultID: "3c1b9d0e-1111-4c2a-9f3e-9d0e11114c2a",
-	}
+	return &fakeRuntime{}
 }
 
 func (f *fakeRuntime) ListDocuments(_ context.Context, namespace string) ([]DocumentRecord, error) {
@@ -128,42 +117,6 @@ func (f *fakeRuntime) Search(_ context.Context, namespace string, request contra
 		return nil, f.searchErr
 	}
 	return f.searchPayload, nil
-}
-
-func (f *fakeRuntime) SubmitSearch(_ context.Context, namespace string, request contracts.SearchRequest) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.namespaces = append(f.namespaces, namespace)
-	f.submitted = append(f.submitted, request)
-	f.lastSearch = request.Query
-	if f.submitErr != nil {
-		return "", f.submitErr
-	}
-	return f.submitResultID, nil
-}
-
-func (f *fakeRuntime) GetSearchResult(_ context.Context, namespace, resultID string, _ int, _ int) (map[string]any, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.namespaces = append(f.namespaces, namespace)
-	f.getResultCalls++
-	if f.getResultErr != nil {
-		return nil, f.getResultErr
-	}
-	if len(f.searchResults) > 0 {
-		payload := f.searchResults[0]
-		if len(f.searchResults) > 1 {
-			f.searchResults = f.searchResults[1:]
-		}
-		return payload, nil
-	}
-	return map[string]any{
-		"result_id": resultID,
-		"namespace": namespace,
-		"query":     f.lastSearch,
-		"status":    "succeeded",
-		"results":   []any{},
-	}, nil
 }
 
 func (f *fakeRuntime) GetArtifact(_ context.Context, namespace, artifactID string, offset, length int) (map[string]any, error) {

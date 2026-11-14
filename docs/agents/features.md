@@ -60,14 +60,15 @@
 - 检索结果只返回**活跃版本**的 chunk（按 `upload_version` 过滤），并按 namespace 隔离；受限调用方会在服务端追加 `document_ids` 过滤，不能由客户端伪造。
 - 结果信封：`query`、`retrieval`、`rerank`、`candidate_k`、`top_k`、`evidence_status`（`found` / `no_evidence`）、`answer_guidance`、`results[]`、`debug{implementation,candidate_count,returned_count,retrieval_ms,rerank_ms,limitations}`。
 - 每条结果：`rank`、`document_id`、`chunk_id`、`title`、`source`、`text`、`score`、`metadata`；命中资产时附 `asset`（图片 base64 或表格结构）与 `artifacts` 引用。
-- MCP `search` 在配置 Kafka 后为排队模式：提交只写 MySQL `search_tasks` 并返回 `result_id`（提交即受理，不等待 Kafka 确认）；`wait_seconds` 0..30，超时只返回 `result_id`，用 `get_search_result` 轮询；未配置 Kafka 时退化为同步执行且 schema 不含 `wait_seconds`。
+- MCP `search` **永远同步**：一次 `tools/call` 完成检索 + 重排并直接返回证据；没有 `wait_seconds`、没有 `result_id`、没有轮询，`get_search_result` 工具已删除。REST `/v1/search` 与 MCP 同语义。
+- 搜索总预算复用 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120s）：在 `Service.Search` 内基于父 ctx 派生 deadline（已有更早 deadline 不延长）；客户端断开/请求取消会向下传递到 Qdrant 与模型调用。
 
-## 6. 结果快照、artifact 与引用
+## 6. artifact 与引用
 
-- 每次检索可生成 `result_id`；排队搜索的结果快照写入 MySQL `search_result_snapshots`（事实来源），Redis 只作读取缓存，丢失后可回源 MySQL 重建；超过 `RAG_RESULT_TTL_SECONDS`（默认 3600 秒）后 MySQL 快照被有界清理，再读取返回 410。
-- artifact 用于引用源文件、图片、表格 JSON：单 artifact 上限 64 MiB，单次检索最多 100 个，超限时结果带 `artifact_warning`。
-- `snapshot_available=false` 表示当前部署没有可用的持久快照（例如未配置 Redis）。
-- 删除文档是**逻辑删除**（`del_flag`），不会立即物理删除源文件与 Qdrant 向量。
+- artifact 用于引用源文件、图片、表格 JSON 与解析产物：单 artifact 上限 64 MiB，单次检索最多 100 个，超限时结果带 `artifact_warning`。
+- artifact 以 MySQL `artifact_snapshots` 为事实来源，按 ID 独立读取（`GET /v1/artifacts/{artifact_id}` 等），保留期由 `RAG_RESULT_TTL_SECONDS`（默认 3600 秒，语义为 artifact TTL）决定。
+- 搜索结果快照已下线：响应不再有 `snapshot_available`、`result_id`、`created_at`、`expires_at`；`search_tasks`/`search_result_snapshots` 为历史表、保留数据但不再读写。
+- 删除文档是**逻辑删除**（`del_flag`），不会立即物理删除源文件与 Qdrant 向量；已签发 artifact 继续有效至到期。
 
 ## 7. MCP 服务（`/mcp`）
 
@@ -77,8 +78,7 @@
 
 | 工具 | 参数要点 | 行为 |
 | --- | --- | --- |
-| `search` | `query`、`retrieval`、`rerank`、`candidate_k`、`top_k`、`filters`；排队模式加 `wait_seconds` | 检索；排队模式下超时只返回 `result_id` |
-| `get_search_result` | `result_id`、`page`、`page_size` | 读取排队状态或结果分页，不重复检索 |
+| `search` | `query`、`retrieval`、`rerank`、`candidate_k`、`top_k`、`filters` | 同步检索并直接返回证据；无 `wait_seconds`/任务 ID |
 | `add_document` | `name` + `content`/`content_base64`，可选 `idempotency_key` | 异步入库，成功只返回 `artifact_id` |
 | `get_document_status` | `artifact_id` | 查询 `status/stage/error` |
 | `update_document` | `name` + `content`/`content_base64` | 同步替换并重建索引 |
@@ -88,7 +88,7 @@
 - 提示词：没有内置模板，全部来自命名空间级 catalog（`{{argument}}` 占位符，仅替换不执行表达式），可经 `/v1/admin/prompts` 管理；`prompts/list` / `prompts/get` 使用该数据。
 - 订阅：旧版 `resources/subscribe` 与新版 `subscriptions/listen`；变更通知只表示“发生了变化”，客户端需重新 list/read，通知不跨进程重放。
 - 工具开关：管理员可经 `/v1/admin/tools` 启停工具、覆盖描述；禁用后 `tools/list` 隐藏、调用返回 `Unknown or disabled RAG tool: <name>`。
-- 错误语义：工具失败是 `CallToolResult.isError` 文本，不是 JSON-RPC error；受限权限不能使用排队搜索。
+- 错误语义：工具失败是 `CallToolResult.isError` 文本，不是 JSON-RPC error；受限权限会真正执行同步检索（服务端按 scope 追加 `document_ids` 过滤）。
 - 安全：Host 白名单（不匹配 421）、Origin 校验（不匹配 403，缺省允许）、Content-Type 校验、请求体上限（约 60 MiB + 64 KiB）。
 
 ## 8. REST API（`/v1/*`）
@@ -99,7 +99,7 @@
 | --- | --- |
 | 基础设施 | `GET /health`、`GET /openapi.json`、`GET /docs`、`GET /`、`GET /console`、`GET /console/assets/*` |
 | 认证 | `GET /v1/auth/status`、`POST /v1/auth/register`、`POST /v1/auth/login`、`POST /v1/auth/logout`、`GET /v1/auth/me` |
-| 租户：检索/结果 | `POST /v1/search`、`GET /v1/search-results/{result_id}`、`GET /v1/artifacts/{artifact_id}`、`GET /v1/artifacts/{artifact_id}/content` |
+| 租户：检索/结果 | `POST /v1/search`、`GET /v1/artifacts/{artifact_id}`、`GET /v1/artifacts/{artifact_id}/content` |
 | 租户：文档 | `GET /v1/documents`、`POST /v1/documents/check`、`GET /v1/document-jobs/{artifact_id}`、`POST /v1/document-batches`、`GET /v1/document-batches`、`GET /v1/document-batches/{batch_id}`、`GET /v1/documents/{name}/content`、`DELETE /v1/documents/{name}` |
 | 租户：知识库/状态 | `GET /v1/knowledge-base`、`GET /v1/namespaces`、`GET /v1/chunking/strategies`、`GET /v1/uploads`、`GET /v1/uploads/{operation_id}` |
 | Console 会话：知识库/共享 | `GET /v1/users`、`POST /v1/knowledge-bases`、`GET /v1/knowledge-bases/{namespace}/access`、`GET /v1/knowledge-bases/{namespace}/permissions`、`DELETE /v1/knowledge-bases/{namespace}/permissions/{user_id}`、`GET|POST /v1/knowledge-bases/{namespace}/invitations`、`GET /v1/invitations`、`POST /v1/invitations/preview`、`POST /v1/invitations/accept`、`POST /v1/invitations/decline`、`DELETE /v1/invitations/{invitation_id}` |
@@ -108,7 +108,7 @@
 | 管理：模型配置 | `GET|POST /v1/admin/model-profiles`、`GET|PATCH|DELETE /v1/admin/model-profiles/{profile_id}`、`GET /v1/admin/model-profiles/{profile_id}/key`、`POST /v1/admin/model-profiles/{profile_id}/models` |
 | 管理：MCP 配置 | `GET /v1/admin/tools`、`PATCH /v1/admin/tools/{name}`、`GET /v1/admin/prompts`、`PUT|DELETE /v1/admin/prompts/{name}` |
 | 管理：展示/只读 | `GET /v1/admin/published-versions`、`GET /v1/admin/upload-leases`（注册为无认证，但 handler 内二次校验管理员+本机边界） |
-| 管理：监控 | `GET /v1/admin/monitor/overview`（只读聚合：三态总体状态、服务信息、依赖探测（Kafka 元数据 / PDF 健康负载）、文档任务/检索/上传分类队列、两个 Debezium 连接器健康、三组 Kafka 消费组积压、缓存 dirty/failures、文档 Worker 心跳、有效文档/结果快照（MySQL）计数、24 小时检索活动；不可得的数字显式为 `null`/未知；本机直连或管理员会话） |
+| 管理：监控 | `GET /v1/admin/monitor/overview`（只读聚合：三态总体状态、服务信息、依赖探测（Kafka 元数据 / PDF 健康负载）、文档任务/上传分类队列、两个 Debezium 连接器健康、两组 Kafka 消费组积压、缓存 dirty/failures、文档 Worker 心跳、有效文档计数、24 小时检索活动；不可得的数字显式为 `null`/未知；本机直连或管理员会话） |
 | 每账号 API Key | `GET|POST /v1/admin/api-keys`、`PUT|DELETE /v1/admin/api-keys/{key_id}`、`GET /v1/admin/api-keys/{key_id}/mcp-config` |
 | MCP | `POST|GET|DELETE /mcp` |
 
@@ -133,7 +133,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | `#/model-profiles` | 模型配置 | 管理员 | Embedding/Reranker/VLM/JEV 分页签，新增/编辑/删除、模型探测、Key 只写不读 |
 | `#/api-keys` | API Key | 所有登录账号 | 自己的密钥 CRUD/启停、一次性明文、复制 MCP 配置 |
 | `#/users` | 用户管理 | 管理员 | 角色（admin/vip/user）、启用/禁用、删除；服务端保证至少保留一名启用的管理员 |
-| `#/monitor` | 系统监控 | 管理员 | 只读监控快照：页头三态状态与降级告警、关键指标（有效文档/任务/上传/检索/结果快照）、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态（Kafka 校验元数据与主题、PDF 校验转换器）、`document_jobs`/`search_tasks` 队列与阶段、上传互斥分类、Debezium 任务/缓存两个连接器健康、三组 Kafka 消费组滞后、缓存 dirty/failures、文档 Worker 心跳（读不到显示「未知」）、服务信息；15 秒自动刷新，窄屏单列 |
+| `#/monitor` | 系统监控 | 管理员 | 只读监控快照：页头三态状态与降级告警、关键指标（有效文档/任务/上传/检索）、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态（Kafka 校验元数据与主题、PDF 校验转换器）、`document_jobs` 队列与阶段、上传互斥分类、Debezium 任务/缓存两个连接器健康、两组 Kafka 消费组滞后、缓存 dirty/failures、文档 Worker 心跳（读不到显示「未知」）、服务信息；15 秒自动刷新，窄屏单列 |
 | `#/permissions` | 权限管理 | 管理员 / VIP | 选择知识库、按用户聚合授权、创建邀请（可读/可修改 × 全库/若干文件）、复制链接、撤销授权/邀请 |
 | `#/invitations` | 邀请中心 | 登录账号 | 待处理邀请、粘贴邀请链接、接受/拒绝（顶部铃铛轮询） |
 | `#/invite?token=` | 受邀预览 | 登录账号 | 预览邀请并接受/拒绝，随后切换到该知识库 |
@@ -158,22 +158,22 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 
 ## 12. 异步队列、死信与缓存
 
-- Kafka 只在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；空值 = brokerless（MCP 搜索同步，通知无法投递、文档任务保持 `queued`、缓存刷新不生效）。
-- **两个 Debezium 连接器**：任务连接器采集 `document_jobs`/`search_tasks`（仅 INSERT 与 `schedule_version` 变化，`skipped.operations=d`）；缓存连接器采集 `knowledge_bases`/`documents`/`mcp_catalogs`/`api_keys`/`document_heads`/`document_leases`/`upload_operations`/`upload_steps`（全部 c/u/d）。应用不再写任何事务 outbox。
+- Kafka 只在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；空值 = brokerless（通知无法投递、文档任务保持 `queued`、缓存刷新不生效）。搜索为同步执行，不受 Kafka 是否配置影响。
+- **两个 Debezium 连接器**：任务连接器只采集 `document_jobs`（仅 INSERT 与 `schedule_version` 变化，`skipped.operations=d`）；缓存连接器采集 `knowledge_bases`/`documents`/`mcp_catalogs`/`api_keys`/`document_heads`/`document_leases`/`upload_operations`/`upload_steps`（全部 c/u/d）。应用不再写任何事务 outbox。
 - 重发只发生在 MySQL 事务内：`schedule_version = schedule_version + 1`；消费者只处理与数据库当前版本相等的通知，旧版本/终态/有效租约安全跳过并 ACK。任务表初始快照的 `op=r` 事件用于切换补投。
-- topic：`praxis_document_ingest`、`praxis_search`、`praxis_state_cache_refresh`；DLQ 是显式 topic `praxis_document_ingest_dead_letters` / `praxis_search_dead_letters` / `praxis_state_cache_refresh_dead_letters`（不是 `%DLQ%` 约定），由 `rag-dead-letter-worker --kind document|search|cache` 消费。
+- topic：`praxis_document_ingest`、`praxis_state_cache_refresh`；DLQ 是显式 topic `praxis_document_ingest_dead_letters` / `praxis_state_cache_refresh_dead_letters`（不是 `%DLQ%` 约定），由 `rag-dead-letter-worker --kind document|cache` 消费。原搜索 topic/消费组/DLQ 已下线。
 - 缓存消费者按 `cache_revisions` 的 revision 水位刷新：读取事件 → 事务内 `revision+1` → 重建脱敏视图 → 提交后写 Redis；失败记录 `attempts/last_error` 并照常 ACK，由周期 `RefreshDirty` 补偿，Redis 写失败不丢收敛、不会造成 DLQ 风暴。
 - 消费语义至少一次：成功提交 offset；失败同进程指数退避重试（100ms 起、上限 5s），达到 `MaxAttempts`（默认 5）后写 DLQ 再提交；重复投递由幂等与 MySQL 租约吸收。
 - 文档 worker 只有 Kafka 消费模式：`rag-service` 不内嵌消费者，`rag-document-worker` 消费 Debezium 投递的 `RAG_DOCUMENT_TOPIC`；未配置 Kafka 或未运行该 worker 时，上传仍受理但任务保持 `queued`。
-- Redis 用途：读模型展示缓存（短 TTL）与搜索结果读取缓存；排队搜索的任务状态与结果事实在 MySQL（`search_tasks`/`search_result_snapshots`），Redis 丢失只影响读取性能，可按 `result_id` 回源重建。
-- 配置了 Kafka 后 MCP `search` 自动排队；没有部署 `rag-search-worker` 时会一直排队到 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120s）后收敛为 `timed_out`。
+- Redis 用途：只承担读模型展示缓存（短 TTL）；搜索响应与 artifact 事实都不在 Redis（artifact 在 MySQL，按 ID 独立读取）。
+- 搜索为同步执行：一次调用完成检索 + 重排并返回证据；总预算由 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120s）约束，客户端取消会终止下游调用。
 
 ## 13. 运维与 CLI
 
 - 健康检查 `GET /health`；OpenAPI `GET /openapi.json`（OpenAPI 3.1.0）、交互文档 `GET /docs`。
 - `rag-state-migrate [--apply]`：状态库表结构检查/幂等创建；`rag-service-migrate` 默认只读预演，`--apply` 只导入源文件与文档记录，**不重建向量**，需要重新上传才会可检索；`rag-service-migrate --retire-outbox --yes` 显式删除 4 张已下线的 outbox 表。
-- `rag-cdc-cutover`：CDC 存量切换 CLI（`--inventory` 盘点、`--record-position` 记录 binlog 位点、`--backfill --baseline=N` 补投、`--mark-cache-baseline` 缓存基线、`--verify --baseline=N` 核对、`--all`），详见 [CDC 迁移契约](../cdc-migration.md) §8。
+- `rag-cdc-cutover`：CDC 存量切换 CLI（`--inventory` 盘点、`--record-position` 记录 binlog 位点、`--backfill --baseline=N` 补投、`--mark-cache-baseline` 缓存基线、`--verify --baseline=N` 核对、`--all`），只覆盖 `document_jobs` 与缓存表（搜索任务盘点/回填已随同步化改造删除），详见 [CDC 迁移契约](../cdc-migration.md) §8。
 - `rag-mcp-ingest`：递归导入本地文件/目录，输出 `OK/SKIP/FAIL` 与 `SUMMARY`；`--dry-run` 不打开运行时。
 - `docker compose up -d` 启动基础设施（MySQL 3307、Qdrant 6333、Redis 6379、Kafka 9092）与 `pdf-parser`（8091）；`--profile app` 构建并启动 Go 服务；默认启动 Debezium CDC。
 - `scripts/start-stack.ps1` 一键起依赖、建 topic、迁移并启动 `rag-service` + `rag-document-worker`；`stop-stack.ps1` 停止。
-- `scripts/verify-debezium-e2e.py`、`verify-kafka-dlq.py`、`verify-kafka-search.py` 是真实基础设施上的验证脚本（需要 Docker 与 Python 3）。
+- `scripts/verify-debezium-e2e.py`、`verify-kafka-dlq.py` 是真实基础设施上的验证脚本（需要 Docker 与 Python 3）；原 `verify-kafka-search.py`（MCP 排队搜索）已随功能删除。

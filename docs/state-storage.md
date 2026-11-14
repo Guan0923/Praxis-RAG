@@ -1,7 +1,8 @@
 # Shared state storage
 > **历史设计文档**：对应的 Python 后端实现已删除；当前 Go 实现位于 `internal/` 对应包，迁移状态与差异见 [GO_MIGRATION](GO_MIGRATION.md)。本文的 schema/契约描述仍作为共享状态层的设计参考。
 >
-> **2026-11-13 更新（事务 outbox 已下线）**：`document_job_outbox`、`search_task_outbox`、`cache_outbox`、`document_task_outbox` 已从活跃路径移除，改由两个 Debezium 连接器直接采集 `document_jobs`/`search_tasks` 与缓存相关业务表（见 [CDC 迁移契约](cdc-migration.md)）。本文中所有以 outbox 为中介的投递描述仅作历史记录；任务表新增 `schedule_version`，`cache_revisions` 扩展为 revision 水位，`search_result_snapshots` 改为活动的结果事实来源。
+> **2026-11-13 更新（事务 outbox 已下线）**：`document_job_outbox`、`search_task_outbox`、`cache_outbox`、`document_task_outbox` 已从活跃路径移除，改由两个 Debezium 连接器直接采集 `document_jobs` 与缓存相关业务表（见 [CDC 迁移契约](cdc-migration.md)）。本文中所有以 outbox 为中介的投递描述仅作历史记录；任务表新增 `schedule_version`，`cache_revisions` 扩展为 revision 水位。
+> **2026-11-13 二次更新（搜索同步化）**：排队搜索与结果快照已下线；`search_tasks`、`search_result_snapshots` 保留历史数据、不再读写（`retired; no longer read or written`），不 DROP、不清数据。搜索为同步执行，artifact 以 `artifact_snapshots` 为事实来源，保留期沿用 `RAG_RESULT_TTL_SECONDS=3600`。见 [产物引用](result-references.md)。
 
 
 Praxis-RAG keeps the retrieval index in Qdrant and permanent published data in
@@ -13,7 +14,7 @@ the queued-search task and the search result snapshot all live in MySQL. Kafka
 carries identifiers only; Redis holds display caches and search-result read
 caches, and is not part of the task-state or delivery path. **Since 2026-11-13**
 two Debezium connectors read MySQL tables directly (task connector:
-`document_jobs`/`search_tasks`; cache connector: eight read-model tables); the
+`document_jobs`; cache connector: eight read-model tables); the
 retired transactional outboxes are no longer written or polled.
 
 ## What is stored where
@@ -29,8 +30,8 @@ retired transactional outboxes are no longer written or polled.
 | Service API keys | `api_keys` |
 | Async document ingest jobs (complete request, file bytes, status, stage, lease) | `document_jobs` (MySQL, source of truth) |
 | Document task notifications (current) | Debezium task connector reads `document_jobs`; Kafka schema 4 identifier-only (`artifact_id/namespace/schedule_version`). The retired `document_job_outbox` is **no longer on the active path** |
-| MCP search tasks and notifications (current) | MySQL `search_tasks` (source of truth, `schedule_version`), Kafka schema 3 identifier-only notifications via the Debezium task connector |
-| Search result snapshots (current) | MySQL `search_result_snapshots` is the source of truth; Redis is a read cache that can be rebuilt from MySQL. `RAG_RESULT_TTL_SECONDS=3600` by default |
+| MCP search (current) | Fully synchronous: one `tools/call` runs retrieval + rerank and returns evidence; no task row, no notification, no polling. |
+| ~~Search result snapshots~~ | **retired 2026-11-13**: the queue, schema-3 notification, worker and snapshot read path were removed. `search_result_snapshots` rows are retained as history and are no longer read or written. Artifacts (`artifact_snapshots`) remain the durable reference, TTL `RAG_RESULT_TTL_SECONDS=3600`. |
 | Issued version-bound artifact snapshots | MySQL `artifact_snapshots` (bytes and expiry) |
 | Upload publication/recovery operations and business leases | MySQL UploadJournal tables (see below) |
 | Persistent read-model refresh revisions | MySQL `cache_revisions` (`revision`, `refreshed_revision`, `attempts`, `last_error`, `updated_at`); Debezium cache connector → separate cache Kafka topic. `cache_outbox` is retired |
@@ -110,9 +111,9 @@ migration CLI.
 | `document_batch_items` | `(batch_id, position)` | **active** per-file batch outcome: `saving`/`accepted`/`skipped`/`failed`, skip/failure reason, `artifact_id`, safe error text |
 | `document_tasks` | `artifact_id` | **legacy, inactive** asynchronous document task state |
 | `document_task_outbox` | `artifact_id` | **retired 2026-11-13** legacy initial-delivery metadata; dropped by `--retire-outbox` |
-| `search_tasks` | `result_id` | **active** queued-search task: arguments, deadline, `schedule_version`, status/stage |
+| `search_tasks` | `result_id` | **retired 2026-11-13**: queued-search task table retained as history; no longer read or written, not dropped |
 | `search_task_outbox` | `result_id` | **retired 2026-11-13**; dropped by `--retire-outbox` |
-| `search_result_snapshots` | `result_id` | **active** search result source of truth (envelope JSON, expiry); Redis is a read cache |
+| `search_result_snapshots` | `result_id` | **retired 2026-11-13**: result snapshot table retained as history; no longer read or written, not dropped. Artifacts live in `artifact_snapshots` |
 | `cache_revisions` | `(kind, scope)` | **active** read-model revision plus refresh watermark (`refreshed_revision`, `attempts`, `last_error`, `updated_at`) |
 | `cdc_cutover_state` | `k` | **transition-only** key/value state for the CDC cutover (`cdc_start_file`, `cdc_start_pos`, `cutover_at`, `schedule_baseline`, `phase`) |
 | `users` | `id`, unique `username`, unique nullable `email` | Console accounts: PBKDF2 password hash, role/enabled, profile columns `email_verified`/`age`/`gender` |
@@ -166,8 +167,9 @@ index and publish.
 ### Asynchronous notification delivery
 
 Kafka 通知统一由两个 Debezium 连接器从 MySQL 表级采集投递。API 只在 MySQL 单事务中提交
-文档任务（或搜索任务）；任务连接器读取 `document_jobs`/`search_tasks` 的 binlog 并分别发送到
-`RAG_DOCUMENT_TOPIC`/`RAG_SEARCH_TOPIC`，缓存连接器读取 8 张业务表并发送到 `RAG_CACHE_TOPIC`。
+文档任务；任务连接器只读取 `document_jobs` 的 binlog 并发送到 `RAG_DOCUMENT_TOPIC`，
+缓存连接器读取 8 张业务表并发送到 `RAG_CACHE_TOPIC`。搜索为同步执行，不产生通知，
+也没有搜索 topic/消费组（原 `search_tasks` 采集已删除）。
 应用没有 outbox 轮询发布器或投递模式开关（该机制已于 2026-11-13 下线）。
 连接器配置见 [deploy/debezium/README.md](../deploy/debezium/README.md) 与 [CDC 迁移契约](cdc-migration.md)。
 
@@ -178,21 +180,21 @@ Debezium change event (`{"before": ..., "after": {...}, "op": "c"}`) and reads
 `after`, so no extra SMT/script transform is required. The 10 MiB single-file
 limit is enforced when the job is committed.
 
-Queued search is accepted at MySQL commit: `SearchTasks.Submit` writes
-`search_tasks` and returns `result_id` without waiting for Kafka or Redis. The
-Debezium task connector delivers the schema-3 identifier-only notification and
-`rag-search-worker` reads the arguments back from MySQL; results are stored in
-`search_result_snapshots` (Redis is a read cache). For documents, Redis and Kafka
-are not on the acceptance path either; only MySQL availability (and a running
-consumer, to make progress) matters. Logs contain only task/operation IDs and
-safe error categories, never query text, file/message content or secrets.
+Search is fully synchronous (2026-11-13): `Service.Search` runs retrieval + rerank
+in the request and returns evidence directly, so there is no task row, schema-3
+notification or worker. `search_tasks`/`search_result_snapshots` are retained as
+history and are no longer read or written. For documents, Redis and Kafka are not
+on the acceptance path either; only MySQL availability (and a running consumer, to
+make progress) matters. Logs contain only task/operation IDs and safe error
+categories, never query text, file/message content or secrets.
 
 ### Kafka consumption and terminal state
 
-Document, search and persistent read-model cache refresh use separate topics and
-groups. Document, search and cache run in separate worker processes. The Go Kafka
-consumer adapter owns in-process retries and dead-letter publishing; all task
-state and result snapshots live in MySQL, never only in Redis.
+Document and persistent read-model cache refresh use separate topics and groups.
+Document and cache run in separate worker processes; search runs synchronously in
+`rag-service` (no topic, no worker since 2026-11-13). The Go Kafka
+consumer adapter owns in-process retries and dead-letter publishing; all document
+task state lives in MySQL, never only in Redis.
 
 A document notification is identifier-only: the worker loads the job from
 `document_jobs`, takes a SQL lease (`RAG_DOCUMENT_JOB_LEASE_SECONDS`, default 300
@@ -216,21 +218,22 @@ deliveries cannot overwrite an existing terminal status. UploadJournal
 independently prevents duplicate document publication; a replayed notification
 reconciles the committed journal result instead of publishing again.
 
-For search, success stores the result snapshot and terminal state in the same
-MySQL transaction before the offset is committed; deterministic failures write
-the terminal `failed` state in MySQL first. Duplicate/old `schedule_version`
-notifications are skipped. Redis loss does not affect result facts or durable
-deduplication. Nonterminal work is never committed as successful; in-flight
-model/Qdrant work is not forcibly cancelled by consumer shutdown.
+Search is executed synchronously and therefore has no consumer, no notification
+and no terminal-state transaction: the response is produced in the request and
+artifacts are committed to `artifact_snapshots` before returning. Search-related
+`schedule_version`/snapshot concepts are retired. Nonterminal work is never
+committed as successful; in-flight model/Qdrant work is cancelled when the
+request context is cancelled (client disconnect or `RAG_SEARCH_TIMEOUT_SECONDS`).
 
-The independent `rag-dead-letter-worker --kind document|search|cache` consumes
+The independent `rag-dead-letter-worker --kind document|cache` consumes
 the explicit dead-letter topics (`RAG_DOCUMENT_DLQ_TOPIC` /
-`RAG_SEARCH_DLQ_TOPIC` / `RAG_CACHE_DLQ_TOPIC`) with independent
+`RAG_CACHE_DLQ_TOPIC`) with independent
 `RAG_*_DLQ_GROUP` consumer groups and records nonterminal task failure before
-committing (document/search: `failed` in MySQL; cache: alert only, because the
+committing (document: `failed` in MySQL; cache: alert only, because the
 revision watermark is retried by `RefreshDirty`). It does not load models, infer,
 parse or rerun tasks. Dead-letter topics are explicitly configured rather than
-derived from a source group. Historical live verification covered the retired
+derived from a source group. The `--kind search` branch and `RAG_SEARCH_DLQ_*`
+were removed with synchronous search. Historical live verification covered the retired
 outbox pipeline; the dual-connector architecture has not been verified on a live
 cluster yet. See [VALIDATION](../VALIDATION.md) and
 [deployment](DEPLOYMENT.md).
@@ -409,8 +412,8 @@ recorded in [GO_MIGRATION](GO_MIGRATION.md) and [VALIDATION](../VALIDATION.md).
 
 ## Redis 状态读模型
 
-第一批缓存公开知识库配置、MCP catalog、文档列表及知识库列表/统计。第二批缓存 API Key 管理状态、发布指针、租约和事务/步骤/回滚的展示投影；实际鉴权、检索版本、上传事务租约执行权和日志恢复仍直接读取 MySQL。cache_revisions 与状态修改在 MySQL 同事务提交，随后由 Debezium 缓存连接器投递、`rag-cache-worker` 按 revision 水位刷新；Redis 故障时读模型回源，脏 key 由 `RefreshDirty` 重试。**异步文档任务状态与文件字节不经 Redis**：`document_jobs` 是权威，Redis 只承担展示缓存与搜索结果读取缓存。完整配置、启动和故障语义见 [状态缓存](state-cache.md)。
+第一批缓存公开知识库配置、MCP catalog、文档列表及知识库列表/统计。第二批缓存 API Key 管理状态、发布指针、租约和事务/步骤/回滚的展示投影；实际鉴权、检索版本、上传事务租约执行权和日志恢复仍直接读取 MySQL。cache_revisions 与状态修改在 MySQL 同事务提交，随后由 Debezium 缓存连接器投递、`rag-cache-worker` 按 revision 水位刷新；Redis 故障时读模型回源，脏 key 由 `RefreshDirty` 重试。**异步文档任务状态与文件字节不经 Redis**：`document_jobs` 是权威，Redis 只承担展示缓存；搜索为同步执行，不写 Redis。完整配置、启动和故障语义见 [状态缓存](state-cache.md)。
 
 ## UUID 结果与逻辑删除
 
-搜索快照以 MySQL `search_result_snapshots` 为事实来源，沿用 `RAG_RESULT_TTL_SECONDS=3600`；Redis 只是读取缓存，丢失可回源重建，超过过期时间且 MySQL 快照被清理后才不可用（可能需重新提交查询）。产物仍持久化于 MySQL `artifact_snapshots`，已签发 artifact 的版本固定及到期前保留保证不变；不要将该保证扩展到搜索结果 UUID。文档删除通过 del_flag 隐藏，不物理删除持久化源文件和 Qdrant 数据。正常自动 schema 为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [UUID 引用与迁移](result-references.md)。
+artifact 以 MySQL `artifact_snapshots` 为事实来源，沿用 `RAG_RESULT_TTL_SECONDS=3600`（语义为 artifact TTL）；已签发 artifact 的版本固定及到期前保留保证不变。`search_tasks`/`search_result_snapshots` 保留历史数据但不再读写，因此不存在“搜索结果 UUID 回源”路径，重新检索即可获得新证据。文档删除通过 del_flag 隐藏，不物理删除持久化源文件和 Qdrant 数据。正常自动 schema 为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [产物引用](result-references.md)。

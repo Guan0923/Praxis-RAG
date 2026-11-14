@@ -4,23 +4,23 @@
 
 | 实例 | Compose 服务 / 容器 | 采集表 | 投递 topic（env） | 消费组（env） | 健康端口（loopback） | 状态卷 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 任务连接器 | `debezium` / `praxis-rag-debezium` | `document_jobs`、`search_tasks` | `RAG_DOCUMENT_TOPIC`、`RAG_SEARCH_TOPIC` | `RAG_DOCUMENT_GROUP`、`RAG_SEARCH_GROUP` | `RAG_DEBEZIUM_PORT`（8083） | `debezium_data` |
+| 任务连接器 | `debezium` / `praxis-rag-debezium` | `document_jobs` | `RAG_DOCUMENT_TOPIC` | `RAG_DOCUMENT_GROUP` | `RAG_DEBEZIUM_PORT`（8083） | `debezium_data` |
 | 缓存连接器 | `debezium-cache` / `praxis-rag-debezium-cache` | `knowledge_bases`、`documents`、`mcp_catalogs`、`api_keys`、`document_heads`、`document_leases`、`upload_operations`、`upload_steps` | `RAG_CACHE_TOPIC` | `RAG_CACHE_GROUP` | `RAG_DEBEZIUM_CACHE_PORT`（8084） | `debezium_cache_data` |
 
 配置分别在 `application.properties`（任务）与 `application-cache.properties`（缓存），
 契约来源是 [`docs/cdc-migration.md`](../../docs/cdc-migration.md) §1–§5、§10。
 
 ```text
-document_jobs ──┐ 任务连接器：只投递 INSERT 与 schedule_version 变化
-search_tasks  ──┴──► RAG_DOCUMENT_TOPIC / RAG_SEARCH_TOPIC ──► rag-document-worker / rag-search-worker
+document_jobs ─────► 任务连接器：只投递 INSERT 与 schedule_version 变化 ──► RAG_DOCUMENT_TOPIC ──► rag-document-worker
 
 knowledge_bases、documents、mcp_catalogs、api_keys、document_heads、document_leases、
 upload_operations、upload_steps ──► 缓存连接器：全量 c/u/d ──► RAG_CACHE_TOPIC ──► rag-cache-worker
 ```
 
-MySQL 仍是唯一事实来源，Kafka 只传通知；消息只带定位标识（`artifact_id`/`result_id`/
-`namespace`/`schedule_version`、缓存表定位列），任务参数、检索参数、文件字节、KB settings、
-catalog data、凭据等一律不经过 Kafka，由消费者按 ID 回 MySQL 读取。
+MySQL 仍是唯一事实来源，Kafka 只传通知；消息只带定位标识（`artifact_id`/`namespace`/
+`schedule_version`、缓存表定位列），任务参数、文件字节、KB settings、catalog data、
+凭据等一律不经过 Kafka，由消费者按 ID 回 MySQL 读取。搜索为同步执行，不经过 Kafka，
+也没有搜索任务表/通知（`search_tasks` 为历史表，保留数据但不再读写）。
 
 ## 为什么必须拆成两个连接器
 
@@ -60,9 +60,9 @@ RAG_DEBEZIUM_CACHE_HEALTH_URL=http://127.0.0.1:8084/q/health
 ```
 
 脚本会依次：起依赖（含两个 Debezium 连接器）→ 等 MySQL healthy → 等 Kafka healthy →
-显式创建/校验 3 个业务 topic 与 3 个 DLQ topic → 执行 `rag-state-migrate --apply` →
+显式创建/校验 2 个业务 topic 与 2 个 DLQ topic（文档/缓存）→ 执行 `rag-state-migrate --apply` →
 等待两个连接器 `/q/health` 为 UP 且日志出现 `Starting streaming` → 启动 `rag-service`、
-`rag-document-worker` 与 `rag-cache-worker`。`rag-search-worker` 按需单独启动。
+`rag-document-worker` 与 `rag-cache-worker`。搜索为同步执行，不需要额外 worker。
 只想准备依赖与数据库时加 `-MigrateOnly`。
 
 ### Go 后端使用
@@ -71,11 +71,10 @@ RAG_DEBEZIUM_CACHE_HEALTH_URL=http://127.0.0.1:8084/q/health
 pwsh -File scripts/build-go.ps1 -SkipFrontend   # 构建 dist/bin
 dist\bin\rag-service.exe                        # API（提交即受理，不再发布通知）
 dist\bin\rag-document-worker.exe                # 消费 RAG_DOCUMENT_TOPIC
-dist\bin\rag-search-worker.exe                  # 消费 RAG_SEARCH_TOPIC
 dist\bin\rag-cache-worker.exe                   # 消费 RAG_CACHE_TOPIC（缓存读模型）
 ```
 
-四者的 `RAG_*` / `RAG_MYSQL_*` / `RAG_KAFKA_*` 环境必须一致；状态库必须是 MySQL。
+三者的 `RAG_*` / `RAG_MYSQL_*` / `RAG_KAFKA_*` 环境必须一致；状态库必须是 MySQL。
 端到端验证脚本：`python scripts/verify-debezium-e2e.py`（需要本目录的 compose 栈与
 `dist/bin` 已就绪，脚本使用临时 fake 模型 API，不会写入真实知识库配置）。
 
@@ -94,11 +93,11 @@ dist\bin\rag-cache-worker.exe                   # 消费 RAG_CACHE_TOPIC（缓�
 
 ## 消息长什么样
 
-### 任务连接器（document_jobs / search_tasks）
+### 任务连接器（document_jobs）
 
 `application.properties` 的 `column.include.list` 只保留
-`artifact_id/namespace/schedule_version`（document）与 `result_id/namespace/schedule_version`
-（search），因此 topic 上的物理事件形如（`value.schemas.enable=false`）：
+`artifact_id` / `namespace` / `schedule_version`，因此 topic 上的物理事件形如
+（`value.schemas.enable=false`）：
 
 ```json
 {"before":null,
@@ -109,11 +108,12 @@ dist\bin\rag-cache-worker.exe                   # 消费 RAG_CACHE_TOPIC（缓�
 ```
 
 - `op`：首次快照为 `r`，事务内新受理为 `c`，重发（调度版本递增）为 `u`。
-- 两个 `ByLogicalTableRouter` 把 `document_jobs` 路由到 `RAG_DOCUMENT_TOPIC`、
-  `search_tasks` 路由到 `RAG_SEARCH_TOPIC`；`key.enforce.uniqueness=false` 保留原始行 key。
+- 一个 `ByLogicalTableRouter` 把 `document_jobs` 路由到 `RAG_DOCUMENT_TOPIC`；
+  `key.enforce.uniqueness=false` 保留原始行 key。
 - 消费者兼容“应用原生 envelope”（便于单测和手工补发）：
-  `{"schema":4,"artifact_id":"...","namespace":"...","schedule_version":3}`（文档）与
-  `{"schema":3,"result_id":"...","namespace":"...","schedule_version":2}`（搜索）。
+  `{"schema":4,"artifact_id":"...","namespace":"...","schedule_version":3}`。
+- **搜索已改为同步执行**：`search_tasks` 是历史表（保留历史数据、不再写入也不再读取），
+  不再采集、不再路由到 `RAG_SEARCH_TOPIC`，也不再有搜索 worker/DLQ。
 
 ### 缓存连接器（定位列白名单）
 
@@ -139,7 +139,7 @@ dist\bin\rag-cache-worker.exe                   # 消费 RAG_CACHE_TOPIC（缓�
    因此心跳/进度/终态 UPDATE 被连接器丢弃，唯一被投递的 UPDATE 是 `schedule_version` 递增。
 3. `skipped.operations=d`：`GCJobs`/切换脚本的清理 DELETE 不进入业务 topic，也不产生 tombstone。
 
-即使过滤配置失效，消费者按“`artifact_id`/`result_id` + `namespace` + `schedule_version`
+即使过滤配置失效，消费者按“`artifact_id` + `namespace` + `schedule_version`
 相等 + 租约/状态条件”领取，重复或过期通知会被安全跳过并 ACK（至少一次投递的幂等要求）。
 
 ### 首次快照、断点恢复、删除与重复投递
@@ -162,7 +162,7 @@ dist\bin\rag-cache-worker.exe                   # 消费 RAG_CACHE_TOPIC（缓�
 
 | 组件 | 职责 |
 | --- | --- |
-| MySQL `document_jobs` / `search_tasks` | 任务事实与 `schedule_version`；所有状态变更都在事务内 |
+| MySQL `document_jobs` | 任务事实与 `schedule_version`；所有状态变更都在事务内 |
 | Debezium（两个连接器） | 读取 binlog 并投递 Kafka；**不回写** MySQL 状态 |
 | Kafka 消费组 | 记录消费位点与滞后 |
 | `rag-cache-worker` | 消费缓存事件，递增 `cache_revisions` 并重建 Redis 读模型（失败由 `refreshed_revision < revision` 兜底重试） |
@@ -186,7 +186,7 @@ Compose 把两个连接器的 Quarkus 健康端口发布到宿主机 loopback：
 # 1. 两个容器是否都 healthy/running（不要只看一个）
 docker inspect --format "{{.State.Status}}" praxis-rag-debezium praxis-rag-debezium-cache
 
-# 2. broker API 可达 + 三个业务 topic 与三个 DLQ topic 存在
+# 2. broker API 可达 + 两个业务 topic 与两个 DLQ topic 存在
 docker exec praxis-rag-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
 
 # 3. 两个连接器是否都在 streaming

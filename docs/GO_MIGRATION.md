@@ -1,6 +1,6 @@
 # 后端 Go 重构总纲
 
-当前 Kafka 通知只由两个 Debezium 连接器（任务/缓存）从 MySQL 表级采集投递，应用不再写事务 outbox；早期章节中的 relay、outbox 与单连接器记录是历史实现，当前变更见文末 2026-11-13 的说明。
+当前 Kafka 通知只由两个 Debezium 连接器（任务/缓存）从 MySQL 表级采集投递，应用不再写事务 outbox；早期章节中的 relay、outbox 与单连接器记录是历史实现，当前变更见文末 2026-11-13 的说明。搜索已于 2026-11-13 改为同步直返：正文中的排队搜索、结果快照、`get_search_result`、`wait_seconds` 与 `/v1/search-results` 记录均为历史，被文末「第十八轮」取代。
 
 ## REST 上传接口统一（2026-11-12）
 
@@ -438,3 +438,15 @@ REST /v1/admin/tools -> 6 tools
 - **CLI/运维**：新增 `cmd/rag-cdc-cutover`（`--inventory`/`--record-position`/`--backfill`/`--mark-cache-baseline`/`--verify`/`--all`）；`cmd/rag-service-migrate --retire-outbox --yes` 显式删除四张旧表；`cmd/rag-service-migrate` 其余行为不变。
 - **文档**：README、USAGE、DEPLOYMENT、state-cache、result-references、state-storage、agents 文档同步；所有 outbox 描述删除或标注“已下线”；`VALIDATION.md` 追加本次验证范围与未实机项。
 - **未验证**：真实 Docker/Debezium/Kafka/Redis 双连接器链路、缓存 revision 收敛、搜索 MySQL 回源、存量切换/回滚演练均未实机执行，见 `VALIDATION.md`。
+
+### 2026-11-13 第十八轮：搜索同步化（排队搜索与结果快照下线）
+
+> 本轮取代第十七轮中的搜索链路描述；第十七轮正文保留为历史记录。
+
+- **契约**：MCP 工具固定 5 个（`search`/`add_document`/`update_document`/`delete_document`/`get_document_status`），`search` 删除 `wait_seconds`，`get_search_result` 删除；`POST /v1/search` 同步返回，响应删除 `result_id`/`created_at`/`expires_at`/`snapshot_available`/`snapshot_error`；`GET /v1/search-results/{result_id}` 删除；`/v1/artifacts/*` 与 410 映射保留。
+- **执行**：`runtime.Service.Search` → `SearchEngine.Search` 单入口同步执行，`RAG_SEARCH_TIMEOUT_SECONDS` 改作同步检索总预算（默认 120s），超时映射 503，取消向下传递；MCP SDK 开启 `PropagateRequestCancellation`；受限 scope 真正执行同步检索并按 `DocumentIDs` 过滤。
+- **删除**：`internal/runtime/queued_search.go`、`Service.SubmitSearch`/`GetSearchResult`、`SearchEngine.GetSearchResult`、`messageRestrictedSearchQueued`、`QueuedSearchRequest*`、`SearchResultRequest`、`MaxResultPage`；`internal/state/search_tasks.go`、`internal/redisstate/snapshot_index.go`、`internal/searchworker/`、`cmd/rag-search-worker/`、死信 `--kind search`、搜索 schema-3 envelope、搜索 topic/group/DLQ 与 `RAG_SEARCH_*`（除 `RAG_SEARCH_TIMEOUT_SECONDS`）。
+- **保留**：`search_tasks`、`search_result_snapshots` 表 DDL 保留（注释 `retired; no longer read or written`），不 DROP、不清数据；artifact（`artifact_snapshots`）与 `RAG_RESULT_TTL_SECONDS` 语义不变；`apierrors.SnapshotUnavailable` 常量保留用于 artifact 410。
+- **未变**：文档入库（`document_jobs` + schema 4 + `rag-document-worker`）与缓存链路（Debezium 缓存连接器 → `rag-cache-worker` → revision 水位）完全不变。
+- **文档**：README、USAGE、DEPLOYMENT（新增 §11 变更速查、§12 迁移与切换）、cdc-migration（§12 迁移入口）、state-cache、state-storage、result-references（重写为 artifact 主题）、agents 文档、`AGENTS.md`、`internal/mcp/NOTES.md` 同步；`VALIDATION.md` 顶部标注旧记录过期。
+- **未验证**：同步搜索超时/取消、artifact 独立读取、受限 scope 过滤、迁移/回滚演练均未在真实 Docker/Kafka/Redis 环境执行，见 `VALIDATION.md`。

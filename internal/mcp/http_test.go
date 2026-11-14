@@ -18,10 +18,9 @@ import (
 )
 
 const (
-	testToken    = "test-token"
-	manualsNS    = "manuals"
-	otherNS      = "other"
-	searchResult = "3c1b9d0e-1111-4c2a-9f3e-9d0e11114c2a"
+	testToken = "test-token"
+	manualsNS = "manuals"
+	otherNS   = "other"
 )
 
 // newTestHTTPHandler builds an Endpoint plus the dual-era /mcp handler with the
@@ -231,7 +230,13 @@ func toolErrorText(t *testing.T, payload map[string]any) string {
 
 func TestLegacyProtocolLifecycle(t *testing.T) {
 	runtime := newFakeRuntime()
-	_, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	runtime.searchPayload = map[string]any{
+		"query":           "first",
+		"namespace":       manualsNS,
+		"evidence_status": "found",
+		"results":         []any{},
+	}
+	_, server := newTestHTTPHandler(t, runtime, Options{})
 	client := newRawRPC(t, server.URL, manualsNS)
 
 	initialized := client.initialize()
@@ -255,26 +260,26 @@ func TestLegacyProtocolLifecycle(t *testing.T) {
 	for _, tool := range tools {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	want := []string{"search", "get_search_result", "add_document", "update_document", "delete_document", "get_document_status"}
+	want := []string{"search", "add_document", "update_document", "delete_document", "get_document_status"}
 	if strings.Join(names, ",") != strings.Join(want, ",") {
 		t.Fatalf("tools = %v, want %v", names, want)
 	}
 	searchTool := tools[0].(map[string]any)
-	waitSeconds := searchTool["inputSchema"].(map[string]any)["properties"].(map[string]any)["wait_seconds"].(map[string]any)
-	if waitSeconds["default"] != float64(10) {
-		t.Fatalf("wait_seconds = %#v", waitSeconds)
+	searchProperties := searchTool["inputSchema"].(map[string]any)["properties"].(map[string]any)
+	if _, ok := searchProperties["wait_seconds"]; ok {
+		t.Fatalf("synchronous search must not expose wait_seconds")
 	}
 	searchAnnotations := searchTool["annotations"].(map[string]any)
 	if searchAnnotations["readOnlyHint"] != true || searchAnnotations["idempotentHint"] != true ||
 		searchAnnotations["destructiveHint"] != false || searchAnnotations["openWorldHint"] != false {
 		t.Fatalf("search annotations = %#v", searchAnnotations)
 	}
-	addAnnotations := tools[2].(map[string]any)["annotations"].(map[string]any)
+	addAnnotations := tools[1].(map[string]any)["annotations"].(map[string]any)
 	if addAnnotations["readOnlyHint"] != false || addAnnotations["destructiveHint"] != false ||
 		addAnnotations["idempotentHint"] != false || addAnnotations["openWorldHint"] != false {
 		t.Fatalf("add_document annotations = %#v", addAnnotations)
 	}
-	updateAnnotations := tools[3].(map[string]any)["annotations"].(map[string]any)
+	updateAnnotations := tools[2].(map[string]any)["annotations"].(map[string]any)
 	if updateAnnotations["destructiveHint"] != true || updateAnnotations["readOnlyHint"] != false {
 		t.Fatalf("update_document annotations = %#v", updateAnnotations)
 	}
@@ -297,12 +302,13 @@ func TestLegacyProtocolLifecycle(t *testing.T) {
 		t.Fatalf("unknown tool error = %q", text)
 	}
 
-	read, _ := client.call("tools/call", map[string]any{
-		"name": "get_search_result", "arguments": map[string]any{"result_id": searchResult},
+	// get_search_result was removed with the queued flow: it is an unknown tool
+	// now, and search itself already returned the evidence above.
+	removed, _ := client.call("tools/call", map[string]any{
+		"name": "get_search_result", "arguments": map[string]any{"result_id": "123e4567-e89b-12d3-a456-426614174000"},
 	})
-	readPayload := toolPayload(t, read)
-	if readPayload["status"] != "succeeded" || readPayload["result_id"] != searchResult {
-		t.Fatalf("get_search_result payload = %#v", readPayload)
+	if text := toolErrorText(t, removed); text != "Unknown or disabled RAG tool: get_search_result" {
+		t.Fatalf("get_search_result error = %q", text)
 	}
 
 	prompts, _ := client.call("prompts/list", nil)
@@ -313,7 +319,7 @@ func TestLegacyProtocolLifecycle(t *testing.T) {
 
 func TestLegacySessionIsNamespaceBound(t *testing.T) {
 	runtime := newFakeRuntime()
-	_, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	_, server := newTestHTTPHandler(t, runtime, Options{})
 	manuals := newRawRPC(t, server.URL, manualsNS)
 	manuals.initialize()
 
@@ -369,7 +375,13 @@ func newModernClientWithOptions(t *testing.T, server *httptest.Server, namespace
 
 func TestModernProtocolLifecycle(t *testing.T) {
 	runtime := newFakeRuntime()
-	endpoint, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	runtime.searchPayload = map[string]any{
+		"query":           "modern",
+		"namespace":       manualsNS,
+		"evidence_status": "found",
+		"results":         []any{},
+	}
+	endpoint, server := newTestHTTPHandler(t, runtime, Options{})
 	session := newModernClient(t, server, manualsNS)
 	ctx := context.Background()
 
@@ -381,13 +393,12 @@ func TestModernProtocolLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
 	}
-	if len(listed.Tools) != 6 || listed.Tools[0].Name != "search" {
+	if len(listed.Tools) != 5 || listed.Tools[0].Name != "search" {
 		t.Fatalf("tools = %#v", listed.Tools)
 	}
 	searchSchema := listed.Tools[0].InputSchema.(map[string]any)
-	waitSeconds := searchSchema["properties"].(map[string]any)["wait_seconds"].(map[string]any)
-	if waitSeconds["default"] != float64(10) {
-		t.Fatalf("wait_seconds = %#v", waitSeconds)
+	if _, ok := searchSchema["properties"].(map[string]any)["wait_seconds"]; ok {
+		t.Fatalf("synchronous search must not expose wait_seconds")
 	}
 
 	called, err := session.CallTool(ctx, &sdk.CallToolParams{
@@ -474,7 +485,8 @@ func manualNSForTest() string { return manualsNS }
 
 func TestModernNamespaceIsolationAndDisable(t *testing.T) {
 	runtime := newFakeRuntime()
-	endpoint, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	runtime.searchPayload = map[string]any{"namespace": otherNS, "evidence_status": "found", "results": []any{}}
+	endpoint, server := newTestHTTPHandler(t, runtime, Options{})
 	manuals := newModernClient(t, server, manualsNS)
 	other := newModernClient(t, server, otherNS)
 	ctx := context.Background()
@@ -494,8 +506,8 @@ func TestModernNamespaceIsolationAndDisable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list manuals tools: %v", err)
 	}
-	if len(listed.Tools) != 5 {
-		t.Fatalf("manuals tools = %d, want 5", len(listed.Tools))
+	if len(listed.Tools) != 4 {
+		t.Fatalf("manuals tools = %d, want 4", len(listed.Tools))
 	}
 	blocked, err := manuals.CallTool(ctx, &sdk.CallToolParams{Name: "search", Arguments: map[string]any{"query": "x"}})
 	if err != nil {
@@ -509,8 +521,8 @@ func TestModernNamespaceIsolationAndDisable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list other tools: %v", err)
 	}
-	if len(otherTools.Tools) != 6 {
-		t.Fatalf("other tools = %d, want 6", len(otherTools.Tools))
+	if len(otherTools.Tools) != 5 {
+		t.Fatalf("other tools = %d, want 5", len(otherTools.Tools))
 	}
 	called, err := other.CallTool(ctx, &sdk.CallToolParams{Name: "search", Arguments: map[string]any{"query": "other"}})
 	if err != nil || called.IsError {
@@ -527,7 +539,7 @@ func TestModernNamespaceIsolationAndDisable(t *testing.T) {
 
 func TestHTTPTransportSecurity(t *testing.T) {
 	runtime := newFakeRuntime()
-	_, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	_, server := newTestHTTPHandler(t, runtime, Options{})
 	initializeBody := map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "initialize",
 		"params": map[string]any{
@@ -647,7 +659,7 @@ func TestNamespaceCallbackForbidden(t *testing.T) {
 
 func TestLegacyToolListChangedNotification(t *testing.T) {
 	runtime := newFakeRuntime()
-	endpoint, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	endpoint, server := newTestHTTPHandler(t, runtime, Options{})
 	client := newRawRPC(t, server.URL, manualsNS)
 	client.initialize()
 

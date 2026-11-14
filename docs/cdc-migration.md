@@ -1,29 +1,29 @@
 # CDC 迁移：从事务 outbox 到 Debezium 表级采集
 
 - 状态：实施中。本文件是本次迁移的**唯一契约来源**；代码、配置、脚本与本文冲突时以本文为准，变更需同时更新本文。
-- 迁移目标：删除 `document_job_outbox`、`search_task_outbox`、`cache_outbox`、历史 `document_task_outbox` 的写入/轮询/补发/清理；改由 Debezium 直接采集**任务表**和**影响缓存的业务表**，按表与事件用途路由到三个独立 topic；MySQL 仍是唯一事实来源，Kafka 只传通知。
+- 迁移目标：删除 `document_job_outbox`、`search_task_outbox`、`cache_outbox`、历史 `document_task_outbox` 的写入/轮询/补发/清理；改由 Debezium 直接采集**任务表**和**影响缓存的业务表**，按表与事件用途路由到独立 topic；MySQL 仍是唯一事实来源，Kafka 只传通知。
+- **2026-11-13 二次调整（搜索同步化）**：搜索改为一次调用同步返回，搜索任务/结果快照/搜索 topic/消费者/死信全部下线；`search_tasks`、`search_result_snapshots` 保留历史数据、不再读写。因此本文的搜索链路（schema 3 通知、搜索 worker、提交即受理、结果快照）均标为**历史/已下线**，迁移入口见 §12。文档任务（schema 4）与缓存链路不变。
 
 ## 1. 目标架构
 
 ```text
                     ┌──────────────────── Debezium（任务连接器，只采集 INSERT / schedule_version 变化）────────────────────┐
 document_jobs ──────┤ skipped.operations=d；column.include.list 只含 artifact_id/namespace/schedule_version；               ├─► praxis_document_ingest
-search_tasks  ──────┤ skip.messages.without.change=true；ByLogicalTableRouter 按表路由                                      ├─► praxis_search
+                    │ skip.messages.without.change=true；ByLogicalTableRouter 按表路由                                      │
                     └──────────────────────────────────────────────────────────────────────────────────────────────────────┘
                     ┌──────────── Debezium（缓存连接器，采集影响缓存读模型的业务表，全量 c/u/d）───────────────┐
 knowledge_bases ────┤ column.include.list 只含定位标识；ByLogicalTableRouter 路由到单一缓存 topic                ├─► praxis_state_cache_refresh
 documents / mcp_catalogs / api_keys / document_heads / document_leases / upload_operations / upload_steps ─┘
 ```
 
-三个消费者完全独立，各自一个 topic + 消费组：
+两个消费者完全独立，各自一个 topic + 消费组（搜索为同步执行，不再有消费者）：
 
 | 事件类 | Topic（环境变量） | 消费组（环境变量） | 消费者 |
 | --- | --- | --- | --- |
 | 文档任务 | `RAG_DOCUMENT_TOPIC`（默认 `praxis_document_ingest`） | `RAG_DOCUMENT_GROUP`（默认 `praxis_document_ingest_workers`） | `cmd/rag-document-worker` |
-| 搜索任务 | `RAG_SEARCH_TOPIC`（默认 `praxis_search`） | `RAG_SEARCH_GROUP`（默认 `praxis_search_workers`） | `cmd/rag-search-worker` |
 | 缓存变更 | `RAG_CACHE_TOPIC`（默认 `praxis_state_cache_refresh`） | `RAG_CACHE_GROUP`（默认 `praxis_state_cache_refresh_workers`） | `cmd/rag-cache-worker`（新增） |
 
-约束：topic 与消费组不得复用；DLQ topic 各自独立（`RAG_DOCUMENT_DLQ_TOPIC` / `RAG_SEARCH_DLQ_TOPIC` / `RAG_CACHE_DLQ_TOPIC`）。DLQ 消费组同样独立。
+约束：topic 与消费组不得复用；DLQ topic 各自独立（`RAG_DOCUMENT_DLQ_TOPIC` / `RAG_CACHE_DLQ_TOPIC`）。DLQ 消费组同样独立。原搜索 topic/消费组/DLQ（`RAG_SEARCH_*`、`praxis_search`）已随搜索同步化下线。
 
 ## 2. 事件契约
 
@@ -47,9 +47,11 @@ Debezium 物理事件形如（`column.include.list` 已保证 `content` 等字�
 - 删除事件（`op=d`、tombstone、`before`-only）不是任务：直接 ACK，不重试、不进 DLQ。
 - 调度版本不匹配、任务已终态、租约仍有效的记录一律安全跳过并 ACK（至少一次投递下的幂等要求）。
 
-### 2.2 搜索任务通知（schema 3）
+### 2.2 搜索任务通知（schema 3，已下线）
 
-原 schema 2 携带完整 `arguments`/`deadline`/`expires_at`；新契约只携带定位标识，参数回 MySQL 读取。
+> **历史（2026-11-13 已删除）**：搜索改为同步执行，不再有 `search_tasks` 通知、schema 3 envelope、搜索 topic/group 或 `rag-search-worker`。以下仅存档，不再实现；`search_tasks` 表保留历史数据、不再读写。
+
+原 schema 2 携带完整 `arguments`/`deadline`/`expires_at`；schema 3 只携带定位标识，参数回 MySQL 读取。
 
 ```json
 {"schema":3,"result_id":"<uuid>","namespace":"<ns>","schedule_version":2}
@@ -75,8 +77,9 @@ Debezium 物理事件形如（`column.include.list` 已保证 `content` 等字�
 
 ```sql
 ALTER TABLE document_jobs ADD COLUMN schedule_version BIGINT NOT NULL DEFAULT 1;
-ALTER TABLE search_tasks  ADD COLUMN schedule_version BIGINT NOT NULL DEFAULT 1;
 ```
+
+搜索任务已下线：迁移不再给 `search_tasks` 追加 `schedule_version`（历史列保留原样）。
 
 `cache_revisions` 从"只有版本号"扩展为"缓存脏状态 + 刷新水位"：
 
@@ -91,7 +94,7 @@ ALTER TABLE cache_revisions ADD COLUMN updated_at DOUBLE NOT NULL DEFAULT 0;
 
 ### 3.2 复用既有表
 
-- `search_result_snapshots`（已存在）成为**搜索结果事实来源**：`id=result_id`、`namespace`、`content`（同一 envelope JSON）、`created_at`、`expires_at`。Redis 只作读取缓存。
+- `search_result_snapshots`（已存在）**保留为历史表**：搜索同步化后不再写入、不再读取，也不 DROP；artifact 事实来源改为 `artifact_snapshots`（见 [产物引用](result-references.md)）。
 - `cache_revisions` 保持 `(kind, scope)` 主键和 `revision` 单调递增语义。
 
 ### 3.3 退役表
@@ -111,8 +114,8 @@ cdc_cutover_state (k VARCHAR(64) PRIMARY KEY, v LONGTEXT NOT NULL)
 ### 4.1 版本规则
 
 - 新任务在受理事务内 `schedule_version = 1` 写入。
-- **重发只发生在 MySQL 事务内**：长期停留 `queued` 需要补发、`processing` 租约过期需要重新排队、可重试失败需要再次执行时，执行
-  `UPDATE ... SET schedule_version = schedule_version + 1, status='queued', stage='retry_wait', owner=NULL, lease_until=0, retry_at=?, updated_at=? WHERE artifact_id=? AND ...`（搜索为 `result_id`）。
+- **重发只发生在 MySQL 事务内**：长期停留 `queued` 需要补发、`processing` 租约过期需要重新排队、可重试失败需要再次执行时，对 `document_jobs` 执行
+  `UPDATE ... SET schedule_version = schedule_version + 1, status='queued', stage='retry_wait', owner=NULL, lease_until=0, retry_at=?, updated_at=? WHERE artifact_id=? AND ...`（搜索任务已下线，无重发语义）。
 - 同一任务可多次递增；消费者只处理与数据库当前 `schedule_version` 相等的通知。
 - 心跳、进度、完成/失败终态都是普通 UPDATE，**不递增版本**。
 
@@ -120,11 +123,11 @@ cdc_cutover_state (k VARCHAR(64) PRIMARY KEY, v LONGTEXT NOT NULL)
 
 任务连接器同时使用三个连接器级配置（无需脚本 SMT，库存镜像即可运行）：
 
-1. `column.include.list`：只包含 `artifact_id/namespace/schedule_version`（文档）与 `result_id/namespace/schedule_version`（搜索）。心跳列（`lease_until`）、进度列（`stage/operation_id`）、终态列（`status/error/owner/content` 等）不在采集列内。
+1. `column.include.list`：只包含 `artifact_id/namespace/schedule_version`（`document_jobs`）。心跳列（`lease_until`）、进度列（`stage/operation_id`）、终态列（`status/error/owner/content` 等）不在采集列内。搜索表不采集。
 2. `skip.messages.without.change=true`：UPDATE 事件只有在**被采集列**发生变化时才投递。因此心跳/进度/终态 UPDATE 被连接器丢弃；只有 `schedule_version` 递增的 UPDATE 会被投递。这是"同一任务需要再次执行"的唯一 UPDATE 信号。
 3. `skipped.operations=d`：`GCOutbox`/`GCJobs` 一类清理 DELETE 不进入业务 topic（也不再产生 tombstone）。
 
-补充：首次启动的初始快照会为两张任务表的**现存行**投递 `op=r` 事件（快照不受 `skipped.operations` 影响）。消费者对终态/已领取/版本不符的行安全跳过；对遗留的未完成任务则天然完成一次补投——切换阶段依赖这一特性（见 §8）。
+补充：首次启动的初始快照会为 `document_jobs` 的**现存行**投递 `op=r` 事件（快照不受 `skipped.operations` 影响）。消费者对终态/已领取/版本不符的行安全跳过；对遗留的未完成任务则天然完成一次补投——切换阶段依赖这一特性（见 §8）。
 
 ### 4.3 为什么不用 Filter SMT
 
@@ -144,9 +147,11 @@ Debezium 的行级过滤 `io.debezium.transforms.Filter` 依赖 JSR-223 脚本�
 4. 成功：`Reconcile` 确认 journal 发布已提交后写 `succeeded`；失败：可重试则按 §4.1 递增版本重新排队，不可重试写 `failed`。
 5. **只有 DB 已记录领取、跳过或终态后才 ACK**；DB 不可用/写失败返回 nack，交给消费重试与 DLQ。
 
-### 5.2 搜索任务
+### 5.2 搜索任务（已下线）
 
-同上，但 `Claim` 条件增加 `deadline > now`；逾期在 `Claim`/`Get`/`Expire` 三处收敛为 `timed_out`。成功时在**同一 MySQL 事务**内写 `search_result_snapshots` 并把任务置 `succeeded`（见 §6），提交后才 ACK。
+> **历史（2026-11-13 已删除）**：搜索不再有 `Claim`/`Complete`/`Expire` 或 `search_result_snapshots` 写入。同步搜索在请求内完成检索 + 重排并直接返回；artifact 写入 `artifact_snapshots`，超时/取消由 `RAG_SEARCH_TIMEOUT_SECONDS` 与请求 ctx 约束。下文仅存档原排队实现。
+
+原排队实现：`Claim` 条件增加 `deadline > now`；逾期在 `Claim`/`Get`/`Expire` 三处收敛为 `timed_out`。成功时在**同一 MySQL 事务**内写 `search_result_snapshots` 并把任务置 `succeeded`，提交后才 ACK。
 
 ### 5.3 提交位点原则
 
@@ -157,23 +162,17 @@ ACK（提交 Kafka 位点）当且仅当：
 
 Redis 写入失败、缓存刷新失败不是 nack 理由：缓存有独立的重试水位（§7.3），任务事实在 MySQL。
 
-## 6. 搜索受理与结果事实来源
+## 6. 搜索同步化后的事实来源（替代原“提交即受理/结果快照”）
 
-### 6.1 提交即受理
+### 6.1 同步直返
 
-`SearchTasks.Submit` 只做一件事：单事务写入 `search_tasks`（`arguments`、`deadline`、`status=queued`、`schedule_version=1`）并提交，返回 `result_id`。**不再等待 Kafka 确认**，也不再回滚失败任务。
+`runtime.Service.Search` 在一次请求内完成检索 + 重排并返回证据；`RAG_SEARCH_TIMEOUT_SECONDS`（默认 120 秒）在服务内派生 deadline，客户端断开/取消向下传递到 Qdrant 与模型调用。没有任务行、没有提交即受理、没有 `result_id`、没有轮询；旧客户端迁移见 [部署指南 §12](DEPLOYMENT.md#12-搜索同步化迁移与切换)。
 
-- Kafka/Debezium 暂停：任务保持 `queued`；恢复后由 Debezium 补投并处理。
-- 超过 `deadline`：`Expire`（后台维护循环）与 `Claim`/`Get` 懒收敛为 `timed_out`，返回既有"超时"错误契约。
-- worker 领取后崩溃：租约到期前的重复投递按"租约有效"安全跳过；把 `RAG_SEARCH_TASK_LEASE_SECONDS` 配得小于 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120/120）时，租约过期后可在 deadline 前重新领取并重跑；否则任务按超时收敛为 `timed_out`，仍不丢事实、不产生死信风暴。
-- MCP/REST/Console 文案改为"已提交/排队中，结果就绪后按 result_id 读取"，删除"Kafka 受理确认"表述。
+### 6.2 artifact 事实来源
 
-### 6.2 结果快照
-
-- `SearchTasks.Complete`：同一事务内 `INSERT INTO search_result_snapshots`（envelope JSON 与 Redis 现值一致，含 `payload/expires_at/status/stage`）+ `UPDATE search_tasks SET status='succeeded'`；提交后**尽力**写 Redis 缓存（失败只记日志，不影响成功）。
-- 读取：先查 `search_tasks` 状态（未完成直接返回状态投影），`succeeded` 后先读 Redis，未命中/不可用则回源 `search_result_snapshots` 并尽力回填 Redis。分页、`expires_at`、`snapshot_available`、`result_id` 引用契约保持不变。
-- 过期清理：`PurgeExpired` 删除 `expires_at <= now` 的 MySQL 快照（有界批量），Redis 侧仍靠 TTL。
-- Redis 丢失：结果仍可从 MySQL 重建，不需要客户端重新提交。
+- 搜索命中可签发 artifact（源文件、图片、表格 JSON、解析产物），写入 MySQL `artifact_snapshots`，按 ID 独立读取（`GET /v1/artifacts/{artifact_id}` 与 `/content`）。
+- 保留期沿用 `RAG_RESULT_TTL_SECONDS`（默认 3600 秒，语义为 artifact TTL）；到期后读取映射 410，客户端重新检索即可。
+- `search_tasks`、`search_result_snapshots` 保留历史数据、不再读写；迁移不清空、不 DROP（与 `document_tasks` 先例一致）。
 
 ## 7. 缓存消费者
 
@@ -209,10 +208,10 @@ Redis 写入失败、缓存刷新失败不是 nack 理由：缓存有独立的�
 前提：应用写入口已升级到"无 outbox 写入 + schedule_version"版本，旧 worker 已停止。
 
 1. **记录 CDC 起始位置**：停写窗口内执行 `SHOW MASTER STATUS`，把 `File/Position` 写入 `cdc_cutover_state`（CLI `--record-position`）。
-2. **盘点**：`rag-cdc-cutover --inventory` 输出未完成文档任务（按状态/最老年龄）、未完成搜索任务、缓存 key 数、各 key 当前 revision。
+2. **盘点**：`rag-cdc-cutover --inventory` 输出未完成文档任务（按状态/最老年龄）、缓存 key 数、各 key 当前 revision（搜索任务不再盘点；历史 `search_tasks` 行原样保留）。
 3. **启动缓存连接器**：初始快照会把业务表现存行全部投递一次 → 缓存消费者递增 revision 并重建，形成"新版本基线"。
-4. **启动任务连接器**：初始快照为 `document_jobs`/`search_tasks` 现存行投递 `op=r`；`rag-cdc-cutover --backfill` 对仍未完成的任务在事务内把 `schedule_version` 递增到基线（例如 `schedule_version = GREATEST(schedule_version, baseline) + 1`），确保每个未完成任务都有一条可消费通知，避免"快照完成前的 UPDATE 丢失"。
-5. **核对**：`--verify` 断言所有活动任务 `schedule_version >= baseline+1`；脚本消费三个 topic 统计 ID 集合，与 MySQL 未完成任务集合比对（允许消费侧安全跳过的终态/重复）。
+4. **启动任务连接器**：初始快照为 `document_jobs` 现存行投递 `op=r`；`rag-cdc-cutover --backfill` 对仍未完成的任务在事务内把 `schedule_version` 递增到基线（例如 `schedule_version = GREATEST(schedule_version, baseline) + 1`），确保每个未完成任务都有一条可消费通知，避免"快照完成前的 UPDATE 丢失"。
+5. **核对**：`--verify` 断言所有活动任务 `schedule_version >= baseline+1`；脚本消费两个 topic 统计 ID 集合，与 MySQL 未完成任务集合比对（允许消费侧安全跳过的终态/重复）。
 6. **放量**：恢复写入口，继续观察 Debezium 延迟、Kafka 积压、脏缓存数归零。
 7. **下线旧表**：确认无旧进程写入后执行 `rag-service-migrate --retire-outbox`（删除 4 张 outbox 表），并更新 `docs/USAGE.md` 的升级步骤。
 
@@ -222,31 +221,56 @@ Redis 写入失败、缓存刷新失败不是 nack 理由：缓存有独立的�
 
 - 删除写入：`document_job_outbox`、`search_task_outbox`、`cache_outbox`（及历史 `document_task_outbox`）的 INSERT/UPDATE/DELETE。
 - 删除轮询/补发：`DocumentJobs.PendingOutbox/MarkPublished/GCOutbox`、`SearchTasks.DispatchPending/RunOnce`、`CacheSynchronizer` 的 relay/flush-pending 队列。
-- 删除"Kafka 受理确认"路径与失败回滚（搜索改为提交即受理）。
-- 保留：任务租约恢复（`Sweep`）、超时处理（`Expire`）、重排（`schedule_version+1`）、死信终态落库、DLQ 消费。
+- 删除"Kafka 受理确认"路径与失败回滚（搜索已改为同步直返，不再有提交即受理）。
+- 搜索同步化额外删除：`internal/state/search_tasks.go`、`internal/searchworker/`、`cmd/rag-search-worker/`、死信 `--kind search`、搜索 schema-3 envelope、`SearchEngine.GetSearchResult`、`Runtime.SubmitSearch` 与 `/v1/search-results` 路由。
+- 保留：任务租约恢复（`Sweep`）、超时处理（`Expire`）、重排（`schedule_version+1`）、死信终态落库、DLQ 消费（仅文档/缓存）。`search_tasks`/`search_result_snapshots` 两表保留历史数据、不再读写。
 
 ## 10. 监控替换
 
 | 旧指标 | 新指标 |
 | --- | --- |
-| `pipeline.outbox`（`document_job_outbox` 状态/最老记录） | `pipeline.debezium`（任务/缓存两个连接器健康）+ `pipeline.kafka`（三个业务 topic 的消费组积压） |
-| 搜索 outbox 状态 | `queues.search_tasks`：按状态计数、最老活动任务、近期超时数、逾期未收敛数 |
+| `pipeline.outbox`（`document_job_outbox` 状态/最老记录） | `pipeline.debezium`（任务/缓存两个连接器健康）+ `pipeline.kafka`（文档/缓存两个业务 topic 的消费组积压） |
+| 搜索 outbox 状态 | 已随搜索同步化移除（`queues.search_tasks` 不再存在） |
 | 文档 outbox 积压 | `queues.document_jobs`：按状态/阶段计数、最老排队、租约过期数、近期失败数 |
 | — | `cache`：脏 key 数（`refreshed_revision < revision`）、刷新失败数（`last_error` 非空）、最近刷新时间 |
 
-Console 监控页字段、`/v1/admin/monitor/overview` 响应、`internal/monitor` 测试同步调整；README/USAGE/DEPLOYMENT 的 outbox 说明全部替换。
+Console 监控页字段、`/v1/admin/monitor/overview` 响应、`internal/monitor` 测试同步调整；README/USAGE/DEPLOYMENT 的 outbox 说明全部替换。结果快照计数与搜索 DLQ 指标随同步化一并删除。
 
 ## 11. 验收矩阵
 
 | 链路 | 用例 | 断言 |
 | --- | --- | --- |
 | 文档受理与补发 | 受理后无 outbox 写入；Sweep 对滞留 queued / 租约过期 processing 递增版本；重复投递旧版本 | 每个未完成任务恰有一次可消费通知；旧版本/终态/有效租约被安全跳过；DB 落库后才 ACK |
-| 排队搜索与结果读取 | Kafka 未配置/不可用时 Submit 仍返回 result_id；恢复后处理；超时收敛 `timed_out`；结果写入 MySQL；清空 Redis 后仍可读 | 受理不依赖 broker；终态与快照同事务；分页/过期/引用契约不变 |
+| 排队搜索与结果读取（已下线） | ~~Submit 返回 result_id / 超时收敛 / Redis 回源~~ | **已随 2026-11-13 搜索同步化删除**；新断言见 §12：`search` 一次返回、无 `result_id`、artifact 独立读取 |
 | 手工 SQL → Redis 收敛 | 直接 `UPDATE/DELETE/同名重建` 业务表 → Debezium 事件 → 消费者 bump revision + 重建 | Redis 最终等于 MySQL 脱敏视图；旧回填被 watermark 拒绝 |
 | 故障演练 | Debezium 暂停/恢复、Kafka 重复投递、worker 领取后崩溃、Redis 写入失败 | 任务不丢、终态一致、缓存最终恢复、无死信风暴 |
 
 测试以 Go 单测/集成测试（有 `RAG_TEST_MYSQL_URL` 时）覆盖；实机链路用 `scripts/verify-*.py` 与 Compose 验证，未实机验证项明确记录在 `VALIDATION.md`。
 
-- `internal/cdcacceptance/`：按本表逐条实现的验收/混沌套件（文档受理与补发、搜索提交即受理与 MySQL 回源、手工 SQL 后缓存收敛、Debezium 暂停/重复投递/领取后崩溃/Redis 写失败）。
-- `internal/{documentworker,searchworker,cacheconsumer}`：消费者级幂等、版本、租约、ACK/DLQ 规则。
+- `internal/cdcacceptance/`：按本表逐条实现的验收/混沌套件（文档受理与补发、手工 SQL 后缓存收敛、Debezium 暂停/重复投递/领取后崩溃/Redis 写失败）。原“搜索提交即受理与 MySQL 回源”用例已随排队搜索删除，改为 `internal/runtime` 与 `internal/httpapi` 的同步搜索/超时/取消用例。
+- `internal/{documentworker,cacheconsumer}`：消费者级幂等、版本、租约、ACK/DLQ 规则（`searchworker` 已删除）。
 - `internal/{state,mq,monitor,migrate,runtime,e2e}`：表结构/迁移、事件解码、监控契约、切换 CLI 端到端。
+- `internal/searchrefs`：artifact 注册、版本固定、分块读取与到期语义（原结果快照用例已删除）。
+
+## 12. 搜索同步化迁移入口
+
+本节是搜索同步化（2026-11-13）的契约入口，取代原先的“提交即受理 + 结果快照”链路。
+
+### 12.1 契约变化
+
+- MCP：工具固定 5 个，`search` 无 `wait_seconds`；`get_search_result` 删除；受限 scope 改为同步检索 + `DocumentIDs` 过滤。
+- REST：`POST /v1/search` 同步返回；`GET /v1/search-results/{result_id}` 删除；响应去掉 `result_id`/`created_at`/`expires_at`/`snapshot_available`/`snapshot_error`。
+- 存储：`search_tasks`、`search_result_snapshots` 保留历史数据、不再读写、不 DROP；artifact 以 `artifact_snapshots` 为事实来源，TTL 沿用 `RAG_RESULT_TTL_SECONDS`。
+- 消息：搜索 schema-3 通知、`praxis_search` topic/group、搜索 DLQ、`rag-search-worker`、死信 `--kind search` 全部删除；环境变量 `RAG_SEARCH_*`（除 `RAG_SEARCH_TIMEOUT_SECONDS`）保留为废弃键、启动忽略。
+
+### 12.2 在途任务与切换
+
+1. 升级前 `SELECT status, COUNT(*) FROM search_tasks GROUP BY status` 记录存量；未完成任务不会再被消费，直接作为历史保留（必要时维护窗口内 SQL 收敛为 `timed_out`，不要 DROP/清空）。
+2. 停搜索入口 → 停 `rag-search-worker` 与 `--kind search` 死信 → 等 `praxis_search` lag 归零 → 可删除搜索 topic（先备份消息）；**不要**删除两张历史表。
+3. `rag-state-migrate --apply`（不再给 `search_tasks` 追加 `schedule_version`）；部署新版 `rag-service`，从进程管理器与 Debezium 任务连接器 `column.include.list` 中移除搜索表。
+4. 验证：`tools/list` 5 个工具、`POST /v1/search` 一次返回、`/v1/search-results/<uuid>` 返回 404、受限账号按 scope 过滤、监控页无搜索队列/快照指标。
+5. 完整步骤、客户端调整与回滚见 [部署指南 §12](DEPLOYMENT.md#12-搜索同步化迁移与切换)。
+
+### 12.3 回滚
+
+回退 `rag-service`/`rag-search-worker` 二进制与任务连接器配置（恢复 `search_tasks` 采集与 `praxis_search`），重启搜索 worker 与 `--kind search` 死信。两张历史表未删除、未清空，旧行仍可被旧 worker 按 `schedule_version`/状态收敛；若已删除搜索 topic，需重建并依赖初始快照 `op=r` 补投。artifact 与 TTL 语义前后一致，回滚不影响已签发引用。回滚后在监控页核对 `pipeline.kafka.groups` 组数，避免新旧混跑。

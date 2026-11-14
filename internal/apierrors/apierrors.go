@@ -16,8 +16,9 @@ type KnowledgeValidationError struct{ Message string }
 // Error implements error.
 func (e *KnowledgeValidationError) Error() string { return e.Message }
 
-// SnapshotUnavailable marks an expired or missing stored result snapshot
-// (HTTP 410, never retried from SQL).
+// SnapshotUnavailable marks an expired or missing stored artifact snapshot
+// (HTTP 410, never retried from SQL). Search results are returned inline and are
+// not stored, so only artifact reads can raise it.
 type SnapshotUnavailable struct{ Message string }
 
 // Error implements error.

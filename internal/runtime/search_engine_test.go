@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
@@ -320,117 +319,6 @@ func TestPublicKnowledgeBase(t *testing.T) {
 	}
 }
 
-func TestGetSearchResultUnavailableWithoutTransientStore(t *testing.T) {
-	stores := newSearchTestStores(t)
-	engine, err := NewSearchEngine(config.RagConfig{
-		Backend: config.BackendQdrant, QdrantURL: "http://127.0.0.1:1", Collection: "unused",
-	}, stores)
-	if err != nil {
-		t.Fatalf("NewSearchEngine() error = %v", err)
-	}
-	t.Cleanup(func() { _ = engine.Close(context.Background()) })
-
-	const resultID = "123e4567-e89b-12d3-a456-426614174000"
-	_, err = engine.GetSearchResult(context.Background(), "alpha", resultID, 1, 10)
-	var unavailable *apierrors.SnapshotUnavailable
-	if !errors.As(err, &unavailable) {
-		t.Fatalf("GetSearchResult() error = %v, want SnapshotUnavailable", err)
-	}
-	if unavailable.Message != "Search result expired or unavailable" {
-		t.Errorf("message = %q", unavailable.Message)
-	}
-
-	if _, err := engine.GetSearchResult(context.Background(), "alpha", "not-a-uuid", 1, 10); err == nil {
-		t.Fatalf("GetSearchResult() accepted an invalid result id")
-	} else if !errors.As(err, &unavailable) {
-		t.Errorf("invalid id error = %v, want SnapshotUnavailable", err)
-	}
-}
-
-func TestGetSearchResultAvailable(t *testing.T) {
-	stores := newSearchTestStores(t)
-	transient := &fakeTransient{values: map[string]any{}}
-	stores.Results.Transient = transient
-	const resultID = "123e4567-e89b-12d3-a456-426614174000"
-	stored := map[string]any{
-		"query": "E03",
-		"results": []any{
-			map[string]any{"rank": 1, "document_id": "doc-1"},
-			map[string]any{"rank": 2, "document_id": "doc-2"},
-			map[string]any{"rank": 3, "document_id": "doc-3"},
-		},
-	}
-	if _, err := stores.Results.Save("alpha", stored, strPtr(resultID), nil); err != nil {
-		t.Fatalf("Results.Save() error = %v", err)
-	}
-	engine, err := NewSearchEngine(config.RagConfig{
-		Backend: config.BackendQdrant, QdrantURL: "http://127.0.0.1:1", Collection: "unused",
-	}, stores)
-	if err != nil {
-		t.Fatalf("NewSearchEngine() error = %v", err)
-	}
-	t.Cleanup(func() { _ = engine.Close(context.Background()) })
-
-	payload, err := engine.GetSearchResult(context.Background(), "alpha", resultID, 2, 2)
-	if err != nil {
-		t.Fatalf("GetSearchResult() error = %v", err)
-	}
-	if payload["page"] != 2 || payload["page_size"] != 2 || payload["total_results"] != 3 {
-		t.Errorf("page payload = %v", payload)
-	}
-	results, _ := payload["results"].([]any)
-	if len(results) != 1 {
-		t.Fatalf("page results = %v", results)
-	}
-	if next, present := payload["next_page"]; !present || next != nil {
-		t.Errorf("next_page = %v", payload["next_page"])
-	}
-
-	firstPage, err := engine.GetSearchResult(context.Background(), "alpha", resultID, 1, 2)
-	if err != nil {
-		t.Fatalf("GetSearchResult(first page) error = %v", err)
-	}
-	if firstPage["next_page"] != 2 {
-		t.Errorf("first page next_page = %v", firstPage["next_page"])
-	}
-
-	// A snapshot belonging to another tenant is unavailable, not readable.
-	if _, err := engine.GetSearchResult(context.Background(), "beta", resultID, 1, 2); err == nil {
-		t.Fatalf("GetSearchResult() read another tenant's snapshot")
-	} else {
-		var unavailable *apierrors.SnapshotUnavailable
-		if !errors.As(err, &unavailable) {
-			t.Errorf("cross-tenant error = %v, want SnapshotUnavailable", err)
-		}
-	}
-}
-
-func TestGetSearchResultPageDoesNotExist(t *testing.T) {
-	stores := newSearchTestStores(t)
-	stores.Results.Transient = &fakeTransient{values: map[string]any{}}
-	const resultID = "123e4567-e89b-12d3-a456-426614174000"
-	stored := map[string]any{"results": []any{map[string]any{"rank": 1}}}
-	if _, err := stores.Results.Save("alpha", stored, strPtr(resultID), nil); err != nil {
-		t.Fatalf("Results.Save() error = %v", err)
-	}
-	engine, err := NewSearchEngine(config.RagConfig{
-		Backend: config.BackendQdrant, QdrantURL: "http://127.0.0.1:1", Collection: "unused",
-	}, stores)
-	if err != nil {
-		t.Fatalf("NewSearchEngine() error = %v", err)
-	}
-	t.Cleanup(func() { _ = engine.Close(context.Background()) })
-
-	_, err = engine.GetSearchResult(context.Background(), "alpha", resultID, 9, 10)
-	var validation *contracts.SearchValidationError
-	if !errors.As(err, &validation) {
-		t.Fatalf("GetSearchResult() error = %v, want SearchValidationError", err)
-	}
-	if validation.Message != "Result page does not exist" {
-		t.Errorf("message = %q", validation.Message)
-	}
-}
-
 // newFailingQdrantAPI answers collection metadata but fails points/query with
 // HTTP 500 so retrieval error wrapping can be asserted.
 func newFailingQdrantAPI(t *testing.T) string {
@@ -451,46 +339,6 @@ func newFailingQdrantAPI(t *testing.T) string {
 	}))
 	t.Cleanup(server.Close)
 	return server.URL
-}
-
-func strPtr(value string) *string { return &value }
-
-// fakeTransient is an in-memory state.TransientStore used to exercise the
-// result-snapshot read path without Redis.
-type fakeTransient struct {
-	mu     sync.Mutex
-	values map[string]any
-}
-
-func (f *fakeTransient) key(kind, identity string) string { return kind + ":" + identity }
-
-func (f *fakeTransient) Get(kind, identity string) (any, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	value, found := f.values[f.key(kind, identity)]
-	return value, found, nil
-}
-
-func (f *fakeTransient) Put(kind, identity string, value any, _ float64, nx bool) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	key := f.key(kind, identity)
-	if _, exists := f.values[key]; exists && nx {
-		return false, nil
-	}
-	f.values[key] = value
-	return true, nil
-}
-
-func (f *fakeTransient) Delete(kind, identity string) (int64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	key := f.key(kind, identity)
-	if _, exists := f.values[key]; !exists {
-		return 0, nil
-	}
-	delete(f.values, key)
-	return 1, nil
 }
 
 func TestSearchSnapshotContext(t *testing.T) {
@@ -543,9 +391,9 @@ func TestSearchSnapshotContext(t *testing.T) {
 }
 
 // TestNormalizeSearchPayloadShapes pins the JSON-shaped contract at the runtime
-// boundary: orchestrator results are []map[string]any, while searchrefs and
-// state.ResultSnapshots require []any. Nil payloads and result-less payloads must
-// stay nil/absent, and already-normalized payloads must pass through untouched.
+// boundary: orchestrator results are []map[string]any, while searchrefs requires
+// []any. Nil payloads and result-less payloads must stay nil/absent, and
+// already-normalized payloads must pass through untouched.
 func TestNormalizeSearchPayloadShapes(t *testing.T) {
 	if normalized := normalizeSearchPayload(nil); normalized != nil {
 		t.Fatalf("normalizeSearchPayload(nil) = %v, want nil", normalized)

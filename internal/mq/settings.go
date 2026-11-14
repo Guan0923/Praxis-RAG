@@ -27,16 +27,12 @@ const (
 	DefaultDocumentTopic = "praxis_document_ingest"
 	DefaultDocumentGroup = "praxis_document_ingest_workers"
 
-	DefaultSearchTopic = "praxis_search"
-	DefaultSearchGroup = "praxis_search_workers"
-
 	DefaultDocumentDLQTopic = "praxis_document_ingest_dead_letters"
-	DefaultSearchDLQTopic   = "praxis_search_dead_letters"
 	DefaultCacheDLQTopic    = "praxis_state_cache_refresh_dead_letters"
 
 	// DefaultCacheDLQGroup is the consumer group of the cache dead-letter
 	// handler. It must stay distinct from every business group and from the
-	// document/search DLQ groups.
+	// document DLQ group.
 	DefaultCacheDLQGroup = "praxis_state_cache_refresh_dead_letters"
 
 	DefaultPublishTimeout    = 10 * time.Second
@@ -83,11 +79,7 @@ type Settings struct {
 	DocumentTopic string
 	DocumentGroup string
 
-	SearchTopic string
-	SearchGroup string
-
 	DocumentDLQTopic string
-	SearchDLQTopic   string
 	// CacheDLQTopic/CacheDLQGroup belong to the cache read-model consumer
 	// (rag-cache-worker): a malformed cache event is dead-lettered there instead
 	// of blocking the cache topic.
@@ -99,8 +91,9 @@ type Settings struct {
 
 // SettingsFromEnv resolves the Kafka queue settings from the shared env contract.
 // The broker/security/topic values come from internal/state (BrokerSettings and
-// DocumentQueueSettings) so producer, consumer, and state agree; the search and
-// DLQ topics/groups plus the publish timeout are mq-level settings.
+// DocumentQueueSettings) so producer, consumer, and state agree. Search is
+// synchronous and has no Kafka topic/group; the DLQ topics and the publish
+// timeout are mq-level settings.
 func SettingsFromEnv() (Settings, error) {
 	broker := state.BrokerSettingsFromEnv()
 	document, err := state.DocumentQueueSettingsFromEnv()
@@ -124,10 +117,7 @@ func SettingsFromEnv() (Settings, error) {
 		CacheGroup:       broker.CacheGroup,
 		DocumentTopic:    document.Topic,
 		DocumentGroup:    document.Group,
-		SearchTopic:      strings.TrimSpace(envOrDefault("RAG_SEARCH_TOPIC", DefaultSearchTopic)),
-		SearchGroup:      strings.TrimSpace(envOrDefault("RAG_SEARCH_GROUP", DefaultSearchGroup)),
 		DocumentDLQTopic: strings.TrimSpace(envOrDefault("RAG_DOCUMENT_DLQ_TOPIC", DefaultDocumentDLQTopic)),
-		SearchDLQTopic:   strings.TrimSpace(envOrDefault("RAG_SEARCH_DLQ_TOPIC", DefaultSearchDLQTopic)),
 		CacheDLQTopic:    strings.TrimSpace(envOrDefault("RAG_CACHE_DLQ_TOPIC", DefaultCacheDLQTopic)),
 		CacheDLQGroup:    strings.TrimSpace(envOrDefault("RAG_CACHE_DLQ_GROUP", DefaultCacheDLQGroup)),
 		PublishTimeout:   publishTimeout,
@@ -170,40 +160,24 @@ func (s Settings) Validate() error {
 	if strings.TrimSpace(s.DocumentTopic) == "" || strings.TrimSpace(s.DocumentGroup) == "" {
 		return newConfigError("Document topic and consumer group must not be empty")
 	}
-	if strings.TrimSpace(s.SearchTopic) == "" || strings.TrimSpace(s.SearchGroup) == "" {
-		return newConfigError("Search topic and consumer group must not be empty")
-	}
-	if s.SearchTopic == s.DocumentTopic || s.SearchGroup == s.DocumentGroup {
-		return newConfigError("Search topic/group must be separate from the cache and document queues")
-	}
 	if s.CacheTopic != "" || s.CacheGroup != "" {
-		if s.CacheTopic == s.DocumentTopic || s.CacheTopic == s.SearchTopic ||
-			s.CacheGroup == s.DocumentGroup || s.CacheGroup == s.SearchGroup {
-			return newConfigError("Cache topic/group must be separate from the document and search queues")
+		if s.CacheTopic == s.DocumentTopic || s.CacheGroup == s.DocumentGroup {
+			return newConfigError("Cache topic/group must be separate from the document queue")
 		}
 	}
 	if s.DocumentDLQTopic != "" {
-		if s.DocumentDLQTopic == s.DocumentTopic || s.DocumentDLQTopic == s.SearchTopic ||
-			s.DocumentDLQTopic == s.CacheTopic {
+		if s.DocumentDLQTopic == s.DocumentTopic || s.DocumentDLQTopic == s.CacheTopic {
 			return newConfigError("Document dead-letter topic must be separate from the business topics")
 		}
 	}
-	if s.SearchDLQTopic != "" {
-		if s.SearchDLQTopic == s.DocumentTopic || s.SearchDLQTopic == s.SearchTopic ||
-			s.SearchDLQTopic == s.CacheTopic || s.SearchDLQTopic == s.DocumentDLQTopic {
-			return newConfigError("Search dead-letter topic must be separate from the business topics")
-		}
-	}
 	if s.CacheDLQTopic != "" {
-		if s.CacheDLQTopic == s.DocumentTopic || s.CacheDLQTopic == s.SearchTopic ||
-			s.CacheDLQTopic == s.CacheTopic || s.CacheDLQTopic == s.DocumentDLQTopic ||
-			s.CacheDLQTopic == s.SearchDLQTopic {
+		if s.CacheDLQTopic == s.DocumentTopic || s.CacheDLQTopic == s.CacheTopic ||
+			s.CacheDLQTopic == s.DocumentDLQTopic {
 			return newConfigError("Cache dead-letter topic must be separate from the business topics")
 		}
 	}
 	if s.CacheDLQGroup != "" {
-		if s.CacheDLQGroup == s.DocumentGroup || s.CacheDLQGroup == s.SearchGroup ||
-			s.CacheDLQGroup == s.CacheGroup {
+		if s.CacheDLQGroup == s.DocumentGroup || s.CacheDLQGroup == s.CacheGroup {
 			return newConfigError("Cache dead-letter group must be separate from the business consumer groups")
 		}
 	}
@@ -234,8 +208,6 @@ func (s Settings) DLQTopicFor(topic string) string {
 		return ""
 	case s.DocumentTopic:
 		return s.DocumentDLQTopic
-	case s.SearchTopic:
-		return s.SearchDLQTopic
 	case s.CacheTopic:
 		return s.CacheDLQTopic
 	default:

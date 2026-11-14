@@ -36,6 +36,8 @@ func TestInvalidSearchArgumentsFailAtTheBoundary(t *testing.T) {
 		{map[string]any{"query": "x", "rerank": "bi_encoder"}, "rerank must be none or cross_encoder"},
 		{map[string]any{"query": "x", "filters": map[string]any{"raw_qdrant": "unsafe"}}, "Unsupported filters"},
 		{map[string]any{"query": "x", "unknown": true}, "Unknown search arguments"},
+		{map[string]any{"query": "x", "wait_seconds": 3}, "Unknown search arguments"},
+		{map[string]any{"query": "x", "result_id": "123e4567-e89b-12d3-a456-426614174000"}, "Unknown search arguments"},
 		{map[string]any{"query": "   "}, "query must be a non-empty string"},
 		{map[string]any{"query": strings.Repeat("a", 2001)}, "at most 2000 characters"},
 		{map[string]any{"query": "x", "candidate_k": true}, "candidate_k must be an integer"},
@@ -77,26 +79,6 @@ func TestFilterValuesMustBeScalar(t *testing.T) {
 	}
 }
 
-func TestQueuedSearchRequestValidation(t *testing.T) {
-	request, err := QueuedSearchRequestFromArguments(map[string]any{"query": "manual"})
-	if err != nil {
-		t.Fatalf("QueuedSearchRequestFromArguments() error = %v", err)
-	}
-	if request.WaitSeconds != 10 || request.Search.Query != "manual" {
-		t.Fatalf("unexpected queued request: %+v", request)
-	}
-	for _, wait := range []any{0, 0.03, 30, json.Number("5")} {
-		if _, err := QueuedSearchRequestFromArguments(map[string]any{"query": "manual", "wait_seconds": wait}); err != nil {
-			t.Fatalf("wait_seconds=%v rejected: %v", wait, err)
-		}
-	}
-	for _, wait := range []any{-1, 31, "5", true} {
-		if _, err := QueuedSearchRequestFromArguments(map[string]any{"query": "manual", "wait_seconds": wait}); err == nil {
-			t.Fatalf("wait_seconds=%v accepted", wait)
-		}
-	}
-}
-
 func TestValidateUUID(t *testing.T) {
 	valid := "123e4567-e89b-12d3-a456-426614174000"
 	if got, err := ValidateUUID(valid); err != nil || got != valid {
@@ -115,26 +97,6 @@ func TestValidateUUID(t *testing.T) {
 	}
 }
 
-func TestValidateSearchResultArguments(t *testing.T) {
-	resultID := "123e4567-e89b-12d3-a456-426614174000"
-	request, err := ValidateSearchResultArguments(map[string]any{"result_id": resultID})
-	if err != nil {
-		t.Fatalf("ValidateSearchResultArguments() error = %v", err)
-	}
-	if request.Page != 1 || request.PageSize != 10 {
-		t.Fatalf("unexpected request: %+v", request)
-	}
-	for _, arguments := range []map[string]any{
-		{"result_id": resultID, "page": 0},
-		{"result_id": resultID, "page_size": 101},
-		{"result_id": resultID, "unexpected": 1},
-	} {
-		if _, err := ValidateSearchResultArguments(arguments); err == nil {
-			t.Fatalf("accepted invalid arguments: %v", arguments)
-		}
-	}
-}
-
 func TestValidateArtifactRange(t *testing.T) {
 	if err := ValidateArtifactRange(0, 1); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -148,7 +110,7 @@ func TestValidateArtifactRange(t *testing.T) {
 }
 
 func TestSearchToolSchemaKeepsThePublicContract(t *testing.T) {
-	schema := SearchToolSchema(false)
+	schema := SearchToolSchema()
 	required, ok := schema["required"].([]string)
 	if !ok || len(required) != 1 || required[0] != "query" {
 		t.Fatalf("required = %v", schema["required"])
@@ -163,12 +125,16 @@ func TestSearchToolSchemaKeepsThePublicContract(t *testing.T) {
 	if len(allowed) != 2 || allowed[0] != "none" || allowed[1] != "cross_encoder" {
 		t.Fatalf("rerank enum = %v", allowed)
 	}
-	if _, exists := properties["wait_seconds"]; exists {
-		t.Fatalf("non-queued schema exposed wait_seconds")
+	if len(properties) != 6 {
+		t.Fatalf("properties = %v, want exactly query/retrieval/rerank/candidate_k/top_k/filters", properties)
 	}
-	queued := SearchToolSchema(true)["properties"].(map[string]any)
-	if _, exists := queued["wait_seconds"]; !exists {
-		t.Fatalf("queued schema is missing wait_seconds")
+	for _, gone := range []string{"wait_seconds", "result_id"} {
+		if _, exists := properties[gone]; exists {
+			t.Fatalf("synchronous search schema exposed %q", gone)
+		}
+	}
+	if schema["additionalProperties"] != false {
+		t.Fatalf("additionalProperties = %v, want false", schema["additionalProperties"])
 	}
 	if !SearchToolAnnotations.ReadOnlyHint || SearchToolAnnotations.DestructiveHint {
 		t.Fatalf("unexpected annotations: %+v", SearchToolAnnotations)

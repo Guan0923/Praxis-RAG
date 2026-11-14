@@ -5,6 +5,8 @@
 
 > **PDF 解析历史说明（2026-11-13）**：文中提到的 Docling/本地模型/vision worker 指审计时的旧实现。当前 PDF 版面/OCR/表格/公式/图片描述统一由知识库配置的远端 OpenAI 兼容视觉模型完成，pdf-service 本地只做 PyMuPDF 读取/渲染/裁图，不再有 Docling/torch/模型卷；详见 [GO_MIGRATION](GO_MIGRATION.md) 的「2026-11-13」一节。
 
+> **搜索同步化历史说明（2026-11-13）**：文中 MCP “同步/排队模式”、`wait_seconds`、`get_search_result`、结果快照与 `/v1/search-results` 的描述均为审计时实现。当前 MCP 固定 5 个工具、`search` 永远同步、无 `result_id`/轮询/结果快照，`GET /v1/search-results/{result_id}` 已删除；本文相关差异项（P0-2 等）已随功能下线关闭，仅作历史对照，见 [GO_MIGRATION](GO_MIGRATION.md)「第十八轮」与 [部署指南 §12](DEPLOYMENT.md#12-搜索同步化迁移与切换)。
+
 
 审计对象：`D:\Project\Praxis-RAG\.agents\worktrees\dsh-d432f525-b2f1`
 审计类型：只读（本文件是唯一写入）

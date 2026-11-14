@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -55,27 +54,6 @@ func TestMaintenanceRecoversStaleUploads(t *testing.T) {
 	}
 	if _, statErr := os.Stat(workspace); !os.IsNotExist(statErr) {
 		t.Errorf("stale workspace was not reclaimed: %v", statErr)
-	}
-}
-
-func TestMaintenanceExpiresSearchTasks(t *testing.T) {
-	service, stores := newMaintenanceService(t)
-	ctx := context.Background()
-	clock := float64(time.Now().Unix())
-	stores.SearchTasks.Clock = func() float64 { return clock }
-	envelope, err := stores.SearchTasks.Submit(ctx, "alpha", map[string]any{"query": "stale"}, nil)
-	if err != nil {
-		t.Fatalf("SearchTasks.Submit() error = %v", err)
-	}
-	clock += 1_000
-
-	service.maintenancePass(ctx)
-
-	_, err = stores.SearchTasks.Get(ctx, "alpha", envelope.ResultID, 1, 10)
-	var unavailable *state.SnapshotUnavailable
-	if !errors.As(err, &unavailable) ||
-		unavailable.Message != "Search timed out before completion; submit a new search" {
-		t.Fatalf("expired task read error = %v", err)
 	}
 }
 
@@ -172,11 +150,12 @@ func TestMaintenancePurgesExpiredArtifacts(t *testing.T) {
 	}
 }
 
-// TestBackgroundLifecycle pins the background loop contract: it starts
-// idempotently, expires stale search tasks through the periodic pass and stops
-// idempotently. Delivery itself is Debezium's responsibility.
+// TestBackgroundLifecycle pins the background loop contract: it starts and
+// stops idempotently and the periodic pass runs without error. Stale search-task
+// expiry was removed with the queued search flow; the document sweep/GC and
+// artifact purge are asserted directly in the maintenance-pass tests.
 func TestBackgroundLifecycle(t *testing.T) {
-	service, stores := newMaintenanceService(t)
+	service, _ := newMaintenanceService(t)
 	ctx := context.Background()
 	if err := service.StartBackground(ctx,
 		WithMaintenanceInterval(20*time.Millisecond),
@@ -193,29 +172,6 @@ func TestBackgroundLifecycle(t *testing.T) {
 	}
 	if !service.BackgroundRunning() {
 		t.Fatalf("BackgroundRunning() = false after second start")
-	}
-
-	// The periodic loop must expire a task whose deadline has passed.
-	clock := float64(time.Now().Unix())
-	stores.SearchTasks.Clock = func() float64 { return clock }
-	notification, err := stores.SearchTasks.Submit(ctx, "alpha", map[string]any{"query": "loop"}, nil)
-	if err != nil {
-		t.Fatalf("SearchTasks.Submit() error = %v", err)
-	}
-	clock += 1_000
-	deadline := time.Now().Add(60 * time.Second)
-	expired := false
-	for time.Now().Before(deadline) {
-		_, err := stores.SearchTasks.Get(ctx, "alpha", notification.ResultID, 1, 10)
-		var unavailable *state.SnapshotUnavailable
-		if errors.As(err, &unavailable) {
-			expired = true
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !expired {
-		t.Fatalf("background loop did not expire the stale search task")
 	}
 
 	service.StopBackground()

@@ -14,8 +14,6 @@ import (
 const (
 	// DocumentEnvelopeSchema is the identifier-only document task notification.
 	DocumentEnvelopeSchema = 4
-	// SearchEnvelopeSchema is the identifier-only queued-search notification.
-	SearchEnvelopeSchema = 3
 )
 
 // ErrIgnorableCDCChange marks a Debezium change that is not a task record:
@@ -29,15 +27,6 @@ var ErrIgnorableCDCChange = errors.New("ignorable CDC change")
 type DocumentNotification struct {
 	Schema          int    `json:"schema"`
 	ArtifactID      string `json:"artifact_id"`
-	Namespace       string `json:"namespace"`
-	ScheduleVersion int64  `json:"schedule_version"`
-}
-
-// SearchNotification is the schema-3 queued-search notification. It carries
-// locating identifiers only; the worker reads the arguments back from MySQL.
-type SearchNotification struct {
-	Schema          int    `json:"schema"`
-	ResultID        string `json:"result_id"`
 	Namespace       string `json:"namespace"`
 	ScheduleVersion int64  `json:"schedule_version"`
 }
@@ -77,35 +66,6 @@ func ValidateDocumentNotification(payload any) (DocumentNotification, error) {
 	}, nil
 }
 
-// ValidateSearchNotification accepts the application-native schema-3 envelope
-// or a raw Debezium change event for search_tasks and returns the canonical
-// notification. Deletes, tombstones and before-only changes return
-// ErrIgnorableCDCChange; malformed messages return a *ValueError.
-func ValidateSearchNotification(payload any) (SearchNotification, error) {
-	fields, err := notificationFields(payload, SearchEnvelopeSchema)
-	if err != nil {
-		return SearchNotification{}, err
-	}
-	resultID, err := canonicalNotificationID(fields, "result_id")
-	if err != nil {
-		return SearchNotification{}, err
-	}
-	namespace, err := notificationNamespace(fields)
-	if err != nil {
-		return SearchNotification{}, err
-	}
-	scheduleVersion, err := notificationScheduleVersion(fields)
-	if err != nil {
-		return SearchNotification{}, err
-	}
-	return SearchNotification{
-		Schema:          SearchEnvelopeSchema,
-		ResultID:        resultID,
-		Namespace:       namespace,
-		ScheduleVersion: scheduleVersion,
-	}, nil
-}
-
 // DocumentJobEnvelope builds the content-free schema-4 notification of one job.
 func DocumentJobEnvelope(job *DocumentJob) (DocumentNotification, error) {
 	if job == nil {
@@ -116,19 +76,6 @@ func DocumentJobEnvelope(job *DocumentJob) (DocumentNotification, error) {
 		"artifact_id":      job.ArtifactID,
 		"namespace":        job.Namespace,
 		"schedule_version": job.ScheduleVersion,
-	})
-}
-
-// SearchTaskEnvelope builds the content-free schema-3 notification of one task.
-func SearchTaskEnvelope(task *SearchTask) (SearchNotification, error) {
-	if task == nil {
-		return SearchNotification{}, newValueError("Invalid search message envelope")
-	}
-	return ValidateSearchNotification(map[string]any{
-		"schema":           float64(SearchEnvelopeSchema),
-		"result_id":        task.ResultID,
-		"namespace":        task.Namespace,
-		"schedule_version": task.ScheduleVersion,
 	})
 }
 

@@ -644,3 +644,20 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 切换 CLI：新增 `cmd/rag-cdc-cutover`（`--inventory`/`--record-position`/`--backfill`/`--mark-cache-baseline`/`--verify`/`--all`，退出码 0/1/2）；`cmd/rag-service-migrate --retire-outbox --yes` 调用 `migrate.RetireOutbox` 删除四张旧表，缺 `--yes` 只读列出并拒绝执行。
 - [x] 文档：README、USAGE、DEPLOYMENT、state-storage、state-cache、result-references、GO_MIGRATION、agents 文档与 AGENTS.md 同步；历史 outbox 描述删除或标注已下线；`VALIDATION.md` 追加本次验证范围与未实机项。
 - 已知边界：真实 Docker/Debezium/Kafka/Redis 双连接器链路、缓存 revision 收敛、搜索 MySQL 回源、存量切换/回滚演练与 Console 前端构建均未在本轮实机执行，详见 `VALIDATION.md`。
+
+
+## 2026-11-13 搜索同步化：MCP/REST 一次调用直返证据，下线搜索任务/快照/队列
+
+本轮按需求把检索从"排队 + 轮询 + 结果快照"改为**同步执行**：一次调用完成检索与重排并直接返回证据，删除搜索任务、结果快照、按 `result_id` 查询、SQL 搜索任务状态机、搜索队列/worker/DLQ 与 Debezium 搜索采集。文档入库与缓存同步链路不变。
+
+- [x] MCP 契约：工具 6→5（删除 `get_search_result`），`search` 永远同步、返回 `results`/`artifacts`/`evidence_status`/`answer_guidance`；删除 `wait_seconds`、`executeQueuedSearch`、`Options.QueuedSearch`、`SubmitSearch`/`GetSearchResult` 适配；受限 scope 改为真正执行同步检索并按文档过滤；开启 SDK `PropagateRequestCancellation` 使客户端断开可取消下游检索。
+- [x] REST 契约：`POST /v1/search` 同步直返，响应删除 `result_id/created_at/expires_at/snapshot_available/snapshot_error`；删除 `GET /v1/search-results/{result_id}`（路由/handler/`ResultRuntime`/OpenAPI/no-store 前缀）；artifact 下载与分块读取保留（410 语义不变）。
+- [x] 超时与取消：`RAG_SEARCH_TIMEOUT_SECONDS` 从排队任务 deadline 改为同步检索总预算（默认 120s，非法值启动失败），超时映射 503/`Search timed out`，父 ctx 更早 deadline 不延长、客户端取消向下传播。
+- [x] 结果快照与 Redis：删除 `state.ResultSnapshots`、`redisstate` transient 存储与 `search-result` ZSET 索引、`Attach` 快照装配、维护循环过期清理与监控快照计数；搜索不再写 MySQL/Redis 结果数据；`artifact_snapshots` 与 artifact TTL（`RAG_RESULT_TTL_SECONDS`）保留。
+- [x] SQL 搜索任务与队列：删除 `internal/state/search_tasks.go`、搜索 schema-3 通知与 `mq.DecodeSearchNotification`、`internal/searchworker/`、`cmd/rag-search-worker/`、搜索 DLQ 分支与搜索 topic/group/DLQ 配置、维护循环 `SearchTasks.Expire`、CDC 切换 CLI 的搜索盘点/回填；`search_tasks`/`search_result_snapshots` DDL 保留并标注 retired（历史数据不删、不 DROP，物理删除另行安排）。
+- [x] Debezium/部署：任务连接器只采集 `document_jobs`（`table.include.list`/`column.include.list`/`RouteDocumentJobs`），删除 `RouteSearchTasks` 与 `RAG_SEARCH_TOPIC` 注入；`docker-compose.yml`、`scripts/start-stack.ps1`、`verify-debezium-e2e.py`、`.env.example` 同步；删除 `scripts/verify-kafka-search.py`；旧搜索配置键作为 legacy ignored 接受，避免既有 `config.toml` 升级失败。
+- [x] 监控与 Console：`/v1/monitor` 删除 `queues.search_tasks`、`library.result_snapshots` 与搜索消费组（Kafka groups 3→2）；前端删除检索任务卡片、搜索消费行、快照指标与相关类型。
+- [x] 文档：README、USAGE、DEPLOYMENT（§11 变更速查/§12 迁移切换/回滚）、state-storage、state-cache、result-references（改写为 artifact 引用主题）、cdc-migration（§12 迁移入口）、agents 文档、AGENTS.md、`internal/mcp/NOTES.md`、`internal/documentworker/WIRING.md`、GO_MIGRATION（追加补注）、GO_PARITY_AUDIT（存档说明）、VALIDATION（Superseded + 本轮验证范围）。
+- [x] 测试：删除搜索任务/快照/排队/transient 相关用例，改写 MCP/REST/runtime/searchrefs/监控/队列/集成测试并新增同步专项（同步直返、5 工具固定顺序、`wait_seconds` 拒绝、受限 scope 过滤、响应无快照字段、`/v1/search-results` 404、超时/取消）。`go build ./...`、`go vet ./...` 通过；`internal/mcp`、`internal/redisstate`、`internal/mq`、`internal/monitor`、`internal/contracts`、`internal/cacheconsumer` 测试通过；前端 typecheck 与 224 例测试通过。
+- [x] 缓存同步专项（独立验证，与快照无关）：核对 Debezium 缓存连接器 8 表→Kafka→`rag-cache-worker`→`CacheSynchronizer`→Redis 读模型链路完整；`internal/cacheconsumer` 新增 8 表 DELETE 映射、跨 scope、重放幂等与生产 decoder 用例（12/12 PASS）；`cache_chain_test.go` 补删除后 `kb_list.document_count` 递减与跨 namespace 变更收敛断言。
+- 已知边界：本机无 MySQL/Redis/Kafka/docker，依赖外部服务的集成用例属环境失败（`internal/statetest` Fatalf 而非 skip），未做实机端到端切换/回滚演练；历史表数据未清理，物理删除另排期。详见 `VALIDATION.md` 本轮记录与 `.test-tmp/search-sync-plan/` 盘点/验证报告。

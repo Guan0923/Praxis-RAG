@@ -21,7 +21,7 @@ import (
 // agreement, and the dispatcher must route the request to the stateless
 // transport so the rejection is a 400 instead of a session error.
 func TestModernProtocolHeadersAreValidated(t *testing.T) {
-	_, server := newTestHTTPHandler(t, newFakeRuntime(), Options{QueuedSearch: true})
+	_, server := newTestHTTPHandler(t, newFakeRuntime(), Options{})
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{` +
 		`"io.modelcontextprotocol/protocolVersion":"2026-07-28",` +
 		`"io.modelcontextprotocol/clientCapabilities":{}}}}`
@@ -61,7 +61,7 @@ func TestModernProtocolHeadersAreValidated(t *testing.T) {
 
 func TestModernPromptPagination(t *testing.T) {
 	runtime := newFakeRuntime()
-	endpoint, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	endpoint, server := newTestHTTPHandler(t, runtime, Options{})
 	store := endpoint.opts.Catalog.(*catalog.MemoryStore)
 	namespaceCatalog, err := catalog.NewNamespaceCatalog(store, manualsNS)
 	if err != nil {
@@ -102,7 +102,7 @@ func TestModernPromptPagination(t *testing.T) {
 
 func TestModernToolValidationErrors(t *testing.T) {
 	runtime := newFakeRuntime()
-	_, server := newTestHTTPHandler(t, runtime, Options{QueuedSearch: true})
+	_, server := newTestHTTPHandler(t, runtime, Options{})
 	session := newModernClient(t, server, manualsNS)
 	ctx := context.Background()
 	cases := []struct {
@@ -110,10 +110,9 @@ func TestModernToolValidationErrors(t *testing.T) {
 		arguments map[string]any
 		want      string
 	}{
-		{"negative wait", map[string]any{"query": "x", "wait_seconds": -1}, "wait_seconds must be a finite number between 0 and 30"},
+		{"removed wait argument", map[string]any{"query": "x", "wait_seconds": -1}, "Unknown search arguments: wait_seconds"},
 		{"unknown search argument", map[string]any{"query": "x", "namespace": "other"}, "Unknown search arguments: namespace"},
 		{"unknown document argument", map[string]any{"name": "a.txt", "content": "x", "path": "C:/x"}, "Unknown document arguments"},
-		{"bad result uuid", map[string]any{"result_id": "nope"}, "Expected a dashed UUID string"},
 		{"bad artifact uuid", map[string]any{"artifact_id": "nope"}, "artifact_id must be a canonical UUID"},
 	}
 	for _, testCase := range cases {
@@ -130,28 +129,39 @@ func TestModernToolValidationErrors(t *testing.T) {
 		})
 	}
 
-	// The wait validation must run before any submission.
-	if len(runtime.submitted) != 0 {
-		t.Fatalf("invalid waits must not reach the runtime")
+	// Validation runs before retrieval: nothing reached the runtime yet.
+	if len(runtime.searchCalls) != 0 {
+		t.Fatalf("invalid arguments must not reach the runtime: %#v", runtime.searchCalls)
 	}
-	waited, err := session.CallTool(ctx, &sdk.CallToolParams{
-		Name: "search", Arguments: map[string]any{"query": "x", "wait_seconds": 0},
+
+	// A valid call runs retrieval and returns the evidence payload directly.
+	runtime.searchPayload = map[string]any{
+		"query": "x", "evidence_status": "found", "results": []any{},
+	}
+	synced, err := session.CallTool(ctx, &sdk.CallToolParams{
+		Name: "search", Arguments: map[string]any{"query": "x"},
 	})
-	if err != nil || waited.IsError {
-		t.Fatalf("zero wait search failed: %v %#v", err, waited)
+	if err != nil || synced.IsError {
+		t.Fatalf("synchronous search failed: %v %#v", err, synced)
 	}
-	var admitted map[string]any
-	if err := json.Unmarshal([]byte(waited.Content[0].(*sdk.TextContent).Text), &admitted); err != nil {
-		t.Fatalf("decode admitted payload: %v", err)
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(synced.Content[0].(*sdk.TextContent).Text), &payload); err != nil {
+		t.Fatalf("decode search payload: %v", err)
 	}
-	if len(admitted) != 1 || admitted["result_id"] != runtime.submitResultID {
-		t.Fatalf("zero wait admitted = %#v", admitted)
+	if payload["evidence_status"] != "found" {
+		t.Fatalf("search payload = %#v", payload)
+	}
+	if _, queued := payload["result_id"]; queued {
+		t.Fatalf("search must not return a result id: %#v", payload)
+	}
+	if len(runtime.searchCalls) != 1 {
+		t.Fatalf("search calls = %d, want 1", len(runtime.searchCalls))
 	}
 }
 
 func TestModernToolListChangedNotification(t *testing.T) {
 	runtime := newFakeRuntime()
-	endpoint := newTestEndpoint(t, runtime, Options{QueuedSearch: true})
+	endpoint := newTestEndpoint(t, runtime, Options{})
 	events := make(chan struct{}, 4)
 	client := sdk.NewClient(&sdk.Implementation{Name: "test-client", Version: "1"}, &sdk.ClientOptions{
 		ToolListChangedHandler: func(context.Context, *sdk.ToolListChangedRequest) {
