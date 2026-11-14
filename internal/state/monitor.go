@@ -172,6 +172,34 @@ func (s *Stores) MonitorStats(ctx context.Context, now time.Time, recentWindow t
 	return stats, nil
 }
 
+// MonitorIndexedCollections lists the Qdrant collections that live document
+// records are indexed into, ordered by name. The monitoring probe verifies
+// exactly these collections instead of the single RAG_COLLECTION fallback name:
+// every knowledge base stores its own generated collection name in its settings,
+// so the fallback is not required to exist, and a knowledge base without
+// documents legitimately has no Qdrant collection yet. Soft-deleted documents
+// are tombstones and do not require their collection to remain.
+func (s *Stores) MonitorIndexedCollections(ctx context.Context) ([]string, error) {
+	rows, err := s.DB.QueryContext(ctx,
+		"SELECT DISTINCT collection FROM documents WHERE del_flag = 0 AND collection <> '' ORDER BY collection")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	collections := make([]string, 0, 8)
+	for rows.Next() {
+		var collection string
+		if err := rows.Scan(&collection); err != nil {
+			return nil, err
+		}
+		collections = append(collections, collection)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return collections, nil
+}
+
 // monitorGroupCounts runs a "SELECT <key>, COUNT(*) ... GROUP BY <key>" query.
 func (s *Stores) monitorGroupCounts(ctx context.Context, query string, arguments ...any) (map[string]int, error) {
 	rows, err := s.DB.QueryContext(ctx, query, arguments...)

@@ -171,7 +171,8 @@ func run() error {
 		DBStats:               stores.DB.Stats,
 		Redis:                 cache,
 		QdrantURL:             ragConfig.QdrantURL,
-		Collection:            ragConfig.Collection,
+		FallbackCollection:    ragConfig.Collection,
+		IndexedCollections:    stores.MonitorIndexedCollections,
 		KafkaBootstrapServers: mqSettings.BootstrapServers,
 		KafkaProbe:            kafkaProbe,
 		// The two Debezium connectors are the delivery path now; their Quarkus

@@ -1965,3 +1965,57 @@ go vet ./internal/contracts ./internal/retrieval ./internal/modelapi ./internal/
 go test -p 1 -count=1 ./internal/contracts ./internal/retrieval ./internal/modelapi ./internal/qdrant ./internal/runtime ./internal/httpapi ./internal/mcp   # ok
 cd frontend && npm run typecheck                  # exit 0
 ```
+
+## 系统监控 Qdrant 集合判定对齐知识库实际入库集合 — 2026-11-14
+
+工作树 `dsh-43becfb6-ff65`（Windows 11，Go 1.27.3）。目标：修复监控页把
+`RAG_COLLECTION` 回退集合当作健康条件导致的误报——知识库创建时在配置中生成
+`knowledge_*` 集合名，入库代码按配置写入并在首次入库时创建 Qdrant 集合；服务启动时却把
+全局回退名传给监控，监控要求它存在。真实实例有 26 个 `knowledge_*` 集合、默认知识库使用
+`knowledge_e0fd7ba996b0e4d3adeb72b1bde6e853` 且仅 1 条有效文档，页面仍报
+「集合 mini_agent_knowledge_pdf_assets_v1 不存在」并降级。
+
+**代码改动**
+
+- `internal/state/monitor.go`：新增 `MonitorIndexedCollections`，返回 `documents` 中
+  `del_flag = 0` 且 `collection <> ''` 的去重集合名（`ORDER BY collection`）；软删除文档
+  不再要求集合存在。
+- `internal/monitor/monitor.go`：`Options.Collection` 改为 `FallbackCollection`（只用于
+  `service.collection` 展示）；新增 `IndexedCollections` 回调；`probeQdrant` 只校验真实入库
+  集合：连接失败 → `error`；回调失败 → `unknown`（不误报 Qdrant）；缺失 → `degraded` 并点名；
+  0 个入库集合（空库/空知识库）→ `ok`。`dependencies[].points` 保留字段但不再赋值（多集合
+  没有单一聚合点数）。
+- `cmd/rag-service/main.go`：注入 `IndexedCollections: stores.MonitorIndexedCollections`。
+- 文档：`docs/USAGE.md`（`RAG_COLLECTION` 说明、监控语义、`points` 兼容字段）、
+  `docs/agents/features.md`、`PROGRESS.md`。
+
+**验证**
+
+- 基线（旧服务 8011，同一真实栈）：`/v1/admin/monitor/overview` 返回
+  `status:"degraded"`、`service.collection:"mini_agent_knowledge_pdf_assets_v1"`，qdrant 行
+  `status:"degraded"`、detail「集合 mini_agent_knowledge_pdf_assets_v1 不存在」；Qdrant
+  `/collections` 返回 26 个集合且确实不含该回退名。
+- 单元/集成测试：
+  - `go build ./...` → exit 0；`go vet ./internal/monitor ./internal/state ./cmd/rag-service` → exit 0。
+  - `go test ./internal/monitor -count=1` → ok（新增
+    `TestMonitorQdrantUsesIndexedCollections`：回退集合未创建不降级、入库集合缺失降级、
+    多缺失点名、无入库集合、状态读取失败仅 unknown）。
+  - `go test ./internal/state -run 'TestMonitor' -count=1 -p 1`（`RAG_TEST_MYSQL_URL` 指向
+    `praxis_unit_test`）→ ok（`TestMonitorIndexedCollections` 覆盖去重、排序、软删除与空集合名）。
+- 新构建实机 E2E（`go build -o .test-tmp/bin/rag-service.exe ./cmd/rag-service`，同一二进制与
+  装配；`RAG_SERVICE_PORT=18011`，Qdrant 为真实实例）：由于 `rag-service` 启动会执行维护写操作，
+  本次按任务允许的安全回退把状态库指向一次性 `praxis_gotest`（库名含 test，先插入 1 行
+  `documents`：`del_flag=0`、`collection=knowledge_e0fd7ba996b0e4d3adeb72b1bde6e853`），Redis
+  关闭、数据根指向 `.test-tmp`，未写生产库。`/health` 200；`GET /v1/admin/monitor/overview`
+  返回 `status:"ok"`，qdrant 行为
+  `{"status":"ok","detail":"集合 26 个；knowledge_e0fd7ba996b0e4d3adeb72b1bde6e853 已就绪"}`，
+  `service.collection` 仍为 `mini_agent_knowledge_pdf_assets_v1`（兼容），`dependencies[]` 无
+  `points` 键，旧回退集合不再被检查。随后杀进程、确认 18011 无监听并清理 `.test-tmp` 与 seed 行。
+- 真实库只读核对：`praxis_rag.documents` 共 26 行（1 行有效、25 行软删除墓碑），唯一有效文档的
+  collection 为 `knowledge_e0fd7ba996b0e4d3adeb72b1bde6e853`，与修复后监控期望集合一致；
+  Qdrant 的 26 个集合包含该集合、不含 `mini_agent_knowledge_pdf_assets_v1`。
+
+**未验证/限制**：未在真实浏览器中人工点检 Console 监控页（只验证 HTTP JSON）；`documents` 表由
+入库发布同步写入，若集合被外部删除，监控在下一轮 15s 刷新会发现；不再展示单一"向量点"聚合数；
+`documents.collection` 无索引，`DISTINCT` 查询在文档量很大时是全表扫描（当前 26 行无影响，本轮
+不改 MySQL 结构；量大时可考虑加 `(del_flag, collection)` 索引）。

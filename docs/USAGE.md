@@ -199,7 +199,7 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_BACKEND` | `mock`（服务拒绝启动） | 必须为 `qdrant`；`mock` 仅用于 mcp-debug |
 | `QDRANT_URL` | 未设置时 `http://localhost:6333` | Qdrant HTTP 地址 |
 | `QDRANT_PATH` | 空 | **Go 不支持**；设置会启动失败（改用 `QDRANT_URL`） |
-| `RAG_COLLECTION` | `mini_agent_knowledge_pdf_assets_v1` | 默认集合名；实际集合由知识库配置决定 |
+| `RAG_COLLECTION` | `mini_agent_knowledge_pdf_assets_v1` | 回退集合名；实际集合由知识库配置决定（创建知识库时生成 `knowledge_*` 名称，首次入库时创建），监控不要求该回退集合存在 |
 | `RAG_DENSE_VECTOR_SIZE` | `1024` | 固定值，其他尺寸报错 |
 | `RAG_EMBEDDING_MODEL` | `BAAI/bge-m3` | 默认模型标识（实际连接由知识库配置覆盖） |
 | `RAG_EMBEDDING_DEVICE` | 空 | 传给兼容模型 API 的可选设备提示 |
@@ -578,9 +578,9 @@ curl.exe -X POST http://127.0.0.1:8011/v1/document-batches `
 
 管理员（或本机直连）可在 Console 侧边栏打开「系统监控」（`#/monitor`），页面每 15 秒自动刷新，全部为只读数据。页面顶部是一排标签：`概览` + 每个系统组件（`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium`）+ `全部日志`；组件标签展示该组件的既有监控内容与该组件最近日志；`全部日志` 页的组件筛选显示各组件的最近日志条数。概览版式按重要性排列：页头总体状态 → 主机资源 → 关键指标 → 依赖与投递 → 队列与记录 → 服务信息；窄屏自动单列。
 
-- **页头总体状态**：由状态库聚合与依赖探测共同推导的三态 `status`（`ok`/`degraded`/`error`，`ok` 为兼容字段，等于 `status == "ok"`）。任一依赖异常或状态库不可读 → `error`；任一依赖/Qdrant 目标集合/文档 Worker 心跳/Debezium 运行检查降级，或 Kafka 消费进度读取失败 → `degraded`；未启用或未知不降级。`pipeline.document_jobs` 只反映任务负载，不参与总体状态。Qdrant 已降级时页头不再显示「运行正常」。
+- **页头总体状态**：由状态库聚合与依赖探测共同推导的三态 `status`（`ok`/`degraded`/`error`，`ok` 为兼容字段，等于 `status == "ok"`）。任一依赖异常或状态库不可读 → `error`；任一依赖/Qdrant 已入库集合/文档 Worker 心跳/Debezium 运行检查降级，或 Kafka 消费进度读取失败 → `degraded`；未启用或未知不降级。`pipeline.document_jobs` 只反映任务负载，不参与总体状态。Qdrant 已降级时页头不再显示「运行正常」。
 - **关键指标**：有效文档数（只统计 `del_flag = 0`，不含软删除）、排队/处理中文档任务、上传进行中、近 24 小时检索次数、artifact 快照数（结果快照指标已随搜索同步化移除）。
-- **依赖探测**：MySQL（含连接池 in_use/wait）、Redis（PING）、Qdrant（集合数与目标集合点数）、Kafka（broker 元数据：连通性、TLS/SASL 认证、目标主题是否存在与分区数，不再只测 TCP 端口）、pdf-service（`/healthz` 解析转换器状态、版本、配置错误，不再只看 HTTP 状态码）；未启用的依赖标记为「未启用」，未配置 Kafka 时显示「未配置 Kafka：…」。
+- **依赖探测**：MySQL（含连接池 in_use/wait）、Redis（PING）、Qdrant（集合总数；校验有效文档实际入库的 `collection` 是否仍然存在；不要求 `RAG_COLLECTION` 回退名存在，空知识库尚未创建集合不算异常）、Kafka（broker 元数据：连通性、TLS/SASL 认证、目标主题是否存在与分区数，不再只测 TCP 端口）、pdf-service（`/healthz` 解析转换器状态、版本、配置错误，不再只看 HTTP 状态码）；未启用的依赖标记为「未启用」，未配置 Kafka 时显示「未配置 Kafka：…」。
 - **文档任务与队列**：`document_jobs` 按状态/阶段计数、最老排队时长、租约过期的卡死任务数、24 小时失败数；上传操作拆成互斥分类：进行中（`INTENT`+`RUNNING`）、失败（`FAILED`+`ROLLBACK_FAILED`）、回滚中（`ROLLING_BACK`）、待清理（`cleanup_pending`），并保留并集 `unfinished`。页面注明「未完成操作」是进行中、失败待处理与待清理的合计，不代表当前正在上传或入库的文件数。
 - **Debezium 两个连接器**：任务连接器与缓存连接器分别探测 `/q/health` 的 `checks[]`，失败项点名；两个连接器的 binlog 采集位点都显示「未知」（应用侧读不到）。
 - **Kafka 两组积压**：文档、缓存两个消费组各自的 topic/group、已提交位点、末尾位点与滞后（读不到/未配置显示「未知/未启用」）；聚合状态按两组综合。
@@ -589,7 +589,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/document-batches `
 - **主机资源（概览顶部）**：`system` 对象给出 CPU 使用率/逻辑核数/型号/load1/5/15、内存与 swap、网络总收发速率与最忙的 8 个网卡、本进程 RSS/VMS/goroutine/heap 用量。CPU 使用率与网络速率由两次采样差值计算，服务启动后的首次采样为 `null`；Windows 没有 load average，`load1/5/15` 为 `null` 并在 `system.notes` 说明；采集失败时 `system` 为 `null`，原因追加到顶层 `errors`，**不会**改变总体 `status`/`ok`（主机资源只做展示，不参与健康判定）。
 - **组件日志**：内存日志源是进程内环形缓冲（`RAG_LOG_BUFFER_SIZE`，默认 1000 条），按组件统计条数用于 `全部日志` 的组件筛选；文件日志源读取启动时配置的 `RAG_LOG_FILE`（最多最近 512 KiB，丢弃首个不完整行，无法解析的行计入提示）。组件按记录的显式 `component` 属性优先归类，否则按调用方源码包路径映射（`internal/state`→MySQL、`internal/redisstate`→Redis、`internal/qdrant`→Qdrant、`internal/mq`/`internal/cacheconsumer`→Kafka、`internal/documentworker`/`internal/ingest`/`internal/document`→文档 Worker、`internal/cdcacceptance`→Debezium、`internal/modelapi`→模型调用、`internal/retrieval`/`internal/searchrefs`/`internal/sparse`→检索、`internal/httpapi`/`internal/mcp`→HTTP API、`internal/monitor`→系统监控、`cmd/rag-service`→服务、其余→其他）。
 
-页面对应的只读接口是 `GET /v1/admin/monitor/overview`（仅本机直连或管理员会话，响应 `Cache-Control: no-store`）。依赖降级时接口仍返回 200，用顶层 `status` 与 `dependencies[].status`（`ok`/`degraded`/`error`/`disabled`/`unknown`）区分；`queues.uploads` 同时提供 `by_status` 与 `in_progress`/`failed`/`rolling_back`/`cleanup_pending`；`pipeline.debezium` 为 `{tasks, cache}` 两个连接器（各含 `status/detail/capture_progress`），`pipeline.kafka.groups` 为 `document`/`cache` 两组位点，`pipeline.cache` 为 `{status, dirty_keys, refresh_failures}`，`service.delivery` 固定为 `debezium`；`library` 只含有效文档/知识库/artifact 快照计数（原 `result_snapshots` 字段已移除）。顶层新增 `system`（主机资源，见上一节；采集不可用时为 `null`，原有字段一律不变）。状态库不可读时 `queues`/`library`/`activity` 为 `null`、`pipeline.cache.dirty_keys/refresh_failures` 为 `null`，`pipeline.document_jobs.status` 为 `unknown`，`pipeline.debezium`/`pipeline.kafka`/`pipeline.worker` 仍各自探测，并附带 `errors` 中文说明。数字 `null` 表示未知，不要当作 0。该接口只做聚合查询，不读取任务/文档正文，也不记录查询内容：
+页面对应的只读接口是 `GET /v1/admin/monitor/overview`（仅本机直连或管理员会话，响应 `Cache-Control: no-store`）。依赖降级时接口仍返回 200，用顶层 `status` 与 `dependencies[].status`（`ok`/`degraded`/`error`/`disabled`/`unknown`）区分；`queues.uploads` 同时提供 `by_status` 与 `in_progress`/`failed`/`rolling_back`/`cleanup_pending`；`pipeline.debezium` 为 `{tasks, cache}` 两个连接器（各含 `status/detail/capture_progress`），`pipeline.kafka.groups` 为 `document`/`cache` 两组位点，`pipeline.cache` 为 `{status, dirty_keys, refresh_failures}`，`service.delivery` 固定为 `debezium`；`library` 只含有效文档/知识库/artifact 快照计数（原 `result_snapshots` 字段已移除）。顶层新增 `system`（主机资源，见上一节；采集不可用时为 `null`，原有字段一律不变）；`dependencies[].points` 是兼容旧 Console 的保留字段，Qdrant 行不再返回单一聚合点数（每个知识库各有一个集合）。状态库不可读时 `queues`/`library`/`activity` 为 `null`、`pipeline.cache.dirty_keys/refresh_failures` 为 `null`，`pipeline.document_jobs.status` 为 `unknown`，`pipeline.debezium`/`pipeline.kafka`/`pipeline.worker` 仍各自探测，并附带 `errors` 中文说明。数字 `null` 表示未知，不要当作 0。该接口只做聚合查询，不读取任务/文档正文，也不记录查询内容：
 
 ```powershell
 curl.exe http://127.0.0.1:8011/v1/admin/monitor/overview

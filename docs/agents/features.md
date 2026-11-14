@@ -8,7 +8,7 @@
 - 一个知识库 = 一个 namespace，命名规则 `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`；文档、切分配置、Embedding/Reranker/VLM 连接、Qdrant collection 与维度都按知识库保存。
 - 所有租户请求（REST `/v1/*`、MCP）必须携带 `X-RAG-Namespace`；Qdrant 查询按 payload 中的 `namespace` 过滤，不同知识库互不可见。
 - 知识库默认归创建者私有；共享通过「权限管理」页的邀请链接完成（见 §10）。
-- 每个知识库的 Qdrant 集合由配置决定，默认 `RAG_COLLECTION=mini_agent_knowledge_pdf_assets_v1`；dense 向量维度固定 1024（BGE-M3），其他维度启动即报错。
+- 每个知识库的 Qdrant 集合由知识库配置决定（创建知识库时生成 `knowledge_*` 名称，首次入库时创建）；`RAG_COLLECTION` 只是没有知识库配置时的回退名，系统监控按有效文档实际入库的集合校验，不要求回退集合存在，空知识库没有集合也不算异常；dense 向量维度固定 1024（BGE-M3），其他维度启动即报错。
 
 ## 2. 文档导入与异步任务
 
