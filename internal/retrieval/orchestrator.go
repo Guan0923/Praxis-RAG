@@ -176,6 +176,12 @@ func BuildDefaultOrchestrator(cfg config.RagConfig) (*Orchestrator, error) {
 			contracts.RetrievalBM25:      retriever,
 			contracts.RetrievalEmbedding: retriever,
 			contracts.RetrievalHybrid:    retriever,
+			// The deterministic mock backend has no lexical corpus and no JEV
+			// decision model, so sag2 reports its limitation instead of
+			// silently returning mock evidence.
+			contracts.RetrievalSAG2: NewUnavailableRetriever(
+				"retrieval sag2 requires the Qdrant backend with a configured JEV decision model",
+			),
 		},
 		map[contracts.RerankMode]Reranker{
 			contracts.RerankCrossEncoder: NewMockReranker("cross_encoder"),
@@ -261,6 +267,13 @@ func BuildQdrantOrchestrator(
 			contracts.RetrievalBM25:      bm25,
 			contracts.RetrievalEmbedding: dense,
 			contracts.RetrievalHybrid:    hybrid,
+			// The standalone debug CLI stack has no state-store access to
+			// resolve a JEV model profile or a lexical corpus, so sag2 stays
+			// explicitly unavailable here; the service runtime registers the
+			// real implementation.
+			contracts.RetrievalSAG2: NewUnavailableRetriever(
+				"retrieval sag2 requires the service runtime with a configured JEV decision model",
+			),
 		},
 		map[contracts.RerankMode]Reranker{
 			contracts.RerankCrossEncoder: crossEncoder,

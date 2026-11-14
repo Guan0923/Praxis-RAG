@@ -19,6 +19,11 @@ const (
 	RetrievalBM25      RetrievalMode = "bm25"
 	RetrievalEmbedding RetrievalMode = "embedding"
 	RetrievalHybrid    RetrievalMode = "hybrid"
+	// RetrievalSAG2 is the query-time lexical-association mode (BM25 initial
+	// candidates + JEV necessary-evidence decisions + term expansion + DPP).
+	// It requires a configured JEV decision model and pairs with rerank=none:
+	// the JEV evidence score is the final ordering.
+	RetrievalSAG2 RetrievalMode = "sag2"
 )
 
 // RerankMode selects the second-stage relevance scorer.
@@ -161,8 +166,9 @@ func SearchRequestFromArguments(arguments map[string]any) (SearchRequest, error)
 	retrieval := RetrievalHybrid
 	if raw, exists := arguments["retrieval"]; exists {
 		value, ok := raw.(string)
-		if !ok || (value != string(RetrievalBM25) && value != string(RetrievalEmbedding) && value != string(RetrievalHybrid)) {
-			return SearchRequest{}, validationError("retrieval must be bm25, embedding, or hybrid")
+		if !ok || (value != string(RetrievalBM25) && value != string(RetrievalEmbedding) &&
+			value != string(RetrievalHybrid) && value != string(RetrievalSAG2)) {
+			return SearchRequest{}, validationError("retrieval must be bm25, embedding, hybrid, or sag2")
 		}
 		retrieval = RetrievalMode(value)
 	}
@@ -174,6 +180,11 @@ func SearchRequestFromArguments(arguments map[string]any) (SearchRequest, error)
 			return SearchRequest{}, validationError("rerank must be none or cross_encoder")
 		}
 		rerank = RerankMode(value)
+	}
+	// The SAG2 ordering comes from the JEV necessary-evidence decisions; a
+	// cross-encoder pass would silently replace it and double the model cost.
+	if retrieval == RetrievalSAG2 && rerank != RerankNone {
+		return SearchRequest{}, validationError("retrieval sag2 requires rerank none")
 	}
 
 	candidateK, err := boundedInteger(arguments["candidate_k"], 10, "candidate_k", 1, 100)
@@ -303,7 +314,9 @@ func ValidateUUID(value any) (string, error) {
 // SearchToolDescription is the stable Agent-facing search description.
 const SearchToolDescription = "Search user-uploaded/local knowledge for manuals, internal facts, exact identifiers, and evidence " +
 	"not already established in the conversation. Prefer hybrid + cross_encoder initially; use bm25 " +
-	"for exact codes/names and embedding for semantic paraphrases. Cite returned source and chunk_id. " +
+	"for exact codes/names and embedding for semantic paraphrases. When the knowledge base has a " +
+	"configured JEV decision model, retrieval sag2 chains multi-hop lexical evidence with " +
+	"necessary-evidence decisions (requires rerank none). Cite returned source and chunk_id. " +
 	"If evidence_status is no_evidence, rewrite the query once when useful, otherwise say the knowledge " +
 	"base is insufficient. Do not use this tool for greetings or unrelated general tasks."
 
@@ -330,7 +343,7 @@ func SearchToolSchema() map[string]any {
 	properties := map[string]any{
 		"query": map[string]any{"type": "string", "minLength": 1, "maxLength": 2000},
 		"retrieval": map[string]any{
-			"type": "string", "enum": []string{"bm25", "embedding", "hybrid"}, "default": "hybrid",
+			"type": "string", "enum": []string{"bm25", "embedding", "hybrid", "sag2"}, "default": "hybrid",
 		},
 		"rerank": map[string]any{
 			"type": "string", "enum": []string{"none", "cross_encoder"}, "default": "cross_encoder",

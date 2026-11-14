@@ -34,6 +34,8 @@ func TestInvalidSearchArgumentsFailAtTheBoundary(t *testing.T) {
 		{map[string]any{"query": "x", "top_k": 6, "candidate_k": 5}, "top_k"},
 		{map[string]any{"query": "x", "retrieval": "sql"}, "retrieval"},
 		{map[string]any{"query": "x", "rerank": "bi_encoder"}, "rerank must be none or cross_encoder"},
+		{map[string]any{"query": "x", "retrieval": "sag2"}, "retrieval sag2 requires rerank none"},
+		{map[string]any{"query": "x", "retrieval": "sag2", "rerank": "cross_encoder"}, "retrieval sag2 requires rerank none"},
 		{map[string]any{"query": "x", "filters": map[string]any{"raw_qdrant": "unsafe"}}, "Unsupported filters"},
 		{map[string]any{"query": "x", "unknown": true}, "Unknown search arguments"},
 		{map[string]any{"query": "x", "wait_seconds": 3}, "Unknown search arguments"},
@@ -79,6 +81,29 @@ func TestFilterValuesMustBeScalar(t *testing.T) {
 	}
 }
 
+func TestSAG2SearchRequestRequiresRerankNone(t *testing.T) {
+	request, err := SearchRequestFromArguments(map[string]any{
+		"query": "多跳问题", "retrieval": "sag2", "rerank": "none", "candidate_k": 100,
+	})
+	if err != nil {
+		t.Fatalf("SearchRequestFromArguments() error = %v", err)
+	}
+	if request.Retrieval != RetrievalSAG2 || request.Rerank != RerankNone {
+		t.Fatalf("request = %+v", request)
+	}
+}
+
+func TestSearchToolSchemaExposesSAG2(t *testing.T) {
+	schema := SearchToolSchema()
+	retrieval, ok := schema["properties"].(map[string]any)["retrieval"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema properties = %#v", schema["properties"])
+	}
+	values, ok := retrieval["enum"].([]string)
+	if !ok || len(values) != 4 || values[3] != "sag2" {
+		t.Fatalf("retrieval enum = %v", retrieval["enum"])
+	}
+}
 func TestValidateUUID(t *testing.T) {
 	valid := "123e4567-e89b-12d3-a456-426614174000"
 	if got, err := ValidateUUID(valid); err != nil || got != valid {

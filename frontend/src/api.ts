@@ -207,7 +207,7 @@ export type Health = {
   backend?: string;
   collection?: string;
 };
-export type Retrieval = "bm25" | "embedding" | "hybrid";
+export type Retrieval = "bm25" | "embedding" | "hybrid" | "sag2";
 export type Rerank = "none" | "cross_encoder";
 export type Hit = {
   rank: number;
@@ -368,6 +368,7 @@ export const retrievalLabels = {
   bm25: "BM25",
   embedding: "Embedding",
   hybrid: "Hybrid",
+  sag2: "SAG2（词法多跳）",
 };
 export const rerankLabels = {
   none: "不重排",

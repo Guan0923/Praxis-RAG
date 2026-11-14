@@ -308,6 +308,25 @@ func TestBuildDefaultOrchestratorQdrantRequiresConnections(t *testing.T) {
 	}
 }
 
+func TestMockBackendKeepsSAG2ExplicitlyUnavailable(t *testing.T) {
+	orchestrator, err := BuildDefaultOrchestrator(config.RagConfig{Backend: config.BackendMock})
+	if err != nil {
+		t.Fatalf("BuildDefaultOrchestrator() error = %v", err)
+	}
+	request := contracts.SearchRequest{
+		Query: "多跳", Retrieval: contracts.RetrievalSAG2, Rerank: contracts.RerankNone,
+	}
+	_, err = orchestrator.Search(context.Background(), request)
+	if err == nil {
+		t.Fatal("mock backend accepted sag2 retrieval")
+	}
+	var operationError *contracts.RagOperationError
+	if !errors.As(err, &operationError) ||
+		!strings.Contains(operationError.Message, "JEV") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestBuildQdrantOrchestratorRejectsLocalPathMode(t *testing.T) {
 	cfg := config.RagConfig{
 		Backend:    config.BackendQdrant,
