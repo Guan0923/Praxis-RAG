@@ -1877,3 +1877,35 @@ DELETE /v1/admin/knowledge-bases/{missing}   -> 404
   `TestKnowledgeBasePurgeBatchScalesWithDocuments`、schema 断言；全部通过。
 - 生产实例重启后 `information_schema` 已出现 `retired_at` 列与
   `ix_content_objects_retired` 索引；批量删除返回结构不变。
+
+## 合并到 main 时的 CDC 适配 — 2026-11-14
+
+内容去重与批量清理分支（`b602bb7` + `d3b87bf`）在 `main`@`9690452` 上重放，适配了
+11-13 Debezium CDC 迁移与 11-14 搜索同步化之后的 state 结构：
+
+- `cache_events.touch` 已不再写 `cache_outbox`（事务 outbox 已下线）；批量清理改为
+  删除 `cache_revisions` 行后调用 revision-only 的 `touch`，不再插入 outbox。
+- 批量清理按当前 schema 调整表集合：去掉已不存在的 `cache_outbox` /
+  `document_job_outbox` / `search_task_outbox`，新增 `document_batches` /
+  `document_batch_items`（先物化到 `tmp_purge_batches`，再按 batch_id 删除）。
+- 维护循环的 GC 调用改为 `PurgeUnreferencedContent(ctx, state.ContentObjectRetentionSeconds, 100)`，
+  即 `retired_at` + 8 天保留策略；`logBackgroundFailure` 按当前签名补 `ctx`。
+- `schema.go` 末尾追加 `content_objects(hash,size,content,created_at,retired_at)`，并为
+  `upload_objects.content_hash` / `ix_upload_objects_content` / `ix_blobs_sha256` /
+  `ix_content_objects_retired` 补迁移与 schema 断言。
+- 文档：`docs/state-storage.md` 的删除与保留语义改为 `retired_at` + 8 天。
+
+验证（2026-11-14，Windows 11，Go 1.27，MySQL `praxis_gotest` 一次性测试库）：
+
+```
+go build ./...                                                                                                         # exit 0
+go vet ./internal/state ./internal/runtime ./internal/httpapi ./internal/wire ./internal/migrate ./cmd/rag-service     # exit 0
+go test -p 1 -count=1 ./internal/state -skip TestMigrationsAddMissingLegacyColumns                                      # ok
+go test -p 1 -count=1 ./internal/runtime ./internal/httpapi                                                             # ok
+go test -p 1 -count=1 ./internal/migrate                                                                                # ok
+```
+
+说明：`internal/state` 的 `TestMigrationsAddMissingLegacyColumns` 在合并前的主干
+（`9690452`）上已经失败（退役的 `search_tasks` 仍声明 `schedule_version`，与“已退役表
+不应再迁移回该列”的测试期望不符），与本次去重/批量清理无关，因此验证时用 `-skip`
+排除该基线失败。
