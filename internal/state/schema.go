@@ -560,10 +560,6 @@ var schemaTables = []*SchemaTable{
 			double("deadline"),
 			double("created_at"),
 			double("updated_at"),
-			// schedule_version is the scheduling generation Debezium watches:
-			// it starts at 1 and is incremented inside the MySQL transaction
-			// that requeues a task (retryable failure or cutover backfill).
-			bigint("schedule_version").Default("1"),
 		},
 		Indexes: []SchemaIndex{
 			index("ix_search_tasks_deadline", "status", "deadline"),

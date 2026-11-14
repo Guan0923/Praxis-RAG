@@ -30,7 +30,7 @@ var expectedSchema = []struct {
 	{"artifact_snapshots", []string{"id", "namespace", "identity", "document_id", "version", "kind", "name", "mime_type", "content", "created_at", "expires_at"}},
 	{"document_tasks", []string{"artifact_id", "namespace", "name", "name_key", "content", "sha256", "idempotency_key", "configuration_version", "status", "stage", "attempts", "owner", "lease_until", "operation_id", "error", "created_at", "updated_at"}},
 	{"document_jobs", []string{"artifact_id", "namespace", "name", "name_key", "content", "size", "sha256", "configuration_version", "idempotency_key", "status", "stage", "attempts", "owner", "execution_id", "lease_until", "operation_id", "retry_at", "error", "created_at", "updated_at", "schedule_version"}},
-	{"search_tasks", []string{"result_id", "namespace", "arguments", "status", "stage", "attempts", "owner", "lease_until", "retry_at", "deadline", "created_at", "updated_at", "schedule_version"}},
+	{"search_tasks", []string{"result_id", "namespace", "arguments", "status", "stage", "attempts", "owner", "lease_until", "retry_at", "deadline", "created_at", "updated_at"}},
 	{"users", []string{"id", "username", "password_hash", "role", "enabled", "created_at", "updated_at", "last_login_at", "email", "email_verified", "age", "gender"}},
 	{"user_sessions", []string{"id", "user_id", "token_digest", "csrf_token", "expires_at", "created_at", "last_seen_at", "revoked"}},
 	{"kb_permissions", []string{"id", "namespace", "grantee_user_id", "document_name", "permission", "granted_by", "created_at", "updated_at"}},
