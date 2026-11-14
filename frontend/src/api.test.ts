@@ -39,11 +39,14 @@ import {
   sendTestMail,
   setCSRFToken,
   setUnauthorizedHandler,
+  submitDocumentBatch,
+  subscribeUploadProgress,
   updateModelProfile,
   updateProfile,
   uploadAvatar,
   type Connection,
   type InvitationView,
+  type UploadProgressEvent,
 } from "./api";
 
 // jsonResponse builds the minimal Response surface the client touches.
@@ -66,6 +69,34 @@ function textResponse(body: string, status: number) {
     json: async () => JSON.parse(body),
     text: async () => body,
   } as unknown as Response;
+}
+
+// streamResponse emulates a fetch Response whose body is an SSE byte stream
+// delivered in fixed chunks; chunk boundaries deliberately split frames.
+function streamResponse(chunks: string[]) {
+  const encoder = new TextEncoder();
+  let index = 0;
+  const reader = {
+    read: async () => {
+      if (index >= chunks.length) return { done: true, value: undefined };
+      const value = encoder.encode(chunks[index]);
+      index += 1;
+      return { done: false, value };
+    },
+    cancel: async () => undefined,
+  };
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    body: { getReader: () => reader },
+  } as unknown as Response;
+}
+
+// flushMicrotasks lets the background SSE consumer advance through await hops
+// without relying on real timers.
+async function flushMicrotasks() {
+  for (let index = 0; index < 10; index += 1) await Promise.resolve();
 }
 
 const fetchMock = vi.fn();
@@ -228,6 +259,150 @@ describe("apiResponse transport contract", () => {
     await expect(apiResponse("/v1/documents", connection)).rejects.toThrow(
       "plain text failure",
     );
+  });
+});
+
+describe("subscribeUploadProgress", () => {
+  it("parses SSE frames split across chunks and resolves ready", async () => {
+    fetchMock.mockReturnValue(streamResponse([
+      'data: {"type":"ready","upload_id":"upload/1"}\n\ndata: {"type":"prog',
+      'ress","index":0,"received":1024}\r\n\r\n: ping\n\ndata: not-json\n\n'
+        + 'data: {"type":"result","index":0,"status":"saved","reason":null,"error":null}\n\r',
+      '\n\r\ndata: {"type":"done","batch_id":"batch-1","detail":null}\n\n',
+    ]));
+    const events: UploadProgressEvent[] = [];
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const subscription = subscribeUploadProgress("upload/1", connection, (event) => {
+      events.push(event);
+      if (event.type === "done") finish();
+    });
+
+    await subscription.ready;
+    await finished;
+
+    expect(events).toEqual([
+      { type: "ready", upload_id: "upload/1" },
+      { type: "progress", index: 0, received: 1024 },
+      { type: "result", index: 0, status: "saved", reason: null, error: null },
+      { type: "done", batch_id: "batch-1", detail: null },
+    ]);
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/document-batches/upload-events/upload%2F1");
+    const headers = options.headers as Headers;
+    expect(headers.get("Accept")).toBe("text/event-stream");
+    expect(headers.get("X-RAG-Namespace")).toBe("team-kb");
+    expect(options.credentials).toBe("same-origin");
+  });
+
+  it("rejects ready when the server refuses the subscription", async () => {
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 503,
+      statusText: "Service Unavailable",
+      text: async () => '{"detail":"订阅通道已满"}',
+    } as unknown as Response);
+    const subscription = subscribeUploadProgress("u-2", connection, vi.fn());
+    await expect(subscription.ready).rejects.toThrow("HTTP 503：订阅通道已满");
+  });
+
+  it("rejects ready when the response has no event stream body", async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      body: null,
+    } as unknown as Response);
+    const subscription = subscribeUploadProgress("u-3", connection, vi.fn());
+    await expect(subscription.ready).rejects.toThrow("响应没有事件流");
+  });
+
+  it("close aborts the stream and settles ready", async () => {
+    const never = new Promise<never>(() => {});
+    const read = vi.fn(() => never);
+    const cancel = vi.fn(async () => undefined);
+    fetchMock.mockImplementation(async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      body: { getReader: () => ({ read, cancel }) },
+    }) as unknown as Response);
+    const subscription = subscribeUploadProgress("u-4", connection, vi.fn());
+    await flushMicrotasks();
+    const [path, options] = requestArgs(0) as [string, RequestInit];
+    expect(path).toBe("/v1/document-batches/upload-events/u-4");
+    expect(read).toHaveBeenCalled();
+    const signal = options.signal as AbortSignal;
+    expect(signal.aborted).toBe(false);
+
+    subscription.close();
+    expect(signal.aborted).toBe(true);
+    await expect(subscription.ready).rejects.toThrow("上传事件订阅已关闭");
+  });
+});
+
+describe("submitDocumentBatch upload id", () => {
+  // The batch POST goes through XMLHttpRequest because fetch() cannot report
+  // upload progress. This fake captures the headers so the X-Upload-ID
+  // correlation with the SSE stream is covered, not only type-checked.
+  class FakeXHR {
+    static instances: FakeXHR[] = [];
+    method = "";
+    url = "";
+    headers: Record<string, string> = {};
+    upload: { onprogress?: (event: ProgressEvent) => void } = {};
+    status = 202;
+    statusText = "Accepted";
+    responseText = JSON.stringify({ batch_id: "batch-1" });
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    onabort: (() => void) | null = null;
+    constructor() {
+      FakeXHR.instances.push(this);
+    }
+    open(method: string, url: string) {
+      this.method = method;
+      this.url = url;
+    }
+    setRequestHeader(name: string, value: string) {
+      this.headers[name] = value;
+    }
+    send() {
+      this.upload.onprogress?.({ lengthComputable: true, loaded: 5, total: 10 } as ProgressEvent);
+      this.onload?.();
+    }
+    abort() {
+      this.onabort?.();
+    }
+  }
+
+  beforeEach(() => {
+    FakeXHR.instances = [];
+    vi.stubGlobal("XMLHttpRequest", FakeXHR);
+  });
+
+  it("sends the same X-Upload-ID as the subscription", async () => {
+    const batch = await submitDocumentBatch([new File(["hello"], "a.md")], connection, {
+      idempotencyKey: "idem-1",
+      uploadId: "upload-123",
+    });
+
+    expect(batch.batch_id).toBe("batch-1");
+    const [xhr] = FakeXHR.instances;
+    expect(xhr.method).toBe("POST");
+    expect(xhr.url).toBe("/v1/document-batches");
+    expect(xhr.headers["X-Upload-ID"]).toBe("upload-123");
+    expect(xhr.headers["Idempotency-Key"]).toBe("idem-1");
+    expect(xhr.headers["X-RAG-Namespace"]).toBe("team-kb");
+  });
+
+  it("omits X-Upload-ID for callers that ignore progress", async () => {
+    await submitDocumentBatch([new File(["hello"], "a.md")], connection, {
+      idempotencyKey: "idem-2",
+    });
+    expect(FakeXHR.instances[0].headers["X-Upload-ID"]).toBeUndefined();
   });
 });
 

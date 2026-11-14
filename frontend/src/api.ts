@@ -482,6 +482,10 @@ export async function listActiveDocumentBatches(
 export type DocumentBatchSubmitOptions = {
   signal?: AbortSignal;
   idempotencyKey: string;
+  // uploadId is the client-generated ID of this request: the same value is
+  // passed to subscribeUploadProgress() and sent as X-Upload-ID so the server
+  // can tie SSE events to this exact POST.
+  uploadId?: string;
   onProgress?: (percent: number) => void;
 };
 
@@ -532,6 +536,7 @@ export function submitDocumentBatch(
     if (token) xhr.setRequestHeader("X-CSRF-Token", token);
     if (options.idempotencyKey)
       xhr.setRequestHeader("Idempotency-Key", options.idempotencyKey);
+    if (options.uploadId) xhr.setRequestHeader("X-Upload-ID", options.uploadId);
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable || !event.total) return;
       const percent = Math.min(
@@ -575,6 +580,242 @@ export function submitDocumentBatch(
       fail(error instanceof Error ? error : new Error(String(error)));
     }
   });
+}
+
+// --- Upload progress SSE -----------------------------------------------------
+// POST /v1/document-batches can push per-file transfer progress and save
+// results over GET /v1/document-batches/upload-events/{upload_id}. The Console
+// opens the subscription before the POST (and waits for `ready`) so that no
+// event can be missed; fetch() is used instead of EventSource because the
+// stream needs the same credential/namespace headers as the JSON API.
+
+export type UploadResultStatus = "saved" | "skipped" | "failed";
+
+export type UploadProgressEvent =
+  | { type: "ready"; upload_id: string }
+  | { type: "progress"; index: number; received: number }
+  | {
+    type: "result";
+    index: number;
+    status: UploadResultStatus;
+    reason: string | null;
+    error: string | null;
+  }
+  | { type: "done"; batch_id: string | null; detail: string | null };
+
+export type UploadProgressSubscription = {
+  // ready resolves once the server confirmed the subscription; it rejects when
+  // the stream cannot be established (callers may still fall back to POST).
+  ready: Promise<void>;
+  close: () => void;
+};
+
+export function uploadProgressPath(uploadId: string) {
+  return `/v1/document-batches/upload-events/${encodeURIComponent(uploadId)}`;
+}
+
+// parseUploadProgressEvent keeps only well-formed events; a stray frame must
+// never break the whole stream.
+function parseUploadProgressEvent(value: unknown): UploadProgressEvent | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  switch (record.type) {
+    case "ready":
+      return {
+        type: "ready",
+        upload_id: typeof record.upload_id === "string" ? record.upload_id : "",
+      };
+    case "progress":
+      if (typeof record.index !== "number" || !Number.isInteger(record.index)) return null;
+      if (typeof record.received !== "number" || !Number.isFinite(record.received)) return null;
+      return { type: "progress", index: record.index, received: record.received };
+    case "result": {
+      const status = record.status;
+      if (status !== "saved" && status !== "skipped" && status !== "failed") return null;
+      if (typeof record.index !== "number" || !Number.isInteger(record.index)) return null;
+      return {
+        type: "result",
+        index: record.index,
+        status,
+        reason: typeof record.reason === "string" ? record.reason : null,
+        error: typeof record.error === "string" ? record.error : null,
+      };
+    }
+    case "done":
+      return {
+        type: "done",
+        batch_id: typeof record.batch_id === "string" ? record.batch_id : null,
+        detail: typeof record.detail === "string" ? record.detail : null,
+      };
+    default:
+      return null;
+  }
+}
+
+// nextSSEFrame finds one complete frame (terminated by a blank line) in the
+// buffered stream text, tolerating both LF and CRLF line endings and frames
+// split across read() chunks.
+function nextSSEFrame(buffer: string): { frame: string; rest: string } | null {
+  const lf = buffer.indexOf("\n\n");
+  const crlf = buffer.indexOf("\r\n\r\n");
+  if (lf < 0 && crlf < 0) return null;
+  if (crlf >= 0 && (lf < 0 || crlf < lf))
+    return { frame: buffer.slice(0, crlf), rest: buffer.slice(crlf + 4) };
+  return { frame: buffer.slice(0, lf), rest: buffer.slice(lf + 2) };
+}
+
+// subscribeUploadProgress opens the event stream of one upload request. Events
+// are delivered through onEvent; comments/heartbeats are ignored, and every
+// `data:` payload is parsed as JSON. The stream is closed by close(), by the
+// caller's signal, or after the server sends `done`.
+export function subscribeUploadProgress(
+  uploadId: string,
+  connection: Connection | undefined,
+  onEvent: (event: UploadProgressEvent) => void,
+  options: { signal?: AbortSignal } = {},
+): UploadProgressSubscription {
+  const path = uploadProgressPath(uploadId);
+  const controller = new AbortController();
+  const headers = new Headers({ Accept: "text/event-stream" });
+  if (connection?.namespace) headers.set("X-RAG-Namespace", connection.namespace);
+  if (connection?.token) headers.set("Authorization", `Bearer ${connection.token}`);
+  const signal = options.signal;
+  const abort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  }
+
+  let closed = false;
+  let readySettled = false;
+  let resolveReady: () => void = () => undefined;
+  let rejectReady: (error: Error) => void = () => undefined;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  // Callers put their own deadline on `ready`; keep an abandoned rejection from
+  // surfacing as an unhandled promise rejection.
+  ready.catch(() => undefined);
+
+  const settleReady = (error?: Error) => {
+    if (readySettled) return;
+    readySettled = true;
+    if (error) rejectReady(error);
+    else resolveReady();
+  };
+
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    signal?.removeEventListener("abort", abort);
+    controller.abort();
+    settleReady(new Error(`GET ${path}\n上传事件订阅已关闭`));
+  };
+
+  function handleFrame(frame: string) {
+    const lines = frame.split("\n");
+    const data: string[] = [];
+    for (const rawLine of lines) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      // Empty lines terminate frames (already split) and ":" lines are
+      // comments/heartbeats; neither carries data.
+      if (!line || line.startsWith(":")) continue;
+      if (!line.startsWith("data:")) continue;
+      let value = line.slice(5);
+      if (value.startsWith(" ")) value = value.slice(1);
+      data.push(value);
+    }
+    if (!data.length) return;
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data.join("\n"));
+    } catch {
+      return;
+    }
+    const event = parseUploadProgressEvent(payload);
+    if (!event) return;
+    if (event.type === "ready") {
+      settleReady();
+    }
+    onEvent(event);
+    if (event.type === "done") close();
+  }
+
+  const consume = async () => {
+    let response: Response;
+    try {
+      response = await fetch(path, {
+        method: "GET",
+        headers,
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: controller.signal,
+      });
+    } catch (error) {
+      settleReady(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
+    if (!response.ok) {
+      if (response.status === 401) unauthorizedHandler?.();
+      let detail = response.statusText;
+      try {
+        const body = await response.text();
+        detail = body || detail;
+        try {
+          const payload = JSON.parse(body);
+          detail = typeof payload.detail === "string"
+            ? payload.detail
+            : JSON.stringify(payload.detail ?? payload);
+        } catch {
+          // Keep the raw response body.
+        }
+      } catch {
+        // Keep the status text.
+      }
+      settleReady(new Error(`GET ${path}\nHTTP ${response.status}：${detail}`));
+      return;
+    }
+    if (!response.body) {
+      settleReady(new Error(`GET ${path}\nHTTP ${response.status}：响应没有事件流`));
+      return;
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (!closed) {
+        const chunk = await reader.read();
+        if (closed) break;
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        let frame = nextSSEFrame(buffer);
+        while (frame) {
+          buffer = frame.rest;
+          handleFrame(frame.frame);
+          if (closed) break;
+          frame = nextSSEFrame(buffer);
+        }
+      }
+      if (!closed) {
+        buffer += decoder.decode();
+        if (buffer.trim()) handleFrame(buffer);
+      }
+    } catch (error) {
+      settleReady(error instanceof Error ? error : new Error(String(error)));
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        // The stream may already be aborted by close().
+      }
+      signal?.removeEventListener("abort", abort);
+      settleReady(new Error(`GET ${path}\n上传事件订阅已结束`));
+    }
+  };
+  void consume();
+
+  return { ready, close };
 }
 
 // --- Console authentication -------------------------------------------------

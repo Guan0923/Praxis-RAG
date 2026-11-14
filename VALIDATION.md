@@ -1909,3 +1909,36 @@ go test -p 1 -count=1 ./internal/migrate                                        
 （`9690452`）上已经失败（退役的 `search_tasks` 仍声明 `schedule_version`，与“已退役表
 不应再迁移回该列”的测试期望不符），与本次去重/批量清理无关，因此验证时用 `-skip`
 排除该基线失败。
+
+## Console 逐文件上传进度（SSE）与每文件保存结果 — 2026-11-14
+
+范围：`GET /v1/document-batches/upload-events/{upload_id}` SSE 端点、`POST /v1/document-batches` 的可选 `X-Upload-ID` 头、Console 逐文件进度条与每文件保存结果，以及 README / `docs/USAGE.md` / `docs/agents/features.md` / `PROGRESS.md` 的同步。工作目录 `D:\Project\Praxis-RAG\.agents\worktrees\dsh-074b99dd-e98a`（Windows + MSYS bash，Go 1.27.3，Node v26.13.0，vitest 5.1.0）。
+
+后端：
+
+```
+go build ./...                                                                # exit 0
+go vet ./internal/httpapi                                                     # exit 0
+go test ./internal/httpapi -run 'TestDocumentBatch|TestUpload' -count=1       # ok 1.196s
+go test -race ./internal/httpapi -run 'TestDocumentBatch|TestUpload' -count=1 # ok 2.327s
+```
+
+说明：`TestUploadEventStreamReportsPerFileProgressAndResults` 用 `httptest.NewServer` 起真实 HTTP 服务，先订阅并读到 `ready` 再异步发 POST，校验 `Content-Type: text/event-stream`、`Cache-Control: no-store`、5 MiB 大文件的逐次 `progress.received` 累计递增、两个文件各自的 `result`（`saved` / `failed`）与末尾 `done`；同组用例还覆盖不带 `X-Upload-ID` 的旧行为、非法 upload id 返回 400、缺租户凭据 401、上传校验失败仍发 `done`（`TestUploadValidationErrorEmitsDone`）。
+
+前端：
+
+```
+cd frontend
+npm run typecheck                                                      # exit 0（tsc --noEmit）
+npx vitest run src/uploadBatches.test.ts src/api.test.ts               # 2 files, 60 tests passed
+npx vitest run                                                         # 17 files, 235 tests passed
+npm run build                                                          # exit 0（vite 3117 modules；build/web/index.html + assets）
+```
+
+说明：定向用例覆盖"先订阅后 POST"、逐文件进度与同名文件不串行、单文件失败不影响其他行、响应核对补齐、恢复/重试与徽标文案，以及 SSE 跨 chunk / CRLF 分帧、HTTP 错误与 `close()` 中断；契约补充的 XMLHttpRequest 断言（`submitDocumentBatch` 发送相同的 `X-Upload-ID`、无 `uploadId` 时不同）也在 60 例内。全量运行 17 文件 235 用例全部通过；单独运行 `src/LoginPage.test.tsx` 仍可见 4 条既有 jsdom teardown 的 `window is not defined` 未捕获异常（该文件 6 个用例通过、退出码 0），与本次改动无关。前端生产构建通过：`npm run build` exit 0，vite 转换 3117 个模块、复制 198 项静态资源，产物 `build/web/index.html` 与 assets（`index-*.js` 1,322.16 kB、`index-*.css` 18.68 kB、`PdfPreview-*.js` 432.76 kB、`pdf.worker.min-*.mjs` 1,265.41 kB），仅提示部分 chunk 超过 500 kB，无错误。
+
+未实机项：
+
+- 未在真实浏览器中打开 Console 观察进度条动画与真实 SSE 连接（仅 jsdom 单测 + `typecheck` + 生产构建覆盖）。
+- 未用真实大文件（如 8 MiB PDF）在真实 `rag-service` + MySQL/Kafka 环境实测上传；SSE 端到端仅在 httptest + fake runtime 下验证，未接真实文档 worker 观察解析阶段。
+- 多实例 `rag-service` 下的进度流失效属于设计边界（进程内 hub），未做负载均衡实测；需要会话粘滞或单实例部署。

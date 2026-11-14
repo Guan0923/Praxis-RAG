@@ -6,6 +6,7 @@ import {
   Empty,
   Modal,
   Popover,
+  Progress,
   Table,
   Tag,
   Tooltip,
@@ -40,9 +41,10 @@ import {
   canRetryItem,
   clearFinished,
   getSnapshot,
-  isBatchTerminal,
   isFailedItem,
+  isUploadSettled,
   itemStatusText,
+  perFileProgress,
   restore,
   retryFailedItem,
   setOnSettled,
@@ -275,7 +277,7 @@ export function DocumentsPage({
   // null means no batch has ever been started in this tab.
   const summary = uploadSummary(batches);
   const retryableFailed = batches.failedItems.filter((item) => canRetryItem(item));
-  const hasFinished = batches.batches.some((batch) => isBatchTerminal(batch.status));
+  const hasFinished = batches.batches.some((batch) => isUploadSettled(batch));
   const uploadBubble = (
     <div className="upload-bubble">
       <div className="upload-bubble-heading">
@@ -305,10 +307,23 @@ export function DocumentsPage({
                       <div className="upload-bubble-name break-text">
                         {item.name}
                       </div>
+                      <Progress
+                        className="upload-bubble-progress"
+                        size="small"
+                        percent={perFileProgress(item)}
+                        status={
+                          failed
+                            ? "exception"
+                            : item.status === "saving"
+                              ? "active"
+                              : "success"
+                        }
+                        showInfo
+                      />
                       <div
                         className={`upload-bubble-state${failed ? " upload-bubble-state-failed" : ""}`}
                       >
-                        {itemStatusText(item, batch.transferProgress)}
+                        {itemStatusText(item)}
                       </div>
                     </div>
                     {failed && canRetryItem(item) && (
