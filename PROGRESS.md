@@ -661,3 +661,15 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 - [x] 测试：删除搜索任务/快照/排队/transient 相关用例，改写 MCP/REST/runtime/searchrefs/监控/队列/集成测试并新增同步专项（同步直返、5 工具固定顺序、`wait_seconds` 拒绝、受限 scope 过滤、响应无快照字段、`/v1/search-results` 404、超时/取消）。`go build ./...`、`go vet ./...` 通过；`internal/mcp`、`internal/redisstate`、`internal/mq`、`internal/monitor`、`internal/contracts`、`internal/cacheconsumer` 测试通过；前端 typecheck 与 224 例测试通过。
 - [x] 缓存同步专项（独立验证，与快照无关）：核对 Debezium 缓存连接器 8 表→Kafka→`rag-cache-worker`→`CacheSynchronizer`→Redis 读模型链路完整；`internal/cacheconsumer` 新增 8 表 DELETE 映射、跨 scope、重放幂等与生产 decoder 用例（12/12 PASS）；`cache_chain_test.go` 补删除后 `kb_list.document_count` 递减与跨 namespace 变更收敛断言。
 - 已知边界：本机无 MySQL/Redis/Kafka/docker，依赖外部服务的集成用例属环境失败（`internal/statetest` Fatalf 而非 skip），未做实机端到端切换/回滚演练；历史表数据未清理，物理删除另排期。详见 `VALIDATION.md` 本轮记录与 `.test-tmp/search-sync-plan/` 盘点/验证报告。
+
+## 2026-11-14 Console 逐文件上传进度（SSE）与每文件保存结果
+
+本轮把 Console 批量上传从"整批进度 + 解析阶段"改为**每个文件一行独立进度条**：前端先订阅本次上传的 SSE 再发 POST，后端读取每个 multipart 文件时推送该文件的累计接收字节数，并在每个文件保存成功/失败/跳过时推送该文件结果；上传面板在保存结果处结束，不再展示或轮询解析进度。批次接口 `POST /v1/document-batches` 的请求、响应与既有契约不变。
+
+- [x] 后端 SSE hub：新增 `internal/httpapi/upload_events.go`，进程内 hub 按 `(namespace, upload_id)` 隔离；`progress` 队列满或无人订阅时直接丢弃，`result`/`done` 用 100ms 短超时尽力送达，15s 发 `: ping` 心跳；重连订阅会替换旧流。新增 `GET /v1/document-batches/upload-events/{upload_id}`（`authTenant`，响应 `text/event-stream` + `no-store`）并注册到 OpenAPI。
+- [x] 后端逐文件进度与结果：`documents.go` 新增 `readMultipartFilesWithProgress`（首字节 + 每累计 32 KiB + part 结束精确末值回调，`LimitReader` 10 MiB 语义不变）；`documents_batch.go` 读取可选 `X-Upload-ID`（`^[A-Za-z0-9._:-]{1,128}$`，非法 400，缺省不推事件），读 body 时发 `progress`，受理成功后按 `items[].position` 发每个文件的 `result`（`accepted→saved`、`skipped→skipped`、`failed→failed`），最后发 `done`（带 `batch_id`）；校验/权限/runtime 失败路径也发带安全 `detail` 的 `done`。
+- [x] 前端 SSE 客户端：`api.ts` 新增 `UploadProgressEvent` 与 `subscribeUploadProgress`（fetch + ReadableStream 分帧，支持跨 chunk、CRLF、注释心跳与中断），`submitDocumentBatch` 支持 `X-Upload-ID`；先订阅并最多等 `ready` 5s，失败/超时仍继续上传。
+- [x] 前端逐文件进度条：`uploadBatches.ts` 行模型删除解析字段、新增 `uploadId/receivedBytes/totalBytes/transferComplete`，新增 `perFileProgress`、`itemStatusText`，`uploadSummary` 只保留"保存中 x/y"/"已完成 x/y"（删除 processing 阶段）；`DocumentsPage.tsx` 为每个文件渲染独立 `<Progress>` 与状态文案（上传中…/保存中…/已保存/保存失败：…/已跳过），失败行保留重试；响应到达后核对并补齐遗漏结果，上传结束后不再轮询解析。
+- [x] 测试：后端 `go build ./...`、`go vet ./internal/httpapi` 通过；`go test ./internal/httpapi -run 'TestDocumentBatch|TestUpload' -count=1` 通过（含 httptest 真流式 SSE 端到端：`ready`→逐文件 `progress`→`result`→`done`）；同一组用例 `-race` 通过。前端 `npm run typecheck` 通过；`npx vitest run src/uploadBatches.test.ts src/api.test.ts` 2 文件 60 用例通过；全量 `npx vitest run` 17 文件 235 用例通过（LoginPage 仍有既有 jsdom teardown 噪声，用例本身通过）。详见 `VALIDATION.md`。
+- [x] 文档：README、`docs/USAGE.md`、`docs/agents/features.md` 同步；`VALIDATION.md` 追加本轮记录。
+- 已知边界：SSE hub 是**进程内**的，订阅与 POST 必须落在同一个 `rag-service` 实例（多实例部署需会话粘滞，事件不跨实例转发）；没有订阅者时事件直接丢弃；`progress` 只表示请求体接收字节（不含 multipart 头），不含解析/索引进度；**上传面板不再展示解析进度**（解析进度不在本轮范围，仍可用 `GET /v1/document-jobs/{artifact_id}` 或批次状态接口查询）；未做真实浏览器、真实 MySQL/Kafka 与真实大文件实测。

@@ -1,7 +1,7 @@
 # 功能清单
 
 > 本文件是根 `AGENTS.md` 的拆分细节：当前实际提供的功能。根文件只保留常驻系统提示词的精简索引。
-> 校对基准：仓库代码 + `docs/`（2026-11-11）。
+> 校对基准：仓库代码 + `docs/`（2026-11-14）。
 
 ## 1. 知识库（namespace）与租户隔离
 
@@ -13,9 +13,9 @@
 ## 2. 文档导入与异步任务
 
 - 支持格式：`.md`、`.txt`、`.pdf`、`.docx`、`.doc`（DOC 需外部 LibreOffice）；每批最多 10 个文件，单文件最大 10 MiB。
-- **异步受理**：`POST /v1/document-batches` 为每个文件在一个事务内写入 `document_jobs`（含文件字节、sha256、配置版本、`schedule_version=1`），以 `202` 返回批次和逐文件结果；解析/切分/Embedding/发布在 worker 后台完成。任务表由 Debezium 任务连接器采集，不再写事务 outbox。
+- **异步受理**：`POST /v1/document-batches` 为每个文件在一个事务内写入 `document_jobs`（含文件字节、sha256、配置版本、`schedule_version=1`），以 `202` 返回批次和逐文件结果；解析/切分/Embedding/发布在 worker 后台完成。任务表由 Debezium 任务连接器采集，不再写事务 outbox。上传 POST 可携带可选的 `X-Upload-ID`，与 `GET /v1/document-batches/upload-events/{upload_id}`（SSE）配对实时推送逐文件字节进度与保存结果；缺省该头时行为与响应完全不变。
 - 上传前可用 `POST /v1/documents/check` 做同名/SHA-256 预检；`Idempotency-Key` 支持重试复用原批次及其文件任务。
-- **批次上传（Console 使用）**：`POST /v1/document-batches` 先提交 `document_batches` + `document_batch_items`（每项 `saving`），再按文件名加锁并行受理每个文件（不同名互不排队，默认 6 路），最后把每项结果与计数写回并返回 `202`。`GET /v1/document-batches/{batch_id}` 同时给出保存结果（`accepted`/`skipped`/`failed` + 原因）与已受理文件的 `job.status/stage`；`GET /v1/document-batches?limit=20` 只返回仍有未完成工作的批次，供 Console 刷新后恢复进度气泡。批次只是进度元数据，不保存文件字节，7 天后清理。
+- **批次上传（Console 使用）**：`POST /v1/document-batches` 先提交 `document_batches` + `document_batch_items`（每项 `saving`），再按文件名加锁并行受理每个文件（不同名互不排队，默认 6 路），最后把每项结果与计数写回并返回 `202`。`GET /v1/document-batches/{batch_id}` 同时给出保存结果（`accepted`/`skipped`/`failed` + 原因）与已受理文件的 `job.status/stage`；`GET /v1/document-batches?limit=20` 只返回仍有未完成工作的批次，供 Console 刷新后恢复进度气泡。批次只是进度元数据，不保存文件字节，7 天后清理。Console 上传面板为每个文件一行独立进度条并先订阅 SSE（`ready` 后发 POST）：`progress.received` 是请求体累计接收的内容字节数（前端按本地 `File.size` 换算百分比），每文件 `result`（`saved`/`skipped`/`failed`）落地即结束该行；面板在保存结果处结束，不再展示或轮询解析阶段（解析阶段仍由批次状态接口的 `items[].job.status/stage` 暴露）。
 - 任务状态：`queued` → `processing`（带 `stage`）→ `succeeded` / `failed`；`stage` 依次为 `parsing`、`chunking`、`staging`、`embedding`、`indexing`、`publishing`、`completed`/`failed`。只有 `succeeded` 表示已持久发布、可检索。
 - 冲突规则：同名文档已存在、或已有同名排队/执行中的新增，会被拒绝；`add_document` 不覆盖同名文档，替换用 `update_document`。
 - 失败重试：同进程内指数退避（默认最多 5 次），仍是“至少一次”投递；耗尽后进入显式 DLQ topic，由 `rag-dead-letter-worker` 落终态。崩溃恢复：任务租约 + 心跳 + 上传 journal 对账，重复投递靠幂等吸收。
@@ -100,7 +100,7 @@
 | 基础设施 | `GET /health`、`GET /openapi.json`、`GET /docs`、`GET /`、`GET /console`、`GET /console/assets/*` |
 | 认证 | `GET /v1/auth/status`、`POST /v1/auth/register`、`POST /v1/auth/login`、`POST /v1/auth/logout`、`GET /v1/auth/me` |
 | 租户：检索/结果 | `POST /v1/search`、`GET /v1/artifacts/{artifact_id}`、`GET /v1/artifacts/{artifact_id}/content` |
-| 租户：文档 | `GET /v1/documents`、`POST /v1/documents/check`、`GET /v1/document-jobs/{artifact_id}`、`POST /v1/document-batches`、`GET /v1/document-batches`、`GET /v1/document-batches/{batch_id}`、`GET /v1/documents/{name}/content`、`DELETE /v1/documents/{name}` |
+| 租户：文档 | `GET /v1/documents`、`POST /v1/documents/check`、`GET /v1/document-jobs/{artifact_id}`、`POST /v1/document-batches`、`GET /v1/document-batches`、`GET /v1/document-batches/{batch_id}`、`GET /v1/document-batches/upload-events/{upload_id}`（SSE）、`GET /v1/documents/{name}/content`、`DELETE /v1/documents/{name}` |
 | 租户：知识库/状态 | `GET /v1/knowledge-base`、`GET /v1/namespaces`、`GET /v1/chunking/strategies`、`GET /v1/uploads`、`GET /v1/uploads/{operation_id}` |
 | Console 会话：知识库/共享 | `GET /v1/users`、`POST /v1/knowledge-bases`、`GET /v1/knowledge-bases/{namespace}/access`、`GET /v1/knowledge-bases/{namespace}/permissions`、`DELETE /v1/knowledge-bases/{namespace}/permissions/{user_id}`、`GET|POST /v1/knowledge-bases/{namespace}/invitations`、`GET /v1/invitations`、`POST /v1/invitations/preview`、`POST /v1/invitations/accept`、`POST /v1/invitations/decline`、`DELETE /v1/invitations/{invitation_id}` |
 | 管理：用户 | `GET /v1/admin/users`、`PATCH /v1/admin/users/{user_id}`、`DELETE /v1/admin/users/{user_id}` |
@@ -126,7 +126,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | 路由 | 页面 | 可见角色 | 主要功能 |
 | --- | --- | --- | --- |
 | `#/workspaces/search` | 检索调试 | 所有登录账号 | BM25/Embedding/Hybrid 检索、Cross-Encoder 重排开关、候选/Top-K 调整、三模式对比、耗时与证据状态、命中详情（分数、来源、页码/章节、图片、脚注） |
-| `#/workspaces/documents` | 知识文档 | 所有登录账号 | 文档列表（大小/块数/切分配置）、上传（批次受理：工具栏徽标 + 逐文件进度气泡，可失败重试；刷新后恢复未完成批次）、删除；只读授权时隐藏写操作 |
+| `#/workspaces/documents` | 知识文档 | 所有登录账号 | 文档列表（大小/块数/切分配置）、上传（批次受理：工具栏「保存中/已完成 x/y」徽标 + 逐文件独立进度条气泡，SSE 实时字节进度与每文件保存结果，可失败重试；面板在保存结果处结束、不展示解析阶段；刷新后恢复未完成批次）、删除；只读授权时隐藏写操作 |
 | `#/workspaces/documents/{name}` | 文档详情 | 所有登录账号 | 正文预览、PDF 预览（pdfjs）、图片/表格资产查看 |
 | `#/workspaces/create` | 创建知识库 | 所有登录账号 | 管理员：namespace + 切分参数 + 从「模型配置」选择 Embedding/Reranker/VLM；VIP/普通用户：简化表单（从默认模板克隆模型配置） |
 | `#/knowledge-bases` | 知识库 | 管理员 | 知识库列表、编辑抽屉（模型/切分/重新向量化确认） |

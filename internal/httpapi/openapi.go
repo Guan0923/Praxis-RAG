@@ -83,6 +83,7 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "POST", Path: "/v1/document-batches", Summary: "Upload documents as one durable batch (202 with per-file outcomes)", Tag: "documents", Response: "202", Multipart: true, RequestBody: true},
 	{Method: "GET", Path: "/v1/document-batches", Summary: "List the caller's unfinished document batches", Tag: "documents", Query: []string{"limit"}, Response: "200"},
 	{Method: "GET", Path: "/v1/document-batches/{batch_id}", Summary: "Read one document batch with per-file progress", Tag: "documents", Response: "200"},
+	{Method: "GET", Path: "/v1/document-batches/upload-events/{upload_id}", Summary: "Stream one upload's file progress and per-file save results (SSE)", Tag: "documents", Response: "200"},
 	{Method: "GET", Path: "/v1/documents/{name}", Summary: "Read document metadata", Tag: "documents", Response: "200"},
 	{Method: "DELETE", Path: "/v1/documents/{name}", Summary: "Delete a document", Tag: "documents", Response: "200"},
 	{Method: "GET", Path: "/v1/documents/{name}/content", Summary: "Download document content", Tag: "documents", Response: "200"},

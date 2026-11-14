@@ -19,7 +19,7 @@ Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可
 
 ### 文档导入与管理
 
-支持 Markdown、TXT、PDF、DOCX，以及安装 LibreOffice 后的 DOC。网页/REST 上传默认异步受理：每个文件在共享状态数据库（MySQL）的一个事务内写入完整任务（`document_jobs`），**提交成功即返回 `artifact_id`**，解析与索引由独立的 `rag-document-worker` 在后台完成（任务表由 Debezium 采集，需要 Kafka + Debezium；否则任务保持 `queued`），前端用 `GET /v1/document-jobs/{artifact_id}` 轮询 `status`/`stage`。Console 使用批次接口 `POST /v1/document-batches`：点上传后弹窗立即关闭，工具栏按钮缩成"保存中/处理中/已完成 x/y"的徽标，点开是逐文件进度气泡（保存结果 + 解析阶段 + 失败重试），刷新或切页后从 `GET /v1/document-batches?limit=20` 恢复；上传期间允许切换 Console 页面，工作区切换仍锁定。MCP `add_document` 始终异步；MCP `update_document`、`delete_document` 仍为同步请求。每批最多 10 个文件，单文件最大 10 MiB。
+支持 Markdown、TXT、PDF、DOCX，以及安装 LibreOffice 后的 DOC。网页/REST 上传默认异步受理：每个文件在共享状态数据库（MySQL）的一个事务内写入完整任务（`document_jobs`），**提交成功即返回 `artifact_id`**，解析与索引由独立的 `rag-document-worker` 在后台完成（任务表由 Debezium 采集，需要 Kafka + Debezium；否则任务保持 `queued`），前端用 `GET /v1/document-jobs/{artifact_id}` 轮询 `status`/`stage`。Console 使用批次接口 `POST /v1/document-batches`：每个文件一行独立进度条，上传时通过 SSE（`GET /v1/document-batches/upload-events/{upload_id}`，POST 同时带可选的 `X-Upload-ID` 头）实时推送该文件累计接收字节数（前端按本地文件大小换算百分比），每个文件保存成功/失败/跳过时推送该文件的保存结果（已保存/保存失败/已跳过）；上传面板在保存结果处结束，**不再展示或轮询解析进度**。点上传后弹窗立即关闭，工具栏按钮缩成"保存中/已完成 x/y"的徽标，点开是逐文件进度气泡（每文件进度条 + 保存结果 + 失败重试），刷新或切页后从 `GET /v1/document-batches?limit=20` 恢复；上传期间允许切换 Console 页面，工作区切换仍锁定。`X-Upload-ID` 可省略：省略时不推送事件，POST 响应与旧行为完全一致。MCP `add_document` 始终异步；MCP `update_document`、`delete_document` 仍为同步请求。每批最多 10 个文件，单文件最大 10 MiB。
 
 相同内容与切分配置的重复上传会跳过；`add_document` 与异步 REST 上传不覆盖同名文档，替换请用 `update_document`。状态用 MCP `get_document_status` 或 REST `GET /v1/document-jobs/{artifact_id}` 轮询，终态为 `succeeded` / `failed`，状态在 MySQL，不依赖 Redis TTL。
 

@@ -124,9 +124,60 @@ type uploadProblem struct {
 	validation []validationDetail
 }
 
+// uploadProgressStep is the minimum number of newly received content bytes
+// between two transfer-progress callbacks for the same file part.
+const uploadProgressStep = 32 * 1024
+
+// uploadProgressReader counts the content bytes read from one multipart file
+// part (multipart headers excluded) and reports throttle-limited progress.
+type uploadProgressReader struct {
+	reader     io.Reader
+	index      int
+	received   int64
+	lastReport int64
+	reported   bool
+	onProgress func(index int, received int64)
+}
+
+func (p *uploadProgressReader) Read(buffer []byte) (int, error) {
+	read, err := p.reader.Read(buffer)
+	if read > 0 {
+		p.received += int64(read)
+		if !p.reported || p.received-p.lastReport >= uploadProgressStep {
+			p.reported = true
+			p.lastReport = p.received
+			p.onProgress(p.index, p.received)
+		}
+	}
+	return read, err
+}
+
+// finish emits the exact final byte count of the part when the throttled stream
+// did not already end on it.
+func (p *uploadProgressReader) finish() {
+	if p == nil || p.onProgress == nil {
+		return
+	}
+	if p.reported && p.received == p.lastReport {
+		return
+	}
+	p.reported = true
+	p.lastReport = p.received
+	p.onProgress(p.index, p.received)
+}
+
 // readMultipartFiles streams the multipart body, rejecting non-file fields and
 // oversized files before they reach the runtime.
 func readMultipartFiles(r *http.Request) ([]UploadFile, *uploadProblem) {
+	return readMultipartFilesWithProgress(r, nil)
+}
+
+// readMultipartFilesWithProgress is readMultipartFiles plus per-file transfer
+// progress. onProgress reports the cumulative content bytes of each file part
+// keyed by its 0-based appearance order: the first bytes, then at most one
+// callback per additional 32 KiB, and one exact final callback per part. A nil
+// callback keeps the original behaviour and cost.
+func readMultipartFilesWithProgress(r *http.Request, onProgress func(index int, received int64)) ([]UploadFile, *uploadProblem) {
 	reader, err := r.MultipartReader()
 	if err != nil {
 		return nil, &uploadProblem{status: http.StatusBadRequest, detail: "There was an error parsing the body"}
@@ -149,7 +200,18 @@ func readMultipartFiles(r *http.Request) ([]UploadFile, *uploadProblem) {
 				detail: "上传仅接受文件，切分和向量参数由知识库配置决定",
 			}
 		}
-		content, readErr := io.ReadAll(io.LimitReader(part, MaxFileBytes+1))
+		var contentReader io.Reader = io.LimitReader(part, MaxFileBytes+1)
+		var progress *uploadProgressReader
+		if onProgress != nil {
+			progress = &uploadProgressReader{
+				reader:     contentReader,
+				index:      len(files),
+				onProgress: onProgress,
+			}
+			contentReader = progress
+		}
+		content, readErr := io.ReadAll(contentReader)
+		progress.finish()
 		_ = part.Close()
 		if readErr != nil {
 			return nil, &uploadProblem{status: http.StatusBadRequest, detail: "Could not read the uploaded file"}

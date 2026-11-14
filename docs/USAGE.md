@@ -18,6 +18,7 @@ REST /v1/* --------------------> rag-service ──> 共享状态库（MySQL：�
 REST 批次上传 POST /v1/document-batches（Console 使用）
                  -> 每文件一个事务并行受理（按文件名加锁，不同名互不排队）
                  -> 202 返回 batch_id + 每个文件 accepted/skipped/failed
+                 -> 可选 X-Upload-ID + GET .../upload-events/{upload_id}（SSE）推送逐文件字节进度与保存结果
                  -> GET /v1/document-batches/{batch_id} 同时给出保存结果与解析阶段
 MCP search / REST /v1/search（同步）-> runtime.Service.Search -> 检索 + 重排 + artifact 投影
                  -> 同一次响应返回 results / artifacts / evidence_status / answer_guidance
@@ -509,7 +510,7 @@ curl.exe http://127.0.0.1:8011/docs           # 自包含交互文档
 
 切块完成后，同一文档的 Embedding 与 BM25 稀疏向量计算并发执行，两步都成功才写入 Qdrant。任一步失败会取消另一侧的计算，并等待其退出后清理上传；BM25 在 chunk 之间检查取消信号。Embedding 仍每批最多发送 32 个 chunk，同一文档内各批请求按顺序执行。
 
-`POST /v1/document-batches` 的响应结构（Console 气泡直接消费）：
+`POST /v1/document-batches` 的响应结构（Console 气泡用于核对并补齐每文件结果）：
 
 ```json
 {
@@ -532,7 +533,44 @@ curl.exe http://127.0.0.1:8011/docs           # 自包含交互文档
 - `GET /v1/document-batches/{batch_id}` 返回同一结构，`items[].job` 给出解析阶段（`parsing` → `chunking` → `staging` → `embedding` → `indexing` → `publishing`），终态为 `succeeded` / `failed`。
 - `GET /v1/document-batches?limit=20` 只返回调用方未完成的批次，Console 刷新/切页后据此恢复进度；批次只保存进度元数据（不保存文件字节），默认保留 7 天后清理。
 - 批次状态由批次行和对应 `document_jobs` 实时推导：`saving`（受理中）→ `processing` → `completed`（含全部跳过）/ `failed`（有失败且没有任何文件入队）；`interrupted` 表示服务在受理中途重启（文件未入队，可重试）。
-- Console 行为：点"上传并索引"后弹窗立即关闭，按钮缩成"保存中 x/y / 处理中 x/y / 已完成 x/y"的小徽标，点开是逐文件进度气泡；失败项可单独重试。上传期间**允许切换 Console 页面**（工作区切换仍被锁住，因为批次绑定知识库）。
+- Console 行为：点"上传并索引"后弹窗立即关闭，按钮缩成"保存中 x/y / 已完成 x/y"的小徽标，点开是逐文件进度气泡：每个文件一行独立进度条，上传中按 SSE 推送的累计接收字节数占本地文件大小的比例显示 0–100%，传输完成后显示"保存中…"，保存结束显示"已保存 / 保存失败：… / 已跳过"；失败项可单独重试。上传面板在**保存结果**处结束，**不再展示或轮询解析/索引阶段**（解析进度仍可用 `GET /v1/document-jobs/{artifact_id}` 或批次状态接口查询）。上传期间**允许切换 Console 页面**（工作区切换仍被锁住，因为批次绑定知识库）。
+
+#### 上传进度事件流（可选）
+
+Console 的逐文件进度条依赖一条可选的 SSE 通道；不关心实时进度的调用方可以完全忽略它——`POST /v1/document-batches` 的请求、响应、状态码与既有批次契约都不变。
+
+1. 先订阅（Console 收到 `ready` 后才发 POST）：
+
+```powershell
+curl.exe -N http://127.0.0.1:8011/v1/document-batches/upload-events/<upload_id> `
+  -H "Authorization: Bearer <token-or-key>" `
+  -H "X-RAG-Namespace: default" `
+  -H "Accept: text/event-stream"
+```
+
+2. 再上传，`X-Upload-ID` 与订阅路径里的 id 相同（仅允许 `^[A-Za-z0-9._:-]{1,128}$`；非法返回 `400 {"detail":"Invalid upload id."}`，在读取 body 之前拒绝）：
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8011/v1/document-batches `
+  -H "Authorization: Bearer <token-or-key>" `
+  -H "X-RAG-Namespace: default" `
+  -H "X-Upload-ID: <upload_id>" `
+  -F "files=@guide.md" -F "files=@manual.txt"
+```
+
+响应头为 `Content-Type: text/event-stream`、`Cache-Control: no-store`、`Connection: keep-alive`；每帧一条 `data: <json>`（不使用 `event:` 字段，用 JSON 的 `type` 区分），约每 15 秒发送 `: ping` 心跳；服务端发出 `done` 后关闭流。
+
+| type | 字段 | 说明 |
+| --- | --- | --- |
+| `ready` | `upload_id` | 订阅已建立，客户端可以发 POST |
+| `progress` | `index`, `received` | 文件 `index`（multipart 中 `files` part 的出现顺序，0 起）的累计接收**内容字节数**（不含 multipart 头）；单调递增，每个文件最后一次为该文件的精确字节数；服务端不发送文件总大小 |
+| `result` | `index`, `status`, `reason`, `error` | 文件 `index` 的保存结果：`saved`（已保存）、`skipped`（已跳过）、`failed`（保存失败）；`reason`/`error` 可为 `null` |
+| `done` | `batch_id`, `detail` | 本次上传流终止，错误路径也会发送；`batch_id` 在批次受理成功时存在，`detail` 是安全错误文案，可为 `null` |
+
+- 事件顺序：`ready` → 若干 `progress`（按文件读取顺序，每个文件内累计递增）→ 每个文件的 `result` → `done`；`result` 在批次受理返回后按 `items[].position` 顺序推送，状态映射为 `accepted → saved`、`skipped → skipped`、`failed → failed`。
+- 读取/校验失败（类型、大小、文件数、权限拒绝、runtime 错误等）没有逐文件 `result` 时仍会收到 `done`，`detail` 为安全文案；同时 POST 返回原有错误响应，调用方以 HTTP 响应为准。
+- 流按 `(namespace, upload_id)` 隔离；hub 在进程内，**订阅与 POST 必须落在同一个 `rag-service` 实例**，没有订阅者时事件直接丢弃（不缓存、不阻塞上传）。多实例部署时需会话粘滞，否则可能收不到进度。
+- 不带 `X-Upload-ID` 时服务端不推送任何事件，行为与旧版完全一致；`upload_id` 只用于定位本次上传的流，不要跨批次复用。
 
 ### 系统监控（Console 页面与只读接口）
 
@@ -733,7 +771,7 @@ curl.exe "http://127.0.0.1:8011/v1/documents/guide.md/content" -H $headers   # �
 curl.exe -X DELETE "http://127.0.0.1:8011/v1/documents/guide.md" -H $headers
 ```
 
-批次上传返回 `202`，响应包含 `batch_id`、`total/accepted/skipped/failed` 计数与 `items`。每项包含文件名、`accepted/skipped/failed` 结果、原因，以及受理成功后的 `artifact_id`。使用 `GET /v1/document-batches/{batch_id}` 查询整个批次，或 `GET /v1/document-jobs/{artifact_id}` 查询单文件状态；只有任务 `succeeded` 才表示已索引。重复提交同一 `Idempotency-Key` 会返回原批次。单文件 10 MiB、单批 10 个，切分参数来自知识库配置，不接受请求级覆盖。PDF 正文下载返回原文件字节（`Content-Type: application/pdf`），版本化 PDF/Word 的文本视图读取已保存的 `document.md`。
+批次上传返回 `202`，响应包含 `batch_id`、`total/accepted/skipped/failed` 计数与 `items`。每项包含文件名、`accepted/skipped/failed` 结果、原因，以及受理成功后的 `artifact_id`。使用 `GET /v1/document-batches/{batch_id}` 查询整个批次，或 `GET /v1/document-jobs/{artifact_id}` 查询单文件状态；只有任务 `succeeded` 才表示已索引。重复提交同一 `Idempotency-Key` 会返回原批次。单文件 10 MiB、单批 10 个，切分参数来自知识库配置，不接受请求级覆盖。需要逐文件实时进度时，可为 POST 加上 `X-Upload-ID` 并订阅 `GET /v1/document-batches/upload-events/{upload_id}`（见上文「上传进度事件流（可选）」）；不带该头时行为与旧版一致。PDF 正文下载返回原文件字节（`Content-Type: application/pdf`），版本化 PDF/Word 的文本视图读取已保存的 `document.md`。
 
 ### 搜索、结果与产物
 

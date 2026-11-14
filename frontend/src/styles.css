@@ -689,6 +689,17 @@ h3 {
 .upload-bubble-name {
   line-height: 1.5;
 }
+.upload-bubble-progress.ant-progress {
+  margin: 4px 0 0;
+  line-height: 1;
+}
+.upload-bubble-progress .ant-progress-text {
+  color: var(--muted);
+  font-size: 12px;
+}
+.upload-bubble-progress .ant-progress-bg {
+  transition: width 0.2s ease;
+}
 .upload-bubble-state {
   color: var(--muted);
   font-size: 12px;
@@ -722,6 +733,9 @@ h3 {
 }
 :root[data-theme="dark"] .upload-bubble-state-failed {
   color: #ff7875;
+}
+:root[data-theme="dark"] .upload-bubble-progress .ant-progress-text {
+  color: #a3a3a3;
 }
 .ant-modal .ant-modal-title,
 .ant-message-notice-content,

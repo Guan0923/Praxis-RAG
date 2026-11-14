@@ -103,6 +103,7 @@ type Server struct {
 	limiter        *loginLimiter
 	accountLimiter *rateLimiter
 	docNotifier    DocumentChangeNotifier
+	uploadEvents   *uploadEventHub
 	handler        http.Handler
 }
 
@@ -124,6 +125,7 @@ func New(settings config.ServiceSettings, status StatusProvider, keys KeyLookup,
 		limiter:        newLoginLimiter(),
 		accountLimiter: newRateLimiter(),
 		webRoot:        resolveWebRoot(settings.WebRoot),
+		uploadEvents:   newUploadEventHub(),
 	}
 	for _, option := range options {
 		option(server)
@@ -162,6 +164,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/document-jobs/{artifact_id}", authTenant, s.handleDocumentJobStatus)
 	s.router.add("POST", "/v1/document-batches", authTenant, s.handleCreateDocumentBatch)
 	s.router.add("GET", "/v1/document-batches", authTenant, s.handleListDocumentBatches)
+	s.router.add("GET", "/v1/document-batches/upload-events/{upload_id}", authTenant, s.handleUploadEvents)
 	s.router.add("GET", "/v1/document-batches/{batch_id}", authTenant, s.handleDocumentBatchStatus)
 	s.router.add("GET", "/v1/documents/{name}/content", authTenant, s.handleDocumentContent)
 	s.router.add("DELETE", "/v1/documents/{name}", authTenant, s.handleDeleteDocument)
