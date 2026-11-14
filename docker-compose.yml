@@ -282,6 +282,12 @@ services:
       RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-info}
       RAG_LOG_FORMAT: ${RAG_LOG_FORMAT:-text}
       RAG_DEBUG_TRACE: ${RAG_DEBUG_TRACE:-false}
+      # Optional JSON Lines log file shared with the Console log view. The path
+      # must be writable inside the container (for example
+      # /app/data/logs/praxis-rag.jsonl); empty disables the file source and
+      # leaves the in-memory ring only.
+      RAG_LOG_FILE: ${RAG_LOG_FILE:-}
+      RAG_LOG_BUFFER_SIZE: ${RAG_LOG_BUFFER_SIZE:-1000}
       RAG_WEB_ROOT: /app/web
       QDRANT_URL: ${RAG_APP_QDRANT_URL:-http://qdrant:6333}
       RAG_MYSQL_HOST: ${RAG_APP_MYSQL_HOST:-mysql}
@@ -350,6 +356,10 @@ services:
       RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-info}
       RAG_LOG_FORMAT: ${RAG_LOG_FORMAT:-text}
       RAG_DEBUG_TRACE: ${RAG_DEBUG_TRACE:-false}
+      # Keep the same file/buffer settings as the app service so the Console log
+      # view sees the cache worker's records too.
+      RAG_LOG_FILE: ${RAG_LOG_FILE:-}
+      RAG_LOG_BUFFER_SIZE: ${RAG_LOG_BUFFER_SIZE:-1000}
       RAG_MYSQL_HOST: ${RAG_APP_MYSQL_HOST:-mysql}
       RAG_MYSQL_PORT: "3306"
       RAG_MYSQL_USER: ${RAG_MYSQL_USER:-rag}

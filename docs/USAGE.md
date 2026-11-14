@@ -360,12 +360,14 @@ PDF 总解析容量上限为 `RAG_PDF_SERVICE_WORKERS × RAG_PDF_SERVICE_CONCURR
 | `RAG_LOG_LEVEL` | `info` | Go 服务与 3 个 worker 的统一日志级别：`debug`/`info`/`warning`/`error`（`warn` 同义）；未设置时回退 `RAG_DEBUG_TRACE` |
 | `RAG_LOG_FORMAT` | `text` | `text`（默认，单行键值）或 `json`（每行一个 JSON 对象，便于采集）|
 | `RAG_DEBUG_TRACE` | `false` | 兼容旧调试开关；为真且未设置 `RAG_LOG_LEVEL` 时日志为 `debug`，同时控制模型 API 的调试输出 |
+| `RAG_LOG_FILE` | 空（只写 stderr） | 可选。设置后 `rag-service` 与 3 个 worker 在写 stderr 的同时，把同一批记录以 JSON Lines（含 `time`/`level`/`msg`/`source`/属性）追加到该文件，供 Console「系统监控 → 全部日志」的文件日志源读取；目录必须已存在，打开失败按配置错误启动失败。路径只来自启动配置，接口请求不能指定 |
+| `RAG_LOG_BUFFER_SIZE` | `1000` | 进程内日志环形缓冲条数（`100`..`20000`），供监控页内存日志源读取；非法值按配置错误启动失败 |
 | `RAG_PDF_SERVICE_LOG_LEVEL` | `info` | pdf-parser（Python）日志级别：`debug`/`info`/`warning`/`error` |
 | `RAG_PDF_SERVICE_LOG_FORMAT` | `text` | pdf-parser 日志编码：`text`/`json` |
 
 - **一次上传从请求追到任务**：`rag-service` 为每个 HTTP 请求接受或生成 `X-Request-ID`（响应头回写）；上传日志携带 `operation_id`/`artifact_id`/`batch_id`，`rag-document-worker` 的日志携带 `artifact_id`/`operation_id`/`attempt`；上传路径调用 pdf-parser 时也会转发同一个 `X-Request-ID`，两边日志可按该 ID 关联。
 - **失败原因可诊断**：文档任务失败时 `document_jobs.error` 写入最近一次失败摘要（`<类别> at <阶段> (HTTP <状态>): <脱敏详情>`）；重试耗尽的终态提示为 `Message retry limit reached; last error: ...`，死信日志同样保留该摘要。
-- **统一脱敏**：日志只记录任务/操作 ID、失败阶段与安全错误类别，不记录查询、文件正文、消息正文与凭据；错误详情经 `enc:v1:`、URL 用户信息、Bearer/API Key 与查询参数脱敏后截断。
+- **统一脱敏**：日志只记录任务/操作 ID、失败阶段与安全错误类别，不记录查询、文件正文、消息正文与凭据；错误详情经 `enc:v1:`、URL 用户信息、Bearer/API Key 与查询参数脱敏后截断。监控页日志视图输出前也走同一套 `RedactLimit`（消息正文、属性值一并脱敏，属性值截断到 500 字符）。
 
 ### 搜索执行环境
 
@@ -574,7 +576,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/document-batches `
 
 ### 系统监控（Console 页面与只读接口）
 
-管理员（或本机直连）可在 Console 侧边栏打开「系统监控」（`#/monitor`），页面每 15 秒自动刷新，全部为只读数据。版式按重要性排列：页头总体状态 → 关键指标 → 依赖与投递 → 队列与记录 → 服务信息；窄屏自动单列。
+管理员（或本机直连）可在 Console 侧边栏打开「系统监控」（`#/monitor`），页面每 15 秒自动刷新，全部为只读数据。页面顶部是一排标签：`概览` + 每个系统组件（`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium`）+ `全部日志`；组件标签展示该组件的既有监控内容与该组件最近日志；`全部日志` 页的组件筛选显示各组件的最近日志条数。概览版式按重要性排列：页头总体状态 → 主机资源 → 关键指标 → 依赖与投递 → 队列与记录 → 服务信息；窄屏自动单列。
 
 - **页头总体状态**：由状态库聚合与依赖探测共同推导的三态 `status`（`ok`/`degraded`/`error`，`ok` 为兼容字段，等于 `status == "ok"`）。任一依赖异常或状态库不可读 → `error`；任一依赖/Qdrant 目标集合/文档 Worker 心跳/Debezium 运行检查降级，或 Kafka 消费进度读取失败 → `degraded`；未启用或未知不降级。`pipeline.document_jobs` 只反映任务负载，不参与总体状态。Qdrant 已降级时页头不再显示「运行正常」。
 - **关键指标**：有效文档数（只统计 `del_flag = 0`，不含软删除）、排队/处理中文档任务、上传进行中、近 24 小时检索次数、artifact 快照数（结果快照指标已随搜索同步化移除）。
@@ -584,11 +586,31 @@ curl.exe -X POST http://127.0.0.1:8011/v1/document-batches `
 - **Kafka 两组积压**：文档、缓存两个消费组各自的 topic/group、已提交位点、末尾位点与滞后（读不到/未配置显示「未知/未启用」）；聚合状态按两组综合。
 - **缓存水位**：脏 key 数（`refreshed_revision < revision`）与刷新失败数（`last_error` 非空）；统计不可用时为 `null`（未知）。
 - **资料库与活动**：有效文档数（排除软删除）、知识库数、artifact 快照数；最近 24 小时入库成功/失败与检索次数。检索次数由活动计数器记录**每次**同步检索调用（失败也计入）。
+- **主机资源（概览顶部）**：`system` 对象给出 CPU 使用率/逻辑核数/型号/load1/5/15、内存与 swap、网络总收发速率与最忙的 8 个网卡、本进程 RSS/VMS/goroutine/heap 用量。CPU 使用率与网络速率由两次采样差值计算，服务启动后的首次采样为 `null`；Windows 没有 load average，`load1/5/15` 为 `null` 并在 `system.notes` 说明；采集失败时 `system` 为 `null`，原因追加到顶层 `errors`，**不会**改变总体 `status`/`ok`（主机资源只做展示，不参与健康判定）。
+- **组件日志**：内存日志源是进程内环形缓冲（`RAG_LOG_BUFFER_SIZE`，默认 1000 条），按组件统计条数用于 `全部日志` 的组件筛选；文件日志源读取启动时配置的 `RAG_LOG_FILE`（最多最近 512 KiB，丢弃首个不完整行，无法解析的行计入提示）。组件按记录的显式 `component` 属性优先归类，否则按调用方源码包路径映射（`internal/state`→MySQL、`internal/redisstate`→Redis、`internal/qdrant`→Qdrant、`internal/mq`/`internal/cacheconsumer`→Kafka、`internal/documentworker`/`internal/ingest`/`internal/document`→文档 Worker、`internal/cdcacceptance`→Debezium、`internal/modelapi`→模型调用、`internal/retrieval`/`internal/searchrefs`/`internal/sparse`→检索、`internal/httpapi`/`internal/mcp`→HTTP API、`internal/monitor`→系统监控、`cmd/rag-service`→服务、其余→其他）。
 
-页面对应的只读接口是 `GET /v1/admin/monitor/overview`（仅本机直连或管理员会话，响应 `Cache-Control: no-store`）。依赖降级时接口仍返回 200，用顶层 `status` 与 `dependencies[].status`（`ok`/`degraded`/`error`/`disabled`/`unknown`）区分；`queues.uploads` 同时提供 `by_status` 与 `in_progress`/`failed`/`rolling_back`/`cleanup_pending`；`pipeline.debezium` 为 `{tasks, cache}` 两个连接器（各含 `status/detail/capture_progress`），`pipeline.kafka.groups` 为 `document`/`cache` 两组位点，`pipeline.cache` 为 `{status, dirty_keys, refresh_failures}`，`service.delivery` 固定为 `debezium`；`library` 只含有效文档/知识库/artifact 快照计数（原 `result_snapshots` 字段已移除）。状态库不可读时 `queues`/`library`/`activity` 为 `null`、`pipeline.cache.dirty_keys/refresh_failures` 为 `null`，`pipeline.document_jobs.status` 为 `unknown`，`pipeline.debezium`/`pipeline.kafka`/`pipeline.worker` 仍各自探测，并附带 `errors` 中文说明。数字 `null` 表示未知，不要当作 0。该接口只做聚合查询，不读取任务/文档正文，也不记录查询内容：
+页面对应的只读接口是 `GET /v1/admin/monitor/overview`（仅本机直连或管理员会话，响应 `Cache-Control: no-store`）。依赖降级时接口仍返回 200，用顶层 `status` 与 `dependencies[].status`（`ok`/`degraded`/`error`/`disabled`/`unknown`）区分；`queues.uploads` 同时提供 `by_status` 与 `in_progress`/`failed`/`rolling_back`/`cleanup_pending`；`pipeline.debezium` 为 `{tasks, cache}` 两个连接器（各含 `status/detail/capture_progress`），`pipeline.kafka.groups` 为 `document`/`cache` 两组位点，`pipeline.cache` 为 `{status, dirty_keys, refresh_failures}`，`service.delivery` 固定为 `debezium`；`library` 只含有效文档/知识库/artifact 快照计数（原 `result_snapshots` 字段已移除）。顶层新增 `system`（主机资源，见上一节；采集不可用时为 `null`，原有字段一律不变）。状态库不可读时 `queues`/`library`/`activity` 为 `null`、`pipeline.cache.dirty_keys/refresh_failures` 为 `null`，`pipeline.document_jobs.status` 为 `unknown`，`pipeline.debezium`/`pipeline.kafka`/`pipeline.worker` 仍各自探测，并附带 `errors` 中文说明。数字 `null` 表示未知，不要当作 0。该接口只做聚合查询，不读取任务/文档正文，也不记录查询内容：
 
 ```powershell
 curl.exe http://127.0.0.1:8011/v1/admin/monitor/overview
+```
+
+日志视图对应 `GET /v1/admin/monitor/logs`（同样仅本机直连或管理员会话，`Cache-Control: no-store`，运行时 5 秒超时）：
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `source` | `memory` | `memory`（进程内环形缓冲）或 `file`（`RAG_LOG_FILE`）；未知值 400 |
+| `component` | 全部 | 组件 id：`mysql`/`redis`/`qdrant`/`kafka`/`pdf`/`worker`/`debezium`/`model`/`search`/`http`/`monitor`/`service`/`other`；未知值 400，detail 为 `未知日志组件: xxx` |
+| `level` | 全部 | 最低级别 `debug`/`info`/`warn`/`warning`/`error`（`warning` 等价 `warn`）；非法值 400 |
+| `query` | 空 | 关键字（消息/来源/组件名/属性值的大小写不敏感包含匹配），最多 200 字符 |
+| `limit` | `100` | 每页条数，越界钳制到 `1..500` |
+| `offset` | `0` | 跳过条数，`0..100000`，越界 400 |
+
+响应固定包含 `generated_at`/`source`/`available`/`entries`/`total`/`has_more`/`components`/`file`/`notes`：`entries` 统一按最新在前排序，`total` 为过滤后匹配条数，`components` 统计整个缓冲/文件窗口内各组件的条数（忽略 `component`/`level`/`query` 过滤，「全部日志」页用作组件筛选项的条数），`file` 为 `{configured, path, size_bytes, truncated, note}`。`source=file` 但未配置 `RAG_LOG_FILE` 时仍返回 200：`available=false`、`entries=[]`、`file.configured=false`，`notes` 中文说明；文件较大时只读最近 512 KiB 并在 `file.note` 说明。`attrs` 值转为字符串并截断到 500 字符，正文与属性值都走统一脱敏；`level` 输出大写 `DEBUG`/`INFO`/`WARN`/`ERROR`。
+
+```powershell
+curl.exe "http://127.0.0.1:8011/v1/admin/monitor/logs?component=mysql&level=warn&limit=50"
+curl.exe "http://127.0.0.1:8011/v1/admin/monitor/logs?source=file&query=timeout"
 ```
 
 ### API Key 管理（本机或登录会话）

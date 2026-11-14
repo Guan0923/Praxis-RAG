@@ -1234,3 +1234,63 @@ body.drag-selecting * {
   }
 }
 
+/* The nine monitor tabs exceed the content width on a phone: let the nav wrap
+   (or scroll) instead of clipping the last labels behind an invisible "more"
+   trigger. */
+.monitor-tabs > .ant-tabs-nav {
+  margin-bottom: 16px;
+}
+.monitor-tabs .ant-tabs-nav-wrap {
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.monitor-tabs .ant-tabs-nav-list {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+.monitor-tabs .ant-tabs-tab {
+  padding-inline: 0;
+  margin-inline-end: 20px;
+}
+/* Log panel: every filter stays on one wrapping row, and the table scrolls
+   sideways so long messages never widen the card. */
+.monitor-log-filters {
+  margin-bottom: 12px;
+}
+.monitor-log-filters > * {
+  min-width: 0;
+}
+.monitor-log-card .ant-table-cell {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  vertical-align: top;
+}
+.monitor-log-file,
+.monitor-log-attrs {
+  margin: 0 0 12px;
+}
+.monitor-log-attrs .ant-descriptions-item-content {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+/* Host resources: the four columns must wrap their values, not overflow. */
+.monitor-system-card .ant-descriptions-item-content {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+@media (max-width: 767px) {
+  .monitor-tabs .ant-tabs-nav-list {
+    flex-wrap: nowrap;
+  }
+  .monitor-log-filters > .ant-segmented {
+    width: 100%;
+  }
+  .monitor-log-filters > .ant-input,
+  .monitor-log-filters > .ant-select {
+    flex: 1 1 140px;
+    max-width: none !important;
+  }
+}
+
+

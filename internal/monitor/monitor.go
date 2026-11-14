@@ -20,8 +20,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/qdrant"
 	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/sysinfo"
 	"github.com/Guan0923/xinghe_rag/internal/version"
 )
 
@@ -117,6 +119,18 @@ type Options struct {
 	// HTTPClient is shared by the Qdrant and PDF probes; nil uses a client
 	// bounded by probeTimeout.
 	HTTPClient *http.Client
+
+	// System samples host CPU/memory/network/process resources for the Console
+	// system card (GET /v1/admin/monitor/overview → "system"). nil leaves the
+	// object null; a sampling error is appended to "errors" without changing
+	// the overall health status.
+	System SystemSampler
+	// Logs is the process-wide in-memory log ring installed by logging.Setup.
+	Logs *logging.Buffer
+	// LogFilePath is the startup-configured RAG_LOG_FILE absolute path. Requests
+	// never choose it: only this wiring does, so a caller cannot read arbitrary
+	// files through the log endpoint.
+	LogFilePath string
 }
 
 // Service renders monitoring snapshots. It is safe for concurrent use.
@@ -191,6 +205,13 @@ type KafkaStatus struct {
 type WorkerHeartbeat struct {
 	UpdatedAt time.Time
 	Instances int
+}
+
+// SystemSampler is the narrow host-resource surface the monitoring service
+// consumes; *sysinfo.Sampler implements it. A nil System option keeps the
+// "system" object null without changing the health verdict.
+type SystemSampler interface {
+	Sample() (*sysinfo.Snapshot, error)
 }
 
 // pipelineSnapshot is the delivery-pipeline view of the monitoring snapshot:
@@ -358,6 +379,45 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 		defer cancel()
 		workerBeat, workerErr = s.options.WorkerHeartbeat(probeContext)
 	}()
+
+	// Host resources are a best-effort side view: a nil sampler keeps "system"
+	// null, and a failed sample only appends a reason to "errors". It must never
+	// change the healthy/degraded/error verdict of the infrastructure probes, so
+	// it deliberately stays outside overallStatus.
+	var systemView any
+	var systemErr error
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		if s.options.System == nil {
+			return
+		}
+		type sampleResult struct {
+			snapshot *sysinfo.Snapshot
+			err      error
+		}
+		results := make(chan sampleResult, 1)
+		go func() {
+			snapshot, sampleErr := s.options.System.Sample()
+			results <- sampleResult{snapshot: snapshot, err: sampleErr}
+		}()
+		select {
+		case result := <-results:
+			if result.err != nil {
+				systemErr = result.err
+				return
+			}
+			if result.snapshot == nil {
+				systemErr = errors.New("系统资源采样返回空结果")
+				return
+			}
+			systemView = result.snapshot
+		case <-time.After(probeTimeout):
+			// The sampler keeps running in the background; the snapshot must not
+			// wait on a wedged operating-system call.
+			systemErr = errors.New("系统资源采样超时")
+		}
+	}()
 	wait.Wait()
 
 	dependencies := make([]dependency, 0, len(probes))
@@ -413,6 +473,9 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 	} else {
 		errorsList = append(errorsList, "监控统计不可用："+shortError(statsErr))
 	}
+	if systemErr != nil {
+		errorsList = append(errorsList, "系统资源采集失败："+shortError(systemErr))
+	}
 
 	startedAt := s.options.StartedAt
 	if startedAt.IsZero() {
@@ -442,6 +505,7 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 		"pipeline":     pipeline,
 		"library":      library,
 		"activity":     activity,
+		"system":       systemView,
 		"errors":       errorsList,
 	}
 }

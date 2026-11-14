@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Alert,
   Button,
@@ -6,34 +6,60 @@ import {
   Col,
   Descriptions,
   Flex,
+  Input,
   Row,
+  Segmented,
+  Select,
   Spin,
   Statistic,
   Switch,
   Table,
+  Tabs,
   Tag,
   Tooltip,
 } from "antd";
 import { ReloadOutlined } from "@ant-design/icons";
 import {
   errorText,
+  fetchMonitorLogs,
   fetchMonitorOverview,
+  formatBytes,
   formatDateTime,
   formatDuration,
+  formatPercent,
+  formatRate,
+  monitorComponentLabels,
   monitorDependencyStatusColors,
   monitorDependencyStatusLabels,
+  monitorTabComponents,
   uploadJobStageLabels,
+  type MonitorActivity,
   type MonitorDependency,
   type MonitorDependencyStatus,
+  type MonitorLibrary,
+  type MonitorLogEntry,
+  type MonitorLogFile,
+  type MonitorLogPage,
+  type MonitorLogSource,
   type MonitorOverallStatus,
   type MonitorOverview,
+  type MonitorPipeline,
   type MonitorPipelineKafkaGroup,
+  type MonitorQueues,
+  type MonitorService,
+  type MonitorSystem,
+  type MonitorTabComponent,
 } from "./api";
 
 // monitorRefreshMs is the auto-refresh period: the backend does not push
 // snapshot updates, so the page polls. It stays off the request path and only
 // re-fetches while the switch is on.
 const monitorRefreshMs = 15_000;
+
+// monitorLogLimit is the number of rows a component panel asks for; the 全部日志
+// tab asks for a wider client-paginated window instead.
+const monitorComponentLogLimit = 50;
+const monitorAllLogLimit = 100;
 
 // The three-state overall status ranks the snapshot. An older backend omits the
 // field entirely, in which case the boolean fallback keeps the header honest.
@@ -59,6 +85,33 @@ const documentJobStatusLabels: Record<string, string> = {
   succeeded: "成功",
   failed: "失败",
 };
+
+// Log levels keep the backend's lowercase keys; the table renders them as the
+// upper-case tags operators expect.
+const logLevelLabels: Record<string, string> = {
+  debug: "DEBUG",
+  info: "INFO",
+  warn: "WARN",
+  error: "ERROR",
+};
+const logLevelColors: Record<string, string> = {
+  debug: "default",
+  info: "blue",
+  warn: "warning",
+  error: "error",
+};
+// The level filter is fixed to 全部/INFO/WARN/ERROR; debug records stay visible
+// under 全部级别 but are not a dedicated filter.
+const logLevelOptions = [
+  { value: "", label: "全部级别" },
+  { value: "info", label: "INFO" },
+  { value: "warn", label: "WARN" },
+  { value: "error", label: "ERROR" },
+];
+const logSourceOptions = [
+  { value: "memory", label: "内存" },
+  { value: "file", label: "文件" },
+];
 
 // unknownOrNumber keeps absent counters out of the page instead of printing a
 // fake zero. A real 0 renders as 0, so "no failed uploads" stays visible.
@@ -90,6 +143,24 @@ function latencyText(dependency: MonitorDependency) {
     : "—";
 }
 
+// cpuUsageText marks a first sample as 采样中 instead of a fake 0%: the
+// collector needs two polls before a usage percentage exists.
+function cpuUsageText(value: number | null | undefined) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "采样中/未知";
+  return formatPercent(value);
+}
+
+// loadAverageText joins the three load averages. Windows never reports them, so
+// a null triple stays 未知 instead of looking like an idle host.
+function loadAverageText(cpu: MonitorSystem["cpu"]) {
+  const { load1, load5, load15 } = cpu;
+  if (load1 === null && load5 === null && load15 === null) return "未知";
+  const part = (value: number | null) => (
+    typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "未知"
+  );
+  return `1/5/15 分钟：${part(load1)} / ${part(load5)} / ${part(load15)}`;
+}
+
 // StatusCountTags renders one queue's by_status map as count tags. Known
 // statuses keep the label map's display order; unknown keys are appended as-is.
 function StatusCountTags({ counts, labels }: {
@@ -118,9 +189,9 @@ function StatusCountTags({ counts, labels }: {
   return entries.length ? tags : <span className="secondary">暂无队列数据</span>;
 }
 
-// DependencyTable lists the five built-in probes. The horizontal scroll keeps
-// the four columns readable on a phone without stretching the card, and the
-// detail cell wraps long diagnostics instead of pushing the table wider.
+// DependencyTable lists the built-in probes. The horizontal scroll keeps the
+// four columns readable on a phone without stretching the card, and the detail
+// cell wraps long diagnostics instead of pushing the table wider.
 function DependencyTable({ dependencies }: { dependencies: MonitorDependency[] }) {
   return (
     <div className="monitor-dependency-table">
@@ -234,26 +305,33 @@ function degradedDependencyNotes(overview: MonitorOverview): string[] {
   return notes;
 }
 
-// MonitorSnapshot renders one successfully fetched overview. It is a separate
-// component so every section can narrow null queues/pipeline/library/activity
-// without repeating guards in the page shell.
-function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
-  const { service, dependencies, queues, pipeline, library, activity } = overview;
-  const jobs = queues?.document_jobs;
-  const pipelineJobs = pipeline?.document_jobs;
-  const worker = pipeline?.worker;
-  const debeziumTasks = pipeline?.debezium?.tasks;
-  const debeziumCache = pipeline?.debezium?.cache;
-  const kafkaGroups = pipeline?.kafka?.groups;
-  const kafkaDocument = kafkaGroups?.document;
-  const kafkaCache = kafkaGroups?.cache;
-  const cache = pipeline?.cache;
-  const uploads = queues?.uploads;
-  const stages = Object.entries(jobs?.by_stage || {}).map(([stage, count]) => ({ stage, count }));
+// PipelineRow is the shared status/detail row used by every delivery view. The
+// optional children carry the connector-specific offsets or capture progress.
+function PipelineRow({ label, status, detail, children }: {
+  label: string;
+  status?: MonitorDependencyStatus;
+  detail?: string;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="monitor-progress-row">
+      <Flex wrap gap={8} align="center">
+        <strong>{label}</strong>
+        <PipelineStatusTag status={status} />
+        <span className="secondary break-text">{detail || "未知"}</span>
+      </Flex>
+      {children}
+    </div>
+  );
+}
 
-  // The key metrics are the page's first screen: task health instead of static
-  // service configuration. Each value degrades to 未知 when its section is
-  // unavailable rather than pretending the queue is empty.
+// KeyMetricsCard carries the page's first screen: task health instead of static
+// service configuration. Each value degrades to 未知 when its section is
+// unavailable rather than pretending the queue is empty.
+function KeyMetricsCard({ overview }: { overview: MonitorOverview }) {
+  const { queues, library, activity } = overview;
+  const jobs = queues?.document_jobs;
+  const uploads = queues?.uploads;
   const metrics: Array<{ key: string; title: string; value: number | string }> = [
     {
       key: "documents",
@@ -285,204 +363,899 @@ function MonitorSnapshot({ overview }: { overview: MonitorOverview }) {
   ];
 
   return (
+    <Card size="small" title="关键指标">
+      <Row gutter={[16, 16]}>
+        {metrics.map((metric) => (
+          <Col key={metric.key} xs={12} sm={8} xl={6}>
+            <Statistic className="monitor-stat" title={metric.title} value={metric.value} />
+          </Col>
+        ))}
+      </Row>
+    </Card>
+  );
+}
+
+// SystemResourcesCard renders the host sample: CPU, memory, network and the
+// service process. A missing collector or a first-sample null rate stays 未知.
+function SystemResourcesCard({ system }: { system?: MonitorSystem | null }) {
+  if (!system) {
+    return (
+      <Card size="small" title="系统资源">
+        <span className="secondary">系统资源：未知（采集不可用）</span>
+      </Card>
+    );
+  }
+  const { cpu, memory, network, process } = system;
+  // notes/interfaces are arrays in the wire contract, but a partial sample can
+  // serialize them as null; fall back to empty collections instead of throwing.
+  const interfaces = network.interfaces ?? [];
+  const systemNotes = system.notes ?? [];
+  return (
+    <Card size="small" title="系统资源" className="monitor-system-card">
+      <Row gutter={[24, 16]}>
+        <Col xs={24} md={12} xl={6}>
+          <h4 className="monitor-subheading">CPU</h4>
+          <Descriptions
+            size="small"
+            column={1}
+            items={[
+              { key: "usage", label: "使用率", children: cpuUsageText(cpu.usage_percent) },
+              { key: "cores", label: "核心数", children: `${cpu.cores} 核` },
+              { key: "model", label: "型号", children: cpu.model || "未知" },
+              { key: "load", label: "负载", children: loadAverageText(cpu) },
+            ]}
+          />
+        </Col>
+        <Col xs={24} md={12} xl={6}>
+          <h4 className="monitor-subheading">内存</h4>
+          <Descriptions
+            size="small"
+            column={1}
+            items={[
+              { key: "percent", label: "使用率", children: formatPercent(memory.used_percent) },
+              {
+                key: "used",
+                label: "已用",
+                children: `${formatBytes(memory.used_bytes)} / ${formatBytes(memory.total_bytes)}`,
+              },
+              { key: "available", label: "可用", children: formatBytes(memory.available_bytes) },
+              {
+                key: "swap",
+                label: "Swap",
+                children: `${formatBytes(memory.swap_used_bytes)} / ${formatBytes(memory.swap_total_bytes)}（${formatPercent(memory.swap_used_percent)}）`,
+              },
+            ]}
+          />
+        </Col>
+        <Col xs={24} md={12} xl={6}>
+          <h4 className="monitor-subheading">网络</h4>
+          <Descriptions
+            size="small"
+            column={1}
+            items={[
+              { key: "rxRate", label: "接收速率", children: formatRate(network.rx_bytes_per_second) },
+              { key: "txRate", label: "发送速率", children: formatRate(network.tx_bytes_per_second) },
+              { key: "rxTotal", label: "累计接收", children: formatBytes(network.rx_bytes_total) },
+              { key: "txTotal", label: "累计发送", children: formatBytes(network.tx_bytes_total) },
+            ]}
+          />
+        </Col>
+        <Col xs={24} md={12} xl={6}>
+          <h4 className="monitor-subheading">进程</h4>
+          <Descriptions
+            size="small"
+            column={1}
+            items={[
+              { key: "pid", label: "PID", children: String(process.pid) },
+              { key: "rss", label: "RSS", children: formatBytes(process.rss_bytes) },
+              { key: "vms", label: "虚拟内存", children: formatBytes(process.vms_bytes) },
+              { key: "goroutines", label: "Goroutines", children: String(process.goroutines) },
+              { key: "heap", label: "堆内存", children: formatBytes(process.heap_alloc_bytes) },
+            ]}
+          />
+        </Col>
+      </Row>
+      {interfaces.length > 0 && (
+        <>
+          <h4 className="monitor-subheading">网卡</h4>
+          <Flex wrap gap={6} className="monitor-tags">
+            {interfaces.map((item) => (
+              <Tag key={item.name}>
+                {item.name}：接收 {formatRate(item.rx_bytes_per_second)} / 发送 {formatRate(item.tx_bytes_per_second)}
+              </Tag>
+            ))}
+          </Flex>
+        </>
+      )}
+      {systemNotes.length > 0 && (
+        <ul className="monitor-error-list secondary monitor-note">
+          {systemNotes.map((note, index) => <li key={index}>{note}</li>)}
+        </ul>
+      )}
+      <p className="secondary monitor-note">
+        采集于 {formatDateTime(system.collected_at)}（窗口 {system.window_seconds} 秒）；首次采样时速率与 CPU 使用率可能为未知。
+      </p>
+    </Card>
+  );
+}
+
+// ServiceInfoCard renders the static service facts last: they never change
+// between refreshes and would otherwise crowd the task metrics.
+function ServiceInfoCard({ service }: { service?: MonitorService }) {
+  return (
+    <Card size="small" title="服务信息" className="monitor-service-info">
+      <Descriptions
+        size="small"
+        column={{ xs: 1, sm: 2, lg: 3 }}
+        items={[
+          { key: "version", label: "版本", children: service?.version || "—" },
+          { key: "uptime", label: "运行时长", children: formatDuration(service?.uptime_seconds) },
+          { key: "backend", label: "后端", children: service?.backend || "—" },
+          { key: "collection", label: "集合", children: service?.collection || "—" },
+          { key: "upload", label: "上传模式", children: service?.upload_mode || "—" },
+          { key: "delivery", label: "投递方式", children: service?.delivery || "—" },
+          { key: "pdf", label: "PDF 引擎", children: service?.pdf_engine || "—" },
+          { key: "started", label: "启动时间", children: formatDateTime(service?.started_at) },
+        ]}
+      />
+    </Card>
+  );
+}
+
+// OverviewTab keeps the page-level health banner together with the metrics,
+// host resources and static service facts.
+function OverviewTab({ overview }: { overview: MonitorOverview }) {
+  const status = overallStatusOf(overview);
+  const errors = overview.errors ?? [];
+  const degradedNotes = degradedDependencyNotes(overview);
+  return (
     <Flex vertical gap={16}>
-      <Card size="small" title="关键指标">
-        <Row gutter={[16, 16]}>
-          {metrics.map((metric) => (
-            <Col key={metric.key} xs={12} sm={8} xl={6}>
-              <Statistic className="monitor-stat" title={metric.title} value={metric.value} />
-            </Col>
-          ))}
-        </Row>
-      </Card>
-
-      <Card size="small" title="依赖与投递">
-        <Row gutter={[24, 16]}>
-          <Col xs={24} xl={12}>
-            <section className="monitor-block" aria-label="依赖状态">
-              <h3>依赖状态</h3>
-              <DependencyTable dependencies={dependencies} />
-            </section>
-          </Col>
-          <Col xs={24} xl={12}>
-            <section className="monitor-block" aria-label="投递与消费进度">
-              <h3>投递与消费进度</h3>
-              <Flex vertical gap={12}>
-                <div className="monitor-progress-row">
-                  <Flex wrap gap={8} align="center">
-                    <strong>Debezium 任务连接器</strong>
-                    <PipelineStatusTag status={debeziumTasks?.status} />
-                    <span className="secondary break-text">{debeziumTasks?.detail || "未知"}</span>
-                  </Flex>
-                  <span className="break-text">{captureProgressText(debeziumTasks?.capture_progress)}</span>
-                </div>
-                <div className="monitor-progress-row">
-                  <Flex wrap gap={8} align="center">
-                    <strong>Debezium 缓存连接器</strong>
-                    <PipelineStatusTag status={debeziumCache?.status} />
-                    <span className="secondary break-text">{debeziumCache?.detail || "未知"}</span>
-                  </Flex>
-                  <span className="break-text">{captureProgressText(debeziumCache?.capture_progress)}</span>
-                </div>
-                {([
-                  ["Kafka 文档消费", kafkaDocument],
-                  ["Kafka 缓存消费", kafkaCache],
-                ] as const).map(([label, group]) => (
-                  <div className="monitor-progress-row" key={label}>
-                    <Flex wrap gap={8} align="center">
-                      <strong>{label}</strong>
-                      <PipelineStatusTag status={group?.status} />
-                      <span className="secondary break-text">{group?.detail || "未知"}</span>
-                    </Flex>
-                    <span className="secondary break-text">
-                      Topic：{group?.topic || "未知"}　Consumer Group：{group?.group || "未知"}
-                    </span>
-                    <span className="break-text">{kafkaGroupLagText(group)}</span>
-                  </div>
-                ))}
-                <div className="monitor-progress-row">
-                  <Flex wrap gap={8} align="center">
-                    <strong>文档 Worker</strong>
-                    <PipelineStatusTag status={worker?.status} />
-                    <span className="secondary break-text">{worker?.detail || "未知"}</span>
-                  </Flex>
-                </div>
-                <div className="monitor-progress-row">
-                  <Flex wrap gap={8} align="center">
-                    <strong>文档任务状态</strong>
-                    <PipelineStatusTag status={pipelineJobs?.status} />
-                    <span className="secondary break-text">{pipelineJobs?.detail || "未知"}</span>
-                  </Flex>
-                </div>
-              </Flex>
-            </section>
-          </Col>
-        </Row>
-      </Card>
-
-      <Card size="small" title="队列与记录">
-        <Row gutter={[24, 16]}>
-          <Col xs={24} xl={12}>
-            <section className="monitor-block" aria-label="文档任务队列">
-              <h3>文档任务</h3>
-              <StatusCountTags counts={jobs?.by_status} labels={documentJobStatusLabels} />
-              <Descriptions
-                size="small"
-                column={1}
-                items={[
-                  { key: "oldest", label: "最老排队", children: queues ? formatDuration(jobs?.oldest_queued_seconds) : "未知" },
-                  { key: "stuck", label: "卡死处理中", children: queues ? `${jobs?.stuck_processing ?? 0} 个` : "未知" },
-                  { key: "failed", label: "近 24 小时失败", children: queues ? `${jobs?.failed_recent ?? 0} 个` : "未知" },
-                ]}
-              />
-              <h4 className="monitor-subheading">阶段分布</h4>
-              {stages.length ? (
-                <Flex wrap gap={6} className="monitor-tags">
-                  {stages.map(({ stage, count }) => (
-                    <Tag key={stage}>
-                      {uploadJobStageLabels[stage] || stage} {count}
-                    </Tag>
-                  ))}
-                </Flex>
-              ) : (
-                // 没有处理中任务时不渲染空表格，只留一行说明。
-                <span className="secondary">{queues ? "暂无处理中任务" : "状态库暂不可用"}</span>
-              )}
-            </section>
-          </Col>
-          <Col xs={24} xl={12}>
-            <Flex vertical gap={20}>
-              <section className="monitor-block" aria-label="缓存水位">
-                <h3>缓存水位</h3>
-                <Descriptions
-                  size="small"
-                  column={1}
-                  items={[
-                    {
-                      key: "status",
-                      label: "状态",
-                      children: <PipelineStatusTag status={cache?.status} />,
-                    },
-                    {
-                      key: "dirty",
-                      label: "脏 key",
-                      children: cache ? unknownOrNumber(cache.dirty_keys) : "未知",
-                    },
-                    {
-                      key: "failures",
-                      label: "刷新失败",
-                      children: cache ? unknownOrNumber(cache.refresh_failures) : "未知",
-                    },
-                  ]}
-                />
-                <p className="secondary monitor-note">
-                  脏 key = refreshed_revision 小于 revision；刷新失败 = last_error 非空。数字未知表示状态库或统计不可读。
-                </p>
-              </section>
-            </Flex>
-          </Col>
-        </Row>
-        <section className="monitor-block monitor-uploads" aria-label="上传队列">
-          <h3>上传操作</h3>
-          {uploads ? (
-            <>
-              <Row gutter={[12, 12]}>
-                <Col xs={12} sm={6}>
-                  <Statistic className="monitor-stat" title="进行中" value={unknownOrNumber(uploads.in_progress)} />
-                </Col>
-                <Col xs={12} sm={6}>
-                  <Statistic className="monitor-stat" title="失败" value={unknownOrNumber(uploads.failed)} />
-                </Col>
-                <Col xs={12} sm={6}>
-                  <Statistic className="monitor-stat" title="回滚中" value={unknownOrNumber(uploads.rolling_back)} />
-                </Col>
-                <Col xs={12} sm={6}>
-                  <Statistic className="monitor-stat" title="待清理" value={unknownOrNumber(uploads.cleanup_pending)} />
-                </Col>
-              </Row>
-              <span className="secondary">
-                未完成操作合计：{unknownOrNumber(uploads.unfinished)}
-              </span>
-              <p className="secondary monitor-note">
-                未完成操作 = 进行中 + 失败/回滚待处理 + 待清理，不代表当前正在上传或入库的文件数。
-              </p>
-            </>
-          ) : (
-            <span className="secondary">上传操作：未知</span>
-          )}
-        </section>
-      </Card>
-
-      <Card size="small" title="服务信息" className="monitor-service-info">
-        <Descriptions
-          size="small"
-          column={{ xs: 1, sm: 2, lg: 3 }}
-          items={[
-            { key: "version", label: "版本", children: service?.version || "—" },
-            { key: "uptime", label: "运行时长", children: formatDuration(service?.uptime_seconds) },
-            { key: "backend", label: "后端", children: service?.backend || "—" },
-            { key: "collection", label: "集合", children: service?.collection || "—" },
-            { key: "upload", label: "上传模式", children: service?.upload_mode || "—" },
-            { key: "delivery", label: "投递方式", children: service?.delivery || "—" },
-            { key: "pdf", label: "PDF 引擎", children: service?.pdf_engine || "—" },
-            { key: "started", label: "启动时间", children: formatDateTime(service?.started_at) },
-          ]}
+      {status === "error" && (
+        <Alert
+          className="page-alert"
+          type="error"
+          showIcon
+          title="服务状态异常"
+          description={errors.length ? (
+            <ul className="monitor-error-list">
+              {errors.map((message, index) => <li key={index}>{message}</li>)}
+            </ul>
+          ) : "后端未返回具体错误，请查看下方依赖状态。"}
         />
-      </Card>
+      )}
+      {status === "degraded" && (
+        <Alert
+          className="page-alert"
+          type="warning"
+          showIcon
+          title="服务存在降级"
+          description={degradedNotes.length ? (
+            <ul className="monitor-error-list">
+              {degradedNotes.map((note, index) => <li key={index}>{note}</li>)}
+            </ul>
+          ) : "后端未返回具体降级详情，请查看下方依赖状态。"}
+        />
+      )}
+      <KeyMetricsCard overview={overview} />
+      <SystemResourcesCard system={overview.system} />
+      <ServiceInfoCard service={overview.service} />
     </Flex>
   );
 }
 
-// MonitorPage is the read-only system overview for administrators. It leads with
-// the task metrics, then the dependency probes and delivery/consumption progress,
-// then the queue/record statistics, and only ends with the static service facts.
-// It auto-refreshes every 15 seconds while the switch stays on.
+// DependencyCard narrows the probe table to one component tab. Keeping the same
+// table keeps the status/latency/detail vocabulary identical everywhere.
+function DependencyCard({ overview, names }: { overview: MonitorOverview; names: string[] }) {
+  const dependencies = overview.dependencies.filter((dependency) => names.includes(dependency.name));
+  return (
+    <Card size="small" title="依赖状态">
+      <section className="monitor-block" aria-label="依赖状态">
+        <DependencyTable dependencies={dependencies} />
+      </section>
+    </Card>
+  );
+}
+
+// DocumentJobsBlock is the queue view shared by the MySQL and Worker tabs:
+// status counts, the oldest queue age, stuck/failed counters and the stage
+// distribution the queue worker reports.
+function DocumentJobsBlock({ queues }: { queues: MonitorQueues | null }) {
+  const jobs = queues?.document_jobs;
+  const stages = Object.entries(jobs?.by_stage || {}).map(([stage, count]) => ({ stage, count }));
+  return (
+    <section className="monitor-block" aria-label="文档任务队列">
+      <StatusCountTags counts={jobs?.by_status} labels={documentJobStatusLabels} />
+      <Descriptions
+        size="small"
+        column={1}
+        items={[
+          { key: "oldest", label: "最老排队", children: queues ? formatDuration(jobs?.oldest_queued_seconds) : "未知" },
+          { key: "stuck", label: "卡死处理中", children: queues ? `${jobs?.stuck_processing ?? 0} 个` : "未知" },
+          { key: "failed", label: "近 24 小时失败", children: queues ? `${jobs?.failed_recent ?? 0} 个` : "未知" },
+        ]}
+      />
+      <h4 className="monitor-subheading">阶段分布</h4>
+      {stages.length ? (
+        <Flex wrap gap={6} className="monitor-tags">
+          {stages.map(({ stage, count }) => (
+            <Tag key={stage}>
+              {uploadJobStageLabels[stage] || stage} {count}
+            </Tag>
+          ))}
+        </Flex>
+      ) : (
+        // 没有处理中任务时不渲染空表格，只留一行说明。
+        <span className="secondary">{queues ? "暂无处理中任务" : "状态库暂不可用"}</span>
+      )}
+    </section>
+  );
+}
+
+// UploadsBlock lists the four disjoint upload operation buckets. A missing
+// section stays 未知 instead of printing fake zeros.
+function UploadsBlock({ uploads }: { uploads?: MonitorQueues["uploads"] | null }) {
+  if (!uploads) {
+    return (
+      <section className="monitor-block" aria-label="上传队列">
+        <span className="secondary">上传操作：未知</span>
+      </section>
+    );
+  }
+  return (
+    <section className="monitor-block" aria-label="上传队列">
+      <Row gutter={[12, 12]}>
+        <Col xs={12} sm={6}>
+          <Statistic className="monitor-stat" title="进行中" value={unknownOrNumber(uploads.in_progress)} />
+        </Col>
+        <Col xs={12} sm={6}>
+          <Statistic className="monitor-stat" title="失败" value={unknownOrNumber(uploads.failed)} />
+        </Col>
+        <Col xs={12} sm={6}>
+          <Statistic className="monitor-stat" title="回滚中" value={unknownOrNumber(uploads.rolling_back)} />
+        </Col>
+        <Col xs={12} sm={6}>
+          <Statistic className="monitor-stat" title="待清理" value={unknownOrNumber(uploads.cleanup_pending)} />
+        </Col>
+      </Row>
+      <span className="secondary">
+        未完成操作合计：{unknownOrNumber(uploads.unfinished)}
+      </span>
+      <p className="secondary monitor-note">
+        未完成操作 = 进行中 + 失败/回滚待处理 + 待清理，不代表当前正在上传或入库的文件数。
+      </p>
+    </section>
+  );
+}
+
+// LibraryActivityBlock shows the state-database counts: documents, knowledge
+// bases, artifact snapshots and the recent search volume.
+function LibraryActivityBlock({ library, activity }: {
+  library: MonitorLibrary | null;
+  activity: MonitorActivity | null;
+}) {
+  return (
+    <section className="monitor-block" aria-label="库与活动">
+      <Descriptions
+        size="small"
+        column={{ xs: 1, sm: 2, lg: 4 }}
+        items={[
+          { key: "documents", label: "有效文档", children: library ? unknownOrNumber(library.documents) : "未知" },
+          { key: "knowledge-bases", label: "知识库", children: library ? unknownOrNumber(library.knowledge_bases) : "未知" },
+          { key: "artifacts", label: "artifact 快照", children: library ? unknownOrNumber(library.artifact_snapshots) : "未知" },
+          {
+            key: "searches",
+            label: `近 ${activity?.window_hours ?? 24} 小时检索次数`,
+            children: activity ? unknownOrNumber(activity.searches) : "未知",
+          },
+        ]}
+      />
+      <p className="secondary monitor-note">
+        统计来自状态库；artifact 快照按 ID 独立读取，检索为同步执行，不经过 Kafka。
+      </p>
+    </section>
+  );
+}
+
+// CacheBlock shows the read-model revision watermark. The explanatory note is
+// part of the contract: dirty keys and refresh failures are not the same thing.
+function CacheBlock({ pipeline }: { pipeline: MonitorPipeline | null }) {
+  const cache = pipeline?.cache;
+  return (
+    <section className="monitor-block" aria-label="缓存水位">
+      <Descriptions
+        size="small"
+        column={1}
+        items={[
+          {
+            key: "status",
+            label: "状态",
+            children: <PipelineStatusTag status={cache?.status} />,
+          },
+          {
+            key: "dirty",
+            label: "脏 key",
+            children: cache ? unknownOrNumber(cache.dirty_keys) : "未知",
+          },
+          {
+            key: "failures",
+            label: "刷新失败",
+            children: cache ? unknownOrNumber(cache.refresh_failures) : "未知",
+          },
+        ]}
+      />
+      <p className="secondary monitor-note">
+        脏 key = refreshed_revision 小于 revision；刷新失败 = last_error 非空。数字未知表示状态库或统计不可读。
+      </p>
+    </section>
+  );
+}
+
+// KafkaGroupsBlock renders both independent consumer groups: document and cache.
+// Offsets stay 未知 when Kafka does not report them.
+function KafkaGroupsBlock({ pipeline }: { pipeline: MonitorPipeline | null }) {
+  const documentGroup = pipeline?.kafka?.groups?.document;
+  const cacheGroup = pipeline?.kafka?.groups?.cache;
+  return (
+    <section className="monitor-block" aria-label="Kafka 消费进度">
+      <Flex vertical gap={12}>
+        {([
+          ["Kafka 文档消费", documentGroup],
+          ["Kafka 缓存消费", cacheGroup],
+        ] as const).map(([label, group]) => (
+          <PipelineRow key={label} label={label} status={group?.status} detail={group?.detail}>
+            <span className="secondary break-text">
+              Topic：{group?.topic || "未知"}　Consumer Group：{group?.group || "未知"}
+            </span>
+            <span className="break-text">{kafkaGroupLagText(group)}</span>
+          </PipelineRow>
+        ))}
+      </Flex>
+    </section>
+  );
+}
+
+// DebeziumBlock renders the two connectors separately: they are independent
+// processes with independent offsets and must never be merged.
+function DebeziumBlock({ pipeline }: { pipeline: MonitorPipeline | null }) {
+  const tasks = pipeline?.debezium?.tasks;
+  const cache = pipeline?.debezium?.cache;
+  return (
+    <section className="monitor-block" aria-label="Debezium 连接器">
+      <Flex vertical gap={12}>
+        <PipelineRow label="Debezium 任务连接器" status={tasks?.status} detail={tasks?.detail}>
+          <span className="break-text">{captureProgressText(tasks?.capture_progress)}</span>
+        </PipelineRow>
+        <PipelineRow label="Debezium 缓存连接器" status={cache?.status} detail={cache?.detail}>
+          <span className="break-text">{captureProgressText(cache?.capture_progress)}</span>
+        </PipelineRow>
+      </Flex>
+    </section>
+  );
+}
+
+// WorkerBlock shows the document worker heartbeat. Only a fresh heartbeat row
+// proves the independent worker process is alive.
+function WorkerBlock({ pipeline }: { pipeline: MonitorPipeline | null }) {
+  return (
+    <section className="monitor-block" aria-label="Worker 心跳">
+      <PipelineRow
+        label="文档 Worker"
+        status={pipeline?.worker?.status}
+        detail={pipeline?.worker?.detail}
+      />
+    </section>
+  );
+}
+
+// DocumentJobsStatusBlock is the pipeline-level document job view, distinct from
+// the state-database queue counts.
+function DocumentJobsStatusBlock({ pipeline }: { pipeline: MonitorPipeline | null }) {
+  return (
+    <section className="monitor-block" aria-label="文档任务状态">
+      <PipelineRow
+        label="文档任务状态"
+        status={pipeline?.document_jobs?.status}
+        detail={pipeline?.document_jobs?.detail}
+      />
+    </section>
+  );
+}
+
+// StageDistributionBlock isolates the by_stage view for the worker tab.
+function StageDistributionBlock({ queues }: { queues: MonitorQueues | null }) {
+  const jobs = queues?.document_jobs;
+  const stages = Object.entries(jobs?.by_stage || {}).map(([stage, count]) => ({ stage, count }));
+  return (
+    <section className="monitor-block" aria-label="阶段分布">
+      {stages.length ? (
+        <Flex wrap gap={6} className="monitor-tags">
+          {stages.map(({ stage, count }) => (
+            <Tag key={stage}>
+              {uploadJobStageLabels[stage] || stage} {count}
+            </Tag>
+          ))}
+        </Flex>
+      ) : (
+        <span className="secondary">{queues ? "暂无处理中任务" : "状态库暂不可用"}</span>
+      )}
+    </section>
+  );
+}
+
+// logFileNote explains why the file source cannot be read, without pretending a
+// missing configuration is an empty log.
+function logFileNote(file: MonitorLogFile) {
+  const reason = file.note || "请先配置日志文件路径";
+  return `日志文件未配置：${reason}`;
+}
+
+// MonitorLogPanel is the single log viewer reused by every component tab and the
+// 全部日志 tab. It defaults to the in-memory source, follows the page's auto
+// refresh switch while its tab is active, and never invents rows when the
+// backend reports the source unavailable.
+type MonitorLogPanelProps = {
+  component?: MonitorTabComponent;
+  autoRefresh: boolean;
+  active: boolean;
+  allFilters?: boolean;
+  title: string;
+  panelLabel: string;
+};
+
+function MonitorLogPanel({
+  component,
+  autoRefresh,
+  active,
+  allFilters = false,
+  title,
+  panelLabel,
+}: MonitorLogPanelProps) {
+  const [source, setSource] = useState<MonitorLogSource>("memory");
+  const [level, setLevel] = useState("");
+  const [componentFilter, setComponentFilter] = useState("");
+  const [keyword, setKeyword] = useState("");
+  const [draftKeyword, setDraftKeyword] = useState("");
+  const [data, setData] = useState<MonitorLogPage>();
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const request = useRef<AbortController | null>(null);
+  const effectiveComponent = allFilters ? componentFilter : (component ?? "");
+  const limit = allFilters ? monitorAllLogLimit : monitorComponentLogLimit;
+
+  const load = useCallback(async () => {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setLoading(true);
+    try {
+      const page = await fetchMonitorLogs(
+        {
+          source,
+          component: effectiveComponent || undefined,
+          level: level || undefined,
+          query: keyword || undefined,
+          limit,
+        },
+        controller.signal,
+      );
+      if (!controller.signal.aborted) {
+        setData(page);
+        setError("");
+      }
+    } catch (cause) {
+      if (!controller.signal.aborted) setError(errorText(cause));
+    } finally {
+      if (!controller.signal.aborted) setLoading(false);
+    }
+  }, [source, effectiveComponent, level, keyword, limit]);
+
+  useEffect(() => {
+    void load();
+    return () => request.current?.abort();
+  }, [load]);
+
+  useEffect(() => {
+    if (!autoRefresh || !active) return;
+    const timer = setInterval(() => void load(), monitorRefreshMs);
+    return () => clearInterval(timer);
+  }, [autoRefresh, active, load]);
+
+  // The component filter offers the frozen vocabulary first and appends any
+  // future component the backend reports, so an upgrade never hides log rows.
+  const componentOptions = useMemo(() => {
+    const counted = new Map((data?.components ?? []).map((item) => [item.id, item]));
+    const options = Object.entries(monitorComponentLabels).map(([id, label]) => {
+      const item = counted.get(id);
+      return { value: id, label: item ? `${item.label || label}（${item.count}）` : label };
+    });
+    for (const item of data?.components ?? []) {
+      if (!(item.id in monitorComponentLabels)) {
+        options.push({ value: item.id, label: `${item.label || item.id}（${item.count}）` });
+      }
+    }
+    return options;
+  }, [data?.components]);
+
+  const entries = data?.entries ?? [];
+  const file = data?.file;
+  const unavailableNote = data && !data.available
+    ? (data.notes.length
+      ? data.notes.join("；")
+      : `${source === "file" ? "文件日志" : "内存日志"}不可用`)
+    : "";
+  const fileNote = source === "file" && file && !file.configured ? logFileNote(file) : "";
+  const pageNotes = data?.notes ?? [];
+
+  return (
+    <Card
+      size="small"
+      title={title}
+      className="monitor-log-card"
+      extra={(
+        <Button
+          size="small"
+          icon={<ReloadOutlined />}
+          loading={loading}
+          onClick={() => void load()}
+        >
+          刷新日志
+        </Button>
+      )}
+    >
+      <section aria-label={panelLabel} className="monitor-log-panel">
+        <Flex wrap gap={8} align="center" className="monitor-log-filters">
+          <Segmented
+            size="small"
+            options={logSourceOptions}
+            value={source}
+            onChange={(value) => setSource(value as MonitorLogSource)}
+          />
+          {allFilters && (
+            <Select
+              size="small"
+              virtual={false}
+              aria-label={`${panelLabel}组件`}
+              value={componentFilter}
+              onChange={(value) => setComponentFilter(value)}
+              options={[{ value: "", label: "全部组件" }, ...componentOptions]}
+              style={{ minWidth: 160 }}
+            />
+          )}
+          <Select
+            size="small"
+            virtual={false}
+            aria-label={`${panelLabel}级别`}
+            value={level}
+            onChange={(value) => setLevel(value)}
+            options={logLevelOptions}
+            style={{ minWidth: 110 }}
+          />
+          <Input
+            size="small"
+            allowClear
+            aria-label={`${panelLabel}关键字`}
+            placeholder="关键字"
+            value={draftKeyword}
+            onChange={(event) => {
+              const value = event.target.value;
+              setDraftKeyword(value);
+              // 清空输入即恢复无关键字，不必再按查询。
+              if (!value) setKeyword("");
+            }}
+            onPressEnter={() => setKeyword(draftKeyword.trim())}
+            style={{ maxWidth: 220, minWidth: 140 }}
+          />
+          <Button size="small" onClick={() => setKeyword(draftKeyword.trim())}>查询</Button>
+        </Flex>
+
+        {unavailableNote && (
+          <Alert
+            className="page-alert"
+            type="warning"
+            showIcon
+            title="日志不可用"
+            description={<span className="preserve-lines">{unavailableNote}</span>}
+          />
+        )}
+        {fileNote && (
+          // 文件未配置通常同时让来源不可用；把配置原因单独再说明一次，
+          // 避免操作员只看到“不可用”却不知道要配置什么。
+          <Alert
+            className="page-alert"
+            type="info"
+            showIcon
+            title="日志文件未配置"
+            description={<span className="preserve-lines">{fileNote}</span>}
+          />
+        )}
+        {error && (
+          <Alert
+            className="page-alert"
+            type="error"
+            showIcon
+            title="日志加载失败"
+            description={<span className="preserve-lines">{error}</span>}
+          />
+        )}
+
+        {allFilters && (
+          <Descriptions
+            size="small"
+            className="monitor-log-file"
+            column={{ xs: 1, sm: 2, lg: 4 }}
+            items={[
+              { key: "path", label: "配置路径", children: file?.configured ? file.path : "未配置" },
+              { key: "size", label: "大小", children: file ? formatBytes(file.size_bytes) : "未知" },
+              { key: "truncated", label: "截断", children: file ? (file.truncated ? "已截断（仅保留最近日志）" : "未截断") : "未知" },
+              { key: "source", label: "当前来源", children: source === "file" ? "文件" : "内存" },
+            ]}
+          />
+        )}
+
+        <Table<MonitorLogEntry>
+          rowKey="seq"
+          size="small"
+          loading={loading}
+          dataSource={entries}
+          locale={{ emptyText: "暂无日志" }}
+          scroll={{ x: 860 }}
+          pagination={{
+            pageSize: allFilters ? 20 : 10,
+            size: "small",
+            hideOnSinglePage: true,
+            showSizeChanger: false,
+          }}
+          expandable={{
+            rowExpandable: (entry) => Object.keys(entry.attrs || {}).length > 0,
+            expandedRowRender: (entry) => (
+              <Descriptions
+                size="small"
+                column={1}
+                className="monitor-log-attrs"
+                items={Object.entries(entry.attrs || {}).map(([key, value]) => ({
+                  key,
+                  label: key,
+                  children: value,
+                }))}
+              />
+            ),
+          }}
+          columns={[
+            {
+              title: "时间",
+              dataIndex: "time",
+              width: 180,
+              render: (value: string) => <span className="break-text">{formatDateTime(value)}</span>,
+            },
+            {
+              title: "级别",
+              dataIndex: "level",
+              width: 90,
+              render: (value: string) => (
+                <Tag color={logLevelColors[value] || "default"}>
+                  {logLevelLabels[value] || value || "未知"}
+                </Tag>
+              ),
+            },
+            {
+              title: "组件",
+              dataIndex: "component",
+              width: 130,
+              render: (value: string, entry) => (
+                <span className="break-text">
+                  {entry.component_label || monitorComponentLabels[value] || value || "未知"}
+                </span>
+              ),
+            },
+            {
+              title: "内容",
+              dataIndex: "message",
+              render: (value: string) => <span className="break-text">{value}</span>,
+            },
+            {
+              // source is the caller code location (repo-relative file:line),
+              // never the memory/file log source; that is the page-level filter.
+              title: "代码位置",
+              dataIndex: "source",
+              width: 220,
+              render: (value: string) => (
+                <span className="break-text">{value || "—"}</span>
+              ),
+            },
+          ]}
+        />
+
+        {pageNotes.length > 0 && !unavailableNote && (
+          <ul className="secondary monitor-error-list monitor-note">
+            {pageNotes.map((note, index) => <li key={index}>{note}</li>)}
+          </ul>
+        )}
+      </section>
+    </Card>
+  );
+}
+
+// ComponentTab maps one component tab to its blocks plus that component's log
+// panel. Every existing monitor block is preserved here or on the overview tab.
+function ComponentTab({ tab, overview, autoRefresh, active }: {
+  tab: MonitorTabComponent;
+  overview: MonitorOverview;
+  autoRefresh: boolean;
+  active: boolean;
+}) {
+  const label = monitorComponentLabels[tab];
+  const logPanel = (
+    <MonitorLogPanel
+      component={tab}
+      autoRefresh={autoRefresh}
+      active={active}
+      title={`${label}日志`}
+      panelLabel={`${label}日志面板`}
+    />
+  );
+
+  switch (tab) {
+    case "mysql":
+      return (
+        <Flex vertical gap={16}>
+          <DependencyCard overview={overview} names={["mysql"]} />
+          <Card size="small" title="文档任务队列">
+            <DocumentJobsBlock queues={overview.queues} />
+          </Card>
+          <Card size="small" title="上传操作">
+            <UploadsBlock uploads={overview.queues?.uploads} />
+          </Card>
+          <Card size="small" title="库与活动">
+            <LibraryActivityBlock library={overview.library} activity={overview.activity} />
+          </Card>
+          {logPanel}
+        </Flex>
+      );
+    case "redis":
+      return (
+        <Flex vertical gap={16}>
+          <DependencyCard overview={overview} names={["redis"]} />
+          <Card size="small" title="缓存水位">
+            <CacheBlock pipeline={overview.pipeline} />
+          </Card>
+          {logPanel}
+        </Flex>
+      );
+    case "qdrant":
+      return (
+        <Flex vertical gap={16}>
+          <DependencyCard overview={overview} names={["qdrant"]} />
+          <Card size="small" title="Qdrant 集合">
+            <section className="monitor-block" aria-label="Qdrant 集合">
+              <Descriptions
+                size="small"
+                column={1}
+                items={[
+                  { key: "collection", label: "集合名", children: overview.service?.collection || "未知" },
+                ]}
+              />
+              <p className="secondary monitor-note">
+                依赖行中的“向量点”为该集合当前存储的点数；集合名来自服务配置。
+              </p>
+            </section>
+          </Card>
+          {logPanel}
+        </Flex>
+      );
+    case "kafka":
+      return (
+        <Flex vertical gap={16}>
+          <DependencyCard overview={overview} names={["kafka"]} />
+          <Card size="small" title="Kafka 消费进度">
+            <KafkaGroupsBlock pipeline={overview.pipeline} />
+          </Card>
+          <Card size="small" title="文档任务投递状态">
+            <DocumentJobsStatusBlock pipeline={overview.pipeline} />
+          </Card>
+          {logPanel}
+        </Flex>
+      );
+    case "pdf":
+      return (
+        <Flex vertical gap={16}>
+          <DependencyCard overview={overview} names={["pdf-service"]} />
+          <Card size="small" title="PDF 引擎">
+            <section className="monitor-block" aria-label="PDF 引擎">
+              <Descriptions
+                size="small"
+                column={1}
+                items={[
+                  { key: "engine", label: "引擎", children: overview.service?.pdf_engine || "未知" },
+                ]}
+              />
+              <p className="secondary monitor-note">
+                PDF 解析服务是可选独立微服务；依赖行的延迟与详情来自其健康探针。版面/OCR/表格/公式/图片描述由服务端配置的远端视觉模型提供。
+              </p>
+            </section>
+          </Card>
+          {logPanel}
+        </Flex>
+      );
+    case "worker":
+      return (
+        <Flex vertical gap={16}>
+          <Card size="small" title="Worker 心跳">
+            <WorkerBlock pipeline={overview.pipeline} />
+          </Card>
+          <Card size="small" title="文档任务状态">
+            <DocumentJobsStatusBlock pipeline={overview.pipeline} />
+          </Card>
+          <Card size="small" title="阶段分布">
+            <StageDistributionBlock queues={overview.queues} />
+          </Card>
+          {logPanel}
+        </Flex>
+      );
+    case "debezium":
+      return (
+        <Flex vertical gap={16}>
+          <Card size="small" title="Debezium 连接器">
+            <DebeziumBlock pipeline={overview.pipeline} />
+          </Card>
+          <Card size="small" title="文档任务投递状态">
+            <DocumentJobsStatusBlock pipeline={overview.pipeline} />
+          </Card>
+          {logPanel}
+        </Flex>
+      );
+    default:
+      return null;
+  }
+}
+
+// monitorTabs builds the top bar: overview, the seven component tabs in the
+// frozen order, then the all-logs tab.
+function monitorTabs(overview: MonitorOverview, autoRefresh: boolean, activeTab: string) {
+  return [
+    {
+      key: "overview",
+      label: "概览",
+      children: <OverviewTab overview={overview} />,
+    },
+    ...monitorTabComponents.map((tab) => ({
+      key: tab,
+      label: monitorComponentLabels[tab],
+      children: (
+        <ComponentTab
+          tab={tab}
+          overview={overview}
+          autoRefresh={autoRefresh}
+          active={activeTab === tab}
+        />
+      ),
+    })),
+    {
+      key: "logs",
+      label: "全部日志",
+      children: (
+        <MonitorLogPanel
+          allFilters
+          autoRefresh={autoRefresh}
+          active={activeTab === "logs"}
+          title="全部日志"
+          panelLabel="全部日志面板"
+        />
+      ),
+    },
+  ];
+}
+
+// MonitorPage is the read-only system overview for administrators. The top bar
+// splits the snapshot by component, the overview tab leads with the task
+// metrics and host resources, and every tab carries its own log panel. The
+// quick facts (updated at, auto refresh) stay visible above the tabs.
 export function MonitorPage() {
   const [overview, setOverview] = useState<MonitorOverview>();
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [activeTab, setActiveTab] = useState("overview");
   const request = useRef<AbortController | null>(null);
 
   const load = useCallback(async () => {
@@ -520,8 +1293,6 @@ export function MonitorPage() {
   }, [autoRefresh, load]);
 
   const status = overview ? overallStatusOf(overview) : undefined;
-  const errors = overview?.errors ?? [];
-  const degradedNotes = overview ? degradedDependencyNotes(overview) : [];
 
   return (
     <section aria-label="系统监控页面">
@@ -545,7 +1316,12 @@ export function MonitorPage() {
               />
             </label>
           </Tooltip>
-          <Button icon={<ReloadOutlined />} loading={refreshing} onClick={() => void load()}>
+          <Button
+            icon={<ReloadOutlined />}
+            aria-label="刷新监控数据"
+            loading={refreshing}
+            onClick={() => void load()}
+          >
             刷新
           </Button>
         </div>
@@ -560,36 +1336,15 @@ export function MonitorPage() {
           action={<Button size="small" onClick={() => void load()}>重试</Button>}
         />
       )}
-      {overview && status === "error" && (
-        <Alert
-          className="page-alert"
-          type="error"
-          showIcon
-          title="服务状态异常"
-          description={errors.length ? (
-            <ul className="monitor-error-list">
-              {errors.map((message, index) => <li key={index}>{message}</li>)}
-            </ul>
-          ) : "后端未返回具体错误，请查看下方依赖状态。"}
-        />
-      )}
-      {overview && status === "degraded" && (
-        <Alert
-          className="page-alert"
-          type="warning"
-          showIcon
-          title="服务存在降级"
-          description={degradedNotes.length ? (
-            <ul className="monitor-error-list">
-              {degradedNotes.map((note, index) => <li key={index}>{note}</li>)}
-            </ul>
-          ) : "后端未返回具体降级详情，请查看下方依赖状态。"}
-        />
-      )}
       {loading && !overview ? (
         <Spin description="正在读取监控快照…" />
       ) : overview ? (
-        <MonitorSnapshot overview={overview} />
+        <Tabs
+          className="monitor-tabs"
+          activeKey={activeTab}
+          onChange={setActiveTab}
+          items={monitorTabs(overview, autoRefresh, activeTab)}
+        />
       ) : null}
     </section>
   );

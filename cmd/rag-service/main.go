@@ -29,6 +29,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
 	"github.com/Guan0923/xinghe_rag/internal/searchrefs"
 	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/sysinfo"
 	"github.com/Guan0923/xinghe_rag/internal/version"
 	"github.com/Guan0923/xinghe_rag/internal/wire"
 )
@@ -48,6 +49,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = logging.CloseLogFile() }()
 	if _, err := config.LoadStartupConfig(); err != nil {
 		return err
 	}
@@ -152,6 +154,17 @@ func run() error {
 		}
 		return &monitor.WorkerHeartbeat{UpdatedAt: snapshot.UpdatedAt, Instances: snapshot.Instances}, nil
 	}
+	// Host resources are a best-effort extra card on the monitoring page: a
+	// failed sampler only leaves "system" null, it never blocks the service.
+	// The in-memory log ring and the optional RAG_LOG_FILE path are installed by
+	// logging.Setup above, so the Console log view reads the same records.
+	var systemSampler monitor.SystemSampler
+	sampler, samplerErr := sysinfo.New()
+	if samplerErr != nil {
+		logger.Warn("系统资源采集初始化失败，Console 监控页的 system 将为 null", "error", samplerErr)
+	} else {
+		systemSampler = sampler
+	}
 	monitorService := monitor.New(monitor.Options{
 		Stats:                 stores,
 		MySQL:                 stores,
@@ -176,6 +189,9 @@ func run() error {
 		PDFEngine:              ragConfig.PDFEngine,
 		PDFServiceURL:          ragConfig.PDFServiceURL,
 		StartedAt:              time.Now(),
+		System:                 systemSampler,
+		Logs:                   logging.DefaultBuffer(),
+		LogFilePath:            logging.LogFilePath(),
 	})
 	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{

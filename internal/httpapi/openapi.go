@@ -94,6 +94,7 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "GET", Path: "/v1/admin/published-versions", Summary: "List published versions", Tag: "admin", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/upload-leases", Summary: "List upload leases", Tag: "admin", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/monitor/overview", Summary: "Read-only monitoring snapshot", Tag: "admin", Response: "200"},
+	{Method: "GET", Path: "/v1/admin/monitor/logs", Summary: "Read-only monitor log page (memory ring or RAG_LOG_FILE)", Tag: "admin", Query: []string{"source", "component", "level", "query", "limit", "offset"}, Response: "200"},
 	{Method: "GET", Path: "/v1/users", Summary: "List accounts available for an invitation", Tag: "sharing", Response: "200"},
 	{Method: "POST", Path: "/v1/knowledge-bases", Summary: "Create a knowledge base owned by the current account", Tag: "knowledge-bases", Request: "SelfCreateKnowledgeBaseBody", Response: "201"},
 	{Method: "GET", Path: "/v1/knowledge-bases/{namespace}/access", Summary: "Read the current account's knowledge-base access", Tag: "sharing", Response: "200"},

@@ -1274,6 +1274,62 @@ export type MonitorService = {
   delivery: string;
   pdf_engine: string;
 };
+// MonitorSystem is the host resource snapshot served as overview.system. The
+// collector samples CPU/network rates between two polls, so the first response
+// after startup carries null rates; load averages are null on Windows, which
+// does not report them. A null system section means the collector itself is
+// unavailable, never "all zero".
+export type MonitorSystemCpu = {
+  usage_percent: number | null;
+  cores: number;
+  model: string;
+  load1: number | null;
+  load5: number | null;
+  load15: number | null;
+};
+export type MonitorSystemMemory = {
+  total_bytes: number;
+  used_bytes: number;
+  available_bytes: number;
+  used_percent: number;
+  swap_total_bytes: number;
+  swap_used_bytes: number;
+  swap_used_percent: number;
+};
+// MonitorSystemInterface is one NIC sample; per-interface rates are null until
+// the collector has two samples for that interface.
+export type MonitorSystemInterface = {
+  name: string;
+  rx_bytes_per_second: number | null;
+  tx_bytes_per_second: number | null;
+  rx_bytes_total: number;
+  tx_bytes_total: number;
+};
+export type MonitorSystemNetwork = {
+  rx_bytes_per_second: number | null;
+  tx_bytes_per_second: number | null;
+  rx_bytes_total: number;
+  tx_bytes_total: number;
+  interfaces: MonitorSystemInterface[];
+};
+export type MonitorSystemProcess = {
+  pid: number;
+  rss_bytes: number;
+  vms_bytes: number;
+  goroutines: number;
+  heap_alloc_bytes: number;
+};
+export type MonitorSystem = {
+  collected_at: string;
+  window_seconds: number;
+  // notes carries collector diagnostics (for example an unreadable swap file);
+  // the panel shows them verbatim instead of guessing.
+  notes: string[];
+  cpu: MonitorSystemCpu;
+  memory: MonitorSystemMemory;
+  network: MonitorSystemNetwork;
+  process: MonitorSystemProcess;
+};
 export type MonitorOverview = {
   generated_at: string;
   // status ranks the whole snapshot. Older backends omit it; the page then
@@ -1288,6 +1344,9 @@ export type MonitorOverview = {
   pipeline: MonitorPipeline | null;
   library: MonitorLibrary | null;
   activity: MonitorActivity | null;
+  // system is optional (older backends omit it) and null when the host
+  // collector is unavailable; the page renders 系统资源：未知（采集不可用）.
+  system?: MonitorSystem | null;
   errors: string[];
 };
 
@@ -1328,6 +1387,127 @@ export async function fetchMonitorOverview(signal?: AbortSignal): Promise<Monito
     signal,
     cache: "no-store",
   });
+}
+
+// monitorComponentLabels is the frozen component vocabulary shared by the
+// overview snapshot and GET /v1/admin/monitor/logs. Labels are UI copy, not
+// server data, so an unknown future component still stays readable.
+export const monitorComponentLabels: Record<string, string> = {
+  mysql: "MySQL",
+  redis: "Redis",
+  qdrant: "Qdrant",
+  kafka: "Kafka",
+  pdf: "PDF 解析服务",
+  worker: "文档 Worker",
+  debezium: "Debezium",
+  model: "模型调用",
+  search: "检索",
+  http: "HTTP API",
+  monitor: "系统监控",
+  service: "服务",
+  other: "其他",
+};
+// monitorTabComponents drives the component tabs of the monitor page; the
+// 概览 and 全部日志 tabs are page chrome, not log components.
+export const monitorTabComponents = [
+  "mysql",
+  "redis",
+  "qdrant",
+  "kafka",
+  "pdf",
+  "worker",
+  "debezium",
+] as const;
+export type MonitorTabComponent = (typeof monitorTabComponents)[number];
+
+// MonitorLogSource selects the in-memory ring buffer or the configured file.
+export type MonitorLogSource = "memory" | "file";
+// MonitorLogQuery is the read-only filter accepted by the log endpoint. Empty
+// values are omitted by fetchMonitorLogs so the server defaults apply.
+export type MonitorLogQuery = {
+  source?: MonitorLogSource;
+  component?: string;
+  level?: string;
+  query?: string;
+  limit?: number;
+  offset?: number;
+};
+export type MonitorLogEntry = {
+  seq: number;
+  time: string;
+  level: string;
+  component: string;
+  component_label: string;
+  message: string;
+  // attrs are the structured fields attached to the record (job id, route,
+  // duration); they are values only, never query text or credentials.
+  attrs: Record<string, string>;
+  source: string;
+};
+export type MonitorLogComponent = {
+  id: string;
+  label: string;
+  count: number;
+};
+export type MonitorLogFile = {
+  configured: boolean;
+  path: string;
+  size_bytes: number;
+  truncated: boolean;
+  note: string;
+};
+export type MonitorLogPage = {
+  generated_at: string;
+  source: MonitorLogSource;
+  // available is false when the selected source has no usable buffer/file;
+  // notes then explains why in Chinese.
+  available: boolean;
+  entries: MonitorLogEntry[];
+  total: number;
+  has_more: boolean;
+  components: MonitorLogComponent[];
+  file: MonitorLogFile;
+  notes: string[];
+};
+
+// fetchMonitorLogs reads the bounded, read-only log page. Only non-empty
+// filters and positive bounds are sent, so the server defaults (memory source,
+// 100 rows, first page) stay authoritative. Log content is never cached.
+export async function fetchMonitorLogs(
+  query: MonitorLogQuery = {},
+  signal?: AbortSignal,
+): Promise<MonitorLogPage> {
+  const params = new URLSearchParams();
+  if (query.source) params.set("source", query.source);
+  if (query.component) params.set("component", query.component);
+  if (query.level) params.set("level", query.level);
+  if (query.query) params.set("query", query.query);
+  if (typeof query.limit === "number" && query.limit > 0) {
+    params.set("limit", String(query.limit));
+  }
+  if (typeof query.offset === "number" && query.offset > 0) {
+    params.set("offset", String(query.offset));
+  }
+  const search = params.toString();
+  return await api<MonitorLogPage>(
+    `/v1/admin/monitor/logs${search ? `?${search}` : ""}`,
+    undefined,
+    { signal, cache: "no-store" },
+  );
+}
+
+// formatPercent renders a 0-100 percentage with one decimal; a missing sample
+// stays 未知 instead of 0%.
+export function formatPercent(value?: number | null) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "未知";
+  return `${value.toFixed(1)}%`;
+}
+
+// formatRate renders a byte-per-second rate through formatBytes; null means the
+// rate is not sampled yet (first poll), so it stays 未知.
+export function formatRate(value?: number | null) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "未知";
+  return `${formatBytes(value)}/s`;
 }
 
 // --- Knowledge-base permissions and invitations -----------------------------
@@ -1458,7 +1638,8 @@ export function formatScore(value: unknown) {
 export function formatBytes(value: number) {
   if (value < 1024) return `${value} B`;
   if (value < 1048576) return `${(value / 1024).toFixed(1)} KB`;
-  return `${(value / 1048576).toFixed(1)} MB`;
+  if (value < 1073741824) return `${(value / 1048576).toFixed(1)} MB`;
+  return `${(value / 1073741824).toFixed(1)} GB`;
 }
 export function chunkLabel(
   config: Chunking | undefined,

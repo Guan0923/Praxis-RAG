@@ -20,7 +20,7 @@
 | 文档投递/监控 | `RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS`（默认 5）、`RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS`（Worker 心跳间隔，默认 15；监控页 60 秒无心跳判降级）、`RAG_DEBEZIUM_HEALTH_URL`（任务连接器只读健康探测）、`RAG_DEBEZIUM_CACHE_HEALTH_URL`（缓存连接器只读健康探测）、`RAG_APP_DEBEZIUM_HEALTH_URL`/`RAG_APP_DEBEZIUM_CACHE_HEALTH_URL`（compose app profile 覆盖用）、`RAG_DEBEZIUM_PORT`/`RAG_DEBEZIUM_CACHE_PORT`（宿主机健康端口，默认 8083/8084）；采集位点应用侧读不到，监控显示「未知」 |
 | 缓存/CDC | `RAG_CACHE_TOPIC`/`RAG_CACHE_GROUP`、`RAG_CACHE_DLQ_TOPIC`/`RAG_CACHE_DLQ_GROUP`；`cache_revisions` 的 revision/refreshed_revision/attempts/last_error/updated_at；任务表 `schedule_version`；`rag-cdc-cutover` 切换工具 |
 | PDF/Word | `RAG_PDF_ENGINE`（`vision`/`go`；旧值 `docling` 是 `vision` 的兼容别名）、`RAG_PDF_SERVICE_URL`、`RAG_PDF_SERVICE_TIMEOUT`（900）、`RAG_WORD_CONVERTER_PATH`、`RAG_WORD_CONVERT_TIMEOUT`；`RAG_PDF_MODELS_PATH` 已废弃（本地无模型） |
-| 日志 | `RAG_LOG_LEVEL`（`info`）、`RAG_LOG_FORMAT`（`text`/`json`）、`RAG_DEBUG_TRACE`（兼容旧调试开关；未设级别时为 `debug`）、`RAG_PDF_SERVICE_LOG_LEVEL`/`RAG_PDF_SERVICE_LOG_FORMAT` |
+| 日志 | `RAG_LOG_LEVEL`（`info`）、`RAG_LOG_FORMAT`（`text`/`json`）、`RAG_DEBUG_TRACE`（兼容旧调试开关；未设级别时为 `debug`）、`RAG_LOG_FILE`（可选，所有 Go 进程追加同一个 JSON Lines 文件供监控页文件日志源读取；打开失败 fail fast）、`RAG_LOG_BUFFER_SIZE`（`1000`，范围 `100..20000`，进程内环形缓冲）、`RAG_PDF_SERVICE_LOG_LEVEL`/`RAG_PDF_SERVICE_LOG_FORMAT` |
 | VLM | `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`、`RAG_VLM_TIMEOUT`、`RAG_VLM_CONCURRENCY`（Console 知识库配置优先，环境变量是回退） |
 | 默认知识库模板 | `RAG_DEFAULT_KB_TEMPLATE`（默认 `default`，VIP/普通用户建库时克隆其模型配置） |
 
@@ -29,7 +29,8 @@
 - `RAG_BACKEND` 在配置层默认是 `mock`，但 `rag-service` 启动时**只接受 `qdrant`**（`mock` 仅供 `rag-mcp-debug`）。
 - `QDRANT_PATH`（Qdrant 本地文件模式）会被拒绝，只用 `QDRANT_URL`。
 - 状态库只有 MySQL；未配置 `RAG_STATE_URL` / `RAG_MYSQL_*` 时服务直接启动失败，没有本地文件回退。
-- 日志统一走 `internal/logging`（`slog` + 上下文关联 + 脱敏）；入口/worker 安装默认 logger，新代码不要再用 `log.Printf`，也不要只记录 `%T` 错误类型。HTTP 入口统一接受/回显 `X-Request-ID`，上传与后台任务日志带 `operation_id`/`artifact_id`/`batch_id`。
+- 日志统一走 `internal/logging`（`slog` + 上下文关联 + 脱敏）；入口/worker 安装默认 logger，新代码不要再用 `log.Printf`，也不要只记录 `%T` 错误类型。HTTP 入口统一接受/回显 `X-Request-ID`，上传与后台任务日志带 `operation_id`/`artifact_id`/`batch_id`。`logging.Setup()` 同时装配 Console 监控页的日志来源：进程内环形缓冲（`logging.DefaultBuffer()`，默认 1000 条，`RAG_LOG_BUFFER_SIZE` 可调）与可选 `RAG_LOG_FILE` JSON Lines 文件（`logging.LogFilePath()`）；多进程共写同一文件时依赖 `O_APPEND`，读取端只读最近 512 KiB。日志组件归类优先取显式 `component` 属性，否则按调用方源码包路径映射（见 `internal/logging/logs.go` 的组件表）。
+- 主机资源采集在 `internal/sysinfo`（gopsutil/v4 差值采样）：首次采样只建立基线，CPU 使用率与网络速率为 `null`；Windows 的 load 为 `null` 并在 `notes` 说明。`internal/monitor` 的 `Options.System` 是可注入的窄接口（`Sample() (*sysinfo.Snapshot, error)`），采样失败只把 `system` 置为 `null` 并追加 `errors`，不参与总体健康判定。
 
 ## 2. 构建
 
