@@ -50,8 +50,11 @@ The saved-model vocabulary also includes `jev` (TypeSafe JEV / System One
 decision-model endpoint). A JEV profile stores name, base URL, model and the
 encrypted key like a VLM profile, is never probed, has no provider `/models`
 listing, and is not offered when creating or editing a knowledge base;
-knowledge bases still copy only embedding/reranker/vlm/ocr connections. It is a
-Console-only configuration today, kept for later decision-model use.
+knowledge bases still copy only embedding/reranker/vlm/ocr connections.
+The `retrieval: sag2` search mode resolves the most recently updated JEV
+profile on every query and calls the hosted decision endpoint with the
+candidate passages, so the query text and candidate chunks leave the service
+toward the configured JEV provider.
 
 A knowledge base still stores its own copy. Creating or editing a knowledge base
 copies the selected profile's `base_url`, decrypted key and `model` into the

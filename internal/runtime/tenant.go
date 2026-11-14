@@ -114,11 +114,19 @@ func (e *SearchEngine) buildTenant(namespace string, settings map[string]any) (*
 		blobs:     e.stores.Blobs,
 		namespace: namespace,
 	})
+	// sag2 materializes the lexical corpus in memory and resolves the JEV
+	// decision connection per search from the admin-managed model profiles.
+	sag2 := retrieval.NewSag2Retriever(
+		e.sag2CorpusLoader(namespace, store),
+		e.sag2ScorerResolver(),
+		retrieval.Sag2Options{},
+	)
 	orchestrator := retrieval.NewOrchestrator(
 		map[contracts.RetrievalMode]retrieval.Retriever{
 			contracts.RetrievalBM25:      retrieval.NewBm25Retriever(encoder, store),
 			contracts.RetrievalEmbedding: retrieval.NewDenseRetriever(embedder, store),
 			contracts.RetrievalHybrid:    retrieval.NewHybridRetriever(embedder, encoder, store),
+			contracts.RetrievalSAG2:       sag2,
 		},
 		map[contracts.RerankMode]retrieval.Reranker{
 			contracts.RerankCrossEncoder: reranker,

@@ -1942,3 +1942,26 @@ npm run build                                                          # exit 0�
 - 未在真实浏览器中打开 Console 观察进度条动画与真实 SSE 连接（仅 jsdom 单测 + `typecheck` + 生产构建覆盖）。
 - 未用真实大文件（如 8 MiB PDF）在真实 `rag-service` + MySQL/Kafka 环境实测上传；SSE 端到端仅在 httptest + fake runtime 下验证，未接真实文档 worker 观察解析阶段。
 - 多实例 `rag-service` 下的进度流失效属于设计边界（进程内 hub），未做负载均衡实测；需要会话粘滞或单实例部署。
+
+## SAG2 合并到 main 的适配 — 2026-11-14
+
+`sag2-lexical-retrieval`（`3e39327f`）在 `main`@`3447f6b7`（已含内容去重/批量清理
+合并与逐文件上传进度 SSE）上重放，适配搜索同步化之后的契约与运行时：
+
+- `SearchToolSchema` 在搜索同步化中改为无参函数且下线 `queued` 搜索；SAG2 分支的
+  `TestQueuedSearchRequestValidation` 已删除，SAG2 契约测试改用 `SearchToolSchema()`。
+- `README.md` 模型配置段落取主干最新措辞（VLM 为唯一远端视觉模型、OCR 本地引擎
+  已移除），并把「JEV 仅保存配置」改为 `sag2` 每次查询读取最近更新的 JEV 配置。
+- `internal/runtime` 的 `errorTypeName` 辅助函数随主干重构被删除，SAG2 的 JEV
+  解析器需要它做安全错误分类，已在 `internal/runtime/sag2.go` 恢复该函数。
+- 其余 SAG2 文件（`internal/retrieval/lexindex.go`、`sag2.go`、`internal/modelapi/jev.go`、
+  `internal/qdrant/corpus.go`、`internal/runtime/sag2.go`、运行时装配与文档）自动合并。
+
+验证（2026-11-14，Windows 11，Go 1.27，MySQL `praxis_gotest`）：
+
+```
+go build ./...                                    # exit 0
+go vet ./internal/contracts ./internal/retrieval ./internal/modelapi ./internal/qdrant ./internal/runtime ./internal/httpapi ./internal/mcp   # exit 0
+go test -p 1 -count=1 ./internal/contracts ./internal/retrieval ./internal/modelapi ./internal/qdrant ./internal/runtime ./internal/httpapi ./internal/mcp   # ok
+cd frontend && npm run typecheck                  # exit 0
+```

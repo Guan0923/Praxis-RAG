@@ -140,7 +140,7 @@ func TestSearchEndpoint(t *testing.T) {
 	if invalidRetrieval.Code != http.StatusBadRequest {
 		t.Fatalf("retrieval status = %d body = %s", invalidRetrieval.Code, invalidRetrieval.Body.String())
 	}
-	if detail := decodeBody(t, invalidRetrieval)["detail"]; detail != "retrieval must be bm25, embedding, or hybrid" {
+	if detail := decodeBody(t, invalidRetrieval)["detail"]; detail != "retrieval must be bm25, embedding, hybrid, or sag2" {
 		t.Fatalf("detail = %v", detail)
 	}
 

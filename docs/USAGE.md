@@ -792,6 +792,24 @@ curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>/content" -H $headers
 
 搜索**同步执行**：一次请求完成检索 + 重排并直接返回 `retrieval`、`rerank`、`evidence_status`、`results`、`debug`、`snapshot_context`、`artifacts`；资产命中带 `asset`（图片 base64 或表格结构）。响应**不含** `result_id`/`created_at`/`expires_at`/`snapshot_available`/`snapshot_error`，`GET /v1/search-results/{result_id}` 已删除。分页/偏移参数越界返回 400；超过 `RAG_SEARCH_TIMEOUT_SECONDS` 返回搜索错误，重试等于重新检索。
 
+#### SAG2 词法多跳检索（`retrieval: sag2`）
+
+`bm25` / `embedding` / `hybrid` 之外可以选第四种模式 `sag2`：BM25 初筛 → 云端 JEV（TypeSafe System One）判断每个候选是否为“完整证据链上的必要证据” → 从高分段落选词扩展再召回 → 最多 3 轮 → DPP 终排。它面向多跳/关联型问题（A 在某段、B 要靠 A 才能找到），不是图数据库方案。
+
+使用要求与成本：
+
+- 管理员先在 Console「模型配置」添加 `kind=jev` 条目（服务地址、模型、API Key；服务地址末尾不带 `/decisions` 或 `/systemone` 时会自动补 `/systemone`）。存在多条 jev 配置时取**最近更新**的一条。
+- 必须搭配 `"rerank":"none"`；`sag2 + cross_encoder` 会返回校验错误（JEV 证据分即最终排序，重排会覆盖它并双倍计费）。
+- 建议 `candidate_k` 给 50..100（即每轮召回预算），`top_k` ≤10；单次查询约 3 轮 JEV 请求，延迟与 token 费用高于其他模式，超长 chunk 会被预算跳过（得 0 分）。
+- 语料索引按知识库在进程内缓存，按可见文档版本指纹失效：文档发布/覆盖/删除后的下一次 sag2 查询会自动重建；大库首次查询会有明显建索引耗时。
+- JEV 请求失败按 429/5xx/超时做最多 4 次尝试（指数退避），仍失败则本次检索返回操作错误，不影响其他模式。
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8011/v1/search `
+  -H $headers `
+  -d '{"query":"E03 怎么处理？","retrieval":"sag2","rerank":"none","candidate_k":100,"top_k":5,"filters":{}}'
+```
+
 ### 上传状态、发布版本与租约
 
 ```powershell

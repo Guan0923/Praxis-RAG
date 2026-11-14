@@ -53,7 +53,8 @@
 
 ## 5. 检索与重排
 
-- 检索模式：`bm25`（关键词）、`embedding`（语义）、`hybrid`（默认，Qdrant 服务端 RRF 融合 dense + sparse）。
+- 检索模式：`bm25`（关键词）、`embedding`（语义）、`hybrid`（默认，Qdrant 服务端 RRF 融合 dense + sparse）、`sag2`（词法多跳：BM25 初筛 → JEV 必要证据判定 → 词项扩展再召回 → DPP 终排）。
+- `sag2` 约束：必须搭配 `rerank: none`（JEV 证据分即最终排序，校验层直接拒绝 `cross_encoder` 组合）；需要管理员在「模型配置」保存 `kind=jev` 条目，否则检索返回可解释的操作错误；语料在进程内按可见版本指纹缓存（发布/覆盖/删除自动失效），首次查询或失效后重建索引需要全量读取活跃 chunk；`candidate_k` 同时是每轮召回预算（SAG2 参考实现 B=100，建议给 50..100），轮数固定 3（1 轮初筛 + 2 轮扩展），扩展词 ≤20、种子 ≤10、终排前 10 名做 DPP；每次查询约 3 轮 JEV 决策调用，延迟与费用显著高于其他模式。
 - 重排模式：`none`、`cross_encoder`（默认）；Cross-Encoder 通过 HTTP 调用：进入重排的候选上限 30、批大小 4、重排文本上限 4000 字符、模型 token 上限 512。
 - 参数：`query` ≤2000 字符；`candidate_k` 1..100（默认 10）；`top_k` 1..10（默认 5）且 ≤`candidate_k`；`filters` 仅允许 `document_id`、`source`、`title`（闭集白名单）。
 - 名词解释：`dense` 命名向量（Cosine，1024 维）+ `sparse` 命名向量（BM25，确定性哈希词表，IDF 由 Qdrant 提供）；hybrid 先各自 prefetch，再服务端 RRF。
