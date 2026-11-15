@@ -352,3 +352,195 @@ func splitPropertyList(value string) []string {
 	}
 	return items
 }
+
+// readConnectorTemplate parses one Kafka Connect connector template. Placeholder
+// values stay literal; the tests only inspect lists and fixed settings.
+func readConnectorTemplate(t *testing.T, name string) map[string]string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "kafka-connect", "connectors", name))
+	if err != nil {
+		t.Fatalf("read connector template %s: %v", name, err)
+	}
+	var document struct {
+		Name   string            `json:"name"`
+		Config map[string]string `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatalf("parse connector template %s: %v", name, err)
+	}
+	return document.Config
+}
+
+// TestCacheChangeWhitelistMatchesConnectorTemplate pins the cache connector's
+// Kafka Connect template to the Go whitelist, exactly like the old Debezium
+// Server properties test did.
+func TestCacheChangeWhitelistMatchesConnectorTemplate(t *testing.T) {
+	config := readConnectorTemplate(t, "cache-cdc.json")
+	tables := splitPropertyList(config["table.include.list"])
+	connectorTables := make([]string, 0, len(tables))
+	for _, qualified := range tables {
+		connectorTables = append(connectorTables, qualified[strings.LastIndex(qualified, ".")+1:])
+	}
+	sort.Strings(connectorTables)
+	codeTables := make([]string, 0, len(cacheChangeLocators))
+	for table := range cacheChangeLocators {
+		codeTables = append(codeTables, table)
+	}
+	sort.Strings(codeTables)
+	if !reflect.DeepEqual(connectorTables, codeTables) {
+		t.Fatalf("cache tables: connector=%v code=%v", connectorTables, codeTables)
+	}
+
+	tableColumns := map[string]map[string]bool{}
+	for _, qualified := range splitPropertyList(config["column.include.list"]) {
+		segments := strings.Split(qualified, ".")
+		if len(segments) < 3 {
+			t.Fatalf("unexpected column entry %q", qualified)
+		}
+		table := segments[len(segments)-2]
+		if tableColumns[table] == nil {
+			tableColumns[table] = map[string]bool{}
+		}
+		tableColumns[table][segments[len(segments)-1]] = true
+	}
+	for table, locators := range cacheChangeLocators {
+		captured := tableColumns[table]
+		if captured == nil {
+			t.Fatalf("table %s has no captured columns", table)
+		}
+		codeColumns := map[string]bool{}
+		for _, locator := range locators {
+			codeColumns[locator.column] = true
+		}
+		if !reflect.DeepEqual(captured, codeColumns) {
+			t.Fatalf("table %s columns: connector=%v code=%v", table, captured, codeColumns)
+		}
+	}
+	if config["skip.messages.without.change"] != "false" {
+		t.Fatalf("cache skip.messages.without.change = %q, want false", config["skip.messages.without.change"])
+	}
+	if config["skipped.operations"] != "" {
+		t.Fatalf("cache must not skip delete operations: skipped.operations = %q", config["skipped.operations"])
+	}
+	if config["tombstones.on.delete"] != "false" {
+		t.Fatalf("cache tombstones.on.delete = %q, want false", config["tombstones.on.delete"])
+	}
+}
+
+// TestDocumentConnectorTemplateCaptureOnlyLocators pins the document connector
+// template: only locator columns are captured, only schedule_version UPDATEs are
+// published, deletes are skipped and the Kafka Connect JSON converter keeps the
+// envelope flat for the existing Go decoder.
+func TestDocumentConnectorTemplateCaptureOnlyLocators(t *testing.T) {
+	config := readConnectorTemplate(t, "document-cdc.json")
+	if config["skip.messages.without.change"] != "true" {
+		t.Fatalf("skip.messages.without.change = %q", config["skip.messages.without.change"])
+	}
+	if config["skipped.operations"] != "d" {
+		t.Fatalf("skipped.operations = %q", config["skipped.operations"])
+	}
+	expected := map[string]map[string]bool{
+		"document_jobs": {"artifact_id": true, "namespace": true, "schedule_version": true},
+	}
+	captured := map[string]map[string]bool{}
+	for _, qualified := range splitPropertyList(config["column.include.list"]) {
+		segments := strings.Split(qualified, ".")
+		if len(segments) < 3 {
+			t.Fatalf("unexpected column entry %q", qualified)
+		}
+		table := segments[len(segments)-2]
+		if captured[table] == nil {
+			captured[table] = map[string]bool{}
+		}
+		captured[table][segments[len(segments)-1]] = true
+	}
+	if !reflect.DeepEqual(captured, expected) {
+		t.Fatalf("document connector columns = %v, want %v", captured, expected)
+	}
+	if config["transforms.RouteDocumentJobs.type"] != "io.debezium.transforms.ByLogicalTableRouter" ||
+		config["transforms.RouteDocumentJobs.key.enforce.uniqueness"] != "false" ||
+		!strings.Contains(config["transforms.RouteDocumentJobs.topic.replacement"], "RAG_DOCUMENT_TOPIC") {
+		t.Fatalf("document routing = %v", config)
+	}
+}
+
+// TestConnectorTemplatesUseKafkaConnectJSONAndSeparateHistory pins the settings
+// shared by both templates: flat JSON converter (the Go decoder reads
+// top-level before/after/op/source), Kafka-backed schema history, distinct
+// schema history topics/server ids, and no file-based offsets (Kafka Connect's
+// offset topic owns the binlog position so a worker failover resumes there).
+func TestConnectorTemplatesUseKafkaConnectJSONAndSeparateHistory(t *testing.T) {
+	document := readConnectorTemplate(t, "document-cdc.json")
+	cache := readConnectorTemplate(t, "cache-cdc.json")
+	for name, config := range map[string]map[string]string{"document": document, "cache": cache} {
+		if config["connector.class"] != "io.debezium.connector.mysql.MySqlConnector" {
+			t.Fatalf("%s connector.class = %q", name, config["connector.class"])
+		}
+		if config["tasks.max"] != "1" {
+			t.Fatalf("%s tasks.max = %q, want 1 (one binlog reader per connector)", name, config["tasks.max"])
+		}
+		if config["value.converter"] != "org.apache.kafka.connect.json.JsonConverter" ||
+			config["key.converter"] != "org.apache.kafka.connect.json.JsonConverter" {
+			t.Fatalf("%s converters = %q/%q", name, config["key.converter"], config["value.converter"])
+		}
+		if config["value.converter.schemas.enable"] != "false" ||
+			config["key.converter.schemas.enable"] != "false" {
+			t.Fatalf("%s schemas.enable must stay false", name)
+		}
+		if config["snapshot.mode"] != "initial" {
+			t.Fatalf("%s snapshot.mode = %q", name, config["snapshot.mode"])
+		}
+		if config["schema.history.internal.kafka.topic"] == "" ||
+			config["schema.history.internal.kafka.bootstrap.servers"] == "" {
+			t.Fatalf("%s schema history must use Kafka", name)
+		}
+		for key := range config {
+			if strings.Contains(key, "offset.storage.file") || strings.HasPrefix(key, "offset.storage") {
+				t.Fatalf("%s still configures file-based offsets: %s", name, key)
+			}
+		}
+	}
+	if document["schema.history.internal.kafka.topic"] == cache["schema.history.internal.kafka.topic"] {
+		t.Fatal("the two connectors must use separate schema history topics")
+	}
+	if document["database.server.id"] == cache["database.server.id"] {
+		t.Fatal("the two connectors must use distinct database.server.id values")
+	}
+	if document["topic.prefix"] == cache["topic.prefix"] {
+		t.Fatal("the two connectors must use distinct topic prefixes")
+	}
+}
+
+// TestDecodeConnectJSONConverterEnvelope feeds the physical shape the Kafka
+// Connect JsonConverter writes (schemas disabled) through the production
+// decoders: a document insert and a cache delete with before-image locators.
+func TestDecodeConnectJSONConverterEnvelope(t *testing.T) {
+	documentBody := []byte(`{"before":null,` +
+		`"after":{"artifact_id":"` + testDocumentID + `","namespace":"manuals","schedule_version":4},` +
+		`"source":{"version":"3.7.1.Final","connector":"mysql","name":"praxis_rag","ts_ms":1794135700187,` +
+		`"snapshot":"false","db":"praxis_rag","table":"document_jobs","server_id":184054,"file":"mysql-bin.000002","pos":120,"row":0},` +
+		`"op":"c","ts_ms":1794135700187}`)
+	notification, err := DecodeDocumentNotification(documentBody)
+	if err != nil {
+		t.Fatalf("decode document envelope: %v", err)
+	}
+	if notification.ArtifactID != testDocumentID || notification.Namespace != "manuals" ||
+		notification.ScheduleVersion != 4 {
+		t.Fatalf("notification = %+v", notification)
+	}
+
+	cacheBody := []byte(`{"before":{"namespace":"manuals","name":"a.pdf","document_id":"doc-1","del_flag":1},` +
+		`"after":null,` +
+		`"source":{"version":"3.7.1.Final","connector":"mysql","name":"praxis_rag_cache","ts_ms":1794135700187,` +
+		`"snapshot":"false","db":"praxis_rag","table":"documents","server_id":184055,"file":"mysql-bin.000002","pos":220,"row":0},` +
+		`"op":"d","ts_ms":1794135700187}`)
+	change, err := DecodeCacheChange(cacheBody)
+	if err != nil {
+		t.Fatalf("decode cache delete envelope: %v", err)
+	}
+	wantAfterDelete := map[string]any{"namespace": "manuals", "name": "a.pdf", "document_id": "doc-1", "del_flag": json.Number("1")}
+	if change.Table != "documents" || change.Op != "d" || !reflect.DeepEqual(change.Before, wantAfterDelete) ||
+		change.After != nil {
+		t.Fatalf("change = %+v", change)
+	}
+}

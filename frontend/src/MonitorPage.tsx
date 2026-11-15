@@ -44,6 +44,7 @@ import {
   type MonitorOverallStatus,
   type MonitorOverview,
   type MonitorPipeline,
+  type MonitorPipelineConnector,
   type MonitorPipelineKafkaGroup,
   type MonitorQueues,
   type MonitorService,
@@ -257,12 +258,55 @@ function PipelineStatusTag({ status }: { status?: MonitorDependencyStatus }) {
   );
 }
 
-// captureProgressText never invents a Debezium capture percentage: the service
-// does not read Debezium offsets, so the only honest value is 未知.
+// captureProgressText never invents a capture percentage: the binlog position
+// lives in Kafka Connect's offset topic and the service does not read it, so the
+// only honest value is 未知.
 function captureProgressText(progress?: number | null) {
   return typeof progress === "number" && Number.isFinite(progress)
     ? `采集进度：${progress}`
-    : "采集进度：未知（需在 Debezium 侧查看）";
+    : "采集进度：未知（需在 Kafka Connect 侧查看）";
+}
+
+// connectorWorkerText answers "which worker runs this capture path?". After a
+// worker failure this is the value that proves the task moved to a peer.
+function connectorWorkerText(connector?: MonitorPipelineConnector | null) {
+  return `所在 Worker：${connector?.worker_id || "未知"}`;
+}
+
+// connectorTaskText lists every task state with its worker. A connector without
+// tasks is reported explicitly instead of looking healthy by omission.
+function connectorTaskText(connector?: MonitorPipelineConnector | null) {
+  const tasks = connector?.tasks ?? [];
+  if (tasks.length === 0) return "Task：未调度";
+  return `Task：${tasks
+    .map((task) => {
+      const state = task.state || "未知";
+      return task.worker_id ? `task ${task.id} ${state}（${task.worker_id}）` : `task ${task.id} ${state}`;
+    })
+    .join("，")}`;
+}
+
+// connectorFailureText keeps the first failure reason visible on the page; the
+// full bounded trace is also in connector.detail.
+function connectorFailureText(connector?: MonitorPipelineConnector | null) {
+  return connector?.failure_reason ? `失败原因：${connector.failure_reason}` : null;
+}
+
+// connectorRestartText renders the supervisor's recovery result: an in-flight
+// restart with its attempt number, an exhausted budget that needs an operator,
+// a recovered task, or no restart observed. A FAILED task never becomes a green
+// row through this text.
+function connectorRestartText(connector?: MonitorPipelineConnector | null) {
+  if (!connector) return "自动重启：未知";
+  if (connector.restart_exhausted) {
+    return `自动重启：已耗尽（累计 ${connector.restart_attempts} 次），需人工处理`;
+  }
+  if (connector.restarting) {
+    return `自动重启：进行中（第 ${connector.restart_attempts} 次）`;
+  }
+  if (connector.recovery === "recovered") return "自动重启：已恢复";
+  if (!connector.supervised) return "自动重启：未启用（未配置 RAG_CONNECT_URLS）";
+  return "自动重启：未触发";
 }
 
 // kafkaGroupLagText renders one consumer group's lag. The lag is only shown
@@ -289,8 +333,8 @@ function degradedDependencyNotes(overview: MonitorOverview): string[] {
   const pipeline = overview.pipeline;
   if (pipeline) {
     const views: Array<[string, { status: MonitorDependencyStatus; detail: string } | undefined]> = [
-      ["Debezium 任务连接器", pipeline.debezium?.tasks],
-      ["Debezium 缓存连接器", pipeline.debezium?.cache],
+      ["文档采集", pipeline.debezium?.tasks],
+      ["缓存采集", pipeline.debezium?.cache],
       ["文档 Worker", pipeline.worker],
       ["Kafka 消费", pipeline.kafka],
       ["文档任务", pipeline.document_jobs],
@@ -714,20 +758,41 @@ function KafkaGroupsBlock({ pipeline }: { pipeline: MonitorPipeline | null }) {
   );
 }
 
-// DebeziumBlock renders the two connectors separately: they are independent
-// processes with independent offsets and must never be merged.
+// CaptureRow is one named Kafka Connect connector row. The status/detail line
+// answers "is it delivering?", and the nested lines answer the operator's
+// follow-ups: which worker, which task, why it failed, whether an automatic
+// restart is in flight or exhausted, and the last recovery result. The two rows
+// are never merged: document and cache delivery are independent.
+function CaptureRow({ label, connector }: {
+  label: string;
+  connector?: MonitorPipelineConnector | null;
+}) {
+  const failure = connectorFailureText(connector);
+  return (
+    <PipelineRow label={label} status={connector?.status} detail={connector?.detail}>
+      <Flex vertical gap={2} className="secondary break-text">
+        <span>{`连接器：${connector?.connector || "未知"}（${connector?.connector_state || "未知"}）`}</span>
+        <span>{connectorWorkerText(connector)}</span>
+        <span>{connectorTaskText(connector)}</span>
+        {failure ? <span>{failure}</span> : null}
+        <span>{connectorRestartText(connector)}</span>
+        <span>{captureProgressText(connector?.capture_progress)}</span>
+      </Flex>
+    </PipelineRow>
+  );
+}
+
+// DebeziumBlock renders the two capture connectors separately: they are
+// independent Kafka Connect connectors with independent schema history, source
+// offsets and consumers, so merging their rows would hide a single-path outage.
 function DebeziumBlock({ pipeline }: { pipeline: MonitorPipeline | null }) {
   const tasks = pipeline?.debezium?.tasks;
   const cache = pipeline?.debezium?.cache;
   return (
-    <section className="monitor-block" aria-label="Debezium 连接器">
+    <section className="monitor-block" aria-label="采集连接器">
       <Flex vertical gap={12}>
-        <PipelineRow label="Debezium 任务连接器" status={tasks?.status} detail={tasks?.detail}>
-          <span className="break-text">{captureProgressText(tasks?.capture_progress)}</span>
-        </PipelineRow>
-        <PipelineRow label="Debezium 缓存连接器" status={cache?.status} detail={cache?.detail}>
-          <span className="break-text">{captureProgressText(cache?.capture_progress)}</span>
-        </PipelineRow>
+        <CaptureRow label="文档采集" connector={tasks} />
+        <CaptureRow label="缓存采集" connector={cache} />
       </Flex>
     </section>
   );
@@ -1194,7 +1259,7 @@ function ComponentTab({ tab, overview, autoRefresh, active }: {
     case "debezium":
       return (
         <Flex vertical gap={16}>
-          <Card size="small" title="Debezium 连接器">
+          <Card size="small" title="Kafka Connect 采集连接器">
             <DebeziumBlock pipeline={overview.pipeline} />
           </Card>
           <Card size="small" title="文档任务投递状态">

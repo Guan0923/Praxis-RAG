@@ -50,6 +50,9 @@ WORKDIR /app
 COPY --from=build /out/ /app/bin/
 COPY --from=web /repo/build/web /app/web
 COPY deploy/config.container.toml /app/config.toml
+# Connector templates for the one-shot `rag-connect register` service
+# (connect-init) in docker-compose.yml.
+COPY deploy/kafka-connect /app/connect
 RUN mkdir -p /app/data && chown -R rag:rag /app
 
 # RAG_SERVICE_HOST is non-loopback in the container, so a service token and the

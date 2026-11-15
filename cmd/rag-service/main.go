@@ -19,6 +19,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/auth"
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/xinghe_rag/internal/connect"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
 	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/mail"
@@ -101,6 +102,24 @@ func run() error {
 	if err := service.StartBackground(context.Background()); err != nil {
 		return err
 	}
+	// Distributed Kafka Connect hosts the two Debezium capture connectors. The
+	// supervisor repairs one class of failure the platform leaves alone: a task
+	// that entered FAILED (for example after a transient MySQL/network error)
+	// stays FAILED until something restarts it. Worker failover itself is Kafka
+	// Connect's job and needs no application code.
+	connectSettings, err := connect.SettingsFromEnv()
+	if err != nil {
+		return err
+	}
+	connectRuntime, err := connect.NewRuntime(connectSettings, logger)
+	if err != nil {
+		return err
+	}
+	defer connectRuntime.Close()
+	connectRuntime.Start(context.Background())
+	if !connectRuntime.Enabled() {
+		logger.Warn("RAG_CONNECT_URLS is not configured: the Console cannot report Kafka Connect capture state and failed tasks are not restarted automatically")
+	}
 	// Document parsing happens only in the standalone rag-document-worker, which
 	// consumes Debezium-delivered notifications from Kafka. Without Kafka the
 	// service still admits uploads, but their jobs stay queued.
@@ -165,6 +184,10 @@ func run() error {
 	} else {
 		systemSampler = sampler
 	}
+	var connectorProbe monitor.ConnectorProbe
+	if connectRuntime.Enabled() {
+		connectorProbe = connectRuntime
+	}
 	monitorService := monitor.New(monitor.Options{
 		Stats:                 stores,
 		MySQL:                 stores,
@@ -175,24 +198,27 @@ func run() error {
 		IndexedCollections:    stores.MonitorIndexedCollections,
 		KafkaBootstrapServers: mqSettings.BootstrapServers,
 		KafkaProbe:            kafkaProbe,
-		// The two Debezium connectors are the delivery path now; their Quarkus
-		// health endpoints are the only capture-side signal the service can read.
-		DebeziumHealthURL:      os.Getenv("RAG_DEBEZIUM_HEALTH_URL"),
-		DebeziumCacheHealthURL: os.Getenv("RAG_DEBEZIUM_CACHE_HEALTH_URL"),
-		DocumentTopic:          mqSettings.DocumentTopic,
-		DocumentGroup:          mqSettings.DocumentGroup,
-		CacheTopic:             mqSettings.CacheTopic,
-		CacheGroup:             mqSettings.CacheGroup,
-		KafkaGroupProgress:     kafkaGroupProgress,
-		WorkerHeartbeat:        workerHeartbeat,
-		Delivery:               "debezium",
-		UploadMode:             "async",
-		PDFEngine:              ragConfig.PDFEngine,
-		PDFServiceURL:          ragConfig.PDFServiceURL,
-		StartedAt:              time.Now(),
-		System:                 systemSampler,
-		Logs:                   logging.DefaultBuffer(),
-		LogFilePath:            logging.LogFilePath(),
+		// The two Debezium connectors now run as tasks in the distributed Kafka
+		// Connect cluster. The probe reads connector/task state (including the
+		// worker that owns each task) and the restart supervisor's bookkeeping;
+		// the binlog offset itself stays inside Kafka Connect.
+		ConnectorProbe:     connectorProbe,
+		DocumentConnector:  connectSettings.DocumentConnector,
+		CacheConnector:     connectSettings.CacheConnector,
+		DocumentTopic:      mqSettings.DocumentTopic,
+		DocumentGroup:      mqSettings.DocumentGroup,
+		CacheTopic:         mqSettings.CacheTopic,
+		CacheGroup:         mqSettings.CacheGroup,
+		KafkaGroupProgress: kafkaGroupProgress,
+		WorkerHeartbeat:    workerHeartbeat,
+		Delivery:           "debezium",
+		UploadMode:         "async",
+		PDFEngine:          ragConfig.PDFEngine,
+		PDFServiceURL:      ragConfig.PDFServiceURL,
+		StartedAt:          time.Now(),
+		System:             systemSampler,
+		Logs:               logging.DefaultBuffer(),
+		LogFilePath:        logging.LogFilePath(),
 	})
 	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{

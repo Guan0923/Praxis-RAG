@@ -1176,15 +1176,44 @@ export type MonitorQueues = {
 export type MonitorQueueState =
   | MonitorDocumentJobs
   | MonitorUploads;
-// MonitorPipelineConnector reports one Debezium connector health. The task and
-// cache connectors are separate processes with independent offset/schema
-// history, so the backend reports them separately.
+// MonitorPipelineConnectorTask is one Kafka Connect task's observed state and
+// the worker that owns it. A task can move to another worker after failover.
+export type MonitorPipelineConnectorTask = {
+  id: number;
+  state: string;
+  worker_id: string;
+  trace?: string;
+};
+// MonitorPipelineConnector reports one named Kafka Connect connector. The two
+// Debezium connectors are independent capture paths with their own schema
+// history and source-offset namespace, so the backend reports them separately.
 export type MonitorPipelineConnector = {
   status: MonitorDependencyStatus;
   detail: string;
-  // capture_progress is always null: capture offsets live in Debezium, not in
-  // this service, so the page renders 未知 instead of inventing a percentage.
+  // capture_progress is always null: the binlog position lives in Kafka
+  // Connect's offset topic, so the page renders 未知 instead of inventing one.
   capture_progress: number | null;
+  // connector/connector_state identify the fixed connector name and its
+  // cluster-wide state (RUNNING/PAUSED/FAILED/...).
+  connector: string;
+  connector_state: string;
+  // worker_id is the worker hosting the connector (or first task) — it changes
+  // after a worker failover.
+  worker_id: string;
+  tasks: MonitorPipelineConnectorTask[];
+  failed_tasks: number;
+  failure_reason: string;
+  // The restart supervisor's view: whether a retry is in flight, how many
+  // attempts it has made, whether the finite budget is exhausted (needs an
+  // operator), and the last recovery result.
+  restarting: boolean;
+  restart_attempts: number;
+  restart_exhausted: boolean;
+  recovery: "restarting" | "exhausted" | "recovered" | "";
+  last_restart_at: string;
+  last_recovered_at: string;
+  next_restart_at: string;
+  supervised: boolean;
 };
 export type MonitorPipelineDocumentJobs = {
   status: MonitorDependencyStatus;

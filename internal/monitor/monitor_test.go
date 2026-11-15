@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Guan0923/xinghe_rag/internal/connect"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 	"github.com/Guan0923/xinghe_rag/internal/version"
 )
@@ -223,12 +224,13 @@ func healthyOptions(t *testing.T) Options {
 		KafkaProbe: func(context.Context) (KafkaStatus, error) {
 			return KafkaStatus{Brokers: 1, Topic: mqDocumentTopic, TopicExists: true, Partitions: 3}, nil
 		},
-		DebeziumHealthURL:      healthyDebeziumServer(t).URL,
-		DebeziumCacheHealthURL: healthyDebeziumServer(t).URL,
-		DocumentTopic:          mqDocumentTopic,
-		DocumentGroup:          mqDocumentGroup,
-		CacheTopic:             mqCacheTopic,
-		CacheGroup:             mqCacheGroup,
+		ConnectorProbe:    healthyConnectProbe(),
+		DocumentConnector: connectDocumentName,
+		CacheConnector:    connectCacheName,
+		DocumentTopic:     mqDocumentTopic,
+		DocumentGroup:     mqDocumentGroup,
+		CacheTopic:        mqCacheTopic,
+		CacheGroup:        mqCacheGroup,
 		KafkaGroupProgress: func(_ context.Context, topic, _ string) (KafkaProgress, error) {
 			return fakeGroupProgress(topic), nil
 		},
@@ -255,11 +257,49 @@ func fakeGroupProgress(topic string) KafkaProgress {
 	return KafkaProgress{CommittedOffset: &committed, EndOffset: &end, Lag: &lag}
 }
 
-// healthyDebeziumServer serves the Quarkus UP payload both connectors return.
-func healthyDebeziumServer(t *testing.T) *httptest.Server {
-	t.Helper()
-	return debeziumServer(t, http.StatusOK,
-		`{"status":"UP","checks":[{"name":"MySQL","status":"UP"},{"name":"Kafka","status":"UP"}]}`)
+// Connect connector names and a fake probe: the monitor only consumes the
+// connect.ConnectorHealth document, so unit tests need no REST server.
+const (
+	connectDocumentName = "praxis-document-cdc"
+	connectCacheName    = "praxis-cache-cdc"
+)
+
+// fakeConnectorProbe returns fixed health documents and records the connector
+// names the monitor asked about.
+type fakeConnectorProbe struct {
+	health map[string]connect.ConnectorHealth
+	errs   map[string]error
+	calls  []string
+}
+
+func (f *fakeConnectorProbe) Health(_ context.Context, connector string) (connect.ConnectorHealth, error) {
+	f.calls = append(f.calls, connector)
+	if err, ok := f.errs[connector]; ok {
+		return f.health[connector], err
+	}
+	if health, ok := f.health[connector]; ok {
+		return health, nil
+	}
+	return connect.ConnectorHealth{Connector: connector, State: connect.StateUnknown}, nil
+}
+
+// runningConnector builds a fully healthy connector with one RUNNING task.
+func runningConnector(name, worker string) connect.ConnectorHealth {
+	return connect.ConnectorHealth{
+		Connector:         name,
+		State:             connect.StateRunning,
+		WorkerID:          worker,
+		Tasks:             []connect.TaskHealth{{ID: 0, State: connect.StateRunning, WorkerID: worker}},
+		SupervisorEnabled: true,
+	}
+}
+
+// healthyConnectProbe returns both connectors healthy on two distinct workers.
+func healthyConnectProbe() *fakeConnectorProbe {
+	return &fakeConnectorProbe{health: map[string]connect.ConnectorHealth{
+		connectDocumentName: runningConnector(connectDocumentName, "connect-1:8083"),
+		connectCacheName:    runningConnector(connectCacheName, "connect-2:8083"),
+	}}
 }
 
 // pipelineOf resolves the always-present pipeline object from the snapshot.
@@ -276,22 +316,12 @@ func pipelineOf(t *testing.T, overview map[string]any) pipelineSnapshot {
 // dependency noise; tests override the pipeline-specific fields.
 func pipelineTestOptions(stats *state.MonitorStats) Options {
 	return Options{
-		Stats:     &fakeStatsProvider{stats: stats},
-		MySQL:     fakeMySQLPinger{},
-		PDFEngine: "go",
+		Stats:             &fakeStatsProvider{stats: stats},
+		MySQL:             fakeMySQLPinger{},
+		PDFEngine:         "go",
+		DocumentConnector: connectDocumentName,
+		CacheConnector:    connectCacheName,
 	}
-}
-
-// debeziumServer serves a fixed health payload.
-func debeziumServer(t *testing.T, status int, body string) *httptest.Server {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_, _ = w.Write([]byte(body))
-	}))
-	t.Cleanup(server.Close)
-	return server
 }
 
 // int64Pointer is the pointer form the pipeline JSON uses for known numbers.
@@ -426,16 +456,18 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 		!strings.Contains(pipeline.Worker.Detail, "1 个实例运行中") {
 		t.Fatalf("pipeline.worker = %+v", pipeline.Worker)
 	}
-	// healthyOptions wires both connector health endpoints and the three-group
-	// progress reader, so capture health is known while the binlog offset stays
+	// healthyOptions wires both named Kafka Connect connectors and the two-group
+	// progress reader, so capture state is known while the binlog offset stays
 	// null for both connectors.
 	if pipeline.Debezium.Tasks.Status != statusOK ||
-		!strings.Contains(pipeline.Debezium.Tasks.Detail, "任务连接器健康检查正常") ||
+		!strings.Contains(pipeline.Debezium.Tasks.Detail, "praxis-document-cdc RUNNING") ||
+		!strings.Contains(pipeline.Debezium.Tasks.Detail, "task 0 RUNNING@connect-1:8083") ||
 		pipeline.Debezium.Tasks.CaptureProgress != nil {
 		t.Fatalf("pipeline.debezium.tasks = %+v", pipeline.Debezium.Tasks)
 	}
 	if pipeline.Debezium.Cache.Status != statusOK ||
-		!strings.Contains(pipeline.Debezium.Cache.Detail, "缓存连接器健康检查正常") ||
+		!strings.Contains(pipeline.Debezium.Cache.Detail, "praxis-cache-cdc RUNNING") ||
+		!strings.Contains(pipeline.Debezium.Cache.Detail, "task 0 RUNNING@connect-2:8083") ||
 		pipeline.Debezium.Cache.CaptureProgress != nil {
 		t.Fatalf("pipeline.debezium.cache = %+v", pipeline.Debezium.Cache)
 	}
@@ -571,6 +603,8 @@ func TestMonitorOverviewDegradedAndDisabled(t *testing.T) {
 		PDFEngine:          "go",
 		UploadMode:         "sync",
 		Delivery:           "debezium",
+		DocumentConnector:  connectDocumentName,
+		CacheConnector:     connectCacheName,
 	}
 	overview := New(options).MonitorOverview(context.Background())
 
@@ -600,11 +634,11 @@ func TestMonitorOverviewDegradedAndDisabled(t *testing.T) {
 	}
 	pipeline := pipelineOf(t, overview)
 	if pipeline.Debezium.Tasks.Status != statusUnknown ||
-		pipeline.Debezium.Tasks.Detail != "未配置任务连接器健康检查地址，采集进度未知" {
+		!strings.Contains(pipeline.Debezium.Tasks.Detail, "未配置 Kafka Connect 状态探测") {
 		t.Fatalf("pipeline.debezium.tasks = %+v", pipeline.Debezium.Tasks)
 	}
 	if pipeline.Debezium.Cache.Status != statusUnknown ||
-		pipeline.Debezium.Cache.Detail != "未配置缓存连接器健康检查地址，采集进度未知" {
+		!strings.Contains(pipeline.Debezium.Cache.Detail, "未配置 Kafka Connect 状态探测") {
 		t.Fatalf("pipeline.debezium.cache = %+v", pipeline.Debezium.Cache)
 	}
 	if pipeline.Kafka.Status != statusDisabled ||
@@ -796,79 +830,145 @@ func TestMonitorPipelineDocumentJobsDegraded(t *testing.T) {
 	}
 }
 
-// TestMonitorPipelineDebezium covers the health states of BOTH capture
-// connectors. The task connector drives document delivery, the cache
-// connector drives read-model convergence; capture progress is always null
-// because the application cannot read the binlog offset.
-func TestMonitorPipelineDebezium(t *testing.T) {
-	t.Run("未配置健康检查地址", func(t *testing.T) {
-		overview := New(pipelineTestOptions(sampleStats())).MonitorOverview(context.Background())
-		view := pipelineOf(t, overview)
+// TestMonitorPipelineConnect covers the Kafka Connect capture rows: missing
+// configuration, both connectors healthy, a failed task with an in-flight
+// supervisor restart, an exhausted restart budget, a recovered task, a paused
+// connector and an unreadable status. Capture progress is always null because
+// Kafka Connect owns the binlog offset.
+func TestMonitorPipelineConnect(t *testing.T) {
+	missing := pipelineTestOptions(sampleStats())
+	missing.DocumentConnector = ""
+	missing.CacheConnector = ""
+	view := pipelineOf(t, New(missing).MonitorOverview(context.Background()))
+	if view.Debezium.Tasks.Status != statusUnknown ||
+		view.Debezium.Tasks.Detail != "未配置文档采集连接器名称" {
+		t.Fatalf("pipeline.debezium.tasks = %+v", view.Debezium.Tasks)
+	}
+	if view.Debezium.Cache.Status != statusUnknown ||
+		view.Debezium.Cache.Detail != "未配置缓存采集连接器名称" {
+		t.Fatalf("pipeline.debezium.cache = %+v", view.Debezium.Cache)
+	}
+
+	t.Run("未配置状态探测", func(t *testing.T) {
+		view := pipelineOf(t, New(pipelineTestOptions(sampleStats())).MonitorOverview(context.Background()))
 		if view.Debezium.Tasks.Status != statusUnknown ||
-			view.Debezium.Tasks.Detail != "未配置任务连接器健康检查地址，采集进度未知" {
+			!strings.Contains(view.Debezium.Tasks.Detail, "未配置 Kafka Connect 状态探测") {
 			t.Fatalf("pipeline.debezium.tasks = %+v", view.Debezium.Tasks)
 		}
-		if view.Debezium.Cache.Status != statusUnknown ||
-			view.Debezium.Cache.Detail != "未配置缓存连接器健康检查地址，采集进度未知" {
-			t.Fatalf("pipeline.debezium.cache = %+v", view.Debezium.Cache)
-		}
-		if view.Debezium.Tasks.CaptureProgress != nil || view.Debezium.Cache.CaptureProgress != nil {
-			t.Fatalf("capture_progress must stay null: %+v", view.Debezium)
+		if view.Debezium.Tasks.CaptureProgress != nil {
+			t.Fatalf("capture_progress must stay null: %+v", view.Debezium.Tasks)
 		}
 	})
+
 	t.Run("两个连接器均健康", func(t *testing.T) {
 		options := pipelineTestOptions(sampleStats())
-		options.DebeziumHealthURL = healthyDebeziumServer(t).URL
-		options.DebeziumCacheHealthURL = healthyDebeziumServer(t).URL
+		options.ConnectorProbe = healthyConnectProbe()
 		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
 		if view.Debezium.Tasks.Status != statusOK ||
-			!strings.Contains(view.Debezium.Tasks.Detail, "任务连接器健康检查正常") {
+			!strings.Contains(view.Debezium.Tasks.Detail, "task 0 RUNNING@connect-1:8083") ||
+			!strings.Contains(view.Debezium.Tasks.Detail, "采集位点由 Kafka Connect 保存") {
 			t.Fatalf("pipeline.debezium.tasks = %+v", view.Debezium.Tasks)
 		}
 		if view.Debezium.Cache.Status != statusOK ||
-			!strings.Contains(view.Debezium.Cache.Detail, "缓存连接器健康检查正常") {
+			!strings.Contains(view.Debezium.Cache.Detail, "task 0 RUNNING@connect-2:8083") {
 			t.Fatalf("pipeline.debezium.cache = %+v", view.Debezium.Cache)
 		}
 		if view.Debezium.Tasks.CaptureProgress != nil || view.Debezium.Cache.CaptureProgress != nil {
 			t.Fatalf("capture_progress must stay null: %+v", view.Debezium)
 		}
 	})
-	t.Run("HTTP 失败", func(t *testing.T) {
-		server := debeziumServer(t, http.StatusInternalServerError, `{"status":"UP"}`)
+
+	t.Run("失败任务正在重启", func(t *testing.T) {
+		failed := runningConnector(connectDocumentName, "connect-1:8083")
+		failed.Tasks = []connect.TaskHealth{{ID: 0, State: connect.StateFailed, WorkerID: "connect-1:8083",
+			Trace: "Access denied for user 'debezium'"}}
+		failed.FailedTasks = 1
+		failed.FailureReason = "Access denied for user 'debezium'"
+		failed.Restarting = true
+		failed.RestartAttempts = 2
+		failed.Recovery = connect.RecoveryRestarting
+		failed.NextRestartAt = "2026-11-15T06:31:00Z"
+		probe := healthyConnectProbe()
+		probe.health[connectDocumentName] = failed
 		options := pipelineTestOptions(sampleStats())
-		options.DebeziumHealthURL = server.URL
+		options.ConnectorProbe = probe
 		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
 		if view.Debezium.Tasks.Status != statusError ||
-			!strings.Contains(view.Debezium.Tasks.Detail, "HTTP 500") {
+			!view.Debezium.Tasks.Restarting ||
+			view.Debezium.Tasks.RestartAttempts != 2 ||
+			view.Debezium.Tasks.FailedTasks != 1 ||
+			!strings.Contains(view.Debezium.Tasks.FailureReason, "Access denied") ||
+			!strings.Contains(view.Debezium.Tasks.Detail, "正在自动重启（第 2 次）") {
 			t.Fatalf("pipeline.debezium.tasks = %+v", view.Debezium.Tasks)
 		}
+		if view.Debezium.Cache.Status != statusOK {
+			t.Fatalf("the other capture path must stay healthy: %+v", view.Debezium.Cache)
+		}
 	})
-	t.Run("不可达", func(t *testing.T) {
+
+	t.Run("重启次数耗尽", func(t *testing.T) {
+		failed := runningConnector(connectCacheName, "connect-2:8083")
+		failed.Tasks = []connect.TaskHealth{{ID: 0, State: connect.StateFailed, WorkerID: "connect-2:8083",
+			Trace: "Unknown database 'praxis_rag'"}}
+		failed.FailedTasks = 1
+		failed.FailureReason = "Unknown database 'praxis_rag'"
+		failed.RestartExhausted = true
+		failed.RestartAttempts = 5
+		failed.Recovery = connect.RecoveryExhausted
+		probe := healthyConnectProbe()
+		probe.health[connectCacheName] = failed
 		options := pipelineTestOptions(sampleStats())
-		options.DebeziumCacheHealthURL = "http://" + unreachableAddress(t)
+		options.ConnectorProbe = probe
 		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
 		if view.Debezium.Cache.Status != statusError ||
-			view.Debezium.Cache.Detail != "缓存连接器健康检查不可达" {
+			!view.Debezium.Cache.RestartExhausted ||
+			view.Debezium.Cache.RestartAttempts != 5 ||
+			!strings.Contains(view.Debezium.Cache.Detail, "自动重启已耗尽（5 次），需人工处理") {
 			t.Fatalf("pipeline.debezium.cache = %+v", view.Debezium.Cache)
 		}
 	})
-	t.Run("DOWN", func(t *testing.T) {
-		server := debeziumServer(t, http.StatusOK, `{"status":"DOWN"}`)
+
+	t.Run("重启后已恢复", func(t *testing.T) {
+		recovered := runningConnector(connectCacheName, "connect-2:8083")
+		recovered.Recovery = connect.RecoveryRecovered
+		recovered.RestartAttempts = 1
+		recovered.LastRestartAt = "2026-11-15T06:20:00Z"
+		recovered.LastRecoveredAt = "2026-11-15T06:20:08Z"
+		probe := healthyConnectProbe()
+		probe.health[connectCacheName] = recovered
 		options := pipelineTestOptions(sampleStats())
-		options.DebeziumHealthURL = server.URL
+		options.ConnectorProbe = probe
 		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
-		if view.Debezium.Tasks.Status != statusError ||
-			!strings.Contains(view.Debezium.Tasks.Detail, "DOWN") {
-			t.Fatalf("pipeline.debezium.tasks = %+v", view.Debezium.Tasks)
+		if view.Debezium.Cache.Status != statusOK ||
+			view.Debezium.Cache.Recovery != connect.RecoveryRecovered ||
+			!strings.Contains(view.Debezium.Cache.Detail, "上次失败后已自动恢复") {
+			t.Fatalf("pipeline.debezium.cache = %+v", view.Debezium.Cache)
 		}
 	})
-	t.Run("响应不可解析", func(t *testing.T) {
-		server := debeziumServer(t, http.StatusOK, `<html>not json</html>`)
+
+	t.Run("连接器已暂停", func(t *testing.T) {
+		paused := runningConnector(connectCacheName, "connect-2:8083")
+		paused.State = connect.StatePaused
+		paused.Tasks = []connect.TaskHealth{{ID: 0, State: connect.StatePaused, WorkerID: "connect-2:8083"}}
+		probe := healthyConnectProbe()
+		probe.health[connectCacheName] = paused
 		options := pipelineTestOptions(sampleStats())
-		options.DebeziumHealthURL = server.URL
+		options.ConnectorProbe = probe
 		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
-		if view.Debezium.Tasks.Status != statusDegraded ||
-			view.Debezium.Tasks.Detail != "任务连接器健康检查响应无法解析" {
+		if view.Debezium.Cache.Status != statusDegraded ||
+			!strings.Contains(view.Debezium.Cache.Detail, "已暂停，另一路采集不受影响") {
+			t.Fatalf("pipeline.debezium.cache = %+v", view.Debezium.Cache)
+		}
+	})
+
+	t.Run("状态不可读", func(t *testing.T) {
+		probe := healthyConnectProbe()
+		probe.errs = map[string]error{connectDocumentName: errors.New("connect worker unreachable")}
+		options := pipelineTestOptions(sampleStats())
+		options.ConnectorProbe = probe
+		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
+		if view.Debezium.Tasks.Status != statusError ||
+			!strings.Contains(view.Debezium.Tasks.Detail, "状态读取失败") {
 			t.Fatalf("pipeline.debezium.tasks = %+v", view.Debezium.Tasks)
 		}
 	})
@@ -1065,7 +1165,10 @@ func TestMonitorPipelineWireShape(t *testing.T) {
 		if !ok {
 			t.Fatalf("pipeline.debezium.%s has type %T", name, debezium[name])
 		}
-		requireKeys(t, "pipeline.debezium."+name, connector, "status", "detail", "capture_progress")
+		requireKeys(t, "pipeline.debezium."+name, connector, "status", "detail", "capture_progress",
+			"connector", "connector_state", "worker_id", "tasks", "failed_tasks",
+			"failure_reason", "restarting", "restart_attempts", "restart_exhausted",
+			"recovery", "last_restart_at", "last_recovered_at", "next_restart_at", "supervised")
 		if connector["capture_progress"] != nil {
 			t.Fatalf("pipeline.debezium.%s.capture_progress = %v, want null",
 				name, connector["capture_progress"])
@@ -1148,6 +1251,8 @@ func healthyDependencyOptions(t *testing.T) Options {
 		FallbackCollection: "knowledge",
 		IndexedCollections: indexedCollectionsFunc("knowledge"),
 		PDFEngine:          "go",
+		DocumentConnector:  connectDocumentName,
+		CacheConnector:     connectCacheName,
 	}
 }
 
@@ -1176,9 +1281,16 @@ func TestMonitorOverallStatusAggregation(t *testing.T) {
 			t.Fatalf("status/ok = %v/%v, want error/false", overview["status"], overview["ok"])
 		}
 	})
-	t.Run("Debezium 异常", func(t *testing.T) {
+	t.Run("连接器采集异常", func(t *testing.T) {
 		options := healthyDependencyOptions(t)
-		options.DebeziumHealthURL = debeziumServer(t, http.StatusOK, `{"status":"DOWN"}`).URL
+		failed := runningConnector(connectDocumentName, "connect-1:8083")
+		failed.Tasks = []connect.TaskHealth{{ID: 0, State: connect.StateFailed, WorkerID: "connect-1:8083",
+			Trace: "boom"}}
+		failed.FailedTasks = 1
+		failed.FailureReason = "boom"
+		probe := healthyConnectProbe()
+		probe.health[connectDocumentName] = failed
+		options.ConnectorProbe = probe
 		overview := New(options).MonitorOverview(context.Background())
 		if overview["status"] != statusError {
 			t.Fatalf("status = %v, want error", overview["status"])
@@ -1356,33 +1468,6 @@ func TestMonitorPDFHealthPayload(t *testing.T) {
 		item := dependencyByName(t, New(visionOptions(t, server)).MonitorOverview(context.Background()), "pdf-service")
 		if item.Status != statusError || !strings.Contains(item.Detail, "HTTP 500") {
 			t.Fatalf("pdf-service = %+v", item)
-		}
-	})
-}
-
-// TestMonitorDebeziumRuntimeChecks asserts the health probe reports the
-// per-check runtime state instead of trusting the aggregate HTTP code.
-func TestMonitorDebeziumRuntimeChecks(t *testing.T) {
-	t.Run("运行检查通过", func(t *testing.T) {
-		server := jsonServer(t, "/q/health", http.StatusOK,
-			`{"status":"UP","checks":[{"name":"debezium","status":"UP"},{"name":"Database connections health check","status":"UP"}]}`)
-		options := pipelineTestOptions(sampleStats())
-		options.DebeziumHealthURL = server.URL + "/q/health"
-		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
-		if view.Debezium.Tasks.Status != statusOK ||
-			!strings.Contains(view.Debezium.Tasks.Detail, "2 项运行检查通过") {
-			t.Fatalf("pipeline.debezium.tasks = %+v", view.Debezium.Tasks)
-		}
-	})
-	t.Run("运行检查失败", func(t *testing.T) {
-		server := jsonServer(t, "/q/health", http.StatusServiceUnavailable,
-			`{"status":"DOWN","checks":[{"name":"debezium","status":"DOWN"},{"name":"Database connections health check","status":"UP"}]}`)
-		options := pipelineTestOptions(sampleStats())
-		options.DebeziumHealthURL = server.URL + "/q/health"
-		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
-		if view.Debezium.Tasks.Status != statusError ||
-			!strings.Contains(view.Debezium.Tasks.Detail, "检查失败：debezium") {
-			t.Fatalf("pipeline.debezium.tasks = %+v", view.Debezium.Tasks)
 		}
 	})
 }

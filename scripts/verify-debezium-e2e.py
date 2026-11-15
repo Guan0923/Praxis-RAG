@@ -1,22 +1,36 @@
 """Live end-to-end verification of the Debezium CDC pipeline with the Go backend.
 
-Pipeline under test (no transactional outbox any more):
+Pipeline under test (no transactional outbox any more, two Debezium MySQL
+connectors running as tasks in a distributed Kafka Connect cluster):
   MCP add_document -> MySQL document_jobs COMMIT
-  -> task Debezium connector (binlog CDC) -> Kafka RAG_DOCUMENT_TOPIC
+  -> document connector (binlog CDC through Kafka Connect) -> RAG_DOCUMENT_TOPIC
   -> rag-document-worker -> Qdrant + MySQL documents
   -> get_document_status = succeeded, REST search returns the document.
-  The same write is captured by the cache Debezium connector as a locator-only
-  event on RAG_CACHE_TOPIC (documents table, no body), and the cache revision
-  row advances.
-  Search is synchronous now (MCP/REST return evidence in one call): there is no
-  search worker, result_id or result snapshot to poll in this pipeline check.
+  The same write is captured by the cache connector as a locator-only event on
+  RAG_CACHE_TOPIC (documents table, no body), and the cache revision row
+  advances.
 
-Also asserts the Console monitor contract: pipeline.debezium.tasks/cache,
-pipeline.kafka.groups (document/cache), pipeline.cache and
-service.delivery=debezium; pipeline.outbox must be gone.
+Acceptance cases run by this script:
+  2. independent capture: pause the cache connector, write cache changes and
+     submit a document; the document worker still claims and completes it, and
+     the cache connector delivers the queued change after resume.
+  3. worker failover: stop the Connect worker that owns the document task,
+     submit a document during takeover, and require the peer to run the task and
+     deliver the notification to the Go document worker (not merely RUNNING).
+  4. FAILED-task recovery: lock the cache CDC account (workers stay online) so
+     only the cache task fails; after unlocking, the restart supervisor must
+     return it to RUNNING without a manual REST restart, while the document path
+     keeps working.
+  5. message contract: one real document notification and one real cache delete
+     event are decoded by dist/bin/rag-connect.exe, which calls the same Go
+     decoders the workers use.
+
+Also asserts the Console monitor contract: pipeline.debezium.tasks/cache with
+connector/task/worker/restart fields, pipeline.kafka.groups (document/cache),
+pipeline.cache and service.delivery=debezium; pipeline.outbox must be gone.
 
 Requires the docker compose infra (MySQL 3307, Qdrant 6333, Redis 6379,
-Kafka 9092, both Debezium connectors) to be running, and dist/bin binaries built.
+Kafka 9092, two Kafka Connect workers) to be running, and dist/bin binaries built.
 """
 from __future__ import annotations
 
@@ -63,11 +77,28 @@ DOCUMENT_DLQ_GROUP = os.environ.get(
     "RAG_DOCUMENT_DLQ_GROUP", "praxis_document_dead_letters")
 CACHE_DLQ_GROUP = os.environ.get(
     "RAG_CACHE_DLQ_GROUP", "praxis_state_cache_refresh_dead_letters")
-# Loopback health endpoints published by compose for the two connectors.
-DEBEZIUM_HEALTH_URL = os.environ.get(
-    "RAG_DEBEZIUM_HEALTH_URL", "http://127.0.0.1:8083/q/health")
-DEBEZIUM_CACHE_HEALTH_URL = os.environ.get(
-    "RAG_DEBEZIUM_CACHE_HEALTH_URL", "http://127.0.0.1:8084/q/health")
+# Distributed Kafka Connect workers. Any worker answers cluster-wide connector
+# state, so the list is used with failover: killing one worker must not blind the
+# monitor or this script.
+CONNECT_URLS = [
+    url.strip()
+    for url in os.environ.get(
+        "RAG_CONNECT_URLS", "http://127.0.0.1:8083,http://127.0.0.1:8084"
+    ).split(",")
+    if url.strip()
+]
+DOCUMENT_CONNECTOR = os.environ.get(
+    "RAG_CONNECT_DOCUMENT_CONNECTOR", "praxis-document-cdc")
+CACHE_CONNECTOR = os.environ.get(
+    "RAG_CONNECT_CACHE_CONNECTOR", "praxis-cache-cdc")
+CACHE_CDC_USER = os.environ.get("RAG_MYSQL_DEBEZIUM_CACHE_USER", "debezium_cache")
+# Compose service -> container name. Production may spread the workers across
+# machines; the drill then targets the worker that owns the document task.
+CONNECT_CONTAINERS = {
+    "connect-1": "praxis-rag-connect-1",
+    "connect-2": "praxis-rag-connect-2",
+}
+CONNECT_EXE = BIN / "rag-connect.exe"
 
 results: list[tuple[bool, str]] = []
 
@@ -301,11 +332,17 @@ def base_env() -> dict:
         "RAG_CACHE_DLQ_TOPIC": CACHE_DLQ_TOPIC,
         "RAG_DOCUMENT_DLQ_GROUP": DOCUMENT_DLQ_GROUP,
         "RAG_CACHE_DLQ_GROUP": CACHE_DLQ_GROUP,
-        # Compose publishes one health port per connector on loopback; without
-        # them the monitor page reports capture progress as unknown (never
-        # fabricated).
-        "RAG_DEBEZIUM_HEALTH_URL": DEBEZIUM_HEALTH_URL,
-        "RAG_DEBEZIUM_CACHE_HEALTH_URL": DEBEZIUM_CACHE_HEALTH_URL,
+        # Distributed Kafka Connect: the monitor reads the two named connectors'
+        # task state and the failed-task supervisor's restart bookkeeping. The
+        # binlog offsets live in Kafka Connect's offset topic.
+        "RAG_CONNECT_URLS": ",".join(CONNECT_URLS),
+        "RAG_CONNECT_DOCUMENT_CONNECTOR": DOCUMENT_CONNECTOR,
+        "RAG_CONNECT_CACHE_CONNECTOR": CACHE_CONNECTOR,
+        "RAG_CONNECT_TIMEOUT_SECONDS": "2",
+        "RAG_CONNECT_SUPERVISOR_INTERVAL_SECONDS": "5",
+        "RAG_CONNECT_RESTART_MAX_ATTEMPTS": "5",
+        "RAG_CONNECT_RESTART_BASE_BACKOFF_SECONDS": "1",
+        "RAG_CONNECT_RESTART_MAX_BACKOFF_SECONDS": "30",
     })
     return env
 
@@ -367,28 +404,6 @@ def mysql_query(sql: str) -> str:
     return "\n".join(lines).strip()
 
 
-def kafka_probe(artifact_id: str) -> tuple[bool, str]:
-    """Info-only probe: read the document topic from the beginning for 5 seconds.
-
-    Kafka offsets/consumer groups decide what a fresh probe can see; a missing
-    hit is not a failure because the succeeded document job plus the committed
-    document_jobs row already prove the task connector delivered it.
-    """
-    try:
-        completed = subprocess.run([
-            "docker", "exec", "praxis-rag-kafka",
-            "/opt/kafka/bin/kafka-console-consumer.sh",
-            "--bootstrap-server", "kafka:9092",
-            "--topic", DOCUMENT_TOPIC,
-            "--from-beginning",
-            "--timeout-ms", "5000",
-        ], capture_output=True, text=True, timeout=30)
-        output = (completed.stdout or "") + (completed.stderr or "")
-        return artifact_id in output, output[-6000:]
-    except Exception as error:  # noqa: BLE001 - probe is optional evidence
-        return False, f"probe failed: {error}"
-
-
 def tail(path: pathlib.Path, lines: int = 40) -> str:
     try:
         content = path.read_text("utf-8", "replace").splitlines()
@@ -438,11 +453,324 @@ def kafka_topic_contains(topic: str, needle: str) -> tuple[bool, str]:
 
 
 # --------------------------------------------------------------------------- #
+# Kafka Connect REST / docker helpers for the failover and recovery drills.
+# --------------------------------------------------------------------------- #
+def connect_request(method: str, path: str, payload: dict | None = None,
+                    timeout: float = 10.0):
+    """Send one request to the first reachable Connect worker.
+
+    Any worker answers cluster-wide connector state, so a stopped worker must
+    not stop the drill or the monitor. Connection errors fail over; HTTP errors
+    are returned (they are the answer, not a transport problem).
+    """
+    last_error = None
+    for base in CONNECT_URLS:
+        try:
+            status, headers, body = http_json(method, base + path, payload,
+                                              timeout=timeout)
+        except Exception as error:  # noqa: BLE001 - try the next worker
+            last_error = error
+            continue
+        if method != "GET" and status == 409:
+            # Only the group leader accepts some writes; the peer may be leader.
+            last_error = RuntimeError(f"{base} is not the leader: {body}")
+            continue
+        return status, headers, body
+    raise RuntimeError(f"Kafka Connect REST unreachable at {CONNECT_URLS}: {last_error}")
+
+
+def connector_status(name: str) -> dict:
+    status, _, body = connect_request("GET", f"/connectors/{name}/status")
+    if status != 200 or not isinstance(body, dict):
+        raise RuntimeError(f"connector {name} status HTTP {status}: {body}")
+    return body
+
+
+def connector_state(status: dict) -> str:
+    return str(((status or {}).get("connector") or {}).get("state") or "")
+
+
+def connector_all_running(status: dict) -> bool:
+    tasks = (status or {}).get("tasks") or []
+    return (connector_state(status) == "RUNNING" and bool(tasks) and
+            all(task.get("state") == "RUNNING" for task in tasks))
+
+
+def wait_connector(name: str, predicate, timeout: float = 180.0, poll: float = 2.0,
+                   description: str = "condition") -> dict:
+    deadline = time.time() + timeout
+    last: dict = {}
+    while time.time() < deadline:
+        try:
+            last = connector_status(name)
+        except Exception as error:  # noqa: BLE001 - a worker may be down
+            last = {"_error": str(error)}
+        if predicate(last):
+            return last
+        time.sleep(poll)
+    raise RuntimeError(f"{name} did not reach {description} within {timeout:.0f}s: {last}")
+
+
+def set_connector_paused(name: str, paused: bool) -> None:
+    action = "pause" if paused else "resume"
+    status, _, body = connect_request("PUT", f"/connectors/{name}/{action}")
+    if status not in (200, 202, 204):
+        raise RuntimeError(f"{action} {name} HTTP {status}: {body}")
+
+
+def connect_worker_container(worker_id: str) -> tuple[str, str]:
+    """Map a Connect worker_id (hostname:port) to its compose service/container."""
+    host = str(worker_id or "").split(":")[0]
+    if not host:
+        raise RuntimeError("connector task has no worker_id")
+    for service, container in CONNECT_CONTAINERS.items():
+        if host == service:
+            return service, container
+        completed = subprocess.run(
+            ["docker", "inspect", "-f", "{{.Config.Hostname}}", container],
+            capture_output=True, text=True, timeout=20)
+        hostname = (completed.stdout or "").strip()
+        if hostname and host == hostname:
+            return service, container
+    raise RuntimeError(f"cannot map Kafka Connect worker {worker_id!r} to a compose container")
+
+
+def docker_action(*args: str, timeout: float = 120.0) -> str:
+    completed = subprocess.run(["docker", *args], capture_output=True, text=True,
+                               timeout=timeout)
+    if completed.returncode != 0:
+        raise RuntimeError(f"docker {' '.join(args)} failed: {completed.stderr.strip()}")
+    return (completed.stdout or "").strip()
+
+
+# --------------------------------------------------------------------------- #
+# Cache-change markers and Kafka message decoding.
+# --------------------------------------------------------------------------- #
+def insert_lease_marker(namespace: str, marker: str) -> None:
+    mysql_query(
+        f"INSERT INTO {MYSQL_DATABASE}.document_leases "
+        f"(namespace, resource, owner, operation_id, expires_at) VALUES "
+        f"('{namespace}', '{marker}', 'e2e', NULL, UNIX_TIMESTAMP() + 120);")
+
+
+def delete_lease_marker(namespace: str, marker: str) -> None:
+    mysql_query(
+        f"DELETE FROM {MYSQL_DATABASE}.document_leases "
+        f"WHERE namespace = '{namespace}' AND resource = '{marker}';")
+
+
+def kafka_consume_values(topic: str, timeout_ms: int = 5000,
+                         max_messages: int | None = None) -> list[str]:
+    args = [
+        "docker", "exec", "praxis-rag-kafka",
+        "/opt/kafka/bin/kafka-console-consumer.sh",
+        "--bootstrap-server", "kafka:9092",
+        "--topic", topic,
+        "--from-beginning",
+        "--timeout-ms", str(timeout_ms),
+    ]
+    if max_messages:
+        args += ["--max-messages", str(max_messages)]
+    completed = subprocess.run(args, capture_output=True, text=True,
+                               timeout=timeout_ms / 1000 + 30)
+    return [line for line in (completed.stdout or "").splitlines() if line.strip()]
+
+
+def decode_kafka_values(kind: str, values: list[str], op: str | None = None):
+    """Run dist/bin/rag-connect decode over real Kafka values.
+
+    The CLI calls internal/mq, the same production decoder the workers use, so a
+    successful decode proves the deployed converter/routing shape still matches
+    the Go contract — not just that a fixture parses.
+    """
+    if not values:
+        return [], None
+    path = WORK / f"decode-{kind}-{time.time_ns()}.ndjson"
+    path.write_text("\n".join(values) + "\n", encoding="utf-8")
+    args = [str(CONNECT_EXE), "decode", "--kind", kind, "--input", str(path),
+            "--limit", "0"]
+    if op:
+        args += ["--op", op]
+    completed = subprocess.run(args, capture_output=True, text=True, timeout=120)
+    decoded: list[dict] = []
+    for line in (completed.stdout or "").splitlines():
+        try:
+            decoded.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return decoded, completed
+
+
+def wait_kafka_marker(topic: str, marker: str, timeout: float = 90.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        found, _ = kafka_topic_contains(topic, marker)
+        if found:
+            return True
+        time.sleep(2)
+    return False
+
+
+def submit_and_wait(mcp: "MCP", name: str, content: str, key: str,
+                    timeout: float = 240.0) -> tuple[str, dict]:
+    admitted = mcp.call_tool("add_document", {
+        "name": name, "content": content, "idempotency_key": key,
+    })
+    artifact_id = admitted.get("artifact_id", "")
+    if not artifact_id:
+        raise RuntimeError(f"add_document rejected: {admitted}")
+    deadline = time.time() + timeout
+    payload: dict = {}
+    while time.time() < deadline:
+        payload = mcp.call_tool("get_document_status", {"artifact_id": artifact_id})
+        if payload.get("status") in ("succeeded", "failed"):
+            break
+        time.sleep(1.5)
+    return artifact_id, payload
+
+
+# --------------------------------------------------------------------------- #
+# Acceptance drills (items 2, 3 and 4 of the Kafka Connect migration).
+# --------------------------------------------------------------------------- #
+def acceptance_independent_capture(mcp: "MCP", namespace: str) -> str:
+    """Pause cache capture, write a cache change and a document, resume."""
+    marker = f"e2e-cache-{int(time.time() * 1000)}"
+    paused = False
+    try:
+        set_connector_paused(CACHE_CONNECTOR, True)
+        paused = True
+        wait_connector(CACHE_CONNECTOR,
+                       lambda status: connector_state(status) in ("PAUSED", "STOPPED"),
+                       60, 1, "PAUSED")
+        insert_lease_marker(namespace, marker)
+        artifact, payload = submit_and_wait(
+            mcp, f"independent-{int(time.time())}.md",
+            "# Independent capture\n\nThe document path must keep working while cache capture is paused.\n",
+            f"e2e-independent-{int(time.time())}")
+        check(payload.get("status") == "succeeded",
+              f"document completed while the cache connector was paused (artifact={mask(artifact)})")
+        check(connector_state(connector_status(CACHE_CONNECTOR)) in ("PAUSED", "STOPPED"),
+              "cache connector stayed paused while the document reached the document worker")
+    finally:
+        if paused:
+            try:
+                set_connector_paused(CACHE_CONNECTOR, False)
+            except Exception as error:  # noqa: BLE001 - keep the original failure
+                print("WARN could not resume the cache connector:", error)
+    resumed = wait_connector(CACHE_CONNECTOR, connector_all_running, 180, 2,
+                             "RUNNING after resume")
+    check(connector_all_running(resumed),
+          "cache connector resumed to RUNNING after the paused document completed")
+    check(wait_kafka_marker(CACHE_TOPIC, marker, 90),
+          "cache connector delivered the change queued while it was paused (saved binlog offset)")
+    return marker
+
+
+def acceptance_worker_failover(mcp: "MCP", namespace: str,
+                               stopped_containers: set[str]) -> str:
+    """Stop the worker that owns the document task, submit, require peer takeover."""
+    status = connector_status(DOCUMENT_CONNECTOR)
+    task = next((item for item in status.get("tasks") or []
+                 if item.get("state") == "RUNNING"), None)
+    if task is None:
+        raise RuntimeError(f"no RUNNING document task to fail over: {status}")
+    service, container = connect_worker_container(task.get("worker_id", ""))
+    check(True, f"document task currently runs on {service} ({task.get('worker_id')})")
+
+    stopped_containers.add(container)
+    docker_action("stop", container, timeout=180)
+    check(True, f"stopped Kafka Connect worker {service} during the drill")
+
+    def on_peer(candidate: dict) -> bool:
+        if not connector_all_running(candidate):
+            return False
+        for item in candidate.get("tasks") or []:
+            try:
+                peer, _ = connect_worker_container(item.get("worker_id", ""))
+            except Exception:  # noqa: BLE001 - stale worker id during rebalance
+                continue
+            if peer != service:
+                return True
+        return False
+
+    try:
+        artifact, payload = submit_and_wait(
+            mcp, f"failover-{int(time.time())}.md",
+            "# Worker failover\n\nThis document is submitted while the owning Connect worker is stopped.\n",
+            f"e2e-failover-{int(time.time())}", timeout=300)
+        moved = wait_connector(DOCUMENT_CONNECTOR, on_peer, 240, 2,
+                               "RUNNING on the peer worker")
+        check(payload.get("status") == "succeeded",
+              f"document submitted during takeover reached the Go document worker "
+              f"(artifact={mask(artifact)})")
+        check(on_peer(moved),
+              f"document task was reassigned to the peer worker ({moved.get('tasks')})")
+    finally:
+        docker_action("start", container, timeout=180)
+        stopped_containers.discard(container)
+        wait_connector(DOCUMENT_CONNECTOR, connector_all_running, 240, 2,
+                       "RUNNING after the stopped worker restarted")
+    return artifact
+
+
+def acceptance_task_restart(mcp: "MCP", namespace: str,
+                            locked_users: set[str]) -> str:
+    """Fail only the cache task (account lock) and rely on the supervisor."""
+    marker = f"e2e-restart-{int(time.time() * 1000)}"
+    mysql_query(f"ALTER USER '{CACHE_CDC_USER}'@'%' ACCOUNT LOCK;")
+    locked_users.add(CACHE_CDC_USER)
+    try:
+        connection_ids = [
+            line.strip() for line in mysql_query(
+                "SELECT id FROM information_schema.processlist "
+                f"WHERE user = '{CACHE_CDC_USER}';").splitlines()
+            if line.strip().isdigit()
+        ]
+        for connection_id in connection_ids:
+            try:
+                mysql_query(f"KILL {int(connection_id)};")
+            except Exception as error:  # noqa: BLE001 - the connection may be gone
+                print(f"INFO KILL {connection_id} failed: {error}")
+    except Exception:
+        mysql_query(f"ALTER USER '{CACHE_CDC_USER}'@'%' ACCOUNT UNLOCK;")
+        locked_users.discard(CACHE_CDC_USER)
+        raise
+
+    wait_connector(CACHE_CONNECTOR,
+                   lambda status: any(task.get("state") == "FAILED"
+                                      for task in status.get("tasks") or []),
+                   240, 2, "a FAILED cache task")
+    check(True, "cache task entered FAILED while both Kafka Connect workers stayed online")
+    check(connector_all_running(connector_status(DOCUMENT_CONNECTOR)),
+          "document connector kept running while only the cache task failed")
+
+    mysql_query(f"ALTER USER '{CACHE_CDC_USER}'@'%' ACCOUNT UNLOCK;")
+    locked_users.discard(CACHE_CDC_USER)
+    recovered = wait_connector(CACHE_CONNECTOR, connector_all_running, 240, 2,
+                               "RUNNING after the fault was cleared")
+    check(connector_all_running(recovered),
+          "cache task returned to RUNNING without a manual REST restart (supervisor)")
+    insert_lease_marker(namespace, marker)
+    check(wait_kafka_marker(CACHE_TOPIC, marker, 90),
+          "cache delivery resumed after the automatic task restart")
+    delete_lease_marker(namespace, marker)
+
+    artifact, payload = submit_and_wait(
+        mcp, f"after-restart-{int(time.time())}.md",
+        "# After task restart\n\nThe document path still works after the cache task recovered.\n",
+        f"e2e-after-restart-{int(time.time())}")
+    check(payload.get("status") == "succeeded",
+          f"document path still delivers after the cache task recovery "
+          f"(artifact={mask(artifact)})")
+    return marker
+
+
+# --------------------------------------------------------------------------- #
 # Main flow.
 # --------------------------------------------------------------------------- #
 def main() -> int:
-    if not BIN.joinpath("rag-service.exe").exists():
-        print("missing dist/bin binaries; run scripts/build-go.ps1 first")
+    if not BIN.joinpath("rag-service.exe").exists() or not CONNECT_EXE.exists():
+        print("missing dist/bin binaries (rag-service / rag-connect); run scripts/build-go.ps1 first")
         return 2
     if WORK.exists():
         shutil.rmtree(WORK, ignore_errors=True)
@@ -457,6 +785,8 @@ def main() -> int:
     document_name = f"bridge-{int(time.time())}.md"
     service_process = None
     worker_process = None
+    stopped_containers: set[str] = set()
+    locked_users: set[str] = set()
     try:
         env = base_env()
         service_process, service_log = start_process(
@@ -562,17 +892,32 @@ def main() -> int:
         check(status == 200 and any(document_name in str(name) for name in names),
               f"REST search returns the indexed document (hits={len(hits)})")
 
-        # Schema-4 task notification: locator columns only, no body.
-        delivered, probe_output = kafka_probe(artifact_id)
-        if delivered:
-            check('"schedule_version"' in probe_output,
-                  f"task topic event carries the schema-4 schedule_version locator in {DOCUMENT_TOPIC}")
-            check('"content"' not in probe_output,
-                  "task topic event carries no document body (column.include.list pruned)")
-        else:
-            print("INFO kafka-console-consumer could not replay the artifact message for this probe; "
-                  "the succeeded job plus the committed document_jobs row are the conclusive evidence "
-                  "that the task connector delivered it")
+        # Item 5a: the deployed connector JSON/topic shape must be understood by
+        # the SAME Go decoder the document worker uses — not by a fixture.
+        decode_run = None
+        try:
+            decoded_documents, decode_run = decode_kafka_values(
+                "document", kafka_consume_values(DOCUMENT_TOPIC))
+            doc_event = next((item for item in decoded_documents
+                              if item.get("artifact_id") == artifact_id), None)
+            for _ in range(5):
+                if doc_event is not None:
+                    break
+                time.sleep(2)
+                decoded_documents, decode_run = decode_kafka_values(
+                    "document", kafka_consume_values(DOCUMENT_TOPIC))
+                doc_event = next((item for item in decoded_documents
+                                  if item.get("artifact_id") == artifact_id), None)
+            check(doc_event is not None and doc_event.get("namespace") == namespace and
+                  int(doc_event.get("schedule_version") or 0) >= 1,
+                  "production Go document decoder extracts artifact_id/namespace/"
+                  "schedule_version from a real Kafka Connect message")
+            if doc_event is not None:
+                check("content" not in doc_event,
+                      "the decoded document notification carries locators only (no body)")
+        except Exception as error:  # noqa: BLE001 - contract check must be conclusive
+            check(False, f"could not decode a real document notification: {error}")
+            print(f"decode stderr: {(decode_run.stderr or '')[-2000:] if decode_run else ''}")
 
         # ------------------------------------------------------------------ #
         # Acceptance 1: the cache connector captures the same write as a
@@ -594,6 +939,37 @@ def main() -> int:
             f"WHERE kind = 'documents' AND scope = '{namespace}';")
         check(revision.isdigit() and int(revision) > 0,
               f"cache revision for documents('{namespace}') advanced (revision={revision})")
+
+        # ------------------------------------------------------------------ #
+        # Acceptance 2: document and cache capture are independent. Pause the
+        # cache connector, queue a cache change, and submit a document: the
+        # document worker must claim it while cache capture is still paused.
+        # ------------------------------------------------------------------ #
+        independent_marker = acceptance_independent_capture(mcp, namespace)
+        delete_lease_marker(namespace, independent_marker)
+        check(wait_kafka_marker(CACHE_TOPIC, independent_marker, 90),
+              "cache connector delivered the lease delete event after it resumed")
+        cache_run = None
+        try:
+            cache_values = kafka_consume_values(CACHE_TOPIC)
+            decoded_cache, cache_run = decode_kafka_values(
+                "cache", cache_values, op="d")
+            delete_event = next(
+                (item for item in decoded_cache
+                 if item.get("table") == "document_leases" and
+                 (item.get("before") or {}).get("resource") == independent_marker),
+                None)
+            check(delete_event is not None,
+                  "production Go cache decoder extracts source.table/op/before "
+                  "locators from a real delete event")
+            if delete_event is not None:
+                before = delete_event.get("before") or {}
+                check(before.get("namespace") == namespace and
+                      before.get("owner") == "e2e",
+                      f"cache delete event keeps pre-delete locator fields (before={before})")
+        except Exception as error:  # noqa: BLE001 - contract check must be conclusive
+            check(False, f"could not decode a real cache delete event: {error}")
+            print(f"decode stderr: {(cache_run.stderr or '')[-2000:] if cache_run else ''}")
 
 
         # Business document deletion remains a separate path and must still work.
@@ -618,6 +994,21 @@ def main() -> int:
             "DELETE", SERVICE + "/v1/documents/" + second_name, None,
             {"Authorization": "Bearer " + api_key, "X-RAG-Namespace": namespace})
         check(delete_status == 200, f"business document delete still works (HTTP {delete_status})")
+
+        # ------------------------------------------------------------------ #
+        # Acceptance 3: stop the Connect worker that owns the document task,
+        # submit a document during takeover, and require the peer to deliver it
+        # to the Go document worker (RUNNING alone is not proof of delivery).
+        # ------------------------------------------------------------------ #
+        acceptance_worker_failover(mcp, namespace, stopped_containers)
+
+        # ------------------------------------------------------------------ #
+        # Acceptance 4: workers stay online but the cache task fails (its CDC
+        # account is locked and its connections killed). After clearing the
+        # fault, the supervisor must restart only that task without a manual
+        # REST restart; the document path keeps working.
+        # ------------------------------------------------------------------ #
+        acceptance_task_restart(mcp, namespace, locked_users)
 
         # ------------------------------------------------------------------ #
         # Acceptance 3: the monitor contract exposes both Debezium connectors,
@@ -646,11 +1037,33 @@ def main() -> int:
         cache_connector = debezium_section.get("cache") or {}
         check(tasks_section.get("capture_progress") is None and
               cache_connector.get("capture_progress") is None,
-              "Debezium capture progress is null for both connectors (never fabricated)")
-        check(tasks_section.get("status") in ("ok", "unknown"),
-              f"task connector health is ok/unknown (status={tasks_section.get('status')})")
-        check(cache_connector.get("status") in ("ok", "unknown"),
-              f"cache connector health is ok/unknown (status={cache_connector.get('status')})")
+              "capture progress is null for both connectors (binlog offsets live in "
+              "Kafka Connect, never fabricated)")
+        check(tasks_section.get("connector") == DOCUMENT_CONNECTOR and
+              cache_connector.get("connector") == CACHE_CONNECTOR,
+              f"monitor names the two fixed connectors "
+              f"({tasks_section.get('connector')}/{cache_connector.get('connector')})")
+        check(tasks_section.get("status") == "ok" and cache_connector.get("status") == "ok",
+              f"both capture connectors are ok after the drills "
+              f"(document={tasks_section.get('status')}, cache={cache_connector.get('status')})")
+        for label, section in (("document", tasks_section), ("cache", cache_connector)):
+            check(section.get("connector_state") == "RUNNING",
+                  f"{label} connector_state is RUNNING ({section.get('connector_state')})")
+            check(bool(section.get("worker_id")),
+                  f"{label} connector reports its hosting worker ({section.get('worker_id')})")
+            check(bool(section.get("tasks")) and
+                  all(task.get("state") == "RUNNING"
+                      for task in section.get("tasks") or []),
+                  f"{label} task state is RUNNING ({section.get('tasks')})")
+            check(section.get("supervised") is True,
+                  f"{label} connector is supervised by the service")
+            check(section.get("failed_tasks") == 0,
+                  f"{label} connector has no currently failed task")
+        check(cache_connector.get("last_restart_at") or
+              cache_connector.get("recovery") == "recovered",
+              "monitor kept the cache task's automatic restart result "
+              f"(last_restart_at={cache_connector.get('last_restart_at')}, "
+              f"recovery={cache_connector.get('recovery')})")
         cache_section = pipeline_section.get("cache") or {}
         dirty_keys = cache_section.get("dirty_keys")
         refresh_failures = cache_section.get("refresh_failures")
@@ -676,6 +1089,21 @@ def main() -> int:
         print(f"ERROR: {error}", flush=True)
         results.append((False, f"exception: {error}"))
     finally:
+        # Leave the environment usable even when a drill failed midway.
+        for user in list(locked_users):
+            try:
+                mysql_query(f"ALTER USER '{user}'@'%' ACCOUNT UNLOCK;")
+            except Exception:  # noqa: BLE001 - best effort cleanup
+                pass
+        for container in list(stopped_containers):
+            try:
+                docker_action("start", container)
+            except Exception:  # noqa: BLE001 - best effort cleanup
+                pass
+        try:
+            set_connector_paused(CACHE_CONNECTOR, False)
+        except Exception:  # noqa: BLE001 - connector may not exist in this run
+            pass
         stop_process(worker_process)
         stop_process(service_process)
         model_server.shutdown()
@@ -690,8 +1118,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-
-
-

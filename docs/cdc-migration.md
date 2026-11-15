@@ -4,17 +4,23 @@
 - 迁移目标：删除 `document_job_outbox`、`search_task_outbox`、`cache_outbox`、历史 `document_task_outbox` 的写入/轮询/补发/清理；改由 Debezium 直接采集**任务表**和**影响缓存的业务表**，按表与事件用途路由到独立 topic；MySQL 仍是唯一事实来源，Kafka 只传通知。
 - **2026-11-13 二次调整（搜索同步化）**：搜索改为一次调用同步返回，搜索任务/结果快照/搜索 topic/消费者/死信全部下线；`search_tasks`、`search_result_snapshots` 保留历史数据、不再读写。因此本文的搜索链路（schema 3 通知、搜索 worker、提交即受理、结果快照）均标为**历史/已下线**，迁移入口见 §12。文档任务（schema 4）与缓存链路不变。
 
+- **2026-11-15 部署升级（分布式 Kafka Connect）**：两个连接器不再由两个 Debezium Server 进程运行，而是以 task 形式注册到同一分布式 Kafka Connect 集群（生产 ≥2 台机器、同一连接器版本）。连接器配置、source offset（binlog 位点）与 task 状态保存在 Kafka 内部 topic `praxis_connect_configs` / `praxis_connect_offsets` / `praxis_connect_status`；每个连接器使用独立的 schema history topic。旧 Debezium Server 的文件位点**不能导入**，首次启动按 `snapshot.mode=initial` 做初始快照；worker 故障由 Connect group rebalance 接管并从保存位点继续，FAILED task 由 `rag-service` supervisor 自动重启。操作与演练见 [deploy/kafka-connect/README.md](../deploy/kafka-connect/README.md)。
+
 ## 1. 目标架构
 
 ```text
-                    ┌──────────────────── Debezium（任务连接器，只采集 INSERT / schedule_version 变化）────────────────────┐
-document_jobs ──────┤ skipped.operations=d；column.include.list 只含 artifact_id/namespace/schedule_version；               ├─► praxis_document_ingest
-                    │ skip.messages.without.change=true；ByLogicalTableRouter 按表路由                                      │
-                    └──────────────────────────────────────────────────────────────────────────────────────────────────────┘
-                    ┌──────────── Debezium（缓存连接器，采集影响缓存读模型的业务表，全量 c/u/d）───────────────┐
-knowledge_bases ────┤ column.include.list 只含定位标识；ByLogicalTableRouter 路由到单一缓存 topic                ├─► praxis_state_cache_refresh
-documents / mcp_catalogs / api_keys / document_heads / document_leases / upload_operations / upload_steps ─┘
+                    ┌──────── Kafka Connect 集群（connect-1 / connect-2，同一 GROUP_ID）────────┐
+                    │ connect 内部 topic：configs / offsets / status                                    │
+document_jobs ──────┤ praxis-document-cdc（只采集 INSERT / schedule_version 变化；                    ├─► praxis_document_ingest
+                    │   skipped.operations=d；column.include.list 只含定位列；                          │
+                    │   skip.messages.without.change=true；ByLogicalTableRouter）                       │
+                    │                                                                                  │
+knowledge_bases ────┤ praxis-cache-cdc（采集 8 张读模型表，全量 c/u/d；                              ├─► praxis_state_cache_refresh
+documents / mcp_catalogs / api_keys / document_heads / document_leases / upload_operations / upload_steps ┘
+                    └──────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+每个连接器另有独立的 schema history topic（`praxis_cdc_document_schema_history` / `praxis_cdc_cache_schema_history`）；两个连接器使用不同的 `database.server.id` 与独立 MySQL 账号。
 
 两个消费者完全独立，各自一个 topic + 消费组（搜索为同步执行，不再有消费者）：
 
@@ -137,7 +143,7 @@ Debezium 的行级过滤 `io.debezium.transforms.Filter` 依赖 JSR-223 脚本�
 
 ### 4.4 为什么是两个 Debezium 连接器
 
-任务表需要"只投递 INSERT 与调度版本变化"，缓存表需要"每次行变更都投递（含删除）"。`skipped.operations` / `skip.messages.without.change` 是**连接器级**配置，无法按表差异化，因此拆成两个 Debezium Server 实例（同一 MySQL，不同 `database.server.id`、不同 offset/schema-history 文件、不同健康端口）。
+任务表需要"只投递 INSERT 与调度版本变化"，缓存表需要"每次行变更都投递（含删除）"。`skipped.operations` / `skip.messages.without.change` 是**连接器级**配置，无法按表差异化，因此拆成两个连接器（同一 MySQL，不同 `database.server.id`、不同 schema history topic、独立 MySQL 账号）。二者运行在同一分布式 Kafka Connect 集群中，但配置、位点与消费路径相互独立。
 
 ## 5. Worker 领取、续租与提交
 
@@ -209,15 +215,16 @@ Redis 写入失败、缓存刷新失败不是 nack 理由：缓存有独立的�
 
 前提：应用写入口已升级到"无 outbox 写入 + schedule_version"版本，旧 worker 已停止。
 
-1. **记录 CDC 起始位置**：停写窗口内执行 `SHOW MASTER STATUS`，把 `File/Position` 写入 `cdc_cutover_state`（CLI `--record-position`）。
-2. **盘点**：`rag-cdc-cutover --inventory` 输出未完成文档任务（按状态/最老年龄）、缓存 key 数、各 key 当前 revision（搜索任务不再盘点；历史 `search_tasks` 行原样保留）。
-3. **启动缓存连接器**：初始快照会把业务表现存行全部投递一次 → 缓存消费者递增 revision 并重建，形成"新版本基线"。
-4. **启动任务连接器**：初始快照为 `document_jobs` 现存行投递 `op=r`；`rag-cdc-cutover --backfill` 对仍未完成的任务在事务内把 `schedule_version` 递增到基线（例如 `schedule_version = GREATEST(schedule_version, baseline) + 1`），确保每个未完成任务都有一条可消费通知，避免"快照完成前的 UPDATE 丢失"。
-5. **核对**：`--verify` 断言所有活动任务 `schedule_version >= baseline+1`；脚本消费两个 topic 统计 ID 集合，与 MySQL 未完成任务集合比对（允许消费侧安全跳过的终态/重复）。
-6. **放量**：恢复写入口，继续观察 Debezium 延迟、Kafka 积压、脏缓存数归零。
-7. **下线旧表**：确认无旧进程写入后执行 `rag-service-migrate --retire-outbox`（删除 4 张 outbox 表），并更新 `docs/USAGE.md` 的升级步骤。
+1. **备份与保留旧状态**：备份 MySQL（含 4 张旧 outbox 表）；保留旧服务/worker 二进制、旧 Debezium Server 配置与 `debezium_data` / `debezium_cache_data` 卷。**旧文件位点不能导入 Connect**，新连接器首次启动会做初始快照。
+2. **记录 CDC 起始位置**：停写窗口内执行 `SHOW MASTER STATUS`，把 `File/Position` 写入 `cdc_cutover_state`（CLI `--record-position`）。该记录只用于切换核对；`rag-cdc-cutover` **不读取也不迁移** Kafka Connect 的 source offset（`praxis_connect_offsets`），Connect 首次启动仍按 `snapshot.mode=initial` 建立自己的位点。
+3. **盘点**：`rag-cdc-cutover --inventory` 输出未完成文档任务（按状态/最老年龄）、缓存 key 数、各 key 当前 revision（搜索任务不再盘点；历史 `search_tasks` 行原样保留）。
+4. **启动 Connect 并注册**：至少两个 worker、同一 `DEBEZIUM_CONNECT_VERSION`，用 `rag-connect register` 按固定名称注册两个连接器并等待 connector/task `RUNNING`。缓存连接器的初始快照会把业务表现存行全部投递一次 → 缓存消费者递增 revision 并重建，形成"新版本基线"。
+5. **任务连接器补投**：初始快照为 `document_jobs` 现存行投递 `op=r`；`rag-cdc-cutover --backfill` 对仍未完成的任务在事务内把 `schedule_version` 递增到基线（例如 `schedule_version = GREATEST(schedule_version, baseline) + 1`），确保每个未完成任务都有一条可消费通知，避免"快照完成前的 UPDATE 丢失"。
+6. **核对**：`--verify` 断言所有活动任务 `schedule_version >= baseline+1`；脚本消费两个 topic 统计 ID 集合，与 MySQL 未完成任务集合比对（允许消费侧安全跳过的终态/重复）。
+7. **放量**：恢复写入口，继续观察连接器/task 状态、所在 worker、Kafka 积压、脏缓存数归零。
+8. **下线旧表**：确认无旧进程写入后执行 `rag-service-migrate --retire-outbox`（删除 4 张 outbox 表），并更新 `docs/USAGE.md` 的升级步骤。
 
-回滚：保留旧表迁移前的备份；切换窗口内回滚需要同时回退服务/worker 二进制与 Debezium 连接器（offset 文件保留，重新启动会从旧位点继续，消费者幂等）。
+回滚：保留旧表迁移前的备份；切换窗口内回滚需要同时回退服务/worker 二进制、恢复旧 Debezium Server 服务与两个旧卷（旧实例从文件位点继续），并停掉 `connect-1`/`connect-2`/`connect-init`。Connect 的 `praxis_connect_*` 内部 topic 与 `praxis_cdc_*_schema_history` 不被旧部署使用，确认无其他连接器后再清理；消费者按 `schedule_version` 幂等吸收重复。
 
 ## 9. 下线旧机制清单
 
@@ -231,9 +238,10 @@ Redis 写入失败、缓存刷新失败不是 nack 理由：缓存有独立的�
 
 | 旧指标 | 新指标 |
 | --- | --- |
-| `pipeline.outbox`（`document_job_outbox` 状态/最老记录） | `pipeline.debezium`（任务/缓存两个连接器健康）+ `pipeline.kafka`（文档/缓存两个业务 topic 的消费组积压） |
+| `pipeline.outbox`（`document_job_outbox` 状态/最老记录） | `pipeline.debezium.tasks` / `.cache`（两个命名连接器的 connector/task 状态、所在 worker、失败原因、自动重启次数与恢复结果）+ `pipeline.kafka`（文档/缓存两个业务 topic 的消费组积压） |
 | 搜索 outbox 状态 | 已随搜索同步化移除（`queues.search_tasks` 不再存在） |
 | 文档 outbox 积压 | `queues.document_jobs`：按状态/阶段计数、最老排队、租约过期数、近期失败数 |
+| Debezium `/q/health` | `GET /connectors/{name}/status`（集群任意 worker 可答）；`capture_progress` 保持 `null`，因为 binlog 位点在 Connect offset topic |
 | — | `cache`：脏 key 数（`refreshed_revision < revision`）、刷新失败数（`last_error` 非空）、最近刷新时间 |
 
 Console 监控页字段、`/v1/admin/monitor/overview` 响应、`internal/monitor` 测试同步调整；README/USAGE/DEPLOYMENT 的 outbox 说明全部替换。结果快照计数与搜索 DLQ 指标随同步化一并删除。
@@ -245,6 +253,10 @@ Console 监控页字段、`/v1/admin/monitor/overview` 响应、`internal/monito
 | 文档受理与补发 | 受理后无 outbox 写入；Sweep 对滞留 queued / 租约过期 processing 递增版本；重复投递旧版本 | 每个未完成任务恰有一次可消费通知；旧版本/终态/有效租约被安全跳过；DB 落库后才 ACK |
 | 排队搜索与结果读取（已下线） | ~~Submit 返回 result_id / 超时收敛 / Redis 回源~~ | **已随 2026-11-13 搜索同步化删除**；新断言见 §12：`search` 一次返回、无 `result_id`、artifact 独立读取 |
 | 手工 SQL → Redis 收敛 | 直接 `UPDATE/DELETE/同名重建` 业务表 → Debezium 事件 → 消费者 bump revision + 重建 | Redis 最终等于 MySQL 脱敏视图；旧回填被 watermark 拒绝 |
+| 两路采集独立 | 暂停缓存连接器，产生缓存变更并提交文档 | 文档连接器不受影响、文档任务 `succeeded`；resume 后缓存连接器从保存位点补齐变更 |
+| worker 宕机接管 | 停止承载 document task 的 Connect worker，在接管窗口提交文档 | 对端 worker 的 task `RUNNING`，文档实际被 Go worker 领取并 `succeeded`，通知到达 Kafka |
+| task FAILED 自动恢复 | worker 在线，锁定缓存 CDC 账号并 kill 连接使 task FAILED，再解锁 | supervisor 只重启失败 task，无人工 REST 重启；缓存恢复投递，文档路径持续成功；Console 保留失败原因/重启次数/恢复结果 |
+| 解码契约 | 对真实 Kafka 文档通知与缓存删除事件运行 `rag-connect decode` | 提取 `artifact_id`/`namespace`/`schedule_version` 与 `source.table`/`op`/`before` 定位字段 |
 | 故障演练 | Debezium 暂停/恢复、Kafka 重复投递、worker 领取后崩溃、Redis 写入失败 | 任务不丢、终态一致、缓存最终恢复、无死信风暴 |
 
 测试以 Go 单测/集成测试（有 `RAG_TEST_MYSQL_URL` 时）覆盖；实机链路用 `scripts/verify-*.py` 与 Compose 验证，未实机验证项明确记录在 `VALIDATION.md`。

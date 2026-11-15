@@ -236,7 +236,7 @@ Kafka 通知统一由两个 Debezium 连接器从 MySQL 表级采集投递。API
 缓存连接器读取 8 张业务表并发送到 `RAG_CACHE_TOPIC`。搜索为同步执行，不产生通知，
 也没有搜索 topic/消费组（原 `search_tasks` 采集已删除）。
 应用没有 outbox 轮询发布器或投递模式开关（该机制已于 2026-11-13 下线）。
-连接器配置见 [deploy/debezium/README.md](../deploy/debezium/README.md) 与 [CDC 迁移契约](cdc-migration.md)。
+连接器配置见 [deploy/kafka-connect/README.md](../deploy/kafka-connect/README.md) 与 [CDC 迁移契约](cdc-migration.md)。
 
 The Kafka message contains identifiers only:
 `{"schema": 4, "artifact_id", "namespace", "schedule_version"}`. No file bytes,

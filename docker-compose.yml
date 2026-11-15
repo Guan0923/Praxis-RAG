@@ -10,6 +10,14 @@ services:
       MYSQL_USER: ${RAG_MYSQL_USER:-rag}
       MYSQL_PASSWORD: ${RAG_MYSQL_PASSWORD:?set RAG_MYSQL_PASSWORD in .env}
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+      # CDC accounts created on first init: one per Kafka Connect connector, so
+      # a credential/privilege incident on one capture path cannot stop the
+      # other. They differ by grants for failure-isolation drills; the app
+      # account above stays DML-only.
+      RAG_MYSQL_DEBEZIUM_USER: ${RAG_MYSQL_DEBEZIUM_USER:-debezium}
+      RAG_MYSQL_DEBEZIUM_PASSWORD: ${RAG_MYSQL_DEBEZIUM_PASSWORD:?set RAG_MYSQL_DEBEZIUM_PASSWORD in .env}
+      RAG_MYSQL_DEBEZIUM_CACHE_USER: ${RAG_MYSQL_DEBEZIUM_CACHE_USER:-debezium_cache}
+      RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD: ${RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD:?set RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD in .env}
       TZ: UTC
     ports:
       - "${RAG_MYSQL_PORT:-3307}:3306"
@@ -29,7 +37,8 @@ services:
       - --binlog-expire-logs-seconds=604800
     volumes:
       - mysql_data:/var/lib/mysql
-      # Creates the least-privilege CDC user used by Debezium on first init.
+      # Creates the least-privilege CDC accounts used by the Kafka Connect
+      # connectors on first init (one account per connector).
       - ./deploy/mysql/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
@@ -107,57 +116,53 @@ services:
       retries: 30
       start_period: 20s
 
-  # Task CDC connector: tails the MySQL binlog of document_jobs and
-  # publishes identifier-only notifications to Kafka with the native Debezium
-  # Kafka sink. Connection-level filtering (captured columns +
-  # skip.messages.without.change + skipped.operations) delivers only INSERTs and
-  # schedule_version bumps. Enable with `docker compose up -d`.
-  # See deploy/debezium/README.md.
-  debezium:
-    image: ${DEBEZIUM_IMAGE:-quay.io/debezium/server:3.7.1.Final}
-    container_name: praxis-rag-debezium
+  # Distributed Kafka Connect (two workers, one group). The Debezium MySQL
+  # connector tails the binlog and publishes the async pipeline (no
+  # transactional outbox):
+  #   * praxis-document-cdc  document_jobs -> RAG_DOCUMENT_TOPIC
+  #   * praxis-cache-cdc     eight read-model tables -> RAG_CACHE_TOPIC
+  # Connector configs, source offsets and task status live in the three internal
+  # Kafka topics below, so losing a worker only rebalances its tasks: the peer
+  # resumes from the committed binlog offset. Schema history is per connector
+  # (see deploy/kafka-connect/connectors/*.json).
+  # Both workers run the same pinned image, i.e. the same Debezium MySQL
+  # Connector version; registration fails when a worker reports another version.
+  # Connectors are registered by fixed name from the start-stack script (host)
+  # or by the connect-init service (app profile); repeating either only updates a
+  # connector whose configuration actually changed.
+  connect-1:
+    image: ${DEBEZIUM_CONNECT_IMAGE:-quay.io/debezium/connect:3.7.1.Final}
+    container_name: praxis-rag-connect-1
     restart: unless-stopped
     depends_on:
       mysql:
         condition: service_healthy
       kafka:
         condition: service_healthy
-    environment:
-      RAG_MYSQL_HOST: mysql
-      RAG_MYSQL_PORT: "3306"
-      RAG_MYSQL_USER: ${RAG_MYSQL_DEBEZIUM_USER:-debezium}
-      RAG_MYSQL_PASSWORD: ${RAG_MYSQL_DEBEZIUM_PASSWORD:?set RAG_MYSQL_DEBEZIUM_PASSWORD in .env}
-      RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
-      # Container-internal bootstrap address. The host-facing value in .env is
-      # 127.0.0.1:9092; do not pass it into Debezium containers.
-      RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
-      # SMT target topic; must match the app-side RAG_DOCUMENT_TOPIC. The
-      # ByLogicalTableRouter transform in application.properties routes
-      # document_jobs to it.
-      RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
-      DEBEZIUM_SERVER_ID: ${DEBEZIUM_SERVER_ID:-184054}
-      QUARKUS_LOG_LEVEL: ${DEBEZIUM_LOG_LEVEL:-INFO}
+    environment: &connect-environment
+      # Documented Debezium Connect image variables. Use the container-internal
+      # broker listener; the host-facing 127.0.0.1:9092 value must not leak in.
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: ${RAG_CONNECT_GROUP_ID:-praxis-rag-connect}
+      # Internal topics: connector configs, source offsets (the binlog position
+      # that lets a peer resume after a worker failure) and task status.
+      CONFIG_STORAGE_TOPIC: ${RAG_CONNECT_CONFIG_TOPIC:-praxis_connect_configs}
+      OFFSET_STORAGE_TOPIC: ${RAG_CONNECT_OFFSET_TOPIC:-praxis_connect_offsets}
+      STATUS_STORAGE_TOPIC: ${RAG_CONNECT_STATUS_TOPIC:-praxis_connect_status}
+      # Single-broker dev stack. Production: use 3 (see docs/DEPLOYMENT.md).
+      CONFIG_STORAGE_REPLICATION_FACTOR: ${RAG_CONNECT_TOPIC_REPLICATION_FACTOR:-1}
+      OFFSET_STORAGE_REPLICATION_FACTOR: ${RAG_CONNECT_TOPIC_REPLICATION_FACTOR:-1}
+      STATUS_STORAGE_REPLICATION_FACTOR: ${RAG_CONNECT_TOPIC_REPLICATION_FACTOR:-1}
+      OFFSET_STORAGE_PARTITIONS: ${RAG_CONNECT_OFFSET_TOPIC_PARTITIONS:-25}
+      LOG4J_ROOT_LOGLEVEL: ${RAG_CONNECT_LOG_LEVEL:-INFO}
     ports:
-      # Loopback-only Quarkus health endpoint (/q/health) used by the Console
-      # monitor. It reports connector liveness, not the capture offset.
-      - "127.0.0.1:${RAG_DEBEZIUM_PORT:-8083}:8080"
-    volumes:
-      # Debezium Server reads its config from /debezium/config (not /debezium/conf).
-      - ./deploy/debezium/application.properties:/debezium/config/application.properties:ro
-      # Dedicated offset/schema-history volume: the task connector must resume
-      # from its own binlog position, never the cache connector's.
-      - debezium_data:/debezium/data
+      # Loopback-only REST API used by rag-connect (registration, status and the
+      # task restart supervisor) and by the Console monitor.
+      - "127.0.0.1:${RAG_CONNECT_PORT_1:-8083}:8083"
 
-  # Cache CDC connector: same MySQL, same Debezium image, but captures every
-  # create/update/delete of the business tables that feed the Redis read model
-  # and routes them to RAG_CACHE_TOPIC. Kept as a SEPARATE server instance
-  # because skipped.operations / skip.messages.without.change are
-  # connector-level settings that cannot differ per table (see
-  # docs/cdc-migration.md §4.4). It needs its own database.server.id,
-  # offset/schema-history volume and loopback health port.
-  debezium-cache:
-    image: ${DEBEZIUM_IMAGE:-quay.io/debezium/server:3.7.1.Final}
-    container_name: praxis-rag-debezium-cache
+  connect-2:
+    image: ${DEBEZIUM_CONNECT_IMAGE:-quay.io/debezium/connect:3.7.1.Final}
+    container_name: praxis-rag-connect-2
     restart: unless-stopped
     depends_on:
       mysql:
@@ -165,24 +170,54 @@ services:
       kafka:
         condition: service_healthy
     environment:
+      <<: *connect-environment
+    ports:
+      - "127.0.0.1:${RAG_CONNECT_PORT_2:-8084}:8083"
+
+  # One-shot connector registration used by the containerised (app profile)
+  # deployment. rag-connect waits for both workers, checks that each worker
+  # reports the pinned Debezium MySQL Connector version, then PUTs each connector
+  # by fixed name; an unchanged configuration is left alone. Re-run it with
+  # `docker compose --profile app up -d --force-recreate connect-init` after
+  # changing a template or credential.
+  connect-init:
+    image: ${RAG_APP_IMAGE:-praxis-rag:local}
+    container_name: praxis-rag-connect-init
+    profiles: ["app"]
+    restart: "no"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      connect-1:
+        condition: service_started
+      connect-2:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        /app/bin/rag-connect register --wait 180 &&
+        /app/bin/rag-connect wait --wait 180
+    environment:
+      RAG_CONNECT_URLS: http://connect-1:8083,http://connect-2:8083
+      RAG_CONNECT_CONNECTOR_DIR: /app/connect/connectors
+      RAG_CONNECT_DOCUMENT_CONNECTOR: ${RAG_CONNECT_DOCUMENT_CONNECTOR:-praxis-document-cdc}
+      RAG_CONNECT_CACHE_CONNECTOR: ${RAG_CONNECT_CACHE_CONNECTOR:-praxis-cache-cdc}
+      DEBEZIUM_CONNECT_VERSION: ${DEBEZIUM_CONNECT_VERSION:-3.7.1.Final}
       RAG_MYSQL_HOST: mysql
       RAG_MYSQL_PORT: "3306"
-      RAG_MYSQL_USER: ${RAG_MYSQL_DEBEZIUM_USER:-debezium}
-      RAG_MYSQL_PASSWORD: ${RAG_MYSQL_DEBEZIUM_PASSWORD:?set RAG_MYSQL_DEBEZIUM_PASSWORD in .env}
       RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
-      RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
-      # SMT target topic; must match the app-side RAG_CACHE_TOPIC.
+      RAG_MYSQL_DEBEZIUM_USER: ${RAG_MYSQL_DEBEZIUM_USER:-debezium}
+      RAG_MYSQL_DEBEZIUM_PASSWORD: ${RAG_MYSQL_DEBEZIUM_PASSWORD:?set RAG_MYSQL_DEBEZIUM_PASSWORD in .env}
+      RAG_MYSQL_DEBEZIUM_CACHE_USER: ${RAG_MYSQL_DEBEZIUM_CACHE_USER:-debezium_cache}
+      RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD: ${RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD:?set RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD in .env}
+      RAG_CONNECT_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
       RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
-      # Distinct binlog replication identity from the task connector.
+      RAG_CDC_DOCUMENT_SCHEMA_HISTORY_TOPIC: ${RAG_CDC_DOCUMENT_SCHEMA_HISTORY_TOPIC:-praxis_cdc_document_schema_history}
+      RAG_CDC_CACHE_SCHEMA_HISTORY_TOPIC: ${RAG_CDC_CACHE_SCHEMA_HISTORY_TOPIC:-praxis_cdc_cache_schema_history}
+      DEBEZIUM_SERVER_ID: ${DEBEZIUM_SERVER_ID:-184054}
       DEBEZIUM_CACHE_SERVER_ID: ${DEBEZIUM_CACHE_SERVER_ID:-184055}
-      QUARKUS_LOG_LEVEL: ${DEBEZIUM_LOG_LEVEL:-INFO}
-    ports:
-      # Loopback-only Quarkus health endpoint for the Console monitor. 8084
-      # keeps it distinct from the task connector's 8083.
-      - "127.0.0.1:${RAG_DEBEZIUM_CACHE_PORT:-8084}:8080"
-    volumes:
-      - ./deploy/debezium/application-cache.properties:/debezium/config/application.properties:ro
-      - debezium_cache_data:/debezium/data
 
   # PDF parsing microservice: PyMuPDF reads/renders/crops the PDF locally and
   # delegates layout, OCR, tables, formulas and picture descriptions to one
@@ -274,10 +309,8 @@ services:
         condition: service_healthy
       pdf-parser:
         condition: service_started
-      debezium:
-        condition: service_started
-      debezium-cache:
-        condition: service_started
+      connect-init:
+        condition: service_completed_successfully
     environment:
       RAG_SERVICE_TOKEN: ${RAG_SERVICE_TOKEN:-}
       RAG_SERVICE_HOST: "0.0.0.0"
@@ -301,12 +334,18 @@ services:
       RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
       RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
       RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
-      # Optional read-only Debezium health probes for the Console monitor: one
-      # per connector (tasks/cache). They only prove the connector process is
-      # up; the binlog capture offset lives in Debezium, so the page still
-      # reports capture progress as 未知.
-      RAG_DEBEZIUM_HEALTH_URL: ${RAG_APP_DEBEZIUM_HEALTH_URL:-http://debezium:8080/q/health}
-      RAG_DEBEZIUM_CACHE_HEALTH_URL: ${RAG_APP_DEBEZIUM_CACHE_HEALTH_URL:-http://debezium-cache:8080/q/health}
+      # Distributed Kafka Connect hosts the two Debezium capture connectors. The
+      # service reads each connector/task state from these REST endpoints (any
+      # worker answers cluster-wide state) and auto-restarts FAILED tasks with a
+      # bounded exponential backoff. The binlog position lives in Kafka
+      # Connect's offset topic, so the page reports capture progress as 未知.
+      RAG_CONNECT_URLS: ${RAG_APP_CONNECT_URLS:-http://connect-1:8083,http://connect-2:8083}
+      RAG_CONNECT_DOCUMENT_CONNECTOR: ${RAG_CONNECT_DOCUMENT_CONNECTOR:-praxis-document-cdc}
+      RAG_CONNECT_CACHE_CONNECTOR: ${RAG_CONNECT_CACHE_CONNECTOR:-praxis-cache-cdc}
+      RAG_CONNECT_SUPERVISOR_INTERVAL_SECONDS: ${RAG_CONNECT_SUPERVISOR_INTERVAL_SECONDS:-15}
+      RAG_CONNECT_RESTART_MAX_ATTEMPTS: ${RAG_CONNECT_RESTART_MAX_ATTEMPTS:-5}
+      RAG_CONNECT_RESTART_BASE_BACKOFF_SECONDS: ${RAG_CONNECT_RESTART_BASE_BACKOFF_SECONDS:-2}
+      RAG_CONNECT_RESTART_MAX_BACKOFF_SECONDS: ${RAG_CONNECT_RESTART_MAX_BACKOFF_SECONDS:-300}
       # PDF parsing: the default vision engine calls the pdf-parser sidecar
       # over HTTP (zip manifest + assets); the sidecar delegates layout/OCR/
       # tables/formulas/pictures to the knowledge base's remote VLM. Set
@@ -353,8 +392,8 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-      debezium-cache:
-        condition: service_started
+      connect-init:
+        condition: service_completed_successfully
     entrypoint: ["/app/bin/rag-cache-worker"]
     environment:
       RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-info}
@@ -385,5 +424,9 @@ volumes:
   praxis_app_data:
   qdrant_data:
   redis_data:
+  # Legacy Debezium Server state volumes (file-based offsets + schema history).
+  # The distributed Kafka Connect deployment keeps connector state in Kafka and
+  # does not mount these; they are retained for the rollback window after the
+  # cutover. Do not run `docker compose down -v` until that window is closed.
   debezium_data:
   debezium_cache_data:

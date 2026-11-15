@@ -1,0 +1,43 @@
+{
+  "name": "${RAG_CONNECT_DOCUMENT_CONNECTOR:-praxis-document-cdc}",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "${RAG_MYSQL_HOST:-mysql}",
+    "database.port": "${RAG_MYSQL_PORT:-3306}",
+    "database.user": "${RAG_MYSQL_DEBEZIUM_USER:-debezium}",
+    "database.password": "${RAG_MYSQL_DEBEZIUM_PASSWORD}",
+    "database.ssl.mode": "preferred",
+    "database.server.id": "${DEBEZIUM_SERVER_ID:-184054}",
+
+    "topic.prefix": "praxis_rag",
+    "database.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}",
+    "table.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs",
+    "column.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.artifact_id,${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.schedule_version",
+    "skip.messages.without.change": "true",
+    "skipped.operations": "d",
+    "include.schema.changes": "false",
+
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "none",
+
+    "schema.history.internal.kafka.bootstrap.servers": "${RAG_CONNECT_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}",
+    "schema.history.internal.kafka.topic": "${RAG_CDC_DOCUMENT_SCHEMA_HISTORY_TOPIC:-praxis_cdc_document_schema_history}",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false",
+
+    "transforms": "RouteDocumentJobs",
+    "transforms.RouteDocumentJobs.type": "io.debezium.transforms.ByLogicalTableRouter",
+    "transforms.RouteDocumentJobs.topic.regex": "(.*)document_jobs",
+    "transforms.RouteDocumentJobs.topic.replacement": "${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}",
+    "transforms.RouteDocumentJobs.key.enforce.uniqueness": "false",
+
+    "producer.override.acks": "all",
+    "producer.override.enable.idempotence": "true",
+    "producer.override.retries": "2147483647"
+  }
+}
