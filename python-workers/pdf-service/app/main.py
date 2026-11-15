@@ -25,6 +25,7 @@ part of the contract and is validated by :func:`app.parser.validate_manifest`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -72,6 +73,9 @@ LOGGER = logging.getLogger(SERVICE_NAME)
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8091
 DEFAULT_TIMEOUT = 900.0
+#: Actual conversion budget once a parse slot has been acquired. Waiting for a
+#: slot does not consume it, so a queued request still gets its full window.
+DEFAULT_PARSE_TIMEOUT = 120.0
 DEFAULT_WORKERS = 1
 DEFAULT_CONCURRENCY = 1
 DEFAULT_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -185,6 +189,7 @@ class Settings:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     timeout: float = DEFAULT_TIMEOUT
+    parse_timeout: float = DEFAULT_PARSE_TIMEOUT
     workers: int = DEFAULT_WORKERS
     concurrency: int = DEFAULT_CONCURRENCY
     #: Effective converter name (``vision`` or ``fake``).
@@ -223,6 +228,15 @@ class Settings:
         host = os.environ.get("RAG_PDF_SERVICE_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST
         port = _int_env("PORT", DEFAULT_PORT, minimum=1, errors=errors)
         timeout = _float_env("RAG_PDF_SERVICE_TIMEOUT", DEFAULT_TIMEOUT, minimum=0.001, errors=errors)
+        parse_timeout = _float_env(
+            "RAG_PDF_SERVICE_PARSE_TIMEOUT", DEFAULT_PARSE_TIMEOUT, minimum=0.001, errors=errors
+        )
+        if parse_timeout >= timeout:
+            errors.append(
+                "RAG_PDF_SERVICE_PARSE_TIMEOUT must be smaller than "
+                "RAG_PDF_SERVICE_TIMEOUT so the request can finish within the "
+                "client's total deadline"
+            )
         workers = _int_env("RAG_PDF_SERVICE_WORKERS", DEFAULT_WORKERS, minimum=1, errors=errors)
         concurrency = _int_env("RAG_PDF_SERVICE_CONCURRENCY", DEFAULT_CONCURRENCY, minimum=1,
                                errors=errors)
@@ -252,6 +266,7 @@ class Settings:
             host=host,
             port=port,
             timeout=timeout,
+            parse_timeout=parse_timeout,
             workers=workers,
             concurrency=concurrency,
             converter=converter,
@@ -316,6 +331,20 @@ class _UnavailableConverter:
         raise ParserConfigError(self.message)
 
 
+@dataclass
+class _ParseGate:
+    """Serializes conversions of one identical PDF.
+
+    The lock is acquired before a parse slot and released by the worker thread
+    when the conversion really stops. A 504 response therefore does not let a
+    retry of the same PDF start a second conversion while the timed-out thread
+    is still running and still holds its slot.
+    """
+
+    lock: asyncio.Lock
+    waiters: int = 0
+
+
 def create_app(
     settings: Settings | None = None,
     converter: PdfConverter | None = None,
@@ -348,6 +377,9 @@ def create_app(
     app.state.settings = settings
     app.state.converter = selected
     app.state.semaphore = asyncio.Semaphore(settings.concurrency)
+    #: fingerprint -> _ParseGate. Keeps one PDF from occupying two slots while a
+    #: timed-out conversion thread is still winding down.
+    app.state.gates = {}
 
     @app.middleware("http")
     async def request_correlation(request: Request, call_next):
@@ -435,6 +467,7 @@ def _service_info(app: FastAPI) -> dict[str, Any]:
         "vision_model": settings.vlm.model if settings.vlm is not None else None,
         "max_upload_bytes": settings.max_upload_bytes,
         "timeout_seconds": settings.timeout,
+        "parse_timeout_seconds": settings.parse_timeout,
         "concurrency": settings.concurrency,
         "config_error": settings.config_error,
     }
@@ -485,14 +518,19 @@ async def _handle_parse(
     workdir = Path(tempfile.mkdtemp(prefix="rag-pdf-service-"))
     try:
         source = workdir / "source.pdf"
-        size = await _store_upload(file, source, settings.max_upload_bytes)
+        size, fingerprint = await _store_upload(file, source, settings.max_upload_bytes)
         if size == 0:
             raise HTTPException(status_code=400, detail=EMPTY_FILE_MESSAGE)
         if not _looks_like_pdf(source):
             raise HTTPException(status_code=400, detail=INVALID_PDF_MESSAGE)
 
         payload = await _run_conversion(
-            app, source, workdir, options, request_id=_request_id(request)
+            app,
+            source,
+            workdir,
+            options,
+            request_id=_request_id(request),
+            fingerprint=fingerprint,
         )
         return Response(
             content=payload,
@@ -508,8 +546,9 @@ async def _handle_parse(
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-async def _store_upload(file: UploadFile, destination: Path, max_bytes: int) -> int:
+async def _store_upload(file: UploadFile, destination: Path, max_bytes: int) -> tuple[int, str]:
     size = 0
+    digest = hashlib.sha256()
     try:
         with destination.open("wb") as handle:
             while True:
@@ -522,10 +561,11 @@ async def _store_upload(file: UploadFile, destination: Path, max_bytes: int) -> 
                         status_code=413,
                         detail=f"{TOO_LARGE_MESSAGE}（上限 {max_bytes // (1024 * 1024)} MB）",
                     )
+                digest.update(chunk)
                 handle.write(chunk)
     except HTTPException:
         raise
-    return size
+    return size, digest.hexdigest()
 
 
 def _looks_like_pdf(source: Path) -> bool:
@@ -541,14 +581,23 @@ async def _run_conversion(
     options: ParseOptions | None = None,
     *,
     request_id: str = "",
+    fingerprint: str = "",
 ) -> bytes:
     """Queue and run one conversion in a worker thread.
 
-    The semaphore bounds concurrent conversions and the request timeout bounds
-    both the queue wait and the conversion itself. A timed-out conversion keeps
-    its semaphore slot until the worker thread returns; the request already
-    answered 504 and the worker's result is discarded (the temporary directory
-    may already be removed, so the worker can fail after the response was sent).
+    Two clocks are deliberately separate:
+
+    * ``settings.timeout`` bounds waiting for the per-PDF gate and for a parse
+      slot. Queueing never consumes the conversion budget.
+    * ``settings.parse_timeout`` starts only after the worker thread starts and
+      bounds the actual conversion.
+
+    A timed-out conversion keeps its semaphore slot and its per-PDF gate until
+    the worker thread returns; the request has already answered 504 and the
+    worker's result is discarded (the temporary directory may already be
+    removed, so the worker can fail after the response was sent). The next
+    attempt for the same PDF waits on the gate, so one timed-out document
+    cannot occupy two parse slots at once.
     """
     settings: Settings = app.state.settings
     semaphore: asyncio.Semaphore = app.state.semaphore
@@ -558,61 +607,116 @@ async def _run_conversion(
     artifacts = workdir / "artifacts"
     requested = options if options is not None else ParseOptions()
 
+    gate = app.state.gates.get(fingerprint)
+    if gate is None:
+        gate = _ParseGate(lock=asyncio.Lock())
+        app.state.gates[fingerprint] = gate
+
+    def release_gate() -> None:
+        gate.lock.release()
+        if gate.waiters == 0 and not gate.lock.locked():
+            if app.state.gates.get(fingerprint) is gate:
+                app.state.gates.pop(fingerprint, None)
+
+    # The total request budget is settings.timeout. Queueing may use whatever
+    # the conversion window leaves, so a request that starts parsing can finish
+    # within the client's deadline.
+    queue_deadline = loop.time() + max(0.001, settings.timeout - settings.parse_timeout)
+
+    def remaining() -> float:
+        return max(0.0, queue_deadline - loop.time())
+
+    gate.waiters += 1
     try:
-        await asyncio.wait_for(semaphore.acquire(), timeout=settings.timeout)
+        await asyncio.wait_for(gate.lock.acquire(), timeout=remaining())
     except asyncio.TimeoutError as error:
+        gate.waiters -= 1
         raise HTTPException(
             status_code=503,
-            detail="PDF 解析服务繁忙（等待队列超时），请稍后重试",
+            detail="PDF 解析服务繁忙（等待同一文档上一轮解析结束超时），请稍后重试",
         ) from error
+    except BaseException:
+        gate.waiters -= 1
+        raise
+    gate.waiters -= 1
 
-    released = False
-
-    def release() -> None:
-        nonlocal released
-        if not released:
-            released = True
-            semaphore.release()
-
-    def work() -> bytes:
-        try:
-            manifest = converter.convert(source, artifacts, scratch, options=requested)
-            validate_manifest(manifest, artifacts)
-            (artifacts / "manifest.json").write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            return _archive_artifacts(artifacts)
-        finally:
-            loop.call_soon_threadsafe(release)
-
-    future = loop.run_in_executor(None, work)
+    slot_acquired = False
+    thread_started = False
     try:
-        return await asyncio.wait_for(future, timeout=settings.timeout)
-    except asyncio.TimeoutError as error:
-        raise HTTPException(
-            status_code=504,
-            detail="PDF 解析超时，请稍后重试或拆分文档",
-        ) from error
-    except ParserOptionsError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    except ParserConfigError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    except ParserConversionError as error:
-        raise HTTPException(status_code=500, detail=str(error)) from error
-    except ParserError as error:
-        raise HTTPException(status_code=500, detail=str(error)) from error
-    except Exception as error:
-        # The exception message/traceback may embed document text, so only the
-        # exception class name reaches the log sink.
-        LOGGER.error(
-            "Unexpected PDF conversion failure request_id=%s error_type=%s",
-            request_id or "-",
-            type(error).__name__,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail="PDF 解析失败，服务端日志包含详细信息",
-        ) from error
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=remaining())
+            slot_acquired = True
+        except asyncio.TimeoutError as error:
+            raise HTTPException(
+                status_code=503,
+                detail="PDF 解析服务繁忙（等待队列超时），请稍后重试",
+            ) from error
+
+        released = False
+
+        def release_slot() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                semaphore.release()
+
+        def stop() -> None:
+            release_slot()
+            release_gate()
+
+        def work() -> bytes:
+            try:
+                manifest = converter.convert(source, artifacts, scratch, options=requested)
+                validate_manifest(manifest, artifacts)
+                (artifacts / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                return _archive_artifacts(artifacts)
+            finally:
+                try:
+                    loop.call_soon_threadsafe(stop)
+                except RuntimeError:
+                    # The process is shutting down; the slot and gate go away
+                    # with the event loop.
+                    pass
+
+        future = loop.run_in_executor(None, work)
+        thread_started = True
+        try:
+            return await asyncio.wait_for(future, timeout=settings.parse_timeout)
+        except asyncio.TimeoutError as error:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"PDF 解析超时（单次解析超过 {settings.parse_timeout:g} 秒），"
+                    "请稍后重试或拆分文档"
+                ),
+            ) from error
+        except ParserOptionsError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except ParserConfigError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        except ParserConversionError as error:
+            raise HTTPException(status_code=500, detail=str(error)) from error
+        except ParserError as error:
+            raise HTTPException(status_code=500, detail=str(error)) from error
+        except Exception as error:
+            # The exception message/traceback may embed document text, so only the
+            # exception class name reaches the log sink.
+            LOGGER.error(
+                "Unexpected PDF conversion failure request_id=%s error_type=%s",
+                request_id or "-",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="PDF 解析失败，服务端日志包含详细信息",
+            ) from error
+    finally:
+        if not thread_started:
+            if slot_acquired:
+                semaphore.release()
+            release_gate()
 
 
 def _archive_artifacts(artifacts: Path) -> bytes:

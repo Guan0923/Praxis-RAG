@@ -114,10 +114,12 @@ cdc_cutover_state (k VARCHAR(64) PRIMARY KEY, v LONGTEXT NOT NULL)
 ### 4.1 版本规则
 
 - 新任务在受理事务内 `schedule_version = 1` 写入。
-- **重发只发生在 MySQL 事务内**：长期停留 `queued` 需要补发、`processing` 租约过期需要重新排队、可重试失败需要再次执行时，对 `document_jobs` 执行
-  `UPDATE ... SET schedule_version = schedule_version + 1, status='queued', stage='retry_wait', owner=NULL, lease_until=0, retry_at=?, updated_at=? WHERE artifact_id=? AND ...`（搜索任务已下线，无重发语义）。
+- **可重试失败不立即发通知**：`Fail(retry=true)` 写入失败原因、`status='queued'`、`stage='retry_wait'` 和 `retry_at`，不递增 `schedule_version`。到期后由周期 `Sweep` 在同一事务内递增版本并重排，发出下一轮通知；这是唯一的自动重试路径。
+- **租约过期**：`processing` 且 `lease_until <= now` 的任务由 `Sweep` 立即重排；`attempts` 已达上限时直接写 `failed`，不再启动执行。
+- **普通排队不算重试**：仅因 `queued` 超过 120 秒（等 worker 或解析名额）不会被补发，不递增 `schedule_version`，也不消耗执行次数。
+- `document_jobs.attempts` 是执行次数（MySQL 持久化，跨 Kafka 消息、worker 进程和重启），上限 3。第 3 次失败写入 `failed` 和最后失败原因；重复通知、`Sweep` 和租约恢复都不得启动第 4 次执行。
 - 同一任务可多次递增；消费者只处理与数据库当前 `schedule_version` 相等的通知。
-- 心跳、进度、完成/失败终态都是普通 UPDATE，**不递增版本**。
+- 心跳、进度、完成/失败终态以及 `retry_wait` 等待都是普通 UPDATE，**不递增版本**。
 
 ### 4.2 Debezium 如何识别"同一任务需要再次执行"并排除噪声
 
@@ -142,9 +144,9 @@ Debezium 的行级过滤 `io.debezium.transforms.Filter` 依赖 JSR-223 脚本�
 ### 5.1 文档任务
 
 1. 解码通知，得到 `artifact_id/namespace/schedule_version`。
-2. `Claim`：单事务 `SELECT ... FOR UPDATE`，条件为 `artifact_id + namespace`，校验 `schedule_version` 相等、`status IN (queued, processing)`、`lease_until <= now`；然后置 `processing/owner/execution_id/lease_until/attempts+1`。版本不等、终态、租约有效、行不存在 → 返回 nil。
+2. `Claim`：单事务 `SELECT ... FOR UPDATE`，条件为 `artifact_id + namespace`，校验 `schedule_version` 相等、`status IN (queued, processing)`、`lease_until <= now`，`retry_wait` 还要求 `retry_at <= now`；然后置 `processing/owner/execution_id/lease_until/attempts+1`。版本不等、终态、租约有效、重试未到期、行不存在 → 返回 nil；`attempts` 已达 3 时直接终态化并返回 nil。
 3. 心跳/进度只更新本执行（`execution_id`  fencing）。
-4. 成功：`Reconcile` 确认 journal 发布已提交后写 `succeeded`；失败：可重试则按 §4.1 递增版本重新排队，不可重试写 `failed`。
+4. 成功：`Reconcile` 确认 journal 发布已提交后写 `succeeded`；失败：可重试则按 §4.1 写 `retry_at` 等待 `Sweep` 重排，不可重试或第 3 次失败写 `failed`。
 5. **只有 DB 已记录领取、跳过或终态后才 ACK**；DB 不可用/写失败返回 nack，交给消费重试与 DLQ。
 
 ### 5.2 搜索任务（已下线）
@@ -223,7 +225,7 @@ Redis 写入失败、缓存刷新失败不是 nack 理由：缓存有独立的�
 - 删除轮询/补发：`DocumentJobs.PendingOutbox/MarkPublished/GCOutbox`、`SearchTasks.DispatchPending/RunOnce`、`CacheSynchronizer` 的 relay/flush-pending 队列。
 - 删除"Kafka 受理确认"路径与失败回滚（搜索已改为同步直返，不再有提交即受理）。
 - 搜索同步化额外删除：`internal/state/search_tasks.go`、`internal/searchworker/`、`cmd/rag-search-worker/`、死信 `--kind search`、搜索 schema-3 envelope、`SearchEngine.GetSearchResult`、`Runtime.SubmitSearch` 与 `/v1/search-results` 路由。
-- 保留：任务租约恢复（`Sweep`）、超时处理（`Expire`）、重排（`schedule_version+1`）、死信终态落库、DLQ 消费（仅文档/缓存）。`search_tasks`/`search_result_snapshots` 两表保留历史数据、不再读写。
+- 保留：任务租约恢复（`Sweep`）、超时处理（`Expire`）、重排（到期重试或租约过期时 `schedule_version+1`）、死信终态落库、DLQ 消费（仅文档/缓存）。`search_tasks`/`search_result_snapshots` 两表保留历史数据、不再读写。
 
 ## 10. 监控替换
 

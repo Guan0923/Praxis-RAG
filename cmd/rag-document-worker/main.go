@@ -41,9 +41,12 @@ const (
 	exitConfig  = 2
 
 	// defaultMaxAttempts bounds broker redeliveries before OnExhausted records a
-	// durable terminal state. Override with RAG_DOCUMENT_BROKER_MAX_RETRIES
-	// (config-file friendly) or RAG_DOCUMENT_MAX_ATTEMPTS.
-	defaultMaxAttempts = 5
+	// durable terminal state. It is independent from document_jobs.attempts
+	// (the per-document execution budget, capped at 3) and is deliberately the
+	// same small value: a broker redelivery must never become a hidden fourth
+	// parse. Override with RAG_DOCUMENT_BROKER_MAX_RETRIES (config-file
+	// friendly) or RAG_DOCUMENT_MAX_ATTEMPTS.
+	defaultMaxAttempts = 3
 	shutdownTimeout    = 10 * time.Second
 )
 

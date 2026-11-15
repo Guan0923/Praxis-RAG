@@ -68,44 +68,62 @@ func TestMaintenanceSweepsAndGCsDocumentJobs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DocumentJobs.Submit() error = %v", err)
 	}
-	// Backdate the stranded job beyond the sweep window. The sweep increments
-	// schedule_version, which is the only signal Debezium needs to deliver a
-	// fresh notification.
+	// A job that is merely queued is not re-emitted: waiting for a worker or a
+	// parse slot must not bump schedule_version.
 	past := float64(time.Now().Unix()) - 10_000
 	if _, err := stores.DB.ExecContext(ctx,
 		"UPDATE document_jobs SET updated_at = ? WHERE artifact_id = ?", past, admission.ArtifactID); err != nil {
 		t.Fatalf("backdate job: %v", err)
 	}
-
 	service.maintenancePass(ctx)
+	queued, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
+	if err != nil || queued == nil {
+		t.Fatalf("DocumentJobs.Get() = %v, %v", queued, err)
+	}
+	if queued.ScheduleVersion != 1 || queued.Status != state.DocumentJobQueued {
+		t.Fatalf("merely queued job was changed: %+v", queued)
+	}
 
+	// A retryable failure becomes a due retry; the maintenance pass emits the
+	// replacement generation with schedule_version+1.
+	notification, err := state.DocumentJobEnvelope(queued)
+	if err != nil {
+		t.Fatalf("DocumentJobEnvelope() error = %v", err)
+	}
+	task, err := stores.DocumentJobs.Claim(ctx, notification)
+	if err != nil || task == nil {
+		t.Fatalf("Claim() = %v, %v", task, err)
+	}
+	failure := "temporary"
+	if err := stores.DocumentJobs.Fail(ctx, task, true, &failure); err != nil {
+		t.Fatalf("Fail(retry) error = %v", err)
+	}
+	if _, err := stores.DB.ExecContext(ctx,
+		"UPDATE document_jobs SET retry_at = ?, updated_at = ? WHERE artifact_id = ?",
+		past, past, admission.ArtifactID); err != nil {
+		t.Fatalf("backdate retry: %v", err)
+	}
+	service.maintenancePass(ctx)
 	swept, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
 	if err != nil || swept == nil {
 		t.Fatalf("DocumentJobs.Get() = %v, %v", swept, err)
 	}
-	if swept.ScheduleVersion != 2 {
-		t.Errorf("schedule_version after sweep = %d, want 2", swept.ScheduleVersion)
+	if swept.ScheduleVersion != 2 || swept.RetryAt != 0 {
+		t.Errorf("job after retry sweep = %+v, want version 2 and retry_at 0", swept)
 	}
 	if swept.Status != state.DocumentJobQueued {
 		t.Errorf("swept job status = %q, want queued", swept.Status)
 	}
 
 	// A terminal job past the retention window is garbage-collected.
-	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
-	if err != nil || job == nil {
-		t.Fatalf("DocumentJobs.Get() = %v, %v", job, err)
-	}
-	// The sweep requeued the job with a new schedule_version, so the fresh
-	// notification is claimable immediately.
-	notification, err := state.DocumentJobEnvelope(swept)
+	notification, err = state.DocumentJobEnvelope(swept)
 	if err != nil {
 		t.Fatalf("DocumentJobEnvelope() error = %v", err)
 	}
-	task, err := stores.DocumentJobs.Claim(ctx, notification)
+	task, err = stores.DocumentJobs.Claim(ctx, notification)
 	if err != nil || task == nil {
 		t.Fatalf("Claim() after sweep = %v, %v", task, err)
 	}
-	failure := "failed"
 	if err := stores.DocumentJobs.Fail(ctx, task, false, &failure); err != nil {
 		t.Fatalf("Fail() error = %v", err)
 	}

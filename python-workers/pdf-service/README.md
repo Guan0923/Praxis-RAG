@@ -48,6 +48,7 @@ python-workers/pdf-service/
   "vision_model": "qwen2.5-vl-72b",
   "max_upload_bytes": 104857600,
   "timeout_seconds": 900.0,
+  "parse_timeout_seconds": 120.0,
   "concurrency": 1,
   "config_error": null
 }
@@ -92,7 +93,7 @@ pictures/picture-1.png
 | 422 | multipart 字段缺失/不是 `file`；或 `options` 非法（不是 JSON 对象、未知字段、类型错误、`ocr` 键已废除、`vision`/`vlm` 同时出现）|
 | 500 | 转换失败（视觉调用失败、公式为空、表格结构识别失败等）|
 | 503 | 未配置视觉模型，或配置错误（converter 非法等）|
-| 504 | 解析超时（`RAG_PDF_SERVICE_TIMEOUT`）|
+| 504 | 解析超时（拿到解析名额后超过 `RAG_PDF_SERVICE_PARSE_TIMEOUT`）|
 
 ### `options`：每请求视觉模型覆盖
 
@@ -238,7 +239,8 @@ table 的 `image_file` 为 null、`image_file` 是安全相对路径等），避
 | --- | --- | --- |
 | `RAG_PDF_SERVICE_HOST` | `0.0.0.0` | `python -m app.main` 的监听地址（uvicorn CLI 以命令行参数为准）|
 | `PORT` | `8091` | 服务端口 |
-| `RAG_PDF_SERVICE_TIMEOUT` | `900` | 单请求超时（秒）：排队等待与转换各自不超过该值，超时返回 504 |
+| `RAG_PDF_SERVICE_TIMEOUT` | `900` | 单请求总预算（秒），也是 Go 客户端超时；排队等待最多 `本值 - RAG_PDF_SERVICE_PARSE_TIMEOUT`，超时返回 503 |
+| `RAG_PDF_SERVICE_PARSE_TIMEOUT` | `120` | 真正开始转换后的单次解析上限（秒），须小于 `RAG_PDF_SERVICE_TIMEOUT`；超时返回 504。转换线程停止前仍占原名额，同一 PDF 的下一轮解析会等待它结束 |
 | `RAG_PDF_SERVICE_WORKERS` | `1` | Uvicorn 服务进程数（正整数）；各进程共享监听端口 |
 | `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 进程内并发转换上限（信号量）|
 | `RAG_PDF_SERVICE_LOG_LEVEL` | `info` | 日志级别：`debug`/`info`/`warning`/`error`；未设置时回退共享调试开关 `RAG_DEBUG_TRACE` |
@@ -341,7 +343,8 @@ Go 端（`internal/document/pdf_service.go`）：
    把响应体解压到解析 staging 目录（保持 `manifest.json` 与 `pictures/` 的相对路径）；
 3. 读 `manifest.json` 反序列化为 `document.PDFManifest`，走现有 `document.BuildPDFContent(...)` /
    资产入库；
-4. 非 200 时读 `{"detail"}` 作为用户可见错误；HTTP 客户端超时建议 ≥ `RAG_PDF_SERVICE_TIMEOUT`。
+4. 非 200 时读 `{"detail"}` 作为用户可见错误；HTTP 客户端总超时建议 ≥
+   `RAG_PDF_SERVICE_TIMEOUT`（服务端在该预算内完成排队 + 解析；Go 端默认同为 900 秒）。
 
 `options` 只发 `vision`：
 
@@ -364,7 +367,10 @@ Go 端（`internal/document/pdf_service.go`）：
   `go-native-v1`、`docling-service-v1`、`docling-formula-remote-v3`。
 - **zip 只含 manifest.json + 图片**：不返回 OCR 明细或 document.json；诊断只保留为 `warnings[]`。
 - **超时不能中断上游视觉请求**：504 只是快速把错误返回给调用方，后台线程可能跑完并占用并发槽位；
-  遇到重复超时请提高 `RAG_PDF_SERVICE_TIMEOUT` 或扩容副本。
+  同一 PDF 的重试会先等待上一轮线程停止才拿新名额（每进程每文档串行），不会同时占两个名额；
+  不同 PDF 可继续使用剩余名额。该串行 gate 是进程内状态，`RAG_PDF_SERVICE_WORKERS>1` 时不同进程
+  不共享；需要严格保证同一文档不并行占两个名额时保持 `WORKERS=1`（默认）。持续超时请提高
+  `RAG_PDF_SERVICE_PARSE_TIMEOUT` 或扩容副本。
 - **质量取决于远端视觉模型**：版面、OCR、表格、公式、图片描述都由同一模型完成；模型能力不足时
   可能出现块顺序/表格结构不准确，但契约仍会强制：空公式/缺失表格结构会让整篇文档失败，
   不会静默写入错误证据。

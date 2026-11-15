@@ -30,6 +30,7 @@ package document
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -85,12 +86,30 @@ func IsSupportedSuffix(suffix string) bool {
 	return ok
 }
 
+// ErrInvalidDocument marks a read/validation failure that parsing the same
+// bytes again cannot fix: an invalid header, encryption, an unsupported type
+// or a hard size/page limit. The ingest worker terminalizes these instead of
+// consuming the retry budget.
+var ErrInvalidDocument = errors.New("invalid document")
+
 // ReadError is raised when an uploaded document cannot be safely converted to
 // text. It mirrors rag_mcp.document_readers.DocumentReadError; messages match
 // the Python implementation (Chinese where Python exposes Chinese).
-type ReadError struct{ Message string }
+type ReadError struct {
+	Message string
+	// terminal is set only for deterministic format/validation failures.
+	terminal bool
+}
 
 func (e *ReadError) Error() string { return e.Message }
+
+// Unwrap exposes ErrInvalidDocument for terminal read failures.
+func (e *ReadError) Unwrap() error {
+	if e.terminal {
+		return ErrInvalidDocument
+	}
+	return nil
+}
 
 // ErrorCategory implements the optional interface internal/logging uses to
 // classify a failure without importing this package.
@@ -104,6 +123,11 @@ func AsReadError(err error) (*ReadError, bool) {
 
 func readErrf(format string, args ...any) *ReadError {
 	return &ReadError{Message: fmt.Sprintf(format, args...)}
+}
+
+// invalidDocumentErrf is readErrf for failures that retrying cannot repair.
+func invalidDocumentErrf(format string, args ...any) *ReadError {
+	return &ReadError{Message: fmt.Sprintf(format, args...), terminal: true}
 }
 
 // Block is one ordered source block: a paragraph, heading, code fence, table
@@ -250,7 +274,7 @@ func unsupportedSuffixError(suffix string) *ReadError {
 	if display == "" {
 		display = "<none>"
 	}
-	return readErrf("暂不支持该文件类型：%s", display)
+	return invalidDocumentErrf("暂不支持该文件类型：%s", display)
 }
 
 // assembleBlocks joins non-blank blocks with "\n\n" and records rune spans,
@@ -333,7 +357,7 @@ func readUTF8(path, name string) (string, error) {
 	}
 	text := strings.TrimPrefix(string(data), "\ufeff")
 	if !utf8.ValidString(text) {
-		return "", readErrf("文本文件必须使用 UTF-8 编码：%s", name)
+		return "", invalidDocumentErrf("文本文件必须使用 UTF-8 编码：%s", name)
 	}
 	return boundedText(normalizeNewlines(text), name)
 }
@@ -341,7 +365,7 @@ func readUTF8(path, name string) (string, error) {
 // boundedText mirrors document_readers._bounded_text.
 func boundedText(text, name string) (string, error) {
 	if utf8.RuneCountInString(text) > MaxExtractedCharacters {
-		return "", readErrf("文档提取文本过大：%s", name)
+		return "", invalidDocumentErrf("文档提取文本过大：%s", name)
 	}
 	return text, nil
 }

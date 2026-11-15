@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -22,6 +23,12 @@ const (
 
 	// MaxDocumentJobFileBytes is the async admission file ceiling.
 	MaxDocumentJobFileBytes = 10 * 1024 * 1024
+
+	// MaxDocumentJobAttempts is the maximum number of executions of one
+	// document job: the first execution plus at most two automatic retries.
+	// attempts lives in MySQL and therefore survives a new Kafka delivery, a
+	// different worker process and a process restart.
+	MaxDocumentJobAttempts = 3
 )
 
 var documentJobActiveStatuses = []string{DocumentJobQueued, DocumentJobProcessing}
@@ -499,6 +506,23 @@ func (d *DocumentJobs) Claim(ctx context.Context, notification DocumentNotificat
 	if job.Status == DocumentJobProcessing && job.LeaseUntil > now {
 		return nil, nil
 	}
+	// A retry is only claimable once retry_at has arrived. Debezium may replay
+	// an old snapshot row before the periodic sweep emits the due retry.
+	if job.Stage == "retry_wait" && job.RetryAt > now {
+		return nil, nil
+	}
+	if job.Attempts >= MaxDocumentJobAttempts {
+		// Never start a fourth execution. Terminalize in this transaction so a
+		// duplicate notification, a sweep or a lease-expiry recovery all stop on
+		// the same row with the last recorded reason.
+		if err := failAttemptsExhausted(ctx, transaction, job, now); err != nil {
+			return nil, err
+		}
+		if err := transaction.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
 	attempts := job.Attempts + 1
 	leaseUntil := now + d.Settings.LeaseSeconds
 	if _, err := transaction.ExecContext(ctx,
@@ -528,6 +552,30 @@ func documentJobActiveStatus(status string) bool {
 		}
 	}
 	return false
+}
+
+// failAttemptsExhausted writes the terminal row for a job that already used all
+// executions. The caller owns the transaction and the row lock.
+func failAttemptsExhausted(ctx context.Context, transaction *sql.Tx, job *DocumentJob, now float64) error {
+	message := attemptLimitMessage(job)
+	_, err := transaction.ExecContext(ctx,
+		"UPDATE document_jobs SET status = ?, stage = ?, error = ?, owner = NULL, execution_id = NULL, "+
+			"lease_until = 0, retry_at = 0, content = NULL, updated_at = ? WHERE artifact_id = ?",
+		DocumentJobFailed, "failed", message, now, job.ArtifactID)
+	return err
+}
+
+// attemptLimitMessage keeps the last recorded failure reason when the previous
+// attempt recorded one; otherwise it names the exhausted execution budget.
+func attemptLimitMessage(job *DocumentJob) string {
+	message := fmt.Sprintf("Document processing failed: attempt limit reached (%d attempts)",
+		MaxDocumentJobAttempts)
+	if job != nil && job.Error != nil {
+		if lastError := strings.TrimSpace(*job.Error); lastError != "" {
+			message += "; last error: " + lastError
+		}
+	}
+	return message
 }
 
 // Heartbeat renews the processing lease of this execution.
@@ -716,6 +764,11 @@ func (d *DocumentJobs) finish(ctx context.Context, task *DocumentJobTask, status
 }
 
 // Fail requeues (retry) or terminates the job; committed publications reconcile.
+// A retry is only a "waiting room": it records the reason and retry_at without
+// touching schedule_version, so Debezium emits nothing yet. The periodic Sweep
+// emits exactly one replacement notification when retry_at is due. Once the
+// execution budget is spent (or the error is not retryable) the row becomes
+// failed with the last reason.
 func (d *DocumentJobs) Fail(ctx context.Context, task *DocumentJobTask, retry bool, errorMessage *string) error {
 	reconciled, err := d.Reconcile(ctx, task)
 	if err != nil {
@@ -724,21 +777,19 @@ func (d *DocumentJobs) Fail(ctx context.Context, task *DocumentJobTask, retry bo
 	if reconciled {
 		return nil
 	}
-	if !retry {
+	if !retry || task.Attempts >= MaxDocumentJobAttempts {
 		return d.finish(ctx, task, DocumentJobFailed, errorMessage, nil)
 	}
 	now := d.now()
 	if task.ExecutionID == nil {
 		return newUploadConflict("Document execution is no longer current")
 	}
-	// Requeueing is the only UPDATE that must produce a new Debezium
-	// notification, so it increments schedule_version in the same statement.
 	_, err = d.stores.DB.ExecContext(ctx,
-		"UPDATE document_jobs SET schedule_version = schedule_version + 1, status = ?, stage = ?, "+
-			"error = COALESCE(?, error), owner = NULL, execution_id = NULL, lease_until = 0, retry_at = ?, "+
-			"updated_at = ? WHERE artifact_id = ? AND execution_id = ? AND status = ?",
+		"UPDATE document_jobs SET status = ?, stage = ?, error = COALESCE(?, error), owner = NULL, "+
+			"execution_id = NULL, lease_until = 0, retry_at = ?, updated_at = ? "+
+			"WHERE artifact_id = ? AND execution_id = ? AND status = ? AND attempts = ?",
 		DocumentJobQueued, "retry_wait", errorMessage, now+d.Settings.SweepAfterSeconds, now,
-		task.ArtifactID, *task.ExecutionID, DocumentJobProcessing)
+		task.ArtifactID, *task.ExecutionID, DocumentJobProcessing, task.Attempts)
 	return err
 }
 
@@ -797,13 +848,18 @@ func (d *DocumentJobs) DeadLetter(ctx context.Context, notification DocumentNoti
 	return true, nil
 }
 
-// Sweep requeues jobs that need a fresh notification and increments their
-// schedule_version in the same UPDATE, so Debezium emits exactly one consumable
-// change per requeue:
+// Sweep emits the replacement notification for due retries and requeues jobs
+// whose lease expired, incrementing schedule_version in the same UPDATE so
+// Debezium emits exactly one consumable change per requeue:
 //
-//   - queued jobs stranded past the sweep window, whose notification was lost
-//     or never delivered;
+//   - queued retry_wait jobs whose retry_at is due and whose row has been
+//     quiet for one sweep window (the only automatic retry path);
 //   - processing jobs whose lease expired, because the worker crashed.
+//
+// A job that is merely queued is intentionally left alone: waiting for a worker
+// or a parse slot must neither bump schedule_version nor consume an execution
+// attempt. Jobs that already used all executions become terminal instead of
+// being requeued, so no fourth execution can start.
 //
 // No outbox row is written; the schedule_version change is the only signal.
 func (d *DocumentJobs) Sweep(ctx context.Context, limit int) (int, error) {
@@ -817,9 +873,9 @@ func (d *DocumentJobs) Sweep(ctx context.Context, limit int) (int, error) {
 		return 0, err
 	}
 	defer func() { _ = transaction.Rollback() }()
-	stuck, err := d.selectJobsForSweep(ctx, transaction,
-		"status = ? AND updated_at <= ? ORDER BY updated_at LIMIT ?"+d.stores.Uploads.forUpdate(),
-		DocumentJobQueued, cutoff, limit)
+	retryDue, err := d.selectJobsForSweep(ctx, transaction,
+		"status = ? AND stage = ? AND retry_at <= ? AND updated_at <= ? ORDER BY retry_at LIMIT ?"+d.stores.Uploads.forUpdate(),
+		DocumentJobQueued, "retry_wait", now, cutoff, limit)
 	if err != nil {
 		return 0, err
 	}
@@ -830,12 +886,18 @@ func (d *DocumentJobs) Sweep(ctx context.Context, limit int) (int, error) {
 		return 0, err
 	}
 	requeued := 0
-	for _, job := range append(stuck, expired...) {
+	for _, job := range append(retryDue, expired...) {
+		if job.Attempts >= MaxDocumentJobAttempts {
+			if err := failAttemptsExhausted(ctx, transaction, job, now); err != nil {
+				return 0, err
+			}
+			continue
+		}
 		if _, err := transaction.ExecContext(ctx,
 			"UPDATE document_jobs SET schedule_version = schedule_version + 1, status = ?, stage = ?, "+
-				"owner = NULL, execution_id = NULL, lease_until = 0, retry_at = ?, updated_at = ? "+
+				"owner = NULL, execution_id = NULL, lease_until = 0, retry_at = 0, updated_at = ? "+
 				"WHERE artifact_id = ?",
-			DocumentJobQueued, "retry_wait", now, now, job.ArtifactID); err != nil {
+			DocumentJobQueued, "retry_wait", now, job.ArtifactID); err != nil {
 			return 0, err
 		}
 		requeued++

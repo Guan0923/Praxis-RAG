@@ -224,9 +224,13 @@ services:
       # remains the shared debug switch when the level is unset.
       RAG_PDF_SERVICE_LOG_LEVEL: ${RAG_PDF_SERVICE_LOG_LEVEL:-info}
       RAG_PDF_SERVICE_LOG_FORMAT: ${RAG_PDF_SERVICE_LOG_FORMAT:-text}
-      # Parse deadline on the service side as well; the Go client uses the same
-      # value as its HTTP timeout.
+      # Queue wait / total request deadline. The Go client uses the same value
+      # as its HTTP timeout; the actual conversion budget is separate below.
       RAG_PDF_SERVICE_TIMEOUT: ${RAG_PDF_SERVICE_TIMEOUT:-900}
+      # Conversion budget once a parse slot is acquired (queue wait excluded).
+      # Expiry returns 504; the same PDF's next request waits for the timed-out
+      # thread to stop before using another slot.
+      RAG_PDF_SERVICE_PARSE_TIMEOUT: ${RAG_PDF_SERVICE_PARSE_TIMEOUT:-120}
       # Fallback vision model when a request carries no options.vision. PDF
       # parsing uses the same per-knowledge-base VLM as Word picture
       # descriptions; BASE_URL and MODEL must be configured together.

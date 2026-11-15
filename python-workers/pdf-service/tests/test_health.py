@@ -21,6 +21,7 @@ HEALTH_FIELDS = {
     "vision_model",
     "max_upload_bytes",
     "timeout_seconds",
+    "parse_timeout_seconds",
     "concurrency",
     "config_error",
     "status",
@@ -44,6 +45,7 @@ def test_healthz_reports_fake_converter(fake_client: TestClient) -> None:
     assert body["config_error"] is None
     assert body["max_upload_bytes"] > 0
     assert body["timeout_seconds"] > 0
+    assert body["parse_timeout_seconds"] > 0
     assert body["concurrency"] >= 1
     # Local-inference probe fields are gone.
     assert "docling_installed" not in body
@@ -66,6 +68,7 @@ def test_settings_defaults() -> None:
     assert settings.host == "0.0.0.0"
     assert settings.port == 8091
     assert settings.timeout == 900.0
+    assert settings.parse_timeout == 120.0
     assert settings.workers == 1
     assert settings.concurrency == 1
     assert settings.converter == "vision"
@@ -83,6 +86,7 @@ def test_settings_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("RAG_PDF_SERVICE_HOST", "127.0.0.1")
     monkeypatch.setenv("PORT", "9123")
     monkeypatch.setenv("RAG_PDF_SERVICE_TIMEOUT", "42.5")
+    monkeypatch.setenv("RAG_PDF_SERVICE_PARSE_TIMEOUT", "30")
     monkeypatch.setenv("RAG_PDF_SERVICE_WORKERS", "2")
     monkeypatch.setenv("RAG_PDF_SERVICE_CONCURRENCY", "3")
     monkeypatch.setenv("RAG_PDF_PAGE_DPI", "150")
@@ -101,6 +105,7 @@ def test_settings_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.host == "127.0.0.1"
     assert settings.port == 9123
     assert settings.timeout == 42.5
+    assert settings.parse_timeout == 30.0
     assert settings.workers == 2
     assert settings.concurrency == 3
     assert settings.page_dpi == 150
@@ -112,6 +117,18 @@ def test_settings_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.vlm.api_key == "secret-key"
     assert settings.vlm.timeout == 300.0
     assert settings.vlm.concurrency == 2
+
+
+def test_settings_reject_parse_timeout_not_smaller_than_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RAG_PDF_SERVICE_TIMEOUT", "120")
+    monkeypatch.setenv("RAG_PDF_SERVICE_PARSE_TIMEOUT", "120")
+
+    settings = create_app().state.settings
+
+    assert settings.config_error is not None
+    assert "PARSE_TIMEOUT" in settings.config_error
 
 
 def test_healthz_never_exposes_the_api_key(

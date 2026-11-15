@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -211,9 +212,9 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 	}
 	if task == nil {
 		// A stale schedule version, a terminal job, a live lease held by another
-		// worker, or a purged row: all are safe to acknowledge. The sweep pass
-		// requeues any job that still needs execution, so blocking here would
-		// only add a duplicate retry.
+		// worker, an early retry or a purged row: all are safe to acknowledge.
+		// The sweep emits due retries and expired-lease replacements; a merely
+		// queued job stays on its Kafka notification instead of being replayed.
 		p.logInfo(ctx, "document notification skipped",
 			"artifact_id", notification.ArtifactID,
 			"schedule_version", notification.ScheduleVersion,
@@ -264,15 +265,10 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 		}
 		retry := !p.terminalError(ingestErr)
 		// The persisted message stays recognizable for the Console and for
-		// users, while the structured summary adds the safe category/stage/
-		// status/detail that makes the failure diagnosable without secrets.
-		message := "Document processing failed"
-		if !retry {
-			message = "Invalid document or changed knowledge-base configuration"
-		}
-		if summary := logging.ErrorSummary(ingestErr); summary != "" {
-			message += ": " + summary
-		}
+		// users, names the execution count and keeps the safe
+		// category/stage/status/detail that makes the failure diagnosable
+		// without secrets. The third failure terminalizes inside Fail.
+		message := documentFailureMessage(task.Attempts, retry, ingestErr)
 		if failErr := p.jobs.Fail(ctx, task, retry, &message); failErr != nil {
 			// UploadConflict is expected when another worker won the lease.
 			var conflict *state.UploadConflict
@@ -281,13 +277,14 @@ func (p *Processor) Handle(ctx context.Context, notification state.DocumentNotif
 				return false
 			}
 		}
-		p.logWarn(ctx, "document processing deferred",
-			append([]any{"retry", retry}, logging.ErrorAttrs(ingestErr)...)...)
+		p.logWarn(ctx, "document processing failed",
+			append([]any{"retry", retry,
+				"terminal", !retry || task.Attempts >= state.MaxDocumentJobAttempts},
+				logging.ErrorAttrs(ingestErr)...)...)
 	}
-	// The failure path always records a durable outcome (terminal row or an
-	// incremented schedule_version requeue), so the delivery can be
-	// acknowledged: the sweep pass re-emits the notification for the new
-	// version.
+	// The failure path always records a durable outcome (a terminal row or a
+	// retry_wait row whose replacement notification the sweep emits), so the
+	// delivery can be acknowledged.
 	return true
 }
 
@@ -319,6 +316,39 @@ func (p *Processor) startHeartbeat(ctx context.Context, task *state.DocumentJobT
 			<-done
 		})
 	}
+}
+
+// documentFailureMessage renders the durable job error with the execution count
+// so the Console can distinguish attempt 2 of 3 from the final failure.
+func documentFailureMessage(attempt int, retry bool, err error) string {
+	prefix := fmt.Sprintf("Document processing failed: attempt %d/%d",
+		attempt, state.MaxDocumentJobAttempts)
+	if !retry {
+		prefix = fmt.Sprintf("Invalid document or changed knowledge-base configuration: attempt %d/%d",
+			attempt, state.MaxDocumentJobAttempts)
+	}
+	if isDocumentParseTimeout(err) {
+		return prefix + ": parse timeout"
+	}
+	if summary := logging.ErrorSummary(err); summary != "" {
+		return prefix + ": " + summary
+	}
+	return prefix
+}
+
+// isDocumentParseTimeout reports a timeout of the parse stage only. A deadline
+// while embedding or indexing is a different failure and keeps its own
+// category. Both the remote parse service's 504 and a caller-side deadline
+// during parsing mean the per-attempt parse window expired.
+func isDocumentParseTimeout(err error) bool {
+	if err == nil || logging.ErrorStage(err) != "parsing" {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var status interface{ HTTPStatus() int }
+	return errors.As(err, &status) && status.HTTPStatus() == http.StatusGatewayTimeout
 }
 
 // MessageHandler adapts the processor to mq.PullConsumer. The decoder accepts

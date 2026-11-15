@@ -510,6 +510,9 @@ func TestPDFServiceParserTimeoutAndCancel(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout error = %v, want errors.Is(context.DeadlineExceeded)", err)
 	}
+	if !errors.Is(err, ErrPDFParseTimeout) {
+		t.Fatalf("timeout error = %v, want errors.Is(ErrPDFParseTimeout)", err)
+	}
 
 	cancelled, cancelNow := context.WithCancel(context.Background())
 	cancelNow()
@@ -565,10 +568,36 @@ func TestPDFServiceParserConnectionAndInputFailures(t *testing.T) {
 	}
 
 	broken := writeTemp(t, "broken.pdf", []byte("this is not a pdf"))
-	if _, err := (&PDFServiceParser{BaseURL: "http://127.0.0.1:1"}).ParseInto(
-		context.Background(), broken, t.TempDir()); !errors.As(err, &parseErr) ||
-		!strings.Contains(parseErr.Message, "PDF 文件损坏或格式无效") {
+	_, err = (&PDFServiceParser{BaseURL: "http://127.0.0.1:1"}).ParseInto(
+		context.Background(), broken, t.TempDir())
+	if !errors.As(err, &parseErr) || !strings.Contains(parseErr.Message, "PDF 文件损坏或格式无效") {
 		t.Fatalf("broken input error = %v", err)
+	}
+	// The invalid-header cause stays reachable so the worker can terminalize it
+	// without burning the retry budget.
+	var readErr *ReadError
+	if !errors.As(err, &readErr) {
+		t.Fatalf("broken input error = %v, want *ReadError cause", err)
+	}
+	if !errors.Is(err, ErrInvalidDocument) {
+		t.Fatalf("broken input error = %v, want errors.Is(ErrInvalidDocument)", err)
+	}
+}
+
+func TestPDFServiceParserGatewayTimeoutIsParseTimeout(t *testing.T) {
+	source := writeValidPDF(t, "manual.pdf")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusGatewayTimeout)
+	}))
+	t.Cleanup(server.Close)
+	_, err := (&PDFServiceParser{BaseURL: server.URL}).ParseInto(context.Background(), source, t.TempDir())
+	if !errors.Is(err, ErrPDFParseTimeout) {
+		t.Fatalf("gateway timeout error = %v, want errors.Is(ErrPDFParseTimeout)", err)
+	}
+	var parseErr *PDFParseError
+	if !errors.As(err, &parseErr) || parseErr.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("gateway timeout error = %v, want *PDFParseError with status 504", err)
 	}
 }
 

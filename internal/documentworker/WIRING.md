@@ -117,7 +117,7 @@ worker, err := documentworker.New(documentworker.Options{
 if err != nil { return err }
 
 config := mq.DefaultConsumerConfig(settings.DocumentTopic, settings.DocumentGroup)
-config.MaxAttempts = 5                                    // Kafka consumer retries in-process; exhausted -> DLQ topic
+config.MaxAttempts = 3                                    // Kafka consumer retries in-process; exhausted -> DLQ topic
 config.DLQTopic = settings.DocumentDLQTopic
 consumer, err := mq.NewKafkaPullConsumer(settings, config, worker.MessageHandler())
 if err != nil { return err }
@@ -164,8 +164,8 @@ ACK the delivery **iff the outcome is already durable in MySQL**:
 1. the notification was safely skipped — the row is unknown/foreign, terminal,
    owned by a live lease, or carries a stale `schedule_version`; or
 2. the job was claimed (`status=processing`, `attempts+1`) and this round recorded
-   either a terminal state (`succeeded`/`failed`) or a requeue
-   (`schedule_version+1`, `status=queued`, `stage=retry_wait`); or
+   either a terminal state (`succeeded`/`failed`) or a retry wait
+   (`status=queued`, `stage=retry_wait`, `retry_at`; no generation bump yet); or
 3. a dead-letter outcome was recorded (`dead-letter-worker`).
 
 A DB error (claim/reconcile/fail write failure) returns false → nack, so broker
@@ -180,19 +180,23 @@ job fact lives in MySQL.
    terminal job; `Reconcile` adopts an already committed publication before
    claiming (crash recovery).
 3. `Claim` is a single `SELECT ... FOR UPDATE` transaction: it requires
-   `schedule_version` equality, `status IN (queued, processing)` and
-   `lease_until <= now`; a stale version, terminal row, live lease or missing row
-   returns nil → ACK. Requeueing (`Fail(retry)`, `Sweep`) is the only UPDATE that
-   increments `schedule_version`, which is the only signal Debezium re-emits.
+   `schedule_version` equality, `status IN (queued, processing)`,
+   `lease_until <= now` and (for `retry_wait`) `retry_at <= now`; a stale
+   version, terminal row, live lease, early retry or missing row returns nil →
+   ACK. `document_jobs.attempts` is incremented here; at 3 the row is written
+   `failed` instead of claiming a fourth execution. `Sweep` is the only path
+   that increments `schedule_version` (due retry or expired lease), which is the
+   only signal Debezium re-emits.
 4. Heartbeat goroutine renews the lease during ingestion (failure lets lease
    expiry recover the job).
 5. `Reconcile` again, `ExecutionBusy` check, then `Ingester.ProcessDocumentJob`.
 6. Success requires a committed publication (`Reconcile` true), otherwise nack.
 7. Failure: reconcile first; otherwise `Fail(retry)` where validation errors are
    terminal (`Invalid document or changed knowledge-base configuration`) and all
-   other errors retry (`Document processing failed: ...`, `schedule_version+1`).
-   Both branches recorded a durable outcome → ACK; the sweep re-emits the new
-   generation for the retry branch.
-8. `Recover` runs `Sweep` (requeue stranded queued + expired leases, each bumping
-   `schedule_version`), `GCJobs` (terminal retention) and the optional journal
-   recovery. It reads/writes no outbox table.
+   other errors wait for `retry_at` (`Document processing failed: attempt N/3: ...`).
+   The third failure is terminal inside `Fail`; a parse timeout is recorded as
+   `attempt N/3: parse timeout`. Both branches recorded a durable outcome →
+   ACK; the sweep emits the replacement generation when the retry is due.
+8. `Recover` runs `Sweep` (due `retry_wait` + expired leases, each bumping
+   `schedule_version`; merely queued jobs are left untouched), `GCJobs` (terminal
+   retention) and the optional journal recovery. It reads/writes no outbox table.

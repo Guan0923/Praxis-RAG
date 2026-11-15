@@ -213,12 +213,13 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_NAMESPACE` | 空 | 可选的 Qdrant 物理 namespace 过滤 |
 | `RAG_PDF_ENGINE` | 空（有 URL 则 vision，否则 go） | PDF 解析引擎：`go` 内置纯文本 / `vision` 调用 pdf-parser 微服务（远端视觉模型）；旧值 `docling` 作为兼容别名等价于 `vision`；空值按是否配置 `RAG_PDF_SERVICE_URL` 决定。compose `app` 容器默认 `vision` |
 | `RAG_PDF_SERVICE_URL` | `http://127.0.0.1:8091` | pdf-parser 服务地址（绝对 `http(s)` URL，不带 query/fragment）；compose `app` 容器由 compose 注入 `http://pdf-parser:8091` |
-| `RAG_PDF_SERVICE_TIMEOUT` | `900` 秒（1..7200） | Go 调用 pdf-parser 的解析超时；pdf-parser 同时把它作为单请求解析超时 |
+| `RAG_PDF_SERVICE_TIMEOUT` | `900` 秒（1..7200） | Go 调用 pdf-parser 的总超时；pdf-parser 用它作为总预算，排队等待最多 `本值 - RAG_PDF_SERVICE_PARSE_TIMEOUT`（排满 503） |
+| `RAG_PDF_SERVICE_PARSE_TIMEOUT` | `120` 秒（正数，须小于 `RAG_PDF_SERVICE_TIMEOUT`） | pdf-parser 真正开始解析后的单次转换上限；排队等待解析名额不计入。超时返回 504，转换线程停止前仍占用原名额，下一轮同一 PDF 会等待它结束 |
 | `RAG_PDF_SERVICE_PORT` | `8091`（仅 compose） | pdf-parser 的宿主发布端口；容器内端口固定 `8091` |
 | `RAG_PDF_PARSER_IMAGE` | `praxis-rag-pdf-parser:local`（仅 compose） | pdf-parser 镜像名 |
 | `RAG_PDF_MODELS_PATH` | 空 | **已废弃**：本地不再有模型，pdf-parser 不再读取该变量 |
 | `RAG_PDF_SERVICE_WORKERS` | `1` | PDF 容器内启动的 Uvicorn 服务进程数（正整数）。由 `python -m app.main` 读取，同一端口接收请求；每个进程有独立的解析并发名额 |
-| `RAG_PDF_SERVICE_CONCURRENCY` | `1`（仅 pdf-parser） | 每个 PDF 服务进程的并发解析数；PDF 总解析容量上限为 `RAG_PDF_SERVICE_WORKERS × 本值`。应与文档 worker 总任务并发一起调整，超出解析容量的请求会排队并消耗超时窗口；调大前先核对容器 CPU/内存 |
+| `RAG_PDF_SERVICE_CONCURRENCY` | `1`（仅 pdf-parser） | 每个 PDF 服务进程的并发解析数；PDF 总解析容量上限为 `RAG_PDF_SERVICE_WORKERS × 本值`。应与文档 worker 总任务并发一起调整，超出解析容量的请求会排队，但不消耗单次解析上限；调大前先核对容器 CPU/内存 |
 | `RAG_VLM_BASE_URL` | 空 | 远端 OpenAI 兼容视觉模型端点的**环境回退值**，用于描述 Word 无图注图片和 vision 引擎的 PDF 版面/OCR/表格/公式/图片描述；Console 知识库设置优先 |
 | `RAG_VLM_API_KEY` | 空 | VLM 端点密钥，作为 `Authorization: Bearer` 发送 |
 | `RAG_VLM_MODEL` | 空 | 端点上的模型名，如 `qwen2.5-vl-7b`（环境回退值） |
@@ -242,7 +243,7 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 - **无本地模型/模型卷**：`pdf_parser_models` 卷与 `RAG_PDF_MODELS_PATH` 已移除，无需下载或预置任何模型；旧部署的模型卷可以直接删除。视觉模型未配置（知识库/请求/环境变量都没有）时，`/v1/parse` 返回 503，PDF 上传失败。
 - **Console 模型要求（vision）**：先在「模型配置」页添加 VLM（服务地址 + 模型名 + 可选 API Key）条目，再在创建/编辑知识库时选中；缺失时 PDF 上传会被拒绝并提示配置。VLM 配置随每次解析请求下发（multipart `options`），因此同一 pdf-parser 可服务不同知识库（不同知识库可用不同视觉模型）。
 - **端口与健康检查**：pdf-parser 容器内监听 `0.0.0.0:8091`，compose 只发布 `127.0.0.1:${RAG_PDF_SERVICE_PORT:-8091}`；健康检查是 `GET /healthz`，`POST /v1/parse` 不做认证，因此**不要暴露到公网**。修改宿主端口时要同步 `RAG_PDF_SERVICE_URL`（宿主 Go 进程默认 `http://127.0.0.1:8091`）。
-- **并发与超时**：`RAG_PDF_SERVICE_WORKERS` 控制 PDF 服务进程数，`RAG_PDF_SERVICE_CONCURRENCY` 是每个进程内 `asyncio.Semaphore` 的许可数，两者代码默认值均为 `1`。按总解析容量（两者乘积）与文档 worker 总任务并发一起调整，并核对容器 CPU/内存与远端视觉模型限流；多个服务进程不共享信号量。`RAG_PDF_SERVICE_TIMEOUT` 同时是 Go 端调用超时和 pdf-parser 单请求解析超时，**排队等待也计入**（排满返回 503「PDF 解析服务繁忙」）；超大 PDF 会占用该窗口。
+- **并发与超时**：`RAG_PDF_SERVICE_WORKERS` 控制 PDF 服务进程数，`RAG_PDF_SERVICE_CONCURRENCY` 是每个进程内 `asyncio.Semaphore` 的许可数，两者代码默认值均为 `1`。按总解析容量（两者乘积）与文档 worker 总任务并发一起调整，并核对容器 CPU/内存与远端视觉模型限流；多个服务进程不共享信号量。`RAG_PDF_SERVICE_TIMEOUT` 是 Go 调用和 pdf-parser 请求的总预算；排队等待最多使用 `总预算 - RAG_PDF_SERVICE_PARSE_TIMEOUT`（排满返回 503「PDF 解析服务繁忙」），因此不占用解析窗口。`RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120 秒）只在真正拿到名额并开始转换后计时。转换超时返回 504，线程停止前仍占原名额；同一 PDF 的下一轮解析会先等上一轮线程停止，不会同时占用两个名额，其他 PDF 可继续使用其余名额。该按文档串行 gate 是**进程内**状态：`RAG_PDF_SERVICE_WORKERS>1` 时不同进程不共享，需要严格保证同一文档不并行占两个名额时保持 workers=1（默认）。
 - **测试模式**：pdf-parser 的 `RAG_PDF_SERVICE_CONVERTER=fake` 只用于测试/联调（返回固定清单，不调用视觉模型），生产必须保持默认 `vision`。
 - **`.doc` 不受影响**：旧版 `.doc` 仍由 Go 服务调用外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）；DOCX 解析仍在 Go 进程内完成。
 
@@ -312,7 +313,7 @@ Redis 不可用时，持久读模型会回源状态库；搜索为同步直返�
 
 - **只有 MySQL 已记录领取、安全跳过或终态后才提交 Kafka offset**；DB 不可用/写失败返回 nack；
 - handler 失败（nack）→ 在**同一进程内**重试同一条记录，指数退避从 `100ms` 开始、上限 `5s`，`DeliveryAttempt` 从 1 递增；
-- 达到 `MaxAttempts`（document worker 默认 5）→ 把原始消息发布到对应 `RAG_*_DLQ_TOPIC`、执行终态回调、再提交 offset；
+- 达到 `MaxAttempts`（document worker 默认 3）→ 把原始消息发布到对应 `RAG_*_DLQ_TOPIC`、执行终态回调、再提交 offset；
 - `MaxAttempts=0` → 不设上限，一直重试直到进程或 context 取消；
 - 死信 worker 的 `--kind document|cache` 实例消费显式 DLQ topic 与独立 `RAG_*_DLQ_GROUP`，不再使用 `%DLQ%<源组>` 或 mqadmin；`MaxAttempts=0` 的死信 worker 自身不会二次死信。原 `--kind search` 分支已随排队搜索删除。
 - 任务通知只处理与数据库当前 `schedule_version` 相等的记录；版本不符、任务已终态、租约仍有效一律安全跳过并 ACK（任务类事件）。缓存事件按表→key 映射刷新，Redis 写失败不 nack。
@@ -335,8 +336,10 @@ Redis 不可用时，持久读模型会回源状态库；搜索为同步直返�
 | `RAG_DOCUMENT_JOB_RETENTION_SECONDS` | `2592000`（30 天） | 终态任务保留期 |
 | `RAG_DOCUMENT_WORKER_RECOVER_SECONDS` | `30` | 文档 worker 周期性 Recover（恢复中断上传/补偿） |
 | `RAG_DOCUMENT_WORKERS` | `1` | `scripts/start-stack.ps1` 启动的 `rag-document-worker` 进程数（Kafka 同组分摊 `RAG_DOCUMENT_TOPIC` 分区，能分配到分区的进程数受分区数限制；文档任务总并发为有效进程数 × `RAG_DOCUMENT_WORKER_CONCURRENCY`，PDF 解析并发还受 pdf-parser 限制） |
-| `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_DOCUMENT_MAX_ATTEMPTS` | `5` | 文档 worker 的 Kafka 进程内最大尝试次数（前者优先；名称为兼容旧配置保留） |
+| `RAG_DOCUMENT_BROKER_MAX_RETRIES` / `RAG_DOCUMENT_MAX_ATTEMPTS` | `3` | 文档 worker 的 Kafka 进程内最大尝试次数（前者优先；名称为兼容旧配置保留） |
 | `RAG_DOCUMENT_WORKER_CONCURRENCY` | `1` | 文档 worker 并发处理数（1..64）。`>1` 时同一 worker 可同时解析多篇 PDF；解析段的有效并行度受 pdf-parser 的 `RAG_PDF_SERVICE_CONCURRENCY` 封顶，两侧应同量级调整，并核对 pdf-parser 内存/CPU 与本地解压磁盘峰值 |
+
+文档任务的执行次数由 MySQL `document_jobs.attempts` 记录：worker 每次真正领取任务时加 1，换 Kafka 消息、换 worker 或进程重启都沿用同一计数，上限为 3 次（首次 + 最多 2 次自动重试）。第 1、2 次遇到可重试错误时只保存失败原因和 `retry_at`，到期后由后台扫描发出下一轮通知；普通任务仅仅排队超过 120 秒不会增加 `schedule_version`，也不消耗执行次数。第 3 次失败（包括连续 3 次解析超时）后写入 `failed` 和最后一次失败原因；重复通知、后台扫描或租约过期恢复都不会启动第 4 次执行。文件头无效、加密 PDF 等重试无法修复的错误直接标为 `failed`。
 
 对于 16 个逻辑处理器、约 32 GiB 内存的本机部署，`.env.example` 提供以下起始配置（通过 `scripts/start-stack.ps1` 启动，使用单个 pdf-parser 进程）：
 

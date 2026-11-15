@@ -87,7 +87,9 @@ type PDFServiceParser struct {
 func (p *PDFServiceParser) ParseInto(ctx context.Context, source, staging string) (PDFManifest, error) {
 	name := filepath.Base(source)
 	if err := ValidatePDFFile(source, name); err != nil {
-		return PDFManifest{}, &PDFParseError{Message: err.Error()}
+		// Keep the read/validation cause reachable so the ingest worker can
+		// classify an invalid header or encrypted file as terminal.
+		return PDFManifest{}, &PDFParseError{Message: err.Error(), cause: err}
 	}
 	baseURL := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
 	if baseURL == "" {
@@ -134,10 +136,17 @@ func (p *PDFServiceParser) ParseInto(ctx context.Context, source, staging string
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
+		var cause error
+		if response.StatusCode == http.StatusGatewayTimeout {
+			// The service returns 504 only after the conversion itself exceeds the
+			// per-attempt parse window; waiting for a slot does not consume it.
+			cause = ErrPDFParseTimeout
+		}
 		return PDFManifest{}, &PDFParseError{
 			Message: fmt.Sprintf(
 				"PDF 解析服务返回错误（HTTP %d）：%s", response.StatusCode, name),
 			StatusCode: response.StatusCode,
+			cause:      cause,
 		}
 	}
 	if err := checkPDFServiceResponseType(response.Header.Get("Content-Type")); err != nil {
@@ -194,7 +203,10 @@ func (p *PDFServiceParser) Pages(ctx context.Context, source string) ([]Page, er
 func pdfServiceContextError(ctx context.Context, cause error, name string) (*PDFParseError, bool) {
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded):
-		return &PDFParseError{Message: fmt.Sprintf("PDF 解析超时：%s", name), cause: context.DeadlineExceeded}, true
+		return &PDFParseError{
+			Message: fmt.Sprintf("PDF 解析超时：%s", name),
+			cause:   errors.Join(ErrPDFParseTimeout, context.DeadlineExceeded),
+		}, true
 	case errors.Is(ctx.Err(), context.Canceled) || errors.Is(cause, context.Canceled):
 		return &PDFParseError{Message: fmt.Sprintf("PDF 解析已取消：%s", name), cause: context.Canceled}, true
 	default:

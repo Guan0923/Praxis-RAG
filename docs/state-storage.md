@@ -267,14 +267,18 @@ seconds) and renews it every `RAG_DOCUMENT_JOB_HEARTBEAT_SECONDS` (default 20
 seconds) while parsing and calling models. The offset is committed only when the
 job already has a terminal status in MySQL (`succeeded` or `failed`). A
 temporary failure (handler returns false) retries the same record in-process with
-exponential backoff (100 ms base, 5 s cap), `DeliveryAttempt` 1..`MaxAttempts`;
+exponential backoff (100 ms base, 5 s cap), `DeliveryAttempt` 1..`MaxAttempts`
+(default 3; independent from the per-document execution budget below);
 on exhaustion the raw payload is published to the explicit
 `RAG_DOCUMENT_DLQ_TOPIC`, the durable exhausted-state handler runs, and only then
 is the offset committed (at-least-once delivery). `MaxAttempts=0` retries until
-the context/process is cancelled. `jobs.sweep()` re-emits a notification for a
-stranded `queued` job or reclaims an expired `processing` lease, using
-`RAG_DOCUMENT_JOB_SWEEP_SECONDS` (default 120 seconds) as the stale window; it
-increments `schedule_version` inside MySQL instead of writing an outbox row.
+the context/process is cancelled. `jobs.sweep()` emits the replacement notification for a due `retry_wait` job or
+reclaims an expired `processing` lease, using
+`RAG_DOCUMENT_JOB_SWEEP_SECONDS` (default 120 seconds) to pace re-emissions; a
+job that is merely queued is left alone and waiting does not consume an
+execution. It increments `schedule_version` inside MySQL instead of writing an
+outbox row. `document_jobs.attempts` caps executions at 3 (first attempt plus at
+most two retries), and the third failure writes `failed` with the last reason.
 `get_document_status` reads MySQL directly: there is no
 TTL and no Redis dependency, and `succeeded` confirms durable publication.
 

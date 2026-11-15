@@ -143,6 +143,8 @@ func TestDocumentJobClaimHeartbeatProgressAndVersionSemantics(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
 	configureTestNamespace(t, stores, "manuals")
+	clock := unixSeconds()
+	stores.DocumentJobs.Clock = func() float64 { return clock }
 	admission := submitTestDocument(t, stores, "manuals", "manual.txt", []byte("bytes"), nil)
 	notification := documentNotification(t, stores, admission.ArtifactID)
 	task, err := stores.DocumentJobs.Claim(ctx, notification)
@@ -174,13 +176,13 @@ func TestDocumentJobClaimHeartbeatProgressAndVersionSemantics(t *testing.T) {
 	} else {
 		mustBeError[*UploadConflict](t, err)
 	}
-	retryReason := "Document processing failed: qdrant_error at indexing (HTTP 500): boom"
+	retryReason := "Document processing failed: attempt 1/3: qdrant_error at indexing (HTTP 500): boom"
 	if err := stores.DocumentJobs.Fail(ctx, task, true, &retryReason); err != nil {
 		t.Fatalf("Fail(retry) error = %v", err)
 	}
 	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
 	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" ||
-		job.RetryAt <= 0 || job.ScheduleVersion != 2 || job.ExecutionID != nil {
+		job.RetryAt <= clock || job.ScheduleVersion != 1 || job.ExecutionID != nil {
 		t.Fatalf("job after retry = %+v, %v", job, err)
 	}
 	// The retry branch keeps the last recorded failure reason visible while the
@@ -188,10 +190,21 @@ func TestDocumentJobClaimHeartbeatProgressAndVersionSemantics(t *testing.T) {
 	if job.Error == nil || *job.Error != retryReason {
 		t.Fatalf("job after retry lost the failure reason: %+v", job)
 	}
-	// A duplicate delivery of the old generation is skipped; the bumped
-	// generation is claimable.
+	// A duplicate delivery of the old generation is skipped before retry_at; the
+	// periodic sweep is the only path that emits the replacement notification.
 	if old, err := stores.DocumentJobs.Claim(ctx, notification); err != nil || old != nil {
-		t.Fatalf("old schedule_version was claimed: %+v, %v", old, err)
+		t.Fatalf("retry claimed before retry_at: %+v, %v", old, err)
+	}
+	if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 0 {
+		t.Fatalf("Sweep() before retry_at = %d, %v", requeued, err)
+	}
+	clock = job.RetryAt + 1
+	if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 1 {
+		t.Fatalf("Sweep() at retry_at = %d, %v", requeued, err)
+	}
+	job, err = stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
+	if err != nil || job.ScheduleVersion != 2 || job.RetryAt != 0 || job.Status != DocumentJobQueued {
+		t.Fatalf("job after sweep = %+v, %v", job, err)
 	}
 	updated := documentNotification(t, stores, admission.ArtifactID)
 	if updated.ScheduleVersion != 2 {
@@ -230,19 +243,25 @@ func TestDocumentJobRetryFailureReasonPersistsThenSuccessClears(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
 	configureTestNamespace(t, stores, "manuals")
+	clock := unixSeconds()
+	stores.DocumentJobs.Clock = func() float64 { return clock }
 	admission := submitTestDocument(t, stores, "manuals", "retry.txt", []byte("bytes"), nil)
 	notification := documentNotification(t, stores, admission.ArtifactID)
 	task, err := stores.DocumentJobs.Claim(ctx, notification)
 	if err != nil || task == nil {
 		t.Fatalf("Claim() = %+v, %v", task, err)
 	}
-	reason := "Document processing failed: model_api_error at embedding (HTTP 429): rate limited"
+	reason := "Document processing failed: attempt 1/3: model_api_error at embedding (HTTP 429): rate limited"
 	if err := stores.DocumentJobs.Fail(ctx, task, true, &reason); err != nil {
 		t.Fatalf("Fail(retry) error = %v", err)
 	}
 	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
 	if err != nil || job.Error == nil || *job.Error != reason {
 		t.Fatalf("retry_wait job error = %+v, %v; want %q", job, err, reason)
+	}
+	clock = job.RetryAt + 1
+	if _, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil {
+		t.Fatalf("Sweep() error = %v", err)
 	}
 	task, err = stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, admission.ArtifactID))
 	if err != nil || task == nil {
@@ -346,62 +365,214 @@ func TestDocumentJobDeadLetterAndNotificationValidation(t *testing.T) {
 	}
 }
 
-func TestDocumentJobSweepRequeuesAndBumpsVersion(t *testing.T) {
+func TestDocumentJobSweepLeavesQueuedJobsAndEmitsDueRetries(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
 	configureTestNamespace(t, stores, "manuals")
-	admission := submitTestDocument(t, stores, "manuals", "stranded.txt", []byte("x"), nil)
-	// Age the queued job beyond the sweep window.
+	clock := unixSeconds()
+	stores.DocumentJobs.Clock = func() float64 { return clock }
+
+	// A job that is merely queued (notification in flight or waiting for a
+	// worker/parse slot) is not a retry: aging it must not bump the scheduling
+	// generation or consume an execution attempt.
+	stranded := submitTestDocument(t, stores, "manuals", "stranded.txt", []byte("x"), nil)
 	if _, err := stores.DB.ExecContext(ctx,
 		"UPDATE document_jobs SET updated_at = ? WHERE artifact_id = ?",
-		unixSeconds()-3600, admission.ArtifactID); err != nil {
+		clock-3600, stranded.ArtifactID); err != nil {
 		t.Fatalf("age job error = %v", err)
 	}
-	requeued, err := stores.DocumentJobs.Sweep(ctx, 50)
-	if err != nil || requeued != 1 {
-		t.Fatalf("Sweep() = %d, %v", requeued, err)
-	}
-	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
-	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" || job.ScheduleVersion != 2 {
-		t.Fatalf("swept job = %+v, %v", job, err)
-	}
-	// The sweep refreshed updated_at, so the same job is not swept again
-	// immediately; a stale generation is not claimable, the new one is.
 	if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 0 {
-		t.Fatalf("second Sweep() = %d, %v", requeued, err)
+		t.Fatalf("Sweep(queued) = %d, %v", requeued, err)
 	}
-	stale := DocumentNotification{Schema: DocumentEnvelopeSchema, ArtifactID: admission.ArtifactID,
+	job, err := stores.DocumentJobs.Get(ctx, stranded.ArtifactID, nil)
+	if err != nil || job.Status != DocumentJobQueued || job.Stage != DocumentJobQueued ||
+		job.ScheduleVersion != 1 || job.Attempts != 0 {
+		t.Fatalf("merely queued job was changed: %+v, %v", job, err)
+	}
+
+	// A retryable failure records retry_at and the reason but does not emit a
+	// notification immediately.
+	retried := submitTestDocument(t, stores, "manuals", "retry.txt", []byte("y"), nil)
+	task, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, retried.ArtifactID))
+	if err != nil || task == nil {
+		t.Fatalf("Claim() = %+v, %v", task, err)
+	}
+	reason := "Document processing failed: attempt 1/3: parse timeout (2m)"
+	if err := stores.DocumentJobs.Fail(ctx, task, true, &reason); err != nil {
+		t.Fatalf("Fail(retry) error = %v", err)
+	}
+	job, err = stores.DocumentJobs.Get(ctx, retried.ArtifactID, nil)
+	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" ||
+		job.ScheduleVersion != 1 || job.Attempts != 1 || job.RetryAt <= clock {
+		t.Fatalf("job after retry = %+v, %v", job, err)
+	}
+	if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 0 {
+		t.Fatalf("Sweep(before retry_at) = %d, %v", requeued, err)
+	}
+	clock = job.RetryAt + 1
+	if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 1 {
+		t.Fatalf("Sweep(at retry_at) = %d, %v", requeued, err)
+	}
+	job, err = stores.DocumentJobs.Get(ctx, retried.ArtifactID, nil)
+	if err != nil || job.ScheduleVersion != 2 || job.RetryAt != 0 || job.Status != DocumentJobQueued {
+		t.Fatalf("job after sweep = %+v, %v", job, err)
+	}
+	// The pre-sweep generation is stale; the replacement generation claims the
+	// second attempt.
+	stale := DocumentNotification{Schema: DocumentEnvelopeSchema, ArtifactID: retried.ArtifactID,
 		Namespace: "manuals", ScheduleVersion: 1}
 	if task, err := stores.DocumentJobs.Claim(ctx, stale); err != nil || task != nil {
 		t.Fatalf("stale generation claim = %+v, %v", task, err)
 	}
-	// A processing job with an expired lease is requeued with a new generation.
-	second := submitTestDocument(t, stores, "manuals", "expired.txt", []byte("y"), nil)
-	if task, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, second.ArtifactID)); err != nil || task == nil {
-		t.Fatalf("Claim() = %+v, %v", task, err)
+	secondTask, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, retried.ArtifactID))
+	if err != nil || secondTask == nil || secondTask.Attempts != 2 {
+		t.Fatalf("replacement Claim() = %+v, %v", secondTask, err)
+	}
+
+	// A processing job whose worker crashed is requeued once its lease expires.
+	crashed := submitTestDocument(t, stores, "manuals", "expired.txt", []byte("z"), nil)
+	if task, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, crashed.ArtifactID)); err != nil || task == nil {
+		t.Fatalf("Claim(crashed) = %+v, %v", task, err)
 	}
 	if _, err := stores.DB.ExecContext(ctx,
-		"UPDATE document_jobs SET lease_until = 0 WHERE artifact_id = ?", second.ArtifactID); err != nil {
+		"UPDATE document_jobs SET lease_until = 0 WHERE artifact_id = ?", crashed.ArtifactID); err != nil {
 		t.Fatalf("lease expiry update error = %v", err)
 	}
-	if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued < 1 {
+	// Keep the second retried execution's lease live so only the crashed job is
+	// selected by the sweep.
+	if _, err := stores.DB.ExecContext(ctx,
+		"UPDATE document_jobs SET lease_until = ? WHERE artifact_id = ?",
+		clock+3600, secondTask.ArtifactID); err != nil {
+		t.Fatalf("lease keepalive update error = %v", err)
+	}
+	clock += 500
+	if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 1 {
 		t.Fatalf("Sweep(expired) = %d, %v", requeued, err)
 	}
-	job, err = stores.DocumentJobs.Get(ctx, second.ArtifactID, nil)
-	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" || job.ScheduleVersion != 2 {
+	job, err = stores.DocumentJobs.Get(ctx, crashed.ArtifactID, nil)
+	if err != nil || job.Status != DocumentJobQueued || job.Stage != "retry_wait" ||
+		job.ScheduleVersion != 2 || job.RetryAt != 0 {
 		t.Fatalf("requeued job = %+v, %v", job, err)
 	}
+	replacement, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, crashed.ArtifactID))
+	if err != nil || replacement == nil || replacement.Attempts != 2 {
+		t.Fatalf("replacement Claim() = %+v, %v", replacement, err)
+	}
 	// Retention GC deletes terminal jobs.
-	if err := stores.DocumentJobs.Fail(ctx, &DocumentJobTask{DocumentJob: *job}, false, stringPtr("fail")); err != nil {
+	if err := stores.DocumentJobs.Fail(ctx, replacement, false, stringPtr("fail")); err != nil {
 		t.Fatalf("Fail() error = %v", err)
 	}
 	if _, err := stores.DB.ExecContext(ctx,
-		"UPDATE document_jobs SET updated_at = ? WHERE artifact_id = ?", unixSeconds()-100, second.ArtifactID); err != nil {
+		"UPDATE document_jobs SET updated_at = ? WHERE artifact_id = ?", clock-100, crashed.ArtifactID); err != nil {
 		t.Fatalf("age terminal job error = %v", err)
 	}
 	removed, err := stores.DocumentJobs.GCJobs(ctx, float64Pointer(0))
 	if err != nil || removed != 1 {
 		t.Fatalf("GCJobs() = %d, %v", removed, err)
+	}
+}
+
+func TestDocumentJobAttemptLimitStopsFourthExecution(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+	configureTestNamespace(t, stores, "manuals")
+	clock := unixSeconds()
+	stores.DocumentJobs.Clock = func() float64 { return clock }
+	admission := submitTestDocument(t, stores, "manuals", "timeout.pdf", []byte("timeout"), nil)
+
+	for attempt := 1; attempt <= MaxDocumentJobAttempts; attempt++ {
+		task, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, admission.ArtifactID))
+		if err != nil || task == nil || task.Attempts != attempt {
+			t.Fatalf("Claim(attempt %d) = %+v, %v", attempt, task, err)
+		}
+		reason := "Document processing failed: attempt 3/3: parse timeout (2m)"
+		if err := stores.DocumentJobs.Fail(ctx, task, true, &reason); err != nil {
+			t.Fatalf("Fail(attempt %d) error = %v", attempt, err)
+		}
+		job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
+		if err != nil {
+			t.Fatalf("Get(attempt %d) error = %v", attempt, err)
+		}
+		if attempt < MaxDocumentJobAttempts {
+			if job.Status != DocumentJobQueued || job.Stage != "retry_wait" || job.Attempts != attempt {
+				t.Fatalf("job after attempt %d = %+v", attempt, job)
+			}
+			clock = job.RetryAt + 1
+			if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 1 {
+				t.Fatalf("Sweep(after attempt %d) = %d, %v", attempt, requeued, err)
+			}
+			continue
+		}
+		if job.Status != DocumentJobFailed || job.Stage != "failed" || job.Attempts != MaxDocumentJobAttempts {
+			t.Fatalf("job after final failure = %+v", job)
+		}
+		if job.Error == nil || !strings.Contains(*job.Error, "parse timeout") {
+			t.Fatalf("final failure lost the reason: %+v", job.Error)
+		}
+	}
+
+	// Neither a duplicate notification nor the periodic sweep may start a
+	// fourth execution.
+	if task, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, admission.ArtifactID)); err != nil || task != nil {
+		t.Fatalf("fourth Claim() = %+v, %v", task, err)
+	}
+	if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 0 {
+		t.Fatalf("Sweep(after failure) = %d, %v", requeued, err)
+	}
+	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
+	if err != nil || job.Attempts != MaxDocumentJobAttempts || job.Status != DocumentJobFailed {
+		t.Fatalf("final job = %+v, %v", job, err)
+	}
+}
+
+func TestDocumentJobExpiredLeaseAtAttemptLimitTerminalizes(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+	configureTestNamespace(t, stores, "manuals")
+	clock := unixSeconds()
+	stores.DocumentJobs.Clock = func() float64 { return clock }
+	admission := submitTestDocument(t, stores, "manuals", "crash.pdf", []byte("crash"), nil)
+	reason := "Document processing failed: attempt 1/3: parse timeout"
+
+	for attempt := 1; attempt <= MaxDocumentJobAttempts; attempt++ {
+		task, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, admission.ArtifactID))
+		if err != nil || task == nil || task.Attempts != attempt {
+			t.Fatalf("Claim(attempt %d) = %+v, %v", attempt, task, err)
+		}
+		if attempt == MaxDocumentJobAttempts {
+			// The third execution crashed without recording a failure; the
+			// expired lease must terminalize instead of starting a fourth.
+			if _, err := stores.DB.ExecContext(ctx,
+				"UPDATE document_jobs SET lease_until = 0 WHERE artifact_id = ?", admission.ArtifactID); err != nil {
+				t.Fatalf("lease expiry update error = %v", err)
+			}
+			clock += 1
+			if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 0 {
+				t.Fatalf("Sweep(at attempt limit) = %d, %v", requeued, err)
+			}
+			continue
+		}
+		if err := stores.DocumentJobs.Fail(ctx, task, true, &reason); err != nil {
+			t.Fatalf("Fail(attempt %d) error = %v", attempt, err)
+		}
+		job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
+		if err != nil {
+			t.Fatalf("Get(attempt %d) error = %v", attempt, err)
+		}
+		clock = job.RetryAt + 1
+		if requeued, err := stores.DocumentJobs.Sweep(ctx, 50); err != nil || requeued != 1 {
+			t.Fatalf("Sweep(after attempt %d) = %d, %v", attempt, requeued, err)
+		}
+	}
+	job, err := stores.DocumentJobs.Get(ctx, admission.ArtifactID, nil)
+	if err != nil || job.Status != DocumentJobFailed || job.Attempts != MaxDocumentJobAttempts {
+		t.Fatalf("job after expired third lease = %+v, %v", job, err)
+	}
+	if job.Error == nil || !strings.Contains(*job.Error, "attempt limit reached") {
+		t.Fatalf("terminal reason = %+v, want the attempt-limit message", job.Error)
+	}
+	if task, err := stores.DocumentJobs.Claim(ctx, documentNotification(t, stores, admission.ArtifactID)); err != nil || task != nil {
+		t.Fatalf("claim after terminalized crash = %+v, %v", task, err)
 	}
 }
 

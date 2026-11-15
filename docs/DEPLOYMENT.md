@@ -95,7 +95,7 @@ docker run -d --name praxis-rag-service \
 - 公开到宿主机时加 TLS 反向代理；不要直接把 8011 暴露到公网。
 - 使用 MySQL 时先执行一次 schema 检查/建表（见 §6）：`docker run --rm --entrypoint /app/bin/rag-state-migrate ... --apply`。
 - 镜像不含 Python 或 LibreOffice：DOCX 解析与 Word 图片描述（HTTP VLM）由 Go 进程内完成；PDF 高保真解析调用独立的 `pdf-parser`（见 §3.5），使用 `RAG_PDF_ENGINE=go` 时不需要它；只有 .doc 转换需要把 LibreOffice bind mount 进容器并设置 `RAG_WORD_CONVERTER_PATH`；转换进程的路径必须在容器内可见。
-- PDF 高保真解析：设置 `RAG_PDF_ENGINE=vision` 并把 `RAG_PDF_SERVICE_URL` 指向 pdf-parser（同一 compose 网络用 `http://pdf-parser:8091`；单独 `docker run` 时用从容器内可达的地址，如 `http://host.docker.internal:8091`）；超时用 `RAG_PDF_SERVICE_TIMEOUT`（默认 900 秒）。pdf-parser 不可用时 vision 上传会失败，可切回 `RAG_PDF_ENGINE=go`。
+- PDF 高保真解析：设置 `RAG_PDF_ENGINE=vision` 并把 `RAG_PDF_SERVICE_URL` 指向 pdf-parser（同一 compose 网络用 `http://pdf-parser:8091`；单独 `docker run` 时用从容器内可达的地址，如 `http://host.docker.internal:8091`）；调用总超时用 `RAG_PDF_SERVICE_TIMEOUT`（默认 900 秒），真正开始解析后的单次上限用 `RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120 秒，排队等待不计入）。pdf-parser 不可用时 vision 上传会失败，可切回 `RAG_PDF_ENGINE=go`。
 - Word 无图注图片的描述调用远端 OpenAI 兼容视觉模型：优先在 Console 的知识库设置页配置（URL/Key/模型），也可用 `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`（可选 `RAG_VLM_TIMEOUT`/`RAG_VLM_CONCURRENCY`）作为未配置知识库时的环境回退。图片内容会离开本机到该端点，选型时确认合规；未配置时这些图片保留占位描述，上传不会失败。该视觉模型端点同时用于 vision 引擎的 PDF 版面/OCR/表格/公式/图片描述；vision 引擎要求知识库配置 VLM（Console「模型配置」页添加并在知识库表单选择），否则 PDF 上传会在受理阶段被拒绝并提示配置。
 - 数据目录卷保存上传恢复工作区与 artifact 工作区；不要用匿名卷。
 
@@ -109,7 +109,7 @@ docker compose --profile app up -d --build
 docker compose up -d mysql qdrant redis kafka
 ```
 
-`app` 服务从 `.env` 读取 `RAG_SERVICE_TOKEN`（容器 0.0.0.0 绑定，必填）、`RAG_MYSQL_*`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_APP_QDRANT_URL`、`RAG_APP_PORT`、`RAG_APP_KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`RAG_AUTH_*`（Console 登录，见下）、`RAG_PDF_ENGINE`（默认 `vision`）、`RAG_PDF_SERVICE_URL`（compose 内默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）等；默认依赖 MySQL healthy + Qdrant started + Kafka healthy + pdf-parser started。`pdf-parser` 没有 profile，默认 `docker compose up -d` 即启动；它只在 `vision` 引擎下被调用。详细的环境变量见 §3.5。
+`app` 服务从 `.env` 读取 `RAG_SERVICE_TOKEN`（容器 0.0.0.0 绑定，必填）、`RAG_MYSQL_*`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_APP_QDRANT_URL`、`RAG_APP_PORT`、`RAG_APP_KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`RAG_AUTH_*`（Console 登录，见下）、`RAG_PDF_ENGINE`（默认 `vision`）、`RAG_PDF_SERVICE_URL`（compose 内默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120）等；默认依赖 MySQL healthy + Qdrant started + Kafka healthy + pdf-parser started。`pdf-parser` 没有 profile，默认 `docker compose up -d` 即启动；它只在 `vision` 引擎下被调用。详细的环境变量见 §3.5。
 
 ### 3.4 Compose：worker 示例（需自行保存为 override 文件）
 
@@ -229,7 +229,8 @@ docker run -d --name praxis-rag-pdf-parser \\
 | `RAG_PDF_SERVICE_PORT` | `8091` | 仅用于 compose 的宿主发布端口；容器内固定 8091，改宿主端口后要同步 Go 端 `RAG_PDF_SERVICE_URL` |
 | `RAG_PDF_SERVICE_WORKERS` | `1` | 容器内 Uvicorn 服务进程数（正整数）；默认入口 `python -m app.main` 读取。所有进程共用同一端口 |
 | `RAG_PDF_SERVICE_CONCURRENCY` | `1` | 每进程并发解析请求数（`asyncio.Semaphore` 许可数）。本地不再加载模型权重，内存主要随渲染 DPI 与并发解析数增长；内存/CPU 紧张时保持 1 靠副本扩容 |
-| `RAG_PDF_SERVICE_TIMEOUT` | `900` 秒 | 单请求超时；排队等待与转换各自不超过该值（超时 504），与 Go 端同名变量取同一值 |
+| `RAG_PDF_SERVICE_TIMEOUT` | `900` 秒 | Go 调用 pdf-parser 的总超时；pdf-parser 用它作为总预算，排队等待最多 `本值 - RAG_PDF_SERVICE_PARSE_TIMEOUT`（排满 503） |
+| `RAG_PDF_SERVICE_PARSE_TIMEOUT` | `120` 秒 | pdf-parser 真正开始转换后的单次解析上限（超时 504），须小于 `RAG_PDF_SERVICE_TIMEOUT`；同一 PDF 的下一轮解析会等待上一轮线程停止，避免同时占用两个名额（进程内 gate；多 Uvicorn 进程不共享，严格串行时保持 `WORKERS=1`） |
 | `RAG_PDF_SERVICE_MAX_BYTES` | `104857600` | 单次上传上限（字节），超限 413 |
 | `RAG_PDF_SERVICE_CONVERTER` | `vision` | `vision`：远端视觉解析；旧值 `docling` 作为兼容别名归一化为 `vision`；`fake` 仅在测试/联调时返回固定清单，不要用于生产 |
 | `RAG_VLM_BASE_URL` / `RAG_VLM_API_KEY` / `RAG_VLM_MODEL` | 空 | 视觉模型的**环境回退**（请求 `options` 与 Console 知识库配置优先）；`RAG_VLM_BASE_URL` 与 `RAG_VLM_MODEL` 必须**同时**配置，只配一半按配置错误处理 |
@@ -318,6 +319,7 @@ RAG_MCP_ALLOWED_ORIGINS=https://app.example.com
 RAG_PDF_ENGINE=vision
 RAG_PDF_SERVICE_URL=http://127.0.0.1:8091
 RAG_PDF_SERVICE_TIMEOUT=900
+RAG_PDF_SERVICE_PARSE_TIMEOUT=120
 # RAG_VLM_BASE_URL=https://llm.internal/v1
 # RAG_VLM_MODEL=qwen2.5-vl-7b
 # RAG_VLM_TIMEOUT=120

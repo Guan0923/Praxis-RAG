@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+import threading
 import time
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from conftest import MINIMAL_PDF, parse_files
@@ -13,9 +17,15 @@ from app.main import (
     INVALID_PDF_MESSAGE,
     UNKNOWN_CONVERTER_MESSAGE,
     Settings,
+    _run_conversion,
     create_app,
 )
-from app.parser import NOT_CONFIGURED_MESSAGE, ParserConversionError, fake_manifest
+from app.parser import (
+    NOT_CONFIGURED_MESSAGE,
+    FakeConverter,
+    ParserConversionError,
+    fake_manifest,
+)
 
 
 class FailingConverter:
@@ -38,6 +48,43 @@ class SlowConverter:
     def convert(self, source, output_dir, scratch_dir, *, options=None):
         time.sleep(0.3)
         return fake_manifest()
+
+
+class BlockingFirstFakeConverter:
+    """Blocks the first conversion and counts concurrent conversions."""
+
+    name = "blocking-first"
+
+    def __init__(self, *, delay: float = 0.3) -> None:
+        self.delay = delay
+        self.started = threading.Event()
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+        self._lock = threading.Lock()
+
+    def convert(self, source, output_dir, scratch_dir, *, options=None):
+        with self._lock:
+            self.calls += 1
+            call = self.calls
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            if call == 1:
+                self.started.set()
+                time.sleep(self.delay)
+            return FakeConverter().convert(
+                source, output_dir, scratch_dir, options=options
+            )
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+def _workdir(tmp_path: Path, name: str) -> Path:
+    path = tmp_path / name
+    path.mkdir()
+    return path
 
 
 def test_missing_file_field_returns_422_with_string_detail(fake_client: TestClient) -> None:
@@ -139,10 +186,100 @@ def test_invalid_converter_is_a_readable_503(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_conversion_timeout_returns_504() -> None:
-    settings = Settings(converter="vision", timeout=0.05)
+    settings = Settings(converter="vision", timeout=0.2, parse_timeout=0.05)
     client = TestClient(create_app(settings=settings, converter=SlowConverter()))
 
     response = client.post("/v1/parse", files=parse_files(MINIMAL_PDF))
 
     assert response.status_code == 504
     assert "超时" in response.json()["detail"]
+
+
+def test_queue_wait_does_not_consume_parse_timeout_and_waits_for_orphan(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(converter="fake", timeout=5.0, parse_timeout=0.1, concurrency=1)
+    converter = BlockingFirstFakeConverter(delay=0.3)
+    app = create_app(settings=settings, converter=converter)
+
+    async def scenario() -> None:
+        source_a = tmp_path / "a.pdf"
+        source_a.write_bytes(MINIMAL_PDF)
+        source_b = tmp_path / "b.pdf"
+        source_b.write_bytes(MINIMAL_PDF + b"\n")
+        # A occupies the only slot and times out after 0.1s while its thread
+        # keeps running for 0.3s.
+        task_a = asyncio.create_task(
+            _run_conversion(app, source_a, _workdir(tmp_path, "a"), fingerprint="a")
+        )
+        assert await asyncio.to_thread(converter.started.wait, 2)
+        # B waits for the slot much longer than its own parse window. Waiting
+        # must not consume that window, so B is still pending at 0.25s.
+        task_b = asyncio.create_task(
+            _run_conversion(app, source_b, _workdir(tmp_path, "b"), fingerprint="b")
+        )
+        with pytest.raises(HTTPException) as timeout_error:
+            await task_a
+        assert timeout_error.value.status_code == 504
+        await asyncio.sleep(0.15)
+        assert not task_b.done(), "queue wait consumed the parse timeout"
+        payload = await asyncio.wait_for(task_b, 5)
+        assert payload
+
+    asyncio.run(scenario())
+
+
+def test_same_pdf_retry_waits_until_previous_thread_stops(tmp_path: Path) -> None:
+    settings = Settings(converter="fake", timeout=5.0, parse_timeout=0.1, concurrency=2)
+    converter = BlockingFirstFakeConverter(delay=0.3)
+    app = create_app(settings=settings, converter=converter)
+
+    async def scenario() -> None:
+        source = tmp_path / "same.pdf"
+        source.write_bytes(MINIMAL_PDF)
+        task_a = asyncio.create_task(
+            _run_conversion(app, source, _workdir(tmp_path, "a"), fingerprint="same")
+        )
+        assert await asyncio.to_thread(converter.started.wait, 2)
+        with pytest.raises(HTTPException) as timeout_error:
+            await task_a
+        assert timeout_error.value.status_code == 504
+
+        task_b = asyncio.create_task(
+            _run_conversion(app, source, _workdir(tmp_path, "b"), fingerprint="same")
+        )
+        await asyncio.sleep(0.1)
+        assert not task_b.done(), "the same PDF took a second slot while the first thread ran"
+        assert converter.max_active == 1
+        payload = await asyncio.wait_for(task_b, 5)
+        assert payload
+        assert converter.max_active == 1
+
+    asyncio.run(scenario())
+
+
+def test_different_pdf_uses_another_parse_slot(tmp_path: Path) -> None:
+    settings = Settings(converter="fake", timeout=5.0, parse_timeout=1.0, concurrency=2)
+    converter = BlockingFirstFakeConverter(delay=0.6)
+    app = create_app(settings=settings, converter=converter)
+
+    async def scenario() -> None:
+        source_a = tmp_path / "a.pdf"
+        source_a.write_bytes(MINIMAL_PDF)
+        source_b = tmp_path / "b.pdf"
+        source_b.write_bytes(MINIMAL_PDF + b"\n")
+        task_a = asyncio.create_task(
+            _run_conversion(app, source_a, _workdir(tmp_path, "a"), fingerprint="a")
+        )
+        assert await asyncio.to_thread(converter.started.wait, 2)
+        task_b = asyncio.create_task(
+            _run_conversion(app, source_b, _workdir(tmp_path, "b"), fingerprint="b")
+        )
+        payload_b = await asyncio.wait_for(task_b, 0.5)
+        assert payload_b
+        assert not task_a.done()
+        payload_a = await asyncio.wait_for(task_a, 5)
+        assert payload_a
+        assert converter.max_active == 2
+
+    asyncio.run(scenario())

@@ -97,16 +97,16 @@ func (a *docxArchive) part(name string) (*xmlNode, error) {
 func validateDOCX(path, name string) error {
 	reader, err := zip.OpenReader(path)
 	if err != nil {
-		return readErrf("Word 文件损坏或格式无效：%s", name)
+		return invalidDocumentErrf("Word 文件损坏或格式无效：%s", name)
 	}
 	defer reader.Close()
 	members := reader.File
 	if len(members) > MaxDOCXMembers {
-		return readErrf("Word 文件内部条目过多：%s", name)
+		return invalidDocumentErrf("Word 文件内部条目过多：%s", name)
 	}
 	for _, member := range members {
 		if member.Flags&0x1 != 0 {
-			return readErrf("Word 文件已加密，暂不支持需要密码的文件：%s", name)
+			return invalidDocumentErrf("Word 文件已加密，暂不支持需要密码的文件：%s", name)
 		}
 	}
 	uncompressed := int64(0)
@@ -119,7 +119,7 @@ func validateDOCX(path, name string) error {
 	}
 	if uncompressed > MaxDOCXUncompressedBytes {
 		limitMiB := MaxDOCXUncompressedBytes / (1024 * 1024)
-		return readErrf("Word 解压后不能超过 %d MiB：%s", limitMiB, name)
+		return invalidDocumentErrf("Word 解压后不能超过 %d MiB：%s", limitMiB, name)
 	}
 	return nil
 }

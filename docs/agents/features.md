@@ -161,10 +161,10 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 
 - Kafka 只在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；空值 = brokerless（通知无法投递、文档任务保持 `queued`、缓存刷新不生效）。搜索为同步执行，不受 Kafka 是否配置影响。
 - **两个 Debezium 连接器**：任务连接器只采集 `document_jobs`（仅 INSERT 与 `schedule_version` 变化，`skipped.operations=d`）；缓存连接器采集 `knowledge_bases`/`documents`/`mcp_catalogs`/`api_keys`/`document_heads`/`document_leases`/`upload_operations`/`upload_steps`（全部 c/u/d）。应用不再写任何事务 outbox。
-- 重发只发生在 MySQL 事务内：`schedule_version = schedule_version + 1`；消费者只处理与数据库当前版本相等的通知，旧版本/终态/有效租约安全跳过并 ACK。任务表初始快照的 `op=r` 事件用于切换补投。
+- 重发只发生在 MySQL 事务内：可重试失败先写 `retry_at`，到期由 `Sweep` 递增 `schedule_version`；租约过期也由 `Sweep` 递增版本重排。普通 `queued` 等待不递增版本、不消耗执行次数。消费者只处理与数据库当前版本相等的通知，旧版本/终态/有效租约/未到期重试安全跳过并 ACK。任务表初始快照的 `op=r` 事件用于切换补投。
 - topic：`praxis_document_ingest`、`praxis_state_cache_refresh`；DLQ 是显式 topic `praxis_document_ingest_dead_letters` / `praxis_state_cache_refresh_dead_letters`（不是 `%DLQ%` 约定），由 `rag-dead-letter-worker --kind document|cache` 消费。原搜索 topic/消费组/DLQ 已下线。
 - 缓存消费者按 `cache_revisions` 的 revision 水位刷新：读取事件 → 事务内 `revision+1` → 重建脱敏视图 → 提交后写 Redis；失败记录 `attempts/last_error` 并照常 ACK，由周期 `RefreshDirty` 补偿，Redis 写失败不丢收敛、不会造成 DLQ 风暴。
-- 消费语义至少一次：成功提交 offset；失败同进程指数退避重试（100ms 起、上限 5s），达到 `MaxAttempts`（默认 5）后写 DLQ 再提交；重复投递由幂等与 MySQL 租约吸收。
+- 消费语义至少一次：成功提交 offset；失败同进程指数退避重试（100ms 起、上限 5s），达到 `MaxAttempts`（默认 3）后写 DLQ 再提交；重复投递由幂等与 MySQL 租约吸收。文档执行次数另由 `document_jobs.attempts` 记录（上限 3，跨消息/worker/重启），第 3 次失败写 `failed`。
 - 文档 worker 只有 Kafka 消费模式：`rag-service` 不内嵌消费者，`rag-document-worker` 消费 Debezium 投递的 `RAG_DOCUMENT_TOPIC`；未配置 Kafka 或未运行该 worker 时，上传仍受理但任务保持 `queued`。
 - Redis 用途：只承担读模型展示缓存（短 TTL）；搜索响应与 artifact 事实都不在 Redis（artifact 在 MySQL，按 ID 独立读取）。
 - 搜索为同步执行：一次调用完成检索 + 重排并返回证据；总预算由 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120s）约束，客户端取消会终止下游调用。
