@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/documentworker"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -179,6 +181,25 @@ func documentJobIngestError(err error) error {
 	var knowledgeValidation *apierrors.KnowledgeValidationError
 	if errors.As(inner, &knowledgeValidation) {
 		return knowledgeValidation
+	}
+	// A malformed/encrypted/unsupported document cannot be fixed by parsing it
+	// again; fail it now instead of burning retries. Transient read failures
+	// (cancellation, temporary I/O) stay retryable.
+	if errors.Is(inner, document.ErrInvalidDocument) {
+		var readError *document.ReadError
+		if errors.As(inner, &readError) {
+			return &state.DocumentValidationError{Message: readError.Message}
+		}
+		return &state.DocumentValidationError{Message: inner.Error()}
+	}
+	// The parse service rejects malformed uploads (400), over-limit files (413)
+	// and invalid options (422); retrying the same request cannot fix them.
+	var parseError *document.PDFParseError
+	if errors.As(inner, &parseError) {
+		switch parseError.StatusCode {
+		case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+			return &state.DocumentValidationError{Message: parseError.Message}
+		}
 	}
 	var documentValidation *state.DocumentValidationError
 	if errors.As(inner, &documentValidation) {

@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/config"
 
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
+	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/documentworker"
 	"github.com/Guan0923/xinghe_rag/internal/sparse"
 	"github.com/Guan0923/xinghe_rag/internal/state"
@@ -47,6 +50,48 @@ func claimAdmittedJob(t *testing.T, stores *state.Stores, name, content string) 
 		t.Fatalf("Claim() = %v, %v", task, err)
 	}
 	return task, documentworker.PayloadFromTask(task)
+}
+
+func TestDocumentJobIngestErrorKeepsTransientReadFailureRetryable(t *testing.T) {
+	// A temporary read failure is not a malformed document: it must keep the
+	// retry budget instead of terminalizing on the first attempt.
+	transient := &document.ReadError{Message: "知识文件无法读取：manual.pdf"}
+	classified := documentJobIngestError(transient)
+	var validation *state.DocumentValidationError
+	if errors.As(classified, &validation) {
+		t.Fatalf("transient read failure was terminalized: %+v", validation)
+	}
+	// A parse service 400/413/422 is a deterministic request rejection.
+	badRequest := documentJobIngestError(&document.PDFParseError{
+		Message: "PDF 文件损坏或格式无效：bad.pdf", StatusCode: http.StatusBadRequest})
+	if !errors.As(badRequest, &validation) {
+		t.Fatalf("parse-service 400 = %v, want *state.DocumentValidationError", badRequest)
+	}
+	// A parse timeout is retryable and must keep its original type.
+	timeout := documentJobIngestError(&document.PDFParseError{Message: "PDF 解析超时"})
+	var parseErr *document.PDFParseError
+	if !errors.As(timeout, &parseErr) {
+		t.Fatalf("timeout classification = %v, want *document.PDFParseError", timeout)
+	}
+}
+
+func TestDocumentJobIngestErrorTreatsInvalidPDFServiceInputAsTerminal(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "bad.pdf")
+	if err := os.WriteFile(source, []byte("this is not a pdf"), 0o600); err != nil {
+		t.Fatalf("write bad pdf error = %v", err)
+	}
+	_, parseErr := (&document.PDFServiceParser{BaseURL: "http://127.0.0.1:1"}).ParseInto(
+		context.Background(), source, t.TempDir())
+	if parseErr == nil {
+		t.Fatal("ParseInto() accepted an invalid PDF header")
+	}
+	converted := documentJobIngestError(parseErr)
+	var validation *state.DocumentValidationError
+	if !errors.As(converted, &validation) {
+		t.Fatalf("documentJobIngestError(%v) = %v, want *state.DocumentValidationError",
+			parseErr, converted)
+	}
 }
 
 func TestProcessDocumentJobSucceeds(t *testing.T) {
@@ -285,8 +330,9 @@ func TestProcessDocumentJobModelFailureIsRetryable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("documentworker.New() error = %v", err)
 	}
-	// A retryable failure is recorded as an in-transaction requeue: the worker
-	// acknowledges the delivery and Debezium emits the new schedule_version.
+	// A retryable failure is recorded as a durable retry wait: the worker
+	// acknowledges the delivery, and the periodic sweep emits the replacement
+	// notification when retry_at is due.
 	if acked := processor.Handle(ctx, notification); !acked {
 		t.Fatalf("durable retry was not acknowledged")
 	}
@@ -297,8 +343,12 @@ func TestProcessDocumentJobModelFailureIsRetryable(t *testing.T) {
 	if retried.Status != state.DocumentJobQueued || retried.Stage != "retry_wait" || retried.Attempts != 1 {
 		t.Fatalf("retried job = %+v", retried)
 	}
-	if retried.ScheduleVersion != 2 {
-		t.Fatalf("schedule_version after retry = %d, want 2", retried.ScheduleVersion)
+	if retried.ScheduleVersion != 1 {
+		t.Fatalf("schedule_version after retry = %d, want 1 (sweep emits at retry_at)",
+			retried.ScheduleVersion)
+	}
+	if retried.RetryAt <= 0 {
+		t.Fatalf("retry_at = %v, want a future deadline", retried.RetryAt)
 	}
 	// A retryable failure keeps the last reason on the job row: the retry-only
 	// row must say what failed (category), where (stage) and the upstream status

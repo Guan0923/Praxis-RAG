@@ -11,8 +11,9 @@ import (
 
 // TestChaosPausedTaskConnectorResumesWithEveryDocumentProcessed covers the
 // Debezium-pause/resume row for the document task topic: submissions while the
-// connector is paused stay in MySQL, the document sweep re-emits a new
-// generation, and every unfinished job is processed exactly once after resume.
+// connector is paused stay in MySQL with their original generation, the sweep
+// does not re-emit merely queued jobs, and every unfinished job is processed
+// exactly once after resume.
 func TestChaosPausedTaskConnectorResumesWithEveryDocumentProcessed(t *testing.T) {
 	stores := newStores(t)
 	ctx := context.Background()
@@ -33,27 +34,27 @@ func TestChaosPausedTaskConnectorResumesWithEveryDocumentProcessed(t *testing.T)
 	if ingester.callCount() != 0 {
 		t.Fatal("paused connector still executed work")
 	}
-	// Document recovery while paused: the sweep emits new generations.
+	// A merely queued job is not a retry: the sweep leaves both generations
+	// untouched, and the retained Kafka notifications are delivered on resume.
 	stores.DocumentJobs.Settings.SweepAfterSeconds = -1
-	swept, err := stores.DocumentJobs.Sweep(ctx, 10)
-	if err != nil || swept != 2 {
-		t.Fatalf("Sweep(paused) = %d, %v; want 2", swept, err)
+	if swept, err := stores.DocumentJobs.Sweep(ctx, 10); err != nil || swept != 0 {
+		t.Fatalf("Sweep(paused) = %d, %v; want 0", swept, err)
 	}
-	requireDocumentJob(t, stores, firstDoc.ArtifactID, state.DocumentJobQueued, "retry_wait", 2)
-	requireDocumentJob(t, stores, secondDoc.ArtifactID, state.DocumentJobQueued, "retry_wait", 2)
+	requireDocumentJob(t, stores, firstDoc.ArtifactID, state.DocumentJobQueued, "queued", 1)
+	requireDocumentJob(t, stores, secondDoc.ArtifactID, state.DocumentJobQueued, "queued", 1)
 
-	// Resume: the connector publishes the backlog. The pre-sweep generation is
-	// stale; the replacement generation is processed.
+	// Resume: the connector publishes the backlog. Both original generations run
+	// exactly once; duplicates are safely skipped.
 	for _, artifactID := range []string{firstDoc.ArtifactID, secondDoc.ArtifactID} {
 		if acked := deliver(t, documentWorker.MessageHandler(), "praxis_document_ingest",
 			rawDocumentEvent(t, artifactID, namespace, 1, "c")); !acked {
-			t.Fatalf("stale delivery for %s was not acknowledged", artifactID)
-		}
-		if acked := deliver(t, documentWorker.MessageHandler(), "praxis_document_ingest",
-			rawDocumentEvent(t, artifactID, namespace, 2, "u")); !acked {
 			t.Fatalf("resumed delivery for %s was not acknowledged", artifactID)
 		}
-		requireDocumentJob(t, stores, artifactID, state.DocumentJobSucceeded, "completed", 2)
+		if acked := deliver(t, documentWorker.MessageHandler(), "praxis_document_ingest",
+			rawDocumentEvent(t, artifactID, namespace, 1, "u")); !acked {
+			t.Fatalf("duplicate resumed delivery for %s was not acknowledged", artifactID)
+		}
+		requireDocumentJob(t, stores, artifactID, state.DocumentJobSucceeded, "completed", 1)
 	}
 	if ingester.callCount() != 2 {
 		t.Fatalf("ingester calls = %d, want 2 (one per document)", ingester.callCount())
@@ -123,12 +124,23 @@ func TestChaosCrashAndDuplicateDeliveryConverge(t *testing.T) {
 		rawDocumentEvent(t, retryDoc.ArtifactID, namespace, 1, "c")); !acked {
 		t.Fatal("retryable document failure was not acknowledged")
 	}
-	requireDocumentJob(t, stores, retryDoc.ArtifactID, state.DocumentJobQueued, "retry_wait", 2)
+	retryJob := requireDocumentJob(t, stores, retryDoc.ArtifactID, state.DocumentJobQueued, "retry_wait", 1)
 	for attempt := 0; attempt < 2; attempt++ {
 		if acked := deliver(t, documentWorker.MessageHandler(), "praxis_document_ingest",
 			rawDocumentEvent(t, retryDoc.ArtifactID, namespace, 1, "u")); !acked {
-			t.Fatalf("stale generation duplicate %d was not acknowledged", attempt)
+			t.Fatalf("early retry duplicate %d was not acknowledged", attempt)
 		}
+	}
+	// The retry is due: the sweep emits the replacement generation.
+	docOffset = retryJob.RetryAt - docBase + 1
+	if swept, err := stores.DocumentJobs.Sweep(ctx, 10); err != nil || swept != 1 {
+		t.Fatalf("Sweep(retry due) = %d, %v; want 1", swept, err)
+	}
+	requireDocumentJob(t, stores, retryDoc.ArtifactID, state.DocumentJobQueued, "retry_wait", 2)
+	// The old generation is stale; the replacement generation completes.
+	if acked := deliver(t, documentWorker.MessageHandler(), "praxis_document_ingest",
+		rawDocumentEvent(t, retryDoc.ArtifactID, namespace, 1, "u")); !acked {
+		t.Fatal("stale retry generation was not acknowledged")
 	}
 	if acked := deliver(t, documentWorker.MessageHandler(), "praxis_document_ingest",
 		rawDocumentEvent(t, retryDoc.ArtifactID, namespace, 2, "u")); !acked {

@@ -430,7 +430,7 @@ REST /v1/admin/tools -> 6 tools
 - **删除 outbox**：`document_job_outbox`、`search_task_outbox`、`cache_outbox`、历史 `document_task_outbox` 从写入/轮询/补发/清理路径全部移除；`schemaTables` 不再创建这四张表（已存在则保持不动）。
 - **表结构**：`document_jobs`/`search_tasks` 追加 `schedule_version BIGINT NOT NULL DEFAULT 1`；`cache_revisions` 追加 `refreshed_revision/attempts/last_error/updated_at`；新增 `cdc_cutover_state(k,v)`；`search_result_snapshots` 改为活动的结果事实来源。
 - **事件契约**：文档通知 schema 4（`artifact_id/namespace/schedule_version`）、搜索通知 schema 3（`result_id/namespace/schedule_version`）、缓存事件 schema 1（`table/op/before/after` 定位列）；消费者兼容 Debezium 原生 envelope 与应用原生 envelope。
-- **调度版本**：重发只发生在 MySQL 事务内（`schedule_version = GREATEST(schedule_version, baseline)+1`）；`Claim` 校验版本/状态/租约，旧版本/终态/有效租约安全跳过并 ACK；`Sweep`/`Fail(retry)` 用 UPDATE 递增版本重排。
+- **调度版本**：重发只发生在 MySQL 事务内（`schedule_version + 1`，由 `Sweep` 在到期重试或租约过期时执行）；`Claim` 校验版本/状态/租约，旧版本/终态/有效租约/重试未到期安全跳过并 ACK；`Fail(retry)` 只写失败原因与 `retry_at`，不递增版本。
 - **搜索**：`SearchTasks.Submit` 只写 MySQL 并提交后返回 `result_id`（不依赖 publisher、不回滚失败任务、删除 Dispatcher）；`Complete` 在同一事务写 `search_result_snapshots` 并置 `succeeded`；`Get` 先 Redis 后 MySQL（回源 + 尽力回填）；`PurgeExpired` 有界清理 MySQL 快照。
 - **缓存消费者**：新增 `cmd/rag-cache-worker` 与 `internal/cacheconsumer`；`touch()` 只递增 revision，不再写 outbox；新 API `Invalidate`/`RefreshKey`/`Revalidate`/`DirtyKeys`/`RefreshDirty`/`MarkAllDirty`；Redis `Put` 保留 revision 水位旧回填保护；失败记录 `attempts/last_error` 且不 nack。
 - **Debezium/Compose**：新增两个连接器配置（任务连接器只投递 INSERT 与 `schedule_version` 变化；缓存连接器采集 8 张业务表全部 c/u/d），独立 `database.server.id`、offset/schema-history 与健康端口；Compose 新增 `debezium-cache`、`rag-cache-worker`、cache DLQ topic/group。

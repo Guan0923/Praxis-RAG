@@ -195,7 +195,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys `
 .\dist\bin\rag-dead-letter-worker.exe --kind cache
 ```
 
-worker 消费语义：handler 返回成功即提交 Kafka offset；失败在同一进程内指数重试（默认 100ms 起、上限 5s），达到 `MaxAttempts` 后把原始消息写入对应 DLQ topic、执行终态回调再提交 offset，因此是至少一次投递。每个 worker 默认单条串行处理，`RAG_DOCUMENT_WORKER_CONCURRENCY` 可让单个 worker 进程并发处理多条消息；并发时仍按分区"连续完成前缀"提交 offset，未提交记录由幂等处理吸收重投。文档 worker 只通过 Kafka 消费：`rag-service` 只受理上传、从不解析文档；未配置 Kafka 或未运行 `rag-document-worker` 时任务保持 `queued`。详细说明见[使用与部署](docs/USAGE.md)与[部署指南](docs/DEPLOYMENT.md)。
+worker 消费语义：handler 返回成功即提交 Kafka offset；失败在同一进程内指数重试（默认 100ms 起、上限 5s），达到 `MaxAttempts` 后把原始消息写入对应 DLQ topic、执行终态回调再提交 offset，因此是至少一次投递。每个 worker 默认单条串行处理，`RAG_DOCUMENT_WORKER_CONCURRENCY` 可让单个 worker 进程并发处理多条消息；并发时仍按分区"连续完成前缀"提交 offset，未提交记录由幂等处理吸收重投。文档执行次数另由 MySQL `document_jobs.attempts` 记录（跨消息/worker/重启，上限 3）：第 1、2 次可重试失败保存原因与 `retry_at`，到期由后台扫描发出下一轮通知；第 3 次失败直接写 `failed`，不会启动第 4 次。文档 worker 只通过 Kafka 消费：`rag-service` 只受理上传、从不解析文档；未配置 Kafka 或未运行 `rag-document-worker` 时任务保持 `queued`。详细说明见[使用与部署](docs/USAGE.md)与[部署指南](docs/DEPLOYMENT.md)。
 
 Kafka 连接用 `RAG_KAFKA_BOOTSTRAP_SERVERS`（宿主 `127.0.0.1:9092`，compose 容器 `kafka:9092`），可选 `RAG_KAFKA_SECURITY_PROTOCOL` / `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*`；两类事件各自独立 topic/消费组：文档 `praxis_document_ingest`、缓存 `praxis_state_cache_refresh`；死信用显式 `RAG_DOCUMENT_DLQ_TOPIC`、`RAG_CACHE_DLQ_TOPIC` 及独立 `RAG_*_DLQ_GROUP`。原搜索 topic/消费组/DLQ（`praxis_search`、`RAG_SEARCH_DLQ_*`）已随排队搜索下线。`rag-service`、三个 worker 必须共享同一组 bootstrap 与 topic/group 配置。
 
@@ -244,7 +244,7 @@ MCP search / REST /v1/search（同步）-> runtime.Service.Search -> 检索 + �
 - PDF 解析引擎可切换：默认 `vision` 走独立的 `pdf-parser` 微服务（版面/OCR/表格/公式/图片描述统一由远端视觉模型完成），`go` 使用 Go 进程内纯文本引擎；`vision` 引擎下知识库未配置 VLM 时，PDF 上传会在受理阶段被拒绝并提示去「模型配置」页面配置（不进入队列）；pdf-parser 不可用或超时同样会让该次上传失败，可显式设 `RAG_PDF_ENGINE=go` 回退。旧值 `docling` 作为兼容别名等价于 `vision`。
 - 文档、缓存两个消费者与死信 worker 都是**独立进程**；`rag-service` 只受理上传与后台维护，不内嵌任何消费者。搜索在 `rag-service` 内同步执行，不需要 worker。
 - **两类事件、两个 Debezium 连接器**：任务连接器只采集 `document_jobs`，且只投递 INSERT 与 `schedule_version` 递增的 UPDATE（`skip.messages.without.change`）；缓存连接器采集 8 张影响读模型的业务表并投递全部 c/u/d。两个连接器使用独立 `database.server.id`、offset/schema-history 与健康端口；topic/消费组与 DLQ 各自独立。
-- **重发只在 MySQL 事务内发生**：长期 `queued`、租约过期或可重试失败通过 `schedule_version + 1` 重排，消费者只处理与数据库当前版本相等的通知；任务表初始快照的 `op=r` 事件用于存量切换补投。
+- **重发只在 MySQL 事务内发生**：可重试失败先记录原因与 `retry_at`，到期由 `Sweep` 递增 `schedule_version`；租约过期由 `Sweep` 递增版本重排。普通 `queued` 等待（worker/解析名额）不会递增版本，也不消耗执行次数。消费者只处理与数据库当前版本相等的通知；任务表初始快照的 `op=r` 事件用于存量切换补投。
 - **搜索永远同步**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，没有 `result_id`/`wait_seconds`/轮询；artifact 按 ID 独立读取，保留期由 `RAG_RESULT_TTL_SECONDS`（默认 3600 秒）控制。原排队搜索链路（`search_tasks`、`search_result_snapshots`、`praxis_search` topic、`rag-search-worker`、搜索 DLQ）已于 2026-11-13 下线，两张历史表保留数据但不再读写。
 - **缓存消费者 revision 水位**：业务表变更（包括手工 SQL）由缓存连接器投递，消费者递增 `cache_revisions.revision` 后重建并写 Redis；失败记录 `attempts/last_error`，由周期 `RefreshDirty` 收敛，不再有 `cache_outbox` 补发；因此 Redis 写失败不会把事件反复送进 DLQ。
 - Console「系统监控」采用顶部标签栏：`概览` 展示总体状态、关键指标、依赖探测、文档任务/上传、Debezium 两个连接器、两组 Kafka 消费组、缓存水位与 Worker 心跳，并新增主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络总速率与最忙网卡、进程 RSS/VMS/goroutine/heap）；`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` 标签展示该组件既有内容与该组件日志；`全部日志` 提供来源（内存/文件）、级别、关键字过滤与分页。读不到的进度显示「未知」。搜索同步化迁移与切换步骤见 [CDC 迁移契约](docs/cdc-migration.md) §12 与 [部署指南](docs/DEPLOYMENT.md) §12。

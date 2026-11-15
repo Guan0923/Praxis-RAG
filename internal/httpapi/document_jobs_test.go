@@ -24,6 +24,20 @@ func TestDocumentJobStatus(t *testing.T) {
 	if payload["artifact_id"] != artifactID || payload["status"] != "processing" || payload["stage"] != "embedding" {
 		t.Fatalf("job status payload = %v", payload)
 	}
+	reason := "Document processing failed: attempt 3/3: parse timeout"
+	runtime.statusByID[artifactID] = map[string]any{
+		"artifact_id": artifactID, "status": "failed", "stage": "failed", "error": reason,
+	}
+	failed := performRequest(handler, testRequest{
+		method: "GET", target: "/v1/document-jobs/" + artifactID, headers: tenantAuth(),
+	})
+	if failed.Code != http.StatusOK {
+		t.Fatalf("failed job status = %d body = %s", failed.Code, failed.Body.String())
+	}
+	failedPayload := decodeBody(t, failed)
+	if failedPayload["status"] != "failed" || failedPayload["error"] != reason {
+		t.Fatalf("failed job payload = %v, want the last failure reason", failedPayload)
+	}
 	runtime.statusErr = &apierrors.KnowledgeValidationError{Message: "Document upload not found"}
 	missing := performRequest(handler, testRequest{
 		method: "GET", target: "/v1/document-jobs/" + artifactID, headers: tenantAuth(),

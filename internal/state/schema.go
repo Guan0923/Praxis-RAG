@@ -531,8 +531,9 @@ var schemaTables = []*SchemaTable{
 			double("created_at"),
 			double("updated_at"),
 			// schedule_version is the scheduling generation Debezium watches:
-			// it starts at 1 and is incremented inside the MySQL transaction
-			// that requeues a job (stranded/expired lease/retryable failure).
+			// it starts at 1 and is incremented by Sweep when a retry is due or
+			// a processing lease expires. A retryable failure only records
+			// retry_at; attempts (max 3) caps executions.
 			bigint("schedule_version").Default("1"),
 		},
 		Uniques: []SchemaUnique{unique("uq_document_job_idempotency", "namespace", "idempotency_key")},

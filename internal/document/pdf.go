@@ -32,6 +32,12 @@ const (
 	legacyPDFParserVersion = "docling-formula-remote-v3"
 )
 
+// ErrPDFParseTimeout marks a parse that exceeded its execution window. The
+// remote parse service returns HTTP 504 after its post-queue conversion budget
+// expires; a caller-side context deadline is treated the same way. It stays
+// retryable, unlike a malformed file.
+var ErrPDFParseTimeout = errors.New("PDF parse timeout")
+
 // IsSupportedPDFParserVersion reports whether version is a manifest contract
 // this build can ingest. Foreign or future versions are rejected so callers
 // reimport with a compatible parser.
@@ -220,17 +226,17 @@ var pdfEncryptMarker = regexp.MustCompile(`/Encrypt\s*(?:\d+\s+\d+\s+R|<<|<)`)
 func ValidatePDFFile(path, name string) error {
 	handle, err := os.Open(path)
 	if err != nil {
-		return readErrf("PDF 文件损坏或格式无效：%s", name)
+		return invalidDocumentErrf("PDF 文件损坏或格式无效：%s", name)
 	}
 	defer handle.Close()
 	info, err := handle.Stat()
 	if err != nil || info.IsDir() {
-		return readErrf("PDF 文件损坏或格式无效：%s", name)
+		return invalidDocumentErrf("PDF 文件损坏或格式无效：%s", name)
 	}
 	header := make([]byte, 1024)
 	read, _ := io.ReadFull(handle, header)
 	if !bytes.Contains(header[:read], []byte("%PDF-")) {
-		return readErrf("PDF 文件损坏或格式无效：%s", name)
+		return invalidDocumentErrf("PDF 文件损坏或格式无效：%s", name)
 	}
 	tailSize := int64(8192)
 	if info.Size() < tailSize {
@@ -238,10 +244,10 @@ func ValidatePDFFile(path, name string) error {
 	}
 	tail := make([]byte, tailSize)
 	if _, err := handle.ReadAt(tail, info.Size()-tailSize); err != nil && !errors.Is(err, io.EOF) {
-		return readErrf("PDF 文件损坏或格式无效：%s", name)
+		return invalidDocumentErrf("PDF 文件损坏或格式无效：%s", name)
 	}
 	if pdfEncryptMarker.Match(tail) {
-		return readErrf("PDF 已加密，暂不支持需要密码的文件：%s", name)
+		return invalidDocumentErrf("PDF 已加密，暂不支持需要密码的文件：%s", name)
 	}
 	return nil
 }
@@ -332,7 +338,7 @@ func (r *Reader) pdfPages(ctx context.Context, resolved, name string) ([]Page, e
 		return nil, err
 	}
 	if r.PDF == nil {
-		return nil, readErrf("PDF 文本解析未配置解析器：%s", name)
+		return nil, invalidDocumentErrf("PDF 文本解析未配置解析器：%s", name)
 	}
 	pages, err := r.PDF.Pages(ctx, resolved)
 	if err != nil {
@@ -342,21 +348,21 @@ func (r *Reader) pdfPages(ctx context.Context, resolved, name string) ([]Page, e
 		return nil, &ReadError{Message: err.Error()}
 	}
 	if len(pages) > MaxPDFPages {
-		return nil, readErrf("PDF 页数不能超过 %d 页：%s", MaxPDFPages, name)
+		return nil, invalidDocumentErrf("PDF 页数不能超过 %d 页：%s", MaxPDFPages, name)
 	}
 	result := make([]Page, 0, len(pages))
 	extracted := 0
 	for _, page := range pages {
 		extracted += utf8.RuneCountInString(page.Text)
 		if extracted > MaxExtractedCharacters {
-			return nil, readErrf("文档提取文本过大：%s", name)
+			return nil, invalidDocumentErrf("文档提取文本过大：%s", name)
 		}
 		if strings.TrimSpace(page.Text) != "" {
 			result = append(result, page)
 		}
 	}
 	if len(result) == 0 {
-		return nil, readErrf("PDF 未提取到文本，扫描件需要先进行 OCR：%s", name)
+		return nil, invalidDocumentErrf("PDF 未提取到文本，扫描件需要先进行 OCR：%s", name)
 	}
 	return result, nil
 }

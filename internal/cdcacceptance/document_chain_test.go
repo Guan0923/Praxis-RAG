@@ -96,11 +96,11 @@ func TestDocumentChainSucceedsWithoutOutbox(t *testing.T) {
 	}
 }
 
-// TestDocumentChainRetryableFailureBumpsScheduleVersion covers the retry row:
-// an infrastructure failure is recorded as a durable requeue with
-// schedule_version+1 and ACKed; the old generation is skipped and the new one
-// completes.
-func TestDocumentChainRetryableFailureBumpsScheduleVersion(t *testing.T) {
+// TestDocumentChainRetryableFailureWaitsForRetryAt covers the retry row: an
+// infrastructure failure records the reason and retry_at without bumping the
+// generation; a duplicate before the deadline is skipped; the sweep emits the
+// replacement generation when the retry is due, and that generation completes.
+func TestDocumentChainRetryableFailureWaitsForRetryAt(t *testing.T) {
 	stores := newStores(t)
 	ctx := context.Background()
 	namespace := uniqueNamespace(t, "acc-doc-retry")
@@ -110,6 +110,8 @@ func TestDocumentChainRetryableFailureBumpsScheduleVersion(t *testing.T) {
 		failures: []error{errors.New("qdrant unavailable: connect timeout")},
 	}
 	worker := newDocumentProcessor(t, stores, ingester)
+	clock := float64(time.Now().Unix())
+	stores.DocumentJobs.Clock = func() float64 { return clock }
 	admission, err := stores.DocumentJobs.Submit(ctx, namespace, "retry.txt", []byte("retry me"), nil)
 	if err != nil {
 		t.Fatalf("DocumentJobs.Submit() error = %v", err)
@@ -120,18 +122,36 @@ func TestDocumentChainRetryableFailureBumpsScheduleVersion(t *testing.T) {
 		rawDocumentEvent(t, admission.ArtifactID, namespace, 1, "c")); !acked {
 		t.Fatal("retryable failure was not acknowledged")
 	}
-	job := requireDocumentJob(t, stores, admission.ArtifactID, state.DocumentJobQueued, "retry_wait", 2)
+	job := requireDocumentJob(t, stores, admission.ArtifactID, state.DocumentJobQueued, "retry_wait", 1)
 	if job.Error == nil || !strings.Contains(*job.Error, "Document processing failed") {
 		t.Fatalf("job error = %v, want a recorded failure message", job.Error)
 	}
 	if job.Owner != nil || job.ExecutionID != nil || job.LeaseUntil != 0 {
-		t.Fatalf("requeued job still holds execution state: %+v", job)
+		t.Fatalf("retry_wait job still holds execution state: %+v", job)
+	}
+	if job.RetryAt <= clock {
+		t.Fatalf("retry_at = %v, want a future deadline", job.RetryAt)
 	}
 	if ingester.callCount() != 1 {
 		t.Fatalf("ingester calls = %d, want 1", ingester.callCount())
 	}
 
-	// The stale generation is skippable, not executable.
+	// A duplicate before retry_at is skipped, not executed.
+	if acked := deliver(t, worker.MessageHandler(), "praxis_document_ingest",
+		rawDocumentEvent(t, admission.ArtifactID, namespace, 1, "u")); !acked {
+		t.Fatal("early retry delivery was not acknowledged")
+	}
+	if ingester.callCount() != 1 {
+		t.Fatalf("early retry delivery re-ran ingestion: calls = %d", ingester.callCount())
+	}
+
+	// The sweep emits the replacement generation only when retry_at is due.
+	clock = job.RetryAt + 1
+	if swept, err := stores.DocumentJobs.Sweep(ctx, 10); err != nil || swept != 1 {
+		t.Fatalf("Sweep(due) = %d, %v; want 1", swept, err)
+	}
+	requireDocumentJob(t, stores, admission.ArtifactID, state.DocumentJobQueued, "retry_wait", 2)
+	// The old generation is now stale.
 	if acked := deliver(t, worker.MessageHandler(), "praxis_document_ingest",
 		rawDocumentEvent(t, admission.ArtifactID, namespace, 1, "u")); !acked {
 		t.Fatal("stale generation was not acknowledged")
@@ -139,9 +159,7 @@ func TestDocumentChainRetryableFailureBumpsScheduleVersion(t *testing.T) {
 	if ingester.callCount() != 1 {
 		t.Fatalf("stale generation re-ran ingestion: calls = %d", ingester.callCount())
 	}
-	requireDocumentJob(t, stores, admission.ArtifactID, state.DocumentJobQueued, "retry_wait", 2)
-
-	// Debezium publishes the schedule_version bump; the retry completes.
+	// The replacement generation completes.
 	if acked := deliver(t, worker.MessageHandler(), "praxis_document_ingest",
 		rawDocumentEvent(t, admission.ArtifactID, namespace, 2, "u")); !acked {
 		t.Fatal("retry generation was not acknowledged")
@@ -152,10 +170,11 @@ func TestDocumentChainRetryableFailureBumpsScheduleVersion(t *testing.T) {
 	}
 }
 
-// TestDocumentChainSweepAfterPausedDebezium covers the broker-outage row: the
-// notification is never delivered, Sweep increments the version inside MySQL,
-// and the connector's replacement notification completes the job.
-func TestDocumentChainSweepAfterPausedDebezium(t *testing.T) {
+// TestDocumentChainPausedDebeziumKeepsQueuedGeneration covers the broker-outage
+// row: the notification is not delivered while the connector is paused, and a
+// merely queued job is deliberately not re-emitted by Sweep. The original
+// generation is preserved and completes after resume.
+func TestDocumentChainPausedDebeziumKeepsQueuedGeneration(t *testing.T) {
 	stores := newStores(t)
 	ctx := context.Background()
 	namespace := uniqueNamespace(t, "acc-doc-sweep")
@@ -166,30 +185,20 @@ func TestDocumentChainSweepAfterPausedDebezium(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DocumentJobs.Submit() error = %v", err)
 	}
-	// No delivery happens: Debezium is paused. The sweep window is relaxed so
-	// the maintenance pass re-emits immediately.
+	// No delivery happens: Debezium is paused. A merely queued job must keep its
+	// generation; its Kafka notification is retained and delivered on resume.
 	stores.DocumentJobs.Settings.SweepAfterSeconds = -1
-	swept, err := stores.DocumentJobs.Sweep(ctx, 10)
-	if err != nil || swept != 1 {
-		t.Fatalf("Sweep() = %d, %v; want 1", swept, err)
+	if swept, err := stores.DocumentJobs.Sweep(ctx, 10); err != nil || swept != 0 {
+		t.Fatalf("Sweep(paused) = %d, %v; want 0", swept, err)
 	}
-	requireDocumentJob(t, stores, admission.ArtifactID, state.DocumentJobQueued, "retry_wait", 2)
+	requireDocumentJob(t, stores, admission.ArtifactID, state.DocumentJobQueued, "queued", 1)
 
-	// The stranded original notification is stale and safely skipped.
+	// After Debezium resumes, the original notification completes the job.
 	if acked := deliver(t, worker.MessageHandler(), "praxis_document_ingest",
 		rawDocumentEvent(t, admission.ArtifactID, namespace, 1, "c")); !acked {
-		t.Fatal("stale pre-sweep delivery was not acknowledged")
-	}
-	if ingester.callCount() != 0 {
-		t.Fatalf("stale pre-sweep delivery executed the job: calls = %d", ingester.callCount())
-	}
-
-	// After Debezium resumes, the replacement notification completes the job.
-	if acked := deliver(t, worker.MessageHandler(), "praxis_document_ingest",
-		rawDocumentEvent(t, admission.ArtifactID, namespace, 2, "u")); !acked {
 		t.Fatal("post-resume delivery was not acknowledged")
 	}
-	requireDocumentJob(t, stores, admission.ArtifactID, state.DocumentJobSucceeded, "completed", 2)
+	requireDocumentJob(t, stores, admission.ArtifactID, state.DocumentJobSucceeded, "completed", 1)
 	if ingester.callCount() != 1 {
 		t.Fatalf("ingester calls = %d, want 1", ingester.callCount())
 	}

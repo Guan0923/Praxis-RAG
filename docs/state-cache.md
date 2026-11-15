@@ -43,7 +43,7 @@ Redis 只承担**持久数据展示缓存**（另有可选的临时锁/租约工
 
 搜索已改为**同步直返**：`POST /v1/search` 与 MCP `search` 一次调用完成检索 + 重排并直接返回证据，没有任务 ID、`wait_seconds`、轮询、结果快照或 Redis 短期缓存。原 `search_tasks`/`search_result_snapshots` 表保留历史数据、不再读写；搜索 topic/消费组/DLQ 与 `rag-search-worker` 已下线（见 [部署指南 §12](DEPLOYMENT.md#12-搜索同步化迁移与切换)）。**文档入库同样不依赖 Redis**：`add_document` 只提交一个 MySQL 事务（`document_jobs` 完整任务），Kafka 只传 schema 4 纯通知。
 
-文档侧没有 Redis 参与：任务状态、租约与终态全部由 MySQL 提供，worker 用 SQL 租约 claim 并心跳续租，只有 MySQL 记录领取/终态后才 ACK；`get_document_status` 直接读 MySQL，无 TTL。UploadJournal 继续保障文档发布版本一致性，不存在 Redis+MySQL 原子事务问题，也没有 Redis 回源。事务 outbox 已于 2026-11-13 下线：重发只通过 `schedule_version + 1`，不再有 outbox 行或保留期清理。日志仅记录任务/操作 ID 与安全错误类别，不记录查询、文件/消息正文或凭据。
+文档侧没有 Redis 参与：任务状态、租约与终态全部由 MySQL 提供，worker 用 SQL 租约 claim 并心跳续租，只有 MySQL 记录领取/终态后才 ACK；`get_document_status` 直接读 MySQL，无 TTL。UploadJournal 继续保障文档发布版本一致性，不存在 Redis+MySQL 原子事务问题，也没有 Redis 回源。事务 outbox 已于 2026-11-13 下线：重发只通过 `schedule_version + 1`（到期重试或租约过期时由 `Sweep` 执行），不再有 outbox 行或保留期清理。日志仅记录任务/操作 ID 与安全错误类别，不记录查询、文件/消息正文或凭据。
 
 2026-11-13 搜索同步化：搜索不再有 Kafka 通知（原 schema 3 搜索消息、`praxis_search` topic、搜索消费组与搜索 DLQ 一并下线），文档通知仍为 schema 4。切换步骤见 [部署指南 §12](DEPLOYMENT.md#12-搜索同步化迁移与切换)；`search_tasks`/`search_result_snapshots` 保留历史数据、不再读写，artifact 保留边界见 [产物引用](result-references.md)。旧 outbox 表仍可由 `rag-service-migrate --retire-outbox --yes` 删除；`document_tasks` 作为历史表保留但不再读写。
 

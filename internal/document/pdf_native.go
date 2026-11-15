@@ -151,7 +151,7 @@ func (p *NativePDFParser) Pages(ctx context.Context, source string) ([]Page, err
 	defer file.Close()
 	pageCount := reader.NumPage()
 	if pageCount > MaxPDFPages {
-		return nil, readErrf("PDF 页数不能超过 %d 页：%s", MaxPDFPages, name)
+		return nil, invalidDocumentErrf("PDF 页数不能超过 %d 页：%s", MaxPDFPages, name)
 	}
 	result := make([]Page, 0, pageCount)
 	for number := 1; number <= pageCount; number++ {
