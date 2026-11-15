@@ -17,7 +17,7 @@
 | 向量/检索 | `RAG_BACKEND`（服务必须设 `qdrant`）、`QDRANT_URL`、`RAG_COLLECTION`、`RAG_DENSE_VECTOR_SIZE`（1024）、`RAG_EMBEDDING_MODEL`、`RAG_RERANKER_*` |
 | Redis | `RAG_REDIS_URL`、`RAG_REDIS_ENABLED`、`RAG_REDIS_PREFIX`、`RAG_REDIS_TTL_SECONDS`（60，展示缓存）、`RAG_RESULT_TTL_SECONDS`（3600，**artifact 保留期**）、`RAG_RESULT_MAX_BYTES`、`RAG_ARTIFACT_MAX_BYTES` |
 | Kafka | `RAG_KAFKA_BOOTSTRAP_SERVERS`、`RAG_KAFKA_SECURITY_PROTOCOL`、`RAG_KAFKA_SASL_*`、`RAG_KAFKA_TLS_*`、`RAG_DOCUMENT_TOPIC`/`RAG_DOCUMENT_GROUP`、`RAG_DOCUMENT_DLQ_TOPIC`/`RAG_DOCUMENT_DLQ_GROUP`、`RAG_CACHE_TOPIC`/`RAG_CACHE_GROUP`、`RAG_CACHE_DLQ_TOPIC`/`RAG_CACHE_DLQ_GROUP`、`RAG_DOCUMENT_WORKER_CONCURRENCY`（默认 `1`）；搜索相关的 `RAG_SEARCH_*` topic/group/worker 配置已删除，仅保留 `RAG_SEARCH_TIMEOUT_SECONDS`（120，同步检索总预算） |
-| 文档投递/监控 | `RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS`（默认 3；与 MySQL `document_jobs.attempts` 的 3 次执行上限相互独立）、`RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS`（Worker 心跳间隔，默认 15；监控页 60 秒无心跳判降级）、`RAG_DEBEZIUM_HEALTH_URL`（任务连接器只读健康探测）、`RAG_DEBEZIUM_CACHE_HEALTH_URL`（缓存连接器只读健康探测）、`RAG_APP_DEBEZIUM_HEALTH_URL`/`RAG_APP_DEBEZIUM_CACHE_HEALTH_URL`（compose app profile 覆盖用）、`RAG_DEBEZIUM_PORT`/`RAG_DEBEZIUM_CACHE_PORT`（宿主机健康端口，默认 8083/8084）；采集位点应用侧读不到，监控显示「未知」 |
+| 文档投递/监控 | `RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS`（默认 3；与 MySQL `document_jobs.attempts` 的 3 次执行上限相互独立）、`RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS`（Worker 心跳间隔，默认 15；监控页 60 秒无心跳判降级）、`RAG_CONNECT_URLS`（分布式 Kafka Connect REST 端点）、`RAG_CONNECT_DOCUMENT_CONNECTOR`/`RAG_CONNECT_CACHE_CONNECTOR`（固定连接器名）、`RAG_CONNECT_SUPERVISOR_*`（FAILED task 自动重启间隔/次数/退避）；采集位点在 Connect 内部 topic，应用读不到，监控显示「未知」 |
 | 缓存/CDC | `RAG_CACHE_TOPIC`/`RAG_CACHE_GROUP`、`RAG_CACHE_DLQ_TOPIC`/`RAG_CACHE_DLQ_GROUP`；`cache_revisions` 的 revision/refreshed_revision/attempts/last_error/updated_at；任务表 `schedule_version`；`rag-cdc-cutover` 切换工具 |
 | PDF/Word | `RAG_PDF_ENGINE`（`vision`/`go`；旧值 `docling` 是 `vision` 的兼容别名）、`RAG_PDF_SERVICE_URL`、`RAG_PDF_SERVICE_TIMEOUT`（900，Go 调用与 pdf-parser 请求总预算）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（120，真正开始解析后的单次上限，排队等待不计入，须小于总预算）、`RAG_WORD_CONVERTER_PATH`、`RAG_WORD_CONVERT_TIMEOUT`；`RAG_PDF_MODELS_PATH` 已废弃（本地无模型） |
 | 日志 | `RAG_LOG_LEVEL`（`info`）、`RAG_LOG_FORMAT`（`text`/`json`）、`RAG_DEBUG_TRACE`（兼容旧调试开关；未设级别时为 `debug`）、`RAG_LOG_FILE`（可选，所有 Go 进程追加同一个 JSON Lines 文件供监控页文件日志源读取；打开失败 fail fast）、`RAG_LOG_BUFFER_SIZE`（`1000`，范围 `100..20000`，进程内环形缓冲）、`RAG_PDF_SERVICE_LOG_LEVEL`/`RAG_PDF_SERVICE_LOG_FORMAT` |
@@ -116,7 +116,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 
 真实基础设施上的验证脚本（需要 Docker + Python 3）：
 
-- `scripts/verify-debezium-e2e.py`（Debezium 文档通知链路 + 缓存 revision）
+- `scripts/verify-debezium-e2e.py`（Kafka Connect 注册/监控契约 + 验收 2/3/4 + 真实 Kafka 消息解码）
 - `scripts/verify-kafka-dlq.py`（显式 DLQ）
 
 ## 5. 改动约束（细项）
@@ -139,7 +139,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 - `RAG_PDF_ENGINE=go` 只适合文字型 PDF：无版面分析、表格结构、OCR、公式与图片资产；扫描件需先 OCR。
 - 暂不支持 Excel、网页抓取、独立图片上传；`.doc` 依赖外部 LibreOffice。
 - 搜索为同步执行，受 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120s）总预算约束；超时映射为既有搜索错误，客户端取消会传递到 Qdrant/模型调用。`search_tasks`/`search_result_snapshots` 为历史表、不再读写；搜索 topic/worker/DLQ 已下线。
-- 上传默认异步，必须存在文档消费者：配置 Kafka + Debezium 并运行独立的 `rag-document-worker`；没有内嵌/进程内选项，未部署时任务会一直 `queued`。
+- 上传默认异步，必须存在文档消费者：配置 Kafka + 分布式 Kafka Connect 的两个 Debezium 连接器并运行独立的 `rag-document-worker`；没有内嵌/进程内选项，未部署时任务会一直 `queued`。
 - 受限账号可在同步检索中正常工作：服务端按 scope 追加 `document_ids` 过滤，不再有“排队模式下拒绝受限账号”的限制。
 - 管理凭证（Service Token / API Key）在请求时不做知识库归属校验，只受 API Key 命名空间白名单约束。
 
@@ -150,7 +150,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 - 远端视觉模型端点的真实联调（只做了配置/协议单测与 httptest 集成测试）。
 - Console 的浏览器级 E2E（只有 Vitest 单元/契约测试与人工截图核对）。
 - Kafka SASL/TLS 外部集群、MySQL 多实例并发/故障切换。
-- 双 Debezium 连接器与缓存消费者实链路、artifact 独立读取与同步搜索超时/取消、CDC 存量切换/回滚演练（见 `VALIDATION.md`）。
+- 分布式 Kafka Connect 双 worker/failover、FAILED task 自动重启、缓存消费者实链路、artifact 独立读取与同步搜索超时/取消、CDC 存量切换/回滚演练（见 `VALIDATION.md`）。
 - `rag-mcp-ingest` 未连接真实 Qdrant/模型 API 实跑。
 
 详细的验证边界见 `docs/USAGE.md` §10 与 `VALIDATION.md`。
@@ -161,7 +161,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 | --- | --- |
 | `README.md` | 产品概览、快速开始、运行时架构、使用边界 |
 | `docs/USAGE.md` | 构建/配置/启动、REST/MCP 示例、worker、迁移 CLI、Docker、验证边界 |
-| `docs/DEPLOYMENT.md` | Docker/Compose、systemd、worker 重启策略、DLQ 监控、双 Debezium 连接器与升级/回滚 |
+| `docs/DEPLOYMENT.md` | Docker/Compose、systemd、worker 重启策略、DLQ 监控、分布式 Kafka Connect 与升级/回滚 |
 | `docs/PERMISSIONS.md` | 角色、知识库归属、读/写与范围、邀请流程与接口 |
 | `docs/GO_MIGRATION.md` | Python→Go 迁移总纲、阶段与进度（历史背景） |
 | `docs/GO_PARITY_AUDIT.md` | Go 与 Python/前端契约差异、P0/P1/P2 清单 |
@@ -170,8 +170,9 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 | `docs/result-references.md` | artifact 引用、artifact TTL 与容量限制（搜索结果快照/result_id 已下线） |
 | `docs/api-keys.md` | API Key 归属、命名空间与 MCP 配置 |
 | `docs/knowledge-base-settings.md` | 知识库配置、模型配置与 profile 关系（历史设计 + 当前实现说明） |
-| `deploy/debezium/README.md` | Debezium CDC 桥接配置 |
+| `deploy/kafka-connect/` | 分布式 Kafka Connect 与两个 Debezium 连接器模板、注册/故障演练手册 |
+| `deploy/debezium/` | 旧 Debezium Server 配置（仅回滚保留，已下线） |
 | `python-workers/pdf-service/README.md` | PDF 视觉解析微服务的构建、视觉模型配置与接口 |
-| `docs/cdc-migration.md` | 事务 outbox → Debezium 表级采集的迁移契约：双连接器、三类事件、调度版本、缓存消费者、存量切换、监控替换 |
+| `docs/cdc-migration.md` | 事务 outbox → Debezium 表级采集的迁移契约：分布式 Kafka Connect、双连接器、事件、调度版本、缓存消费者、存量切换、监控替换 |
 | `VALIDATION.md` | 已执行的验证记录（按日期） |
 | `PROGRESS.md` | 早期开发阶段记录（历史，不作当前功能清单） |

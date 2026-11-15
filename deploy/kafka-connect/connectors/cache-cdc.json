@@ -1,0 +1,43 @@
+{
+  "name": "${RAG_CONNECT_CACHE_CONNECTOR:-praxis-cache-cdc}",
+  "config": {
+    "connector.class": "io.debezium.connector.mysql.MySqlConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "${RAG_MYSQL_HOST:-mysql}",
+    "database.port": "${RAG_MYSQL_PORT:-3306}",
+    "database.user": "${RAG_MYSQL_DEBEZIUM_CACHE_USER:-debezium_cache}",
+    "database.password": "${RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD}",
+    "database.ssl.mode": "preferred",
+    "database.server.id": "${DEBEZIUM_CACHE_SERVER_ID:-184055}",
+
+    "topic.prefix": "praxis_rag_cache",
+    "database.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}",
+    "table.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.knowledge_bases,${RAG_MYSQL_DATABASE:-praxis_rag}.documents,${RAG_MYSQL_DATABASE:-praxis_rag}.mcp_catalogs,${RAG_MYSQL_DATABASE:-praxis_rag}.api_keys,${RAG_MYSQL_DATABASE:-praxis_rag}.document_heads,${RAG_MYSQL_DATABASE:-praxis_rag}.document_leases,${RAG_MYSQL_DATABASE:-praxis_rag}.upload_operations,${RAG_MYSQL_DATABASE:-praxis_rag}.upload_steps",
+    "column.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.knowledge_bases.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.knowledge_bases.version,${RAG_MYSQL_DATABASE:-praxis_rag}.documents.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.documents.name,${RAG_MYSQL_DATABASE:-praxis_rag}.documents.document_id,${RAG_MYSQL_DATABASE:-praxis_rag}.documents.del_flag,${RAG_MYSQL_DATABASE:-praxis_rag}.mcp_catalogs.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.api_keys.id,${RAG_MYSQL_DATABASE:-praxis_rag}.api_keys.owner_user_id,${RAG_MYSQL_DATABASE:-praxis_rag}.api_keys.enabled,${RAG_MYSQL_DATABASE:-praxis_rag}.document_heads.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.document_heads.document_id,${RAG_MYSQL_DATABASE:-praxis_rag}.document_heads.version,${RAG_MYSQL_DATABASE:-praxis_rag}.document_leases.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.document_leases.resource,${RAG_MYSQL_DATABASE:-praxis_rag}.document_leases.owner,${RAG_MYSQL_DATABASE:-praxis_rag}.document_leases.operation_id,${RAG_MYSQL_DATABASE:-praxis_rag}.upload_operations.id,${RAG_MYSQL_DATABASE:-praxis_rag}.upload_operations.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.upload_operations.name,${RAG_MYSQL_DATABASE:-praxis_rag}.upload_operations.status,${RAG_MYSQL_DATABASE:-praxis_rag}.upload_steps.operation_id,${RAG_MYSQL_DATABASE:-praxis_rag}.upload_steps.name,${RAG_MYSQL_DATABASE:-praxis_rag}.upload_steps.status",
+    "skip.messages.without.change": "false",
+    "tombstones.on.delete": "false",
+    "include.schema.changes": "false",
+
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "none",
+
+    "schema.history.internal.kafka.bootstrap.servers": "${RAG_CONNECT_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}",
+    "schema.history.internal.kafka.topic": "${RAG_CDC_CACHE_SCHEMA_HISTORY_TOPIC:-praxis_cdc_cache_schema_history}",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false",
+
+    "transforms": "RouteCache",
+    "transforms.RouteCache.type": "io.debezium.transforms.ByLogicalTableRouter",
+    "transforms.RouteCache.topic.regex": "(.*)",
+    "transforms.RouteCache.topic.replacement": "${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}",
+    "transforms.RouteCache.key.enforce.uniqueness": "false",
+
+    "producer.override.acks": "all",
+    "producer.override.enable.idempotence": "true",
+    "producer.override.retries": "2147483647"
+  }
+}

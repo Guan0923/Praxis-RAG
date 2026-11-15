@@ -69,15 +69,51 @@ function overviewFixture(overrides: Partial<MonitorOverview> = {}): MonitorOverv
         cleanup_pending: 1,
       },
     },
-    // pipeline 把视图分开：任务/缓存两个 Debezium 连接器、两组 Kafka 消费、
-    // 缓存水位、文档 Worker 心跳与文档任务状态。capture_progress 与 offsets
-    // 为 null 时必须显示“未知”。
+    // pipeline 把视图分开：文档/缓存两个 Kafka Connect 采集连接器、两组 Kafka
+    // 消费、缓存水位、文档 Worker 心跳与文档任务状态。capture_progress 与
+    // offsets 为 null 时必须显示“未知”。
     pipeline: {
       document_jobs: { status: "ok", detail: "文档任务正常，最近成功 10 个" },
       worker: { status: "ok", detail: "最近心跳 3.0 秒前，1 个实例运行中" },
       debezium: {
-        tasks: { status: "unknown", detail: "任务连接器未读健康端点", capture_progress: null },
-        cache: { status: "ok", detail: "缓存连接器运行中", capture_progress: null },
+        tasks: {
+          status: "unknown",
+          detail: "文档采集连接器状态未知",
+          capture_progress: null,
+          connector: "praxis-document-cdc",
+          connector_state: "UNKNOWN",
+          worker_id: "",
+          tasks: [],
+          failed_tasks: 0,
+          failure_reason: "",
+          restarting: false,
+          restart_attempts: 0,
+          restart_exhausted: false,
+          recovery: "",
+          last_restart_at: "",
+          last_recovered_at: "",
+          next_restart_at: "",
+          supervised: true,
+        },
+        cache: {
+          status: "ok",
+          detail: "缓存采集连接器 RUNNING",
+          capture_progress: null,
+          connector: "praxis-cache-cdc",
+          connector_state: "RUNNING",
+          worker_id: "connect-2:8083",
+          tasks: [{ id: 0, state: "RUNNING", worker_id: "connect-2:8083" }],
+          failed_tasks: 0,
+          failure_reason: "",
+          restarting: false,
+          restart_attempts: 1,
+          restart_exhausted: false,
+          recovery: "recovered",
+          last_restart_at: "2026-11-11T14:00:00Z",
+          last_recovered_at: "2026-11-11T14:00:08Z",
+          next_restart_at: "",
+          supervised: true,
+        },
       },
       kafka: {
         status: "unknown",
@@ -762,22 +798,66 @@ describe("MonitorPage", () => {
     await waitFor(() => expect(lastLogUrl()).toContain("component=worker"));
   });
 
-  it("shows both Debezium connectors with the honest 未知 capture progress", async () => {
+  it("shows both capture connectors with worker, task, restart and honest capture progress", async () => {
     renderPage();
     await waitFor(() => expect(screen.getByText("0.4.0")).toBeTruthy());
 
     await openTab("Debezium");
-    const connectorBlock = await screen.findByLabelText("Debezium 连接器");
-    expect(within(connectorBlock).getByText("Debezium 任务连接器")).toBeTruthy();
-    expect(within(connectorBlock).getByText("任务连接器未读健康端点")).toBeTruthy();
-    expect(within(connectorBlock).getByText("Debezium 缓存连接器")).toBeTruthy();
-    expect(within(connectorBlock).getByText("缓存连接器运行中")).toBeTruthy();
+    const connectorBlock = await screen.findByLabelText("采集连接器");
+    expect(within(connectorBlock).getByText("文档采集")).toBeTruthy();
+    expect(within(connectorBlock).getByText("文档采集连接器状态未知")).toBeTruthy();
+    expect(within(connectorBlock).getByText("缓存采集")).toBeTruthy();
+    expect(within(connectorBlock).getByText("缓存采集连接器 RUNNING")).toBeTruthy();
+    // 所在 worker、task 状态与自动恢复结果都必须可见。
+    expect(within(connectorBlock).getByText("所在 Worker：connect-2:8083")).toBeTruthy();
     expect(
-      within(connectorBlock).getAllByText("采集进度：未知（需在 Debezium 侧查看）"),
+      within(connectorBlock).getByText("Task：task 0 RUNNING（connect-2:8083）"),
+    ).toBeTruthy();
+    expect(within(connectorBlock).getByText("自动重启：已恢复")).toBeTruthy();
+    // 采集位点在 Kafka Connect 侧，页面不得编造进度。
+    expect(
+      within(connectorBlock).getAllByText("采集进度：未知（需在 Kafka Connect 侧查看）"),
     ).toHaveLength(2);
 
     expect(screen.getByLabelText("文档任务状态")).toBeTruthy();
     await waitFor(() => expect(lastLogUrl()).toContain("component=debezium"));
+  });
+
+  it("renders an exhausted restart budget and the failure reason for the failed path", async () => {
+    const fixture = overviewFixture();
+    fixture.pipeline!.debezium.cache = {
+      status: "error",
+      detail: "praxis-cache-cdc RUNNING；task 0 FAILED；自动重启已耗尽（5 次），需人工处理",
+      capture_progress: null,
+      connector: "praxis-cache-cdc",
+      connector_state: "RUNNING",
+      worker_id: "connect-2:8083",
+      tasks: [{ id: 0, state: "FAILED", worker_id: "connect-2:8083" }],
+      failed_tasks: 1,
+      failure_reason: "Access denied for user 'debezium_cache'",
+      restarting: false,
+      restart_attempts: 5,
+      restart_exhausted: true,
+      recovery: "exhausted",
+      last_restart_at: "2026-11-11T14:00:00Z",
+      last_recovered_at: "",
+      next_restart_at: "",
+      supervised: true,
+    };
+    overviewPayload = () => jsonResponse(fixture);
+    renderPage();
+    await waitFor(() => expect(screen.getByText("0.4.0")).toBeTruthy());
+
+    await openTab("Debezium");
+    const connectorBlock = await screen.findByLabelText("采集连接器");
+    expect(
+      within(connectorBlock).getByText("失败原因：Access denied for user 'debezium_cache'"),
+    ).toBeTruthy();
+    expect(
+      within(connectorBlock).getByText("自动重启：已耗尽（累计 5 次），需人工处理"),
+    ).toBeTruthy();
+    // 另一路继续显示，不被合并。
+    expect(within(connectorBlock).getByText("文档采集")).toBeTruthy();
   });
 
   it("renders 未知 for every delivery view when the pipeline snapshot is missing", async () => {
@@ -795,11 +875,11 @@ describe("MonitorPage", () => {
     expect(within(cacheBlock).getAllByText("未知")).toHaveLength(3);
 
     await openTab("Debezium");
-    const connectorBlock = await screen.findByLabelText("Debezium 连接器");
+    const connectorBlock = await screen.findByLabelText("采集连接器");
     // 两个连接器各有一个状态 Tag 与详情文本降级为“未知”。
     expect(within(connectorBlock).getAllByText("未知").length).toBeGreaterThanOrEqual(4);
     expect(
-      within(connectorBlock).getAllByText("采集进度：未知（需在 Debezium 侧查看）"),
+      within(connectorBlock).getAllByText("采集进度：未知（需在 Kafka Connect 侧查看）"),
     ).toHaveLength(2);
 
     await openTab("Kafka");

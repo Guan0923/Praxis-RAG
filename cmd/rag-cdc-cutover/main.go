@@ -1,5 +1,5 @@
 // Command rag-cdc-cutover runs the operator-controlled cutover from the retired
-// transactional outboxes to Debezium table-level capture. It is the CLI half of
+// transactional outboxes to Kafka Connect Debezium table-level capture. It is the CLI half of
 // docs/cdc-migration.md §8 (存量切换方案): inventory the unfinished work, record
 // the starting binlog position, bump schedule_version for every unfinished task,
 // mark the read-model cache dirty, and finally verify the baseline.
@@ -229,6 +229,8 @@ func runInventory(ctx context.Context, stores *state.Stores) int {
 	fmt.Println("  3. 记录 File 与 Position；启用了 GTID 时把 Executed_Gtid_Set 作为补充证据保存。")
 	fmt.Println("  4. 执行 `rag-cdc-cutover --record-position --file=<File> --pos=<Position>`。")
 	fmt.Println("  说明：采集位点只用于切换窗口核对，应用不读取 binlog 位点。")
+	fmt.Println("  Kafka Connect 的 source offset 保存在 praxis_connect_offsets，本工具不读取也不迁移；")
+	fmt.Println("  --backfill 只按 document_jobs 补投未完成通知，不能代替 Connect 的初始快照。")
 	return exitOK
 }
 

@@ -109,14 +109,17 @@ RAG_CACHE_DLQ_TOPIC=praxis_state_cache_refresh_dead_letters
 RAG_DOCUMENT_DLQ_GROUP=praxis_document_dead_letters
 RAG_CACHE_DLQ_GROUP=praxis_state_cache_refresh_dead_letters
 RAG_CACHE_WORKER_RECOVER_SECONDS=30
-# RAG_DEBEZIUM_HEALTH_URL / RAG_DEBEZIUM_CACHE_HEALTH_URL 为可选只读健康探测
+# 分布式 Kafka Connect（宿主机进程读取 connector/task 状态并自动重启 FAILED task）
+RAG_CONNECT_URLS=http://127.0.0.1:8083,http://127.0.0.1:8084
+RAG_CONNECT_DOCUMENT_CONNECTOR=praxis-document-cdc
+RAG_CONNECT_CACHE_CONNECTOR=praxis-cache-cdc
 ```
 
 `RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存；artifact 保留期用 `RAG_RESULT_TTL_SECONDS=3600`（变量名保留，语义已更正为 artifact TTL）。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis：**搜索同步直返、artifact 按 ID 从 MySQL 读取，均不依赖 Redis**；被禁用的只是读模型展示缓存（读取回源 MySQL）。文档异步新增不依赖 Redis：禁用后仍可提交、查询状态并完成 MySQL 持久发布（Kafka 部署需 Debezium 完成通知投递，但不影响受理与状态查询）。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；持久数据展示读取可回源 MySQL。多实例共享相同 Redis、前缀、MySQL 和各自的 cache/document topic/group（以及两个显式 DLQ topic）。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；Kafka SASL/TLS 凭据仅从 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*` 读取。
 
 ## Docker 与启动
 
-Compose 提供 Redis 7.4、单节点 KRaft Kafka（`apache/kafka:3.9.0`，宿主 `127.0.0.1:9092` / 容器 `kafka:9092`，4 partitions、自动创建 topic、`kafka_data` 持久卷）以及默认启动的**两个 Debezium 连接器**（`debezium` 任务连接器与 `debezium-cache` 缓存连接器，独立 offset/schema-history 与健康端口）。Redis 开启 AOF 和 noeviction；Kafka 数据写入 `KAFKA_LOG_DIRS=/var/lib/kafka/data`。不再有旧 RocketMQ 组件或存储卷 UID 初始化。
+Compose 提供 Redis 7.4、单节点 KRaft Kafka（`apache/kafka:3.9.0`，宿主 `127.0.0.1:9092` / 容器 `kafka:9092`，4 partitions、自动创建 topic、`kafka_data` 持久卷）以及默认启动的**分布式 Kafka Connect 集群**（`connect-1`/`connect-2`；`connect-init` 一次性注册 `praxis-document-cdc` 与 `praxis-cache-cdc`）。连接器配置、binlog 位点与 task 状态保存在 Kafka 内部 topic，schema history 每连接器独立。Redis 开启 AOF 和 noeviction；Kafka 数据写入 `KAFKA_LOG_DIRS=/var/lib/kafka/data`。不再有旧 RocketMQ 组件或存储卷 UID 初始化。
 
 ```powershell
 .\scripts\start-stack.ps1 -MigrateOnly -SkipMigrate

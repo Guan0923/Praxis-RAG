@@ -2019,3 +2019,40 @@ cd frontend && npm run typecheck                  # exit 0
 入库发布同步写入，若集合被外部删除，监控在下一轮 15s 刷新会发现；不再展示单一"向量点"聚合数；
 `documents.collection` 无索引，`DISTINCT` 查询在文档量很大时是全表扫描（当前 26 行无影响，本轮
 不改 MySQL 结构；量大时可考虑加 `(del_flag, collection)` 索引）。
+
+## 分布式 Kafka Connect 迁移（2026-11-15）
+
+**改动范围**：新增 `internal/connect`（REST 客户端、fixed-name 幂等注册、FAILED task
+supervisor）、`cmd/rag-connect`（register/wait/status/plugins/supervise/decode）、
+`deploy/kafka-connect/connectors/*.json`；Compose 用 `connect-1`/`connect-2` +
+`connect-init` 替代两个 Debezium Server；监控改为读取 connector/task 状态并展示
+worker、失败原因、自动重启与恢复结果；启动脚本与 e2e 脚本覆盖注册、worker failover、
+task 自动恢复与真实 Kafka 消息解码。
+
+**本仓库已执行**
+
+- `go build ./...` → exit 0。
+- `go test ./internal/connect ./internal/monitor ./internal/mq -count=1` → ok（含新增的
+  Connect follower 对写请求返回 409 时向 peer 重试的用例）。
+- `go vet ./internal/connect ./internal/monitor ./internal/mq ./cmd/rag-connect ./cmd/rag-service`
+  → exit 0。
+- `go run ./cmd/rag-connect register --offline --connector-dir deploy/kafka-connect/connectors`
+  → 两个模板各展开 31 项配置，固定名称正确。
+- `go run ./cmd/rag-connect decode --kind document|cache` 用真实 Connect JSON 形状的
+  文档通知与缓存删除事件 → 分别输出 `artifact_id/namespace/schedule_version` 和
+  `table/op/before` 定位字段，exit 0。
+- 前端 `npm run typecheck` → exit 0；`npx vitest run src/MonitorPage.test.tsx src/api.test.ts`
+  → 77 tests passed（新增文档采集/缓存采集的 worker、task、重启耗尽、恢复结果断言）。
+- `python -m py_compile scripts/verify-debezium-e2e.py` → exit 0（脚本含验收 2/3/4 与
+  `rag-connect decode` 契约检查，但未连接真实栈执行）。
+
+**未实机验证**
+
+- 双 worker Connect 集群启动、注册与 rebalance；`docker stop` 承载 document task 的
+  worker 后 peer 接管并从 `praxis_connect_offsets` 恢复。
+- 锁定 `debezium_cache` 账号并 kill 连接后 task 进入 FAILED、解除后 supervisor 自动
+  重启恢复；该演练依赖真实 MySQL/Debezium 错误分类。
+- Compose `app` profile、`connect-init` 一次性容器与镜像内 `deploy/kafka-connect`
+  路径。
+- `scripts/verify-debezium-e2e.py` 的验收 2/3/4 全链路（本环境无 Docker daemon）。
+- 生产多机部署、内部 topic 副本 3、REST 反向代理与认证。

@@ -13,11 +13,16 @@
 # MCP/REST search is synchronous (one call returns evidence): there is no search
 # worker, search topic/group or queued task to consume or drain.
 #
-# Two Debezium Server connectors tail the MySQL binlog and deliver the async
-# pipeline (no transactional outbox):
-#   * debezium       (task connector)  document_jobs -> RAG_DOCUMENT_TOPIC
-#   * debezium-cache (cache connector) business tables -> RAG_CACHE_TOPIC
-# The application never publishes task/cache notifications itself.
+# Two Debezium MySQL connectors run as tasks inside a distributed Kafka Connect
+# cluster (two workers on this machine; production spreads workers across
+# machines). Connector configs, source offsets and tasks status live in Kafka
+# internal topics, so a dead worker is replaced by its peer and resumes from the
+# saved binlog position.
+#   * praxis-document-cdc (RAG_CONNECT_DOCUMENT_CONNECTOR) document_jobs -> RAG_DOCUMENT_TOPIC
+#   * praxis-cache-cdc    (RAG_CONNECT_CACHE_CONNECTOR)    business tables -> RAG_CACHE_TOPIC
+# The application never publishes task/cache notifications itself. Connectors
+# are registered by fixed name below; an unchanged configuration is not updated,
+# so repeating the start never bounces a healthy capture task.
 #
 #   .\scripts\start-stack.ps1                 # full start
 #   .\scripts\start-stack.ps1 -MigrateOnly    # only start dependencies + migrate
@@ -100,12 +105,23 @@ if (-not $env:RAG_DOCUMENT_DLQ_TOPIC) { $env:RAG_DOCUMENT_DLQ_TOPIC = "praxis_do
 if (-not $env:RAG_CACHE_DLQ_TOPIC) { $env:RAG_CACHE_DLQ_TOPIC = "praxis_state_cache_refresh_dead_letters" }
 if (-not $env:RAG_DOCUMENT_DLQ_GROUP) { $env:RAG_DOCUMENT_DLQ_GROUP = "praxis_document_dead_letters" }
 if (-not $env:RAG_CACHE_DLQ_GROUP) { $env:RAG_CACHE_DLQ_GROUP = "praxis_state_cache_refresh_dead_letters" }
-# Debezium health ports published on loopback by compose (tasks=8083, cache=8084)
-# and the matching health URLs used by the Console monitor.
-if (-not $env:RAG_DEBEZIUM_PORT) { $env:RAG_DEBEZIUM_PORT = "8083" }
-if (-not $env:RAG_DEBEZIUM_CACHE_PORT) { $env:RAG_DEBEZIUM_CACHE_PORT = "8084" }
-if (-not $env:RAG_DEBEZIUM_HEALTH_URL) { $env:RAG_DEBEZIUM_HEALTH_URL = "http://127.0.0.1:$($env:RAG_DEBEZIUM_PORT)/q/health" }
-if (-not $env:RAG_DEBEZIUM_CACHE_HEALTH_URL) { $env:RAG_DEBEZIUM_CACHE_HEALTH_URL = "http://127.0.0.1:$($env:RAG_DEBEZIUM_CACHE_PORT)/q/health" }
+# Distributed Kafka Connect REST endpoints (the two workers' loopback ports).
+# Both are listed so the monitor and the restart supervisor fail over when one
+# worker is down. RAG_CONNECT_URLS may be set explicitly to the same list.
+if (-not $env:RAG_CONNECT_PORT_1) { $env:RAG_CONNECT_PORT_1 = "8083" }
+if (-not $env:RAG_CONNECT_PORT_2) { $env:RAG_CONNECT_PORT_2 = "8084" }
+if (-not $env:RAG_CONNECT_URLS) {
+    $env:RAG_CONNECT_URLS = "http://127.0.0.1:$($env:RAG_CONNECT_PORT_1),http://127.0.0.1:$($env:RAG_CONNECT_PORT_2)"
+}
+if (-not $env:RAG_CONNECT_DOCUMENT_CONNECTOR) { $env:RAG_CONNECT_DOCUMENT_CONNECTOR = "praxis-document-cdc" }
+if (-not $env:RAG_CONNECT_CACHE_CONNECTOR) { $env:RAG_CONNECT_CACHE_CONNECTOR = "praxis-cache-cdc" }
+if (-not $env:DEBEZIUM_CONNECT_VERSION) { $env:DEBEZIUM_CONNECT_VERSION = "3.7.1.Final" }
+if (-not $env:RAG_MYSQL_DEBEZIUM_CACHE_USER) { $env:RAG_MYSQL_DEBEZIUM_CACHE_USER = "debezium_cache" }
+if (-not $env:RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD) {
+    # One password for two least-privilege accounts is acceptable in development;
+    # production should set a separate value per connector.
+    $env:RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD = $env:RAG_MYSQL_DEBEZIUM_PASSWORD
+}
 
 $normalTopics = @($env:RAG_CACHE_TOPIC, $env:RAG_DOCUMENT_TOPIC)
 $dlqTopics = @($env:RAG_DOCUMENT_DLQ_TOPIC, $env:RAG_CACHE_DLQ_TOPIC)
@@ -132,7 +148,8 @@ if (@($dlqTopics | Where-Object { $_ -in $normalTopics }).Count) {
 
 $binDir = Join-Path $root "dist\bin"
 $ragService = Join-Path $binDir "rag-service.exe"
-if (-not (Test-Path $ragService)) {
+$connectExe = Join-Path $binDir "rag-connect.exe"
+if (-not (Test-Path $ragService) -or -not (Test-Path $connectExe)) {
     Write-Host "Building the Go backend (dist/bin) before starting..."
     & (Join-Path $PSScriptRoot "build-go.ps1") -SkipFrontend
     if ($LASTEXITCODE -ne 0) { throw "Go build failed; run scripts/build-go.ps1 and retry." }
@@ -152,10 +169,16 @@ foreach ($legacy in @("praxis-rag-rocketmq", "praxis-rag-rocketmq-namesrv", "pra
 }
 
 if (-not $env:RAG_MYSQL_DEBEZIUM_PASSWORD) {
-    throw "RAG_MYSQL_DEBEZIUM_PASSWORD must be set in .env for Debezium."
+    throw "RAG_MYSQL_DEBEZIUM_PASSWORD must be set in .env for the Debezium document connector."
+}
+if (-not $env:RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD) {
+    throw "RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD (or RAG_MYSQL_DEBEZIUM_PASSWORD as fallback) must be set in .env for the Debezium cache connector."
+}
+if ($env:RAG_MYSQL_DEBEZIUM_CACHE_USER -eq $env:RAG_MYSQL_DEBEZIUM_USER) {
+    throw "RAG_MYSQL_DEBEZIUM_CACHE_USER must differ from RAG_MYSQL_DEBEZIUM_USER so one capture path cannot lock out the other."
 }
 
-Write-Host "Starting MySQL, Qdrant, Redis, Kafka, both Debezium connectors and the PDF vision parser (pdf-parser)..."
+Write-Host "Starting MySQL, Qdrant, Redis, Kafka, the Kafka Connect cluster and the PDF vision parser (pdf-parser)..."
 Invoke-Compose -Arguments @("up", "-d")
 if ($LASTEXITCODE -ne 0) {
     throw "docker compose up failed. Is Docker Desktop running and this shell allowed to access it?"
@@ -173,6 +196,42 @@ for ($attempt = 0; $attempt -lt 90; $attempt++) {
 }
 if (-not $healthy) {
     throw "MySQL did not become healthy. Run: docker compose logs mysql"
+}
+
+# Existing data volumes skip docker-entrypoint-initdb.d, so converge both CDC
+# accounts here. This is idempotent and also re-aligns passwords after an
+# operator rotates them in .env. Passwords never go on the docker CLI argv: the
+# SQL goes over stdin and the root password through MYSQL_PWD.
+function ConvertTo-SqlLiteral {
+    param([string]$Value)
+    return $Value.Replace("'", "''")
+}
+$documentUser = ConvertTo-SqlLiteral $env:RAG_MYSQL_DEBEZIUM_USER
+$documentPassword = ConvertTo-SqlLiteral $env:RAG_MYSQL_DEBEZIUM_PASSWORD
+$cacheUser = ConvertTo-SqlLiteral $env:RAG_MYSQL_DEBEZIUM_CACHE_USER
+$cachePassword = ConvertTo-SqlLiteral $env:RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD
+$cdcSql = @'
+CREATE USER IF NOT EXISTS '{0}'@'%' IDENTIFIED BY '{1}';
+ALTER USER '{0}'@'%' IDENTIFIED BY '{1}';
+CREATE USER IF NOT EXISTS '{2}'@'%' IDENTIFIED BY '{3}';
+ALTER USER '{2}'@'%' IDENTIFIED BY '{3}';
+GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{0}'@'%';
+GRANT SELECT, RELOAD, SHOW DATABASES, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{2}'@'%';
+FLUSH PRIVILEGES;
+'@ -f $documentUser, $documentPassword, $cacheUser, $cachePassword
+Write-Host "Ensuring the two CDC accounts ($($env:RAG_MYSQL_DEBEZIUM_USER), $($env:RAG_MYSQL_DEBEZIUM_CACHE_USER)) have binlog privileges..."
+$savedMysqlPwd = $env:MYSQL_PWD
+$env:MYSQL_PWD = $env:MYSQL_ROOT_PASSWORD
+try {
+    # `docker exec -e MYSQL_PWD` (no value) copies the variable from this
+    # process, so the root password never appears on the docker CLI argv.
+    $cdcSql | docker exec -i -e MYSQL_PWD praxis-rag-mysql mysql -uroot
+}
+finally {
+    $env:MYSQL_PWD = $savedMysqlPwd
+}
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not create the CDC users. Check MYSQL_ROOT_PASSWORD and: docker compose logs mysql"
 }
 
 Write-Host "Waiting for Kafka to become healthy..."
@@ -233,7 +292,7 @@ Write-Host "Kafka topics ready: $((& docker exec praxis-rag-kafka /opt/kafka/bin
 Write-Host "Consumers: rag-document-worker and rag-cache-worker are started automatically with rag-service below; MCP/REST search is synchronous and needs no worker."
 Write-Host "REST/Console batch uploads return after durable admission; rag-document-worker processes them afterwards."
 Write-Host "Document workers retry in-process and publish exhausted messages to RAG_DOCUMENT_DLQ_TOPIC; run rag-dead-letter-worker --kind document|cache for them."
-Write-Host "Task/cache notifications come from Debezium instead of an outbox: the task connector carries only document_jobs schema-4 locator ids plus schedule_version; the cache connector publishes locator-only c/u/d events to RAG_CACHE_TOPIC. Deploy API and workers together."
+Write-Host "Task/cache notifications come from the Kafka Connect Debezium connectors instead of an outbox: the document connector carries only document_jobs schema-4 locator ids plus schedule_version; the cache connector publishes locator-only c/u/d events to RAG_CACHE_TOPIC. Deploy API and workers together."
 
 if (-not $SkipMigrate) {
     # Go state schema migration is idempotent; run it before the service touches the database.
@@ -252,40 +311,73 @@ if (-not $SkipMigrate) {
     }
 }
 
-# Both connectors must be capturing before the workers start: the task connector
-# drives document jobs, the cache connector keeps the Redis read model
-# converged. A connector is ready when its Quarkus health endpoint reports UP and
-# its log shows the streaming phase (a started process is not proof of capture).
-function Wait-DebeziumConnector {
-    param(
-        [string]$Container,
-        [string]$HealthURL,
-        [string]$Label
-    )
-    for ($attempt = 0; $attempt -lt 90; $attempt++) {
-        $healthOk = $false
+# Wait until both Connect workers answer their REST API, then register both
+# connectors by fixed name and wait for their connector AND task states to be
+# RUNNING. This replaces the old /q/health probe: it asserts the actual capture
+# task state that delivers notifications, not just a live process.
+function Wait-ConnectWorker {
+    param([string]$Url, [string]$Label)
+    for ($attempt = 0; $attempt -lt 120; $attempt++) {
         try {
-            $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri $HealthURL
-            $healthOk = $response.StatusCode -eq 200 -and ($response.Content -match '"status"\s*:\s*"UP"')
+            $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 -Uri "$Url/connector-plugins"
+            if ($response.StatusCode -eq 200 -and $response.Content -match "io.debezium.connector.mysql.MySqlConnector") {
+                Write-Host "$Label REST API is ready."
+                return
+            }
         }
         catch {
-            $healthOk = $false
-        }
-        $logs = docker logs $Container --tail 200 2>&1
-        $streaming = $logs -match "Starting streaming"
-        if ($healthOk -and $streaming) {
-            Write-Host "$Label is healthy and streaming."
-            return
+            $response = $null
         }
         Start-Sleep -Seconds 2
     }
-    throw "$Label did not become healthy and streaming; check docker logs $Container."
+    throw "$Label REST API did not become ready; check docker compose logs $Label."
 }
 
-Write-Host "Waiting for both Debezium connectors (tasks/cache) to become healthy..."
-Wait-DebeziumConnector -Container "praxis-rag-debezium" -HealthURL $env:RAG_DEBEZIUM_HEALTH_URL -Label "Debezium task connector"
-Wait-DebeziumConnector -Container "praxis-rag-debezium-cache" -HealthURL $env:RAG_DEBEZIUM_CACHE_HEALTH_URL -Label "Debezium cache connector"
-Write-Host "Debezium is streaming MySQL binlog -> topics $($env:RAG_DOCUMENT_TOPIC), $($env:RAG_CACHE_TOPIC)."
+$connectUrls = @($env:RAG_CONNECT_URLS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($connectUrls.Count -eq 0) {
+    throw "RAG_CONNECT_URLS must list at least one Kafka Connect REST endpoint."
+}
+Write-Host "Waiting for the Kafka Connect worker REST APIs: $($connectUrls -join ', ')"
+for ($index = 0; $index -lt $connectUrls.Count; $index++) {
+    Wait-ConnectWorker -Url $connectUrls[$index] -Label "connect-$($index + 1)"
+}
+
+# Registration expands the connector templates with the *container-internal*
+# database/broker addresses: connectors run inside Docker even though this
+# script runs on the host. Host values are restored afterwards.
+function Invoke-ConnectRegistration {
+    param([string]$Executable, [string]$Urls, [string]$ExpectedVersion)
+    $overrides = [ordered]@{
+        RAG_MYSQL_HOST                      = "mysql"
+        RAG_MYSQL_PORT                      = "3306"
+        RAG_CONNECT_KAFKA_BOOTSTRAP_SERVERS = "kafka:9092"
+    }
+    $saved = @{}
+    foreach ($name in $overrides.Keys) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+        Set-Item -Path "Env:$name" -Value $overrides[$name]
+    }
+    try {
+        & $Executable register --urls $Urls --expected-version $ExpectedVersion --wait 180
+        if ($LASTEXITCODE -ne 0) {
+            throw "Connector registration failed. Check docker compose logs connect-1 connect-2."
+        }
+        & $Executable wait --urls $Urls --wait 180
+        if ($LASTEXITCODE -ne 0) {
+            throw "Kafka Connect connectors/tasks did not become RUNNING. Run: dist\bin\rag-connect.exe status"
+        }
+    }
+    finally {
+        foreach ($name in $overrides.Keys) {
+            if ($null -eq $saved[$name]) { Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue }
+            else { Set-Item -Path "Env:$name" -Value $saved[$name] }
+        }
+    }
+}
+
+Write-Host "Registering the two Debezium connectors (idempotent, by fixed name)..."
+Invoke-ConnectRegistration -Executable $connectExe -Urls ($connectUrls -join ',') -ExpectedVersion $env:DEBEZIUM_CONNECT_VERSION
+Write-Host "Kafka Connect is capturing MySQL binlog -> topics $($env:RAG_DOCUMENT_TOPIC), $($env:RAG_CACHE_TOPIC)."
 
 if ($MigrateOnly) {
     Write-Host "Dependencies started and migration finished."

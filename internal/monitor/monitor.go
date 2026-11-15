@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Guan0923/xinghe_rag/internal/connect"
 	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/qdrant"
 	"github.com/Guan0923/xinghe_rag/internal/state"
@@ -45,6 +46,13 @@ const (
 	statusDisabled = "disabled"
 	statusUnknown  = "unknown"
 )
+
+// ConnectorProbe is the read-only Kafka Connect status surface. It is
+// implemented by *connect.Runtime; the interface keeps this package testable
+// without a Connect cluster.
+type ConnectorProbe interface {
+	Health(ctx context.Context, connector string) (connect.ConnectorHealth, error)
+}
 
 // StatsProvider is the read-only state aggregate surface. *state.Stores
 // implements it.
@@ -87,12 +95,15 @@ type Options struct {
 
 	KafkaBootstrapServers []string
 
-	// DebeziumHealthURL / DebeziumCacheHealthURL are the optional Quarkus health
-	// endpoints of the two capture connectors (task connector and cache
-	// connector). They report whether a connector is running, never the binlog
-	// offset: the service cannot observe that from its own state database.
-	DebeziumHealthURL      string
-	DebeziumCacheHealthURL string
+	// ConnectorProbe reads one Kafka Connect connector's live connector/task
+	// state merged with the restart supervisor's bookkeeping. Kafka Connect keeps
+	// the binlog capture offset, so the page still reports capture progress as
+	// unknown. nil means the integration is not configured in this deployment.
+	ConnectorProbe ConnectorProbe
+	// DocumentConnector / CacheConnector are the two fixed connector names. They
+	// label the capture rows and are the identifiers sent to ConnectorProbe.
+	DocumentConnector string
+	CacheConnector    string
 	// Document/Cache Topic+Group label the two independent business consumer
 	// groups (document ingestion and cache refresh). Search is synchronous and
 	// has no consumer group. They are reported even when a progress read is
@@ -257,19 +268,46 @@ type pipelineWorker struct {
 	Detail string `json:"detail"`
 }
 
-// pipelineDebezium reports both capture connectors' health. CaptureProgress is
-// always nil: the application side cannot read the binlog offset and must not
-// invent one.
+// pipelineDebezium reports both Kafka Connect capture connectors. The JSON keys
+// (`tasks`/`cache`) are historical names kept for Console compatibility; the
+// values now come from the two fixed Debezium connectors registered in the
+// distributed Kafka Connect cluster. CaptureProgress is always nil: the binlog
+// position lives in Kafka Connect's offset topic, not in this service.
 type pipelineDebezium struct {
 	Tasks pipelineConnector `json:"tasks"`
 	Cache pipelineConnector `json:"cache"`
 }
 
-// pipelineConnector is one Debezium connector's readiness row.
+// pipelineConnectTask is one connector task's observed state.
+type pipelineConnectTask struct {
+	ID       int    `json:"id"`
+	State    string `json:"state"`
+	WorkerID string `json:"worker_id"`
+	Trace    string `json:"trace,omitempty"`
+}
+
+// pipelineConnector is one capture connector's readiness row plus the restart
+// supervisor's view. The worker and restart fields answer the operator's three
+// questions directly: which worker runs it, why did it fail, and is recovery
+// still in progress or exhausted.
 type pipelineConnector struct {
-	Status          string `json:"status"`
-	Detail          string `json:"detail"`
-	CaptureProgress *int64 `json:"capture_progress"`
+	Status           string                `json:"status"`
+	Detail           string                `json:"detail"`
+	CaptureProgress  *int64                `json:"capture_progress"`
+	Connector        string                `json:"connector"`
+	ConnectorState   string                `json:"connector_state"`
+	WorkerID         string                `json:"worker_id"`
+	Tasks            []pipelineConnectTask `json:"tasks"`
+	FailedTasks      int                   `json:"failed_tasks"`
+	FailureReason    string                `json:"failure_reason"`
+	Restarting       bool                  `json:"restarting"`
+	RestartAttempts  int                   `json:"restart_attempts"`
+	RestartExhausted bool                  `json:"restart_exhausted"`
+	Recovery         string                `json:"recovery"`
+	LastRestartAt    string                `json:"last_restart_at"`
+	LastRecoveredAt  string                `json:"last_recovered_at"`
+	NextRestartAt    string                `json:"next_restart_at"`
+	Supervised       bool                  `json:"supervised"`
 }
 
 // pipelineKafka reports the two independent consumer groups. The document
@@ -350,21 +388,17 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 
 	// The delivery-progress probes run next to the statistics read: neither the
 	// snapshot nor statsErr may wait on a slow capture connector or broker.
-	var debeziumTasks, debeziumCache probeResult
+	var connectTasks, connectCache pipelineConnector
 	var kafka pipelineKafka
 	wait.Add(1)
 	go func() {
 		defer wait.Done()
-		debeziumTasks = s.runProbe(ctx, func(probeCtx context.Context) probeResult {
-			return s.probeDebeziumConnector(probeCtx, s.options.DebeziumHealthURL, "任务连接器")
-		})
+		connectTasks = s.probeConnectConnector(ctx, s.options.DocumentConnector, "文档采集")
 	}()
 	wait.Add(1)
 	go func() {
 		defer wait.Done()
-		debeziumCache = s.runProbe(ctx, func(probeCtx context.Context) probeResult {
-			return s.probeDebeziumConnector(probeCtx, s.options.DebeziumCacheHealthURL, "缓存连接器")
-		})
+		connectCache = s.probeConnectConnector(ctx, s.options.CacheConnector, "缓存采集")
 	}()
 	wait.Add(1)
 	go func() {
@@ -447,9 +481,9 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 		DocumentJobs: pipelineDocumentJobsView(stats, statsErr),
 		Worker:       pipelineWorkerView(workerBeat, workerErr, now),
 		Debezium: pipelineDebezium{
-			Tasks: pipelineConnector{Status: debeziumTasks.status, Detail: debeziumTasks.detail},
-			Cache: pipelineConnector{Status: debeziumCache.status, Detail: debeziumCache.detail},
-			// capture_progress stays nil: only Debezium can read the binlog offset.
+			Tasks: connectTasks,
+			Cache: connectCache,
+			// capture_progress stays nil: Kafka Connect owns the binlog offset.
 		},
 		Kafka: kafka,
 		Cache: pipelineCacheView(stats, statsErr),
@@ -697,87 +731,138 @@ func pipelineDocumentJobsView(stats *state.MonitorStats, statsErr error) pipelin
 	return pipelineJobs{Status: statusOK, Detail: detail}
 }
 
-// debeziumHealth is the subset of the Debezium health payload the probe reads.
-// Debezium Server exposes Quarkus SmallRye Health: the aggregate status plus the
-// individual runtime checks. A failed connector task or database connection
-// turns its check DOWN, so reading the checks is an actual running check instead
-// of an HTTP status-only probe.
-type debeziumHealth struct {
-	Status string `json:"status"`
-	Checks []struct {
-		Name   string `json:"name"`
-		Status string `json:"status"`
-	} `json:"checks"`
-}
-
-// debeziumDownDetail names the failing runtime checks so the Console shows what
-// is actually broken instead of repeating the aggregate status.
-func debeziumDownDetail(health debeziumHealth) string {
-	failing := make([]string, 0, len(health.Checks))
-	for _, check := range health.Checks {
-		if !strings.EqualFold(strings.TrimSpace(check.Status), "UP") {
-			name := strings.TrimSpace(check.Name)
-			if name == "" {
-				name = "未命名检查"
+// probeConnectConnector reads one Kafka Connect connector's live state and the
+// supervisor's restart bookkeeping. status/detail are the Console row; the
+// structured fields keep the worker, failure reason and recovery result
+// addressable instead of flattening them into prose only.
+func (s *Service) probeConnectConnector(ctx context.Context, connector, label string) pipelineConnector {
+	view := pipelineConnector{
+		Connector:       strings.TrimSpace(connector),
+		CaptureProgress: nil,
+		Tasks:           []pipelineConnectTask{},
+	}
+	if view.Connector == "" {
+		view.Status = statusUnknown
+		view.Detail = "未配置" + label + "连接器名称"
+		return view
+	}
+	if s.options.ConnectorProbe == nil {
+		view.Status = statusUnknown
+		view.Detail = "未配置 Kafka Connect 状态探测（RAG_CONNECT_URLS），无法读取" + label
+		return view
+	}
+	probeContext, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	health, err := s.options.ConnectorProbe.Health(probeContext, view.Connector)
+	if name := strings.TrimSpace(health.Connector); name != "" {
+		view.Connector = name
+	}
+	view.ConnectorState = health.State
+	view.WorkerID = health.WorkerID
+	view.FailedTasks = health.FailedTasks
+	view.FailureReason = boundedText(strings.TrimSpace(health.FailureReason), 300)
+	view.Restarting = health.Restarting
+	view.RestartAttempts = health.RestartAttempts
+	view.RestartExhausted = health.RestartExhausted
+	view.Recovery = health.Recovery
+	view.LastRestartAt = health.LastRestartAt
+	view.LastRecoveredAt = health.LastRecoveredAt
+	view.NextRestartAt = health.NextRestartAt
+	view.Supervised = health.SupervisorEnabled
+	view.Tasks = make([]pipelineConnectTask, 0, len(health.Tasks))
+	for _, task := range health.Tasks {
+		view.Tasks = append(view.Tasks, pipelineConnectTask{
+			ID:       task.ID,
+			State:    task.State,
+			WorkerID: task.WorkerID,
+			Trace:    boundedText(task.Trace, 200),
+		})
+	}
+	if view.WorkerID == "" {
+		// A connector row with no connector worker can still show which worker
+		// runs a task; that is the value the operator needs after a failover.
+		for _, task := range view.Tasks {
+			if task.WorkerID != "" {
+				view.WorkerID = task.WorkerID
+				break
 			}
-			failing = append(failing, boundedText(name, 40))
 		}
 	}
-	if len(failing) == 0 {
-		return "状态为 DOWN"
+	if err != nil {
+		view.Status = statusError
+		view.Detail = label + "（" + view.Connector + "）状态读取失败：" + shortError(err)
+		if view.FailureReason != "" {
+			view.Detail += "；" + view.FailureReason
+		}
+		return view
 	}
-	return "状态为 DOWN（检查失败：" + strings.Join(failing, "、") + "）"
+	view.Status, view.Detail = connectorVerdict(view, label)
+	return view
 }
 
-// probeDebeziumConnector checks one capture connector's Quarkus health endpoint
-// and its per-check runtime state. It never reports a capture offset: only
-// Debezium knows the binlog position. label ("任务连接器"/"缓存连接器") keeps the
-// two rows distinguishable in the detail line.
-func (s *Service) probeDebeziumConnector(ctx context.Context, healthURL, label string) probeResult {
-	healthURL = strings.TrimSpace(healthURL)
-	if healthURL == "" {
-		return probeResult{status: statusUnknown, detail: "未配置" + label + "健康检查地址，采集进度未知"}
+// connectorVerdict turns one connector observation into the Console status and
+// detail line. Delivery is healthy only when the connector and every task are
+// RUNNING; a restart in progress is shown explicitly, and an exhausted budget is
+// reported as an error that needs an operator.
+func connectorVerdict(view pipelineConnector, label string) (string, string) {
+	detail := view.Connector + " " + view.ConnectorState
+	if view.WorkerID != "" {
+		detail += "；所在 worker：" + view.WorkerID
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
-	if err != nil {
-		return probeResult{status: statusError, detail: label + "健康检查地址无效"}
-	}
-	response, err := s.httpClient.Do(request)
-	if err != nil {
-		return probeResult{status: statusError, detail: label + "健康检查不可达"}
-	}
-	defer func() { _ = response.Body.Close() }()
-	body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
-	var health debeziumHealth
-	parsed := readErr == nil && json.Unmarshal(body, &health) == nil
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		// Quarkus answers 503 when a check is DOWN; keep the failing check names
-		// when the body is still a health document.
-		if parsed && strings.EqualFold(strings.TrimSpace(health.Status), "DOWN") {
-			return probeResult{status: statusError, detail: label + debeziumDownDetail(health)}
+	taskParts := make([]string, 0, len(view.Tasks))
+	allRunning := len(view.Tasks) > 0
+	for _, task := range view.Tasks {
+		state := task.State
+		if state == "" {
+			state = "未知"
 		}
-		return probeResult{status: statusError, detail: fmt.Sprintf("%s健康检查返回 HTTP %d", label, response.StatusCode)}
-	}
-	if readErr != nil {
-		return probeResult{status: statusDegraded, detail: label + "健康检查响应读取失败"}
-	}
-	if !parsed {
-		return probeResult{status: statusDegraded, detail: label + "健康检查响应无法解析"}
-	}
-	switch strings.ToUpper(strings.TrimSpace(health.Status)) {
-	case "UP":
-		detail := label + "健康检查正常"
-		if len(health.Checks) > 0 {
-			detail = fmt.Sprintf("%s健康检查正常（%d 项运行检查通过）", label, len(health.Checks))
+		part := fmt.Sprintf("task %d %s", task.ID, state)
+		if task.WorkerID != "" {
+			part += "@" + task.WorkerID
 		}
-		return probeResult{status: statusOK, detail: detail + "；采集位点需在 Debezium 侧查看"}
-	case "DOWN":
-		return probeResult{status: statusError, detail: label + debeziumDownDetail(health)}
-	case "":
-		return probeResult{status: statusDegraded, detail: label + "健康检查未返回状态"}
+		taskParts = append(taskParts, part)
+		if task.State != connect.StateRunning {
+			allRunning = false
+		}
+	}
+	if len(taskParts) > 0 {
+		detail += "；" + strings.Join(taskParts, "，")
+	}
+	if view.FailureReason != "" {
+		detail += "；失败原因：" + view.FailureReason
+	}
+	switch {
+	case view.RestartExhausted && view.FailedTasks > 0:
+		detail += fmt.Sprintf("；自动重启已耗尽（%d 次），需人工处理", view.RestartAttempts)
+	case view.Restarting && view.FailedTasks > 0:
+		detail += fmt.Sprintf("；正在自动重启（第 %d 次）", view.RestartAttempts)
+		if view.NextRestartAt != "" {
+			detail += "，下次尝试 " + view.NextRestartAt
+		}
+	case view.Recovery == connect.RecoveryRecovered:
+		detail += "；上次失败后已自动恢复"
+	}
+
+	status := statusOK
+	switch {
+	case view.FailedTasks > 0 || view.ConnectorState == connect.StateFailed:
+		status = statusError
+	case view.ConnectorState == connect.StatePaused || view.ConnectorState == connect.StateStopped:
+		status = statusDegraded
+		detail += "（已暂停，另一路采集不受影响）"
+	case view.ConnectorState != connect.StateRunning:
+		status = statusError
+	case len(view.Tasks) == 0:
+		status = statusDegraded
+		detail += "；尚未调度 task"
+	case !allRunning:
+		status = statusError
 	default:
-		return probeResult{status: statusDegraded, detail: label + "状态为 " + boundedText(health.Status, 40)}
+		// Kafka Connect persists the binlog position in its offset topic; the
+		// application must not invent a capture percentage.
+		detail += "；采集位点由 Kafka Connect 保存"
 	}
+	return status, boundedText(detail, 600)
 }
 
 // probeKafkaGroups reads the two independent business consumer groups (one row
