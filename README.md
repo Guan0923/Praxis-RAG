@@ -23,6 +23,8 @@ Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可
 
 相同内容与切分配置的重复上传会跳过；`add_document` 与异步 REST 上传不覆盖同名文档，替换请用 `update_document`。状态用 MCP `get_document_status` 或 REST `GET /v1/document-jobs/{artifact_id}` 轮询，终态为 `succeeded` / `failed`，状态在 MySQL，不依赖 Redis TTL。
 
+知识文档页还提供「从飞书导入」：用户先用自己的飞书账号完成 OAuth 授权，然后按文件夹浏览或搜索自己有权限访问的飞书文档，勾选后一次导入当前知识库（单次最多 10 篇）。浏览、搜索和读取正文都使用该用户的 `user_access_token`，不会越权读取；导入只取新版飞书文档（docx）的纯文本，复用普通上传的知识库写权限校验、SHA-256 去重、同名跳过和异步索引，逐篇返回「已受理 / 已跳过 / 失败」并在后台轮询索引状态，只有索引成功后才可检索。导入后的副本属于目标知识库，可见范围由 Praxis-RAG 的知识库权限决定，与飞书原文档的分享范围无关。部署方需要配置 `RAG_FEISHU_APP_ID`、`RAG_FEISHU_APP_SECRET` 和 `RAG_FEISHU_REDIRECT_URI`，并在飞书应用申请 `drive:drive:readonly`、`docx:document:readonly`、`offline_access` 权限；未配置时入口会说明原因。文件列表中的旧版飞书文档（doc）、表格和附件会标记为不支持；搜索命中的旧版或不支持文档会作为该篇的失败原因返回，不影响同批其他文档。
+
 ### PDF 与 Word 解析
 
 PDF 默认交给 **PDF 视觉解析微服务**（`python-workers/pdf-service`，默认 `RAG_PDF_ENGINE=vision`，旧值 `docling` 作为兼容别名）：版面分析、表格结构（行列/表头/合并单元格）、OCR、公式 LaTeX 与图片描述都在该服务内通过**远端 OpenAI 兼容视觉模型**完成；服务本地只用 PyMuPDF 读取/渲染/裁图并组装清单，不加载任何模型权重。Go 服务通过 HTTP 取回 zip（`manifest.json` + 图片资产）后再切分入库。该服务是独立镜像，需要单独构建/启动（`docker compose up -d pdf-parser`），只需能访问配置好的视觉模型端点。

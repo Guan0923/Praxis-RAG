@@ -21,6 +21,23 @@
 - 失败重试：同进程内指数退避（默认最多 5 次），仍是“至少一次”投递；耗尽后进入显式 DLQ topic，由 `rag-dead-letter-worker` 落终态。崩溃恢复：任务租约 + 心跳 + 上传 journal 对账，重复投递靠幂等吸收。
 - 上传/切分参数来自知识库配置，**不接受请求级覆盖**。
 
+### 2.1 从飞书导入（可选）
+
+- **授权边界**：部署方配置 `RAG_FEISHU_APP_ID` / `RAG_FEISHU_APP_SECRET` / `RAG_FEISHU_REDIRECT_URI`（三项必须同时存在，否则启动失败；全空则功能禁用）。每个 Console 账号通过 OAuth 连接自己的飞书账号，浏览、搜索、读取正文均使用该账号的 `user_access_token`，不使用应用身份越权。
+- **配置项**（`internal/config/feishu.go`）：`RAG_FEISHU_API_BASE_URL`（默认 `https://open.feishu.cn`）、`RAG_FEISHU_ACCOUNTS_BASE_URL`（默认 `https://accounts.feishu.cn`）、`RAG_FEISHU_TIMEOUT_SECONDS`（默认 20，1..300）。回调地址必须与飞书开放平台登记值完全一致；申请 `drive:drive:readonly`、`docx:document:readonly`、`offline_access`。
+- **API**（`internal/httpapi/feishu.go`，`internal/feishu/`）：
+  - `GET /v1/feishu/status`（会话）：返回是否启用、是否已连接、账号、scope 缺口、是否需要重新授权。
+  - `POST /v1/feishu/oauth/start`（会话，CSRF）：创建一次性 state，返回 `authorize_url`。
+  - `GET /v1/feishu/oauth/callback`（无路由鉴权，处理函数自行校验会话）：校验 state 后换取 token、读取用户信息并加密保存；302 回 `#/workspaces/documents`，结果用 `?feishu=connected|denied|error` 表达。
+  - `DELETE /v1/feishu/connection`（会话，CSRF）：删除本人授权。
+  - `GET /v1/feishu/files`（会话）：列根目录或指定 `folder_token`；`docx`/指向 docx 的 `shortcut` 可导入，文件夹可下钻，其他类型给出明确不支持原因。
+  - `GET /v1/feishu/search`（会话）：`POST /open-apis/suite/docs-api/search/object`，只请求 `docs_types:["doc"]`；该共享接口同时覆盖新旧文档，旧版 `doc` 在读取正文时按该篇失败返回（能识别为版本过旧时提示不支持）。
+  - `POST /v1/feishu/import`（租户 + 会话 + 写 scope，CSRF）：body `{"documents":[{"document_id","title"}]}`，1..10 篇；并发读取上限 4、单篇上下文上限 30 秒（HTTP 客户端默认 20 秒）；按文件名安全转换后复用 `SubmitDocumentBatch`，逐篇返回 `accepted/skipped/failed` 与 job，读取失败不阻断其他文档。
+- **状态表**（Go-only，append 在 schema 末尾）：`feishu_connections`（每账号一行，`access_token`/`refresh_token` 用 `enc:v1:` 加密，App Secret 不入库）、`feishu_oauth_states`（只存 state 的 SHA-256 摘要，10 分钟过期，一次性消费，绑定账号）。
+- **刷新**：access token 临期或接口返回鉴权错误时用 refresh token 刷新；每进程按账号分片加锁，避免单次性 refresh token 并发失效。刷新失败或 scope 缺失时 `status.needs_reauth=true`，前端提示重新连接。
+- **入库语义**：只取 docx `raw_content` 纯文本（空正文/超过 10 MiB 拒绝），生成安全 `.md` 文件名；SHA-256 去重、同名跳过、写权限校验和异步索引全部走普通上传路径。导入结果把「已受理」与「可检索」分开，前端轮询 `GET /v1/document-batches/{batch_id}` 的 job，`succeeded` 才展示为已索引。
+- **可见范围**：副本属于目标知识库，检索可见性由 Praxis-RAG 权限决定，与飞书原文档分享范围无关；弹窗在导入前展示目标知识库名和该说明。
+
 ## 3. 文档解析
 
 | 格式 | 引擎 | 产物/说明 |
@@ -127,7 +144,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | 路由 | 页面 | 可见角色 | 主要功能 |
 | --- | --- | --- | --- |
 | `#/workspaces/search` | 检索调试 | 所有登录账号 | BM25/Embedding/Hybrid 检索、Cross-Encoder 重排开关、候选/Top-K 调整、三模式对比、耗时与证据状态、命中详情（分数、来源、页码/章节、图片、脚注） |
-| `#/workspaces/documents` | 知识文档 | 所有登录账号 | 文档列表（大小/块数/切分配置）、上传（批次受理：工具栏「保存中/已完成 x/y」徽标 + 逐文件独立进度条气泡，SSE 实时字节进度与每文件保存结果，可失败重试；面板在保存结果处结束、不展示解析阶段；刷新后恢复未完成批次）、删除；只读授权时隐藏写操作 |
+| `#/workspaces/documents` | 知识文档 | 所有登录账号 | 文档列表（大小/块数/切分配置）、上传（批次受理：工具栏「保存中/已完成 x/y」徽标 + 逐文件独立进度条气泡，SSE 实时字节进度与每文件保存结果，可失败重试；面板在保存结果处结束、不展示解析阶段；刷新后恢复未完成批次）、「从飞书导入」（连接本人飞书账号 → 浏览文件夹/搜索 → 最多勾选 10 篇 → 目标知识库与可见范围提示 → 逐篇「已受理/已跳过/失败」+ 索引进度）、删除；只读授权时隐藏写操作 |
 | `#/workspaces/documents/{name}` | 文档详情 | 所有登录账号 | 正文预览、PDF 预览（pdfjs）、图片/表格资产查看 |
 | `#/workspaces/create` | 创建知识库 | 所有登录账号 | 管理员：namespace + 切分参数 + 从「模型配置」选择 Embedding/Reranker/VLM；VIP/普通用户：简化表单（从默认模板克隆模型配置） |
 | `#/knowledge-bases` | 知识库 | 管理员 | 知识库列表、编辑抽屉（模型/切分/重新向量化确认） |

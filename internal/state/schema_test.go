@@ -51,6 +51,10 @@ var expectedSchema = []struct {
 	// content_objects is the content-addressed byte store referenced by
 	// upload_objects.content_hash and blobs.sha256.
 	{"content_objects", []string{"hash", "size", "content", "created_at", "retired_at"}},
+	// feishu_connections / feishu_oauth_states are Go-only additions for the
+	// optional Feishu document import, appended after the ported tables.
+	{"feishu_connections", []string{"user_id", "open_id", "union_id", "name", "avatar_url", "access_token", "refresh_token", "access_expires_at", "refresh_expires_at", "scope", "created_at", "updated_at"}},
+	{"feishu_oauth_states", []string{"state_digest", "user_id", "redirect_uri", "expires_at", "consumed", "created_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -84,6 +88,8 @@ var expectedPrimaryKeys = map[string][]string{
 	"runtime_heartbeats":       {"role", "instance"},
 	"cdc_cutover_state":        {"k"},
 	"content_objects":          {"hash"},
+	"feishu_connections":       {"user_id"},
+	"feishu_oauth_states":      {"state_digest"},
 }
 
 var expectedUniques = map[string][]string{
@@ -122,6 +128,7 @@ var expectedIndexes = map[string][]string{
 	"document_batch_items":     {"ix_document_batch_item_artifact"},
 	"email_verification_codes": {"ix_email_codes_lookup", "ix_email_codes_expiry"},
 	"runtime_heartbeats":       {"ix_runtime_heartbeats_role"},
+	"feishu_oauth_states":      {"ix_feishu_oauth_states_user", "ix_feishu_oauth_states_expiry"},
 }
 
 // expectedTableNames returns the schema table names in Python declaration order.

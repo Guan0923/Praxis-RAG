@@ -333,6 +333,13 @@ services:
       RAG_MYSQL_PASSWORD: ${RAG_MYSQL_PASSWORD:-}
       RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
       RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
+      # Optional Feishu document import. Leave the trio empty to disable it.
+      RAG_FEISHU_APP_ID: ${RAG_FEISHU_APP_ID:-}
+      RAG_FEISHU_APP_SECRET: ${RAG_FEISHU_APP_SECRET:-}
+      RAG_FEISHU_REDIRECT_URI: ${RAG_FEISHU_REDIRECT_URI:-}
+      RAG_FEISHU_API_BASE_URL: ${RAG_FEISHU_API_BASE_URL:-https://open.feishu.cn}
+      RAG_FEISHU_ACCOUNTS_BASE_URL: ${RAG_FEISHU_ACCOUNTS_BASE_URL:-https://accounts.feishu.cn}
+      RAG_FEISHU_TIMEOUT_SECONDS: ${RAG_FEISHU_TIMEOUT_SECONDS:-20}
       RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
       # Distributed Kafka Connect hosts the two Debezium capture connectors. The
       # service reads each connector/task state from these REST endpoints (any

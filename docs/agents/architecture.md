@@ -89,8 +89,9 @@ examples/knowledge/         示例知识文档（可直接上传试用）
 | `auth` | 账号、角色、密码、Console 会话与 CSRF |
 | `catalog` | 命名空间级 MCP 工具开关与提示词模板持久化 |
 | `chunking` | 五类切分策略、参数校验与切分实现 |
-| `config` | 环境变量、`~/.praxis-rag/config.toml`、启动校验 |
+| `config` | 环境变量、`~/.praxis-rag/config.toml`、启动校验（含可选飞书应用配置） |
 | `contracts` | 检索/MCP 请求契约、JSON Schema、错误语义 |
+| `feishu` | 可选飞书导入：OAuth state/换 token/刷新、用户信息、文件夹/搜索/正文客户端、逐文档读取与安全文件名 |
 | `document` | PDF 原生解析、PDF 视觉服务客户端、DOCX、DOC 转换、公式、VLM、图片/表格资产 |
 | `documentworker` | 文档任务处理器（仅由 Kafka 消费者 `rag-document-worker` 调用） |
 | `httpapi` | REST 路由、认证中间件、OpenAPI、Console 静态资源 |
@@ -109,7 +110,7 @@ examples/knowledge/         示例知识文档（可直接上传试用）
 | `runtime` | 业务运行时：知识库、文档 CRUD、同步搜索（含总预算/取消）、上传事务、任务状态、维护恢复 |
 | `searchrefs` | 搜索结果投影与 artifact 引用（不再写结果快照） |
 | `sparse` | BM25 sparse 编码（确定性哈希词表） |
-| `state` | MySQL schema、仓储、`enc:v1:` 加密、上传日志、任务（`schedule_version`）、缓存 revision 水位、artifact 快照、CDC 切换状态 |
+| `state` | MySQL schema、仓储、`enc:v1:` 加密、上传日志、任务（`schedule_version`）、缓存 revision 水位、artifact 快照、CDC 切换状态、飞书账号授权与 OAuth state |
 | `statetest` | 测试用共享 schema 与 advisory lock |
 | `version` | 版本常量 |
 | `wire` | 依赖装配（adapters） |

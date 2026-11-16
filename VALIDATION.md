@@ -2056,3 +2056,33 @@ task 自动恢复与真实 Kafka 消息解码。
   路径。
 - `scripts/verify-debezium-e2e.py` 的验收 2/3/4 全链路（本环境无 Docker daemon）。
 - 生产多机部署、内部 topic 副本 3、REST 反向代理与认证。
+
+## 飞书文档导入（2026-11-16）
+
+**改动范围**：新增 `internal/feishu`（OAuth/API 客户端、service、文件名安全转换）、
+`internal/config/feishu.go`、`internal/state/feishu.go`（`feishu_connections` /
+`feishu_oauth_states` 与加密存储）、`internal/httpapi/feishu.go`（status/OAuth/files/
+search/import 路由）、Console「从飞书导入」弹窗与 OAuth 回跳提示；导入复用
+`SubmitDocumentBatch`，因此权限、SHA-256 去重、同名跳过和异步索引沿用普通上传。
+
+**本仓库已执行**
+
+- `go build ./cmd/rag-service ./internal/...` → exit 0。
+- `go test ./internal/feishu ./internal/config -count=1` → ok（客户端请求形状、错误分类、
+  OAuth state 单次消费、token 刷新与鉴权失败重试、文件夹/搜索/正文、文件名转换）。
+- `go test ./internal/httpapi -run 'TestFeishu|TestOpenAPI' -count=1` → ok（逐篇失败隔离、
+  重复选择跳过、写 scope 拦截、CSRF、回调 302 与 OpenAPI 文档）。
+- `go test -p 1 -count=1 ./internal/state -run TestFeishu`（本地 `RAG_TEST_MYSQL_URL`）→ ok
+  （token 明文不落库、刷新覆盖、OAuth state 绑定账号且单次使用、schema 顺序）。
+- 前端 `npm run typecheck` → exit 0；`npm test -- src/FeishuImportModal.test.tsx src/feishu.test.ts`
+  → 7 tests passed（目标知识库与可见范围提示、未授权/只读/未启用状态、浏览勾选与导入结果、
+  搜索、索引进度文案）。
+
+**未实机验证**
+
+- 未使用真实飞书企业/账号联调：浏览文件夹的实际清单、搜索结果覆盖范围、应用可用范围、
+  新增权限后重新授权、refresh token 轮换和飞书限流重试都只在 fake HTTP 服务上验证。
+- 回调地址经反向代理/HTTPS 的实际可达性，以及飞书开放平台「重定向 URL」与
+  `RAG_FEISHU_REDIRECT_URI` 完全一致的部署核对。
+- 真实 docx 正文的排版损失（只导入纯文本，不含图片/表格结构）与 10 MiB 正文上限的实际体验。
+- 多副本 `rag-service` 共享同一账号时的 refresh token 竞争：当前锁为进程内，部署需粘滞或单副本；未做多实例压测。

@@ -628,6 +628,64 @@ h3 {
 .upload-dialog .ant-upload-list-item-name {
   overflow-wrap: anywhere;
 }
+.feishu-import-modal .ant-modal-body {
+  max-height: calc(100dvh - 210px);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+.feishu-import {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 4px;
+}
+.feishu-import > * {
+  min-width: 0;
+}
+.feishu-account {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.feishu-browser {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.feishu-browser-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.feishu-file-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.feishu-selection {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--sidebar);
+  padding: 10px 12px;
+}
+.feishu-selection-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.feishu-result {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
 .upload-report {
   line-height: 1.8;
 }

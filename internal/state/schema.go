@@ -824,6 +824,44 @@ var schemaTables = []*SchemaTable{
 		},
 		Indexes: []SchemaIndex{index("ix_content_objects_retired", "retired_at")},
 	},
+	// feishu_connections stores one Console account's Feishu OAuth grant. Tokens
+	// go through the same Protect/Unprotect path as API keys and model-profile
+	// keys; the App Secret never enters this table. Go-only addition appended
+	// after the ported tables.
+	{
+		Name: "feishu_connections",
+		Columns: []SchemaColumn{
+			identifier("user_id", 32).PK(),
+			identifier("open_id", 64),
+			identifier("union_id", 64).Null(),
+			varchar("name", 128),
+			varchar("avatar_url", 2048).Null(),
+			longText("access_token"),
+			longText("refresh_token").Null(),
+			bigint("access_expires_at"),
+			bigint("refresh_expires_at"),
+			text("scope"),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+		},
+	},
+	// feishu_oauth_states holds only the SHA-256 digest of one browser OAuth
+	// state value, bound to the Console account that started the flow.
+	{
+		Name: "feishu_oauth_states",
+		Columns: []SchemaColumn{
+			identifier("state_digest", 64).PK(),
+			identifier("user_id", 32),
+			varchar("redirect_uri", 1024),
+			bigint("expires_at"),
+			boolean("consumed").Default("0"),
+			bigint("created_at"),
+		},
+		Indexes: []SchemaIndex{
+			index("ix_feishu_oauth_states_user", "user_id", "created_at"),
+			index("ix_feishu_oauth_states_expiry", "expires_at"),
+		},
+	},
 }
 
 // SchemaTables returns the schema tables in creation order. The returned slice

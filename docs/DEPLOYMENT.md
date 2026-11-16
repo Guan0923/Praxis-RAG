@@ -115,7 +115,7 @@ docker compose --profile app up -d --build
 docker compose up -d mysql qdrant redis kafka
 ```
 
-`app` 服务从 `.env` 读取 `RAG_SERVICE_TOKEN`（容器 0.0.0.0 绑定，必填）、`RAG_MYSQL_*`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_APP_QDRANT_URL`、`RAG_APP_PORT`、`RAG_APP_KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`RAG_AUTH_*`（Console 登录，见下）、`RAG_PDF_ENGINE`（默认 `vision`）、`RAG_PDF_SERVICE_URL`（compose 内默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120）等；默认依赖 MySQL healthy + Qdrant started + Kafka healthy + pdf-parser started。`pdf-parser` 没有 profile，默认 `docker compose up -d` 即启动；它只在 `vision` 引擎下被调用。详细的环境变量见 §3.5。
+`app` 服务从 `.env` 读取 `RAG_SERVICE_TOKEN`（容器 0.0.0.0 绑定，必填）、`RAG_MYSQL_*`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_APP_QDRANT_URL`、`RAG_APP_PORT`、`RAG_APP_KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`RAG_AUTH_*`（Console 登录，见下）、`RAG_FEISHU_*`（可选飞书导入，见下）、`RAG_PDF_ENGINE`（默认 `vision`）、`RAG_PDF_SERVICE_URL`（compose 内默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120）等；默认依赖 MySQL healthy + Qdrant started + Kafka healthy + pdf-parser started。`pdf-parser` 没有 profile，默认 `docker compose up -d` 即启动；它只在 `vision` 引擎下被调用。详细的环境变量见 §3.5。
 
 ### 3.4 Compose：worker 示例（需自行保存为 override 文件）
 
@@ -590,6 +590,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 
 - `rag-service` 默认 loopback；远程访问必须设置 `RAG_SERVICE_TOKEN`、`RAG_MCP_ALLOWED_HOSTS`、`RAG_MCP_ALLOWED_ORIGINS`，并在前面加 HTTPS 反向代理。
 - Console 登录默认启用：首次访问注册的第一个账号成为管理员，之后可在"用户管理"页分配角色（管理员 `admin` / VIP `vip` / 普通用户 `user`）、启用/禁用、删除；最后一个启用管理员受保护。HTTPS 部署请设置 `RAG_AUTH_COOKIE_SECURE=true`；不需要自助注册时设 `RAG_AUTH_REGISTRATION=closed`，完全关闭登录用 `RAG_AUTH_ENABLED=false`。
+- 可选的飞书文档导入由 `RAG_FEISHU_APP_ID`、`RAG_FEISHU_APP_SECRET`、`RAG_FEISHU_REDIRECT_URI` 启用，三项必须同时配置。飞书应用需申请 `drive:drive:readonly`、`docx:document:readonly`、`offline_access`，开启「安全设置 → 刷新 user_access_token」并发布应用，再把回调地址（如 `https://rag.example.com/v1/feishu/oauth/callback`）原样登记到飞书开放平台「安全设置 → 重定向 URL」；生产环境必须使用 HTTPS。App Secret 只通过环境变量/密钥注入，不写入 `config.toml`、MySQL 或日志；用户的 access/refresh token 以 `enc:v1:` 加密存于 `feishu_connections`，回调 state 只存摘要且一次性使用。导入后的文档副本按 Praxis-RAG 知识库权限可见，与飞书原文档分享范围无关。
 - 知识库权限：每个知识库归创建者私有，VIP/管理员可通过邀请链接按「可读/可修改」和「单文件/多文件/全库」授权其他账号，被邀请人登录接受后生效；邀请有效期 `RAG_INVITATION_TTL_HOURS`（默认 168 小时）。VIP/普通用户自建知识库时模型连接克隆自 `RAG_DEFAULT_KB_TEMPLATE`（默认 `default`）指向的模板知识库，部署时应先由管理员创建该模板。详见 [权限管理](PERMISSIONS.md)。
 - 账号密码以 PBKDF2-SHA256（每账号独立盐）存于状态库；会话只保存 SHA-256 摘要，Cookie 为 HttpOnly + SameSite=Lax，写操作要求 CSRF Token。
 - `/v1/admin/*` 允许本机直连（loopback + 无代理头 + 同源 Origin）或管理员登录会话；`/v1/admin/api-keys` 是例外：任意已登录账号都可管理自己的 API Key（非管理员只能绑定本人创建的知识库），无会话时仍仅限本机直连。远程自动化仍建议使用 API Key/Service Token。

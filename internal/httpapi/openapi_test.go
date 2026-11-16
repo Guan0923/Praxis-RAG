@@ -43,8 +43,27 @@ func TestOpenAPIAndDocsRoutes(t *testing.T) {
 	if _, present := batches["post"]; !present {
 		t.Fatal("batch upload is missing from OpenAPI")
 	}
+	// Feishu document import: browsing/search/import plus the OAuth callback.
+	for _, path := range []string{
+		"/v1/feishu/status",
+		"/v1/feishu/oauth/start",
+		"/v1/feishu/oauth/callback",
+		"/v1/feishu/connection",
+		"/v1/feishu/files",
+		"/v1/feishu/search",
+		"/v1/feishu/import",
+	} {
+		if _, present := paths[path]; !present {
+			t.Fatalf("paths missing %s", path)
+		}
+	}
 	components, _ := document["components"].(map[string]any)
 	schemas, _ := components["schemas"].(map[string]any)
+	feishuBody, _ := schemas["FeishuImportBody"].(map[string]any)
+	feishuRequired, _ := feishuBody["required"].([]any)
+	if len(feishuRequired) != 1 || feishuRequired[0] != "documents" {
+		t.Fatalf("FeishuImportBody.required = %v", feishuBody["required"])
+	}
 	searchBody, _ := schemas["SearchBody"].(map[string]any)
 	searchProperties, _ := searchBody["properties"].(map[string]any)
 	rerank, _ := searchProperties["rerank"].(map[string]any)

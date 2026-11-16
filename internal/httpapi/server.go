@@ -104,6 +104,7 @@ type Server struct {
 	accountLimiter *rateLimiter
 	docNotifier    DocumentChangeNotifier
 	uploadEvents   *uploadEventHub
+	feishu         FeishuService
 	handler        http.Handler
 }
 
@@ -182,6 +183,7 @@ func (s *Server) registerRoutes() {
 	s.registerUserAuthRoutes()
 	s.registerProfileRoutes()
 	s.registerAccessRoutes()
+	s.registerFeishuRoutes()
 	s.router.add("POST", "/mcp", authMCP, s.handleMCP)
 	s.router.add("GET", "/mcp", authMCP, s.handleMCP)
 	s.router.add("DELETE", "/mcp", authMCP, s.handleMCP)

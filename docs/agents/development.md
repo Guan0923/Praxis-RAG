@@ -13,6 +13,7 @@
 | --- | --- |
 | 服务/监听 | `RAG_SERVICE_HOST`（默认 `127.0.0.1`）、`RAG_SERVICE_PORT`（`8011`）、`RAG_SERVICE_TOKEN`、`RAG_SERVICE_DATA_ROOT`、`RAG_WEB_ROOT`、`RAG_MCP_ALLOWED_HOSTS`、`RAG_MCP_ALLOWED_ORIGINS` |
 | 账号/上传 | `RAG_AUTH_ENABLED`（`true`）、`RAG_AUTH_REGISTRATION`（`open`）、`RAG_AUTH_SESSION_TTL_HOURS`（168）、`RAG_INVITATION_TTL_HOURS`（168） |
+| 飞书导入（可选） | `RAG_FEISHU_APP_ID`、`RAG_FEISHU_APP_SECRET`、`RAG_FEISHU_REDIRECT_URI`（三项必须同时配置或同时为空）、`RAG_FEISHU_API_BASE_URL`（`https://open.feishu.cn`）、`RAG_FEISHU_ACCOUNTS_BASE_URL`（`https://accounts.feishu.cn`）、`RAG_FEISHU_TIMEOUT_SECONDS`（20，1..300）；App Secret 只放环境变量，用户 token 加密入库，只导入 docx 纯文本 |
 | 状态库 | `RAG_STATE_URL` 或 `RAG_MYSQL_*`、`RAG_MYSQL_DATABASE`（`praxis_rag`）、`RAG_STATE_ENCRYPTION_KEY`、`RAG_STATE_AUTO_SCHEMA` |
 | 向量/检索 | `RAG_BACKEND`（服务必须设 `qdrant`）、`QDRANT_URL`、`RAG_COLLECTION`、`RAG_DENSE_VECTOR_SIZE`（1024）、`RAG_EMBEDDING_MODEL`、`RAG_RERANKER_*` |
 | Redis | `RAG_REDIS_URL`、`RAG_REDIS_ENABLED`、`RAG_REDIS_PREFIX`、`RAG_REDIS_TTL_SECONDS`（60，展示缓存）、`RAG_RESULT_TTL_SECONDS`（3600，**artifact 保留期**）、`RAG_RESULT_MAX_BYTES`、`RAG_ARTIFACT_MAX_BYTES` |
@@ -152,6 +153,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 - Kafka SASL/TLS 外部集群、MySQL 多实例并发/故障切换。
 - 分布式 Kafka Connect 双 worker/failover、FAILED task 自动重启、缓存消费者实链路、artifact 独立读取与同步搜索超时/取消、CDC 存量切换/回滚演练（见 `VALIDATION.md`）。
 - `rag-mcp-ingest` 未连接真实 Qdrant/模型 API 实跑。
+- 飞书导入未用真实飞书企业/账号联调：现有测试用 fake HTTP 服务覆盖 OAuth 换 token、刷新、文件夹/搜索/正文和错误映射；真实环境还需核对应用可用范围、用户可见的文件夹/搜索结果、权限变更后的重新授权，以及回调地址在反向代理后的 HTTPS 可达性（见 `VALIDATION.md`）。
 
 详细的验证边界见 `docs/USAGE.md` §10 与 `VALIDATION.md`。
 

@@ -37,6 +37,12 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 # vision-language endpoint. RAG_VLM_API_KEY belongs in the environment.
 # RAG_VLM_BASE_URL = 'https://llm.internal/v1'
 # RAG_VLM_MODEL = 'qwen2.5-vl-7b'
+
+# Optional Feishu (Lark) document import. The App Secret belongs in the
+# environment, not in this file. The redirect URI must be registered in the
+# Feishu developer console and reachable by users' browsers.
+# RAG_FEISHU_APP_ID = 'cli_xxx'
+# RAG_FEISHU_REDIRECT_URI = 'http://127.0.0.1:8011/v1/feishu/oauth/callback'
 `
 
 // observedKeys are the settings accepted inside [environment]. This mirrors
@@ -46,6 +52,9 @@ var observedKeys = []string{
 	"RAG_SERVICE_DATA_ROOT", "RAG_SERVICE_TOKEN", "RAG_MCP_ALLOWED_HOSTS",
 	"RAG_MCP_ALLOWED_ORIGINS", "RAG_AUTH_ENABLED", "RAG_AUTH_REGISTRATION",
 	"RAG_AUTH_SESSION_TTL_HOURS", "RAG_AUTH_COOKIE_SECURE",
+	"RAG_FEISHU_APP_ID", "RAG_FEISHU_REDIRECT_URI",
+	"RAG_FEISHU_API_BASE_URL", "RAG_FEISHU_ACCOUNTS_BASE_URL",
+	"RAG_FEISHU_TIMEOUT_SECONDS",
 	"QDRANT_URL", "QDRANT_PATH", "RAG_COLLECTION",
 	"RAG_STATE_URL", "RAG_MYSQL_HOST", "RAG_MYSQL_PORT", "RAG_MYSQL_USER",
 	"RAG_MYSQL_DATABASE", "RAG_MYSQL_SSL_CA", "RAG_STATE_POOL_SIZE",

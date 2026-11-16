@@ -91,6 +91,11 @@ type Stores struct {
 	DocumentJobs    *DocumentJobs
 	DocumentBatches *DocumentBatches
 
+	// FeishuConnections stores each Console account's Feishu OAuth grant;
+	// FeishuOAuthStates stores short-lived callback state digests.
+	FeishuConnections *FeishuConnectionRepository
+	FeishuOAuthStates *FeishuOAuthStateRepository
+
 	// Activity and Heartbeats are the Go-only monitoring data sources: hourly
 	// activity counters (every retrieval execution) and Worker liveness rows.
 	Activity   *ActivityCounters
@@ -209,6 +214,8 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	}
 	stores.DocumentJobs = documentJobs
 	stores.DocumentBatches = NewDocumentBatches(stores)
+	stores.FeishuConnections = NewFeishuConnectionRepository(stores, settings.EncryptionKey)
+	stores.FeishuOAuthStates = NewFeishuOAuthStateRepository(stores)
 	if _, err := DocumentQueueSettingsFromEnv(); err != nil {
 		uploads.Close()
 		_ = cacheSync.Close()

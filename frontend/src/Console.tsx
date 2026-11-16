@@ -92,6 +92,34 @@ export function Console({
 }) {
   const { message } = App.useApp();
   const [uploading, setUploading] = useState(false);
+  // Feishu OAuth returns to /console?feishu=...; report the outcome once and
+  // strip the query so a refresh does not repeat the notice.
+  const feishuNoticeShown = useRef(false);
+  useEffect(() => {
+    if (feishuNoticeShown.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get("feishu");
+    if (!outcome) return;
+    feishuNoticeShown.current = true;
+    const reason = params.get("feishu_reason") || "";
+    if (outcome === "connected") {
+      void message.success("飞书账号已连接，可以开始导入文档");
+    } else if (outcome === "denied") {
+      void message.warning("已取消飞书授权");
+    } else if (outcome === "login_required") {
+      void message.error("登录状态已失效，请重新登录后再连接飞书");
+    } else {
+      void message.error(feishuOAuthError(reason));
+    }
+    params.delete("feishu");
+    params.delete("feishu_reason");
+    const query = params.toString();
+    window.history.replaceState(
+      null,
+      "",
+      `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`,
+    );
+  }, [message]);
   const onNavigationBlocked = useCallback(() => {
     void message.warning("文档正在上传，请完成后再选择知识库");
   }, [message]);
@@ -737,4 +765,24 @@ export function Console({
       )}
     </div>
   );
+}
+
+// feishuOAuthError maps the callback's stable reason code to actionable text.
+function feishuOAuthError(reason: string): string {
+  switch (reason) {
+    case "state":
+      return "飞书授权校验已过期，请重新发起连接";
+    case "permission":
+      return "飞书授权缺少文档权限，请重新连接并同意全部权限";
+    case "reauth":
+      return "飞书账号授权失败，请重新连接";
+    case "config":
+      return "飞书应用配置有误，请联系管理员检查 App ID / Secret / 回调地址";
+    case "network":
+      return "连接飞书服务失败，请稍后重试";
+    case "disabled":
+      return "部署方尚未启用飞书导入";
+    default:
+      return "飞书授权失败，请重试";
+  }
 }

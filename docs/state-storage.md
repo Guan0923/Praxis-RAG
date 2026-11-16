@@ -123,6 +123,8 @@ migration CLI.
 | `user_avatars` | `user_id` | one profile image per account (`LONGBLOB`, ≤2 MiB); the users projection only joins its `updated_at` |
 | `email_verification_codes` | `id` | registration / e-mail-change codes: SHA-256 digest, purpose, attempts, expiry; issued codes invalidate older ones |
 | `app_settings` | `setting_key` | Console-editable settings; the `mail` row holds the SMTP configuration with its password protected as `enc:v1:` |
+| `feishu_connections` | `user_id` | **optional** per-account Feishu OAuth grant: open/union id, display name/avatar, `access_token`/`refresh_token` protected as `enc:v1:`, expiry and granted scope; the Feishu App Secret is never stored here |
+| `feishu_oauth_states` | `state_digest` (SHA-256) | **optional** one-time OAuth callback state bound to a Console account, 10-minute expiry, pruned on the next state creation; only the digest is stored |
 
 Identifier columns (`namespace`, document `name`, `digest`, blob `key`) use a
 binary collation in MySQL so `Alpha` and `alpha` do not collapse into one row.

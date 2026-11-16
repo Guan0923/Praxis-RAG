@@ -193,6 +193,36 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 
 角色分管理员（`admin`）、VIP（`vip`）和普通用户（`user`），只有管理员可以改角色。知识库默认归创建者私有，共享通过邀请链接完成：仅 VIP 与管理员可邀请（VIP 只能邀请自己创建的知识库，管理员可邀请任意知识库），权限分「可读 / 可修改」、范围分「单文件 / 多文件 / 全库」；被邀请人登录后接受邀请才生效。完整流程见 [权限管理](PERMISSIONS.md)。
 
+### 飞书文档导入
+
+Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账号且对当前知识库有整体写权限时显示）。点击后先连接用户自己的飞书账号，再按文件夹浏览或按标题搜索该账号有权限访问的飞书文档，勾选后一次导入当前知识库，单次最多 10 篇。该功能依赖 Console 登录会话（`RAG_AUTH_ENABLED=true`）；纯 API Key / Service Token 模式没有“用户本人”的飞书身份，因此不显示入口，直接调用接口会返回未登录。
+
+- **使用用户自己的权限**：浏览、搜索、读取正文都用当前 Console 账号的飞书 `user_access_token`；服务端不会用应用身份越权读取。`App ID` / `App Secret` 由部署方配置，普通用户只需点击授权。
+- **复用现有入库规则**：只取新版飞书文档（docx）的纯文本，复用普通上传的知识库写权限校验、SHA-256 去重、同名跳过和异步索引。`document_id` 只用于本次选择和读取，不建立长期映射。
+- **逐篇反馈**：读取失败不会中断其他文档；结果分为「已受理」「已跳过」「失败」。已受理只代表进入后台索引队列，**只有索引状态为 `succeeded` 后才可检索**。
+- **可见范围**：导入前会显示目标知识库名称。导入后文档副本属于该知识库，谁能检索由 Praxis-RAG 的知识库权限决定，与飞书原文档的分享范围无关。
+- **仅支持新版文档**：文件列表中的旧版飞书文档（`doc`）、表格、多维表格、思维笔记和附件会直接标记为暂不支持；快捷方式只在指向 docx 时按 docx 处理。搜索命中旧版或不支持的文档时，会在导入读取阶段作为该篇的失败原因返回，不影响其他文档。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RAG_FEISHU_APP_ID` | 空 | 飞书企业自建应用的 App ID；与 Secret、回调地址必须同时配置 |
+| `RAG_FEISHU_APP_SECRET` | 空 | 飞书应用 Secret；只由服务进程读取，不写入 MySQL、日志或浏览器 |
+| `RAG_FEISHU_REDIRECT_URI` | 空 | OAuth 回调地址，必须与飞书开放平台「安全设置 → 重定向 URL」完全一致，例如 `https://rag.example.com/v1/feishu/oauth/callback` |
+| `RAG_FEISHU_API_BASE_URL` | `https://open.feishu.cn` | 飞书 Open Platform API 地址（测试或私有化部署时可覆盖） |
+| `RAG_FEISHU_ACCOUNTS_BASE_URL` | `https://accounts.feishu.cn` | 飞书账号/OAuth 地址（测试或私有化部署时可覆盖） |
+| `RAG_FEISHU_TIMEOUT_SECONDS` | `20` | 单次飞书 API 调用超时（1..300 秒） |
+
+飞书应用需要申请 `drive:drive:readonly`、`docx:document:readonly` 和 `offline_access` 权限，并启用网页应用能力；同时要在「安全设置」中确认「刷新 user_access_token」开关已开启并发布应用，否则 refresh token 轮换会失败并要求用户重新授权。权限变更后，用户需要在 Console 重新连接飞书账号，使新 scope 生效。三项飞书配置全为空时功能禁用（Console 会说明原因）；只配置其中一部分会让服务启动失败，避免部署方误以为已启用。用户的 access/refresh token 与 API Key 一样以 `enc:v1:` 加密后存入 `feishu_connections`；`feishu_oauth_states` 只保存回调 state 的 SHA-256 摘要，且一次性使用。Console 的「断开连接」只删除本服务保存的授权，不会在飞书侧撤销已经发放的 token；如需彻底撤销，请同时在飞书账号的授权管理中移除该应用。当前 refresh token 的串行刷新锁在进程内；如果部署多个 `rag-service` 副本，应让同一 Console 账号的请求保持粘滞（或先按单副本运行），避免同一 refresh token 被不同实例并发轮换。
+
+首次上线建议用真实飞书账号做一遍联调（本仓库的自动化测试只使用 fake HTTP 服务，不能替代真实账号验证）：
+
+1. 用一个**普通成员**账号（不是管理员/应用所有者）在 Console 连接飞书，确认账号名正确。
+2. 浏览「我的空间」根目录，再进入至少一个子文件夹，核对列表是否只包含该成员本来就能看到的文件；旧版 doc、表格、附件应显示“暂不支持”。
+3. 搜索一个该成员确实有权限的文档标题，确认结果可勾选；再用一个无权访问的关键词确认搜不到。
+4. 勾选 1 篇 docx 导入，确认目标知识库名称和“可见范围由 Praxis-RAG 决定”的提示，然后核对结果逐篇状态与索引状态；`succeeded` 后在检索页确认可搜到。
+5. 在飞书开放平台新增一个权限并发布版本，回到 Console 重新连接，确认 `feishu_connections.scope` 更新、`status.needs_reauth` 变为 `false`。
+6. 让另一个没有该知识库权限的账号检索，确认看不到刚导入的副本。
+
 ### 检索、模型与解析配置
 
 | 变量 | 默认值 | 说明 |

@@ -87,6 +87,13 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "GET", Path: "/v1/documents/{name}", Summary: "Read document metadata", Tag: "documents", Response: "200"},
 	{Method: "DELETE", Path: "/v1/documents/{name}", Summary: "Delete a document", Tag: "documents", Response: "200"},
 	{Method: "GET", Path: "/v1/documents/{name}/content", Summary: "Download document content", Tag: "documents", Response: "200"},
+	{Method: "GET", Path: "/v1/feishu/status", Summary: "Read the account's Feishu connection status", Tag: "feishu", Response: "200"},
+	{Method: "POST", Path: "/v1/feishu/oauth/start", Summary: "Start one Feishu user authorization", Tag: "feishu", Response: "200"},
+	{Method: "GET", Path: "/v1/feishu/oauth/callback", Summary: "Complete the Feishu OAuth callback", Tag: "feishu", Query: []string{"code", "state", "error"}, Response: "302"},
+	{Method: "DELETE", Path: "/v1/feishu/connection", Summary: "Disconnect the account's Feishu authorization", Tag: "feishu", Response: "204"},
+	{Method: "GET", Path: "/v1/feishu/files", Summary: "List one Feishu folder level", Tag: "feishu", Query: []string{"folder_token", "page_token", "page_size"}, Response: "200"},
+	{Method: "GET", Path: "/v1/feishu/search", Summary: "Search the account's Feishu documents", Tag: "feishu", Query: []string{"q", "offset", "limit"}, Response: "200"},
+	{Method: "POST", Path: "/v1/feishu/import", Summary: "Import selected Feishu documents into the current knowledge base", Tag: "feishu", Request: "FeishuImportBody", Response: "202"},
 	{Method: "GET", Path: "/v1/knowledge-base", Summary: "Public knowledge-base settings", Tag: "knowledge-bases", Response: "200"},
 	{Method: "GET", Path: "/v1/namespaces", Summary: "List knowledge-base namespaces", Tag: "knowledge-bases", Response: "200"},
 	{Method: "GET", Path: "/v1/uploads", Summary: "List upload operations", Tag: "uploads", Response: "200"},
@@ -153,6 +160,25 @@ func openAPISchemas() map[string]any {
 			"required":             []any{"names"},
 			"properties": map[string]any{
 				"names": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "title": "Names"},
+			},
+		},
+		"FeishuImportBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"documents"},
+			"properties": map[string]any{
+				"documents": map[string]any{
+					"type": "array", "minItems": 1, "maxItems": 10, "title": "Documents",
+					"items": map[string]any{
+						"type":                 "object",
+						"additionalProperties": false,
+						"required":             []any{"document_id", "title"},
+						"properties": map[string]any{
+							"document_id": map[string]any{"type": "string", "minLength": 1, "maxLength": 128, "title": "Document Id"},
+							"title":       map[string]any{"type": "string", "minLength": 1, "maxLength": 200, "title": "Title"},
+						},
+					},
+				},
 			},
 		},
 		"AuthBody": map[string]any{

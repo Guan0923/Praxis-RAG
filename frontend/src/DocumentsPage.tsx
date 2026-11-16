@@ -16,6 +16,7 @@ import {
 } from "antd";
 import {
   CheckCircleOutlined,
+  CloudDownloadOutlined,
   CloseOutlined,
   DeleteOutlined,
   FileTextOutlined,
@@ -52,6 +53,7 @@ import {
   uploadFiles,
   uploadSummary,
 } from "./uploadBatches";
+import { FeishuImportModal } from "./FeishuImportModal";
 
 type Props = {
   connection: Connection;
@@ -81,6 +83,7 @@ export function DocumentsPage({
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [settingsError, setSettingsError] = useState("");
   const [open, setOpen] = useState(false);
+  const [feishuOpen, setFeishuOpen] = useState(false);
   const [files, setFiles] = useState<UploadFile[]>([]);
   const [uploadError, setUploadError] = useState("");
   const [bubbleOpen, setBubbleOpen] = useState(false);
@@ -454,6 +457,16 @@ export function DocumentsPage({
               onClick={() => void loadDocuments()}
             />
           </Tooltip>
+          {!readOnly && authEnabled && (
+            <Button
+              aria-label="从飞书导入"
+              icon={<CloudDownloadOutlined />}
+              disabled={!!deleting || busy}
+              onClick={() => setFeishuOpen(true)}
+            >
+              从飞书导入
+            </Button>
+          )}
           {!readOnly && (summary ? (
             <Popover
               trigger="click"
@@ -622,6 +635,17 @@ export function DocumentsPage({
           </div>
         </div>
       </Modal>
+      <FeishuImportModal
+        open={feishuOpen}
+        connection={connection}
+        knowledgeBase={knowledgeBase}
+        canWrite={Boolean(access?.scope.whole_write)}
+        onClose={() => setFeishuOpen(false)}
+        onImported={() => {
+          void loadDocuments();
+          void onHealth();
+        }}
+      />
     </>
   );
 }

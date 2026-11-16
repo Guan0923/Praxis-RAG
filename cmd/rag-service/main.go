@@ -20,6 +20,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/catalog"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/connect"
+	"github.com/Guan0923/xinghe_rag/internal/feishu"
 	"github.com/Guan0923/xinghe_rag/internal/httpapi"
 	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/mail"
@@ -63,6 +64,10 @@ func run() error {
 		return err
 	}
 	stateSettings, err := state.SettingsFromEnv(serviceSettings.DataRoot)
+	if err != nil {
+		return err
+	}
+	feishuSettings, err := config.FeishuSettingsFromEnv()
 	if err != nil {
 		return err
 	}
@@ -259,6 +264,13 @@ func run() error {
 	accessService := access.NewService(stores, access.Options{
 		InvitationTTL: serviceSettings.InvitationTTL,
 	})
+	// The optional Feishu integration stores one OAuth grant per Console account
+	// and calls Feishu with that account's user_access_token. It is disabled
+	// unless the deployment configured the app credentials and redirect URI.
+	feishuService := feishu.NewService(feishuSettings, stores.FeishuConnections, stores.FeishuOAuthStates)
+	if !feishuService.Enabled() {
+		logger.Info("Feishu document import is disabled: set RAG_FEISHU_APP_ID, RAG_FEISHU_APP_SECRET and RAG_FEISHU_REDIRECT_URI to enable it")
+	}
 	api := httpapi.New(serviceSettings, service, nil, logger,
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
@@ -275,6 +287,7 @@ func run() error {
 		httpapi.WithUserAuth(userAuth),
 		httpapi.WithAccountProfile(userAuth),
 		httpapi.WithMailAdmin(userAuth),
+		httpapi.WithFeishuService(feishuService),
 	)
 
 	address := net.JoinHostPort(serviceSettings.Host, strconv.Itoa(serviceSettings.Port))
