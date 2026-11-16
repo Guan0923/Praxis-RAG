@@ -54,3 +54,25 @@ func TestMonitorPipelineCache(t *testing.T) {
 		}
 	})
 }
+
+// TestMonitorUnconfiguredQdrantIsDisabled pins the empty-URL behavior: without a
+// configured Qdrant endpoint the dependency is disabled instead of probing the
+// qdrant client's localhost default, which would make CI depend on a local
+// Qdrant instance.
+func TestMonitorUnconfiguredQdrantIsDisabled(t *testing.T) {
+	overview := New(pipelineTestOptions(sampleStats())).MonitorOverview(context.Background())
+	dependencies, ok := overview["dependencies"].([]dependency)
+	if !ok {
+		t.Fatalf("dependencies has type %T", overview["dependencies"])
+	}
+	for _, dependency := range dependencies {
+		if dependency.Name != "qdrant" {
+			continue
+		}
+		if dependency.Status != statusDisabled {
+			t.Fatalf("unconfigured qdrant status = %q, want disabled", dependency.Status)
+		}
+		return
+	}
+	t.Fatal("qdrant dependency row is missing")
+}

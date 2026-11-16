@@ -38,6 +38,8 @@ pytest-of-*/
 # Local agent/dev scratch space (env helper, design notes, Go build cache).
 /.dev/
 /.gocache/
+/.agents/
+/.npm-cache/
 
 # Go build output and local test scratch space.
 /bin/

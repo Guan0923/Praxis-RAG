@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"net"
 	"regexp"
 	"strconv"
@@ -175,7 +176,7 @@ func newAccountTestService(t *testing.T) *accountTestFixture {
 	}
 	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
-	mailService := mail.NewService(stores.AppSettings)
+	mailService := mail.NewService(stores.AppSettings, key)
 	host, portText, err := net.SplitHostPort(smtp.address)
 	if err != nil {
 		t.Fatalf("splitting fake SMTP address: %v", err)
@@ -527,6 +528,15 @@ func TestMailSettingsAndTestMail(t *testing.T) {
 		"SELECT setting_value FROM app_settings WHERE setting_key = ?", "mail").Scan(&raw); err != nil {
 		t.Fatalf("reading stored mail settings: %v", err)
 	}
+	var storedMail struct {
+		Password string `json:"password"`
+	}
+	if err := json.Unmarshal([]byte(raw), &storedMail); err != nil {
+		t.Fatalf("stored mail settings are not JSON: %v", err)
+	}
+	if !strings.HasPrefix(storedMail.Password, state.EncryptionPrefix) {
+		t.Fatalf("stored mail password is not enc:v1 protected: %s", storedMail.Password)
+	}
 	if strings.Contains(raw, "smtp-secret") {
 		t.Fatalf("stored mail settings contain the plaintext password: %s", raw)
 	}
@@ -563,7 +573,7 @@ func TestUnconfiguredMailKeepsLegacyRegistration(t *testing.T) {
 	}
 	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
-	mailService := mail.NewService(stores.AppSettings)
+	mailService := mail.NewService(stores.AppSettings, key)
 	service := NewService(stores.Users, stores.Sessions, Options{
 		RegistrationEnabled: true,
 		SessionTTL:          time.Hour,

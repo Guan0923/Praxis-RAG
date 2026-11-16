@@ -255,7 +255,7 @@ func run() error {
 		SessionTTL:          serviceSettings.SessionTTL,
 		// The mail server is configured from the Console and stored in
 		// app_settings; without it e-mail verification stays disabled.
-		Mail:    mail.NewService(stores.AppSettings),
+		Mail:    mail.NewService(stores.AppSettings, stores.Settings.EncryptionKey),
 		Codes:   stores.EmailCodes,
 		Avatars: stores.Avatars,
 	})

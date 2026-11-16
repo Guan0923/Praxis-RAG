@@ -199,7 +199,7 @@ func rawChangeEvent(t *testing.T, table, op string, before, after map[string]any
 		payload["before"] = before
 		payload["after"] = nil
 	default:
-		payload["before"] = nil
+		payload["before"] = before
 		payload["after"] = after
 	}
 	encoded, err := json.Marshal(payload)

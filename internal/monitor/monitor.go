@@ -1047,6 +1047,9 @@ func (s *Service) probeRedis(ctx context.Context) probeResult {
 // were healthy. A knowledge base without documents has no collection yet, so
 // only collections that actually hold indexed documents are required.
 func (s *Service) probeQdrant(ctx context.Context) probeResult {
+	if strings.TrimSpace(s.options.QdrantURL) == "" {
+		return probeResult{status: statusDisabled, detail: "未配置 Qdrant"}
+	}
 	client := qdrant.NewClient(s.options.QdrantURL, "", s.httpClient)
 	var collections struct {
 		Collections []struct {

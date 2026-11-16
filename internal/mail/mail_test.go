@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net"
 	"strconv"
@@ -11,6 +12,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/xinghe_rag/internal/statetest"
 )
 
 // fakeStore is an in-memory SettingsStore.
@@ -84,7 +88,7 @@ func TestSaveAcceptsPartialSettingsWhileDisabled(t *testing.T) {
 
 func TestPublicNeverLeaksPassword(t *testing.T) {
 	store := newFakeStore()
-	service := NewService(store)
+	service := NewService(store, statetest.TestEncryptionKey)
 	settings := validSettings()
 	settings.Username = "bot@example.com"
 	settings.Password = "smtp-secret"
@@ -92,6 +96,13 @@ func TestPublicNeverLeaksPassword(t *testing.T) {
 		t.Fatalf("Save() error = %v", err)
 	}
 	raw := store.values[settingsKey]
+	var stored storedSettings
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		t.Fatalf("stored settings are not JSON: %v", err)
+	}
+	if !strings.HasPrefix(stored.Password, state.EncryptionPrefix) {
+		t.Fatalf("stored password is not enc:v1 protected: %s", stored.Password)
+	}
 	if strings.Contains(raw, "smtp-secret") {
 		t.Fatalf("stored settings contain the plaintext password: %s", raw)
 	}
@@ -118,7 +129,7 @@ func TestPublicNeverLeaksPassword(t *testing.T) {
 }
 
 func TestSaveWithoutPasswordKeepsStoredOne(t *testing.T) {
-	service := NewService(newFakeStore())
+	service := NewService(newFakeStore(), statetest.TestEncryptionKey)
 	ctx := context.Background()
 	settings := validSettings()
 	settings.Password = "smtp-secret"

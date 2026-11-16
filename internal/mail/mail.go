@@ -128,11 +128,22 @@ type storedSettings struct {
 }
 
 // Service reads, validates and uses the SMTP configuration.
-type Service struct{ store SettingsStore }
+type Service struct {
+	store         SettingsStore
+	encryptionKey string
+}
 
-// NewService builds the mail service. A nil store keeps every method inert so a
-// deployment without the state layer does not panic.
-func NewService(store SettingsStore) *Service { return &Service{store: store} }
+// NewService builds the mail service. The optional encryption key should be the
+// resolved state key; an empty key keeps the legacy state.Protect fallback (the
+// environment key, then the platform legacy format). A nil store keeps every
+// method inert so a deployment without the state layer does not panic.
+func NewService(store SettingsStore, encryptionKey ...string) *Service {
+	key := ""
+	if len(encryptionKey) > 0 {
+		key = encryptionKey[0]
+	}
+	return &Service{store: store, encryptionKey: key}
+}
 
 // loadStored reads the raw stored row, keeping the protected password value.
 func (s *Service) loadStored(ctx context.Context) (storedSettings, bool, error) {
@@ -163,7 +174,7 @@ func (s *Service) Load(ctx context.Context) (Settings, error) {
 	if !found {
 		return Settings{}.normalized(), nil
 	}
-	password, err := state.Unprotect(stored.Password, "")
+	password, err := state.Unprotect(stored.Password, s.encryptionKey)
 	if err != nil {
 		return Settings{}, fmt.Errorf("邮件服务器密码无法解密：%w", err)
 	}
@@ -196,7 +207,7 @@ func (s *Service) Save(ctx context.Context, settings Settings) error {
 		stored = storedSettings{}
 	}
 	if normalized.Password != "" {
-		protected, protectErr := state.Protect(normalized.Password, "")
+		protected, protectErr := state.Protect(normalized.Password, s.encryptionKey)
 		if protectErr != nil {
 			return fmt.Errorf("邮件服务器密码无法加密：%w", protectErr)
 		}
