@@ -65,6 +65,12 @@ func (f *fakeServiceRuntime) ListDocumentBatches(context.Context, string, string
 	return nil, &apierrors.KnowledgeError{Message: "document batches are not available in this test runtime"}
 }
 
+// WriteDocument satisfies the synchronous document write surface for
+// search-only fakes.
+func (f *fakeServiceRuntime) WriteDocument(context.Context, string, string, []byte, bool, string) (map[string]any, error) {
+	return nil, &apierrors.KnowledgeError{Message: "document writes are not available in this test runtime"}
+}
+
 func newRuntimeServer(t *testing.T, runtime Runtime) *Server {
 	t.Helper()
 	return New(testSettings("test-token"), nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), WithRuntime(runtime))

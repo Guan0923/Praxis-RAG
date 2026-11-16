@@ -168,6 +168,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/document-batches/upload-events/{upload_id}", authTenant, s.handleUploadEvents)
 	s.router.add("GET", "/v1/document-batches/{batch_id}", authTenant, s.handleDocumentBatchStatus)
 	s.router.add("GET", "/v1/documents/{name}/content", authTenant, s.handleDocumentContent)
+	s.router.add("POST", "/v1/documents/{name}/replace", authTenant, s.handleReplaceDocument)
 	s.router.add("DELETE", "/v1/documents/{name}", authTenant, s.handleDeleteDocument)
 	s.router.add("GET", "/v1/knowledge-base", authTenant, s.handleKnowledgeBase)
 	s.router.add("GET", "/v1/namespaces", authTenantList, s.handleNamespaceList)

@@ -137,6 +137,9 @@ export function Console({
     token: auth?.auth_enabled ? "" : token,
   }), [namespace, token, auth]);
   const [revision, setRevision] = useState(0);
+  // documentRevision refreshes an already-opened document preview after a
+  // replacement, without remounting the whole workspace page.
+  const [documentRevision, setDocumentRevision] = useState(0);
   const [health, setHealth] = useState<Health>();
   const [healthError, setHealthError] = useState("");
   const [checking, setChecking] = useState(false);
@@ -658,6 +661,7 @@ export function Console({
                   active={view === "documents" && documentName === undefined}
                   authEnabled={sessionMode}
                   onOpenDocument={(name) => navigate({ namespace, page: "documents", documentName: name })}
+                  onDocumentReplaced={() => setDocumentRevision((value) => value + 1)}
                   uploading={uploading}
                   onUploading={setUploading}
                   onHealth={refreshHealth}
@@ -676,7 +680,7 @@ export function Console({
                     <h1>{documentName}</h1>
                   </div>
                   <DocumentPreview
-                    key={`${revision}:${documentName}`}
+                    key={`${revision}:${documentRevision}:${documentName}`}
                     name={documentName}
                     connection={connection}
                   />

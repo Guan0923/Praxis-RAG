@@ -75,6 +75,12 @@ func (a HTTPRuntime) Delete(ctx context.Context, namespace, name string) (map[st
 	return a.Service.Delete(ctx, namespace, name)
 }
 
+// WriteDocument implements httpapi.DocumentRuntime: the Console replace
+// endpoint reuses the synchronous MCP update_document write path.
+func (a HTTPRuntime) WriteDocument(ctx context.Context, namespace, name string, content []byte, overwrite bool, idempotencyKey string) (map[string]any, error) {
+	return a.Service.WriteDocument(ctx, namespace, name, content, overwrite, idempotencyKey)
+}
+
 // CheckDocuments implements httpapi.DocumentRuntime.
 func (a HTTPRuntime) CheckDocuments(ctx context.Context, namespace string, files []httpapi.CheckFile) (map[string]any, error) {
 	converted := make([]runtime.CheckFile, 0, len(files))

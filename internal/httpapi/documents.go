@@ -49,6 +49,10 @@ type DocumentRuntime interface {
 	// ListDocumentBatches lists the caller's unfinished batches.
 	ListDocumentBatches(ctx context.Context, namespace, viewer string, limit int) (map[string]any, error)
 	Delete(ctx context.Context, namespace, name string) (map[string]any, error)
+	// WriteDocument synchronously creates or replaces one document and rebuilds
+	// its index. The Console replace endpoint passes overwrite=true so the
+	// existing document keeps its name while its content changes.
+	WriteDocument(ctx context.Context, namespace, name string, content []byte, overwrite bool, idempotencyKey string) (map[string]any, error)
 	CheckDocuments(ctx context.Context, namespace string, files []CheckFile) (map[string]any, error)
 	ReadDocument(ctx context.Context, namespace, name string) (text string, version string, err error)
 	ReadDocumentFile(ctx context.Context, namespace, name string) ([]byte, error)
@@ -263,6 +267,125 @@ func (s *Server) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 		s.docNotifier.DocumentsChanged(namespace, before, payloadDocuments(payload))
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+// handleReplaceDocument replaces one existing document's file content while
+// keeping its document name. The uploaded file may carry a different filename
+// as long as its type (suffix) matches the target document. The write path is
+// the same synchronous one MCP update_document uses, so the caller sees the
+// rebuilt index in the response and the document keeps one record and one name.
+func (s *Server) handleReplaceDocument(w http.ResponseWriter, r *http.Request) {
+	namespace, ok := s.tenantNamespace(w, r)
+	if !ok {
+		return
+	}
+	// Only the target document's writer may replace it; a file-level grant for
+	// this exact name is enough, and a grant for another file is refused.
+	name := pathParam(r, "name")
+	if !s.requireScopeWriteDocument(w, r, name) {
+		return
+	}
+	if s.runtime == nil {
+		writeDetail(w, http.StatusServiceUnavailable, "RAG service runtime is not available")
+		return
+	}
+	targetSuffix := strings.ToLower(filepath.Ext(name))
+	if !supportedExtension(targetSuffix) {
+		writeDetail(w, http.StatusBadRequest, unsupportedFileTypeMessage(name))
+		return
+	}
+	file, problem := readReplacementFile(r)
+	if problem != nil {
+		writeUploadProblem(w, problem)
+		return
+	}
+	uploadSuffix := strings.ToLower(filepath.Ext(file.Name))
+	if !supportedExtension(uploadSuffix) {
+		writeDetail(w, http.StatusBadRequest, unsupportedFileTypeMessage(file.Name))
+		return
+	}
+	if uploadSuffix != targetSuffix {
+		writeDetail(w, http.StatusBadRequest,
+			"替换文件的类型必须与原文档一致：原文档为 "+targetSuffix+"，新文件为 "+uploadSuffix+"。")
+		return
+	}
+	var before []map[string]any
+	if s.docNotifier != nil {
+		before, _ = s.runtime.ListDocuments(r.Context(), namespace)
+	}
+	payload, err := s.runtime.WriteDocument(r.Context(), namespace, name, file.Content, true, "")
+	if err != nil {
+		var validation *apierrors.KnowledgeValidationError
+		if errors.As(err, &validation) {
+			const missingPrefix = "Document does not exist: "
+			if strings.HasPrefix(validation.Message, missingPrefix) {
+				writeDetail(w, http.StatusNotFound,
+					"知识文件不存在："+strings.TrimPrefix(validation.Message, missingPrefix))
+				return
+			}
+			writeDetail(w, http.StatusBadRequest, validation.Message)
+			return
+		}
+		writeRuntimeError(w, err, false)
+		return
+	}
+	if s.docNotifier != nil {
+		s.docNotifier.DocumentsChanged(namespace, before, payloadDocuments(payload))
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, payload)
+}
+
+// readReplacementFile reads exactly one multipart file part named "file" and
+// bounds it like a regular upload. Progress events do not apply: the Console
+// only needs one explicit replacement submission.
+func readReplacementFile(r *http.Request) (UploadFile, *uploadProblem) {
+	reader, err := r.MultipartReader()
+	if err != nil {
+		return UploadFile{}, &uploadProblem{status: http.StatusBadRequest, detail: "There was an error parsing the body"}
+	}
+	var file UploadFile
+	for {
+		part, nextErr := reader.NextPart()
+		if errors.Is(nextErr, io.EOF) {
+			break
+		}
+		if nextErr != nil {
+			return UploadFile{}, &uploadProblem{status: http.StatusBadRequest, detail: "There was an error parsing the body"}
+		}
+		field := part.FormName()
+		filename := part.FileName()
+		if field != "file" || filename == "" {
+			_ = part.Close()
+			return UploadFile{}, &uploadProblem{
+				status: http.StatusBadRequest, detail: "替换仅接受一个文件字段 file",
+			}
+		}
+		if file.Name != "" {
+			_ = part.Close()
+			return UploadFile{}, &uploadProblem{
+				status: http.StatusBadRequest, detail: "替换一次只能上传一个文件",
+			}
+		}
+		content, readErr := io.ReadAll(io.LimitReader(part, MaxFileBytes+1))
+		_ = part.Close()
+		if readErr != nil {
+			return UploadFile{}, &uploadProblem{status: http.StatusBadRequest, detail: "Could not read the uploaded file"}
+		}
+		if len(content) > MaxFileBytes {
+			return UploadFile{}, &uploadProblem{
+				status: http.StatusBadRequest, detail: "单个知识文件不能超过 10 MiB：" + filename,
+			}
+		}
+		if len(content) == 0 {
+			return UploadFile{}, &uploadProblem{status: http.StatusBadRequest, detail: "替换文件不能为空"}
+		}
+		file = UploadFile{Name: filename, Content: content}
+	}
+	if file.Name == "" {
+		return UploadFile{}, &uploadProblem{status: http.StatusBadRequest, detail: "请选择要替换的文件"}
+	}
+	return file, nil
 }
 
 // payloadDocuments extracts the post-write document list from a runtime

@@ -85,6 +85,7 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "GET", Path: "/v1/document-batches/{batch_id}", Summary: "Read one document batch with per-file progress", Tag: "documents", Response: "200"},
 	{Method: "GET", Path: "/v1/document-batches/upload-events/{upload_id}", Summary: "Stream one upload's file progress and per-file save results (SSE)", Tag: "documents", Response: "200"},
 	{Method: "GET", Path: "/v1/documents/{name}", Summary: "Read document metadata", Tag: "documents", Response: "200"},
+	{Method: "POST", Path: "/v1/documents/{name}/replace", Summary: "Replace one document file and rebuild its index", Tag: "documents", Response: "200", Multipart: true, MultipartField: "file", RequestBody: true},
 	{Method: "DELETE", Path: "/v1/documents/{name}", Summary: "Delete a document", Tag: "documents", Response: "200"},
 	{Method: "GET", Path: "/v1/documents/{name}/content", Summary: "Download document content", Tag: "documents", Response: "200"},
 	{Method: "GET", Path: "/v1/feishu/status", Summary: "Read the account's Feishu connection status", Tag: "feishu", Response: "200"},

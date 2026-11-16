@@ -7,6 +7,7 @@ import {
   Modal,
   Popover,
   Progress,
+  Spin,
   Table,
   Tag,
   Tooltip,
@@ -23,6 +24,7 @@ import {
   InboxOutlined,
   LoadingOutlined,
   ReloadOutlined,
+  SwapOutlined,
   UploadOutlined,
 } from "@ant-design/icons";
 import {
@@ -54,12 +56,19 @@ import {
   uploadSummary,
 } from "./uploadBatches";
 import { FeishuImportModal } from "./FeishuImportModal";
+import {
+  canReplaceDocument,
+  documentExtension,
+  replaceDocument,
+  replaceFileError,
+} from "./documentReplace";
 
 type Props = {
   connection: Connection;
   active: boolean;
   authEnabled: boolean;
   onOpenDocument: (name: string) => void;
+  onDocumentReplaced?: (name: string) => void;
   uploading: boolean;
   onUploading: (busy: boolean) => void;
   onHealth: () => Promise<void>;
@@ -70,6 +79,7 @@ export function DocumentsPage({
   active,
   authEnabled,
   onOpenDocument,
+  onDocumentReplaced,
   uploading,
   onUploading,
   onHealth,
@@ -88,6 +98,10 @@ export function DocumentsPage({
   const [uploadError, setUploadError] = useState("");
   const [bubbleOpen, setBubbleOpen] = useState(false);
   const [deleting, setDeleting] = useState<string>();
+  const [replaceTarget, setReplaceTarget] = useState<DocumentInfo>();
+  const [replaceFiles, setReplaceFiles] = useState<UploadFile[]>([]);
+  const [replaceError, setReplaceError] = useState("");
+  const [replacing, setReplacing] = useState<string>();
   const lifetime = useRef(new AbortController());
   const listRequest = useRef<AbortController | null>(null);
   const listSequence = useRef(0);
@@ -276,6 +290,68 @@ export function DocumentsPage({
       },
     });
   }
+  // openReplaceModal starts one explicit replacement. Nothing is replaced until
+  // the user selects a file and confirms in the dialog.
+  function openReplaceModal(document: DocumentInfo) {
+    if (mutation.current || busy || replacing) return;
+    setReplaceTarget(document);
+    setReplaceFiles([]);
+    setReplaceError("");
+  }
+
+  function closeReplaceModal() {
+    if (replacing) return;
+    setReplaceTarget(undefined);
+    setReplaceFiles([]);
+    setReplaceError("");
+  }
+
+  function startReplace() {
+    const target = replaceTarget;
+    if (!target || mutation.current || replacing) return;
+    const selected = replaceFiles[0]?.originFileObj;
+    const problem = replaceFileError(
+      target.name,
+      selected ? { name: selected.name, size: selected.size ?? 0 } : undefined,
+    );
+    if (problem) {
+      setReplaceError(problem);
+      return;
+    }
+    if (!selected) {
+      setReplaceError("请选择要替换的文件");
+      return;
+    }
+    setReplaceError("");
+    setReplacing(target.name);
+    mutation.current = true;
+    void (async () => {
+      try {
+        const result = await replaceDocument(
+          target.name,
+          selected,
+          connection,
+          lifetime.current.signal,
+        );
+        if (lifetime.current.signal.aborted) return;
+        void message.success(
+          result.status === "unchanged"
+            ? `${target.name} 内容未变化，已保留原文档`
+            : `已替换 ${target.name}`,
+        );
+        setReplaceTarget(undefined);
+        setReplaceFiles([]);
+        await loadDocuments();
+        onDocumentReplaced?.(target.name);
+      } catch (error) {
+        if (!lifetime.current.signal.aborted) setReplaceError(errorText(error));
+      } finally {
+        mutation.current = false;
+        if (!lifetime.current.signal.aborted) setReplacing(undefined);
+      }
+    })();
+  }
+
   // uploadSummary derives the chip label and failure colour from the store;
   // null means no batch has ever been started in this tab.
   const summary = uploadSummary(batches);
@@ -369,10 +445,16 @@ export function DocumentsPage({
     </div>
   );
 
-  // Only whole-knowledge-base writers get upload/delete controls. File-level
-  // writers can still replace authorized documents through the API, but the
-  // Console keeps them read-only (matching the server-side restriction).
-  const readOnly = Boolean(authEnabled && access && (!access.can_write || !access.scope.whole_write));
+  // Whole-knowledge-base writers get upload/delete/Feishu import; a file-level
+  // write grant still permits replacing that one document, so the replace action
+  // is decided per row instead of by the whole-knowledge-base rule.
+  const wholeWrite = !authEnabled || !access || access.scope.whole_write;
+  const anyWrite = !authEnabled || !access || access.can_write
+    || access.scope.whole_write || access.scope.write_documents.length > 0;
+  const fileWriteOnly = Boolean(
+    authEnabled && access && !access.scope.whole_write
+      && access.scope.write_documents.length > 0,
+  );
   const documentColumns: TableColumnsType<DocumentInfo> = [
     {
       title: "文档",
@@ -420,24 +502,44 @@ export function DocumentsPage({
       ),
     },
   ];
-  if (!readOnly) {
+  if (wholeWrite || fileWriteOnly) {
     documentColumns.push({
       title: "操作",
       key: "actions",
-      width: 64,
-      render: (_, doc) => (
-        <Tooltip title="删除文档">
-          <Button
-            type="text"
-            danger
-            aria-label={`删除 ${doc.name}`}
-            icon={<DeleteOutlined />}
-            disabled={busy || !!deleting}
-            loading={deleting === doc.name}
-            onClick={() => removeDocument(doc)}
-          />
-        </Tooltip>
-      ),
+      width: 92,
+      render: (_, doc) => {
+        const replaceable = canReplaceDocument(access, authEnabled, doc.name);
+        if (!replaceable && !wholeWrite) return null;
+        return (
+          <div className="document-actions">
+            {replaceable && (
+              <Tooltip title="替换文件">
+                <Button
+                  type="text"
+                  aria-label={`替换 ${doc.name}`}
+                  icon={<SwapOutlined />}
+                  disabled={busy || !!deleting || !!replacing}
+                  loading={replacing === doc.name}
+                  onClick={() => openReplaceModal(doc)}
+                />
+              </Tooltip>
+            )}
+            {wholeWrite && (
+              <Tooltip title="删除文档">
+                <Button
+                  type="text"
+                  danger
+                  aria-label={`删除 ${doc.name}`}
+                  icon={<DeleteOutlined />}
+                  disabled={busy || !!deleting || !!replacing}
+                  loading={deleting === doc.name}
+                  onClick={() => removeDocument(doc)}
+                />
+              </Tooltip>
+            )}
+          </div>
+        );
+      },
     });
   }
 
@@ -446,7 +548,8 @@ export function DocumentsPage({
       <div className="page-heading">
         <div className="page-heading-title">
           <h1>知识文档</h1>
-          {readOnly && <Tag color="orange">只读</Tag>}
+          {!anyWrite && <Tag color="orange">只读</Tag>}
+          {fileWriteOnly && <Tag color="blue">文件级写入</Tag>}
         </div>
         <div className="toolbar">
           <Tooltip title="刷新文档">
@@ -457,7 +560,7 @@ export function DocumentsPage({
               onClick={() => void loadDocuments()}
             />
           </Tooltip>
-          {!readOnly && authEnabled && (
+          {wholeWrite && authEnabled && (
             <Button
               aria-label="从飞书导入"
               icon={<CloudDownloadOutlined />}
@@ -467,7 +570,7 @@ export function DocumentsPage({
               从飞书导入
             </Button>
           )}
-          {!readOnly && (summary ? (
+          {wholeWrite && (summary ? (
             <Popover
               trigger="click"
               placement="bottomRight"
@@ -501,13 +604,22 @@ export function DocumentsPage({
           ))}
         </div>
       </div>
-      {readOnly && (
+      {!anyWrite && (
         <Alert
           className="page-alert"
           type="info"
           showIcon
           title="只读知识库"
-          description="你对该知识库没有整体写入权限，上传与删除入口已隐藏；文件列表由服务端按授权范围过滤。"
+          description="你对该知识库没有写入权限，上传、替换与删除入口已隐藏；文件列表由服务端按授权范围过滤。"
+        />
+      )}
+      {fileWriteOnly && (
+        <Alert
+          className="page-alert"
+          type="info"
+          showIcon
+          title="文件级写入"
+          description="你只被授权修改部分文档：可对相应文档执行「替换文件」；上传、删除与飞书导入需要全库写权限。"
         />
       )}
       <div className="section-heading">
@@ -631,6 +743,87 @@ export function DocumentsPage({
                 title="上传失败"
                 description={uploadError}
               />
+            )}
+          </div>
+        </div>
+      </Modal>
+      <Modal
+        title="替换文件"
+        className="knowledge-replace-modal"
+        open={!!replaceTarget}
+        width={560}
+        mask={{ closable: !replacing }}
+        closable={!replacing}
+        onCancel={closeReplaceModal}
+        footer={
+          <>
+            <Button aria-label="取消替换" onClick={closeReplaceModal} disabled={!!replacing}>
+              取消
+            </Button>
+            <Button
+              aria-label="确认替换"
+              type="primary"
+              icon={<SwapOutlined />}
+              loading={!!replacing}
+              disabled={!replaceFiles.length || !!replacing}
+              onClick={startReplace}
+            >
+              确认替换
+            </Button>
+          </>
+        }
+      >
+        <div className="replace-dialog">
+          <p className="secondary replace-hint">
+            替换后文档保留原名，预览与检索使用新版内容。新文件可以使用不同的文件名，类型须与原文档一致。
+          </p>
+          <div className="replace-original">
+            <span className="secondary">原文档</span>
+            <div className="break-text">
+              <FileTextOutlined /> {replaceTarget?.name}
+            </div>
+          </div>
+          <Upload.Dragger
+            accept={replaceTarget ? documentExtension(replaceTarget.name) : undefined}
+            beforeUpload={() => false}
+            fileList={replaceFiles}
+            maxCount={1}
+            showUploadList={false}
+            disabled={!!replacing}
+            onChange={({ fileList }) => {
+              setReplaceFiles(fileList.slice(-1));
+              setReplaceError("");
+            }}
+          >
+            <p className="upload-icon">
+              <InboxOutlined />
+            </p>
+            <p>选择新版文件</p>
+            <p className="secondary">
+              可改名，类型须保持 {replaceTarget ? documentExtension(replaceTarget.name) : ""} · 单文件 10 MiB
+            </p>
+          </Upload.Dragger>
+          {replaceFiles[0] && (
+            <div className="replace-summary" aria-label="替换确认">
+              <div>
+                <span className="secondary">原文档：</span>
+                <span className="break-text">{replaceTarget?.name}</span>
+              </div>
+              <div>
+                <span className="secondary">新文件：</span>
+                <span className="break-text">{replaceFiles[0].name}</span>
+                <span className="secondary">（{formatBytes(replaceFiles[0].size ?? 0)}）</span>
+              </div>
+            </div>
+          )}
+          {replacing && (
+            <div className="replace-status" role="status">
+              <Spin size="small" /> 正在替换并重建索引，请稍候…
+            </div>
+          )}
+          <div aria-live="polite">
+            {replaceError && (
+              <Alert type="error" showIcon title="替换失败" description={replaceError} />
             )}
           </div>
         </div>

@@ -43,6 +43,11 @@ func TestOpenAPIAndDocsRoutes(t *testing.T) {
 	if _, present := batches["post"]; !present {
 		t.Fatal("batch upload is missing from OpenAPI")
 	}
+	replace, _ := paths["/v1/documents/{name}/replace"].(map[string]any)
+	replacePost, _ := replace["post"].(map[string]any)
+	if _, present := replacePost["requestBody"]; !present {
+		t.Fatal("document replace request body is missing from OpenAPI")
+	}
 	// Feishu document import: browsing/search/import plus the OAuth callback.
 	for _, path := range []string{
 		"/v1/feishu/status",

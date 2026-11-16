@@ -344,6 +344,53 @@ h3 {
   font-weight: 500;
   margin-bottom: 2px;
 }
+.document-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  white-space: nowrap;
+}
+.knowledge-replace-modal .ant-modal-body {
+  padding-top: 8px;
+}
+.replace-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.replace-dialog > * {
+  min-width: 0;
+}
+.replace-hint {
+  margin: 0;
+}
+.replace-original {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--sidebar);
+}
+.replace-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.replace-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+.replace-dialog .ant-alert-description {
+  max-height: 180px;
+  overflow-y: auto;
+}
 .document-heading {
   flex-wrap: nowrap;
   align-items: flex-start;

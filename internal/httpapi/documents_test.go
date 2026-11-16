@@ -41,6 +41,13 @@ type fakeDocRuntime struct {
 	batchViewer  string
 	batchLimit   int
 	batches      []map[string]any
+
+	writeName      string
+	writeContent   []byte
+	writeOverwrite bool
+	writeKey       string
+	writePayload   map[string]any
+	writeErr       error
 }
 
 func newFakeDocRuntime() *fakeDocRuntime {
@@ -73,6 +80,25 @@ func (f *fakeDocRuntime) GetDocumentStatus(_ context.Context, _ string, artifact
 
 func (f *fakeDocRuntime) Delete(context.Context, string, string) (map[string]any, error) {
 	return f.deletePayload, f.deleteErr
+}
+
+// WriteDocument records the synchronous replace request for assertions.
+func (f *fakeDocRuntime) WriteDocument(_ context.Context, _, name string, content []byte, overwrite bool, idempotencyKey string) (map[string]any, error) {
+	f.writeName = name
+	f.writeContent = append([]byte(nil), content...)
+	f.writeOverwrite = overwrite
+	f.writeKey = idempotencyKey
+	if f.writeErr != nil {
+		return nil, f.writeErr
+	}
+	if f.writePayload != nil {
+		return f.writePayload, nil
+	}
+	return map[string]any{
+		"status":    "updated",
+		"document":  map[string]any{"name": name},
+		"documents": []any{map[string]any{"name": name}},
+	}, nil
 }
 
 // SubmitDocumentBatch records the batch request for assertions.

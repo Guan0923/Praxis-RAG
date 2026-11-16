@@ -17,7 +17,7 @@
 - 上传前可用 `POST /v1/documents/check` 做同名/SHA-256 预检；`Idempotency-Key` 支持重试复用原批次及其文件任务。
 - **批次上传（Console 使用）**：`POST /v1/document-batches` 先提交 `document_batches` + `document_batch_items`（每项 `saving`），再按文件名加锁并行受理每个文件（不同名互不排队，默认 6 路），最后把每项结果与计数写回并返回 `202`。`GET /v1/document-batches/{batch_id}` 同时给出保存结果（`accepted`/`skipped`/`failed` + 原因）与已受理文件的 `job.status/stage`；`GET /v1/document-batches?limit=20` 只返回仍有未完成工作的批次，供 Console 刷新后恢复进度气泡。批次只是进度元数据，不保存文件字节，7 天后清理。Console 上传面板为每个文件一行独立进度条并先订阅 SSE（`ready` 后发 POST）：`progress.received` 是请求体累计接收的内容字节数（前端按本地 `File.size` 换算百分比），每文件 `result`（`saved`/`skipped`/`failed`）落地即结束该行；面板在保存结果处结束，不再展示或轮询解析阶段（解析阶段仍由批次状态接口的 `items[].job.status/stage` 暴露）。
 - 任务状态：`queued` → `processing`（带 `stage`）→ `succeeded` / `failed`；`stage` 依次为 `parsing`、`chunking`、`staging`、`embedding`、`indexing`、`publishing`、`completed`/`failed`。只有 `succeeded` 表示已持久发布、可检索。
-- 冲突规则：同名文档已存在、或已有同名排队/执行中的新增，会被拒绝；`add_document` 不覆盖同名文档，替换用 `update_document`。
+- 冲突规则：同名文档已存在、或已有同名排队/执行中的新增，会被拒绝；`add_document` 不覆盖同名文档，替换用 `update_document`。Console 的「替换文件」调用同步 `POST /v1/documents/{name}/replace`（multipart 字段 `file`）：校验目标文档写权限（全库或单文件授权）、新文件类型与原文档一致，然后复用 `WriteDocument(overwrite=true)` 的替换与重建索引逻辑，保留原名；普通上传规则不变。
 - 失败重试：同进程内指数退避（默认最多 5 次），仍是“至少一次”投递；耗尽后进入显式 DLQ topic，由 `rag-dead-letter-worker` 落终态。崩溃恢复：任务租约 + 心跳 + 上传 journal 对账，重复投递靠幂等吸收。
 - 上传/切分参数来自知识库配置，**不接受请求级覆盖**。
 

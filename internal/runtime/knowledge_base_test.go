@@ -65,7 +65,9 @@ func kbModelHandler(sizes map[string]int) func(path string, body map[string]any)
 
 // fakeKBQdrant models the collection lifecycle used by reembed_into: exists,
 // create, scroll, upsert, delete. Source collections are registered by the
-// test; staging collections only exist after a create request.
+// test; staging collections only exist after a create request. The latest
+// staged points are served by points/query so an upload-and-search test can
+// observe the content that was actually indexed.
 type fakeKBQdrant struct {
 	mu         sync.Mutex
 	requests   []recordedHTTP
@@ -73,6 +75,7 @@ type fakeKBQdrant struct {
 	sources    map[string]bool
 	scroll     string
 	failUpsert bool
+	staged     []map[string]any
 }
 
 func (f *fakeKBQdrant) all() []recordedHTTP {
@@ -138,7 +141,34 @@ func newFakeKBQdrant(t *testing.T, scrollJSON string) (*fakeKBQdrant, string) {
 				_, _ = writer.Write([]byte(`{"status":{"error":"upsert failed"}}`))
 				return
 			}
+			// Remember the last staged version so points/query can return the
+			// chunks this upload actually indexed.
+			if points, ok := recorded.Body["points"].([]any); ok {
+				staged := make([]map[string]any, 0, len(points))
+				for _, item := range points {
+					if point, ok := item.(map[string]any); ok {
+						staged = append(staged, point)
+					}
+				}
+				fake.mu.Lock()
+				fake.staged = staged
+				fake.mu.Unlock()
+			}
 			_, _ = writer.Write([]byte(`{"result":{"status":"completed"}}`))
+		case strings.HasSuffix(path, "/points/query"):
+			fake.mu.Lock()
+			staged := make([]map[string]any, 0, len(fake.staged))
+			for index, point := range fake.staged {
+				scored := make(map[string]any, len(point)+1)
+				for key, value := range point {
+					scored[key] = value
+				}
+				scored["score"] = 1.0 - float64(index)*0.01
+				staged = append(staged, scored)
+			}
+			fake.mu.Unlock()
+			encoded, _ := json.Marshal(map[string]any{"result": map[string]any{"points": staged}})
+			_, _ = writer.Write(encoded)
 		case request.Method == http.MethodDelete:
 			name := collectionFromPath(path)
 			fake.mu.Lock()
