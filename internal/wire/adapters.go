@@ -314,38 +314,38 @@ func (a HTTPRuntime) PurgeKnowledgeBases(ctx context.Context, namespaces []strin
 }
 
 // ListModelProfiles implements httpapi.ModelProfileRuntime.
-func (a HTTPRuntime) ListModelProfiles(ctx context.Context) ([]map[string]any, error) {
-	return a.Service.ListModelProfiles(ctx)
+func (a HTTPRuntime) ListModelProfiles(ctx context.Context, viewerUserID string, isAdmin bool) ([]map[string]any, error) {
+	return a.Service.ListModelProfiles(ctx, viewerUserID, isAdmin)
 }
 
 // ModelProfile implements httpapi.ModelProfileRuntime.
-func (a HTTPRuntime) ModelProfile(ctx context.Context, id string) (map[string]any, error) {
-	return a.Service.ModelProfile(ctx, id)
+func (a HTTPRuntime) ModelProfile(ctx context.Context, viewerUserID string, isAdmin bool, id string) (map[string]any, error) {
+	return a.Service.ModelProfile(ctx, viewerUserID, isAdmin, id)
 }
 
 // CreateModelProfile implements httpapi.ModelProfileRuntime.
-func (a HTTPRuntime) CreateModelProfile(ctx context.Context, input httpapi.ModelProfileInput) (map[string]any, error) {
-	return a.Service.CreateModelProfile(ctx, modelProfileDraft(input))
+func (a HTTPRuntime) CreateModelProfile(ctx context.Context, viewerUserID string, isAdmin bool, input httpapi.ModelProfileInput) (map[string]any, error) {
+	return a.Service.CreateModelProfile(ctx, viewerUserID, isAdmin, modelProfileDraft(input))
 }
 
 // UpdateModelProfile implements httpapi.ModelProfileRuntime.
-func (a HTTPRuntime) UpdateModelProfile(ctx context.Context, id string, input httpapi.ModelProfileInput) (map[string]any, error) {
-	return a.Service.UpdateModelProfile(ctx, id, modelProfileDraft(input))
+func (a HTTPRuntime) UpdateModelProfile(ctx context.Context, viewerUserID string, isAdmin bool, id string, input httpapi.ModelProfileInput) (map[string]any, error) {
+	return a.Service.UpdateModelProfile(ctx, viewerUserID, isAdmin, id, modelProfileDraft(input))
 }
 
 // DeleteModelProfile implements httpapi.ModelProfileRuntime.
-func (a HTTPRuntime) DeleteModelProfile(ctx context.Context, id string) (bool, error) {
-	return a.Service.DeleteModelProfile(ctx, id)
+func (a HTTPRuntime) DeleteModelProfile(ctx context.Context, viewerUserID string, isAdmin bool, id string) (bool, error) {
+	return a.Service.DeleteModelProfile(ctx, viewerUserID, isAdmin, id)
 }
 
 // ModelProfileKey implements httpapi.ModelProfileRuntime.
-func (a HTTPRuntime) ModelProfileKey(ctx context.Context, id string) (string, error) {
-	return a.Service.ModelProfileKey(ctx, id)
+func (a HTTPRuntime) ModelProfileKey(ctx context.Context, viewerUserID string, isAdmin bool, id string) (string, error) {
+	return a.Service.ModelProfileKey(ctx, viewerUserID, isAdmin, id)
 }
 
 // ModelProfileModels implements httpapi.ModelProfileRuntime.
-func (a HTTPRuntime) ModelProfileModels(ctx context.Context, id string) ([]string, error) {
-	return a.Service.ModelProfileModels(ctx, id)
+func (a HTTPRuntime) ModelProfileModels(ctx context.Context, viewerUserID string, isAdmin bool, id string) ([]string, error) {
+	return a.Service.ModelProfileModels(ctx, viewerUserID, isAdmin, id)
 }
 
 // modelProfileDraft converts the transport-neutral input to the runtime draft.

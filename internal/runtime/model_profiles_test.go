@@ -16,6 +16,10 @@ import (
 
 var modelProfileIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
+// testProfileOwner is the account that owns every profile a test creates, so the
+// owner-scoped reads behave like the Console's session-scoped calls.
+const testProfileOwner = "user-1"
+
 // modelProfileDraft builds one provider draft for the fake model API.
 func modelProfileDraft(kind, name, modelURL, model, apiKey string) kbconfig.ModelProfileDraft {
 	return kbconfig.ModelProfileDraft{
@@ -29,7 +33,7 @@ func TestModelProfileLifecycle(t *testing.T) {
 	service, stores := newKBService(t, "http://127.0.0.1:1")
 	ctx := context.Background()
 
-	empty, err := service.ListModelProfiles(ctx)
+	empty, err := service.ListModelProfiles(ctx, testProfileOwner, false)
 	if err != nil {
 		t.Fatalf("ListModelProfiles() error = %v", err)
 	}
@@ -37,7 +41,7 @@ func TestModelProfileLifecycle(t *testing.T) {
 		t.Fatalf("initial list = %v, want an empty slice", empty)
 	}
 
-	embedding, err := service.CreateModelProfile(ctx, modelProfileDraft(
+	embedding, err := service.CreateModelProfile(ctx, testProfileOwner, false, modelProfileDraft(
 		"embedding", "bge-m3", modelURL, "embed-a", "private-key"))
 	if err != nil {
 		t.Fatalf("CreateModelProfile(embedding) error = %v", err)
@@ -77,7 +81,7 @@ func TestModelProfileLifecycle(t *testing.T) {
 		t.Fatalf("embedding probe = %+v", embeddingProbes[0])
 	}
 	// Every list/details projection never exposes credentials.
-	listed, err := service.ListModelProfiles(ctx)
+	listed, err := service.ListModelProfiles(ctx, testProfileOwner, false)
 	if err != nil || len(listed) != 1 {
 		t.Fatalf("list after create = %v, %v", listed, err)
 	}
@@ -87,7 +91,7 @@ func TestModelProfileLifecycle(t *testing.T) {
 	}
 
 	// A reranker profile probes accessibility and stores no dimension.
-	reranker, err := service.CreateModelProfile(ctx, modelProfileDraft(
+	reranker, err := service.CreateModelProfile(ctx, testProfileOwner, false, modelProfileDraft(
 		"reranker", "bge-reranker", modelURL, "rank-a", "rerank-key"))
 	if err != nil {
 		t.Fatalf("CreateModelProfile(reranker) error = %v", err)
@@ -103,7 +107,7 @@ func TestModelProfileLifecycle(t *testing.T) {
 
 	// A VLM profile is stored without any provider probe.
 	providerCallsBefore := len(calls.all())
-	vlm, err := service.CreateModelProfile(ctx, modelProfileDraft(
+	vlm, err := service.CreateModelProfile(ctx, testProfileOwner, false, modelProfileDraft(
 		"vlm", "qwen-vl", modelURL, "qwen2.5-vl-7b", ""))
 	if err != nil {
 		t.Fatalf("CreateModelProfile(vlm) error = %v", err)
@@ -116,7 +120,7 @@ func TestModelProfileLifecycle(t *testing.T) {
 	}
 
 	// List order is kind then display name.
-	listed, err = service.ListModelProfiles(ctx)
+	listed, err = service.ListModelProfiles(ctx, testProfileOwner, false)
 	if err != nil || len(listed) != 3 {
 		t.Fatalf("ListModelProfiles() = %v, %v", listed, err)
 	}
@@ -127,16 +131,16 @@ func TestModelProfileLifecycle(t *testing.T) {
 		}
 	}
 
-	key, err := service.ModelProfileKey(ctx, embeddingID)
+	key, err := service.ModelProfileKey(ctx, testProfileOwner, false, embeddingID)
 	if err != nil || key != "private-key" {
 		t.Fatalf("ModelProfileKey(embedding) = %q, %v", key, err)
 	}
-	if key, err := service.ModelProfileKey(ctx, rerankerID); err != nil || key != "rerank-key" {
+	if key, err := service.ModelProfileKey(ctx, testProfileOwner, false, rerankerID); err != nil || key != "rerank-key" {
 		t.Fatalf("ModelProfileKey(reranker) = %q, %v", key, err)
 	}
 
 	// Provider models are listed through the stored connection (key reused).
-	models, err := service.ModelProfileModels(ctx, embeddingID)
+	models, err := service.ModelProfileModels(ctx, testProfileOwner, false, embeddingID)
 	if err != nil {
 		t.Fatalf("ModelProfileModels() error = %v", err)
 	}
@@ -148,14 +152,14 @@ func TestModelProfileLifecycle(t *testing.T) {
 		t.Fatalf("models request = %+v", modelCalls)
 	}
 
-	detail, err := service.ModelProfile(ctx, embeddingID)
+	detail, err := service.ModelProfile(ctx, testProfileOwner, false, embeddingID)
 	if err != nil || detail["id"] != embeddingID || detail["name"] != "bge-m3" {
 		t.Fatalf("ModelProfile() = %v, %v", detail, err)
 	}
 
 	// Renaming keeps the provider configuration and does not probe again.
 	probesBeforeRename := calls.count(http.MethodPost, "/embeddings")
-	renamed, err := service.UpdateModelProfile(ctx, embeddingID, kbconfig.ModelProfileDraft{Name: "bge-m3-renamed"})
+	renamed, err := service.UpdateModelProfile(ctx, testProfileOwner, false, embeddingID, kbconfig.ModelProfileDraft{Name: "bge-m3-renamed"})
 	if err != nil {
 		t.Fatalf("UpdateModelProfile(rename) error = %v", err)
 	}
@@ -169,7 +173,7 @@ func TestModelProfileLifecycle(t *testing.T) {
 
 	// Changing the model probes again and records the new dimension.
 	probesBeforeModel := calls.count(http.MethodPost, "/embeddings")
-	updated, err := service.UpdateModelProfile(ctx, embeddingID, kbconfig.ModelProfileDraft{Model: "embed-b"})
+	updated, err := service.UpdateModelProfile(ctx, testProfileOwner, false, embeddingID, kbconfig.ModelProfileDraft{Model: "embed-b"})
 	if err != nil {
 		t.Fatalf("UpdateModelProfile(model) error = %v", err)
 	}
@@ -182,7 +186,7 @@ func TestModelProfileLifecycle(t *testing.T) {
 
 	// A key-only change probes too (the stored credential changed).
 	probesBeforeKey := calls.count(http.MethodPost, "/embeddings")
-	if _, err := service.UpdateModelProfile(ctx, embeddingID, kbconfig.ModelProfileDraft{
+	if _, err := service.UpdateModelProfile(ctx, testProfileOwner, false, embeddingID, kbconfig.ModelProfileDraft{
 		APIKey: "rotated-key", HasAPIKey: true,
 	}); err != nil {
 		t.Fatalf("UpdateModelProfile(key) error = %v", err)
@@ -190,18 +194,18 @@ func TestModelProfileLifecycle(t *testing.T) {
 	if calls.count(http.MethodPost, "/embeddings") != probesBeforeKey+1 {
 		t.Fatal("key change did not probe the embedding provider")
 	}
-	if key, err := service.ModelProfileKey(ctx, embeddingID); err != nil || key != "rotated-key" {
+	if key, err := service.ModelProfileKey(ctx, testProfileOwner, false, embeddingID); err != nil || key != "rotated-key" {
 		t.Fatalf("rotated key = %q, %v", key, err)
 	}
 
-	deleted, err := service.DeleteModelProfile(ctx, embeddingID)
+	deleted, err := service.DeleteModelProfile(ctx, testProfileOwner, false, embeddingID)
 	if err != nil || !deleted {
 		t.Fatalf("DeleteModelProfile() = %v, %v", deleted, err)
 	}
-	if deleted, err := service.DeleteModelProfile(ctx, embeddingID); err != nil || deleted {
+	if deleted, err := service.DeleteModelProfile(ctx, testProfileOwner, false, embeddingID); err != nil || deleted {
 		t.Fatalf("second DeleteModelProfile() = %v, %v", deleted, err)
 	}
-	if remaining, err := service.ListModelProfiles(ctx); err != nil || len(remaining) != 2 {
+	if remaining, err := service.ListModelProfiles(ctx, testProfileOwner, false); err != nil || len(remaining) != 2 {
 		t.Fatalf("list after delete = %v, %v", remaining, err)
 	}
 }
@@ -211,7 +215,7 @@ func TestModelProfileErrorMapping(t *testing.T) {
 	service, stores := newKBService(t, "http://127.0.0.1:1")
 	ctx := context.Background()
 
-	created, err := service.CreateModelProfile(ctx, modelProfileDraft(
+	created, err := service.CreateModelProfile(ctx, testProfileOwner, false, modelProfileDraft(
 		"embedding", "bge-m3", modelURL, "embed-a", "private-key"))
 	if err != nil {
 		t.Fatalf("CreateModelProfile() error = %v", err)
@@ -219,7 +223,7 @@ func TestModelProfileErrorMapping(t *testing.T) {
 	profileID, _ := created["id"].(string)
 
 	// Duplicate (kind, name) is an HTTP 409 conflict.
-	_, err = service.CreateModelProfile(ctx, modelProfileDraft(
+	_, err = service.CreateModelProfile(ctx, testProfileOwner, false, modelProfileDraft(
 		"embedding", "bge-m3", modelURL, "embed-a", "private-key"))
 	var conflict *apierrors.KnowledgeConflictError
 	if !errors.As(err, &conflict) || conflict.Message != kbconfig.MessageModelProfileExists {
@@ -227,14 +231,14 @@ func TestModelProfileErrorMapping(t *testing.T) {
 	}
 
 	// Invalid kind and missing service URL are validation errors.
-	_, err = service.CreateModelProfile(ctx, kbconfig.ModelProfileDraft{
+	_, err = service.CreateModelProfile(ctx, testProfileOwner, false, kbconfig.ModelProfileDraft{
 		Kind: "sql", Name: "x", BaseURL: modelURL, Model: "m",
 	})
 	var validation *apierrors.KnowledgeValidationError
 	if !errors.As(err, &validation) || validation.Message != kbconfig.MessageModelKindInvalid {
 		t.Fatalf("invalid kind error = %v", err)
 	}
-	_, err = service.CreateModelProfile(ctx, kbconfig.ModelProfileDraft{
+	_, err = service.CreateModelProfile(ctx, testProfileOwner, false, kbconfig.ModelProfileDraft{
 		Kind: "embedding", Name: "no-url", Model: "m",
 	})
 	if !errors.As(err, &validation) || validation.Message != kbconfig.MessageModelServiceURLRequired {
@@ -245,19 +249,19 @@ func TestModelProfileErrorMapping(t *testing.T) {
 	failingURL, _ := newFakeModelAPI(t, func(string, map[string]any) (int, string) {
 		return http.StatusUnauthorized, `{"detail":"private upstream error"}`
 	})
-	before, _ := service.ListModelProfiles(ctx)
-	if _, err := service.CreateModelProfile(ctx, modelProfileDraft(
+	before, _ := service.ListModelProfiles(ctx, testProfileOwner, false)
+	if _, err := service.CreateModelProfile(ctx, testProfileOwner, false, modelProfileDraft(
 		"embedding", "failing", failingURL, "embed-a", "bad-key")); err == nil {
 		t.Fatal("failing provider was accepted")
 	} else if !errors.As(err, &validation) || validation.Message != "HTTP 401：认证失败，请检查 apikey" {
 		t.Fatalf("provider error = %v", err)
 	}
-	if after, _ := service.ListModelProfiles(ctx); len(after) != len(before) {
+	if after, _ := service.ListModelProfiles(ctx, testProfileOwner, false); len(after) != len(before) {
 		t.Fatalf("failed create persisted a row: %v", after)
 	}
 
 	// A failed update leaves the stored configuration untouched.
-	if _, err := service.UpdateModelProfile(ctx, profileID, kbconfig.ModelProfileDraft{
+	if _, err := service.UpdateModelProfile(ctx, testProfileOwner, false, profileID, kbconfig.ModelProfileDraft{
 		BaseURL: failingURL, Model: "embed-a",
 	}); err == nil {
 		t.Fatal("failing provider update was accepted")
@@ -273,19 +277,19 @@ func TestModelProfileErrorMapping(t *testing.T) {
 	missingID := "0123456789abcdef0123456789abcdef"
 	missingCalls := map[string]func() error{
 		"ModelProfile": func() error {
-			_, err := service.ModelProfile(ctx, missingID)
+			_, err := service.ModelProfile(ctx, testProfileOwner, false, missingID)
 			return err
 		},
 		"UpdateModelProfile": func() error {
-			_, err := service.UpdateModelProfile(ctx, missingID, kbconfig.ModelProfileDraft{Name: "x"})
+			_, err := service.UpdateModelProfile(ctx, testProfileOwner, false, missingID, kbconfig.ModelProfileDraft{Name: "x"})
 			return err
 		},
 		"ModelProfileKey": func() error {
-			_, err := service.ModelProfileKey(ctx, missingID)
+			_, err := service.ModelProfileKey(ctx, testProfileOwner, false, missingID)
 			return err
 		},
 		"ModelProfileModels": func() error {
-			_, err := service.ModelProfileModels(ctx, missingID)
+			_, err := service.ModelProfileModels(ctx, testProfileOwner, false, missingID)
 			return err
 		},
 	}
@@ -296,7 +300,7 @@ func TestModelProfileErrorMapping(t *testing.T) {
 			t.Fatalf("%s(missing) error = %v", name, err)
 		}
 	}
-	if deleted, err := service.DeleteModelProfile(ctx, missingID); err != nil || deleted {
+	if deleted, err := service.DeleteModelProfile(ctx, testProfileOwner, false, missingID); err != nil || deleted {
 		t.Fatalf("DeleteModelProfile(missing) = %v, %v", deleted, err)
 	}
 }
@@ -310,7 +314,7 @@ func TestModelProfileJEVConfiguration(t *testing.T) {
 	service, stores := newKBService(t, "http://127.0.0.1:1")
 	ctx := context.Background()
 
-	created, err := service.CreateModelProfile(ctx, modelProfileDraft(
+	created, err := service.CreateModelProfile(ctx, testProfileOwner, false, modelProfileDraft(
 		"jev", "system-one", modelURL, "jev-latest", "jev-key"))
 	if err != nil {
 		t.Fatalf("CreateModelProfile(jev) error = %v", err)
@@ -341,13 +345,13 @@ func TestModelProfileJEVConfiguration(t *testing.T) {
 		strings.Contains(stored.ProtectedKey, "jev-key") {
 		t.Fatalf("stored protected_key = %q", stored.ProtectedKey)
 	}
-	if key, err := service.ModelProfileKey(ctx, id); err != nil || key != "jev-key" {
+	if key, err := service.ModelProfileKey(ctx, testProfileOwner, false, id); err != nil || key != "jev-key" {
 		t.Fatalf("ModelProfileKey(jev) = %q, %v", key, err)
 	}
 
 	// JEV has no OpenAI-compatible /models route: the listing is empty and the
 	// provider is never contacted.
-	models, err := service.ModelProfileModels(ctx, id)
+	models, err := service.ModelProfileModels(ctx, testProfileOwner, false, id)
 	if err != nil {
 		t.Fatalf("ModelProfileModels(jev) error = %v", err)
 	}
@@ -359,7 +363,7 @@ func TestModelProfileJEVConfiguration(t *testing.T) {
 	}
 
 	// Renaming keeps the stored connection and still never probes.
-	if _, err := service.UpdateModelProfile(ctx, id, kbconfig.ModelProfileDraft{Name: "system-one-renamed"}); err != nil {
+	if _, err := service.UpdateModelProfile(ctx, testProfileOwner, false, id, kbconfig.ModelProfileDraft{Name: "system-one-renamed"}); err != nil {
 		t.Fatalf("UpdateModelProfile(jev rename) error = %v", err)
 	}
 	if len(calls.all()) != 0 {

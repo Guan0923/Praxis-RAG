@@ -806,10 +806,13 @@ func TestCreateKnowledgeBaseForUser(t *testing.T) {
 		selfCreate.input.Chunking.ChunkSize != 256 || selfCreate.input.Chunking.ChunkOverlap != 32 {
 		t.Fatalf("input = %+v", selfCreate.input)
 	}
-	// Provider fields from the admin form are ignored on the tenant route.
-	if selfCreate.input.EmbeddingModel != "" || len(selfCreate.input.EmbeddingValues) != 0 ||
-		len(selfCreate.input.RerankerValues) != 0 || len(selfCreate.input.VLMValues) != 0 {
-		t.Fatalf("provider fields leaked: %+v", selfCreate.input)
+	// Provider fields are per-account: a normal account's explicit selection IS
+	// honored now (it can only resolve its own profiles through the owner-only
+	// /v1/model-profiles/{id}/key route), while isAdmin stays false so the
+	// runtime never falls back to the administrator template.
+	if selfCreate.input.EmbeddingModel != "ignored-model" ||
+		selfCreate.input.EmbeddingValues["base_url"] != "http://ignored" {
+		t.Fatalf("provider selection dropped: %+v", selfCreate.input)
 	}
 
 	adminCreate := performRequest(handler, testRequest{
@@ -817,9 +820,9 @@ func TestCreateKnowledgeBaseForUser(t *testing.T) {
 		headers: mergeHeaders(sessionHeaders("admin-token", ""), map[string]string{"Content-Type": "application/json"}),
 		body:    `{"namespace":"adminkb"}`,
 	})
-	// An administrator using the simplified tenant form also gets the template
-	// clone, owned by their own account.
-	if adminCreate.Code != http.StatusCreated || selfCreate.isAdmin || selfCreate.ownerUserID != "u-admin" {
+	// An administrator using the simplified tenant form keeps the administrator
+	// template fallback (isAdmin=true), owned by their own account.
+	if adminCreate.Code != http.StatusCreated || !selfCreate.isAdmin || selfCreate.ownerUserID != "u-admin" {
 		t.Fatalf("admin create status = %d isAdmin = %v owner = %q", adminCreate.Code, selfCreate.isAdmin, selfCreate.ownerUserID)
 	}
 

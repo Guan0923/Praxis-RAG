@@ -135,7 +135,7 @@ func TestModelProfileRepositoryDuplicateNameConflict(t *testing.T) {
 	ctx := context.Background()
 	repository := stores.ModelProfiles
 
-	first := ModelProfile{Kind: "embedding", Name: "shared", BaseURL: "http://a.local/v1", Model: "embed-a"}
+	first := ModelProfile{Kind: "embedding", Name: "shared", BaseURL: "http://a.local/v1", Model: "embed-a", OwnerUserID: "user-a"}
 	if _, err := repository.Create(ctx, first); err != nil {
 		t.Fatalf("Create(first) error = %v", err)
 	}
@@ -147,14 +147,20 @@ func TestModelProfileRepositoryDuplicateNameConflict(t *testing.T) {
 			t.Fatalf("duplicate error = %v, want StateConflict", err)
 		}
 	}
+	// 隔离的核心保证：两个账号可以各自保存同名同 kind 的配置。
+	neighbour := ModelProfile{Kind: "embedding", Name: "shared", BaseURL: "http://c.local/v1", Model: "embed-c", OwnerUserID: "user-b"}
+	if _, err := repository.Create(ctx, neighbour); err != nil {
+		t.Fatalf("Create(same name, other owner) error = %v", err)
+	}
+
 	// The same display name is allowed for a different kind.
-	other := ModelProfile{Kind: "reranker", Name: "shared", BaseURL: "http://a.local/v1", Model: "rank-a"}
+	other := ModelProfile{Kind: "reranker", Name: "shared", BaseURL: "http://a.local/v1", Model: "rank-a", OwnerUserID: "user-a"}
 	if _, err := repository.Create(ctx, other); err != nil {
 		t.Fatalf("Create(other kind) error = %v", err)
 	}
 
 	// Renaming a profile onto another profile's (kind, name) is a conflict too.
-	second := ModelProfile{Kind: "embedding", Name: "renamed", BaseURL: "http://b.local/v1", Model: "embed-b"}
+	second := ModelProfile{Kind: "embedding", Name: "renamed", BaseURL: "http://b.local/v1", Model: "embed-b", OwnerUserID: "user-a"}
 	created, err := repository.Create(ctx, second)
 	if err != nil {
 		t.Fatalf("Create(second) error = %v", err)

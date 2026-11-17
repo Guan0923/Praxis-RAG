@@ -37,10 +37,13 @@ func (s *Service) ListKnowledgeBases(ctx context.Context) ([]map[string]any, err
 	return items, nil
 }
 
-// messageDefaultKBTemplateMissing is the fixed HTTP 409 detail returned when a
-// tenant self-create runs without an administrator-configured default
-// knowledge-base template (DESIGN §2).
 const messageDefaultKBTemplateMissing = "管理员尚未配置默认知识库模板，请联系管理员创建知识库"
+
+// messageModelSelectionRequired is the fixed HTTP 409 detail returned when a
+// non-administrator self-create carries no provider selection. Credentials are
+// per-account now: the account must add (or pick) its own model configuration
+// instead of inheriting the administrator's template.
+const messageModelSelectionRequired = "请先在「模型配置」页添加并选择 Embedding 模型后重试"
 
 // CreateKnowledgeBase validates and persists one new knowledge base, probing the
 // embedding (and optional reranker) provider for connectivity and vector size.
@@ -75,11 +78,16 @@ func (s *Service) CreateKnowledgeBaseForUser(
 	input kbconfig.CreateInput,
 ) (map[string]any, error) {
 	prober := kbconfig.Prober(kbconfig.HTTPProber{Timeout: modelapi.DefaultTimeout})
-	if !isAdmin || !providerInputConfigured(input) {
+	if !providerInputConfigured(input) {
 		// Validate the request before touching the template so an invalid
 		// namespace is reported as a normal validation failure.
 		if err := s.validateKnowledgeBaseCreate(ctx, input.Namespace); err != nil {
 			return nil, err
+		}
+		if !isAdmin {
+			// Model configurations are per-account: a normal account must select
+			// its own provider instead of inheriting the administrator template.
+			return nil, &apierrors.KnowledgeConflictError{Message: messageModelSelectionRequired}
 		}
 		cloned, templateProber, err := s.cloneDefaultKnowledgeBase(ctx, input)
 		if err != nil {
