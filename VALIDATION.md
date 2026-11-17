@@ -152,8 +152,21 @@ python deploy/k8s/tests/verify_manifests.py   # checks=546 failures=0
 
 - kind 集群内的扩缩容按钮端到端（需要重建集群；RBAC/patch 形状已由 verify_manifests.py
   与 k8sops 单测覆盖，kubectl scale 等价性见 README §8.1）。
-- 真实 Kafka Connect 集群上的「重启连接器」按钮端到端（见上；宿主机栈为遗留 Debezium
-  Server，不提供 Connect REST）。
+
+### 追加实测（2026-11-17 晚，合并到 main 并重启全栈后）
+
+合并到 main（`5b82b77`）后重建 `dist/`（build-go.ps1 冒烟通过）并重启全栈，
+补上了此前「未验证」的最后一项：
+
+- **重启连接器（真实 Kafka Connect 集群）**：`POST /actions/connectors/praxis-cache-cdc/restart`
+  返回 200 `{"restarted":true}`；4~10 秒后 connector 与 task 均回到 `RUNNING`
+  （重启期间与之后 `praxis-document-cdc` 另一路保持 RUNNING 不受影响）。
+- **立即重投（重启后回归）**：`{"requeued":0}`（当前无卡死任务，符合预期）。
+- 清理了验收残留：删除了 Connect 集群里遗留的 `praxis-accept-*` 两个连接器
+  （会重复采集 binlog 的「旧版本内容」）与两个遗留 Debezium Server 容器
+  （占用 8083/8084 端口，阻塞真正的 Connect worker 启动）。
+- openapi 契约表补登四个操作端点（`227534e`），`/docs` 与 `/openapi.json`
+  现已包含完整监控操作面。
 
 ## 当前验证范围：搜索同步化（MCP/REST 一次调用直返证据）— 2026-11-13
 
