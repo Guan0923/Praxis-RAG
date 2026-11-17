@@ -1,0 +1,15 @@
+# Runtime dependencies for the Praxis-RAG Docling parsing microservice.
+#
+# Only the formats this service accepts are installed: DOCX and static HTML.
+# The convert-core extra brings the local conversion helpers; format-docx /
+# format-html bring the python-docx and BeautifulSoup backends. No layout model,
+# OCR model, torch or docling-ibm-models is installed: this service never parses
+# PDFs, so the image is a fraction of a full Docling pipeline image.
+#
+# The version is pinned because both the manifest mapping and the tests were
+# validated against exactly this release. Changing it requires re-running the
+# service contract tests with real DOCX/HTML samples.
+docling-slim[convert-core,format-docx,format-html]==2.150.1
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9

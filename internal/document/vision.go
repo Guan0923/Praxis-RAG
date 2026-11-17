@@ -117,11 +117,13 @@ func ValidateVisionDescription(text string) error {
 
 // MissingPictureCaptions returns the manifest ids of pictures without a
 // document caption; they need the remote vision model (or stay as placeholders
-// when no model is configured).
+// when no model is configured). Pictures without image bytes (for example an
+// external HTML image the Docling service intentionally did not fetch) are not
+// listed: the vision model has nothing to describe.
 func MissingPictureCaptions(manifest WordManifest) []string {
 	missing := make([]string, 0, len(manifest.Assets))
 	for _, asset := range manifest.Assets {
-		if asset.Kind == "picture" && asset.Caption == "" {
+		if asset.Kind == "picture" && asset.Caption == "" && asset.ImageFile != nil {
 			missing = append(missing, asset.AssetID)
 		}
 	}

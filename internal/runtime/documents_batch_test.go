@@ -2,8 +2,55 @@ package runtime
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
+
+// TestSubmitDocumentBatchRejectsHTMLWithoutDocling pins the per-item config
+// failure: when RAG_DOCLING_SERVICE_URL is not configured the HTML file fails
+// with reason "config" and never reaches document_jobs, so nothing retries.
+func TestSubmitDocumentBatchRejectsHTMLWithoutDocling(t *testing.T) {
+	service, stores := newAsyncService(t)
+	ctx := context.Background()
+	files := []UploadFile{
+		{Name: "page.html", Content: []byte("<html></html>")},
+		{Name: "note.md", Content: []byte("# ok")},
+	}
+	payload, err := service.SubmitDocumentBatch(ctx, "alpha", files, "batch-html", "")
+	if err != nil {
+		t.Fatalf("SubmitDocumentBatch() error = %v", err)
+	}
+	if payload["accepted"] != 1 || payload["failed"] != 1 || payload["skipped"] != 0 {
+		t.Fatalf("payload = %v", payload)
+	}
+	items, ok := payload["items"].([]map[string]any)
+	if !ok || len(items) != 2 {
+		t.Fatalf("items = %v", payload["items"])
+	}
+	var htmlItem map[string]any
+	for _, item := range items {
+		if item["name"] == "page.html" {
+			htmlItem = item
+		}
+	}
+	if htmlItem == nil {
+		t.Fatalf("HTML item missing from payload: %v", items)
+	}
+	if htmlItem["status"] != "failed" || htmlItem["reason"] != "config" {
+		t.Fatalf("HTML item = %v, want failed/config", htmlItem)
+	}
+	if text, _ := htmlItem["error"].(string); !strings.Contains(text, doclingServiceRequiredMessage) {
+		t.Fatalf("HTML item error = %q", text)
+	}
+	var jobs int
+	if err := stores.DB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM document_jobs WHERE namespace = ? AND name = ?", "alpha", "page.html").Scan(&jobs); err != nil {
+		t.Fatalf("count document_jobs error = %v", err)
+	}
+	if jobs != 0 {
+		t.Fatalf("document_jobs has %d HTML rows after a rejected batch admission", jobs)
+	}
+}
 
 // TestSubmitDocumentBatchAdmitsAndClassifies verifies the batch admission
 // fan-out: distinct names are accepted in parallel, a duplicate name inside the

@@ -309,6 +309,31 @@ func TestCapturePdfSideCarsAndLimits(t *testing.T) {
 	}
 }
 
+func TestCaptureHTMLSideCars(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+	addDocument(t, stores, testNamespace, "page.html", "doc-html")
+	addBlob(t, stores, testNamespace, state.SourceBucket, "page.html", []byte("<html></html>"), "doc-html")
+	addBlob(t, stores, testNamespace, state.HTMLAssetBucket, "doc-html/document.md", []byte("# page"), "doc-html")
+	addBlob(t, stores, testNamespace, state.HTMLAssetBucket, "doc-html/manifest.json", []byte("{}"), "doc-html")
+
+	result, err := New(stores, testLogger()).Capture(ctx, testNamespace, capturePayload(hitFor("doc-html", nil)))
+	if err != nil {
+		t.Fatalf("Capture: %v", err)
+	}
+	items := artifactsOf(t, result)
+	if len(items) != 3 {
+		t.Fatalf("artifacts = %#v", items)
+	}
+	kinds := map[string]string{}
+	for _, item := range items {
+		kinds[item["kind"].(string)] = item["mime_type"].(string)
+	}
+	if kinds["source"] != "text/html" || kinds["markdown"] != "text/markdown" || kinds["manifest"] != "application/json" {
+		t.Fatalf("artifact kinds = %#v", kinds)
+	}
+}
+
 func TestCaptureArtifactLimitWarnsAndKeepsResults(t *testing.T) {
 	stores := newTestStores(t)
 	t.Setenv("RAG_RESULT_MAX_ARTIFACTS", "1")

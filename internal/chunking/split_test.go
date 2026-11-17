@@ -86,6 +86,27 @@ func TestStructureRangesMarkdownSections(t *testing.T) {
 	}
 }
 
+func TestStructureRangesHTMLSections(t *testing.T) {
+	spans := []document.Span{
+		{Start: 0, End: 4, Block: document.Block{Text: "H1", Kind: document.KindHeading, Headings: []string{"H1"}}, Paragraph: 1},
+		{Start: 6, End: 10, Block: document.Block{Text: "para", Kind: document.KindParagraph, Headings: []string{"H1"}}, Paragraph: 2},
+		{Start: 12, End: 18, Block: document.Block{Text: "H2", Kind: document.KindHeading, Headings: []string{"H1", "H2"}}, Paragraph: 3},
+		{Start: 20, End: 24, Block: document.Block{Text: "sub1", Kind: document.KindParagraph, Headings: []string{"H1", "H2"}}, Paragraph: 4},
+		{Start: 26, End: 30, Block: document.Block{Text: "sub2", Kind: document.KindParagraph, Headings: []string{"H1", "H2"}}, Paragraph: 5},
+		{Start: 32, End: 38, Block: document.Block{Text: "H3", Kind: document.KindHeading, Headings: []string{"H3"}}, Paragraph: 6},
+		{Start: 40, End: 44, Block: document.Block{Text: "last", Kind: document.KindParagraph, Headings: []string{"H3"}}, Paragraph: 7},
+	}
+	content := document.Content{Text: "0123456789012345678901234567890123456789012345", Spans: spans}
+	want := []Range{{Start: 0, End: 10}, {Start: 12, End: 30}, {Start: 32, End: 44}}
+	// HTML participates in heading-section splitting exactly like DOCX, for both
+	// accepted suffixes.
+	for _, suffix := range []string{document.SuffixHTML, document.SuffixHTM} {
+		if groups := StructureRanges(content, suffix); !reflect.DeepEqual(groups, want) {
+			t.Fatalf("%s groups = %v, want %v", suffix, groups, want)
+		}
+	}
+}
+
 func TestStructureRangesTablesAndPages(t *testing.T) {
 	tableSpans := []document.Span{
 		{Start: 0, End: 5, Block: document.Block{Text: "a | b", Kind: document.KindTableRow, Table: 1}, Paragraph: 1},

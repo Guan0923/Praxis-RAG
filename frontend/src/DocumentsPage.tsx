@@ -58,9 +58,10 @@ import {
 import { FeishuImportModal } from "./FeishuImportModal";
 import {
   canReplaceDocument,
-  documentExtension,
+  replaceAcceptAttribute,
   replaceDocument,
   replaceFileError,
+  replaceTypeLabel,
 } from "./documentReplace";
 
 type Props = {
@@ -224,15 +225,15 @@ export function DocumentsPage({
       .map((file) => file.originFileObj)
       .filter((file): file is NonNullable<typeof file> => !!file);
     if (!selected.length) {
-      setUploadError("请选择 Markdown、TXT、PDF、DOCX 或 DOC 文件");
+      setUploadError("请选择 Markdown、TXT、PDF、DOCX、DOC、HTML 或 HTM 文件");
       return;
     }
     if (selected.some((file) => file.size > 10 * 1024 * 1024)) {
       setUploadError("单文件不超过 10 MiB");
       return;
     }
-    if (selected.some((file) => !/\.(md|txt|pdf|docx|doc)$/i.test(file.name))) {
-      setUploadError("仅支持 Markdown、TXT、PDF、DOCX 和 DOC 文件");
+    if (selected.some((file) => !/\.(md|txt|pdf|docx|doc|html|htm)$/i.test(file.name))) {
+      setUploadError("仅支持 Markdown、TXT、PDF、DOCX、DOC、HTML 和 HTM 文件");
       return;
     }
     setUploadError("");
@@ -687,7 +688,7 @@ export function DocumentsPage({
           <div className="upload-selection">
           <Upload.Dragger
             multiple
-            accept=".md,.txt,.pdf,.docx,.doc"
+            accept=".md,.txt,.pdf,.docx,.doc,.html,.htm"
             beforeUpload={() => false}
             fileList={files}
             showUploadList={false}
@@ -698,7 +699,7 @@ export function DocumentsPage({
             </p>
             <p>选择文档</p>
             <p className="secondary">
-              MD / TXT / PDF / DOCX / DOC · 单文件 10 MiB · 超过 10 个自动分批
+              MD / TXT / PDF / DOCX / DOC / HTML / HTM · 单文件 10 MiB · 超过 10 个自动分批
             </p>
           </Upload.Dragger>
           {files.length > 0 && (
@@ -784,7 +785,7 @@ export function DocumentsPage({
             </div>
           </div>
           <Upload.Dragger
-            accept={replaceTarget ? documentExtension(replaceTarget.name) : undefined}
+            accept={replaceTarget ? replaceAcceptAttribute(replaceTarget.name) : undefined}
             beforeUpload={() => false}
             fileList={replaceFiles}
             maxCount={1}
@@ -800,7 +801,7 @@ export function DocumentsPage({
             </p>
             <p>选择新版文件</p>
             <p className="secondary">
-              可改名，类型须保持 {replaceTarget ? documentExtension(replaceTarget.name) : ""} · 单文件 10 MiB
+              可改名，类型须保持 {replaceTarget ? replaceTypeLabel(replaceTarget.name) : ""} · 单文件 10 MiB
             </p>
           </Upload.Dragger>
           {replaceFiles[0] && (

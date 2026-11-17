@@ -80,8 +80,12 @@ func contentTypesXML(extra ...docxEntry) string {
 	for _, entry := range extra {
 		defaults += `<Default Extension="` + entry.name + `" ContentType="` + entry.body + `"/>`
 	}
+	// OOXML consumers (including python-docx, which Docling's Word backend
+	// uses) identify the main part by its Override, not by the file extension.
+	overrides := `<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>` +
+		`<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>`
 	return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-		`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` + defaults + `</Types>`
+		`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` + defaults + overrides + `</Types>`
 }
 
 func documentXML(body string) string {
@@ -106,6 +110,16 @@ func stylesEntry() docxEntry {
 		`</w:styles>`}
 }
 
+// rootRelsXML points the package at word/document.xml. Real Office packages
+// always carry it, and OOXML consumers such as python-docx (used by Docling's
+// Word backend) refuse a package without it.
+func rootRelsXML() docxEntry {
+	return docxEntry{name: "_rels/.rels", body: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+		`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+		`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>` +
+		`</Relationships>`}
+}
+
 func pictureRun(title string) string {
 	label := ""
 	if title != "" {
@@ -126,6 +140,7 @@ func plainDocxPackage(t *testing.T, body string, styles bool) string {
 	t.Helper()
 	entries := []docxEntry{
 		{name: "[Content_Types].xml", body: contentTypesXML()},
+		rootRelsXML(),
 		{name: "word/document.xml", body: documentXML(body)},
 	}
 	if styles {
@@ -139,6 +154,7 @@ func pictureDocxPackage(t *testing.T, body string, styles bool) string {
 	t.Helper()
 	entries := []docxEntry{
 		{name: "[Content_Types].xml", body: contentTypesXML()},
+		rootRelsXML(),
 		{name: "word/document.xml", body: documentXML(body)},
 		{name: "word/_rels/document.xml.rels", body: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
 			`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +

@@ -88,6 +88,14 @@ type RagConfig struct {
 	// PDFServiceTimeout bounds one remote parse call in seconds
 	// (RAG_PDF_SERVICE_TIMEOUT, default 900).
 	PDFServiceTimeout int
+	// DoclingServiceURL is the base URL of the Docling document parse service
+	// (RAG_DOCLING_SERVICE_URL). Empty means the service is not configured:
+	// DOC/DOCX keep the in-process OOXML parser and static HTML cannot be
+	// imported.
+	DoclingServiceURL string
+	// DoclingServiceTimeout bounds one Docling parse call in seconds
+	// (RAG_DOCLING_SERVICE_TIMEOUT, default 300).
+	DoclingServiceTimeout int
 }
 
 // RagConfigFromEnv loads configuration without connecting to Qdrant or loading
@@ -191,6 +199,14 @@ func RagConfigFromEnv() (RagConfig, error) {
 	if err != nil {
 		return RagConfig{}, err
 	}
+	doclingServiceURL, err := parseDoclingServiceURL(os.Getenv("RAG_DOCLING_SERVICE_URL"))
+	if err != nil {
+		return RagConfig{}, err
+	}
+	doclingServiceTimeout, err := integerEnv("RAG_DOCLING_SERVICE_TIMEOUT", 300, 1, 7200)
+	if err != nil {
+		return RagConfig{}, err
+	}
 	vlmBaseURL, err := parseVLMBaseURL(os.Getenv("RAG_VLM_BASE_URL"))
 	if err != nil {
 		return RagConfig{}, err
@@ -241,6 +257,8 @@ func RagConfigFromEnv() (RagConfig, error) {
 		PDFEngine:             pdfEngine,
 		PDFServiceURL:         pdfServiceURL,
 		PDFServiceTimeout:     pdfServiceTimeout,
+		DoclingServiceURL:     doclingServiceURL,
+		DoclingServiceTimeout: doclingServiceTimeout,
 	}, nil
 }
 
@@ -274,6 +292,25 @@ func parsePDFServiceURL(raw string) (string, error) {
 	}
 	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
 		return "", fmt.Errorf("RAG_PDF_SERVICE_URL must not include a query or fragment")
+	}
+	return strings.TrimRight(value, "/"), nil
+}
+
+// parseDoclingServiceURL validates the Docling document parse service base URL.
+// It must be an absolute http(s) URL without a query or fragment because the
+// client appends fixed paths such as /v1/parse. Empty means "not configured",
+// which keeps the in-process Word/HTML parsers in effect.
+func parseDoclingServiceURL(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("RAG_DOCLING_SERVICE_URL must be an http(s) URL, for example http://127.0.0.1:8092")
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", fmt.Errorf("RAG_DOCLING_SERVICE_URL must not include a query or fragment")
 	}
 	return strings.TrimRight(value, "/"), nil
 }

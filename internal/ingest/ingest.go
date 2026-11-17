@@ -6,9 +6,11 @@
 // Dispatch (mirrors DenseDocumentIngester.ingest_and_publish):
 //   - .pdf: the injected PDFParser (default: in-process NativePDFParser)
 //     produces a manifest, then BuildPDFContent + pdfcontent.ContentChunks.
-//   - .doc/.docx: ParseWordPackage (legacy .doc converted first), optional
-//     in-process VLM picture descriptions, BuildWordContent, then the Word
-//     chunk builder (word_assets.word_chunks port).
+//   - .doc/.docx: when Docling.Parser is configured, the file (legacy .doc
+//     converted first) is parsed by the Docling HTTP service; otherwise the
+//     in-process OOXML parser (ParseWordPackage) is used. Both feed the same
+//     Word asset/chunk builder so table structure, captions and images reach
+//     the evidence. HTML (.html/.htm) is Docling-only.
 //   - .md/.txt (and any other suffix, which fails in the reader): the
 //     rag_mcp.chunking.chunk_document port (chunking.ChunkDocument).
 //
@@ -75,6 +77,9 @@ type Options struct {
 	PDF PDFOptions
 	// Word configures legacy conversion and vision descriptions.
 	Word WordOptions
+	// Docling selects the remote Docling service for DOCX/HTML parsing. When
+	// Parser is nil, DOCX keeps the in-process parser and HTML import fails.
+	Docling DoclingOptions
 	// Counter overrides the token counter (default chunking.DefaultCounter).
 	Counter chunking.TokenCounter
 	// StagingDir receives parser artifacts (manifest.json, document.md,
@@ -152,11 +157,23 @@ func Prepare(ctx context.Context, sourcePath string, options Options) (Result, e
 	switch suffix {
 	case document.SuffixPDF:
 		return preparePDF(ctx, sourcePath, options)
+	case document.SuffixHTML, document.SuffixHTM:
+		return prepareDocling(ctx, sourcePath, options)
 	case document.SuffixDOC, document.SuffixDOCX:
+		if doclingEnabledFor(options) {
+			return prepareDocling(ctx, sourcePath, options)
+		}
 		return prepareWord(ctx, sourcePath, options)
 	default:
 		return prepareText(ctx, sourcePath, options)
 	}
+}
+
+// doclingEnabledFor reports whether the configured Docling parser handles DOCX
+// uploads. It exists so the dispatch condition reads once even though the
+// caller only sets Docling.Parser.
+func doclingEnabledFor(options Options) bool {
+	return options.Docling.Parser != nil
 }
 
 // effectiveConfig validates the requested configuration, mapping the zero value
@@ -246,7 +263,8 @@ func prepareWord(ctx context.Context, sourcePath string, options Options) (Resul
 	}
 	title := sourceStem(options.SourceName)
 	chunks, err := buildWordChunks(content.Manifest, documentID, options.SourceName, title,
-		options.Chunking, options.TokenizerModel, options.Counter)
+		options.Chunking, options.TokenizerModel, options.Counter,
+		"word_parser_version", document.WordParserVersion)
 	if err != nil {
 		return fail(err)
 	}

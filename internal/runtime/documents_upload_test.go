@@ -277,7 +277,7 @@ func TestUploadValidationErrors(t *testing.T) {
 	if _, err := service.uploadDocuments(ctx, "alpha", []UploadFile{uploadFile("data.xyz", "text")}, ""); err == nil {
 		t.Fatalf("unsupported extension accepted")
 	} else {
-		assertKnowledgeValidation(t, err, "暂不支持该文件类型：data.xyz；请选择 .doc、.docx、.md、.pdf、.txt。")
+		assertKnowledgeValidation(t, err, "暂不支持该文件类型：data.xyz；请选择 .doc、.docx、.htm、.html、.md、.pdf、.txt。")
 	}
 	missingKnowledgeBase := func() {
 		if _, err := service.uploadDocuments(ctx, "missing", []UploadFile{uploadFile("a.txt", "text")}, ""); err == nil {
@@ -747,6 +747,7 @@ func TestValidateRemotePDFUploadRequiresVLM(t *testing.T) {
 	legacy := &Service{config: config.RagConfig{PDFEngine: config.PDFEngineDocling}}
 	assertKnowledgeValidation(t, legacy.validateRemotePDFUpload(pdf, empty), remotePDFModelsRequiredMessage)
 }
+
 // TestUploadRejectsPDFWithoutVLM pins that the rejection happens while the
 // upload is accepted: no journal operation or document is written.
 func TestUploadRejectsPDFWithoutVLM(t *testing.T) {
@@ -795,12 +796,116 @@ func TestIndexConfigurationRecordsPDFParserEngine(t *testing.T) {
 		{config.PDFEngineDocling, document.PDFParserVersionService},
 	} {
 		metadata := indexConfiguration("paper.pdf", cfg, "BAAI/bge-m3", "bge-m3",
-			document.PDFParserVersionForEngine(testCase.engine))
+			document.PDFParserVersionForEngine(testCase.engine), false)
 		if got := metadata["pdf_parser_version"]; got != testCase.want {
 			t.Fatalf("engine %q pdf_parser_version = %v, want %q", testCase.engine, got, testCase.want)
 		}
 		if got := metadata["embedding_model"]; got != "bge-m3" {
 			t.Fatalf("embedding_model = %v", got)
 		}
+	}
+}
+
+// TestIndexConfigurationRecordsDoclingParserVersions pins the stored parser
+// contract: DOC/DOCX record docling-word-v1 only when the Docling service is
+// configured (word-assets-v1 otherwise) and HTML always records
+// docling-html-v1, so ReadDocument and duplicate detection pick the right
+// asset bucket.
+func TestIndexConfigurationRecordsDoclingParserVersions(t *testing.T) {
+	cfg, err := chunking.NewConfig("character", 700, 100)
+	if err != nil {
+		t.Fatalf("chunking.NewConfig() error = %v", err)
+	}
+	cases := []struct {
+		name    string
+		docling bool
+		key     string
+		want    string
+	}{
+		{name: "manual.docx", docling: false, key: "word_parser_version", want: document.WordParserVersion},
+		{name: "manual.doc", docling: true, key: "word_parser_version", want: document.DoclingWordParserVersion},
+		{name: "page.html", docling: false, key: "html_parser_version", want: document.HTMLParserVersion},
+		{name: "page.htm", docling: true, key: "html_parser_version", want: document.HTMLParserVersion},
+	}
+	for _, testCase := range cases {
+		metadata := indexConfiguration(testCase.name, cfg, "BAAI/bge-m3", "bge-m3",
+			document.PDFParserVersion, testCase.docling)
+		if got := metadata[testCase.key]; got != testCase.want {
+			t.Fatalf("%s %s = %v, want %q", testCase.name, testCase.key, got, testCase.want)
+		}
+	}
+}
+
+// TestDoclingOptionsSelectsConfiguredService pins the runtime assembly: an empty
+// RAG_DOCLING_SERVICE_URL keeps Docling.Parser nil (DOCX stays in-process) while
+// a configured URL builds the HTTP client from the configured timeout.
+func TestDoclingOptionsSelectsConfiguredService(t *testing.T) {
+	if parser := (&Service{}).doclingOptions().Parser; parser != nil {
+		t.Fatalf("default doclingOptions().Parser = %T, want nil", parser)
+	}
+	service := &Service{config: config.RagConfig{
+		DoclingServiceURL:     "http://127.0.0.1:8092/",
+		DoclingServiceTimeout: 300,
+	}}
+	parser, ok := service.doclingOptions().Parser.(*document.DoclingServiceParser)
+	if !ok || parser == nil {
+		t.Fatalf("doclingOptions().Parser = %T, want *document.DoclingServiceParser",
+			service.doclingOptions().Parser)
+	}
+	if parser.BaseURL != "http://127.0.0.1:8092" {
+		t.Fatalf("DoclingServiceParser.BaseURL = %q", parser.BaseURL)
+	}
+	if parser.Client == nil || parser.Client.Timeout != 300*time.Second {
+		t.Fatalf("DoclingServiceParser.Client = %+v, want a 300s timeout", parser.Client)
+	}
+}
+
+// TestValidateDoclingHTMLUploadRequiresService pins the admission-time check:
+// HTML/HTM needs RAG_DOCLING_SERVICE_URL, while DOCX keeps the in-process parser
+// and the other formats are unaffected.
+func TestValidateDoclingHTMLUploadRequiresService(t *testing.T) {
+	service := &Service{}
+	for _, name := range []string{"page.html", "page.HTM"} {
+		assertKnowledgeValidation(t, service.validateDoclingHTMLUpload([]UploadFile{uploadFile(name, "<html></html>")}),
+			doclingServiceRequiredMessage)
+	}
+	for _, name := range []string{"note.md", "note.txt", "manual.pdf", "manual.docx", "manual.doc"} {
+		if err := service.validateDoclingHTMLUpload([]UploadFile{uploadFile(name, "content")}); err != nil {
+			t.Fatalf("%s rejected without Docling: %v", name, err)
+		}
+	}
+	configured := &Service{config: config.RagConfig{DoclingServiceURL: "http://127.0.0.1:8092"}}
+	if err := configured.validateDoclingHTMLUpload([]UploadFile{uploadFile("page.html", "<html></html>")}); err != nil {
+		t.Fatalf("configured HTML upload rejected: %v", err)
+	}
+}
+
+// TestUploadRejectsHTMLWithoutDocling pins that the rejection happens while the
+// upload is accepted: no journal operation or document is written.
+func TestUploadRejectsHTMLWithoutDocling(t *testing.T) {
+	service, stores, qdrantFake, _ := newUploadService(t)
+	ctx := context.Background()
+
+	_, err := service.uploadDocuments(ctx, "alpha",
+		[]UploadFile{uploadFile("page.html", "<html><body>raw</body></html>")}, "")
+	assertKnowledgeValidation(t, err, doclingServiceRequiredMessage)
+
+	var operations int
+	if err := stores.DB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM upload_operations WHERE namespace = ?", "alpha").Scan(&operations); err != nil {
+		t.Fatalf("count upload_operations error = %v", err)
+	}
+	if operations != 0 {
+		t.Fatalf("upload journal has %d rows after a rejected HTML upload", operations)
+	}
+	documents, err := stores.Documents.List(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("Documents.List() error = %v", err)
+	}
+	if len(documents) != 0 {
+		t.Fatalf("documents after a rejected HTML upload = %+v", documents)
+	}
+	if puts := qdrantFake.find("PUT", "/points"); len(puts) != 0 {
+		t.Fatalf("rejected HTML upload wrote %d Qdrant upserts", len(puts))
 	}
 }

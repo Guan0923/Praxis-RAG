@@ -272,24 +272,47 @@ func (s *Service) ReadDocument(ctx context.Context, namespace, name string) (str
 		if !document.IsSupportedPDFParserVersion(recorded) {
 			return "", "", &apierrors.KnowledgeValidationError{Message: pdfParserChangedMessage}
 		}
-		text, readErr := s.readSavedArtifactText(ctx, namespace, name, record,
-			state.PDFAssetBucket, "pdf_parser_version", recorded,
-			pdfParserChangedMessage, savedPDFContentUnavailableMessage)
+		text, readErr := s.readSavedArtifactText(ctx, namespace, name,
+			state.PDFAssetBucket, savedPDFContentUnavailableMessage)
 		if readErr != nil {
 			return "", "", readErr
 		}
 		return text, version, nil
 	}
 	if suffix == document.SuffixDOC || suffix == document.SuffixDOCX {
-		if parserVersionValue(record.Chunking, "word_parser_version") != "" {
-			text, readErr := s.readSavedArtifactText(ctx, namespace, name, record,
-				state.WordAssetBucket, "word_parser_version", document.WordParserVersion,
-				wordParserChangedMessage, savedWordContentUnavailableMessage)
+		// Historical Word content records word-assets-v1; Docling-produced
+		// content records docling-word-v1. Both are readable, so the recorded
+		// value is validated against the supported set before the artifact is
+		// read from the Word asset bucket.
+		recorded := parserVersionValue(record.Chunking, "word_parser_version")
+		if recorded != "" {
+			if !document.IsSupportedWordParserVersion(recorded) {
+				return "", "", &apierrors.KnowledgeValidationError{Message: wordParserChangedMessage}
+			}
+			text, readErr := s.readSavedArtifactText(ctx, namespace, name,
+				state.WordAssetBucket, savedWordContentUnavailableMessage)
 			if readErr != nil {
 				return "", "", readErr
 			}
 			return text, version, nil
 		}
+	}
+	if suffix == document.SuffixHTML || suffix == document.SuffixHTM {
+		// Static HTML only exists as Docling output. Never fall back to the
+		// source bytes: that would return raw markup as document text.
+		recorded := parserVersionValue(record.Chunking, "html_parser_version")
+		if recorded == "" {
+			return "", "", &apierrors.KnowledgeValidationError{Message: savedHTMLContentUnavailableMessage}
+		}
+		if !document.IsSupportedHTMLParserVersion(recorded) {
+			return "", "", &apierrors.KnowledgeValidationError{Message: htmlParserChangedMessage}
+		}
+		text, readErr := s.readSavedArtifactText(ctx, namespace, name,
+			state.HTMLAssetBucket, savedHTMLContentUnavailableMessage)
+		if readErr != nil {
+			return "", "", readErr
+		}
+		return text, version, nil
 	}
 	content, err := s.readSource(ctx, namespace, name)
 	if err != nil {
@@ -310,6 +333,8 @@ func artifactBucketForSuffix(suffix string) (string, bool) {
 		return state.PDFAssetBucket, true
 	case document.SuffixDOC, document.SuffixDOCX:
 		return state.WordAssetBucket, true
+	case document.SuffixHTML, document.SuffixHTM:
+		return state.HTMLAssetBucket, true
 	default:
 		return "", false
 	}
@@ -325,17 +350,15 @@ func (s *Service) readVersionedArtifact(ctx context.Context, version, documentID
 }
 
 // readSavedArtifactText reads an unversioned parser artifact from the namespace
-// asset bucket after validating the parser version, mirroring
-// pdf_assets.read_pdf_content / word_assets.read_word_content.
+// asset bucket, mirroring pdf_assets.read_pdf_content /
+// word_assets.read_word_content. Callers validate the recorded parser version
+// before calling it, because the expected contract differs per format
+// (go-native-v1/docling-service-v1, word-assets-v1/docling-word-v1,
+// docling-html-v1).
 func (s *Service) readSavedArtifactText(
 	ctx context.Context,
-	namespace, name string,
-	record *state.DocumentRecord,
-	bucket, parserKey, expectedParser, changedMessage, unavailableMessage string,
+	namespace, name, bucket, unavailableMessage string,
 ) (string, error) {
-	if parserVersionValue(record.Chunking, parserKey) != expectedParser {
-		return "", &apierrors.KnowledgeValidationError{Message: changedMessage}
-	}
 	documentID := chunking.DocumentID(name)
 	content, found, err := s.stores.Blobs.Get(ctx, namespace, bucket, documentID+"/document.md")
 	if err != nil {
@@ -376,8 +399,10 @@ const (
 	savedContentUnavailableMessage     = "Saved content unavailable; reimport this document"
 	savedPDFContentUnavailableMessage  = "Saved PDF content is unavailable; explicitly reimport this PDF"
 	savedWordContentUnavailableMessage = "Saved Word content unavailable; reimport this document"
+	savedHTMLContentUnavailableMessage = "Saved HTML content unavailable; reimport this document"
 	pdfParserChangedMessage            = "PDF parser version changed; explicitly reimport this PDF"
 	wordParserChangedMessage           = "Word parser changed; reimport this document"
+	htmlParserChangedMessage           = "HTML parser changed; reimport this document"
 	textEncodingErrorPrefix            = "文本文件必须使用 UTF-8 编码："
 	textTooLargePrefix                 = "文档提取文本过大："
 )
@@ -418,10 +443,10 @@ func (s *Service) readSource(ctx context.Context, namespace, name string) ([]byt
 // with the namespace's committed configuration like Python's find_duplicate.
 // SupportedUploadExtensions is the accepted upload suffix set in Python's sorted
 // order (used verbatim in the unsupported-type message).
-var SupportedUploadExtensions = []string{".doc", ".docx", ".md", ".pdf", ".txt"}
+var SupportedUploadExtensions = []string{".doc", ".docx", ".htm", ".html", ".md", ".pdf", ".txt"}
 
 // UnsupportedFileTypeMessage mirrors service_knowledge.validate_uploads:
-// "暂不支持该文件类型：<name>；请选择 .doc、.docx、.md、.pdf、.txt。".
+// "暂不支持该文件类型：<name>；请选择 .doc、.docx、.htm、.html、.md、.pdf、.txt。".
 func UnsupportedFileTypeMessage(name string) string {
 	return "暂不支持该文件类型：" + name + "；请选择 " + strings.Join(SupportedUploadExtensions, "、") + "。"
 }

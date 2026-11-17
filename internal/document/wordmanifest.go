@@ -8,6 +8,35 @@ import (
 // is only reusable while the manifest reports this version.
 const WordParserVersion = "word-assets-v1"
 
+// DoclingWordParserVersion is the parser version recorded for DOC/DOCX content
+// produced by the independent Docling HTTP service. Historical documents keep
+// WordParserVersion; both values are readable.
+const DoclingWordParserVersion = "docling-word-v1"
+
+// HTMLParserVersion is the parser version recorded for HTML/HTM content
+// produced by the Docling HTTP service. HTML chunks never use the Word parser
+// metadata key.
+const HTMLParserVersion = "docling-html-v1"
+
+// IsSupportedWordParserVersion reports whether a recorded Word parser version
+// can still be read: the historical in-process version and the Docling service
+// contract.
+func IsSupportedWordParserVersion(version string) bool {
+	return version == WordParserVersion || version == DoclingWordParserVersion
+}
+
+// IsSupportedHTMLParserVersion reports whether a recorded HTML parser version
+// can still be read.
+func IsSupportedHTMLParserVersion(version string) bool {
+	return version == HTMLParserVersion
+}
+
+// IsSupportedDoclingManifestVersion reports whether a Docling service manifest
+// version can be ingested by this build.
+func IsSupportedDoclingManifestVersion(version string) bool {
+	return version == DoclingWordParserVersion || version == HTMLParserVersion
+}
+
 // WordLocation is the ordered position of a Word block/asset inside the package.
 // It mirrors word_reader.WordReader.location; the fields feed caption/note
 // association and the artifact manifest.

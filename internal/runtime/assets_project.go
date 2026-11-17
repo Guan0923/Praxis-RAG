@@ -115,7 +115,8 @@ func projectAssetResults(
 			// A stale upload version must never expose an old asset.
 			continue
 		}
-		word := projectionString(asset["asset_storage"], "") == "word"
+		storage := projectionString(asset["asset_storage"], "")
+		structured := storage == "word" || storage == "html"
 		caption := projectionString(asset["caption"], "")
 		metadata := cloneProjectionMap(candidate.Metadata)
 		metadata["asset_id"] = assetID
@@ -125,7 +126,7 @@ func projectAssetResults(
 		metadata["captions"] = projectionFieldDefault(asset, "captions", []any{})
 		metadata["footnotes"] = projectionFieldDefault(asset, "footnotes", []any{})
 		metadata["caption_source"] = projectionFieldDefault(asset, "caption_source", "none")
-		if word {
+		if structured {
 			delete(metadata, "page")
 			delete(metadata, "bbox")
 			metadata["location"] = asset["location"]
@@ -146,8 +147,11 @@ func projectAssetResults(
 				continue
 			}
 			bucket := state.PDFAssetBucket
-			if word {
+			switch storage {
+			case "word":
 				bucket = state.WordAssetBucket
+			case "html":
+				bucket = state.HTMLAssetBucket
 			}
 			version := projectionString(candidate.Metadata["upload_version"], "")
 			content, found := objects.ReadAssetObject(ctx, version, bucket, relative)
@@ -162,7 +166,7 @@ func projectAssetResults(
 				"page":      asset["page"],
 				"bbox":      asset["bbox"],
 			}
-			if word {
+			if structured {
 				delete(image, "page")
 				delete(image, "bbox")
 				image["location"] = asset["location"]
@@ -186,11 +190,11 @@ func projectAssetResults(
 				"num_cols":    projectionTableValue(table, "num_cols", 0),
 				"footnotes":   projectionTableValue(table, "footnotes", []any{}),
 			}
-			if word {
+			if structured {
 				rendered["nested_tables"] = projectionTableValue(table, "nested_tables", map[string]any{})
 				rendered["parent_cell"] = table["parent_cell"]
 			}
-			if word {
+			if structured {
 				delete(rendered, "page")
 				delete(rendered, "bbox")
 				rendered["location"] = asset["location"]

@@ -16,7 +16,7 @@ export function DocumentPreview({ name, connection }: { name: string; connection
     setContent(undefined);
     setError("");
     setInfo(undefined);
-    if (/\.docx?$/i.test(name)) void api<{ documents: DocumentInfo[] }>("/v1/documents", connection, { signal: controller.signal })
+    if (/\.(docx?|html?)$/i.test(name)) void api<{ documents: DocumentInfo[] }>("/v1/documents", connection, { signal: controller.signal })
       .then((value) => { if (!controller.signal.aborted) setInfo(value.documents.find((item) => item.name === name)); })
       .catch(() => {});
     async function load() {
@@ -39,6 +39,11 @@ export function DocumentPreview({ name, connection }: { name: string; connection
   if (error) return <Alert type="error" showIcon title="文档内容加载失败" description={error}
     action={<Button onClick={() => setAttempt((value) => value + 1)}>重试</Button>} />;
   if (content === undefined) return <div className="preview-loading" role="status"><Spin /> 正在加载文档</div>;
+  // Text-like documents (Markdown/TXT/Word/HTML) are rendered as React text
+  // nodes, never as markup: the Console is served same-origin with the REST API
+  // and holds the caller's token, so injecting an uploaded document with
+  // dangerouslySetInnerHTML would let arbitrary HTML/JS reach the admin surface
+  // of this origin. HTML documents must stay inert plain text here.
   if (typeof content === "string") return <><WordDiagnostics diagnostics={info?.diagnostics} count={info?.skipped_object_count} />
     <div className="document-text">{content}</div></>;
   return <Suspense fallback={<div className="preview-loading" role="status"><Spin /> 正在加载 PDF</div>}>

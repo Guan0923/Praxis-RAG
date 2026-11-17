@@ -124,6 +124,31 @@ func TestAddDocumentAsyncRejectsPDFWithoutVLM(t *testing.T) {
 	}
 }
 
+// TestAddDocumentAsyncRejectsHTMLWithoutDocling pins that static HTML cannot be
+// admitted without RAG_DOCLING_SERVICE_URL: the rejection is a terminal
+// validation error and no document job is queued for a retry.
+func TestAddDocumentAsyncRejectsHTMLWithoutDocling(t *testing.T) {
+	service, stores := newAsyncService(t)
+	ctx := context.Background()
+
+	_, err := service.addDocumentAsync(ctx, "alpha", "page.html", []byte("<html></html>"), "html-1")
+	assertKnowledgeValidation(t, err, doclingServiceRequiredMessage)
+
+	var jobs int
+	if err := stores.DB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM document_jobs WHERE namespace = ?", "alpha").Scan(&jobs); err != nil {
+		t.Fatalf("count document_jobs error = %v", err)
+	}
+	if jobs != 0 {
+		t.Fatalf("document_jobs has %d rows after a rejected HTML admission", jobs)
+	}
+
+	// Markdown admissions still work without Docling.
+	if _, err := service.addDocumentAsync(ctx, "alpha", "note.md", []byte("# ok"), "md-html-1"); err != nil {
+		t.Fatalf("markdown admission was rejected: %v", err)
+	}
+}
+
 func TestAddDocumentAsyncValidationAndStatus(t *testing.T) {
 	service, stores := newAsyncService(t)
 	ctx := context.Background()

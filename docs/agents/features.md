@@ -12,7 +12,7 @@
 
 ## 2. 文档导入与异步任务
 
-- 支持格式：`.md`、`.txt`、`.pdf`、`.docx`、`.doc`（DOC 需外部 LibreOffice）；每批最多 10 个文件，单文件最大 10 MiB。
+- 支持格式：`.md`、`.txt`、`.pdf`、`.docx`、`.doc`、`.html`、`.htm`；每批最多 10 个文件，单文件最大 10 MiB。配置 `RAG_DOCLING_SERVICE_URL` 后 `.docx`/`.doc`（先经 LibreOffice 转 `.docx`）与 `.html`/`.htm` 由独立的 Docling 解析服务解析；未配置时 `.docx`/`.doc` 仍走 Go 进程内 OOXML，`.html`/`.htm` 不可导入。
 - **异步受理**：`POST /v1/document-batches` 为每个文件在一个事务内写入 `document_jobs`（含文件字节、sha256、配置版本、`schedule_version=1`），以 `202` 返回批次和逐文件结果；解析/切分/Embedding/发布在 worker 后台完成。任务表由 Kafka Connect 的 `praxis-document-cdc` 连接器采集，不再写事务 outbox。上传 POST 可携带可选的 `X-Upload-ID`，与 `GET /v1/document-batches/upload-events/{upload_id}`（SSE）配对实时推送逐文件字节进度与保存结果；缺省该头时行为与响应完全不变。
 - 上传前可用 `POST /v1/documents/check` 做同名/SHA-256 预检；`Idempotency-Key` 支持重试复用原批次及其文件任务。
 - **批次上传（Console 使用）**：`POST /v1/document-batches` 先提交 `document_batches` + `document_batch_items`（每项 `saving`），再按文件名加锁并行受理每个文件（不同名互不排队，默认 6 路），最后把每项结果与计数写回并返回 `202`。`GET /v1/document-batches/{batch_id}` 同时给出保存结果（`accepted`/`skipped`/`failed` + 原因）与已受理文件的 `job.status/stage`；`GET /v1/document-batches?limit=20` 只返回仍有未完成工作的批次，供 Console 刷新后恢复进度气泡。批次只是进度元数据，不保存文件字节，7 天后清理。Console 上传面板为每个文件一行独立进度条并先订阅 SSE（`ready` 后发 POST）：`progress.received` 是请求体累计接收的内容字节数（前端按本地 `File.size` 换算百分比），每文件 `result`（`saved`/`skipped`/`failed`）落地即结束该行；面板在保存结果处结束，不再展示或轮询解析阶段（解析阶段仍由批次状态接口的 `items[].job.status/stage` 暴露）。
@@ -44,13 +44,16 @@
 | --- | --- | --- |
 | PDF（vision，默认） | 独立 `pdf-parser` 微服务 + 远端视觉模型 | 本地 PyMuPDF 读取/渲染/裁图，版面分析、表格结构（行列/表头/合并单元格）、OCR、公式 LaTeX、图片描述统一由知识库配置的远端 OpenAI 兼容视觉模型完成；返回 zip：根 `manifest.json`（版本 `docling-service-v1`，证据格式契约）+ 图片资产 |
 | PDF（`RAG_PDF_ENGINE=go`） | Go 进程内纯文本引擎 | 按页抽正文、按基线分行、合并上标、去页眉页脚/页码、修复连字符换行；清单版本 `go-native-v1`；不支持版面/表格/OCR/公式/图片资产，扫描件会明确报“没有可索引的内容” |
-| DOCX | Go 进程内 OOXML 读取 | 保留内容控件、嵌套表格、合并单元格、原生公式（OMML→LaTeX）、图注/脚注关联；无法可靠读取的结构会明确拒绝入库 |
-| DOC | 外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）转换后再按 DOCX 处理 | 超时 `RAG_WORD_CONVERT_TIMEOUT`（默认 120s） |
+| DOCX | 配置 `RAG_DOCLING_SERVICE_URL` 时走独立 `docling-service`（`POST /v1/parse`，multipart 字段 `file`，返回 zip：版本化清单 + 序列化 `DoclingDocument` + 图片资产；`document.md` 由 Go 生成）；未配置时用 Go 进程内 OOXML 读取 | 解析在服务内完成时，Go 端只校验状态码/content-type、安全解压后切分；未配置 Docling 时保持历史进程内解析 |
+| DOC | 外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）转成 `.docx`；配置了 Docling 时转给 `docling-service`，否则由进程内 OOXML 解析 | 超时 `RAG_WORD_CONVERT_TIMEOUT`（默认 120s）；服务只接收 `.docx`/HTML，不直接接收 `.doc` |
+| HTML / HTM | 必须配置 `docling-service`（未配置时上传被拒绝/任务报 `ErrDoclingNotConfigured`） | 静态 HTML 上传；外部/相对图片不抓取、只保留文字说明（如替代文本）；Console 预览只展示解析后的纯文本，不在同源页面渲染或执行上传的 HTML；不支持网页抓取 |
 | Markdown/TXT | 直接读取 | 直接进入切分 |
 
-- **vision 引擎的强约束**：知识库必须已在 Console「模型配置」中添加并选中 VLM，否则 PDF 上传会在**受理阶段**被拒绝并提示配置，不进入队列；VLM 有 `RAG_VLM_*` 环境回退。同一个视觉模型同时承担 PDF 版面/OCR/表格/公式/图片描述与 Word 无图注图片描述。OCR 已并入视觉模型，不再有独立 OCR 模型类型；升级迁移会删除旧 `kind='ocr'` 配置并清除知识库中的 `ocr`/`ocr_model` 设置。旧值 `RAG_PDF_ENGINE=docling` 等价于 `vision`。
+- **vision 引擎的强约束**：知识库必须已在 Console「模型配置」中添加并选中 VLM，否则 PDF 上传会在**受理阶段**被拒绝并提示配置，不进入队列；VLM 有 `RAG_VLM_*` 环境回退。同一个视觉模型承担 PDF 版面/OCR/表格/公式/图片描述。OCR 已并入视觉模型，不再有独立 OCR 模型类型；升级迁移会删除旧 `kind='ocr'` 配置并清除知识库中的 `ocr`/`ocr_model` 设置。旧值 `RAG_PDF_ENGINE=docling` 等价于 `vision`。
 - 解析上限：单文档最多 1000 页、解压后 50 MiB、最多 10000 个 zip 成员、500 万字符；pdf-parser 请求体默认上限 100 MiB。
 - 安全拒绝：非 `%PDF-` 文件、明显加密的 PDF、空抽取结果都会返回明确错误，不会静默入库垃圾文本。
+- **Docling 服务**：配置 `RAG_DOCLING_SERVICE_URL` 后，`.docx`/`.doc`（先经 LibreOffice 转 `.docx`）与 `.html`/`.htm` 通过该独立服务解析，单次调用超时 `RAG_DOCLING_SERVICE_TIMEOUT`（默认 300 秒，1..7200）；该 URL 为空时不启用 Docling：`.docx`/`.doc` 仍走进程内 OOXML，`.html`/`.htm` 不可导入（`.md`/`.txt`/`.pdf` 不受影响）。已配置但服务不可达时任务失败并按既有重试处理，不回退进程内解析。服务自身环境变量：`RAG_DOCLING_SERVICE_HOST`、`PORT`（默认 8092）、`RAG_DOCLING_SERVICE_TIMEOUT`、`RAG_DOCLING_SERVICE_PARSE_TIMEOUT`、`RAG_DOCLING_SERVICE_CONCURRENCY`、`RAG_DOCLING_SERVICE_WORKERS`、`RAG_DOCLING_SERVICE_MAX_BYTES`、`RAG_DOCLING_SERVICE_LOG_LEVEL`、`RAG_DOCLING_SERVICE_LOG_FORMAT`；容器端口 8092，健康检查 `/healthz`；依赖版本与启动方式见 `python-workers/docling-service/README.md`。
+- **HTML 预览安全**：Console 以 React 文本节点渲染解析后的纯文本，不使用 `dangerouslySetInnerHTML`，上传的 HTML/JS 不会在 Console 同源页面执行。
 - 解析产物（`manifest.json`、`document.md`、图片、表格、图注/脚注）保存在共享状态库；检索命中时返回图片 Base64、表格行列/表头/合并信息与页码/版面或 Word 章节位置。
 - 图片/表格可经 `/v1/artifacts/{artifact_id}`、`/v1/artifacts/{artifact_id}/content` 读取。
 

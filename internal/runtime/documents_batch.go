@@ -169,6 +169,12 @@ func (s *Service) admitDocumentBatchFile(
 		result.Error = batchFailureText(err)
 		return result
 	}
+	if err := s.validateDoclingHTMLAdmission(file.Name); err != nil {
+		result.Status = state.DocumentBatchItemFailed
+		result.Reason = state.DocumentBatchReasonConfig
+		result.Error = batchFailureText(err)
+		return result
+	}
 	admission, err := s.stores.DocumentJobs.Submit(ctx, namespace, file.Name, file.Content, idempotencyKey)
 	if err != nil {
 		return classifyBatchAdmissionFailure(position, err)

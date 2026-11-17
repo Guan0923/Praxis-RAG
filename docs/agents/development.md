@@ -21,7 +21,8 @@
 | Kafka | `RAG_KAFKA_BOOTSTRAP_SERVERS`、`RAG_KAFKA_SECURITY_PROTOCOL`、`RAG_KAFKA_SASL_*`、`RAG_KAFKA_TLS_*`、`RAG_DOCUMENT_TOPIC`/`RAG_DOCUMENT_GROUP`、`RAG_DOCUMENT_DLQ_TOPIC`/`RAG_DOCUMENT_DLQ_GROUP`、`RAG_CACHE_TOPIC`/`RAG_CACHE_GROUP`、`RAG_CACHE_DLQ_TOPIC`/`RAG_CACHE_DLQ_GROUP`、`RAG_DOCUMENT_WORKER_CONCURRENCY`（默认 `1`）；搜索相关的 `RAG_SEARCH_*` topic/group/worker 配置已删除，仅保留 `RAG_SEARCH_TIMEOUT_SECONDS`（120，同步检索总预算） |
 | 文档投递/监控 | `RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS`（默认 3；与 MySQL `document_jobs.attempts` 的 3 次执行上限相互独立）、`RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS`（Worker 心跳间隔，默认 15；监控页 60 秒无心跳判降级）、`RAG_CONNECT_URLS`（分布式 Kafka Connect REST 端点）、`RAG_CONNECT_DOCUMENT_CONNECTOR`/`RAG_CONNECT_CACHE_CONNECTOR`（固定连接器名）、`RAG_CONNECT_SUPERVISOR_*`（FAILED task 自动重启间隔/次数/退避）；采集位点在 Connect 内部 topic，应用读不到，监控显示「未知」 |
 | 缓存/CDC | `RAG_CACHE_TOPIC`/`RAG_CACHE_GROUP`、`RAG_CACHE_DLQ_TOPIC`/`RAG_CACHE_DLQ_GROUP`；`cache_revisions` 的 revision/refreshed_revision/attempts/last_error/updated_at；任务表 `schedule_version`；`rag-cdc-cutover` 切换工具 |
-| PDF/Word | `RAG_PDF_ENGINE`（`vision`/`go`；旧值 `docling` 是 `vision` 的兼容别名）、`RAG_PDF_SERVICE_URL`、`RAG_PDF_SERVICE_TIMEOUT`（900，Go 调用与 pdf-parser 请求总预算）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（120，真正开始解析后的单次上限，排队等待不计入，须小于总预算）、`RAG_WORD_CONVERTER_PATH`、`RAG_WORD_CONVERT_TIMEOUT`；`RAG_PDF_MODELS_PATH` 已废弃（本地无模型） |
+| PDF | `RAG_PDF_ENGINE`（`vision`/`go`；旧值 `docling` 是 `vision` 的兼容别名）、`RAG_PDF_SERVICE_URL`、`RAG_PDF_SERVICE_TIMEOUT`（900，Go 调用与 pdf-parser 请求总预算）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（120，真正开始解析后的单次上限，排队等待不计入，须小于总预算）；`RAG_PDF_MODELS_PATH` 已废弃（本地无模型） |
+| Word/HTML | `RAG_DOCLING_SERVICE_URL`（空=不启用 Docling：`.docx`/`.doc` 仍走进程内 OOXML，`.html`/`.htm` 不可导入）、`RAG_DOCLING_SERVICE_TIMEOUT`（300，1..7200，Go 调用与 docling-service 请求预算）、`RAG_WORD_CONVERTER_PATH` 与 `RAG_WORD_CONVERT_TIMEOUT`（120，`.doc` 先经 LibreOffice 转成 `.docx`；配置 Docling 时再上传给服务，服务只接收 `.docx`/HTML）；服务自身变量：`RAG_DOCLING_SERVICE_HOST`、`PORT`（默认 8092）、`RAG_DOCLING_SERVICE_TIMEOUT`、`RAG_DOCLING_SERVICE_PARSE_TIMEOUT`、`RAG_DOCLING_SERVICE_CONCURRENCY`、`RAG_DOCLING_SERVICE_WORKERS`、`RAG_DOCLING_SERVICE_MAX_BYTES`、`RAG_DOCLING_SERVICE_LOG_LEVEL`/`RAG_DOCLING_SERVICE_LOG_FORMAT`；容器端口 8092 |
 | 日志 | `RAG_LOG_LEVEL`（`info`）、`RAG_LOG_FORMAT`（`text`/`json`）、`RAG_DEBUG_TRACE`（兼容旧调试开关；未设级别时为 `debug`）、`RAG_LOG_FILE`（可选，所有 Go 进程追加同一个 JSON Lines 文件供监控页文件日志源读取；打开失败 fail fast）、`RAG_LOG_BUFFER_SIZE`（`1000`，范围 `100..20000`，进程内环形缓冲）、`RAG_PDF_SERVICE_LOG_LEVEL`/`RAG_PDF_SERVICE_LOG_FORMAT` |
 | VLM | `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`、`RAG_VLM_TIMEOUT`、`RAG_VLM_CONCURRENCY`（Console 知识库配置优先，环境变量是回退） |
 | 默认知识库模板 | `RAG_DEFAULT_KB_TEMPLATE`（默认 `default`，VIP/普通用户建库时克隆其模型配置） |
@@ -125,7 +126,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 
 1. **对外契约**：MCP 工具名与输入 schema、REST 路径与响应结构、环境变量名、`enc:v1:` 凭据格式、MySQL 表结构、PDF 清单版本（`go-native-v1` / `docling-service-v1`，旧 `docling-formula-remote-v3` 仍可读；`docling-service-v1` 只是证据格式契约，与是否使用 Docling 无关）。改契约必须同时做数据迁移、兼容读取与文档更新。
 2. **不要重新引入**：Python 主后端、SQLite 状态库、RocketMQ、Qdrant 本地文件模式。当前传输是 Kafka + MySQL，凭据格式是 `enc:v1:`。
-3. **Go 服务不得依赖 Python**：PDF 的版面/OCR/表格/公式/图片描述能力由 `python-workers/pdf-service` 调用远端视觉模型（或纯 Go 实现）提供；`go build ./...` / `go test ./...` 不涉及 Python，也不加载任何本地模型。
+3. **Go 服务不得依赖 Python**：PDF 的版面/OCR/表格/公式/图片描述能力由 `python-workers/pdf-service` 调用远端视觉模型（或纯 Go 实现）提供，Word/HTML 解析由 `python-workers/docling-service` 提供；`go build ./...` / `go test ./...` 不涉及 Python，也不加载任何本地模型。
 4. **测试串行**：新增包测试仍受同一 MySQL schema 与 advisory lock 约束；不要写依赖执行顺序之外并行假设的测试。
 5. **异步受理不代表完成**：涉及上传/索引的改动必须维护 `document_jobs` 状态机、`schedule_version` 重发语义、幂等与恢复语义，并保留 `GET /v1/document-jobs/{artifact_id}` 的可观测性；不要重新引入任何事务 outbox（Debezium 直接采集任务表）。
 6. **不要提交生成物与本地数据**：`build/`、`dist/`、`frontend/node_modules/`、`.test-tmp/`、`.env*`（除 `.env.example`）、模型/向量数据、根目录 worker 二进制（见 `.gitignore`）。
@@ -139,7 +140,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 - Token 计数是确定性近似，token 策略的切分边界可能与 Python/BGE-M3 不完全一致。
 - vision 引擎的 PDF 必须先在知识库配置 VLM，否则受理阶段直接拒绝；pdf-parser 不可用或超时、远端视觉模型不可用同样会令该次上传失败（可临时切 `RAG_PDF_ENGINE=go`）。OCR 已并入视觉模型，不再有独立 OCR 模型类型；升级迁移会删除旧 `kind='ocr'` 配置并清除知识库中的 `ocr`/`ocr_model` 设置。
 - `RAG_PDF_ENGINE=go` 只适合文字型 PDF：无版面分析、表格结构、OCR、公式与图片资产；扫描件需先 OCR。
-- 暂不支持 Excel、网页抓取、独立图片上传；`.doc` 依赖外部 LibreOffice。
+- 暂不支持 Excel、网页抓取（只支持静态 `.html`/`.htm` 上传，且 HTML 的外部/相对图片不抓取）、独立图片上传；`.doc` 依赖外部 LibreOffice。`.docx`/`.doc` 在配置 `RAG_DOCLING_SERVICE_URL` 后改由 Docling 服务解析（未配置时走进程内 OOXML），`.html`/`.htm` 必须配置 Docling 服务才能导入。
 - 搜索为同步执行，受 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120s）总预算约束；超时映射为既有搜索错误，客户端取消会传递到 Qdrant/模型调用。`search_tasks`/`search_result_snapshots` 为历史表、不再读写；搜索 topic/worker/DLQ 已下线。
 - 上传默认异步，必须存在文档消费者：配置 Kafka + 分布式 Kafka Connect 的两个 Debezium 连接器并运行独立的 `rag-document-worker`；没有内嵌/进程内选项，未部署时任务会一直 `queued`。
 - 受限账号可在同步检索中正常工作：服务端按 scope 追加 `document_ids` 过滤，不再有“排队模式下拒绝受限账号”的限制。
@@ -149,6 +150,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 
 - Docker 镜像构建、compose `app` profile、systemd 部署；Go worker 容器化。
 - pdf-parser 镜像构建、真实视觉端点推理与真实扫描 PDF 的解析质量（现有测试用 fake converter 与注入式视觉客户端覆盖协议，不访问网络）。
+- docling-service 在本环境未构建镜像、未跑端到端链路；服务自身测试用真实 Docling `2.150.1` 与 DOCX/HTML fixture 覆盖清单契约（见服务 README §6），「LibreOffice → Docling」的 `.doc` 链路与真实业务文档质量仍需预发验收；依赖版本、启动方式与验收记录见 `python-workers/docling-service/README.md`。
 - 远端视觉模型端点的真实联调（只做了配置/协议单测与 httptest 集成测试）。
 - Console 的浏览器级 E2E（只有 Vitest 单元/契约测试与人工截图核对）。
 - Kafka SASL/TLS 外部集群、MySQL 多实例并发/故障切换。

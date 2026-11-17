@@ -352,7 +352,7 @@ func ValidatePDFParserVersion(version string) error {
 // Payload renders the asset record the state/Qdrant layers store. The shape
 // matches word_assets.WordAsset.payload / pdf_assets.PdfAsset.payload.
 func (a Asset) Payload(source string) map[string]any {
-	if a.Storage == "word" {
+	if a.Storage == "word" || a.Storage == "html" {
 		payload := map[string]any{
 			"asset_id":              a.ID,
 			"kind":                  a.Kind,
@@ -371,7 +371,7 @@ func (a Asset) Payload(source string) map[string]any {
 			"document_id":           a.DocumentID,
 			"source":                source,
 			"asset_kind":            a.Kind,
-			"asset_storage":         "word",
+			"asset_storage":         a.Storage,
 		}
 		if payload["labels"] == nil {
 			payload["labels"] = []string{}

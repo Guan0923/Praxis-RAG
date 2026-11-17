@@ -94,6 +94,52 @@ func TestReplaceDocumentRejectsMismatchedType(t *testing.T) {
 	}
 }
 
+// TestReplaceDocumentTreatsHTMLAndHTMAsOneFamily pins that the two static-HTML
+// suffixes are interchangeable on replace while every other suffix still must
+// keep the original format.
+func TestReplaceDocumentTreatsHTMLAndHTMAsOneFamily(t *testing.T) {
+	cases := []struct {
+		name   string
+		target string
+		upload string
+		accept bool
+	}{
+		{name: "html_to_htm", target: "page.html", upload: "page-revised.htm", accept: true},
+		{name: "htm_to_html", target: "page.htm", upload: "page-revised.html", accept: true},
+		{name: "html_to_markdown", target: "page.html", upload: "page.md", accept: false},
+		{name: "markdown_to_html", target: "page.md", upload: "page.html", accept: false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			runtime := newFakeDocRuntime()
+			handler := newRuntimeServer(t, runtime).Handler()
+			response := performRequest(handler, replaceRequest(t,
+				testCase.target, testCase.upload, "<html><body>new</body></html>", tenantAuth()))
+			if testCase.accept {
+				if response.Code != http.StatusOK {
+					t.Fatalf("replace status = %d body = %s", response.Code, response.Body.String())
+				}
+				if runtime.writeName != testCase.target {
+					t.Fatalf("replaced name = %q, want %q", runtime.writeName, testCase.target)
+				}
+				if string(runtime.writeContent) != "<html><body>new</body></html>" {
+					t.Fatalf("replaced content = %q", runtime.writeContent)
+				}
+				return
+			}
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("cross-format status = %d body = %s", response.Code, response.Body.String())
+			}
+			if detail, _ := decodeBody(t, response)["detail"].(string); !strings.Contains(detail, "类型必须与原文档一致") {
+				t.Fatalf("cross-format detail = %q", detail)
+			}
+			if runtime.writeName != "" {
+				t.Fatalf("runtime was called for a cross-format replace: %q", runtime.writeName)
+			}
+		})
+	}
+}
+
 func TestReplaceDocumentRejectsUnsupportedAndMissing(t *testing.T) {
 	runtime := newFakeDocRuntime()
 	handler := newRuntimeServer(t, runtime).Handler()

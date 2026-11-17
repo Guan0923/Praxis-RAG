@@ -17,8 +17,13 @@ var wordInlineEquation = regexp.MustCompile(`\$[^$]+\$`)
 // buildWordChunks ports word_assets.word_chunks: pending text blocks are split
 // with the configured strategy, inline equations never split, and picture/table
 // assets become atomic caption/row chunks carrying the asset metadata.
+// parserKey/parserVersion record the parser that produced the manifest
+// (word_parser_version with word-assets-v1 for the in-process OOXML parser,
+// docling-word-v1 for the Docling service, html_parser_version for HTML) so
+// historical chunks stay distinguishable from Docling output.
 func buildWordChunks(manifest document.WordManifest, documentID, source, title string,
-	config chunking.Config, tokenizerModel string, counter chunking.TokenCounter) ([]chunking.Chunk, error) {
+	config chunking.Config, tokenizerModel string, counter chunking.TokenCounter,
+	parserKey, parserVersion string) ([]chunking.Chunk, error) {
 	probe, err := chunking.NewTokenBudget(counter, chunking.Config{Strategy: "token", ChunkSize: 1})
 	if err != nil {
 		return nil, err
@@ -51,11 +56,11 @@ func buildWordChunks(manifest document.WordManifest, documentID, source, title s
 		}
 		index := len(chunks)
 		chunkMetadata := map[string]any{
-			"document_suffix":     suffix,
-			"chunk_index":         index,
-			"chunking":            cloneMap(chunkingMetadata),
-			"word_parser_version": document.WordParserVersion,
-			"token_count":         count,
+			"document_suffix": suffix,
+			"chunk_index":     index,
+			"chunking":        cloneMap(chunkingMetadata),
+			parserKey:         parserVersion,
+			"token_count":     count,
 		}
 		for key, value := range metadata {
 			chunkMetadata[key] = value
@@ -100,7 +105,7 @@ func buildWordChunks(manifest document.WordManifest, documentID, source, title s
 		if config.Strategy == "character" {
 			ranges = chunking.CharacterRanges(text, config.ChunkSize, config.ChunkOverlap)
 		} else {
-			ranges, err = chunking.SplitContent(content, document.SuffixDOCX, config, budget)
+			ranges, err = chunking.SplitContent(content, suffix, config, budget)
 			if err != nil {
 				return err
 			}

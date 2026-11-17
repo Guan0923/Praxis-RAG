@@ -2300,3 +2300,55 @@ go test ./internal/redisstate/ -run 'TestDocumentLock' -count=2 -p 1 -timeout 10
 
 
 
+
+## Word / HTML 独立 Docling 解析服务 — 2026-11-17
+
+工作树 `dsh-9769f458-39e5`（Windows 11，Go 1.27.3，Python 3.11.7，Docling 2.150.1，
+本地 MySQL 3307）。新增独立 `python-workers/docling-service`（FastAPI，:8092，
+`POST /v1/parse` 返回带 `manifest.json`/`document.json`/图片的 ZIP），Go 侧在
+`ingest.Prepare` 中按格式分发：`.docx`/`.html`/`.htm` 走 Docling，`.doc` 先经
+LibreOffice 转 `.docx` 再交给同一服务；`RAG_DOCLING_SERVICE_URL` 为空时保持旧行为
+（`.docx`/`.doc` 进程内解析，HTML 在受理层拒绝）。
+
+### 已验证（可复核）
+
+```powershell
+# 1) 真实 Docling 服务（本机 venv，固定 docling-slim==2.150.1）
+cd python-workers/docling-service
+python -m pytest                                                    # 12 passed
+# 覆盖：DOCX/HTML 清单、表格 row/col/row_span/col_span、<caption>/<figcaption>、
+# DOCX 内嵌图片、HTML data URI 图片、外链图片不抓取、ZIP 布局、400/415/500/504。
+
+# 2) 真实 Docling + 现有 Go 入库入口（RAG_DOCLING_SERVICE_URL 指向真实服务）
+$env:RAG_DOCLING_SERVICE_URL = 'http://127.0.0.1:8092'
+cd <repo>
+go test -count=1 -run TestDoclingIntegration -v ./internal/ingest/
+# TestDoclingIntegrationDOCX/HTML/LegacyDOC/ServiceUnavailable 全 PASS。
+# 断言：表格行块包含表头与对应行值、题注进入资产块、图片资产有真实字节、
+# .doc 来源名仍为 .doc、失败尝试不写 staging、HTML chunk 只带 html_parser_version。
+
+# 3) 修改范围的 Go 回归（MySQL 串行；RAG_TEST_MYSQL_URL 指向 praxis_gotest）
+$env:RAG_TEST_MYSQL_URL = 'mysql+pymysql://rag:praxis-dev-pw@127.0.0.1:3307/praxis_gotest?charset=utf8mb4'
+go test -p 1 -count=1 -timeout 20m ./internal/document/ ./internal/ingest/ ./internal/chunking/ `
+        ./internal/config/ ./internal/state/ ./internal/httpapi/ ./internal/searchrefs/ ./internal/runtime/
+# 全部 ok（state 37.2s / runtime 33.9s，其余 <2s）。
+
+# 4) Console（worktree 复用主仓 node_modules junction）
+cd frontend
+npx vitest run --configLoader native src/documentReplace.test.ts   # 11 passed
+npm run typecheck                                                  # exit 0
+
+# 5) Compose 渲染
+docker compose --env-file .env.example config --quiet              # exit 0
+```
+
+### 未实机验证
+
+- `python-workers/docling-service` 镜像构建与容器运行：本机 Docker engine 不可用
+  （npipe 权限拒绝），只验证了本机 venv 启动与 `docker compose config`。
+- 完整「上传 → Kafka/debezium → rag-document-worker → Qdrant → 检索」链路：未在隔离
+  MySQL/Kafka/Qdrant 栈上运行；`ingest.Prepare` 真实解析、切分、资产与来源字段已验证，
+  检索层回归测试通过。
+- K8s 清单与 `scripts/start-stack.ps1` 尚未接入 Docling（仅 Compose / `.env.example` /
+  `deploy/config.container.toml`）。
+- HTML 预览的浏览器级同源安全验证（代码保持纯文本渲染、无 `dangerouslySetInnerHTML`）。

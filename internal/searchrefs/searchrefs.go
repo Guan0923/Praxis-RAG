@@ -288,6 +288,8 @@ func (s *captureSession) sourceReferences(
 		bucket = state.PDFAssetBucket
 	case strings.HasSuffix(lowered, ".doc"), strings.HasSuffix(lowered, ".docx"):
 		bucket = state.WordAssetBucket
+	case strings.HasSuffix(lowered, ".html"), strings.HasSuffix(lowered, ".htm"):
+		bucket = state.HTMLAssetBucket
 	}
 	if bucket == "" {
 		return references, nil

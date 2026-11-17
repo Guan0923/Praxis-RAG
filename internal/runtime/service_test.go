@@ -131,6 +131,7 @@ func TestReadDocumentServesVersionedSavedMarkdown(t *testing.T) {
 	}{
 		{"manual.pdf", state.PDFAssetBucket},
 		{"manual.docx", state.WordAssetBucket},
+		{"manual.html", state.HTMLAssetBucket},
 	}
 	for index, testCase := range cases {
 		documentID := "doc-" + strings.ReplaceAll(testCase.name, ".", "-")
@@ -267,7 +268,7 @@ func TestCheckDocumentsRejectsUnsupportedExtension(t *testing.T) {
 	if !errors.As(err, &validation) {
 		t.Fatalf("CheckDocuments() error = %v", err)
 	}
-	want := "暂不支持该文件类型：bad.exe；请选择 .doc、.docx、.md、.pdf、.txt。"
+	want := "暂不支持该文件类型：bad.exe；请选择 .doc、.docx、.htm、.html、.md、.pdf、.txt。"
 	if validation.Message != want {
 		t.Fatalf("message = %q, want %q", validation.Message, want)
 	}
@@ -282,4 +283,78 @@ func TestCheckDocumentsRejectsUnsupportedExtension(t *testing.T) {
 	if files, ok := payload["files"].([]map[string]any); !ok || len(files) != 1 {
 		t.Fatalf("payload = %+v", payload)
 	}
+}
+
+// TestArtifactBucketForSuffix pins the parser-artifact bucket selection shared
+// by the versioned read path and the ingest publication.
+func TestArtifactBucketForSuffix(t *testing.T) {
+	cases := map[string]string{
+		".pdf":  state.PDFAssetBucket,
+		".doc":  state.WordAssetBucket,
+		".docx": state.WordAssetBucket,
+		".html": state.HTMLAssetBucket,
+		".htm":  state.HTMLAssetBucket,
+	}
+	for suffix, want := range cases {
+		got, ok := artifactBucketForSuffix(suffix)
+		if !ok || got != want {
+			t.Fatalf("artifactBucketForSuffix(%q) = %q, %v; want %q", suffix, got, ok, want)
+		}
+	}
+	if _, ok := artifactBucketForSuffix(".md"); ok {
+		t.Fatalf("markdown must not select an artifact bucket")
+	}
+}
+
+// TestReadDocumentUnversionedDoclingWordAndHTML pins the unversioned read path:
+// Docling Word content is readable, HTML reads only the HTML asset bucket, and
+// HTML without recorded content never falls back to the raw source markup.
+func TestReadDocumentUnversionedDoclingWordAndHTML(t *testing.T) {
+	service, stores := newKBService(t, "http://127.0.0.1:1")
+	ctx := context.Background()
+
+	wordID := chunking.DocumentID("manual.docx")
+	insertReadableDocument(t, stores, "alpha", "manual.docx", wordID, "", map[string]any{
+		"word_parser_version": document.DoclingWordParserVersion,
+	})
+	if err := stores.Blobs.Put(ctx, "alpha", state.WordAssetBucket, wordID+"/document.md",
+		[]byte("# Saved Docling Word"), nil); err != nil {
+		t.Fatalf("Blobs.Put(docling word) error = %v", err)
+	}
+	if text, _, err := service.ReadDocument(ctx, "alpha", "manual.docx"); err != nil || text != "# Saved Docling Word" {
+		t.Fatalf("docling Word read = %q, %v", text, err)
+	}
+
+	htmlID := chunking.DocumentID("page.html")
+	insertReadableDocument(t, stores, "alpha", "page.html", htmlID, "", map[string]any{
+		"html_parser_version": document.HTMLParserVersion,
+	})
+	if err := stores.Blobs.Put(ctx, "alpha", state.HTMLAssetBucket, htmlID+"/document.md",
+		[]byte("# Saved HTML"), nil); err != nil {
+		t.Fatalf("Blobs.Put(html) error = %v", err)
+	}
+	if text, _, err := service.ReadDocument(ctx, "alpha", "page.html"); err != nil || text != "# Saved HTML" {
+		t.Fatalf("HTML read = %q, %v", text, err)
+	}
+
+	// Missing parser metadata must fail instead of serving raw markup.
+	putSourceBlob(t, stores, "alpha", "raw.html", []byte("<html>raw</html>"))
+	insertReadableDocument(t, stores, "alpha", "raw.html", "doc-raw-html", "", nil)
+	_, _, err := service.ReadDocument(ctx, "alpha", "raw.html")
+	assertKnowledgeValidation(t, err, savedHTMLContentUnavailableMessage)
+
+	// A versioned HTML record whose object is gone also fails without falling
+	// back to the source bytes.
+	putSourceBlob(t, stores, "alpha", "gone.html", []byte("<html>gone</html>"))
+	insertReadableDocument(t, stores, "alpha", "gone.html", "doc-gone-html", strings.Repeat("d", 32), nil)
+	_, _, err = service.ReadDocument(ctx, "alpha", "gone.html")
+	assertKnowledgeValidation(t, err, "Saved content unavailable; reimport this document")
+
+	// An unsupported HTML parser version asks for a reimport.
+	putSourceBlob(t, stores, "alpha", "old.html", []byte("<html>old</html>"))
+	insertReadableDocument(t, stores, "alpha", "old.html", "doc-old-html", "", map[string]any{
+		"html_parser_version": "html-assets-v0",
+	})
+	_, _, err = service.ReadDocument(ctx, "alpha", "old.html")
+	assertKnowledgeValidation(t, err, "HTML parser changed; reimport this document")
 }

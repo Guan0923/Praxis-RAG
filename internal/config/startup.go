@@ -82,6 +82,7 @@ var observedKeys = []string{
 	"RAG_VLM_BASE_URL", "RAG_VLM_API_KEY", "RAG_VLM_MODEL", "RAG_VLM_TIMEOUT",
 	"RAG_VLM_CONCURRENCY",
 	"RAG_WORD_CONVERTER_PATH", "RAG_WORD_CONVERT_TIMEOUT",
+	"RAG_DOCLING_SERVICE_URL", "RAG_DOCLING_SERVICE_TIMEOUT",
 }
 
 // ignoredDocumentKeys are legacy settings still accepted but never applied.
