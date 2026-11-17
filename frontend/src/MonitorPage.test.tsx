@@ -416,9 +416,10 @@ describe("MonitorPage", () => {
       "全部日志",
     ]);
 
-    // 概览版式：状态告警（正常时不渲染）+ 关键指标 + 系统资源 + 服务信息。
+    // 概览版式：状态告警（正常时不渲染）+ 双列网格（关键指标 | 服务信息）
+    // + 整行的系统资源。DOM 顺序 = 网格填充顺序。
     const page = screen.getByLabelText("系统监控页面") as HTMLElement;
-    expect(cardTitles(page)).toEqual(["关键指标", "系统资源", "服务信息"]);
+    expect(cardTitles(page)).toEqual(["关键指标", "服务信息", "系统资源"]);
 
     // 关键指标：五个任务指标都以 Statistic 渲染，数据来自 queues/library/activity。
     const metricsCard = screen.getByText("关键指标").closest(".ant-card") as HTMLElement;

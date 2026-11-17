@@ -1255,6 +1255,29 @@ body.drag-selecting * {
   gap: 6px;
   cursor: pointer;
 }
+/* Two-column monitor grid: compact snapshot cards pair up instead of each
+   taking a full row. Cards keep their natural height (align-items: start) so
+   a short card is never stretched to its tall neighbour; wide blocks (the
+   host-resource sample, Kafka consumer progress, log panels) opt out with
+   .monitor-grid-span-full. Below the lg breakpoint everything stacks to one
+   column, matching the phone layout. */
+.monitor-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+}
+.monitor-grid > * {
+  min-width: 0;
+}
+.monitor-grid-span-full {
+  grid-column: 1 / -1;
+}
+@media (min-width: 992px) {
+  .monitor-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
 .monitor-block {
   display: flex;
   flex-direction: column;

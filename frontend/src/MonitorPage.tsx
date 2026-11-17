@@ -447,7 +447,9 @@ function KeyMetricsCard({ overview }: { overview: MonitorOverview }) {
     <Card size="small" title="关键指标">
       <Row gutter={[16, 16]}>
         {metrics.map((metric) => (
-          <Col key={metric.key} xs={12} sm={8} xl={6}>
+          // 关键指标与「服务信息」分享一行（双列网格）：指标卡按 3/行折行，
+          // 窄屏回落 2/行，避免四格挤成一排。
+          <Col key={metric.key} xs={12} md={8}>
             <Statistic className="monitor-stat" title={metric.title} value={metric.value} />
           </Col>
         ))}
@@ -567,7 +569,7 @@ function ServiceInfoCard({ service }: { service?: MonitorService }) {
     <Card size="small" title="服务信息" className="monitor-service-info">
       <Descriptions
         size="small"
-        column={{ xs: 1, sm: 2, lg: 3 }}
+        column={{ xs: 1, sm: 2 }}
         items={[
           { key: "version", label: "版本", children: service?.version || "—" },
           { key: "uptime", label: "运行时长", children: formatDuration(service?.uptime_seconds) },
@@ -584,7 +586,9 @@ function ServiceInfoCard({ service }: { service?: MonitorService }) {
 }
 
 // OverviewTab keeps the page-level health banner together with the metrics,
-// host resources and static service facts.
+// host resources and static service facts. The two short fact cards (关键指标
+// / 服务信息) share one row of the two-column grid; the wide host-resource
+// sample keeps the full row below them.
 function OverviewTab({ overview }: { overview: MonitorOverview }) {
   const status = overallStatusOf(overview);
   const errors = overview.errors ?? [];
@@ -617,9 +621,13 @@ function OverviewTab({ overview }: { overview: MonitorOverview }) {
           ) : "后端未返回具体降级详情，请查看下方依赖状态。"}
         />
       )}
-      <KeyMetricsCard overview={overview} />
-      <SystemResourcesCard system={overview.system} />
-      <ServiceInfoCard service={overview.service} />
+      <div className="monitor-grid">
+        <KeyMetricsCard overview={overview} />
+        <ServiceInfoCard service={overview.service} />
+        <div className="monitor-grid-span-full">
+          <SystemResourcesCard system={overview.system} />
+        </div>
+      </div>
     </Flex>
   );
 }
@@ -966,22 +974,6 @@ function CaptureRow({ label, connector }: {
         <RestartConnectorAction connector={connector} />
       </Flex>
     </PipelineRow>
-  );
-}
-
-// DebeziumBlock renders the two capture connectors separately: they are
-// independent Kafka Connect connectors with independent schema history, source
-// offsets and consumers, so merging their rows would hide a single-path outage.
-function DebeziumBlock({ pipeline }: { pipeline: MonitorPipeline | null }) {
-  const tasks = pipeline?.debezium?.tasks;
-  const cache = pipeline?.debezium?.cache;
-  return (
-    <section className="monitor-block" aria-label="采集连接器">
-      <Flex vertical gap={12}>
-        <CaptureRow label="文档采集" connector={tasks} />
-        <CaptureRow label="缓存采集" connector={cache} />
-      </Flex>
-    </section>
   );
 }
 
@@ -1350,108 +1342,132 @@ function ComponentTab({ tab, overview, autoRefresh, active }: {
     case "mysql":
       return (
         <Flex vertical gap={16}>
-          <DependencyCard overview={overview} names={["mysql"]} />
-          <Card size="small" title="文档任务队列">
-            <DocumentJobsBlock queues={overview.queues} />
-          </Card>
-          <Card size="small" title="上传操作">
-            <UploadsBlock uploads={overview.queues?.uploads} />
-          </Card>
-          <Card size="small" title="库与活动">
-            <LibraryActivityBlock library={overview.library} activity={overview.activity} />
-          </Card>
+          <div className="monitor-grid">
+            <DependencyCard overview={overview} names={["mysql"]} />
+            <Card size="small" title="文档任务队列">
+              <DocumentJobsBlock queues={overview.queues} />
+            </Card>
+            <Card size="small" title="上传操作">
+              <UploadsBlock uploads={overview.queues?.uploads} />
+            </Card>
+            <Card size="small" title="库与活动">
+              <LibraryActivityBlock library={overview.library} activity={overview.activity} />
+            </Card>
+          </div>
           {logPanel}
         </Flex>
       );
     case "redis":
       return (
         <Flex vertical gap={16}>
-          <DependencyCard overview={overview} names={["redis"]} />
-          <Card size="small" title="缓存水位">
-            <CacheBlock pipeline={overview.pipeline} />
-          </Card>
+          <div className="monitor-grid">
+            <DependencyCard overview={overview} names={["redis"]} />
+            <Card size="small" title="缓存水位">
+              <CacheBlock pipeline={overview.pipeline} />
+            </Card>
+          </div>
           {logPanel}
         </Flex>
       );
     case "qdrant":
       return (
         <Flex vertical gap={16}>
-          <DependencyCard overview={overview} names={["qdrant"]} />
-          <Card size="small" title="Qdrant 集合">
-            <section className="monitor-block" aria-label="Qdrant 集合">
-              <Descriptions
-                size="small"
-                column={1}
-                items={[
-                  { key: "collection", label: "集合名", children: overview.service?.collection || "未知" },
-                ]}
-              />
-              <p className="secondary monitor-note">
-                依赖行中的“向量点”为该集合当前存储的点数；集合名来自服务配置。
-              </p>
-            </section>
-          </Card>
+          <div className="monitor-grid">
+            <DependencyCard overview={overview} names={["qdrant"]} />
+            <Card size="small" title="Qdrant 集合">
+              <section className="monitor-block" aria-label="Qdrant 集合">
+                <Descriptions
+                  size="small"
+                  column={1}
+                  items={[
+                    { key: "collection", label: "集合名", children: overview.service?.collection || "未知" },
+                  ]}
+                />
+                <p className="secondary monitor-note">
+                  依赖行中的“向量点”为该集合当前存储的点数；集合名来自服务配置。
+                </p>
+              </section>
+            </Card>
+          </div>
           {logPanel}
         </Flex>
       );
     case "kafka":
       return (
         <Flex vertical gap={16}>
-          <DependencyCard overview={overview} names={["kafka"]} />
-          <Card size="small" title="Kafka 消费进度">
-            <KafkaGroupsBlock pipeline={overview.pipeline} />
-          </Card>
-          <Card size="small" title="文档任务投递状态">
-            <DocumentJobsStatusBlock pipeline={overview.pipeline} />
-          </Card>
+          <div className="monitor-grid">
+            <DependencyCard overview={overview} names={["kafka"]} />
+            <Card size="small" title="文档任务投递状态">
+              <DocumentJobsStatusBlock pipeline={overview.pipeline} />
+            </Card>
+            {/* 消费进度行包含 topic/group/位点长文本，保留整行宽度换行。 */}
+            <div className="monitor-grid-span-full">
+              <Card size="small" title="Kafka 消费进度">
+                <KafkaGroupsBlock pipeline={overview.pipeline} />
+              </Card>
+            </div>
+          </div>
           {logPanel}
         </Flex>
       );
     case "pdf":
       return (
         <Flex vertical gap={16}>
-          <DependencyCard overview={overview} names={["pdf-service"]} />
-          <Card size="small" title="PDF 引擎">
-            <section className="monitor-block" aria-label="PDF 引擎">
-              <Descriptions
-                size="small"
-                column={1}
-                items={[
-                  { key: "engine", label: "引擎", children: overview.service?.pdf_engine || "未知" },
-                ]}
-              />
-              <p className="secondary monitor-note">
-                PDF 解析服务是可选独立微服务；依赖行的延迟与详情来自其健康探针。版面/OCR/表格/公式/图片描述由服务端配置的远端视觉模型提供。
-              </p>
-            </section>
-          </Card>
+          <div className="monitor-grid">
+            <DependencyCard overview={overview} names={["pdf-service"]} />
+            <Card size="small" title="PDF 引擎">
+              <section className="monitor-block" aria-label="PDF 引擎">
+                <Descriptions
+                  size="small"
+                  column={1}
+                  items={[
+                    { key: "engine", label: "引擎", children: overview.service?.pdf_engine || "未知" },
+                  ]}
+                />
+                <p className="secondary monitor-note">
+                  PDF 解析服务是可选独立微服务；依赖行的延迟与详情来自其健康探针。版面/OCR/表格/公式/图片描述由服务端配置的远端视觉模型提供。
+                </p>
+              </section>
+            </Card>
+          </div>
           {logPanel}
         </Flex>
       );
     case "worker":
       return (
         <Flex vertical gap={16}>
-          <Card size="small" title="Worker 心跳">
-            <WorkerBlock pipeline={overview.pipeline} />
-          </Card>
-          <Card size="small" title="副本数（Kubernetes）">
-            <WorkerScaleCard active={active} />
-          </Card>
-          <Card size="small" title="文档任务状态">
-            <DocumentJobsStatusBlock pipeline={overview.pipeline} />
-          </Card>
-          <Card size="small" title="阶段分布">
-            <StageDistributionBlock queues={overview.queues} />
-          </Card>
+          <div className="monitor-grid">
+            <Card size="small" title="Worker 心跳">
+              <WorkerBlock pipeline={overview.pipeline} />
+            </Card>
+            <Card size="small" title="文档任务状态">
+              <DocumentJobsStatusBlock pipeline={overview.pipeline} />
+            </Card>
+            <Card size="small" title="副本数（Kubernetes）">
+              <WorkerScaleCard active={active} />
+            </Card>
+            <Card size="small" title="阶段分布">
+              <StageDistributionBlock queues={overview.queues} />
+            </Card>
+          </div>
           {logPanel}
         </Flex>
       );
     case "debezium":
       return (
         <Flex vertical gap={16}>
-          <Card size="small" title="Kafka Connect 采集连接器">
-            <DebeziumBlock pipeline={overview.pipeline} />
-          </Card>
+          {/* 文档与缓存采集是两条独立链路：拆成并排的两张卡各自成行，
+              保持“互不合并”的同时让两行内容共享一行高度。 */}
+          <section aria-label="采集连接器">
+            <div className="monitor-grid">
+              <Card size="small" title="文档采集连接器">
+                <CaptureRow label="文档采集" connector={overview.pipeline?.debezium?.tasks} />
+              </Card>
+              <Card size="small" title="缓存采集连接器">
+                <CaptureRow label="缓存采集" connector={overview.pipeline?.debezium?.cache} />
+              </Card>
+            </div>
+          </section>
           <Card size="small" title="文档任务投递状态">
             <DocumentJobsStatusBlock pipeline={overview.pipeline} />
           </Card>
