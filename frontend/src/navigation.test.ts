@@ -26,15 +26,25 @@ describe("canViewConsolePage", () => {
     expect(canViewConsolePage("model-profiles", false, undefined)).toBe(true);
   });
 
-  it("keeps permissions to administrators and VIPs", () => {
+  it("lets signed-in owners reach the shared permission review page", () => {
     expect(canViewConsolePage("permissions", true, "vip")).toBe(true);
-    expect(canViewConsolePage("permissions", true, "user")).toBe(false);
+    // A Free owner must still be able to review/revoke existing sharing; the
+    // page disables new invitations when can_share is false.
+    expect(canViewConsolePage("permissions", true, "user")).toBe(true);
     expect(canViewConsolePage("permissions", false, undefined)).toBe(false);
   });
 
   it("leaves ordinary pages visible to every account", () => {
     expect(canViewConsolePage("search", true, "user")).toBe(true);
     expect(canViewConsolePage("documents", true, "user")).toBe(true);
+  });
+
+  it("keeps the membership page visible to every signed-in role", () => {
+    for (const role of ["admin", "vip", "user"] as const) {
+      expect(canViewConsolePage("membership", true, role)).toBe(true);
+    }
+    // Legacy token-only mode has no account to own an entitlement.
+    expect(canViewConsolePage("membership", false, undefined)).toBe(false);
   });
 });
 
@@ -73,7 +83,7 @@ describe("parseRoute", () => {
   });
 
   it("parses the static Console pages", () => {
-    for (const page of ["api-keys", "model-profiles", "knowledge-bases", "users", "system-settings", "monitor", "permissions", "invitations"]) {
+    for (const page of ["api-keys", "membership", "model-profiles", "knowledge-bases", "users", "system-settings", "monitor", "permissions", "invitations"]) {
       expect(parseRoute("#/" + page, "default")).toEqual({ namespace: "default", page });
     }
   });
@@ -127,6 +137,7 @@ describe("routeHash", () => {
       { namespace: "team", page: "documents" as const },
       { namespace: "team", page: "documents" as const, documentName: "a b.md" },
       { namespace: "team", page: "permissions" as const },
+      { namespace: "team", page: "membership" as const },
       { namespace: "team", page: "monitor" as const },
       { namespace: "team", page: "system-settings" as const },
       { namespace: "team", page: "model-profiles" as const },

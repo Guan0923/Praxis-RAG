@@ -1,11 +1,13 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/Guan0923/xinghe_rag/internal/access"
 	"github.com/Guan0923/xinghe_rag/internal/auth"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
+	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
 // registerAccessRoutes mounts the knowledge-base sharing surface: invite
@@ -53,7 +55,27 @@ func (s *Server) handleListInvitableUsers(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	if !session.User.CanShare() {
+	if s.access != nil {
+		// Membership-aware sharing is an optional extension so existing
+		// AccessControl fakes keep compiling; a role-only control still uses
+		// the historical VIP check below.
+		if checker, ok := s.access.(interface {
+			CanShareAccount(context.Context, state.User) (bool, error)
+		}); ok {
+			canShare, err := checker.CanShareAccount(r.Context(), session.User)
+			if err != nil {
+				writeDetail(w, http.StatusInternalServerError, "知识库权限服务异常")
+				return
+			}
+			if !canShare {
+				writeDetail(w, http.StatusForbidden, access.MessageForbidden)
+				return
+			}
+		} else if !session.User.CanShare() {
+			writeDetail(w, http.StatusForbidden, access.MessageForbidden)
+			return
+		}
+	} else if !session.User.CanShare() {
 		writeDetail(w, http.StatusForbidden, access.MessageForbidden)
 		return
 	}

@@ -147,10 +147,27 @@ func (s *Service) createKnowledgeBase(
 	if err != nil {
 		return nil, adminError(err)
 	}
-	if err := s.stores.KnowledgeBases.CreateWithOwner(ctx, settings, ownerUserID); err != nil {
+	// A personal knowledge base consumes one slot of the owner's current plan.
+	// The count and insert share one MySQL transaction; unowned/system template
+	// knowledge bases keep the administrative path and are not limited.
+	if ownerUserID != "" && s.stores.Membership != nil {
+		entitlement, entitlementErr := s.stores.Membership.Effective(ctx, ownerUserID, time.Now())
+		if entitlementErr != nil {
+			return nil, &apierrors.KnowledgeError{Message: "会员权益读取失败"}
+		}
+		err = s.stores.KnowledgeBases.CreateWithOwnerLimit(ctx, settings, ownerUserID,
+			entitlement.Limits.MaxOwnedKnowledgeBases)
+	} else {
+		err = s.stores.KnowledgeBases.CreateWithOwner(ctx, settings, ownerUserID)
+	}
+	if err != nil {
 		var conflict *state.StateConflict
 		if errors.As(err, &conflict) {
 			return nil, &apierrors.KnowledgeValidationError{Message: kbconfig.MessageKnowledgeBaseExists}
+		}
+		var limit *state.KnowledgeBaseLimitError
+		if errors.As(err, &limit) {
+			return nil, &apierrors.KnowledgeValidationError{Message: limit.Message}
 		}
 		return nil, &apierrors.KnowledgeError{Message: "知识库配置无法保存"}
 	}
@@ -228,6 +245,11 @@ func (s *Service) cloneDefaultKnowledgeBase(
 	cloned.RerankerValues = connectionValues(reranker)
 	cloned.VLMModel = vlm.Model
 	cloned.VLMValues = connectionValues(vlm)
+	// The billing source is a property of the model connection, not of the
+	// requesting account; a template clone must carry it forward.
+	if source, ok := settings["embedding_billing_source"].(string); ok {
+		cloned.EmbeddingBillingSource = source
+	}
 	if strings.TrimSpace(cloned.TokenizerModel) == "" {
 		if tokenizer, ok := settings["tokenizer"].(string); ok {
 			cloned.TokenizerModel = tokenizer
@@ -325,7 +347,7 @@ func (s *Service) publishKnowledgeBase(
 	updated := result.Settings
 	staging := result.StagingCollection
 	if staging != "" {
-		if err := s.reembedIntoStaging(ctx, namespace, current, staging, result); err != nil {
+		if err := s.reembedIntoStaging(ctx, namespace, current, staging, result, snapshot.Version); err != nil {
 			s.discardCollection(staging)
 			return nil, err
 		}
@@ -374,6 +396,7 @@ func (s *Service) reembedIntoStaging(
 	current map[string]any,
 	staging string,
 	result kbconfig.UpdateResult,
+	version int,
 ) error {
 	collection, err := settingString(current, "collection")
 	if err != nil {
@@ -412,7 +435,21 @@ func (s *Service) reembedIntoStaging(
 		return adminError(err)
 	}
 	embedder := modelapi.NewHTTPEmbedder(result.Embedding, modelapi.DefaultTimeout)
-	if err := source.ReembedInto(ctx, staging, embedder, expectedChunks); err != nil {
+	// Re-embedding is an administrator/platform operation. Its quota usage is
+	// recorded against the isolated system ledger and never charged to the
+	// knowledge-base owner.
+	var reembedder qdrant.Embedder = embedder
+	if s.stores.Membership != nil && embeddingBillingSource(current) != "customer" {
+		reembedder = &meteredReembedder{
+			inner:     embedder,
+			repo:      s.stores.Membership,
+			namespace: namespace,
+			model:     result.Embedding.Model,
+			version:   version,
+			now:       s.clock,
+		}
+	}
+	if err := source.ReembedInto(ctx, staging, reembedder, expectedChunks); err != nil {
 		// Model failures are operational (Python ModelAPIError subclasses
 		// RagOperationError); Qdrant failures are reported safely as service
 		// errors so the HTTP layer renders 503.

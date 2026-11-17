@@ -5,7 +5,9 @@ import {
   avatarUrl,
   changeEmail,
   changePassword,
+  closeMembershipOrder,
   createInvitation,
+  createMembershipOrder,
   createModelProfile,
   currentCSRFToken,
   deleteApiKeys,
@@ -14,15 +16,20 @@ import {
   deleteModelProfile,
   errorText,
   fetchAccess,
+  fetchAdminBillingOrders,
   fetchGrants,
   fetchInvitationInbox,
   fetchMailSettings,
+  fetchMembership,
+  fetchMembershipOrder,
   fetchModelProfileModels,
   fetchModelProfiles,
   fetchMonitorLogs,
+  fetchWorkspaceEntitlements,
   formatBytes,
   formatDateTime,
   formatPercent,
+  formatQuota,
   formatRate,
   formatScore,
   invitationLink,
@@ -34,6 +41,7 @@ import {
   monitorTabComponents,
   modelKinds,
   permissionLabels,
+  refundAdminBillingOrder,
   registerAccount,
   requestEmailChange,
   requestRegisterCode,
@@ -46,6 +54,7 @@ import {
   setUnauthorizedHandler,
   submitDocumentBatch,
   subscribeUploadProgress,
+  thousands,
   updateModelProfile,
   updateProfile,
   uploadAvatar,
@@ -555,6 +564,113 @@ describe("sharing API paths and payloads", () => {
   it("returns decoded JSON through api()", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ users: [{ id: "u1" }] }));
     await expect(api("/v1/users")).resolves.toEqual({ users: [{ id: "u1" }] });
+  });
+});
+
+describe("membership API contract", () => {
+  it("reads the membership overview without caching", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({
+      membership: { plan: "free", plan_name: "Free" },
+      plans: [],
+      orders: [],
+    }));
+    const data = await fetchMembership();
+    expect(data.membership.plan_name).toBe("Free");
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/membership");
+    expect(options.cache).toBe("no-store");
+  });
+
+  it("creates an order from plan/period and returns the server payment form", async () => {
+    const pay = {
+      gateway: "https://openapi.alipay.com/gateway.do",
+      params: { out_trade_no: "PR1", total_amount: "191.04" },
+    };
+    fetchMock.mockResolvedValue(
+      jsonResponse({ order: { id: "PR1", amount_yuan: "191.04" }, pay }),
+    );
+    const result = await createMembershipOrder({ plan: "plus", period: "year" });
+    expect(result.order.id).toBe("PR1");
+    // The amount comes from pay.params, never from the Console.
+    expect(result.pay?.params.total_amount).toBe("191.04");
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/membership/orders");
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(String(options.body))).toEqual({ plan: "plus", period: "year" });
+  });
+
+  it("sends an upgrade intent without a period", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ order: { id: "PR2" } }));
+    await createMembershipOrder({ intent: "upgrade", plan: "pro" });
+    expect(JSON.parse(String(requestArgs(0)[1].body))).toEqual({
+      intent: "upgrade",
+      plan: "pro",
+    });
+  });
+
+  it("refreshes one order and closes it", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ order: { id: "PR 1", status: "paid", status_label: "已支付" } }),
+    );
+    const result = await fetchMembershipOrder("PR 1", true);
+    expect(result.order.status_label).toBe("已支付");
+    expect(requestArgs(0)[0]).toBe("/v1/membership/orders/PR%201?refresh=1");
+    expect(requestArgs(0)[1].cache).toBe("no-store");
+    fetchMock.mockResolvedValue(
+      jsonResponse({ order: { id: "PR1", status: "closed", status_label: "已关闭" } }),
+    );
+    await expect(closeMembershipOrder("PR1")).resolves.toMatchObject({ status: "closed" });
+    expect(requestArgs(1)[0]).toBe("/v1/membership/orders/PR1/close");
+    expect(requestArgs(1)[1].method).toBe("POST");
+  });
+
+  it("reads the workspace entitlements for the encoded namespace", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({
+      namespace: "team kb",
+      owner: true,
+      shared: false,
+      owner_username: null,
+      files: { used: 1, limit: 10, unlimited: false, can_add: true, reason: null },
+      embedding: {
+        can_use: true,
+        owner_view: true,
+        refresh_at: "2026-12-01T00:00:00Z",
+        limit: 100000,
+        used: 0,
+        reserved: 0,
+        remaining: 100000,
+      },
+    }));
+    const data = await fetchWorkspaceEntitlements("team kb", connection);
+    expect(data.files?.used).toBe(1);
+    expect(requestArgs(0)[0]).toBe("/v1/workspaces/team%20kb/entitlements");
+    expect(requestArgs(0)[1].cache).toBe("no-store");
+    const headers = requestArgs(0)[1].headers as Headers;
+    expect(headers.get("X-RAG-Namespace")).toBe("team-kb");
+  });
+
+  it("filters admin reconciliation orders and posts a refund reason", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ orders: [{ id: "PR1", username: "alice" }] }),
+    );
+    const rows = await fetchAdminBillingOrders("paid");
+    expect(rows[0].username).toBe("alice");
+    expect(requestArgs(0)[0]).toBe("/v1/admin/billing/orders?status=paid&limit=100");
+    fetchMock.mockResolvedValue(
+      jsonResponse({ order: { id: "PR1", status: "refunded", status_label: "已退款" } }),
+    );
+    await expect(refundAdminBillingOrder("PR1", "重复下单"))
+      .resolves.toMatchObject({ status: "refunded" });
+    expect(requestArgs(1)[0]).toBe("/v1/admin/billing/orders/PR1/refund");
+    expect(JSON.parse(String(requestArgs(1)[1].body))).toEqual({ reason: "重复下单" });
+  });
+
+  it("formats quota numbers in Chinese", () => {
+    expect(thousands(1234567)).toBe("1,234,567");
+    expect(thousands(0)).toBe("0");
+    expect(formatQuota(100_000)).toBe("100,000");
+    expect(formatQuota(1_000_000_000)).toBe("10 亿");
+    expect(formatQuota(150_000_000)).toBe("1.5 亿");
   });
 });
 

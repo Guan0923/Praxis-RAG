@@ -2300,3 +2300,53 @@ go test ./internal/redisstate/ -run 'TestDocumentLock' -count=2 -p 1 -timeout 10
 
 
 
+
+## 2026-11-17 个人会员、支付宝与 Embedding 额度
+
+工作树 `dsh-c017f309-b115`（Windows 11，Go 1.27.3，本地 MySQL 3307）。
+
+**改动范围**：新增 `internal/plans`（套餐目录/周期/升级报价）、`internal/payment`
+（支付宝电脑网站支付 RSA2 签名、下单/查单/关单/退款/通知）、`internal/membership`
+（会员投影与订单编排）；`internal/state` 新增 6 张表与
+Membership/Billing 仓库、同事务知识库/文件配额和 Embedding 周额度账本；
+`internal/runtime` 在切分后、Embedding 前预留字符额度并在成功/未知时结算；
+访问层让 Plus/Pro 会员可分享自有库且到期后停止新发邀请；Console 新增「会员与用量」页、
+文档页额度提示和自付连接标记。
+
+**本仓库已执行**
+
+```powershell
+$env:RAG_TEST_MYSQL_URL = 'mysql://rag:praxis-dev-pw@127.0.0.1:3307/praxis_cache_test_smoke'
+$env:GOCACHE = 'D:/Project/Praxis-RAG/.agents/worktrees/dsh-c017f309-b115/.test-tmp/go-cache'
+go build ./...                                                            # exit 0
+go vet ./internal/plans ./internal/payment ./internal/membership ./internal/state `
+  ./internal/access ./internal/runtime ./internal/httpapi ./internal/kbconfig `
+  ./internal/wire ./cmd/rag-service                                      # exit 0
+go test -p 1 -count=1 -timeout 25m ./internal/plans ./internal/payment ./internal/membership `
+  ./internal/state ./internal/access ./internal/httpapi ./internal/runtime ./internal/e2e
+# 8 包全部 ok；state 37.2s，runtime 30.3s，httpapi 2.2s，e2e 3.3s
+```
+
+新增/更新的重点用例：
+
+- `internal/plans`：价格与限额、1 月 31 日锚点跨短月、上海自然月、升级差价逐段计算。
+- `internal/payment`：RSA2 签名/验签与密钥格式、金额整数分、PagePay/Query/Close/Refund/
+  QueryRefund、错 app_id/seller_id/金额/状态通知拒绝，全部无网络。
+- `internal/state/membership_quota_test.go`：剩余 1,000 字符时两个 800 字符并发预留至多
+  一个成功；pending_review→settled 不重复扣费；Free 第 10 个文件并发受理至多一个；
+  Free 5 个自有库后并发创建至多一个成功，共享库不占名额。
+- `internal/membership/service_integration_test.go`：真实 MySQL 上 Plus 下单→验签通知→
+  幂等重复通知→订单/额度到账→Plus→Pro 升级保留到期日→错金额通知不发放→查看他人订单被拒。
+- `internal/httpapi/membership_http_test.go`：支付宝通知无需会话/CSRF、失败不回显签名；
+  会员路由未登录 401；错误类别映射。
+- 前端 `npm run typecheck` 通过；`MembershipPage/navigation/api.test/uploadBatches/Console/
+  KnowledgeBasesPage` 共 6 个文件 115 个用例通过。
+
+**未实机验证 / 上线条件**
+
+- 支付宝沙箱与生产真实联调需要商户 AppID、应用私钥、支付宝公钥、SellerID、公网 HTTPS
+  `RAG_ALIPAY_NOTIFY_URL` 与签约的电脑网站支付产品；仓库内只验证了本地 RSA/幂等/HTTP
+  契约，没有真实扣款或支付宝通知。
+- Qdrant/Kafka/Redis 在本机可达，但本次未做真实 Qdrant 发布失败后的部分批次计量演练。
+- 存量账号迁移基线、超限存量保留和后台对账只做了 schema/仓库级测试，未在真实生产数据上
+  执行迁移演练。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -560,16 +561,25 @@ func (r *KnowledgeBaseRepository) Get(ctx context.Context, namespace string) (ma
 
 // Create inserts a new knowledge base at version 1 without an owner.
 func (r *KnowledgeBaseRepository) Create(ctx context.Context, settings map[string]any) error {
-	return r.create(ctx, settings, "")
+	return r.create(ctx, settings, "", -1)
 }
 
 // CreateWithOwner inserts a new knowledge base at version 1 owned by the given
 // Console account. An empty ownerUserID is the same as Create.
 func (r *KnowledgeBaseRepository) CreateWithOwner(ctx context.Context, settings map[string]any, ownerUserID string) error {
-	return r.create(ctx, settings, ownerUserID)
+	return r.create(ctx, settings, ownerUserID, -1)
 }
 
-func (r *KnowledgeBaseRepository) create(ctx context.Context, settings map[string]any, ownerUserID string) error {
+// CreateWithOwnerLimit inserts a new knowledge base at version 1 only when the
+// owner still has room left. The owner row is locked and the existing count is
+// taken in the same transaction as the INSERT, so two concurrent creates cannot
+// both pass the check. maxOwned < 0 means unlimited and keeps the
+// CreateWithOwner behaviour.
+func (r *KnowledgeBaseRepository) CreateWithOwnerLimit(ctx context.Context, settings map[string]any, ownerUserID string, maxOwned int) error {
+	return r.create(ctx, settings, ownerUserID, maxOwned)
+}
+
+func (r *KnowledgeBaseRepository) create(ctx context.Context, settings map[string]any, ownerUserID string, maxOwned int) error {
 	namespace, err := requireSetting(settings, "namespace")
 	if err != nil {
 		return err
@@ -592,6 +602,43 @@ func (r *KnowledgeBaseRepository) create(ctx context.Context, settings map[strin
 		return newStateError("知识库配置无法保存")
 	}
 	defer func() { _ = database.Rollback() }()
+	if ownerUserID != "" && maxOwned >= 0 {
+		// Locking the account row serializes every create attempt of this
+		// owner; the count then reflects every committed knowledge base.
+		var locked string
+		lockErr := database.QueryRowContext(ctx,
+			"SELECT id FROM users WHERE id = ? FOR UPDATE", ownerUserID).Scan(&locked)
+		if lockErr != nil && !errors.Is(lockErr, sql.ErrNoRows) {
+			return newStateError("知识库配置无法保存")
+		}
+		// A locking read is required: MySQL's default REPEATABLE READ would keep
+		// the pre-lock snapshot for a plain COUNT and two concurrent creates
+		// could both pass the limit.
+		rows, countErr := database.QueryContext(ctx,
+			"SELECT namespace FROM knowledge_bases WHERE owner_user_id = ? FOR UPDATE", ownerUserID)
+		if countErr != nil {
+			return newStateError("知识库配置无法保存")
+		}
+		current := 0
+		for rows.Next() {
+			var existing string
+			if scanErr := rows.Scan(&existing); scanErr != nil {
+				_ = rows.Close()
+				return newStateError("知识库配置无法保存")
+			}
+			current++
+		}
+		if closeErr := rows.Close(); closeErr != nil {
+			return newStateError("知识库配置无法保存")
+		}
+		if current >= maxOwned {
+			return &KnowledgeBaseLimitError{
+				Current: current,
+				Limit:   maxOwned,
+				Message: fmt.Sprintf("已有知识库数量已达上限（%d 个）", maxOwned),
+			}
+		}
+	}
 	if _, err := touch(ctx, database, knowledgeKeys(namespace)...); err != nil {
 		return newStateError("知识库配置无法保存")
 	}

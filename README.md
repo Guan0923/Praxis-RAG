@@ -72,7 +72,7 @@ REST `/v1/search`、MCP `search`、Console 与本地调试**全部同步执行**
 
 | 入口 | 能力 |
 | --- | --- |
-| Web Console：`/console` | 账号登录/注册（可配置邮箱验证码）、个人信息（头像 / 年龄 / 性别 / 用户名 / 邮箱 / 密码）、角色与知识库权限管理、文档管理、检索调试、工作区切换、管理员「系统设置」邮件服务器（SMTP）与「系统监控」只读页面，「模型配置」模型列表（Embedding / Reranker / VLM / JEV）与知识库配置中的模型快速选择，以及知识库 / API Key 的批量删除（复选或鼠标框选）。 |
+| Web Console：`/console` | 账号登录/注册（可配置邮箱验证码）、个人信息（头像 / 年龄 / 性别 / 用户名 / 邮箱 / 密码）、个人会员与用量（Free/Plus/Pro、月/年卡、支付宝支付、订单与管理员对账）、角色与知识库权限管理、文档管理、检索调试、工作区切换、管理员「系统设置」邮件服务器（SMTP）与「系统监控」只读页面，「模型配置」模型列表（Embedding / Reranker / VLM / JEV）与知识库配置中的模型快速选择，以及知识库 / API Key 的批量删除（复选或鼠标框选）。 |
 | MCP：`/mcp` | 搜索、添加/更新/删除文档、分页读取正文、提示词模板及订阅变更。 |
 | REST API：`/v1/*` | 知识管理与检索接入现有应用；`/openapi.json` 与 `/docs` 提供 OpenAPI 3.1 契约。 |
 
@@ -301,6 +301,7 @@ npm run build
 | --- | --- |
 | [使用与部署](docs/USAGE.md) | Go 后端的构建、运行、环境变量、REST/MCP 示例、worker、迁移 CLI。 |
 | [知识库权限管理](docs/PERMISSIONS.md) | 角色、知识库归属、可读/可修改与单文件/多文件/全库权限、邀请链接流程与接口。 |
+| [个人会员与额度](docs/PERSONAL_MEMBERSHIP.md) | Free/Plus/Pro 套餐、文件/字符额度、有效期与升级、支付宝支付和上线检查。 |
 | [部署指南](docs/DEPLOYMENT.md) | Docker/Compose 与 systemd 示例、worker 重启策略、DLQ 监控、分布式 Kafka Connect、文档锁切换与升级/回滚。 |
 | [Kafka Connect 操作手册](deploy/kafka-connect/README.md) | 两个 Debezium 连接器的模板、注册、生产要求、FAILED task 自动重启与故障演练。 |
 | [Go 迁移总纲](docs/GO_MIGRATION.md) | 目标架构、兼容性硬约束、阶段与进度记录、当前切换状态。 |

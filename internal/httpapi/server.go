@@ -94,6 +94,7 @@ type Server struct {
 	kbAdmin        KnowledgeBaseAdminRuntime
 	kbSelfCreate   KnowledgeBaseSelfCreateRuntime
 	modelProfiles  ModelProfileRuntime
+	membership     MembershipRuntime
 	monitor        MonitorRuntime
 	monitorActions MonitorActionsRuntime
 	notifier       ChangeNotifier
@@ -183,6 +184,7 @@ func (s *Server) registerRoutes() {
 	s.registerDocumentationRoutes()
 	s.registerKnowledgeBaseAdminRoutes()
 	s.registerModelProfileRoutes()
+	s.registerMembershipRoutes()
 	s.registerUserAuthRoutes()
 	s.registerProfileRoutes()
 	s.registerAccessRoutes()

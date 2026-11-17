@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
@@ -14,13 +13,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
-// documentBatchAdmissionConcurrency bounds the per-batch admission fan-out.
-// Admissions for different names run truly in parallel (each one owns its own
-// per-name lease row and transaction); same-name files still serialize on the
-// shared lease row, which is exactly the correctness requirement.
-const documentBatchAdmissionConcurrency = 6
-
-// documentBatchAdmissionBudget bounds one batch admission fan-out even if the
+// documentBatchAdmissionBudget bounds one batch admission even if the
 // client disconnects: the bytes were already accepted over HTTP, so the batch
 // keeps settling instead of being abandoned halfway.
 const documentBatchAdmissionBudget = 5 * time.Minute
@@ -75,24 +68,16 @@ func (s *Service) SubmitDocumentBatch(
 	defer cancel()
 	admissionCtx = logging.WithBatchID(admissionCtx, batch.ID)
 	results := make([]state.DocumentBatchItemResult, len(files))
-	limit := documentBatchAdmissionConcurrency
-	if limit > len(files) {
-		limit = len(files)
+	// Admit in input order. The owner's file/Knowledge-base quota is a scarce
+	// resource and the Console must report which of the first N files won the
+	// last slot deterministically; a concurrent fan-out would make the accepted
+	// filename depend on scheduling. Each admitted job still runs
+	// asynchronously on the worker pool afterwards.
+	for position := range files {
+		results[position] = s.admitDocumentBatchFile(
+			admissionCtx, namespace, position, files[position],
+			documentBatchFileKey(idempotencyKey, position))
 	}
-	var waitGroup sync.WaitGroup
-	slots := make(chan struct{}, limit)
-	for index := range files {
-		waitGroup.Add(1)
-		go func(position int) {
-			defer waitGroup.Done()
-			slots <- struct{}{}
-			defer func() { <-slots }()
-			results[position] = s.admitDocumentBatchFile(
-				admissionCtx, namespace, position, files[position],
-				documentBatchFileKey(idempotencyKey, position))
-		}(index)
-	}
-	waitGroup.Wait()
 	if err := s.stores.DocumentBatches.Finish(admissionCtx, namespace, batch.ID, results); err != nil {
 		// The admissions are already durable; report the batch so the Console
 		// can keep polling instead of losing every accepted artifact id.
@@ -217,6 +202,12 @@ func classifyBatchAdmissionFailure(position int, err error) state.DocumentBatchI
 	if errors.As(err, &conflict) {
 		result.Reason = state.DocumentBatchReasonConflict
 		result.Error = asyncUploadConflictMessage
+		return result
+	}
+	var quota *state.DocumentQuotaExceededError
+	if errors.As(err, &quota) {
+		result.Reason = state.DocumentBatchReasonQuota
+		result.Error = quota.Message
 		return result
 	}
 	result.Reason = state.DocumentBatchReasonInternal

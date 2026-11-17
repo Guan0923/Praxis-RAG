@@ -82,6 +82,13 @@ type Stores struct {
 	Documents      *DocumentRepository
 	Catalogs       *CatalogRepository
 
+	// Membership and Billing own the personal-plan entitlement, the embedding
+	// quota ledger and the Alipay order state. MySQL is the only source of
+	// truth: Redis never participates in an entitlement, quota or order
+	// decision.
+	Membership *MembershipRepository
+	Billing    *BillingRepository
+
 	CacheSync *CacheSynchronizer
 	Blobs     *BlobStore
 	Views     *CachedReadViews
@@ -203,6 +210,8 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.KnowledgeBases = newKnowledgeBaseRepository(database, cacheSync)
 	stores.Documents = newDocumentRepository(database, cacheSync)
 	stores.Catalogs = newCatalogRepository(database, cacheSync)
+	stores.Membership = newMembershipRepository(database)
+	stores.Billing = newBillingRepository(database)
 	stores.Blobs = newBlobStore(database)
 	uploads, err := NewUploadJournal(stores)
 	if err != nil {
@@ -454,6 +463,12 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 		return err
 	}
 	if err := s.migrateVisionModelConfig(ctx); err != nil {
+		return err
+	}
+	// Backfill one free membership row per existing account. The statement is
+	// INSERT IGNORE ... SELECT, so it is additive, idempotent and safe under
+	// concurrent startup: it never rewrites an account that already has a row.
+	if err := s.migrateMembershipBaseline(ctx); err != nil {
 		return err
 	}
 	return s.migrateContentStore(ctx)

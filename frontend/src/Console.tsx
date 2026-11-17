@@ -8,6 +8,7 @@ import {
   ArrowLeftOutlined,
   BellOutlined,
   BookOutlined,
+  CrownOutlined,
   DashboardOutlined,
   DatabaseOutlined,
   DownOutlined,
@@ -31,6 +32,7 @@ import {
   fetchAuthStatus,
   fetchCurrentUser,
   fetchInvitationInbox,
+  fetchMembership,
   logoutSession,
   permissionLabels,
   invitationStatus,
@@ -56,6 +58,7 @@ import { ProfileModal } from "./ProfileModal";
 import { SystemSettingsPage } from "./SystemSettingsPage";
 import { UsersPage } from "./UsersPage";
 import { InvitationsPage, InvitePage } from "./InvitationsPage";
+import { MembershipPage } from "./MembershipPage";
 import { PermissionsPage } from "./PermissionsPage";
 import {
   canViewConsolePage,
@@ -73,6 +76,7 @@ const pages = [
   { key: "create", label: "创建知识库", icon: <ApiOutlined /> },
   { key: "permissions", label: "权限管理", icon: <SafetyOutlined /> },
   { key: "api-keys", label: "API Key", icon: <KeyOutlined /> },
+  { key: "membership", label: "会员与用量", icon: <CrownOutlined /> },
   { key: "model-profiles", label: "模型配置", icon: <AppstoreOutlined /> },
   { key: "knowledge-bases", label: "知识库", icon: <SettingOutlined /> },
   { key: "users", label: "用户管理", icon: <TeamOutlined /> },
@@ -129,6 +133,10 @@ export function Console({
   const [auth, setAuth] = useState<AuthStatus>();
   const [authUser, setAuthUser] = useState<AuthUser>();
   const [profileOpen, setProfileOpen] = useState(false);
+  // planName is the cached membership plan shown in the account menu identity
+  // line; it stays empty (line not extended) until the first load succeeds.
+  const [planName, setPlanName] = useState("");
+  const [planLoaded, setPlanLoaded] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState("");
   const sessionMode = Boolean(auth?.auth_enabled);
@@ -206,6 +214,31 @@ export function Console({
     return () => setUnauthorizedHandler(undefined);
   }, [message]);
 
+  // The account menu shows 当前套餐 · Free/Plus/Pro. A backend without the
+  // membership endpoint (or a failed load) simply keeps the plain identity line.
+  useEffect(() => {
+    if (!sessionMode || !authUser) {
+      setPlanName("");
+      setPlanLoaded(true);
+      return;
+    }
+    let cancelled = false;
+    setPlanLoaded(false);
+    void (async () => {
+      try {
+        const data = await fetchMembership();
+        if (!cancelled) setPlanName(data.membership?.plan_name || "");
+      } catch {
+        // Older deployments: the membership API may not exist yet.
+      } finally {
+        if (!cancelled) setPlanLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionMode, authUser]);
+
   // The invitation inbox drives the header notification bell. It only exists
   // for console sessions; legacy API-key mode has no per-user inbox.
   const loadInbox = useCallback(async () => {
@@ -274,11 +307,11 @@ export function Console({
   // A page this account may not view redirects to the search page; the rule is
   // shared with the sidebar filter, so a direct #/<page> link cannot bypass it.
   useEffect(() => {
-    if (!auth?.auth_enabled || !authUser) return;
-    if (!canViewConsolePage(view, true, authUser.role)) {
+    if (!auth?.auth_enabled || !authUser || !planLoaded) return;
+    if (!canViewConsolePage(view, true, authUser.role, planName)) {
       navigate({ namespace, page: "search" }, true);
     }
-  }, [auth, authUser, view, namespace, navigate]);
+  }, [auth, authUser, view, namespace, navigate, planLoaded, planName]);
 
   async function handleLogout() {
     await logoutSession();
@@ -446,7 +479,7 @@ export function Console({
     { key: "all", label: pendingInvitations.length ? "查看全部邀请" : "邀请中心" },
   ];
   const visiblePages = pages.filter((page) =>
-    canViewConsolePage(page.key, sessionMode, authUser?.role));
+    canViewConsolePage(page.key, sessionMode, authUser?.role, planName));
   // The selector's menu doubles as its status display: loading, explicit
   // failure + retry, the exact "no accessible knowledge base" copy, or the
   // accessible list.
@@ -576,14 +609,16 @@ export function Console({
                     {
                       key: "identity",
                       disabled: true,
-                      label: `${authUser.username} · ${roleLabel(authUser.role)}`,
+                      label: `${authUser.username} · ${roleLabel(authUser.role)}${planName ? ` · 当前套餐 ${planName}` : ""}`,
                     },
                     { key: "profile", icon: <IdcardOutlined />, label: "个人信息" },
+                    { key: "membership", icon: <CrownOutlined />, label: "会员与用量" },
                     { type: "divider" },
                     { key: "logout", icon: <LogoutOutlined />, label: "退出登录" },
                   ],
                   onClick: ({ key }) => {
                     if (key === "profile") setProfileOpen(true);
+                    if (key === "membership") navigate({ namespace, page: "membership" });
                     if (key === "logout") void handleLogout();
                   },
                 }}
@@ -695,6 +730,9 @@ export function Console({
               role={authUser?.role}
             />
           )}
+          {view === "membership" && sessionMode && authUser && (
+            <MembershipPage role={authUser.role} onPlanName={setPlanName} />
+          )}
           {view === "model-profiles" && (!sessionMode || authUser?.role === "admin") && (
             <ModelProfilesPage disabled={uploading} />
           )}
@@ -712,7 +750,9 @@ export function Console({
           {view === "monitor" && canViewConsolePage("monitor", sessionMode, authUser?.role) && (
             <MonitorPage />
           )}
-          {view === "permissions" && authUser && (authUser.role === "admin" || authUser.role === "vip") && (
+          {view === "permissions" && authUser
+            && (authUser.role === "admin" || authUser.role === "vip"
+              || planName === "Plus" || planName === "Pro") && (
             <PermissionsPage
               connection={connection}
               currentUserId={authUser.id}

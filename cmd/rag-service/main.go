@@ -25,8 +25,10 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/logging"
 	"github.com/Guan0923/xinghe_rag/internal/mail"
 	"github.com/Guan0923/xinghe_rag/internal/mcp"
+	"github.com/Guan0923/xinghe_rag/internal/membership"
 	"github.com/Guan0923/xinghe_rag/internal/monitor"
 	"github.com/Guan0923/xinghe_rag/internal/mq"
+	"github.com/Guan0923/xinghe_rag/internal/payment"
 	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
 	"github.com/Guan0923/xinghe_rag/internal/searchrefs"
@@ -68,6 +70,13 @@ func run() error {
 		return err
 	}
 	feishuSettings, err := config.FeishuSettingsFromEnv()
+	if err != nil {
+		return err
+	}
+	// Personal membership / Alipay. An incomplete merchant configuration is a
+	// valid state: the Console still shows plans and usage, while purchasing is
+	// disabled. Invalid scalar values (bad timeout/flag/gateway) fail startup.
+	paymentSettings, err := payment.SettingsFromEnv()
 	if err != nil {
 		return err
 	}
@@ -312,8 +321,13 @@ func run() error {
 	})
 	// Knowledge-base ownership and the invite-based sharing rules are enforced
 	// by the access service; httpapi only maps its typed errors to HTTP.
+	membershipService, err := membership.New(stores, paymentSettings)
+	if err != nil {
+		return err
+	}
 	accessService := access.NewService(stores, access.Options{
 		InvitationTTL: serviceSettings.InvitationTTL,
+		Entitlements:  membershipService,
 	})
 	// The optional Feishu integration stores one OAuth grant per Console account
 	// and calls Feishu with that account's user_access_token. It is disabled
@@ -327,6 +341,7 @@ func run() error {
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseSelfCreateRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithModelProfileRuntime(wire.HTTPRuntime{Service: service}),
+		httpapi.WithMembership(membershipService),
 		httpapi.WithMonitorRuntime(monitorService),
 		httpapi.WithMonitorActions(actions),
 		httpapi.WithAccessControl(accessService),

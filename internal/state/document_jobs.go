@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Document job states (document_jobs.py).
@@ -396,6 +397,24 @@ func (d *DocumentJobs) insertJob(
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return DocumentAdmission{}, err
+	}
+	// The knowledge-base owner's logical-file allowance is decided in this same
+	// transaction, immediately before the job row exists. An idempotent replay
+	// already returned above, so a replay never re-checks or re-counts the
+	// quota; an owner row lock serializes concurrent admissions of one owner.
+	if d.stores.Membership != nil {
+		quota, quotaErr := d.stores.Membership.documentQuotaTx(ctx, transaction, namespace,
+			time.Unix(0, int64(now*float64(time.Second))).UTC())
+		if quotaErr != nil {
+			return DocumentAdmission{}, quotaErr
+		}
+		if !quota.CanAdd {
+			return DocumentAdmission{}, &DocumentQuotaExceededError{
+				Used:    quota.Used,
+				Limit:   quota.Limit,
+				Message: fmt.Sprintf("所有者的知识库文件数已达上限（%d 个）", quota.Limit),
+			}
+		}
 	}
 	if _, err := transaction.ExecContext(ctx,
 		"INSERT INTO document_jobs (artifact_id, namespace, name, name_key, content, size, sha256, "+

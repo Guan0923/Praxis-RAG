@@ -267,6 +267,12 @@ func (c *ModelHTTPClient) Models(ctx context.Context) ([]string, error) {
 // HTTPEmbedder is the retrieval embedder backed by the model HTTP API.
 type HTTPEmbedder struct {
 	client *ModelHTTPClient
+	// OnBatchSucceeded is an optional document-embedding observer. It fires
+	// after one provider batch has been validated and accepted, so the caller
+	// can settle metered usage for exactly the batches that reached the model.
+	// It is set only on the document-ingest path; query embedding and provider
+	// probes never attach a billing observer.
+	OnBatchSucceeded func(index int, texts []string)
 }
 
 // NewHTTPEmbedder builds an HTTP embedder.
@@ -343,6 +349,9 @@ func (e *HTTPEmbedder) EmbedDocuments(ctx context.Context, texts []string) ([][]
 				return nil, modelError("Embedding 返回的序号或向量无效")
 			}
 			vectors = append(vectors, vector)
+		}
+		if e.OnBatchSucceeded != nil {
+			e.OnBatchSucceeded(start/32, batch)
 		}
 	}
 	return vectors, nil

@@ -866,6 +866,172 @@ var schemaTables = []*SchemaTable{
 			index("ix_feishu_oauth_states_expiry", "expires_at"),
 		},
 	},
+	// The personal-membership tables below are Go-only additions appended after
+	// the ported tables, so a migrated database and a freshly created one keep
+	// the same table order. They are the only source of truth for plan
+	// entitlement, the embedding quota ledger and the Alipay order state: Redis
+	// never participates in any of those decisions and no table carries a
+	// foreign key (like every other state table).
+	//
+	// user_memberships is the per-account snapshot row: the current plan, the
+	// entitlement source, the furthest paid expiry and the entitlement version
+	// quoted upgrade orders are validated against. membership_terms keeps the
+	// immutable purchase/renew/upgrade grant history the snapshot is derived
+	// from.
+	{
+		Name: "user_memberships",
+		Columns: []SchemaColumn{
+			identifier("user_id", 32).PK(),
+			varchar("plan", 16),
+			varchar("source", 16),
+			varchar("starts_at", 40),
+			varchar("expires_at", 40).Null(),
+			integer("anchor_day"),
+			bigint("entitlement_version"),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+		},
+	},
+	{
+		Name: "membership_terms",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("user_id", 32),
+			// order_id is NULL for grants that did not come from a paid order.
+			// The unique constraint is what makes one order grant at most one
+			// term; MySQL allows many NULL rows in a unique index.
+			identifier("order_id", 32).Null(),
+			varchar("plan", 16),
+			varchar("billing_period", 16),
+			// kind is purchase|renew|upgrade. An upgrade term is an override
+			// that only raises the plan in force until the existing expiry.
+			varchar("kind", 16),
+			varchar("starts_at", 40),
+			varchar("ends_at", 40),
+			integer("anchor_day"),
+			// status is active|refunded; a refunded term never grants
+			// entitlement again.
+			varchar("status", 16),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_membership_terms_order", "order_id")},
+		Indexes: []SchemaIndex{index("ix_membership_terms_user", "user_id", "ends_at")},
+	},
+	// billing_orders is the merchant order of record: the server-generated
+	// amount, the price/term snapshot shown before paying, the Alipay trade
+	// identity and the manual-refund bookkeeping. id is the Alipay out_trade_no
+	// (letters and digits only, at most 32 characters).
+	{
+		Name: "billing_orders",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("user_id", 32),
+			varchar("plan", 16),
+			varchar("billing_period", 16),
+			varchar("kind", 16),
+			varchar("status", 16),
+			bigint("amount_cents"),
+			varchar("currency", 8),
+			// quote/product_snapshot only ever carry the price, plan and term
+			// rules; signatures, keys and notification bodies are never stored.
+			longText("quote"),
+			longText("product_snapshot"),
+			bigint("entitlement_version"),
+			varchar("term_start", 40),
+			varchar("term_end", 40),
+			varchar("alipay_trade_no", 64).Null(),
+			varchar("expires_at", 40),
+			varchar("paid_at", 40).Null(),
+			varchar("closed_at", 40).Null(),
+			varchar("refund_request_no", 64).Null(),
+			bigint("refund_amount_cents").Default("0"),
+			varchar("refund_status", 24).Null(),
+			text("refund_reason").Null(),
+			text("manual_note").Null(),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{
+			unique("uq_billing_orders_trade", "alipay_trade_no"),
+			unique("uq_billing_orders_refund", "refund_request_no"),
+		},
+		Indexes: []SchemaIndex{
+			index("ix_billing_orders_user", "user_id", "created_at"),
+			index("ix_billing_orders_status", "status", "created_at"),
+		},
+	},
+	// embedding_quota_periods is one granted allowance window per account and
+	// source (free|paid|system). A paid window follows the membership month of
+	// the base term; a free window is the Shanghai natural month.
+	{
+		Name: "embedding_quota_periods",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("user_id", 32),
+			varchar("source", 16),
+			varchar("period_start", 40),
+			varchar("period_end", 40),
+			varchar("plan", 16),
+			bigint("allowance_chars"),
+			bigint("used_chars"),
+			bigint("reserved_chars"),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_embedding_period", "user_id", "source", "period_start")},
+		Indexes: []SchemaIndex{index("ix_embedding_period_user", "user_id", "period_end")},
+	},
+	// embedding_usage is the per-operation ledger row. operation_id is the
+	// idempotent identity: an automatic retry of the same logical embedding
+	// call reuses it, so one logical call is charged at most once. The row only
+	// records counts and identifiers, never text or model credentials.
+	{
+		Name: "embedding_usage",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("operation_id", 200),
+			identifier("user_id", 32),
+			identifier("quota_period_id", 32),
+			identifier("namespace", 64),
+			identifier("document_name", 200),
+			varchar("document_version", 64),
+			varchar("model", 255),
+			varchar("purpose", 32),
+			bigint("reserved_chars"),
+			bigint("used_chars"),
+			// status is reserved|settled|pending_review|released. A pending
+			// review row keeps only the unconfirmed remainder reserved and is
+			// released automatically after the 24 hour lease.
+			varchar("status", 24),
+			varchar("expires_at", 40),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_embedding_usage_operation", "operation_id")},
+		Indexes: []SchemaIndex{
+			index("ix_embedding_usage_user", "user_id", "created_at"),
+			index("ix_embedding_usage_review", "status", "expires_at"),
+		},
+	},
+	// billing_events is the append-only audit/idempotency log: event_key is
+	// unique so a repeated Alipay notification or refund callback cannot grant
+	// entitlement twice.
+	{
+		Name: "billing_events",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("order_id", 32),
+			identifier("event_key", 128),
+			varchar("event_type", 32),
+			varchar("alipay_trade_no", 64).Null(),
+			bigint("amount_cents"),
+			longText("detail").Null(),
+			varchar("created_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_billing_events_key", "event_key")},
+		Indexes: []SchemaIndex{index("ix_billing_events_order", "order_id")},
+	},
 }
 
 // SchemaTables returns the schema tables in creation order. The returned slice

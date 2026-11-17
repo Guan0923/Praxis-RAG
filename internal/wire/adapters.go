@@ -228,15 +228,16 @@ func (a HTTPRuntime) ListKnowledgeBases(ctx context.Context) ([]map[string]any, 
 // CreateKnowledgeBase implements httpapi.KnowledgeBaseAdminRuntime.
 func (a HTTPRuntime) CreateKnowledgeBase(ctx context.Context, input httpapi.KnowledgeBaseCreateInput) (map[string]any, error) {
 	return a.Service.CreateKnowledgeBase(ctx, kbconfig.CreateInput{
-		Namespace:       input.Namespace,
-		Chunking:        input.Chunking,
-		EmbeddingModel:  input.EmbeddingModel,
-		RerankerModel:   input.RerankerModel,
-		EmbeddingValues: input.EmbeddingValues,
-		RerankerValues:  input.RerankerValues,
-		VLMModel:        input.VLMModel,
-		VLMValues:       input.VLMValues,
-		TokenizerModel:  a.Service.Config().ChunkTokenizerModel,
+		Namespace:              input.Namespace,
+		Chunking:               input.Chunking,
+		EmbeddingModel:         input.EmbeddingModel,
+		RerankerModel:          input.RerankerModel,
+		EmbeddingValues:        input.EmbeddingValues,
+		RerankerValues:         input.RerankerValues,
+		VLMModel:               input.VLMModel,
+		VLMValues:              input.VLMValues,
+		EmbeddingBillingSource: input.EmbeddingBillingSource,
+		TokenizerModel:         a.Service.Config().ChunkTokenizerModel,
 	})
 }
 
@@ -265,8 +266,9 @@ func (a HTTPRuntime) CreateKnowledgeBaseForUser(
 // UpdateKnowledgeBase implements httpapi.KnowledgeBaseAdminRuntime.
 func (a HTTPRuntime) UpdateKnowledgeBase(ctx context.Context, namespace string, input httpapi.KnowledgeBaseUpdateInput) (map[string]any, error) {
 	return a.Service.UpdateKnowledgeBase(ctx, namespace, kbconfig.UpdateInput{
-		Values:  input.Values,
-		Reembed: input.Reembed,
+		Values:                 input.Values,
+		Reembed:                input.Reembed,
+		EmbeddingBillingSource: input.EmbeddingBillingSource,
 	})
 }
 
