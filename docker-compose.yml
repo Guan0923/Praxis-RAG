@@ -363,6 +363,17 @@ services:
       RAG_PDF_SERVICE_TIMEOUT: ${RAG_PDF_SERVICE_TIMEOUT:-900}
       RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
       RAG_CACHE_GROUP: ${RAG_CACHE_GROUP:-praxis_state_cache_refresh_workers}
+      # Document lease backend. mysql (default) keeps the pre-migration SQL lease
+      # rows; redis moves long-lived document leases to Redis with a durable MySQL
+      # fencing generation. The switch is deployment-wide: flip it for rag-service
+      # and every rag-document-worker together while document writes are stopped
+      # (docs/DEPLOYMENT.md §13). The display cache stays independent.
+      RAG_DOCUMENT_LOCK_MODE: ${RAG_DOCUMENT_LOCK_MODE:-mysql}
+      RAG_REDIS_LOCK_URL: ${RAG_APP_REDIS_LOCK_URL:-redis://redis:6379/0}
+      RAG_REDIS_LOCK_PREFIX: ${RAG_REDIS_LOCK_PREFIX:-rag:lock:v1}
+      RAG_REDIS_LOCK_TTL_SECONDS: ${RAG_REDIS_LOCK_TTL_SECONDS:-120}
+      RAG_REDIS_LOCK_TIMEOUT_SECONDS: ${RAG_REDIS_LOCK_TIMEOUT_SECONDS:-1}
+      RAG_REDIS_LOCK_WAIT_SECONDS: ${RAG_REDIS_LOCK_WAIT_SECONDS:-2}
       RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
       RAG_DOCUMENT_GROUP: ${RAG_DOCUMENT_GROUP:-praxis_document_ingest_workers}
       RAG_DOCUMENT_DLQ_TOPIC: ${RAG_DOCUMENT_DLQ_TOPIC:-praxis_document_ingest_dead_letters}

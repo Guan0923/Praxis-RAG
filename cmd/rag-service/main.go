@@ -94,6 +94,33 @@ func run() error {
 	if err := redisstate.Attach(stores, cache); err != nil {
 		return err
 	}
+	// The document lock is independent of the display cache: it has its own
+	// switch and TTL, and disabling the cache must not disable it. When enabled,
+	// every process that writes, recovers or cleans document state must use the
+	// same configuration (rag-service, rag-document-worker, rag-mcp-ingest).
+	lockSettings, err := state.DocumentLockSettingsFromEnv()
+	if err != nil {
+		return err
+	}
+	var documentLock *redisstate.DocumentLock
+	if lockSettings.RedisMode() {
+		documentLock, err = redisstate.NewDocumentLock(lockSettings)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = documentLock.Close() }()
+		if err := stores.AttachDocumentLocker(documentLock); err != nil {
+			return err
+		}
+	}
+	logger.Info("Document lease backend configured",
+		"mode", lockSettings.Mode, "ttl_seconds", lockSettings.TTLSeconds)
+	var redisProbe monitor.RedisProbe = cache
+	if !cache.Enabled() && documentLock != nil {
+		// The Console dependency row reports the lease backend when the display
+		// cache is disabled.
+		redisProbe = leaseLivenessProbe{lock: documentLock}
+	}
 	stores.CacheSync.Start()
 	service, err := runtime.New(ragConfig, stores, serviceSettings.DataRoot)
 	if err != nil {
@@ -197,7 +224,7 @@ func run() error {
 		Stats:                 stores,
 		MySQL:                 stores,
 		DBStats:               stores.DB.Stats,
-		Redis:                 cache,
+		Redis:                 redisProbe,
 		QdrantURL:             ragConfig.QdrantURL,
 		FallbackCollection:    ragConfig.Collection,
 		IndexedCollections:    stores.MonitorIndexedCollections,
@@ -332,3 +359,13 @@ func run() error {
 	}
 	return nil
 }
+
+// leaseLivenessProbe adapts the document-lock backend to the Console Redis
+// dependency probe when the display cache itself is disabled.
+type leaseLivenessProbe struct{ lock *redisstate.DocumentLock }
+
+// Enabled reports that the lease backend is configured.
+func (leaseLivenessProbe) Enabled() bool { return true }
+
+// Ping checks lease-backend connectivity.
+func (p leaseLivenessProbe) Ping(ctx context.Context) error { return p.lock.Ping(ctx) }

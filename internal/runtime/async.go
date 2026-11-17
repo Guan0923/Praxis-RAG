@@ -20,6 +20,11 @@ const asyncSubmissionFailedMessage = "Document submission failed; retry with the
 // generic safe failure message for status lookups.
 const documentOperationUnavailableMessage = "Document operation unavailable"
 
+// documentLockUnavailableMessage is the retryable message reported when the
+// cross-instance document lease backend could not confirm ownership. It is not
+// a conflict: the caller should retry the same request.
+const documentLockUnavailableMessage = "文档锁暂不可用，请稍后使用相同的幂等键重试"
+
 // admitDocument durably submits one upload and maps admission failures to the
 // runtime's safe public categories. Callers decide how much of the admission
 // projection to expose: MCP returns artifact_id only, REST also reports the
@@ -95,6 +100,10 @@ func asyncDocumentError(err error) error {
 	var knowledgeValidation *apierrors.KnowledgeValidationError
 	if errors.As(err, &knowledgeValidation) {
 		return knowledgeValidation
+	}
+	var lockUnavailable *state.LockUnavailable
+	if errors.As(err, &lockUnavailable) {
+		return &apierrors.KnowledgeError{Message: documentLockUnavailableMessage}
 	}
 	var knowledge *apierrors.KnowledgeError
 	if errors.As(err, &knowledge) {

@@ -11,7 +11,7 @@ MCP 客户端 ──/mcp──────────────┤
 REST 客户端 ──/v1/*────────────┴──> rag-service
                                        ├─> Qdrant（dense + sparse 向量）
                                        ├─> MySQL（文档/KB/任务/artifact/API Key/模型配置/权限/缓存水位）
-                                       ├─> Redis（读模型展示缓存；可选）
+                                       ├─> Redis（读模型展示缓存；可选，也可承载文档长租约）
                                        ├─> Kafka（Kafka Connect 的 Debezium 文档通知 / 缓存变更；文档入库必需）
                                        └─> pdf-parser :8091（HTTP；本地 PyMuPDF 读取/渲染/裁图，
                                               版面/OCR/表格/公式/图片描述交远端视觉模型）
@@ -104,7 +104,7 @@ examples/knowledge/         示例知识文档（可直接上传试用）
 | `connect` | 分布式 Kafka Connect 集成：固定名称幂等注册（PUT 前比较配置）、REST 客户端（worker failover、follower 409 重试）、FAILED task supervisor（只重启失败 task、指数退避、有限次数）；worker 宕机由 Connect rebalance 接管，位点在 Kafka offset topic |
 | `mq` | Kafka 生产/消费、两类 Debezium 事件解码（文档/缓存）、进程内重试、DLQ 发布 |
 | `qdrant` | Qdrant HTTP 客户端（collection、向量、过滤、RRF 查询） |
-| `redisstate` | Redis 读模型展示缓存与水位 |
+| `redisstate` | Redis 读模型展示缓存与水位；可选的文档锁 Lua 后端（长租约 + 原子多资源获取） |
 | `resources` | MCP 文档资源 URI 与分页 |
 | `retrieval` | BM25 / Dense / Hybrid 检索、Cross-Encoder 重排、Orchestrator |
 | `runtime` | 业务运行时：知识库、文档 CRUD、同步搜索（含总预算/取消）、上传事务、任务状态、维护恢复 |

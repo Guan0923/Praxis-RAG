@@ -23,7 +23,7 @@ var expectedSchema = []struct {
 	{"upload_operations", []string{"id", "namespace", "name", "document_id", "collection", "idempotency_key", "fingerprint", "owner", "old_version", "status", "result", "error", "cleanup_pending", "workspace", "workspace_node", "created_at", "updated_at"}},
 	{"upload_steps", []string{"operation_id", "name", "status", "details", "error", "started_at", "finished_at"}},
 	{"document_heads", []string{"namespace", "document_id", "version", "updated_at"}},
-	{"document_leases", []string{"namespace", "resource", "owner", "operation_id", "expires_at"}},
+	{"document_leases", []string{"namespace", "resource", "owner", "operation_id", "expires_at", "fencing_epoch"}},
 	{"upload_objects", []string{"operation_id", "bucket", "key", "content", "content_hash", "metadata", "created_at"}},
 	{"cache_revisions", []string{"kind", "scope", "revision", "refreshed_revision", "attempts", "last_error", "updated_at"}},
 	{"search_result_snapshots", []string{"id", "namespace", "content", "created_at", "expires_at"}},

@@ -1,8 +1,8 @@
 # Praxis-RAG 部署指南（Go 后端）
 
-本文给出 `rag-service` 与三个 worker（文档/缓存/死信）的生产部署模板：Docker/Compose、systemd、重启策略、DLQ 监控和上线顺序。搜索为同步执行、不部署 worker；**搜索同步化迁移与回滚见 §12**。安装、环境变量与 API 用法见 [使用与部署](USAGE.md)；迁移背景与当前缺口见 [GO_MIGRATION](GO_MIGRATION.md)；契约差异见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。
+本文给出 `rag-service` 与三个 worker（文档/缓存/死信）的生产部署模板：Docker/Compose、systemd、重启策略、DLQ 监控和上线顺序。搜索为同步执行、不部署 worker；**搜索同步化迁移与回滚见 §12**；**文档长租约默认由 MySQL 承担，可选切到 Redis，切换与回退见 §13**。安装、环境变量与 API 用法见 [使用与部署](USAGE.md)；迁移背景与当前缺口见 [GO_MIGRATION](GO_MIGRATION.md)；契约差异见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。
 
-> 本文的镜像构建、`app`/worker Compose profile 与 systemd 示例未在本仓库完整实机运行。2026-11-15 的 Kafka Connect 改造（两个 Debezium MySQL Connector 运行在双 worker 的分布式 Connect 集群，连接器配置/位点/task 状态存 Kafka 内部 topic）**尚未在真实 Docker/Kafka Connect/MySQL 链路上验证**；此前 Debezium Server 文件位点的实机记录对应已下线的部署。生产上线前请按 [Kafka Connect 操作手册](../deploy/kafka-connect/README.md)、[CDC 迁移契约](cdc-migration.md) §8、§12 与本文 §6、§12 逐项演练并记录到 [VALIDATION](../VALIDATION.md)。
+> 本文的镜像构建、`app`/worker Compose profile 与 systemd 示例未在本仓库完整实机运行。2026-11-15 的 Kafka Connect 改造（两个 Debezium MySQL Connector 运行在双 worker 的分布式 Connect 集群，连接器配置/位点/task 状态存 Kafka 内部 topic）**尚未在真实 Docker/Kafka Connect/MySQL 链路上验证**；此前 Debezium Server 文件位点的实机记录对应已下线的部署。生产上线前请按 [Kafka Connect 操作手册](../deploy/kafka-connect/README.md)、[CDC 迁移契约](cdc-migration.md) §8、§12 与本文 §6、§12、§13 逐项演练并记录到 [VALIDATION](../VALIDATION.md)。
 
 ## 1. 进程拓扑
 
@@ -104,6 +104,7 @@ docker run -d --name praxis-rag-service \
 - PDF 高保真解析：设置 `RAG_PDF_ENGINE=vision` 并把 `RAG_PDF_SERVICE_URL` 指向 pdf-parser（同一 compose 网络用 `http://pdf-parser:8091`；单独 `docker run` 时用从容器内可达的地址，如 `http://host.docker.internal:8091`）；调用总超时用 `RAG_PDF_SERVICE_TIMEOUT`（默认 900 秒），真正开始解析后的单次上限用 `RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120 秒，排队等待不计入）。pdf-parser 不可用时 vision 上传会失败，可切回 `RAG_PDF_ENGINE=go`。
 - Word 无图注图片的描述调用远端 OpenAI 兼容视觉模型：优先在 Console 的知识库设置页配置（URL/Key/模型），也可用 `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`（可选 `RAG_VLM_TIMEOUT`/`RAG_VLM_CONCURRENCY`）作为未配置知识库时的环境回退。图片内容会离开本机到该端点，选型时确认合规；未配置时这些图片保留占位描述，上传不会失败。该视觉模型端点同时用于 vision 引擎的 PDF 版面/OCR/表格/公式/图片描述；vision 引擎要求知识库配置 VLM（Console「模型配置」页添加并在知识库表单选择），否则 PDF 上传会在受理阶段被拒绝并提示配置。
 - 数据目录卷保存上传恢复工作区与 artifact 工作区；不要用匿名卷。
+- 文档长租约默认由 MySQL `document_leases` 承担；设置 `RAG_DOCUMENT_LOCK_MODE=redis` 时，必须让 `rag-service`、`rag-document-worker` 与 `rag-mcp-ingest` 使用同一组 `RAG_REDIS_LOCK_*` 配置，切换/回退见 §13。
 
 ### 3.3 Compose：app profile
 
@@ -115,7 +116,7 @@ docker compose --profile app up -d --build
 docker compose up -d mysql qdrant redis kafka
 ```
 
-`app` 服务从 `.env` 读取 `RAG_SERVICE_TOKEN`（容器 0.0.0.0 绑定，必填）、`RAG_MYSQL_*`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_APP_QDRANT_URL`、`RAG_APP_PORT`、`RAG_APP_KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`RAG_AUTH_*`（Console 登录，见下）、`RAG_FEISHU_*`（可选飞书导入，见下）、`RAG_PDF_ENGINE`（默认 `vision`）、`RAG_PDF_SERVICE_URL`（compose 内默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120）等；默认依赖 MySQL healthy + Qdrant started + Kafka healthy + pdf-parser started。`pdf-parser` 没有 profile，默认 `docker compose up -d` 即启动；它只在 `vision` 引擎下被调用。详细的环境变量见 §3.5。
+`app` 服务从 `.env` 读取 `RAG_SERVICE_TOKEN`（容器 0.0.0.0 绑定，必填）、`RAG_MYSQL_*`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_APP_QDRANT_URL`、`RAG_APP_PORT`、`RAG_APP_KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`RAG_AUTH_*`（Console 登录，见下）、`RAG_FEISHU_*`（可选飞书导入，见下）、`RAG_PDF_ENGINE`（默认 `vision`）、`RAG_PDF_SERVICE_URL`（compose 内默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120）、`RAG_DOCUMENT_LOCK_MODE`/`RAG_REDIS_LOCK_*`（文档锁，见 §13）等；默认依赖 MySQL healthy + Qdrant started + Kafka healthy + pdf-parser started。`pdf-parser` 没有 profile，默认 `docker compose up -d` 即启动；它只在 `vision` 引擎下被调用。详细的环境变量见 §3.5。
 
 ### 3.4 Compose：worker 示例（需自行保存为 override 文件）
 
@@ -300,6 +301,14 @@ RAG_STATE_ENCRYPTION_KEY=base64:CHANGE_ME
 RAG_BACKEND=qdrant
 QDRANT_URL=http://127.0.0.1:6333
 RAG_REDIS_URL=redis://127.0.0.1:6379/0
+# 文档长租约后端（默认 mysql）：切 redis 时所有 app 进程必须同值，
+# 且 RAG_REDIS_LOCK_URL/前缀/TTL 一致；展示缓存开关不控制文档锁。切换见 §13。
+# RAG_DOCUMENT_LOCK_MODE=mysql
+# RAG_REDIS_LOCK_URL=redis://127.0.0.1:6379/0
+# RAG_REDIS_LOCK_PREFIX=rag:lock:v1
+# RAG_REDIS_LOCK_TTL_SECONDS=120
+# RAG_REDIS_LOCK_TIMEOUT_SECONDS=1
+# RAG_REDIS_LOCK_WAIT_SECONDS=2
 RAG_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
 # 外部 Kafka 可追加 RAG_KAFKA_SECURITY_PROTOCOL / RAG_KAFKA_SASL_* / RAG_KAFKA_TLS_*
 # 上传默认异步受理：由独立的 rag-document-worker 消费 Kafka 文档通知
@@ -471,7 +480,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 
 1. MySQL/Redis/Kafka/Qdrant 就绪，`binlog_row_image=FULL` 且两个 CDC 账号（`debezium`、`debezium_cache`）都具备 `SELECT/RELOAD/SHOW DATABASES/REPLICATION SLAVE/REPLICATION CLIENT`。
 2. `pdf-parser` 就绪（使用 vision 引擎时；compose 默认随基础设施启动，等待 `/healthz` 返回 200）。它不依赖状态库，可与基础设施并行启动。
-3. `rag-state-migrate --apply`（见 §6；幂等追加 `schedule_version`/缓存水位列并创建 `cdc_cutover_state`）。
+3. `rag-state-migrate --apply`（见 §6；幂等追加 `schedule_version`/缓存水位列与 `document_leases.fencing_epoch`，并创建 `cdc_cutover_state`）。
 4. 分布式 Kafka Connect 至少两个 worker 就绪（同一 `GROUP_ID`、同一连接器版本），执行 `rag-connect register` 注册两个固定名称连接器，并等待 connector/task 都 `RUNNING`；一个 worker 宕机时 peer 必须能接管。
 5. `praxis-rag.service`（API 受理、同步搜索、维护循环、FAILED task supervisor）。
 6. `praxis-rag-document-worker.service`（文档解析必需；未启动时上传只受理、任务保持 `queued`）、`praxis-rag-cache-worker.service`。
@@ -480,6 +489,8 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 9. 打开 `/health`，创建/确认 API Key，做一次上传与检索冒烟；vision 引擎还要确认 `http://127.0.0.1:8091/healthz`，并为测试知识库选择 VLM 配置。
 
 停止顺序相反：先停 worker/死信（让在途任务完成或回到可重试状态），再停服务。
+
+所有 app 进程（`rag-service`、`rag-document-worker`、`rag-mcp-ingest`）必须使用相同的文档锁配置（`RAG_DOCUMENT_LOCK_MODE`、`RAG_REDIS_LOCK_URL`/前缀/TTL）。从 `mysql` 切到 `redis` 或回退都**不能热切**：先停写并处理在途操作，见 §13。
 
 ## 5. 重启策略
 
@@ -502,7 +513,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 ```bash
 # 只报告（默认）
 /opt/praxis-rag/bin/rag-state-migrate
-# 幂等建表/增量迁移（追加 schedule_version、缓存水位列，创建 cdc_cutover_state）
+# 幂等建表/增量迁移（追加 schedule_version、缓存水位列与 document_leases.fencing_epoch，创建 cdc_cutover_state）
 /opt/praxis-rag/bin/rag-state-migrate --apply
 # 旧 Mini-Agent 知识源预览/导入（不重建向量）
 /opt/praxis-rag/bin/rag-service-migrate --legacy-root /home/<user>/.mini_agent
@@ -597,7 +608,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 - MySQL/Redis/Kafka 只监听内网；Kafka 启用 SASL/TLS 时使用 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*`，凭据通过环境文件/密钥管理注入，禁止写入 `config.toml`、镜像或 Git。
 - `pdf-parser` 是无认证的内部服务：compose 只把 8091 发布到 `127.0.0.1`，不要改成 `0.0.0.0` 或挂到公网反向代理；只允许 Go 服务所在的容器/主机访问。VLM 端点凭据同样只通过环境变量/密钥注入，且要确认 PDF 图片/公式会被发送到该外部端点。
 - 运行用户非 root，数据目录 0700；env 文件 0600；日志不要输出查询/文件内容（Go 实现只记录任务 ID 与错误类别）。
-- 定期备份 MySQL；上传恢复工作区同样需要备份。Redis 只保存可丢失的缓存/短期快照，不作为真相。
+- 定期备份 MySQL；上传恢复工作区同样需要备份。Redis 默认只保存可丢失的展示缓存；启用 `RAG_DOCUMENT_LOCK_MODE=redis` 时它还保存文档长租约（只是互斥凭据，可由 TTL 过期后由恢复流程补偿，不是业务数据真相，建议开启 AOF 或接受“重启后最多等一个 TTL”的短暂写不可用）。
 
 ## 10. 验证与已知未验证项
 
@@ -606,8 +617,9 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 - Go 全量 `go build ./...` 与 `go test -count=1 ./...`（历史基线，包数/用例数随代码演进）。
 - `scripts/build-go.ps1` 本机构建 + 冒烟（健康检查、Console、`/`）。
 - worker 的启动/退出码行为（缺少 Kafka → `2`、错误 backend、非法 `--kind`、`--help`）。
+- 文档长租约 Redis 后端：`internal/state` 的冲突矩阵、迟到登记、接管围栏、Redis 丢失/不可用/释放失败与租约展示，`internal/runtime`/`internal/documentworker` 回归，以及 `internal/redisstate` 用两个独立客户端对真实 Redis 的 Lua、续租与 TTL 集成测试。
 
-本环境**未完整验证**：Docker 镜像构建、`app`/worker Compose profile、`pdf-parser` 镜像与真实视觉端点推理、systemd 单元、真实 MySQL 多实例并发与故障切换、真实 Kafka+SASL/TLS 集群、LibreOffice DOC 转换与真实 VLM 端点实链路。**2026-11-15 Kafka Connect 改造（双 worker、Kafka 内部 topic 保存位点、固定名称注册、FAILED task 自动重启、worker/task 故障演练）与 2026-11-13 CDC/搜索改造尚未实机验证**；历史 Kafka 3.9.0 + Debezium 3.7.1 实机记录对应已下线的 Debezium Server/outbox 链路，不能作为当前架构验收依据。上线前请在预发环境按本文 §6.2、§12、[Kafka Connect 操作手册](../deploy/kafka-connect/README.md) §6 与 [CDC 迁移契约](cdc-migration.md) §8、§12 逐项演练，并参考 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 的剩余 P1/P2 与 [GO_MIGRATION](GO_MIGRATION.md) 的进行中项。
+本环境**未完整验证**：Docker 镜像构建、`app`/worker Compose profile、`pdf-parser` 镜像与真实视觉端点推理、systemd 单元、真实 MySQL 多实例并发与故障切换、真实 Kafka+SASL/TLS 集群、LibreOffice DOC 转换与真实 VLM 端点实链路，以及文档锁在 Redis Cluster/Sentinel 下的行为与 `-race` 压测。**2026-11-15 Kafka Connect 改造（双 worker、Kafka 内部 topic 保存位点、固定名称注册、FAILED task 自动重启、worker/task 故障演练）与 2026-11-13 CDC/搜索改造尚未实机验证**；历史 Kafka 3.9.0 + Debezium 3.7.1 实机记录对应已下线的 Debezium Server/outbox 链路，不能作为当前架构验收依据。上线前请在预发环境按本文 §6.2、§12、§13、[Kafka Connect 操作手册](../deploy/kafka-connect/README.md) §6 与 [CDC 迁移契约](cdc-migration.md) §8、§12 逐项演练，并参考 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md) 的剩余 P1/P2 与 [GO_MIGRATION](GO_MIGRATION.md) 的进行中项。
 
 ## 11. 搜索同步化变更速查（2026-11-13）
 
@@ -660,3 +672,35 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 - 若已删除搜索 topic，回滚需重建 topic 并依赖任务连接器初始快照（`op=r`）补投未完成任务；否则需手工重排 `schedule_version`。
 - 回滚不涉及 artifact：`artifact_snapshots` 与 TTL 语义前后一致，已签发 artifact 继续可读。
 - 回滚后务必再次核对监控页 `pipeline.kafka.groups` 是否恢复三组（旧版本）或保持两组（新版本），避免混跑。
+
+## 13. 文档锁迁移到 Redis（升级必读）
+
+本节只覆盖**文档长租约后端**：默认 `mysql` 行为不变（`document_leases` 行持有租约，心跳用 SQL 续写 `expires_at`）；改为 `redis` 后长租约在 Redis，MySQL 只保存持有者登记与单调递增的 `fencing_epoch`，所有破坏性事务（`document_heads` 更新、删除、回滚、清理、知识库配置写入）提交前按当前持有者校验。入库任务领取、任务心跳、重试、终态与 Kafka 去重仍在 MySQL（`document_jobs`），两种模式都一样；`RAG_REDIS_ENABLED` 只控制读模型展示缓存，不影响本节。
+
+### 13.1 前置与 Redis 要求
+
+- **全进程一致**：`rag-service`、`rag-document-worker`、`rag-mcp-ingest` 必须使用相同的 `RAG_DOCUMENT_LOCK_MODE`、`RAG_REDIS_LOCK_URL`（为空时回退 `RAG_REDIS_URL`）、`RAG_REDIS_LOCK_PREFIX` 与 TTL。混跑两种后端等于没有互斥。
+- **Redis 部署**：建议开启 AOF；也可以接受“重启后最多等一个租约 TTL”的短暂写不可用——租约丢失只让旧实例在下一个步骤边界停止推进，恢复流程接管，不会出现两个发布者。锁键是每个 namespace 一个 Hash（`<prefix>:{<sha256(namespace) 前 32 位>}:leases`），单键内多个 field，天然兼容 Redis Cluster；Redis 需允许 `EVALSHA`/`EVAL`。
+- **表结构**：`document_leases.fencing_epoch BIGINT NOT NULL DEFAULT 0` 追加在列尾。开启自动 schema（默认 `RAG_STATE_AUTO_SCHEMA=true`）时启动会幂等执行 `ALTER TABLE ... ADD COLUMN`，旧库升级前只需备份；关闭自动 schema 的部署按 §6 用有 DDL 权限的账号执行 `rag-state-migrate --apply`。
+- **键空间隔离**：`RAG_REDIS_PREFIX`（读模型）与 `RAG_REDIS_LOCK_PREFIX`（锁）是两套键空间，不要指向同一前缀。
+- **回退无损**：`fencing_epoch` 列回退后仍保留（MySQL 模式不读它）；已有操作日志、已发布版本与租约行都不删除。
+
+### 13.2 切换步骤（建议停机窗口）
+
+1. **暂停新文档写入**：停掉上传/删除/知识库修改入口，或在网关摘流，避免切换窗口内产生新的 INTENT。
+2. **停止 `rag-document-worker` 与维护恢复循环**：停 worker（Compose 部署移除对应服务；`rag-service` 的维护循环每 10 秒扫描上传恢复，建议在停写窗口一并停掉 `rag-service`）。
+3. **排空/明确接管在途操作**：等待运行中的上传/删除完成，或让其租约过期后由恢复流程补偿；确认没有 `INTENT`/`RUNNING`/`FAILED`/`ROLLING_BACK`/`ROLLBACK_FAILED` 残留，或在切换记录中写明如何补偿。
+4. **统一改配置并重启**：所有 app 进程改为 `RAG_DOCUMENT_LOCK_MODE=redis`（同一 URL/前缀/TTL），重启。
+5. **恢复 worker 与写入入口**。
+6. **观察**：`GET /v1/admin/upload-leases` 的持有者/过期时间正常，日志出现 `Document lease backend configured mode=redis`；做一次上传冒烟。
+
+### 13.3 回退
+
+同样先停写并处理在途操作，再把所有进程统一改回 `RAG_DOCUMENT_LOCK_MODE=mysql` 并重启。**禁止新旧进程分别拿两种锁**：一部分进程用 Redis、一部分用 MySQL 时两者互不可见。回退后 `document_leases` 行重新由 SQL 心跳续写 `expires_at`，`fencing_epoch` 保留但不参与判定；已发布版本与操作日志不变。
+
+### 13.4 就绪检查与监控
+
+- 启动校验：`redis` 模式必须能解析出锁 URL，否则进程启动即失败并报配置错误（`rag-document-worker` 退出码 `2`，`rag-service`/`rag-mcp-ingest` 为 `1`）；正常启动会记录 `Document lease backend configured mode=...`。`GET /health` 只表示服务进程已就绪，不探测锁后端；锁后端的观测点是监控页与 `upload-leases`。
+- Console「系统监控 → 概览」：读模型缓存启用时 `Redis` 依赖行探测展示缓存；`RAG_REDIS_ENABLED=false` 且启用文档锁时，该行改报**文档锁后端**的连接状态（只显示连接是否正常，不暴露键与 token）。
+- `GET /v1/admin/upload-leases`：`redis` 模式下 `expires_at`/`expired` 用锁后端实时 TTL 计算（长任务不再被误判过期），Redis 不可用时回退 MySQL 登记值；接口不返回原始 owner token，`holder_id` 是短哈希。
+- 失败语义：Redis 冲突仍是 409 冲突；Redis 不可用返回可重试错误（异步受理 5xx），单实例不会回退 MySQL 锁；提交成功但释放锁失败时不重复执行已提交操作，最多等到租约 TTL 过期。

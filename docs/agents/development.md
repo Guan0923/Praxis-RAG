@@ -17,6 +17,7 @@
 | 状态库 | `RAG_STATE_URL` 或 `RAG_MYSQL_*`、`RAG_MYSQL_DATABASE`（`praxis_rag`）、`RAG_STATE_ENCRYPTION_KEY`、`RAG_STATE_AUTO_SCHEMA` |
 | 向量/检索 | `RAG_BACKEND`（服务必须设 `qdrant`）、`QDRANT_URL`、`RAG_COLLECTION`、`RAG_DENSE_VECTOR_SIZE`（1024）、`RAG_EMBEDDING_MODEL`、`RAG_RERANKER_*` |
 | Redis | `RAG_REDIS_URL`、`RAG_REDIS_ENABLED`、`RAG_REDIS_PREFIX`、`RAG_REDIS_TTL_SECONDS`（60，展示缓存）、`RAG_RESULT_TTL_SECONDS`（3600，**artifact 保留期**）、`RAG_RESULT_MAX_BYTES`、`RAG_ARTIFACT_MAX_BYTES` |
+| 文档锁 | `RAG_DOCUMENT_LOCK_MODE`（`mysql` 默认 / `redis`）、`RAG_REDIS_LOCK_URL`（空则回退 `RAG_REDIS_URL`）、`RAG_REDIS_LOCK_PREFIX`（`rag:lock:v1`）、`RAG_REDIS_LOCK_TTL_SECONDS`（120；心跳按 1/3 续租）、`RAG_REDIS_LOCK_TIMEOUT_SECONDS`（1）、`RAG_REDIS_LOCK_WAIT_SECONDS`（2）；与展示缓存开关解耦，`redis` 模式下所有文档写入/恢复/清理进程必须一致 |
 | Kafka | `RAG_KAFKA_BOOTSTRAP_SERVERS`、`RAG_KAFKA_SECURITY_PROTOCOL`、`RAG_KAFKA_SASL_*`、`RAG_KAFKA_TLS_*`、`RAG_DOCUMENT_TOPIC`/`RAG_DOCUMENT_GROUP`、`RAG_DOCUMENT_DLQ_TOPIC`/`RAG_DOCUMENT_DLQ_GROUP`、`RAG_CACHE_TOPIC`/`RAG_CACHE_GROUP`、`RAG_CACHE_DLQ_TOPIC`/`RAG_CACHE_DLQ_GROUP`、`RAG_DOCUMENT_WORKER_CONCURRENCY`（默认 `1`）；搜索相关的 `RAG_SEARCH_*` topic/group/worker 配置已删除，仅保留 `RAG_SEARCH_TIMEOUT_SECONDS`（120，同步检索总预算） |
 | 文档投递/监控 | `RAG_DOCUMENT_BROKER_MAX_RETRIES`/`RAG_DOCUMENT_MAX_ATTEMPTS`（默认 3；与 MySQL `document_jobs.attempts` 的 3 次执行上限相互独立）、`RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS`（Worker 心跳间隔，默认 15；监控页 60 秒无心跳判降级）、`RAG_CONNECT_URLS`（分布式 Kafka Connect REST 端点）、`RAG_CONNECT_DOCUMENT_CONNECTOR`/`RAG_CONNECT_CACHE_CONNECTOR`（固定连接器名）、`RAG_CONNECT_SUPERVISOR_*`（FAILED task 自动重启间隔/次数/退避）；采集位点在 Connect 内部 topic，应用读不到，监控显示「未知」 |
 | 缓存/CDC | `RAG_CACHE_TOPIC`/`RAG_CACHE_GROUP`、`RAG_CACHE_DLQ_TOPIC`/`RAG_CACHE_DLQ_GROUP`；`cache_revisions` 的 revision/refreshed_revision/attempts/last_error/updated_at；任务表 `schedule_version`；`rag-cdc-cutover` 切换工具 |
@@ -89,7 +90,7 @@ $env:RAG_WEB_ROOT = "$PWD/dist/web"
 
 默认地址：Console `/console`、MCP `/mcp`、API 文档 `/docs`（机器可读 `/openapi.json`）、健康检查 `/health`。
 
-worker 与 `rag-service` 必须共享同一 `RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`QDRANT_URL`、`RAG_STATE_ENCRYPTION_KEY`、Redis/Kafka 配置；它们不继承其他终端里的 `.env`。
+worker 与 `rag-service` 必须共享同一 `RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`QDRANT_URL`、`RAG_STATE_ENCRYPTION_KEY`、Redis/Kafka 配置（文档锁启用时还必须共享同一 `RAG_DOCUMENT_LOCK_MODE` 与 `RAG_REDIS_LOCK_*`）；它们不继承其他终端里的 `.env`。
 
 ## 4. 测试
 

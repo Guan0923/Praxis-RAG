@@ -402,6 +402,10 @@ func (s *Service) deleteDocumentByName(ctx context.Context, namespace, name stri
 		if errors.As(lockErr, &conflict) {
 			return nil, &apierrors.KnowledgeValidationError{Message: "文档正在更新，请稍后再删除"}
 		}
+		var lockUnavailable *state.LockUnavailable
+		if errors.As(lockErr, &lockUnavailable) {
+			return nil, &apierrors.KnowledgeError{Message: documentLockUnavailableMessage}
+		}
 		var knowledge *apierrors.KnowledgeError
 		if errors.As(lockErr, &knowledge) {
 			return nil, knowledge
@@ -528,7 +532,8 @@ func (s *Service) storeAndIndex(
 
 	sha256Value := sha256HexBytes(options.Content)
 	size := int64(len(options.Content))
-	received, err := journal.RunStep(ctx, operation, "receive_source", func() (any, error) {
+	received, err := journal.RunStepContext(ctx, operation, "receive_source", func(actionContext context.Context) (any, error) {
+		ctx := actionContext
 		if err := os.MkdirAll(workspace, 0o755); err != nil {
 			return nil, err
 		}
@@ -578,7 +583,8 @@ func (s *Service) storeAndIndex(
 	if !options.DeduplicateAcrossNames {
 		onlyName = &name
 	}
-	previousValue, err := journal.RunStep(ctx, operation, "deduplicate", func() (any, error) {
+	previousValue, err := journal.RunStepContext(ctx, operation, "deduplicate", func(actionContext context.Context) (any, error) {
+		ctx := actionContext
 		previous, err := s.findDuplicate(ctx, namespace, sha256Value, configuration, onlyName)
 		if err != nil {
 			return nil, err
@@ -645,8 +651,8 @@ func (s *Service) storeAndIndex(
 		return s.failDocumentOperation(ctx, journal, coordinator, operation,
 			logging.WrapStage("indexing", err))
 	}
-	stageValue, err := journal.RunStep(ctx, operation, "stage_qdrant", func() (any, error) {
-		count, stageErr := resources.store.StageVersion(ctx, indexed.qdrantChunks, vectors, sparseVectors,
+	stageValue, err := journal.RunStepContext(ctx, operation, "stage_qdrant", func(actionContext context.Context) (any, error) {
+		count, stageErr := resources.store.StageVersion(actionContext, indexed.qdrantChunks, vectors, sparseVectors,
 			assetPayloads, operation.ID)
 		return count, stageErr
 	}, map[string]any{"version": operation.ID})
@@ -728,8 +734,8 @@ func (s *Service) ingestDocument(
 	workspace, sourcePath, name string,
 	resources *uploadResources,
 ) (*indexedUpload, error) {
-	value, err := journal.RunStep(ctx, operation, "chunking_tokenizer", func() (any, error) {
-		return ingest.Prepare(ctx, sourcePath, ingest.Options{
+	value, err := journal.RunStepContext(ctx, operation, "chunking_tokenizer", func(actionContext context.Context) (any, error) {
+		return ingest.Prepare(actionContext, sourcePath, ingest.Options{
 			SourceName:     name,
 			Chunking:       resources.chunking,
 			TokenizerModel: resources.tokenizerModel,
@@ -823,7 +829,8 @@ func (s *Service) stageArtifacts(
 	operation *state.UploadOperation,
 	indexed *indexedUpload,
 ) error {
-	_, err := journal.RunStep(ctx, operation, "stage_mysql", func() (any, error) {
+	_, err := journal.RunStepContext(ctx, operation, "stage_mysql", func(actionContext context.Context) (any, error) {
+		ctx := actionContext
 		manifest := make([]map[string]any, len(indexed.result.Chunks))
 		for index, chunk := range indexed.result.Chunks {
 			manifest[index] = map[string]any{
@@ -1237,6 +1244,10 @@ func safeUploadErrorText(err error) string {
 	var validation *apierrors.KnowledgeValidationError
 	if errors.As(err, &validation) {
 		return truncateText(validation.Message, 500)
+	}
+	var lockUnavailable *state.LockUnavailable
+	if errors.As(err, &lockUnavailable) {
+		return documentLockUnavailableMessage
 	}
 	var knowledge *apierrors.KnowledgeError
 	if errors.As(err, &knowledge) {

@@ -354,9 +354,11 @@ func (v *CachedReadViews) loadHeads(ctx context.Context, querier viewQuerier, na
 }
 
 func (v *CachedReadViews) loadLeases(ctx context.Context, querier viewQuerier, namespace string) (any, error) {
+	// A released lease keeps its row (and fencing generation) in redis mode, so
+	// only rows with a current holder are display records.
 	rows, err := querier.QueryContext(ctx,
 		"SELECT resource, owner, operation_id, expires_at FROM document_leases "+
-			"WHERE namespace = ? AND resource != ? ORDER BY resource", namespace, "namespace:guard")
+			"WHERE namespace = ? AND resource != ? AND owner != '' ORDER BY resource", namespace, "namespace:guard")
 	if err != nil {
 		return nil, viewLoadError(err)
 	}
@@ -609,7 +611,10 @@ func (v *CachedReadViews) PublishedVersions(ctx context.Context, namespace strin
 	return versions, nil
 }
 
-// Leases returns the display snapshot with expiry recomputed per call.
+// Leases returns the display snapshot with expiry recomputed per call. In redis
+// mode the live TTL comes from the lease backend (the MySQL expires_at is only
+// the registration time), so an operation that is still running is not reported
+// as expired and a crashed holder is. The raw owner token is never returned.
 func (v *CachedReadViews) Leases(ctx context.Context, namespace string) ([]map[string]any, error) {
 	value, err := v.getOrLoad(ctx, "leases", namespace)
 	if err != nil {
@@ -623,6 +628,7 @@ func (v *CachedReadViews) Leases(ctx context.Context, namespace string) ([]map[s
 		return []map[string]any{}, nil
 	}
 	now := unixSeconds()
+	inspector := v.leaseInspector()
 	results := make([]map[string]any, 0, len(records))
 	for _, record := range records {
 		expires, _ := record["expires_at"].(float64)
@@ -631,9 +637,34 @@ func (v *CachedReadViews) Leases(ctx context.Context, namespace string) ([]map[s
 			item[key] = value
 		}
 		item["expired"] = expires <= now
+		if inspector != nil {
+			if resource, ok := record["resource"].(string); ok {
+				if lease, inspectErr := inspector.Inspect(ctx, namespace, resource); inspectErr == nil {
+					holder, _ := record["holder_id"].(string)
+					switch {
+					case lease.Live() && (holder == "" || lease.OwnerDigest == holder):
+						item["holder_id"] = lease.OwnerDigest
+						item["expires_at"] = now + lease.TTL.Seconds()
+						item["expired"] = false
+					case lease.OwnerDigest != holder:
+						// The registered holder is gone (crash) or was replaced.
+						item["expired"] = true
+					}
+				}
+				// A backend failure falls back to the MySQL registration values.
+			}
+		}
 		results = append(results, item)
 	}
 	return results, nil
+}
+
+// leaseInspector returns the optional display-only lock backend.
+func (v *CachedReadViews) leaseInspector() DocumentLockInspector {
+	if v.stores == nil || v.stores.DocumentLocks == nil {
+		return nil
+	}
+	return v.stores.DocumentLocks
 }
 
 // UploadOperations returns the latest 100 display operations.

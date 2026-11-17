@@ -154,6 +154,9 @@ func (s *Service) publishDocument(
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
+	// The publication is durable; release the Redis lease. A release failure only
+	// delays reuse until the lease TTL and must never re-run committed work.
+	_ = s.stores.Uploads.ReleaseOperation(ctx, operation)
 	// The publish transaction touched the documents/kb_list read models through
 	// UpsertTx (which never flushes on its own). Refresh them now so cached
 	// document lists and search snapshots see the published head immediately.

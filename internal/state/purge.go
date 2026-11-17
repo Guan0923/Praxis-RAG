@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 )
 
@@ -31,6 +32,11 @@ type KnowledgeBasePurgeReport struct {
 // transaction. The statement count is fixed (~30) no matter how many documents,
 // operations or namespaces are involved, so a batch-delete request costs one
 // round-trip set instead of one per document.
+//
+// In redis mode a namespace is only purged after its exclusive lease was taken
+// in Redis and fenced in MySQL; a live document write rejects the purge with the
+// pre-migration "busy" outcome. The MySQL expires_at alone never proves that a
+// running upload is gone.
 func (r *KnowledgeBaseRepository) Purge(ctx context.Context, namespaces []string) (KnowledgeBasePurgeReport, error) {
 	report := KnowledgeBasePurgeReport{
 		Present:              map[string]bool{},
@@ -42,15 +48,49 @@ func (r *KnowledgeBaseRepository) Purge(ctx context.Context, namespaces []string
 	if len(names) == 0 {
 		return report, nil
 	}
+	journal := r.purgeJournal()
+	held := map[string]*LockToken{}
+	if journal != nil && journal.redisLeaseMode() {
+		for _, namespace := range names {
+			token, err := journal.AcquireLock(ctx, namespace, nil)
+			if err != nil {
+				var conflict *UploadConflict
+				if errors.As(err, &conflict) {
+					report.Busy[namespace] = true
+					continue
+				}
+				releasePurgeLocks(journal, held)
+				return report, err
+			}
+			held[namespace] = token
+		}
+		if len(held) == 0 {
+			return report, nil
+		}
+		defer releasePurgeLocks(journal, held)
+	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return report, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	active, err := r.purgeBusyNamespaces(ctx, tx, names, report.Busy)
-	if err != nil {
-		return report, err
+	var active []string
+	if journal != nil && journal.redisLeaseMode() {
+		active = make([]string, 0, len(held))
+		for _, namespace := range names {
+			if token, ok := held[namespace]; ok {
+				if err := journal.AssertLockTx(ctx, tx, token); err != nil {
+					return report, err
+				}
+				active = append(active, namespace)
+			}
+		}
+	} else {
+		active, err = r.purgeBusyNamespaces(ctx, tx, names, report.Busy)
+		if err != nil {
+			return report, err
+		}
 	}
 	if len(active) == 0 {
 		if err := tx.Rollback(); err != nil {
@@ -133,6 +173,26 @@ func (r *KnowledgeBaseRepository) Purge(ctx context.Context, namespaces []string
 		return report, err
 	}
 	return report, nil
+}
+
+// purgeJournal returns the upload journal when the store attached one.
+func (r *KnowledgeBaseRepository) purgeJournal() *UploadJournal {
+	if r.cacheSync == nil || r.cacheSync.stores == nil {
+		return nil
+	}
+	return r.cacheSync.stores.Uploads
+}
+
+// releasePurgeLocks releases every exclusive lease a purge acquired. It uses a
+// detached context because the request context may already be cancelled.
+func releasePurgeLocks(journal *UploadJournal, held map[string]*LockToken) {
+	if journal == nil {
+		return
+	}
+	ctx := context.WithoutCancel(context.Background())
+	for _, token := range held {
+		_ = journal.ReleaseLock(ctx, token)
+	}
 }
 
 // purgeBusyNamespaces returns the namespaces that no active upload lease holds.
