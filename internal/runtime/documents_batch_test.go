@@ -3,10 +3,12 @@ package runtime
 import (
 	"context"
 	"testing"
+
+	"github.com/Guan0923/xinghe_rag/internal/state"
 )
 
-// TestSubmitDocumentBatchAdmitsAndClassifies verifies the batch admission
-// fan-out: distinct names are accepted in parallel, a duplicate name inside the
+// TestSubmitDocumentBatchAdmitsAndClassifies verifies input-order admission:
+// the first same-name file wins deterministically, a duplicate name inside the
 // same batch is reported as skipped instead of failing the whole batch, and a
 // retried batch with the same idempotency key reuses the original record.
 func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
@@ -106,6 +108,62 @@ func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
 
 // TestSubmitDocumentBatchRejectsOversizedInput keeps the batch contract at the
 // ten-file limit of the batch upload endpoint.
+// TestSubmitDocumentBatchOrdersQuotaRejections covers the "9 files, last slot"
+// case: the first file in input order wins, the remaining files report the
+// owner's quota reason, and no document job is written for the rejected ones.
+func TestSubmitDocumentBatchOrdersQuotaRejections(t *testing.T) {
+	service, stores := newAsyncService(t)
+	ctx := context.Background()
+	owner, err := stores.Users.Create(ctx, "batch-quota-owner", "hash")
+	if err != nil {
+		t.Fatalf("Users.Create() error = %v", err)
+	}
+	if _, err := stores.KnowledgeBases.SetOwner(ctx, "alpha", owner.ID); err != nil {
+		t.Fatalf("SetOwner() error = %v", err)
+	}
+	for index := 0; index < 9; index++ {
+		name := "existing-" + string(rune('a'+index)) + ".md"
+		if err := stores.Documents.Upsert(ctx, "alpha", state.DocumentRecord{
+			Name: name, DocumentID: "doc-" + string(rune('a'+index)), Size: 4,
+			ChunkCount: 1, Collection: "knowledge_test",
+		}); err != nil {
+			t.Fatalf("Documents.Upsert(%q) error = %v", name, err)
+		}
+	}
+	files := []UploadFile{
+		{Name: "slot.md", Content: []byte("# slot")},
+		{Name: "over-a.md", Content: []byte("# over a")},
+		{Name: "over-b.md", Content: []byte("# over b")},
+	}
+	payload, err := service.SubmitDocumentBatch(ctx, "alpha", files, "quota-batch", "")
+	if err != nil {
+		t.Fatalf("SubmitDocumentBatch() error = %v", err)
+	}
+	if payload["accepted"] != 1 || payload["failed"] != 2 {
+		t.Fatalf("payload = %v, want accepted 1 failed 2", payload)
+	}
+	items, ok := payload["items"].([]map[string]any)
+	if !ok || len(items) != 3 {
+		t.Fatalf("items = %v", payload["items"])
+	}
+	if items[0]["name"] != "slot.md" || items[0]["status"] != "accepted" {
+		t.Fatalf("first item = %v, want slot.md accepted", items[0])
+	}
+	for _, index := range []int{1, 2} {
+		if items[index]["status"] != "failed" || items[index]["reason"] != state.DocumentBatchReasonQuota {
+			t.Fatalf("item %d = %v, want quota failure", index, items[index])
+		}
+	}
+	var jobs int
+	if err := stores.DB.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM document_jobs WHERE namespace = ?", "alpha").Scan(&jobs); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if jobs != 1 {
+		t.Fatalf("document jobs = %d, want only the accepted slot", jobs)
+	}
+}
+
 func TestSubmitDocumentBatchRejectsOversizedInput(t *testing.T) {
 	service, _ := newAsyncService(t)
 	files := make([]UploadFile, 11)

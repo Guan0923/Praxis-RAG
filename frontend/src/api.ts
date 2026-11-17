@@ -166,6 +166,9 @@ export type KnowledgeBase = Chunking & {
   embedding_model: string;
   reranker_model: string;
   vlm_model?: string;
+  // Who pays the Embedding provider for document ingestion. Existing rows
+  // without the key are platform-provided by default.
+  embedding_billing_source?: "platform" | "customer";
   collection: string;
   tokenizer: string;
   created_at: string;
@@ -288,7 +291,8 @@ export type DocumentBatchStatus =
 export type DocumentBatchItemStatus = "accepted" | "skipped" | "failed" | "saving";
 export type DocumentBatchJobStatus = "queued" | "processing" | "succeeded" | "failed";
 // DocumentBatchItemReason explains a skipped item; failed items keep a safe
-// error category instead of a raw server message.
+// error category instead of a raw server message. "quota" marks a file the
+// membership quota rejected; its error text is the server's Chinese reason.
 export type DocumentBatchItemReason =
   | "exists"
   | "queued"
@@ -296,6 +300,7 @@ export type DocumentBatchItemReason =
   | "validation"
   | "config"
   | "conflict"
+  | "quota"
   | "internal";
 export type DocumentBatchJob = {
   status: DocumentBatchJobStatus;
@@ -1759,6 +1764,30 @@ export function formatBytes(value: number) {
   if (value < 1073741824) return `${(value / 1048576).toFixed(1)} MB`;
   return `${(value / 1073741824).toFixed(1)} GB`;
 }
+
+// thousands groups digits with ASCII commas so quota numbers read the same in
+// every browser locale (the Console stays Chinese-facing).
+export function thousands(value: number) {
+  if (!Number.isFinite(value)) return "—";
+  const rounded = Math.trunc(value);
+  const digits = Math.abs(rounded).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return rounded < 0 ? `-${digits}` : digits;
+}
+
+// formatQuota renders an Embedding character quota. B-level allowances use 亿
+// (Chinese) so 1_000_000_000 reads as "10 亿" instead of an unreadable digit
+// run; smaller values keep thousands separators.
+export function formatQuota(value: number) {
+  if (!Number.isFinite(value)) return "—";
+  if (Math.abs(value) >= 100_000_000) {
+    const yi = value / 100_000_000;
+    const text = Number.isInteger(yi)
+      ? String(yi)
+      : yi.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+    return `${text} 亿`;
+  }
+  return thousands(value);
+}
 export function chunkLabel(
   config: Chunking | undefined,
   strategies: Strategy[],
@@ -1847,4 +1876,308 @@ export async function deleteApiKeys(ids: string[]): Promise<BatchDeleteResult> {
     body: JSON.stringify({ ids }),
   });
   return normalizeBatchDeleteResult(payload);
+}
+
+// --- Membership, orders & entitlements (会员与用量) --------------------------
+// Every number on the membership page comes from the server: catalog prices,
+// quota usage, order amounts and the Alipay parameters. The Console only
+// renders them and never computes or edits a price.
+export type PlanKey = "free" | "plus" | "pro";
+export type BillingPeriod = "month" | "year";
+// PlanLimits mirrors the server projection; `unlimited_*` wins over the numeric
+// field, which stays <= 0 for an unlimited tier.
+export type PlanLimits = {
+  knowledge_bases: number;
+  files_per_kb: number;
+  embedding_chars_per_month: number;
+  unlimited_knowledge_bases: boolean;
+  unlimited_files: boolean;
+};
+export type MembershipUsage = {
+  knowledge_bases: number;
+  embedding_allowance: number;
+  embedding_used: number;
+  embedding_reserved: number;
+  period_start: string;
+  period_end: string;
+};
+// PurchaseState reports whether new orders may be created; a paused store keeps
+// the reason the Console has to show next to the disabled buttons.
+export type PurchaseState = {
+  available: boolean;
+  paused: boolean;
+  reason: string | null;
+};
+export type MembershipView = {
+  plan: PlanKey | string;
+  plan_name: string;
+  source: "free" | "paid" | string;
+  started_at: string;
+  expires_at: string | null;
+  refresh_at: string;
+  limits: PlanLimits;
+  usage: MembershipUsage;
+  can_share: boolean;
+  upgrade_plan: PlanKey | string | null;
+  purchase: PurchaseState;
+};
+// PlanCatalogItem is one row of the priced catalog (GET /v1/membership plans).
+export type PlanCatalogItem = {
+  plan: PlanKey | string;
+  name: string;
+  monthly_cents: number;
+  yearly_cents: number;
+  monthly_yuan: string;
+  yearly_yuan: string;
+  year_discount: boolean;
+  limits: PlanLimits;
+  can_share: boolean;
+};
+export type OrderQuoteSegment = {
+  plan?: string;
+  plan_name?: string;
+  starts_at?: string;
+  ends_at?: string;
+  amount_cents?: number;
+  amount_yuan?: string;
+};
+// OrderQuote is the server-side settlement preview of one order: the Console
+// shows these dates and never derives them from the local clock.
+export type OrderQuote = {
+  starts_at: string;
+  ends_at: string;
+  current_plan: string;
+  target_plan: string;
+  segments: OrderQuoteSegment[];
+};
+export type OrderView = {
+  id: string;
+  status: string;
+  status_label: string;
+  plan: string;
+  plan_name: string;
+  period: BillingPeriod | string;
+  period_label: string;
+  kind: string;
+  kind_label: string;
+  amount_cents: number;
+  amount_yuan: string;
+  currency: string;
+  quote?: OrderQuote | null;
+  alipay_trade_no: string | null;
+  created_at: string;
+  expires_at: string;
+  paid_at: string | null;
+  refund_status?: string | null;
+  refund_amount_yuan?: string | null;
+};
+// AdminOrderView adds the account name to the reconciliation rows only.
+export type AdminOrderView = OrderView & { username?: string | null };
+// PaymentForm is the server-signed Alipay redirect: a gateway URL plus the
+// exact form fields to post. It is opaque to the Console.
+export type PaymentForm = {
+  gateway: string;
+  params: Record<string, string>;
+};
+export type CreateOrderResult = {
+  order: OrderView;
+  pay?: PaymentForm | null;
+};
+export type MembershipOverview = {
+  membership: MembershipView;
+  plans: PlanCatalogItem[];
+  orders: OrderView[];
+};
+export type WorkspaceFilesQuota = {
+  used: number;
+  limit: number;
+  unlimited: boolean;
+  can_add: boolean;
+  reason: string | null;
+};
+// WorkspaceEmbeddingQuota omits the accounting numbers for a shared knowledge
+// base: owner_view=false means only can_use/refresh_at exist.
+export type WorkspaceEmbeddingQuota = {
+  can_use: boolean;
+  owner_view: boolean;
+  refresh_at: string;
+  limit?: number;
+  used?: number;
+  reserved?: number;
+  remaining?: number;
+};
+export type WorkspaceEntitlements = {
+  namespace: string;
+  owner: boolean;
+  shared: boolean;
+  owner_username?: string | null;
+  files?: WorkspaceFilesQuota | null;
+  embedding?: WorkspaceEmbeddingQuota | null;
+};
+
+export const orderStatusLabels: Record<string, string> = {
+  pending: "待支付",
+  paid: "已支付",
+  closed: "已关闭",
+  refunding: "退款中",
+  refunded: "已退款",
+  manual: "待人工处理",
+};
+export const orderStatusColors: Record<string, string> = {
+  pending: "processing",
+  paid: "success",
+  closed: "default",
+  refunding: "warning",
+  refunded: "default",
+  manual: "error",
+};
+// orderStatusText prefers the server label so a new status still reads in
+// Chinese, and falls back to the local vocabulary for an older backend.
+export function orderStatusText(order: { status: string; status_label?: string }) {
+  return order.status_label || orderStatusLabels[order.status] || order.status;
+}
+export function orderStatusColor(order: { status: string }) {
+  return orderStatusColors[order.status] || "default";
+}
+
+// fetchMembership reads the current membership, the priced catalog and the
+// caller's own orders in one round trip.
+export async function fetchMembership(signal?: AbortSignal): Promise<MembershipOverview> {
+  return await api<MembershipOverview>("/v1/membership", undefined, {
+    signal,
+    cache: "no-store",
+  });
+}
+
+export async function fetchMembershipOrders(): Promise<OrderView[]> {
+  const payload = await api<{ orders?: OrderView[] | null }>(
+    "/v1/membership/orders",
+    undefined,
+    { cache: "no-store" },
+  );
+  return payload.orders || [];
+}
+
+// CreateOrderInput never carries a price: the server generates the amount from
+// its own catalog. An upgrade is expressed as intent=upgrade plus the plan.
+export type CreateOrderInput = {
+  plan: PlanKey | string;
+  period?: BillingPeriod;
+  intent?: "purchase" | "upgrade";
+};
+
+export async function createMembershipOrder(
+  input: CreateOrderInput,
+): Promise<CreateOrderResult> {
+  return await api<CreateOrderResult>("/v1/membership/orders", undefined, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+// fetchMembershipOrder reads one order; refresh=1 asks the gateway for the
+// authoritative status (a payment callback may be pending).
+export async function fetchMembershipOrder(
+  orderId: string,
+  refresh = false,
+): Promise<CreateOrderResult> {
+  return await api<CreateOrderResult>(
+    `/v1/membership/orders/${encodeURIComponent(orderId)}${refresh ? "?refresh=1" : ""}`,
+    undefined,
+    { cache: "no-store" },
+  );
+}
+
+export async function closeMembershipOrder(orderId: string): Promise<OrderView> {
+  const payload = await api<{ order: OrderView }>(
+    `/v1/membership/orders/${encodeURIComponent(orderId)}/close`,
+    undefined,
+    { method: "POST" },
+  );
+  return payload.order;
+}
+
+export async function fetchWorkspaceEntitlements(
+  namespace: string,
+  connection?: Connection,
+  signal?: AbortSignal,
+): Promise<WorkspaceEntitlements> {
+  return await api<WorkspaceEntitlements>(
+    `/v1/workspaces/${encodeURIComponent(namespace)}/entitlements`,
+    connection,
+    { signal, cache: "no-store" },
+  );
+}
+
+// --- Admin billing reconciliation (订单对账) --------------------------------
+export async function fetchAdminBillingOrders(status = ""): Promise<AdminOrderView[]> {
+  const query = status ? `?status=${encodeURIComponent(status)}&limit=100` : "?limit=100";
+  const payload = await api<{ orders?: AdminOrderView[] | null }>(
+    `/v1/admin/billing/orders${query}`,
+    undefined,
+    { cache: "no-store" },
+  );
+  return payload.orders || [];
+}
+
+export async function queryAdminBillingOrder(orderId: string): Promise<OrderView> {
+  const payload = await api<{ order: OrderView }>(
+    `/v1/admin/billing/orders/${encodeURIComponent(orderId)}/query`,
+    undefined,
+    { method: "POST" },
+  );
+  return payload.order;
+}
+
+export async function refundAdminBillingOrder(
+  orderId: string,
+  reason: string,
+): Promise<OrderView> {
+  const payload = await api<{ order: OrderView }>(
+    `/v1/admin/billing/orders/${encodeURIComponent(orderId)}/refund`,
+    undefined,
+    { method: "POST", body: JSON.stringify({ reason }) },
+  );
+  return payload.order;
+}
+
+export async function manualAdminBillingOrder(
+  orderId: string,
+  note: string,
+): Promise<OrderView> {
+  const payload = await api<{ order: OrderView }>(
+    `/v1/admin/billing/orders/${encodeURIComponent(orderId)}/manual`,
+    undefined,
+    { method: "POST", body: JSON.stringify({ note }) },
+  );
+  return payload.order;
+}
+
+// submitAlipayForm posts the server-signed payment parameters as a hidden form.
+// The Console never builds, edits or rounds an amount: every field is passed
+// through exactly as the server returned it. Opening the gateway in a new
+// window keeps the Console state intact while the payer authenticates.
+export function submitAlipayForm(pay: PaymentForm): HTMLFormElement {
+  const gateway = pay?.gateway || "";
+  const params = pay?.params || {};
+  if (!gateway) throw new Error("支付网关地址缺失，请重新下单");
+  const form = document.createElement("form");
+  form.method = "POST";
+  form.action = gateway;
+  form.target = "_blank";
+  form.style.display = "none";
+  for (const [name, value] of Object.entries(params)) {
+    const input = document.createElement("input");
+    input.type = "hidden";
+    input.name = name;
+    input.value = value === null || value === undefined ? "" : String(value);
+    form.appendChild(input);
+  }
+  document.body.appendChild(form);
+  try {
+    form.submit();
+  } finally {
+    form.remove();
+  }
+  return form;
 }

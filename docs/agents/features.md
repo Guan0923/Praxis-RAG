@@ -7,7 +7,7 @@
 
 - 一个知识库 = 一个 namespace，命名规则 `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`；文档、切分配置、Embedding/Reranker/VLM 连接、Qdrant collection 与维度都按知识库保存。
 - 所有租户请求（REST `/v1/*`、MCP）必须携带 `X-RAG-Namespace`；Qdrant 查询按 payload 中的 `namespace` 过滤，不同知识库互不可见。
-- 知识库默认归创建者私有；共享通过「权限管理」页的邀请链接完成（见 §10）。
+- 知识库默认归创建者私有；共享通过「权限管理」页的邀请链接完成（见 §10）。个人会员 Free/Plus/Pro 只影响自有库数、每库文件数和平台文档 Embedding 字符额度，不改 `admin/vip/user` 角色；Plus/Pro 可对自己拥有的知识库发邀请。
 - 每个知识库的 Qdrant 集合由知识库配置决定（创建知识库时生成 `knowledge_*` 名称，首次入库时创建）；`RAG_COLLECTION` 只是没有知识库配置时的回退名，系统监控按有效文档实际入库的集合校验，不要求回退集合存在，空知识库没有集合也不算异常；dense 向量维度固定 1024（BGE-M3），其他维度启动即报错。
 
 ## 2. 文档导入与异步任务
@@ -15,7 +15,7 @@
 - 支持格式：`.md`、`.txt`、`.pdf`、`.docx`、`.doc`（DOC 需外部 LibreOffice）；每批最多 10 个文件，单文件最大 10 MiB。
 - **异步受理**：`POST /v1/document-batches` 为每个文件在一个事务内写入 `document_jobs`（含文件字节、sha256、配置版本、`schedule_version=1`），以 `202` 返回批次和逐文件结果；解析/切分/Embedding/发布在 worker 后台完成。任务表由 Kafka Connect 的 `praxis-document-cdc` 连接器采集，不再写事务 outbox。上传 POST 可携带可选的 `X-Upload-ID`，与 `GET /v1/document-batches/upload-events/{upload_id}`（SSE）配对实时推送逐文件字节进度与保存结果；缺省该头时行为与响应完全不变。
 - 上传前可用 `POST /v1/documents/check` 做同名/SHA-256 预检；`Idempotency-Key` 支持重试复用原批次及其文件任务。
-- **批次上传（Console 使用）**：`POST /v1/document-batches` 先提交 `document_batches` + `document_batch_items`（每项 `saving`），再按文件名加锁并行受理每个文件（不同名互不排队，默认 6 路），最后把每项结果与计数写回并返回 `202`。`GET /v1/document-batches/{batch_id}` 同时给出保存结果（`accepted`/`skipped`/`failed` + 原因）与已受理文件的 `job.status/stage`；`GET /v1/document-batches?limit=20` 只返回仍有未完成工作的批次，供 Console 刷新后恢复进度气泡。批次只是进度元数据，不保存文件字节，7 天后清理。Console 上传面板为每个文件一行独立进度条并先订阅 SSE（`ready` 后发 POST）：`progress.received` 是请求体累计接收的内容字节数（前端按本地 `File.size` 换算百分比），每文件 `result`（`saved`/`skipped`/`failed`）落地即结束该行；面板在保存结果处结束，不再展示或轮询解析阶段（解析阶段仍由批次状态接口的 `items[].job.status/stage` 暴露）。
+- **批次上传（Console 使用）**：`POST /v1/document-batches` 先提交 `document_batches` + `document_batch_items`（每项 `saving`），再按输入顺序逐项受理每个文件（每项仍有独立的文件名锁与事务），最后把每项结果与计数写回并返回 `202`。顺序裁决保证最后一个文件/知识库名额归属确定，已受理项仍在后台异步运行。`GET /v1/document-batches/{batch_id}` 同时给出保存结果（`accepted`/`skipped`/`failed` + 原因）与已受理文件的 `job.status/stage`；`GET /v1/document-batches?limit=20` 只返回仍有未完成工作的批次，供 Console 刷新后恢复进度气泡。批次只是进度元数据，不保存文件字节，7 天后清理。Console 上传面板为每个文件一行独立进度条并先订阅 SSE（`ready` 后发 POST）：`progress.received` 是请求体累计接收的内容字节数（前端按本地 `File.size` 换算百分比），每文件 `result`（`saved`/`skipped`/`failed`）落地即结束该行；面板在保存结果处结束，不再展示或轮询解析阶段（解析阶段仍由批次状态接口的 `items[].job.status/stage` 暴露）。
 - 任务状态：`queued` → `processing`（带 `stage`）→ `succeeded` / `failed`；`stage` 依次为 `parsing`、`chunking`、`staging`、`embedding`、`indexing`、`publishing`、`completed`/`failed`。只有 `succeeded` 表示已持久发布、可检索。
 - 冲突规则：同名文档已存在、或已有同名排队/执行中的新增，会被拒绝；`add_document` 不覆盖同名文档，替换用 `update_document`。Console 的「替换文件」调用同步 `POST /v1/documents/{name}/replace`（multipart 字段 `file`）：校验目标文档写权限（全库或单文件授权）、新文件类型与原文档一致，然后复用 `WriteDocument(overwrite=true)` 的替换与重建索引逻辑，保留原名；普通上传规则不变。
 - 失败重试：同进程内指数退避（默认最多 5 次），仍是“至少一次”投递；耗尽后进入显式 DLQ topic，由 `rag-dead-letter-worker` 落终态。崩溃恢复：任务租约 + 心跳 + 上传 journal 对账，重复投递靠幂等吸收。
@@ -121,6 +121,7 @@
 | 租户：文档 | `GET /v1/documents`、`POST /v1/documents/check`、`GET /v1/document-jobs/{artifact_id}`、`POST /v1/document-batches`、`GET /v1/document-batches`、`GET /v1/document-batches/{batch_id}`、`GET /v1/document-batches/upload-events/{upload_id}`（SSE）、`GET /v1/documents/{name}/content`、`DELETE /v1/documents/{name}` |
 | 租户：知识库/状态 | `GET /v1/knowledge-base`、`GET /v1/namespaces`、`GET /v1/chunking/strategies`、`GET /v1/uploads`、`GET /v1/uploads/{operation_id}` |
 | Console 会话：知识库/共享 | `GET /v1/users`、`POST /v1/knowledge-bases`、`GET /v1/knowledge-bases/{namespace}/access`、`GET /v1/knowledge-bases/{namespace}/permissions`、`DELETE /v1/knowledge-bases/{namespace}/permissions/{user_id}`、`GET|POST /v1/knowledge-bases/{namespace}/invitations`、`GET /v1/invitations`、`POST /v1/invitations/preview`、`POST /v1/invitations/accept`、`POST /v1/invitations/decline`、`DELETE /v1/invitations/{invitation_id}` |
+| Console 会话：会员/支付 | `GET /v1/membership`、`GET|POST /v1/membership/orders`、`GET /v1/membership/orders/{order_id}`、`POST /v1/membership/orders/{order_id}/close`、`GET /v1/workspaces/{namespace}/entitlements`、`POST /v1/payments/alipay/notify`（无会话，RSA2 验签）；管理员：`GET /v1/admin/billing/orders`、`POST /v1/admin/billing/orders/{order_id}/query|refund|manual` |
 | 管理：用户 | `GET /v1/admin/users`、`PATCH /v1/admin/users/{user_id}`、`DELETE /v1/admin/users/{user_id}` |
 | 管理：知识库 | `GET|POST /v1/admin/knowledge-bases`、`POST /v1/admin/knowledge-bases/models/{kind}`、`GET /v1/admin/knowledge-bases/defaults`、`GET|PATCH /v1/admin/knowledge-bases/{namespace}`、`GET /v1/admin/knowledge-bases/{namespace}/key/{kind}` |
 | 管理：模型配置 | `GET|POST /v1/admin/model-profiles`、`GET|PATCH|DELETE /v1/admin/model-profiles/{profile_id}`、`GET /v1/admin/model-profiles/{profile_id}/key`、`POST /v1/admin/model-profiles/{profile_id}/models` |
@@ -146,13 +147,14 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | `#/workspaces/search` | 检索调试 | 所有登录账号 | BM25/Embedding/Hybrid 检索、Cross-Encoder 重排开关、候选/Top-K 调整、三模式对比、耗时与证据状态、命中详情（分数、来源、页码/章节、图片、脚注） |
 | `#/workspaces/documents` | 知识文档 | 所有登录账号 | 文档列表（大小/块数/切分配置）、上传（批次受理：工具栏「保存中/已完成 x/y」徽标 + 逐文件独立进度条气泡，SSE 实时字节进度与每文件保存结果，可失败重试；面板在保存结果处结束、不展示解析阶段；刷新后恢复未完成批次）、「从飞书导入」（连接本人飞书账号 → 浏览文件夹/搜索 → 最多勾选 10 篇 → 目标知识库与可见范围提示 → 逐篇「已受理/已跳过/失败」+ 索引进度）、删除；只读授权时隐藏写操作 |
 | `#/workspaces/documents/{name}` | 文档详情 | 所有登录账号 | 正文预览、PDF 预览（pdfjs）、图片/表格资产查看 |
-| `#/workspaces/create` | 创建知识库 | 所有登录账号 | 管理员：namespace + 切分参数 + 从「模型配置」选择 Embedding/Reranker/VLM；VIP/普通用户：简化表单（从默认模板克隆模型配置） |
+| `#/workspaces/create` | 创建知识库 | 所有登录账号 | namespace + 切分参数 + 从**本人**「模型配置」选择 Embedding/Reranker/VLM；管理员未提交连接时可回退默认模板，普通账号必须选择本人模型 |
 | `#/knowledge-bases` | 知识库 | 管理员 | 知识库列表、编辑抽屉（模型/切分/重新向量化确认） |
 | `#/model-profiles` | 模型配置 | 管理员 | Embedding/Reranker/VLM/JEV 分页签，新增/编辑/删除、模型探测、Key 只写不读 |
 | `#/api-keys` | API Key | 所有登录账号 | 自己的密钥 CRUD/启停、一次性明文、复制 MCP 配置 |
 | `#/users` | 用户管理 | 管理员 | 角色（admin/vip/user）、启用/禁用、删除；服务端保证至少保留一名启用的管理员 |
 | `#/monitor` | 系统监控 | 管理员 | 只读监控：顶部标签栏 = `概览` + `MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` + `全部日志`，组件标签含该组件既有内容与该组件日志，`全部日志` 的组件筛选显示各组件日志条数。概览：页头三态状态与降级告警、主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络速率与最忙网卡、进程 RSS/VMS/goroutine/heap；首次采样与 Windows load 显示「—」）、关键指标（有效文档/任务/上传/检索）、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态（Kafka 校验元数据与主题、PDF 校验转换器）、`document_jobs` 队列与阶段、上传互斥分类、`文档采集`/`缓存采集` 两行（connector/task 状态、所在 worker、失败原因、自动重启次数与恢复结果）、两组 Kafka 消费组滞后、缓存 dirty/failures、文档 Worker 心跳（读不到显示「未知」）、服务信息；全部日志支持内存/文件来源、最低级别、关键字过滤与分页；15 秒自动刷新，窄屏单列 |
-| `#/permissions` | 权限管理 | 管理员 / VIP | 选择知识库、按用户聚合授权、创建邀请（可读/可修改 × 全库/若干文件）、复制链接、撤销授权/邀请 |
+| `#/membership` | 会员与用量 | 所有登录账号 | Free/Plus/Pro 目录、月/年卡、到期/刷新日、自有库与文件额度、Embedding 字符总额/已用/预留、下单并跳转支付宝、本人订单与继续支付/关单；管理员额外显示订单对账/查单/整单退款/人工处理 |
+| `#/permissions` | 权限管理 | 所有登录账号（仅自有库可管理；新建邀请限管理员/VIP/Plus/Pro） | 选择知识库、按用户聚合授权、创建邀请（可读/可修改 × 全库/若干文件）、复制链接、撤销授权/邀请；到期后仍可查看和撤销已有共享 |
 | `#/invitations` | 邀请中心 | 登录账号 | 待处理邀请、粘贴邀请链接、接受/拒绝（顶部铃铛轮询） |
 | `#/invite?token=` | 受邀预览 | 登录账号 | 预览邀请并接受/拒绝，随后切换到该知识库 |
 
@@ -164,7 +166,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 - 角色只有 `admin`、`vip`、`user`；只有管理员能改角色，且最后一个启用的管理员不能被降级/禁用/删除。
 - Console 会话：HttpOnly Cookie `rag_session`（默认 7 天，`RAG_AUTH_SESSION_TTL_HOURS`）；Cookie 会话的写操作要求 `X-CSRF-Token`，Bearer 会话/API Key 不需要。
 - 知识库权限：管理员或创建者拥有全部读写；其他人取授权的并集——授权分 `read`/`write`，范围分全库或指定文件；写授权隐含可读。**文件级写授权只能替换已授权的同名文档，不能上传新文件**。
-- 邀请：只有管理员与 VIP 可发起（管理员可邀请任意知识库，VIP 只能邀请自己创建的）；邀请链接一次性，数据库只存 token 的 SHA-256 摘要；被邀请人必须存在且启用，不能邀请自己；默认 TTL 168 小时。
+- 邀请：管理员、VIP 以及当前 Plus/Pro 会员可发起（管理员可邀请任意知识库，其余只能邀请自己创建的；手工 VIP 保留原权限）；邀请链接一次性，数据库只存 token 的 SHA-256 摘要；被邀请人必须存在且启用，不能邀请自己；默认 TTL 168 小时。到期后已有共享保留，但停止新发付费邀请；接受过期会员先前发出的未使用邀请会重新校验邀请人资格。
 - API Key：`prk_` 前缀，明文只在创建时返回一次；按命名空间白名单生效；密钥归创建账号所有，非管理员看不到别人的密钥（返回 404）。
 
 ## 11. 模型配置（model profiles）

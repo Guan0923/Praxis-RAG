@@ -200,6 +200,13 @@ func (s *Service) maintenancePass(ctx context.Context) {
 	if _, err := s.stores.PurgeUnreferencedContent(ctx, state.ContentObjectRetentionSeconds, 100); err != nil {
 		logBackgroundFailure(ctx, "content purge", err)
 	}
+	if s.stores.Membership != nil {
+		// Unknown embedding outcomes stay reserved for 24 hours. After that the
+		// platform absorbs the uncertainty and releases the unconsumed hold.
+		if _, err := s.stores.Membership.ReleaseStaleEmbedding(ctx, time.Now().Add(-24*time.Hour)); err != nil {
+			logBackgroundFailure(ctx, "embedding reservation recovery", err)
+		}
+	}
 }
 
 // recoverUploadsGlobal runs the upload coordinator recovery/cleanup pass for

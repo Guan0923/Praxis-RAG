@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
@@ -636,10 +637,44 @@ func (s *Service) storeAndIndex(
 		return s.failDocumentOperation(ctx, journal, coordinator, operation,
 			logging.WrapStage("embedding", err))
 	}
+	// Reserve the whole document's known character count before the first paid
+	// embedding call. The reservation is bound to this operation (and therefore
+	// to automatic job retries) and to the quota period active right now.
+	var embeddingChars int64
+	for _, chunk := range indexed.result.Chunks {
+		embeddingChars += int64(utf8.RuneCountInString(chunk.Text))
+	}
+	meterVersion := operation.ID
+	if options.Task != nil {
+		// Automatic retries of one admitted artifact reuse this identity, so the
+		// customer is charged at most once per logical document call.
+		meterVersion = options.Task.ArtifactID
+	}
+	meter, meterErr := s.prepareDocumentEmbeddingMeter(
+		ctx, namespace, name, meterVersion, resources.embeddingModel, embeddingChars, "document", "")
+	if meterErr != nil {
+		return s.failDocumentOperation(ctx, journal, coordinator, operation,
+			logging.WrapStage("embedding", meterErr))
+	}
+	if meter != nil {
+		resources.embedder.OnBatchSucceeded = meter.observe
+	}
 	vectors, sparseVectors, err := s.encodeDocumentVectors(ctx, journal, operation, indexed, resources)
+	if meter != nil {
+		resources.embedder.OnBatchSucceeded = nil
+	}
 	if err != nil {
+		if meter != nil {
+			_ = meter.finishUnknown(ctx)
+		}
 		return s.failDocumentOperation(ctx, journal, coordinator, operation,
 			logging.WrapStage("embedding", err))
+	}
+	if meter != nil {
+		if err := meter.settle(ctx); err != nil {
+			return s.failDocumentOperation(ctx, journal, coordinator, operation,
+				logging.WrapStage("embedding", err))
+		}
 	}
 	assetPayloads := make([]map[string]any, 0, len(indexed.result.Assets))
 	for _, asset := range indexed.result.Assets {

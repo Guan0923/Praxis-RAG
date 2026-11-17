@@ -205,5 +205,17 @@ func documentJobIngestError(err error) error {
 	if errors.As(inner, &documentValidation) {
 		return documentValidation
 	}
+	var quota *state.QuotaExceededError
+	if errors.As(inner, &quota) {
+		message := quota.Message
+		if message == "" {
+			message = "所有者的文档向量化额度不足，请等待额度刷新或升级套餐"
+		}
+		return &state.DocumentValidationError{Message: message}
+	}
+	var fileQuota *state.DocumentQuotaExceededError
+	if errors.As(inner, &fileQuota) {
+		return &state.DocumentValidationError{Message: fileQuota.Message}
+	}
 	return inner
 }

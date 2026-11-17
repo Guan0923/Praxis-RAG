@@ -25,6 +25,7 @@ type Values = Chunking & {
   embedding_profile: string;
   reranker_profile?: string;
   vlm_profile?: string;
+  embedding_billing_source?: "platform" | "customer";
 };
 type Defaults = { default: string; strategies: Strategy[] };
 // 创建草稿只保存 Namespace、切分参数、所选模型配置和开关，绝不保存 API Key。
@@ -323,6 +324,8 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         reranker_model: rerankerEnabled ? reranker.model : "",
         vlm: vlmEnabled ? vlm.provider : { base_url: "", apikey: "" },
         vlm_model: vlmEnabled ? vlm.model : "",
+        embedding_billing_source: values.embedding_billing_source
+          ?? initial?.embedding_billing_source ?? "platform",
       };
       // 创建走会话级自建接口：任何角色都可以提交自己模型配置对应的 provider
       // 字段（每个账号用自己的配置建库）；编辑仍沿用管理员的知识库配置接口。
@@ -446,6 +449,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         embedding_profile: initial ? currentProfile : undefined,
         reranker_profile: initial && initial.reranker_model ? currentProfile : undefined,
         vlm_profile: initial && initial.vlm_model ? currentProfile : undefined,
+        embedding_billing_source: initial?.embedding_billing_source || "platform",
         strategy: initial?.strategy, chunk_size: initial?.chunk_size, chunk_overlap: initial?.chunk_overlap }}
       onValuesChange={() => {
         setError("");
@@ -457,6 +461,16 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
       {initial
         ? providerSections
         : <div className="knowledge-provider-grid" role="group" aria-label="模型配置">{providerSections}</div>}
+      <section className="knowledge-provider" aria-label="Embedding 计费归属">
+        <div className="section-heading"><h2>Embedding 计费归属</h2></div>
+        <Form.Item name="embedding_billing_source" label="文档 Embedding 费用"
+          extra="platform：使用平台赠额并计入会员额度；customer：客户自付连接，不扣平台赠额。仅管理员可修改。">
+          <Select virtual={false} disabled={locked} options={[
+            { value: "platform", label: "平台供给（默认，计入赠额）" },
+            { value: "customer", label: "客户自付（不扣平台赠额）" },
+          ]} />
+        </Form.Item>
+      </section>
       <section className="knowledge-provider" aria-label="切分配置"><h2>文本切分</h2>
         <div className="knowledge-chunk-row">
           <Form.Item name="strategy" label="切分方式" rules={[{ required: true }]}>

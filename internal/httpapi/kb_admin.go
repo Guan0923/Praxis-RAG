@@ -30,20 +30,22 @@ func (p providerSettings) values() map[string]any {
 
 // KnowledgeBaseCreateInput is the transport-neutral create request.
 type KnowledgeBaseCreateInput struct {
-	Namespace       string
-	Chunking        chunking.Config
-	EmbeddingModel  string
-	RerankerModel   string
-	EmbeddingValues map[string]any
-	RerankerValues  map[string]any
-	VLMModel        string
-	VLMValues       map[string]any
+	Namespace              string
+	Chunking               chunking.Config
+	EmbeddingModel         string
+	RerankerModel          string
+	EmbeddingValues        map[string]any
+	RerankerValues         map[string]any
+	VLMModel               string
+	VLMValues              map[string]any
+	EmbeddingBillingSource string
 }
 
 // KnowledgeBaseUpdateInput is the transport-neutral patch request.
 type KnowledgeBaseUpdateInput struct {
-	Values  map[string]any
-	Reembed bool
+	Values                 map[string]any
+	Reembed                bool
+	EmbeddingBillingSource *string
 }
 
 // KnowledgeBaseAdminRuntime is the knowledge-base administration surface.
@@ -146,26 +148,28 @@ func filterNamespaceNames(namespaces, allowed []string) []string {
 }
 
 type createKnowledgeBaseBody struct {
-	Namespace      string            `json:"namespace"`
-	Embedding      *providerSettings `json:"embedding"`
-	Reranker       *providerSettings `json:"reranker"`
-	EmbeddingModel *string           `json:"embedding_model"`
-	RerankerModel  string            `json:"reranker_model"`
-	VLM            *providerSettings `json:"vlm"`
-	VLMModel       string            `json:"vlm_model"`
-	Strategy       string            `json:"strategy"`
-	ChunkSize      *int              `json:"chunk_size"`
-	ChunkOverlap   *int              `json:"chunk_overlap"`
+	Namespace              string            `json:"namespace"`
+	Embedding              *providerSettings `json:"embedding"`
+	Reranker               *providerSettings `json:"reranker"`
+	EmbeddingModel         *string           `json:"embedding_model"`
+	RerankerModel          string            `json:"reranker_model"`
+	VLM                    *providerSettings `json:"vlm"`
+	VLMModel               string            `json:"vlm_model"`
+	EmbeddingBillingSource string            `json:"embedding_billing_source"`
+	Strategy               string            `json:"strategy"`
+	ChunkSize              *int              `json:"chunk_size"`
+	ChunkOverlap           *int              `json:"chunk_overlap"`
 }
 
 type updateKnowledgeBaseBody struct {
-	Embedding      *providerSettings `json:"embedding"`
-	Reranker       *providerSettings `json:"reranker"`
-	EmbeddingModel *string           `json:"embedding_model"`
-	RerankerModel  *string           `json:"reranker_model"`
-	VLM            *providerSettings `json:"vlm"`
-	VLMModel       *string           `json:"vlm_model"`
-	Reembed        bool              `json:"reembed"`
+	Embedding              *providerSettings `json:"embedding"`
+	Reranker               *providerSettings `json:"reranker"`
+	EmbeddingModel         *string           `json:"embedding_model"`
+	RerankerModel          *string           `json:"reranker_model"`
+	VLM                    *providerSettings `json:"vlm"`
+	VLMModel               *string           `json:"vlm_model"`
+	EmbeddingBillingSource *string           `json:"embedding_billing_source"`
+	Reembed                bool              `json:"reembed"`
 }
 
 func (body updateKnowledgeBaseBody) values() map[string]any {
@@ -316,9 +320,10 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		EmbeddingModel:  *body.EmbeddingModel,
 		RerankerModel:   body.RerankerModel,
 		EmbeddingValues: embeddingValues,
-		RerankerValues:  rerankerValues,
-		VLMModel:        body.VLMModel,
-		VLMValues:       vlmValues,
+		RerankerValues:         rerankerValues,
+		VLMModel:               body.VLMModel,
+		VLMValues:              vlmValues,
+		EmbeddingBillingSource: body.EmbeddingBillingSource,
 	})
 	if err != nil {
 		writeCreateKnowledgeBaseError(w, err)
@@ -479,8 +484,9 @@ func (s *Server) handleUpdateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 	}
 
 	payload, err := s.kbAdmin.UpdateKnowledgeBase(r.Context(), pathParam(r, "namespace"), KnowledgeBaseUpdateInput{
-		Values:  body.values(),
-		Reembed: body.Reembed,
+		Values:                 body.values(),
+		Reembed:                body.Reembed,
+		EmbeddingBillingSource: body.EmbeddingBillingSource,
 	})
 	if err != nil {
 		writeUpdateKnowledgeBaseError(w, err)

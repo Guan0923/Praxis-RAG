@@ -32,12 +32,15 @@ import {
   chunkLabel,
   errorText,
   fetchAccess,
+  fetchWorkspaceEntitlements,
   formatBytes,
+  formatQuota,
   type AccessView,
   type Connection,
   type DocumentInfo,
   type KnowledgeBase,
   type Strategy,
+  type WorkspaceEntitlements,
 } from "./api";
 import {
   bindNamespace,
@@ -89,6 +92,10 @@ export function DocumentsPage({
   const [loading, setLoading] = useState(false);
   const [listError, setListError] = useState("");
   const [access, setAccess] = useState<AccessView>();
+  // entitlements carries the membership quota of this knowledge base: who owns
+  // it, how many files it may hold and (for the owner only) the Embedding
+  // balance. It is a hint, the server still enforces every limit.
+  const [entitlements, setEntitlements] = useState<WorkspaceEntitlements>();
   const [knowledgeBase, setKnowledgeBase] = useState<KnowledgeBase>();
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [settingsError, setSettingsError] = useState("");
@@ -164,6 +171,21 @@ export function DocumentsPage({
       // enforces write permissions on every mutation.
     }
   }
+  // loadEntitlements resolves the quota projection of this knowledge base. A
+  // missing endpoint (older backend) or a shared workspace without numbers must
+  // never break the document list: the hint simply stays hidden.
+  async function loadEntitlements() {
+    try {
+      const data = await fetchWorkspaceEntitlements(
+        connection.namespace,
+        connection,
+        lifetime.current.signal,
+      );
+      if (!lifetime.current.signal.aborted) setEntitlements(data);
+    } catch {
+      if (!lifetime.current.signal.aborted) setEntitlements(undefined);
+    }
+  }
   useEffect(() => {
     void loadKnowledgeBase();
     void loadAccess();
@@ -173,8 +195,12 @@ export function DocumentsPage({
       confirmDialog.current?.destroy();
     };
   }, []);
+  // The quota projection is read while the document list is visible; every
+  // activation re-reads it because an upload elsewhere may have consumed slots.
   useEffect(() => {
-    if (active) void loadDocuments();
+    if (!active) return;
+    void loadDocuments();
+    void loadEntitlements();
   }, [active]);
   // Restore unfinished batches once on mount (after a page reload); leaving
   // the page never cancels an upload because the parent keeps this component
@@ -188,11 +214,13 @@ export function DocumentsPage({
     void restore(connection);
   }, [connection]);
   // Batch polling lives outside React, so the settled callback refreshes the
-  // document list and health summary once every tracked batch finishes.
+  // document list, the health summary and the file quota once every tracked
+  // batch finishes (an accepted file consumes a quota slot).
   useEffect(() => {
     setOnSettled(() => {
       void loadDocuments();
       void onHealth();
+      void loadEntitlements();
     });
     return () => setOnSettled(undefined);
   }, [connection]);
@@ -604,6 +632,50 @@ export function DocumentsPage({
           ))}
         </div>
       </div>
+      {entitlements && (
+        <div
+          aria-label="知识库配额"
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 16,
+            alignItems: "baseline",
+            marginBottom: 12,
+          }}
+        >
+          <span>
+            <span className="secondary">知识库归属：</span>
+            <strong>
+              {entitlements.owner ? "自有库" : entitlements.shared ? "共享库" : "知识库"}
+            </strong>
+            {entitlements.shared && entitlements.owner_username && (
+              <span className="secondary">（所有者 {entitlements.owner_username}）</span>
+            )}
+          </span>
+          {entitlements.files && (
+            <span>
+              <span className="secondary">文件额度：</span>
+              <strong>
+                {entitlements.files.unlimited || entitlements.files.limit < 0
+                  ? "不限"
+                  : `${entitlements.files.used} / ${entitlements.files.limit}`}
+              </strong>
+            </span>
+          )}
+          {/* Only the owner sees the embedding balance; a shared knowledge base
+              reports just can_use/refresh_at. */}
+          {entitlements.embedding?.owner_view
+            && entitlements.embedding.remaining !== undefined && (
+            <span>
+              <span className="secondary">Embedding 剩余：</span>
+              <strong>{formatQuota(entitlements.embedding.remaining)}</strong>
+              {entitlements.embedding.limit !== undefined && (
+                <span className="secondary"> / {formatQuota(entitlements.embedding.limit)}</span>
+              )}
+            </span>
+          )}
+        </div>
+      )}
       {!anyWrite && (
         <Alert
           className="page-alert"
@@ -620,6 +692,18 @@ export function DocumentsPage({
           showIcon
           title="文件级写入"
           description="你只被授权修改部分文档：可对相应文档执行「替换文件」；上传、删除与飞书导入需要全库写权限。"
+        />
+      )}
+      {entitlements?.files && !entitlements.files.can_add && (
+        <Alert
+          className="page-alert"
+          type="warning"
+          showIcon
+          title="文件数量已达上限"
+          description={
+            entitlements.files.reason
+              || "当前知识库的文件数量已达套餐上限，暂时无法上传新文档；可删除不再需要的文档或升级套餐。"
+          }
         />
       )}
       <div className="section-heading">

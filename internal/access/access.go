@@ -54,6 +54,7 @@ const (
 	MessageInvitationOwner  = "该邀请不属于当前账号"
 	MessageInvitationUsed   = "邀请已处理或已失效"
 	MessageInvitationExpiry = "邀请已过期"
+	MessageInviterExpired   = "邀请人的会员权益已失效，无法接受该邀请"
 	MessageUserMissing      = "用户不存在"
 	MessageUserDisabled     = "该账号已被禁用"
 	MessageSelfInvite       = "不能邀请自己"
@@ -158,12 +159,23 @@ func (s ScopeSet) WriteDocumentNames() []string {
 	return names
 }
 
+// EntitlementProvider reports whether an account's current personal membership
+// includes the "may issue new share invitations" entitlement. The access layer
+// keeps its role contract (admin/vip) and asks this provider for paid plans, so
+// a purchase never mutates an account role.
+type EntitlementProvider interface {
+	CanShare(ctx context.Context, userID string) (bool, error)
+}
+
 // Options configures a Service.
 type Options struct {
 	// Now overrides the clock in tests.
 	Now func() time.Time
 	// InvitationTTL is how long one share link stays acceptable.
 	InvitationTTL time.Duration
+	// Entitlements supplies membership-based sharing for Plus/Pro accounts.
+	// Nil keeps the historical role-only behaviour.
+	Entitlements EntitlementProvider
 }
 
 // Service resolves access and implements knowledge-base sharing.
@@ -173,6 +185,7 @@ type Service struct {
 	permissions    *state.PermissionRepository
 	invitations    *state.InvitationRepository
 	documents      *state.DocumentRepository
+	entitlements   EntitlementProvider
 	now            func() time.Time
 	invitationTTL  time.Duration
 }
@@ -193,9 +206,27 @@ func NewService(stores *state.Stores, options Options) *Service {
 		permissions:    stores.Permissions,
 		invitations:    stores.Invitations,
 		documents:      stores.Documents,
+		entitlements:   options.Entitlements,
 		now:            clock,
 		invitationTTL:  ttl,
 	}
+}
+
+// CanShareAccount reports whether the account may issue new share invitations:
+// administrators and the existing manual VIP role always may, and Plus/Pro
+// members may through their active paid entitlement. A purchase or expiry never
+// changes the stored role.
+func (s *Service) CanShareAccount(ctx context.Context, user state.User) (bool, error) {
+	if !user.Enabled {
+		return false, nil
+	}
+	if user.CanShare() {
+		return true, nil
+	}
+	if s.entitlements == nil {
+		return false, nil
+	}
+	return s.entitlements.CanShare(ctx, user.ID)
 }
 
 // scopeContextKey carries one request's resolved visibility into lower layers.
@@ -282,18 +313,18 @@ func (s *Service) ScopeSet(ctx context.Context, user state.User, namespace strin
 // manage grants for one knowledge base. Only VIPs and administrators may share,
 // and a VIP only for knowledge bases they created.
 func (s *Service) CanShareKnowledgeBase(ctx context.Context, user state.User, namespace string) (bool, error) {
-	if !user.CanShare() {
-		return false, nil
+	canShare, err := s.CanShareAccount(ctx, user)
+	if err != nil || !canShare {
+		return false, err
 	}
 	return s.CanManage(ctx, user, namespace)
 }
 
-// RequireSharePermission returns the typed error explaining why an account may
-// not manage sharing for a knowledge base.
-func (s *Service) RequireSharePermission(ctx context.Context, user state.User, namespace string) error {
-	if !user.CanShare() {
-		return NewError(KindForbidden, MessageForbidden)
-	}
+// RequireManagePermission allows an owner or administrator to inspect and
+// revoke existing sharing even after a paid membership expires. It deliberately
+// does not check the "new invitation" entitlement: expiry must stop new paid
+// invitations without trapping previously shared libraries.
+func (s *Service) RequireManagePermission(ctx context.Context, user state.User, namespace string) error {
 	manage, err := s.CanManage(ctx, user, namespace)
 	if err != nil {
 		return err
@@ -302,6 +333,19 @@ func (s *Service) RequireSharePermission(ctx context.Context, user state.User, n
 		return NewError(KindForbidden, MessageNotOwner)
 	}
 	return nil
+}
+
+// RequireSharePermission additionally requires the account to be allowed to
+// issue new invitations (admin/vip or an active Plus/Pro entitlement).
+func (s *Service) RequireSharePermission(ctx context.Context, user state.User, namespace string) error {
+	canShare, err := s.CanShareAccount(ctx, user)
+	if err != nil {
+		return err
+	}
+	if !canShare {
+		return NewError(KindForbidden, MessageForbidden)
+	}
+	return s.RequireManagePermission(ctx, user, namespace)
 }
 
 // VisibleNamespaces lists the knowledge bases one account may use at all:

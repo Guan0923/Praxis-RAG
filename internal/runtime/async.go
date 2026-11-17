@@ -97,6 +97,10 @@ func asyncDocumentError(err error) error {
 	if errors.As(err, &lookup) {
 		return &apierrors.KnowledgeValidationError{Message: lookup.Message}
 	}
+	var quota *state.DocumentQuotaExceededError
+	if errors.As(err, &quota) {
+		return &apierrors.KnowledgeValidationError{Message: quota.Message}
+	}
 	var knowledgeValidation *apierrors.KnowledgeValidationError
 	if errors.As(err, &knowledgeValidation) {
 		return knowledgeValidation
