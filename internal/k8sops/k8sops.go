@@ -1,17 +1,14 @@
-// Package k8sops implements the minimal Kubernetes operations the Console
-// monitor page offers: reading one Deployment's replica state and scaling the
-// document worker. It speaks the Kubernetes API over HTTPS with the pod's
-// service-account credentials, and fails closed when the service account is
-// not mounted (RBAC not applied) so the endpoints degrade to 503 instead of
-// pretending to work.
+// Package k8sops implements the Kubernetes side channel of the Console system
+// monitor page: one shared list/watch cache over the built-in workload and pod
+// resources, read-only snapshots for the browser, rolling restarts of
+// Deployment / StatefulSet / DaemonSet, and the legacy document-worker scale
+// operation.
 //
-// The package is deliberately tiny: no informers, no watch, no typed clientset
-// dependency. Two REST calls cover the Console needs:
-//
-//   - GET  /apis/apps/v1/namespaces/{ns}/deployments/{name}
-//     (read spec.replicas, status.replicas, observedGeneration),
-//   - PATCH (application/merge-patch+json) on the same path with
-//     {"spec":{"replicas":N}} — the server-side equivalent of kubectl scale.
+// The package talks to the Kubernetes API over HTTPS. Credentials come either
+// from the mounted service-account projection (in-cluster) or from an
+// explicitly configured kubeconfig (out-of-cluster); with neither, every
+// cluster endpoint degrades to a configuration hint instead of failing
+// startup.
 package k8sops
 
 import (
@@ -29,8 +26,9 @@ import (
 	"time"
 )
 
-// ErrNotInCluster means no Kubernetes service account is mounted: the Console
-// endpoints must degrade instead of dialing a nonexistent API server.
+// ErrNotInCluster means no Kubernetes service account or kubeconfig is
+// configured: the Console endpoints must degrade instead of dialing a
+// nonexistent API server.
 var ErrNotInCluster = errors.New("kubernetes service account is not mounted")
 
 // ErrForbidden means the API server answered 403: the RBAC role is missing or
@@ -48,35 +46,78 @@ const (
 	DefaultNamespace  = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 )
 
-// Settings carries the service-account in-cluster resolution. An empty
-// APIEndpoint means "not running inside a Kubernetes pod with a mounted
-// service account"; Enabled then reports false and the operations degrade.
+// Settings carries the resolved cluster access. An empty APIEndpoint means
+// "no cluster is configured"; Enabled then reports false and the Console
+// endpoints degrade to ConfigurationHint instead of failing startup.
+//
+// The legacy in-cluster fields (TokenPath, RootCAPath, Namespace) and the
+// kubeconfig-derived fields (CAData, Token, TokenFile, ...) are unified here so
+// the same REST client can talk to either credential source.
 type Settings struct {
 	// APIEndpoint is the kube-apiserver URL (https://kubernetes.default.svc:443).
 	APIEndpoint string
-	// Namespace is the pod namespace (used when DeploymentNamespace is empty).
+	// Namespace is the pod namespace (in-cluster) or the kubeconfig context
+	// namespace.
 	Namespace string
-	// TokenPath is the projected service-account token file.
+	// TokenPath is the projected service-account token file (in-cluster). It
+	// is re-read on every call because kubelet rotates it.
 	TokenPath string
-	// RootCAPath is the cluster CA bundle used to verify the API server.
+	// RootCAPath is the cluster CA bundle used to verify the API server
+	// (in-cluster).
 	RootCAPath string
 	// DeploymentNamespace overrides the namespace of the managed Deployment
-	// (defaults to the pod namespace).
+	// (defaults to the pod / context namespace).
 	DeploymentNamespace string
 	// DocumentWorkerDeployment is the Deployment the scale endpoint manages.
 	DocumentWorkerDeployment string
+
+	// Source identifies the credential source (SourceServiceAccount or
+	// SourceKubeconfig). It is surfaced by ClusterInfo.
+	Source string
+	// KubeconfigPath is the explicit kubeconfig the credentials came from.
+	KubeconfigPath string
+	// ContextName is the kubeconfig context used for the cluster identity.
+	ContextName string
+	// CAData is the PEM-encoded cluster CA bundle from the kubeconfig.
+	CAData []byte
+	// InsecureSkipTLSVerify disables API-server certificate verification
+	// (kubeconfig insecure-skip-tls-verify).
+	InsecureSkipTLSVerify bool
+	// Token is a static kubeconfig bearer token.
+	Token string
+	// TokenFile is a kubeconfig token file; it is re-read on every call so
+	// external rotation keeps working.
+	TokenFile string
+	// ClientCertData / ClientKeyData are the PEM client certificate pair from
+	// the kubeconfig (inline data or loaded from the referenced files).
+	ClientCertData []byte
+	ClientKeyData  []byte
+	// Username / Password are kubeconfig basic-auth credentials.
+	Username string
+	Password string
 }
 
-// SettingsFromEnv resolves the in-cluster access from the standard mounted
-// files plus optional env overrides:
+// SettingsFromEnv resolves the cluster access, in priority order:
 //
-//	RAG_K8S_API_ENDPOINT         (default https://kubernetes.default.svc:443)
-//	RAG_K8S_WORKER_DEPLOYMENT    (default rag-document-worker)
-//	RAG_K8S_DEPLOYMENT_NAMESPACE (default: the pod namespace file)
+//  1. RAG_K8S_KUBECONFIG (optional RAG_K8S_CONTEXT): an explicit out-of-cluster
+//     kubeconfig. Unreadable files, malformed YAML and unsupported exec /
+//     auth-provider plugins fail startup with a Chinese configuration error.
+//  2. The mounted service-account projection (standard in-cluster access).
+//  3. Neither: the zero Settings and a nil error, so the Console degrades.
 //
-// An endpoint set without the mounted token is a configuration error: the
-// operator asked for Kubernetes control without providing credentials.
+// In-cluster env overrides: RAG_K8S_API_ENDPOINT, RAG_K8S_WORKER_DEPLOYMENT,
+// RAG_K8S_DEPLOYMENT_NAMESPACE. An endpoint set without the mounted token is a
+// configuration error: the operator asked for Kubernetes control without
+// providing credentials.
 func SettingsFromEnv() (Settings, error) {
+	if path := strings.TrimSpace(os.Getenv("RAG_K8S_KUBECONFIG")); path != "" {
+		return settingsFromKubeconfig(path, strings.TrimSpace(os.Getenv("RAG_K8S_CONTEXT")))
+	}
+	return settingsFromInCluster()
+}
+
+// settingsFromInCluster keeps the original service-account behavior.
+func settingsFromInCluster() (Settings, error) {
 	settings := Settings{
 		APIEndpoint:              strings.TrimSpace(os.Getenv("RAG_K8S_API_ENDPOINT")),
 		DocumentWorkerDeployment: strings.TrimSpace(os.Getenv("RAG_K8S_WORKER_DEPLOYMENT")),
@@ -112,11 +153,79 @@ func SettingsFromEnv() (Settings, error) {
 	} else {
 		settings.Namespace = settings.DeploymentNamespace
 	}
+	settings.Source = SourceServiceAccount
 	return settings, nil
 }
 
 // Enabled reports whether Kubernetes operations are wired.
 func (s Settings) Enabled() bool { return s.APIEndpoint != "" }
+
+// authorize attaches the resolved credentials to one request. Token files are
+// re-read every call: kubelet rotates the projected service-account token and
+// external operators rotate kubeconfig token files, so a long-lived service
+// process must not pin the first value forever.
+func (s Settings) authorize(request *http.Request) error {
+	if s.TokenFile != "" {
+		token, err := os.ReadFile(s.TokenFile)
+		if err != nil {
+			return fmt.Errorf("无法读取 kubeconfig tokenFile 文件 %s: %w", s.TokenFile, err)
+		}
+		request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+		return nil
+	}
+	if s.Token != "" {
+		request.Header.Set("Authorization", "Bearer "+s.Token)
+		return nil
+	}
+	if s.TokenPath != "" {
+		token, err := os.ReadFile(s.TokenPath)
+		if err != nil {
+			return fmt.Errorf("无法读取 Kubernetes token 文件 %s: %w", s.TokenPath, err)
+		}
+		request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+		return nil
+	}
+	if s.Username != "" || s.Password != "" {
+		request.SetBasicAuth(s.Username, s.Password)
+	}
+	return nil
+}
+
+// tlsConfig builds the API-server transport configuration. An explicit CA
+// bundle wins; otherwise the in-cluster service-account CA is loaded when
+// present. A missing CA file is tolerated for backward compatibility with the
+// legacy client (the mounted bundle may be absent during local runs), but any
+// other read error is fatal.
+func (s Settings) tlsConfig() (*tls.Config, error) {
+	config := &tls.Config{MinVersion: tls.VersionTLS12}
+	if s.InsecureSkipTLSVerify {
+		config.InsecureSkipVerify = true
+	}
+	caData := s.CAData
+	if len(caData) == 0 && s.RootCAPath != "" {
+		certificate, err := os.ReadFile(s.RootCAPath)
+		switch {
+		case err == nil:
+			caData = certificate
+		case !os.IsNotExist(err):
+			return nil, fmt.Errorf("cannot read the cluster CA bundle: %w", err)
+		}
+	}
+	if len(caData) > 0 {
+		pool := x509.NewCertPool()
+		if pool.AppendCertsFromPEM(caData) {
+			config.RootCAs = pool
+		}
+	}
+	if len(s.ClientCertData) > 0 || len(s.ClientKeyData) > 0 {
+		certificate, err := tls.X509KeyPair(s.ClientCertData, s.ClientKeyData)
+		if err != nil {
+			return nil, fmt.Errorf("无法加载 kubeconfig 客户端证书: %w", err)
+		}
+		config.Certificates = []tls.Certificate{certificate}
+	}
+	return config, nil
+}
 
 // Deployment is the read model the Console needs: no status details beyond
 // replica counts, so the page cannot leak unrelated cluster information.
@@ -139,23 +248,21 @@ type Client struct {
 // request open (the transport handler applies its own shorter bound too).
 const timeout = 10 * time.Second
 
-// NewClient builds the REST client from resolved settings.
+// NewClient builds the REST client from resolved settings. It works with both
+// credential sources: the mounted service account and an explicit kubeconfig.
 func NewClient(settings Settings) (*Client, error) {
 	if !settings.Enabled() {
 		return nil, ErrNotInCluster
 	}
-	pool := x509.NewCertPool()
-	ca, err := os.ReadFile(settings.RootCAPath)
-	if err == nil && len(ca) > 0 {
-		pool.AppendCertsFromPEM(ca)
-	} else if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("cannot read the cluster CA bundle: %w", err)
+	tlsSettings, err := settings.tlsConfig()
+	if err != nil {
+		return nil, err
 	}
 	return &Client{
 		settings: settings,
 		http: &http.Client{
 			Timeout:   timeout,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+			Transport: &http.Transport{TLSClientConfig: tlsSettings},
 		},
 	}, nil
 }
@@ -166,14 +273,8 @@ func (s Settings) deploymentPath(namespace, name string) string {
 		"/apis/apps/v1/namespaces/" + strings.Trim(namespace, "/") + "/deployments/" + strings.Trim(name, "/")
 }
 
-// request issues one authenticated API call. The token is re-read from the
-// projected volume on every call: kubelet rotates it, and a long-lived
-// service process must not pin the first token forever.
+// request issues one authenticated API call.
 func (c *Client) request(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {
-	token, err := os.ReadFile(c.settings.TokenPath)
-	if err != nil {
-		return nil, 0, fmt.Errorf("cannot read the service-account token: %w", err)
-	}
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -182,7 +283,9 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 	if err != nil {
 		return nil, 0, err
 	}
-	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	if err := c.settings.authorize(request); err != nil {
+		return nil, 0, err
+	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/merge-patch+json")
 	}

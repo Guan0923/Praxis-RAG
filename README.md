@@ -72,11 +72,11 @@ REST `/v1/search`、MCP `search`、Console 与本地调试**全部同步执行**
 
 | 入口 | 能力 |
 | --- | --- |
-| Web Console：`/console` | 账号登录/注册（可配置邮箱验证码）、个人信息（头像 / 年龄 / 性别 / 用户名 / 邮箱 / 密码）、角色与知识库权限管理、文档管理、检索调试、工作区切换、管理员「系统设置」邮件服务器（SMTP）与「系统监控」只读页面，「模型配置」模型列表（Embedding / Reranker / VLM / JEV）与知识库配置中的模型快速选择，以及知识库 / API Key 的批量删除（复选或鼠标框选）。 |
+| Web Console：`/console` | 账号登录/注册（可配置邮箱验证码）、个人信息（头像 / 年龄 / 性别 / 用户名 / 邮箱 / 密码）、角色与知识库权限管理、文档管理、检索调试、工作区切换、管理员「系统设置」邮件服务器（SMTP）与「系统监控」页面（概览/依赖/日志、Kubernetes 工作负载与滚动重启），「模型配置」模型列表（Embedding / Reranker / VLM / JEV）与知识库配置中的模型快速选择，以及知识库 / API Key 的批量删除（复选或鼠标框选）。 |
 | MCP：`/mcp` | 搜索、添加/更新/删除文档、分页读取正文、提示词模板及订阅变更。 |
 | REST API：`/v1/*` | 知识管理与检索接入现有应用；`/openapi.json` 与 `/docs` 提供 OpenAPI 3.1 契约。 |
 
-MCP 需要 `Authorization: Bearer <service token 或 API Key>` 与 `X-RAG-Namespace`；`/v1/admin/*` 管理接口仅允许本机直连或管理员会话，其中 `/v1/admin/api-keys` 是例外：任意已登录账号都可以管理**自己的** API Key（非管理员只能绑定本人创建的知识库，历史无主密钥仅管理员/本机管理可见）。管理员可以启停已注册的 MCP 工具、调整工具说明和管理提示词模板。
+MCP 需要 `Authorization: Bearer <service token 或 API Key>` 与 `X-RAG-Namespace`；`/v1/admin/*` 管理接口仅允许本机直连或管理员会话，其中 `/v1/admin/api-keys` 是例外：任意已登录账号都可以管理**自己的** API Key（非管理员只能绑定本人创建的知识库，历史无主密钥仅管理员/本机管理可见）；`/v1/admin/k8s/*` 只接受已登录管理员会话（无本机直连兜底）。管理员可以启停已注册的 MCP 工具、调整工具说明和管理提示词模板。
 
 ### 模型配置与知识库模型选择
 
@@ -252,7 +252,7 @@ MCP search / REST /v1/search（同步）-> runtime.Service.Search -> 检索 + �
 - **重发只在 MySQL 事务内发生**：可重试失败先记录原因与 `retry_at`，到期由 `Sweep` 递增 `schedule_version`；租约过期由 `Sweep` 递增版本重排。普通 `queued` 等待（worker/解析名额）不会递增版本，也不消耗执行次数。消费者只处理与数据库当前版本相等的通知；任务表初始快照的 `op=r` 事件用于存量切换补投。
 - **搜索永远同步**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，没有 `result_id`/`wait_seconds`/轮询；artifact 按 ID 独立读取，保留期由 `RAG_RESULT_TTL_SECONDS`（默认 3600 秒）控制。原排队搜索链路（`search_tasks`、`search_result_snapshots`、`praxis_search` topic、`rag-search-worker`、搜索 DLQ）已于 2026-11-13 下线，两张历史表保留数据但不再读写。
 - **缓存消费者 revision 水位**：业务表变更（包括手工 SQL）由缓存连接器投递，消费者递增 `cache_revisions.revision` 后重建并写 Redis；失败记录 `attempts/last_error`，由周期 `RefreshDirty` 收敛，不再有 `cache_outbox` 补发；因此 Redis 写失败不会把事件反复送进 DLQ。
-- Console「系统监控」采用顶部标签栏：`概览` 展示总体状态、关键指标、依赖探测、文档任务/上传、两个 Kafka Connect 采集连接器（`文档采集`/`缓存采集`，含 connector/task 状态、所在 worker、失败原因、自动重启与恢复结果）、两组 Kafka 消费组、缓存水位与 Worker 心跳，并新增主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络总速率与最忙网卡、进程 RSS/VMS/goroutine/heap）；`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` 标签展示该组件既有内容与该组件日志（概览的 `Redis` 依赖行在读模型缓存关闭时报告文档锁后端）；`全部日志` 提供来源（内存/文件）、级别、关键字过滤与分页。读不到的进度显示「未知」。搜索同步化迁移与切换步骤见 [CDC 迁移契约](docs/cdc-migration.md) §12 与 [部署指南](docs/DEPLOYMENT.md) §12；采集层操作见 [Kafka Connect 手册](deploy/kafka-connect/README.md)。
+- Console「系统监控」按固定每秒自动刷新（页头只显示「自动刷新 · 每 1 秒」与最近一次成功更新时间，无开关、手动刷新或失败重试按钮；失败保留上次数据并自动重试，慢请求不堆叠），采用顶部标签栏：`概览` 展示总体状态、关键指标、依赖探测、文档任务/上传、两个 Kafka Connect 采集连接器（`文档采集`/`缓存采集`，含 connector/task 状态、所在 worker、失败原因、自动重启与恢复结果）、两组 Kafka 消费组、缓存水位与 Worker 心跳，并新增主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络总速率与最忙网卡、进程 RSS/VMS/goroutine/heap）；`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` 标签展示该组件既有内容与该组件日志（概览的 `Redis` 依赖行在读模型缓存关闭时报告文档锁后端）；`全部日志` 提供来源（内存/文件）、级别、关键字过滤与分页。管理员另有 `Kubernetes` 标签：查看已连接集群全部命名空间的 Deployment/StatefulSet/DaemonSet/ReplicaSet/ReplicationController/Job/CronJob 工作负载与全部 Pod，按 ownerReferences 展开归属 Pod，并对可滚动更新的工作负载执行滚动重启（需要 `rbac-monitor-ops.yaml` 的 ClusterRole/ClusterRoleBinding，或集群外 `RAG_K8S_KUBECONFIG`）。读不到的进度显示「未知」。搜索同步化迁移与切换步骤见 [CDC 迁移契约](docs/cdc-migration.md) §12 与 [部署指南](docs/DEPLOYMENT.md) §12；采集层操作见 [Kafka Connect 手册](deploy/kafka-connect/README.md)。
 
 ## 迁移状态
 

@@ -25,7 +25,7 @@ worker）和可选的 PDF 高保真微服务部署到已有集群里。MySQL、Q
 deploy/k8s/
 ├── common/                     # ConfigMap（普通参数）——先于一切 apply
 ├── base/                       # 公共工作负载：API、文档 worker、文档死信 worker
-│                               #   + rbac-monitor-ops.yaml（监控页扩缩容的 SA/Role/Binding）
+│                               #   + rbac-monitor-ops.yaml（监控页 Kubernetes 标签与扩缩容的 SA/ClusterRole/ClusterRoleBinding）
 ├── overlays/
 │   ├── go/                     # 完整安装入口：Go 进程内 PDF 解析
 │   ├── vision/                 # 完整安装入口：+ pdf-parser（高保真 PDF）
@@ -506,12 +506,15 @@ kubectl -n praxis-rag get pods -l app.kubernetes.io/component=document-worker -o
 
 ```bash
 # B. Console 监控页（「文档 Worker」标签页的「副本数」卡片）
-#    前提：rag-service 使用 rbac-monitor-ops.yaml 的 ServiceAccount 运行
-#    （base/ 已接线，正常 apply 即生效）。
+#    前提：rag-service 已解析到 Kubernetes 凭据——集群内使用
+#    rbac-monitor-ops.yaml 的 ServiceAccount（base/ 已接线，正常 apply 即
+#    生效），集群外设置 RAG_K8S_KUBECONFIG（可选 RAG_K8S_CONTEXT）。
+#    ClusterRole 的 get/list/watch 覆盖读取 Deployment 副本数，
+#    patch 覆盖 spec.replicas 的 merge patch（与滚动重启共用同一凭据）。
 #    卡片会实时显示期望/就绪副本数，输入目标副本数点「应用副本数」即可。
 #    实现 = 对 Deployment 的 spec.replicas 发 merge patch（与 kubectl scale
 #    等价，admission/quota 同样生效），进程内 k8sops 客户端每次调用重读
-#    kubelet 投影轮换的 token。
+#    kubelet 投影轮换的 token（kubeconfig 的 tokenFile 同理）。
 ```
 
 确认两件事：
@@ -551,15 +554,16 @@ kubectl -n praxis-rag scale deploy/rag-document-worker --replicas=1
 缩容时正在处理的分区会 rebalance 给存活 Pod；未提交的消息重新投递，
 由 `schedule_version` + 租约保证幂等。
 
-### 8.1 监控页的三个运维操作（第一层 + worker 扩缩容）
+### 8.1 监控页的运维操作（立即重投 / 重启连接器 / worker 扩缩容 / 滚动重启）
 
-Console 监控页（管理员登录或 kubectl port-forward 的本机直连）现在有三类操作：
+Console 监控页固定每秒自动刷新（页头只显示「自动刷新 · 每 1 秒」和最近一次成功更新时间，没有自动刷新开关、手动刷新或失败重试按钮；失败保留上次数据并在下一秒重试，每个数据类同一时间最多一个请求）。除原有的三类操作外，管理员的 `Kubernetes` 标签还提供工作负载/Pod 查看与滚动重启：
 
 | 操作 | 位置 | 后端端点 | 前提 |
 | --- | --- | --- | --- |
 | 立即重投 | MySQL / 文档 Worker 标签页「卡死处理中」行 | `POST /v1/admin/monitor/actions/requeue-jobs` | 无（只依赖 MySQL） |
 | 重启连接器 | Debezium 标签页失败采集行的按钮 | `POST /v1/admin/monitor/actions/connectors/{name}/restart` | `RAG_CONNECT_URLS` 已配置 |
-| worker 扩缩容 | 文档 Worker 标签页「副本数」卡片 | `GET/POST /v1/admin/monitor/actions/worker-deployment(/scale)` | 已挂载 ServiceAccount + RBAC |
+| worker 扩缩容 | 文档 Worker 标签页「副本数」卡片 | `GET/POST /v1/admin/monitor/actions/worker-deployment(/scale)` | 已解析 Kubernetes 凭据（ServiceAccount 或 kubeconfig）+ RBAC |
+| 滚动重启 | Kubernetes 标签页工作负载行 | `POST /v1/admin/k8s/workloads/{resource}/{namespace}/{name}/restart` | 已挂载 ServiceAccount + ClusterRole RBAC（或集群外 kubeconfig） |
 
 要点：
 
@@ -570,13 +574,27 @@ Console 监控页（管理员登录或 kubectl port-forward 的本机直连）�
   任务：重启连接器及其任务的同时清空该连接器的重启预算，自动重启循环
   拿到新预算。只接受两个固定连接器名（`praxis-document-cdc` /
   `praxis-cache-cdc`），不会转发任意名字。
-- **扩缩容**的 RBAC 在 `base/rbac-monitor-ops.yaml`：ServiceAccount
-  `rag-monitor-ops` + Role（仅 `apps` 组 `deployments` 的 `get`+`patch`，
-  `resourceNames` 限定 `rag-document-worker`）。未应用该清单或 Compose/
-  宿主机部署时，rag-service 正常启动，卡片显示「未启用」——本地开发环境
-  不受影响。
-- 所有操作端点都在 `/v1/admin/*` 边界内（管理员会话 + CSRF，或本机直连
-  破窗），与只读监控接口同一鉴权。
+- **扩缩容与滚动重启**的 RBAC 在 `base/rbac-monitor-ops.yaml`：ServiceAccount
+  `rag-monitor-ops` + ClusterRole/ClusterRoleBinding（全部命名空间的
+  `pods`/`replicationcontrollers`、`apps` 的 `deployments`/`statefulsets`/
+  `daemonsets`/`replicasets`、`batch` 的 `jobs`/`cronjobs` 为
+  `get`/`list`/`watch`；另对 `deployments`/`statefulsets`/`daemonsets`
+  授予 `patch`）。扩缩容与 Kubernetes 标签共用同一份已解析凭据（集群内
+  ServiceAccount 或集群外 `RAG_K8S_KUBECONFIG`）：`get` 已包含在 list/watch
+  规则中，`patch` 授权覆盖 `rag-document-worker` 的 `spec.replicas` 和滚动
+  重启；原 `resourceNames` 限定单 Deployment 的 Role 已不再使用。两者都未
+  配置时，rag-service 正常启动，扩缩容接口返回 503「Kubernetes 操作未启用」、
+  卡片显示「未启用」，Kubernetes 标签显示配置提示；RBAC 缺少权限时页面显示
+  502 错误提示。Compose/宿主机部署不受影响。
+- **Kubernetes 标签**（仅管理员）默认展示「工作负载」，旁边可切「全部 Pod」：
+  覆盖已连接集群全部命名空间（含系统命名空间与 Praxis-RAG 以外的应用），
+  支持命名空间/名称筛选，展开行按 ownerReferences 显示归属 Pod。滚动重启只
+  对可滚动更新的 Deployment/StatefulSet/DaemonSet 可用，paused/Recreate/
+  OnDelete/`partition>0` 会在行内说明不可用原因。
+- 三个监控操作端点都在 `/v1/admin/*` 边界内（管理员会话 + CSRF，或本机直连
+  破窗），与只读监控接口同一鉴权。Kubernetes 查询/重启使用更严格的
+  `authAdminSession`：只接受已登录管理员会话，**没有本机直连兜底**，
+  无会话 401、普通用户 403。
 - 操作按钮按 overview 返回的 `actions` 能力块显示：能力为假（后端未装配/
   老版本）时按钮直接不渲染，而不是调一个会 503 的端点。
 

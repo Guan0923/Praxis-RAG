@@ -127,13 +127,14 @@
 | 管理：MCP 配置 | `GET /v1/admin/tools`、`PATCH /v1/admin/tools/{name}`、`GET /v1/admin/prompts`、`PUT|DELETE /v1/admin/prompts/{name}` |
 | 管理：展示/只读 | `GET /v1/admin/published-versions`、`GET /v1/admin/upload-leases`（注册为无认证，但 handler 内二次校验管理员+本机边界） |
 | 管理：监控 | `GET /v1/admin/monitor/overview`（只读聚合：三态总体状态、服务信息、依赖探测（Kafka 元数据 / PDF 健康负载）、文档任务/上传分类队列、两个 Kafka Connect 采集连接器（connector/task、worker、失败原因、自动重启/恢复结果）、两组 Kafka 消费组积压、缓存 dirty/failures、文档 Worker 心跳、有效文档计数、24 小时检索活动，以及顶层 `system` 主机资源（CPU/内存/网络/进程；采集不可用为 `null` 并追加到 `errors`，不影响健康判定）；不可得的数字显式为 `null`/未知；本机直连或管理员会话）、`GET /v1/admin/monitor/logs`（组件日志查询：`source=memory|file`、`component`、最低 `level`、`query`、`limit`/`offset`，按最新在前分页，返回各组件条数（「全部日志」组件筛选用）与文件元信息；未配置 `RAG_LOG_FILE` 时 `available=false` 仍返回 200，参数非法返回 400；本机直连或管理员会话） |
+| 管理：Kubernetes | `GET /v1/admin/k8s/workloads`、`GET /v1/admin/k8s/pods`（`namespace` 精确匹配、`name` 大小写不敏感子串；返回全部命名空间的工作负载/Pod 快照与命名空间列表）、`POST /v1/admin/k8s/workloads/{resource}/{namespace}/{name}/restart`（resource 仅 `deployments`/`statefulsets`/`daemonsets`；patch Pod 模板的 `kubectl.kubernetes.io/restartedAt` 注解）。全部 `Cache-Control: no-store`；只接受已登录管理员会话（Cookie 或 Bearer 会话令牌；无 loopback 兜底；Cookie 写请求需 CSRF） |
 | 每账号 API Key | `GET|POST /v1/admin/api-keys`、`PUT|DELETE /v1/admin/api-keys/{key_id}`、`GET /v1/admin/api-keys/{key_id}/mcp-config` |
 | MCP | `POST|GET|DELETE /mcp` |
 
 认证边界：
 
 - 租户接口：`Authorization: Bearer <RAG_SERVICE_TOKEN 或 API Key>` + `X-RAG-Namespace`；Console 登录后也可用会话 Cookie（写操作需 `X-CSRF-Token`）。
-- `/v1/admin/*`：本机直连（loopback、无代理头、同源 Origin）**或**管理员会话；唯一例外是 `/v1/admin/api-keys`——任意登录账号都可管理**自己的** API Key（非管理员只能绑定本人创建的知识库）。
+- `/v1/admin/*`：本机直连（loopback、无代理头、同源 Origin）**或**管理员会话。`/v1/admin/api-keys` 允许任意登录账号管理**自己的** API Key（非管理员只能绑定本人创建的知识库）；`/v1/admin/k8s/*` 只接受已登录管理员会话，没有本机直连兜底（无会话 401、普通用户 403）。
 - 会话共享接口（邀请/权限）只接受 Console 会话，没有 loopback 兜底。
 - 未设置 Token 且本机直连时，普通租户接口可用 headers 直接访问（开发便利），生产必须配置 Token。
 
@@ -151,7 +152,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | `#/model-profiles` | 模型配置 | 管理员 | Embedding/Reranker/VLM/JEV 分页签，新增/编辑/删除、模型探测、Key 只写不读 |
 | `#/api-keys` | API Key | 所有登录账号 | 自己的密钥 CRUD/启停、一次性明文、复制 MCP 配置 |
 | `#/users` | 用户管理 | 管理员 | 角色（admin/vip/user）、启用/禁用、删除；服务端保证至少保留一名启用的管理员 |
-| `#/monitor` | 系统监控 | 管理员 | 只读监控：顶部标签栏 = `概览` + `MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` + `全部日志`，组件标签含该组件既有内容与该组件日志，`全部日志` 的组件筛选显示各组件日志条数。概览：页头三态状态与降级告警、主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络速率与最忙网卡、进程 RSS/VMS/goroutine/heap；首次采样与 Windows load 显示「—」）、关键指标（有效文档/任务/上传/检索）、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态（Kafka 校验元数据与主题、PDF 校验转换器）、`document_jobs` 队列与阶段、上传互斥分类、`文档采集`/`缓存采集` 两行（connector/task 状态、所在 worker、失败原因、自动重启次数与恢复结果）、两组 Kafka 消费组滞后、缓存 dirty/failures、文档 Worker 心跳（读不到显示「未知」）、服务信息；全部日志支持内存/文件来源、最低级别、关键字过滤与分页；15 秒自动刷新，窄屏单列 |
+| `#/monitor` | 系统监控 | 管理员 | 只读监控 + 运维操作：顶部标签栏 = `概览` + `MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` + `全部日志`，组件标签含该组件既有内容与该组件日志，`全部日志` 的组件筛选显示各组件日志条数。管理员另有 `Kubernetes` 标签：工作负载（Deployment/StatefulSet/DaemonSet/ReplicaSet/ReplicationController/Job/CronJob，7 类）与「全部 Pod」两个视图，覆盖全部命名空间，支持命名空间/名称筛选，展开行按 ownerReferences 显示归属 Pod；仅对可滚动更新的 Deployment/StatefulSet/DaemonSet 提供滚动重启（paused/Recreate/OnDelete/`partition>0` 行内说明不可用原因）。概览：页头三态状态与降级告警、主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络速率与最忙网卡、进程 RSS/VMS/goroutine/heap；首次采样与 Windows load 显示「—」）、关键指标（有效文档/任务/上传/检索）、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态（Kafka 校验元数据与主题、PDF 校验转换器）、`document_jobs` 队列与阶段、上传互斥分类、`文档采集`/`缓存采集` 两行（connector/task 状态、所在 worker、失败原因、自动重启次数与恢复结果）、两组 Kafka 消费组滞后、缓存 dirty/failures、文档 Worker 心跳（读不到显示「未知」）、服务信息；全部日志支持内存/文件来源、最低级别、关键字过滤与分页；每秒自动刷新（页头固定「自动刷新 · 每 1 秒」与最近一次成功更新时间，无自动刷新开关/手动刷新/失败重试；失败保留上次数据并自动重试，慢请求不堆叠），窄屏单列 |
 | `#/permissions` | 权限管理 | 管理员 / VIP | 选择知识库、按用户聚合授权、创建邀请（可读/可修改 × 全库/若干文件）、复制链接、撤销授权/邀请 |
 | `#/invitations` | 邀请中心 | 登录账号 | 待处理邀请、粘贴邀请链接、接受/拒绝（顶部铃铛轮询） |
 | `#/invite?token=` | 受邀预览 | 登录账号 | 预览邀请并接受/拒绝，随后切换到该知识库 |

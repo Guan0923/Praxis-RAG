@@ -1,28 +1,47 @@
-# rag-service 的 Kubernetes 操作专用 ServiceAccount + 最小 RBAC。
+# rag-service 的 Kubernetes 监控与操作专用 ServiceAccount + ClusterRole。
 #
-# 背景：Console 监控页的「worker 扩缩容」卡片通过 rag-service 进程内的
-# k8sops 客户端调用 Kubernetes API（GET/PATCH deployments 的
-# spec.replicas，即 kubectl scale 的服务端等价物）。本清单只授权这一个
-# 动词、这一个资源、这一个 Deployment 命名空间内的访问：
+# 背景：Console 监控页新增管理员专用的「Kubernetes」标签，默认展示已连接
+# 集群**全部命名空间**的工作负载与 Pod（含 kube-system 等系统命名空间和
+# Praxis-RAG 以外的应用），并允许对可滚动更新的工作负载提交滚动重启。
+# 因此这里使用 ClusterRole + ClusterRoleBinding，而不是只作用于
+# praxis-rag 命名空间的 Role；ServiceAccount 名称保持 rag-monitor-ops，
+# rag-service 的 Deployment 继续挂载它。
 #
-#   - ServiceAccount  rag-monitor-ops      —— 只有 rag-service 使用；
-#   - Role            rag-monitor-ops      —— 仅 apps 组 deployments 的
-#                                            get + patch（scale 的实现），
-#                                            不含 create/delete/escalate；
-#   - RoleBinding     rag-monitor-ops      —— 绑定到上述 ServiceAccount。
+# 授权范围（只读快照 + 仅滚动重启需要的 patch）：
+#   - 核心组 pods / replicationcontrollers、apps 组 deployments /
+#     statefulsets / daemonsets / replicasets、batch 组 jobs / cronjobs：
+#     get + list + watch。后端用共享 list/watch 缓存生成「工作负载」与
+#     「全部 Pod」两个只读快照，并按 ownerReferences 展开
+#     Deployment→ReplicaSet→Pod、CronJob→Job→Pod。
+#   - apps 组 deployments / statefulsets / daemonsets：patch。滚动重启只向
+#     spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"]
+#     发 merge patch，由对应控制器自己滚动更新；不直接修改 Pod，也不需要
+#     pods 的写权限。
+#   - 不授予 create / update / delete：页面没有创建、修改规格或删除集群
+#     资源的入口，patch 只用于滚动重启与 worker 扩缩容（部署/删除工作负载
+#     仍交给 kubectl / GitOps）。pods/exec、secrets、configmaps 等一律不授权。
 #
-# 不可用时的行为：未挂载 ServiceAccount（Compose/宿主机部署、或未应用
-# 本清单）时，rag-service 启动不受影响，监控页的扩缩容卡片显示
-# 「未启用」；应用本清单后无需重启即生效（token 由 kubelet 投影轮换，
-# 客户端每次调用重新读取）。
+# worker 扩缩容：原清单用 resourceNames 把访问限定在 praxis-rag 命名空间的
+# rag-document-worker Deployment。跨命名空间的滚动重启无法用 resourceNames
+# 表达，因此改为集群级规则：get 已包含在上面的 list/watch 规则中，patch
+# 授权覆盖扩缩容（仍只对 Deployment 的 spec.replicas 做 merge patch）。
+# 扩缩容与 Kubernetes 标签共用同一份凭据来源（集群内 ServiceAccount 或
+# 集群外 RAG_K8S_KUBECONFIG），kubeconfig 身份同样需要这些规则。
+# 若需要进一步收紧，应把「监控只读」与「扩缩容/重启」拆成两套独立凭据。
 #
-# 安全边界：
-#   - Role 限定在 praxis-rag 命名空间（kustomize namespace 字段）；
-#   - 资源名限定 rag-document-worker：进程可以读写自己部署的 worker
-#     副本数，但读不到其他 Deployment（`resourceNames` 同时约束 get）。
-#     注意：resourceNames 对 patch 的 verbs 约束同样生效，扩展部署其它
-#     worker 前先改这里；
-#   - 不授予 list/watch：监控页不展示集群全量信息。
+# 不可用时的行为：
+#   - 未挂载 ServiceAccount 且未配置 RAG_K8S_KUBECONFIG（Compose/宿主机部署
+#     等不使用本清单的环境）时，rag-service 启动不受影响；Console 的
+#     Kubernetes 标签显示配置提示，查询/重启接口返回 503（detail 为
+#     k8sops.ConfigurationHint），原「worker 扩缩容」卡片显示「未启用」。
+#   - 清单已挂载但 ClusterRole（或 ClusterRoleBinding）缺失时，读接口返回
+#     502「Kubernetes 数据读取失败」，滚动重启返回 502「Kubernetes 拒绝操作，
+#     请检查 RBAC 清单」；页面显示错误提示，不会静默展示空表。
+#
+# 安全边界：这些接口只接受已登录的管理员会话（Console Cookie 或 Bearer
+# 会话令牌；Cookie 写请求需 X-CSRF-Token），没有本机直连（loopback）兜底，
+# 普通用户返回 403。ClusterRoleBinding 只绑定 rag-monitor-ops 这一个
+# ServiceAccount。
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -33,7 +52,7 @@ metadata:
     app.kubernetes.io/part-of: praxis-rag
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: rag-monitor-ops
   labels:
@@ -41,15 +60,28 @@ metadata:
     app.kubernetes.io/component: api
     app.kubernetes.io/part-of: praxis-rag
 rules:
+  # 全部 Pod 视图（控制器创建的 Pod 与独立 Pod 都要列出），以及
+  # ReplicationController、独立 Pod 的 ownerReferences 解析。
+  - apiGroups: [""]
+    resources: ["pods", "replicationcontrollers"]
+    verbs: ["get", "list", "watch"]
+  # Deployment / StatefulSet / DaemonSet / ReplicaSet 的列表、状态与
+  # Deployment→ReplicaSet→Pod 展开。
   - apiGroups: ["apps"]
-    resources: ["deployments"]
-    # get+patch 是 deployments/scale 子资源读写的等价最小集；
-    # 实际走主资源路径的 merge patch（与 kubectl scale 相同）。
-    verbs: ["get", "patch"]
-    resourceNames: ["rag-document-worker"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  # Job / CronJob 的列表、完成数与 CronJob→Job→Pod 展开。
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  # 滚动重启：只 patch 上述三类可滚动更新工作负载的 Pod 模板注解
+  # kubectl.kubernetes.io/restartedAt，由控制器执行滚动更新。
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: rag-monitor-ops
   labels:
@@ -58,8 +90,9 @@ metadata:
     app.kubernetes.io/part-of: praxis-rag
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
+  kind: ClusterRole
   name: rag-monitor-ops
 subjects:
   - kind: ServiceAccount
     name: rag-monitor-ops
+    namespace: praxis-rag

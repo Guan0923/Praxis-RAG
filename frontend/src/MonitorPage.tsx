@@ -14,13 +14,10 @@ import {
   Select,
   Spin,
   Statistic,
-  Switch,
   Table,
   Tabs,
   Tag,
-  Tooltip,
 } from "antd";
-import { ReloadOutlined } from "@ant-design/icons";
 import {
   errorText,
   fetchMonitorLogs,
@@ -58,12 +55,14 @@ import {
   type MonitorSystem,
   type MonitorTabComponent,
   type MonitorWorkerDeployment,
+  type Role,
 } from "./api";
+import { KubernetesMonitor } from "./KubernetesMonitor";
 
-// monitorRefreshMs is the auto-refresh period: the backend does not push
-// snapshot updates, so the page polls. It stays off the request path and only
-// re-fetches while the switch is on.
-const monitorRefreshMs = 15_000;
+// monitorTickMs is the page-level refresh period: the backend does not push
+// snapshot updates, so the page polls every second. One timer drives every
+// panel; each panel skips a tick while its previous request is still running.
+const monitorTickMs = 1_000;
 
 // monitorLogLimit is the number of rows a component panel asks for; the 全部日志
 // tab asks for a wider client-paginated window instead.
@@ -1143,12 +1142,13 @@ function logFileNote(file: MonitorLogFile) {
 }
 
 // MonitorLogPanel is the single log viewer reused by every component tab and the
-// 全部日志 tab. It defaults to the in-memory source, follows the page's auto
-// refresh switch while its tab is active, and never invents rows when the
+// 全部日志 tab. It defaults to the in-memory source, follows the page-level
+// per-second tick while its tab is active, and never invents rows when the
 // backend reports the source unavailable.
 type MonitorLogPanelProps = {
   component?: MonitorTabComponent;
-  autoRefresh: boolean;
+  // tick is the page-level per-second counter shared by every panel.
+  tick: number;
   active: boolean;
   allFilters?: boolean;
   title: string;
@@ -1157,7 +1157,7 @@ type MonitorLogPanelProps = {
 
 function MonitorLogPanel({
   component,
-  autoRefresh,
+  tick,
   active,
   allFilters = false,
   title,
@@ -1175,11 +1175,14 @@ function MonitorLogPanel({
   const effectiveComponent = allFilters ? componentFilter : (component ?? "");
   const limit = allFilters ? monitorAllLogLimit : monitorComponentLogLimit;
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false) => {
+    // Single-flight: while a request is running the tick is skipped, so a slow
+    // log endpoint never stacks requests or aborts one per second. A filter
+    // change forces a new request because the operator asked for it.
+    if (request.current && !force) return;
     request.current?.abort();
     const controller = new AbortController();
     request.current = controller;
-    setLoading(true);
     try {
       const page = await fetchMonitorLogs(
         {
@@ -1198,20 +1201,26 @@ function MonitorLogPanel({
     } catch (cause) {
       if (!controller.signal.aborted) setError(errorText(cause));
     } finally {
+      if (request.current === controller) request.current = null;
+      // 只有首次加载显示 loading；之后的每秒刷新沿用旧表格，不清空也不闪。
       if (!controller.signal.aborted) setLoading(false);
     }
   }, [source, effectiveComponent, level, keyword, limit]);
 
+  // Filter changes (and the first mount) fetch immediately.
   useEffect(() => {
-    void load();
+    void load(true);
     return () => request.current?.abort();
   }, [load]);
 
+  // The page tick drives the per-second refresh; only the active tab polls, and
+  // a tick that arrives while the previous request is running is skipped.
+  const handledTick = useRef(tick);
   useEffect(() => {
-    if (!autoRefresh || !active) return;
-    const timer = setInterval(() => void load(), monitorRefreshMs);
-    return () => clearInterval(timer);
-  }, [autoRefresh, active, load]);
+    if (!active || tick === handledTick.current) return;
+    handledTick.current = tick;
+    void load(false);
+  }, [active, tick, load]);
 
   // The component filter offers the frozen vocabulary first and appends any
   // future component the backend reports, so an upgrade never hides log rows.
@@ -1244,16 +1253,6 @@ function MonitorLogPanel({
       size="small"
       title={title}
       className="monitor-log-card"
-      extra={(
-        <Button
-          size="small"
-          icon={<ReloadOutlined />}
-          loading={loading}
-          onClick={() => void load()}
-        >
-          刷新日志
-        </Button>
-      )}
     >
       <section aria-label={panelLabel} className="monitor-log-panel">
         <Flex wrap gap={8} align="center" className="monitor-log-filters">
@@ -1430,17 +1429,17 @@ function MonitorLogPanel({
 
 // ComponentTab maps one component tab to its blocks plus that component's log
 // panel. Every existing monitor block is preserved here or on the overview tab.
-function ComponentTab({ tab, overview, autoRefresh, active }: {
+function ComponentTab({ tab, overview, tick, active }: {
   tab: MonitorTabComponent;
   overview: MonitorOverview;
-  autoRefresh: boolean;
+  tick: number;
   active: boolean;
 }) {
   const label = monitorComponentLabels[tab];
   const logPanel = (
     <MonitorLogPanel
       component={tab}
-      autoRefresh={autoRefresh}
+      tick={tick}
       active={active}
       title={`${label}日志`}
       panelLabel={`${label}日志面板`}
@@ -1613,8 +1612,9 @@ function ComponentTab({ tab, overview, autoRefresh, active }: {
 }
 
 // monitorTabs builds the top bar: overview, the seven component tabs in the
-// frozen order, then the all-logs tab.
-function monitorTabs(overview: MonitorOverview, autoRefresh: boolean, activeTab: string) {
+// frozen order, then the all-logs tab. The administrator-only Kubernetes tab is
+// inserted after 概览 by MonitorPage itself.
+function monitorTabs(overview: MonitorOverview, activeTab: string, tick: number) {
   return [
     {
       key: "overview",
@@ -1628,7 +1628,7 @@ function monitorTabs(overview: MonitorOverview, autoRefresh: boolean, activeTab:
         <ComponentTab
           tab={tab}
           overview={overview}
-          autoRefresh={autoRefresh}
+          tick={tick}
           active={activeTab === tab}
         />
       ),
@@ -1639,7 +1639,7 @@ function monitorTabs(overview: MonitorOverview, autoRefresh: boolean, activeTab:
       children: (
         <MonitorLogPanel
           allFilters
-          autoRefresh={autoRefresh}
+          tick={tick}
           active={activeTab === "logs"}
           title="全部日志"
           panelLabel="全部日志面板"
@@ -1651,38 +1651,42 @@ function monitorTabs(overview: MonitorOverview, autoRefresh: boolean, activeTab:
 
 // MonitorPage is the read-only system overview for administrators. The top bar
 // splits the snapshot by component, the overview tab leads with the task
-// metrics and host resources, and every tab carries its own log panel. The
-// quick facts (updated at, auto refresh) stay visible above the tabs.
-export function MonitorPage() {
+// metrics and host resources, and every tab carries its own log panel. One
+// page-level timer ticks every second; the header only states that fixed
+// cadence plus the most recent successful refresh time.
+//
+// role is optional so a legacy (API-key) Console renders the page without the
+// administrator-only Kubernetes tab; a session Console passes the login role.
+export function MonitorPage({ role }: { role?: Role } = {}) {
   const [overview, setOverview] = useState<MonitorOverview>();
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [lastUpdatedAt, setLastUpdatedAt] = useState("");
+  const [tick, setTick] = useState(0);
   const [activeTab, setActiveTab] = useState("overview");
   const request = useRef<AbortController | null>(null);
   const { message } = App.useApp();
 
   const load = useCallback(async () => {
-    // A new request supersedes the previous one, so a slow response can never
-    // overwrite a newer snapshot.
-    request.current?.abort();
+    // Single-flight: while the previous overview request is still running the
+    // tick is skipped instead of aborting and re-sending it every second. A
+    // slow backend therefore never accumulates requests.
+    if (request.current) return;
     const controller = new AbortController();
     request.current = controller;
-    setRefreshing(true);
     try {
       const snapshot = await fetchMonitorOverview(controller.signal);
       if (!controller.signal.aborted) {
         setOverview(snapshot);
         setError("");
+        setLastUpdatedAt(snapshot.generated_at);
       }
     } catch (cause) {
+      // The last successful snapshot stays on screen; the next tick retries.
       if (!controller.signal.aborted) setError(errorText(cause));
     } finally {
-      if (!controller.signal.aborted) {
-        setRefreshing(false);
-        setLoading(false);
-      }
+      if (request.current === controller) request.current = null;
+      if (!controller.signal.aborted) setLoading(false);
     }
   }, []);
 
@@ -1712,18 +1716,47 @@ export function MonitorPage() {
     }),
   }), [overview?.actions, load, message]);
 
+  // The first snapshot is requested immediately; the cleanup aborts an in-flight
+  // request when the page unmounts.
   useEffect(() => {
     void load();
     return () => request.current?.abort();
   }, [load]);
 
+  // One timer for the whole page drives every panel's per-second refresh.
   useEffect(() => {
-    if (!autoRefresh) return;
-    const timer = setInterval(() => void load(), monitorRefreshMs);
+    const timer = setInterval(() => setTick((value) => value + 1), monitorTickMs);
     return () => clearInterval(timer);
-  }, [autoRefresh, load]);
+  }, []);
+
+  // Tick 0 is the initial load above; every later tick re-reads the snapshot.
+  useEffect(() => {
+    if (tick === 0) return;
+    void load();
+  }, [tick, load]);
 
   const status = overview ? overallStatusOf(overview) : undefined;
+  const kubernetesEnabled = role === "admin";
+  // Without a successful overview the only reachable tab is Kubernetes: the
+  // administrator can still inspect the cluster while the overview endpoint
+  // fails (a non-administrator keeps the error-only view).
+  const activeKey = overview || !kubernetesEnabled ? activeTab : "kubernetes";
+  const kubernetesActive = overview ? activeTab === "kubernetes" : kubernetesEnabled;
+  const kubernetesTab = kubernetesEnabled ? {
+    key: "kubernetes",
+    label: "Kubernetes",
+    children: (
+      <KubernetesMonitor
+        tick={tick}
+        active={kubernetesActive}
+        onUpdated={(generatedAt) => setLastUpdatedAt(generatedAt)}
+      />
+    ),
+  } : null;
+  const baseTabs = overview ? monitorTabs(overview, activeKey, tick) : [];
+  const items = kubernetesTab
+    ? (overview ? [baseTabs[0], kubernetesTab, ...baseTabs.slice(1)] : [kubernetesTab])
+    : baseTabs;
 
   return (
     <section aria-label="系统监控页面">
@@ -1733,28 +1766,10 @@ export function MonitorPage() {
           {status && <Tag color={overallStatusColors[status]}>{overallStatusLabels[status]}</Tag>}
         </div>
         <div className="toolbar">
+          <span className="secondary">自动刷新 · 每 1 秒</span>
           <span className="secondary">
-            {overview ? `更新于 ${formatClock(overview.generated_at)}` : "正在获取监控快照"}
+            {lastUpdatedAt ? `更新于 ${formatClock(lastUpdatedAt)}` : "正在获取监控快照"}
           </span>
-          <Tooltip title={`每 ${monitorRefreshMs / 1000} 秒自动刷新`}>
-            <label className="monitor-auto-refresh">
-              <span className="secondary">自动刷新</span>
-              <Switch
-                size="small"
-                title="自动刷新"
-                checked={autoRefresh}
-                onChange={setAutoRefresh}
-              />
-            </label>
-          </Tooltip>
-          <Button
-            icon={<ReloadOutlined />}
-            aria-label="刷新监控数据"
-            loading={refreshing}
-            onClick={() => void load()}
-          >
-            刷新
-          </Button>
         </div>
       </div>
       {error && (
@@ -1764,18 +1779,17 @@ export function MonitorPage() {
           showIcon
           title="监控数据加载失败"
           description={<span className="preserve-lines">{error}</span>}
-          action={<Button size="small" onClick={() => void load()}>重试</Button>}
         />
       )}
       {loading && !overview ? (
         <Spin description="正在读取监控快照…" />
-      ) : overview ? (
+      ) : items.length > 0 ? (
         <MonitorActionContext.Provider value={actionContext}>
           <Tabs
             className="monitor-tabs"
-            activeKey={activeTab}
+            activeKey={activeKey}
             onChange={setActiveTab}
-            items={monitorTabs(overview, autoRefresh, activeTab)}
+            items={items}
           />
         </MonitorActionContext.Provider>
       ) : null}

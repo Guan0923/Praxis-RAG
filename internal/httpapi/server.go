@@ -96,6 +96,7 @@ type Server struct {
 	modelProfiles  ModelProfileRuntime
 	monitor        MonitorRuntime
 	monitorActions MonitorActionsRuntime
+	kubernetes     KubernetesRuntime
 	notifier       ChangeNotifier
 	users          UserAuth
 	account        AccountProfile
@@ -180,6 +181,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/admin/monitor/overview", authAdmin, s.handleMonitorOverview)
 	s.router.add("GET", "/v1/admin/monitor/logs", authAdmin, s.handleMonitorLogs)
 	s.registerMonitorActionRoutes()
+	s.registerKubernetesRoutes()
 	s.registerDocumentationRoutes()
 	s.registerKnowledgeBaseAdminRoutes()
 	s.registerModelProfileRoutes()
@@ -319,6 +321,16 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !s.requireAdmin(recorder, r) {
 			return
 		}
+	case authAdminSession:
+		// The Kubernetes monitor/restart endpoints act only for an explicitly
+		// signed-in administrator: no session means 401 and the loopback
+		// break-glass used by authAdmin is never consulted.
+		recorder.Header().Set("Cache-Control", "no-store")
+		session, ok := s.requireAdminSession(recorder, r)
+		if !ok {
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, session))
 	case authMCP:
 		// MCP requires credentials even on loopback; the protocol endpoint
 		// answers 401 with a Bearer challenge instead of the local-admin

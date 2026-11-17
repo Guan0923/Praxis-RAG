@@ -556,7 +556,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
   - `/v1/uploads` 的失败操作、`document_jobs` 的 `failed` 计数。
   - Kafka consumer group lag：文档、缓存两个消费组分别观察；Console 监控页的 `pipeline.kafka.groups` 会给出两组已提交/末尾位点与滞后，读不到时显示「未知」。
   - 缓存 dirty/failures：`cache_revisions` 中 `refreshed_revision < revision` 或 `last_error` 非空的行；持续不清零说明缓存 worker 未运行或 Redis 不可用。
-  - Console「系统监控」页（`#/monitor`）汇总上述队列与依赖状态，对应只读接口 `GET /v1/admin/monitor/overview`（本机直连或管理员会话），适合作值班快速定位入口。
+  - Console「系统监控」页（`#/monitor`）每秒自动刷新，汇总上述队列与依赖状态，对应只读接口 `GET /v1/admin/monitor/overview`（本机直连或管理员会话），适合作值班快速定位入口；管理员还可用同页的 `Kubernetes` 标签查看全部命名空间的工作负载/Pod 并执行滚动重启（`GET /v1/admin/k8s/workloads`、`GET /v1/admin/k8s/pods`、`POST /v1/admin/k8s/workloads/{resource}/{namespace}/{name}/restart`，只接受已登录管理员会话，需挂载 ServiceAccount + ClusterRole 或配置 `RAG_K8S_KUBECONFIG`）。
 - 告警处理顺序：先看死信 worker 是否在跑且配置正确，再查对应正常组是否有堆积，再按 `stage/error` 定位解析/模型/发布失败；不要直接清空 DLQ topic（会丢失持久终态）。
 
 ## 8. 分布式 Kafka Connect、两个 Debezium 连接器与缓存消费者

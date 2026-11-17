@@ -710,7 +710,7 @@ export function Console({
             <SystemSettingsPage />
           )}
           {view === "monitor" && canViewConsolePage("monitor", sessionMode, authUser?.role) && (
-            <MonitorPage />
+            <MonitorPage role={authUser?.role} />
           )}
           {view === "permissions" && authUser && (authUser.role === "admin" || authUser.role === "vip") && (
             <PermissionsPage

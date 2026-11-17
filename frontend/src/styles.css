@@ -1249,12 +1249,6 @@ body.drag-selecting * {
 }
 
 /* System monitor (系统监控): read-only snapshot cards. */
-.monitor-auto-refresh {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-}
 /* Two-column monitor layout. Blocks are packed by measured height in JS
    (MonitorMasonry) because native CSS masonry is still behind browser flags:
    .monitor-masonry is the flex row of equal-width columns, .monitor-stack is the

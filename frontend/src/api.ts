@@ -1614,6 +1614,158 @@ export async function fetchMonitorLogs(
   );
 }
 
+// --- Kubernetes monitor (Kubernetes 监控) -----------------------------------
+//
+// The two list endpoints are admin-scoped read-only snapshots of the cluster
+// the service runs in. Both answer 503 when no cluster is configured (the
+// Chinese `detail` explains what to set up) and 403/502 when the service
+// account lacks RBAC or the API server is unreachable; the page renders that
+// text instead of an empty table. Snapshots are generated per request, so
+// they are never cached.
+
+// K8sPodOwner addresses the controller that owns a pod (or a workload's parent).
+export type K8sPodOwner = {
+  kind: string;
+  name: string;
+};
+
+// K8sClusterInfo identifies where the snapshot came from: name is the
+// configured cluster name and source says how the client was built
+// (in-cluster service account, kubeconfig, ...).
+export type K8sClusterInfo = {
+  name: string;
+  source: string;
+};
+
+// K8sPod is one pod as reported by the cluster. ready_containers/total_containers
+// keep the "1/2" readiness readable without guessing from phase alone; reason
+// and message carry the waiting/termination diagnostics verbatim.
+export type K8sPod = {
+  namespace: string;
+  name: string;
+  node: string;
+  phase: string;
+  reason?: string;
+  message?: string;
+  ready_containers: number;
+  total_containers: number;
+  restarts: number;
+  owner?: K8sPodOwner;
+};
+
+// K8sRestartState is the observed progress of one rolling restart. status
+// advances submitted -> rolling -> completed, or failed when the rollout does
+// not converge; updated is the pods already on the new template, desired the
+// target count and ready the pods currently ready.
+export type K8sRestartState = {
+  status: string;
+  message: string;
+  started_at: string;
+  updated_at: string;
+  updated: number;
+  desired: number;
+  ready: number;
+};
+
+// K8sWorkload is one restartable/observable controller. The counters are
+// kind-specific (Deployment-style ready/desired, Job succeeded/completions,
+// CronJob schedule+suspended), and pods is the nested list the backend already
+// associated by owner, so the expanded row needs no second request.
+export type K8sWorkload = {
+  kind: string;
+  // resource is the REST resource name used in the restart path.
+  resource: string;
+  namespace: string;
+  name: string;
+  uid: string;
+  status: string;
+  desired: number;
+  ready: number;
+  available: number;
+  updated: number;
+  completions: number;
+  succeeded: number;
+  failed: number;
+  active: number;
+  schedule?: string;
+  suspended?: boolean;
+  owner?: K8sPodOwner;
+  restartable: boolean;
+  restart_blocked_reason?: string;
+  restart?: K8sRestartState;
+  pods: K8sPod[];
+};
+
+export type K8sWorkloadView = {
+  generated_at: string;
+  cluster: K8sClusterInfo;
+  namespaces: string[];
+  workloads: K8sWorkload[];
+};
+
+export type K8sPodView = {
+  generated_at: string;
+  namespaces: string[];
+  pods: K8sPod[];
+};
+
+// K8sWorkloadFilter is the server-side filter shared by both list endpoints.
+// Empty values are omitted so the server default (all namespaces) applies.
+export type K8sWorkloadFilter = {
+  namespace?: string;
+  name?: string;
+};
+
+function kubernetesQuery(filter: K8sWorkloadFilter): string {
+  const params = new URLSearchParams();
+  if (filter.namespace) params.set("namespace", filter.namespace);
+  if (filter.name) params.set("name", filter.name);
+  const search = params.toString();
+  return search ? `?${search}` : "";
+}
+
+// fetchKubernetesWorkloads reads the workload snapshot (controllers plus their
+// nested pods) for the given namespace/name filter.
+export async function fetchKubernetesWorkloads(
+  filter: K8sWorkloadFilter = {},
+  signal?: AbortSignal,
+): Promise<K8sWorkloadView> {
+  return await api<K8sWorkloadView>(
+    `/v1/admin/k8s/workloads${kubernetesQuery(filter)}`,
+    undefined,
+    { signal, cache: "no-store" },
+  );
+}
+
+// fetchKubernetesPods reads the flat pod snapshot for the same filter.
+export async function fetchKubernetesPods(
+  filter: K8sWorkloadFilter = {},
+  signal?: AbortSignal,
+): Promise<K8sPodView> {
+  return await api<K8sPodView>(
+    `/v1/admin/k8s/pods${kubernetesQuery(filter)}`,
+    undefined,
+    { signal, cache: "no-store" },
+  );
+}
+
+// restartKubernetesWorkload triggers a rolling restart (the kubectl rollout
+// restart equivalent: the pod template annotation is bumped). The path names
+// the target, so the request has an empty body; the shared api() adds the CSRF
+// header for cookie-authenticated sessions. Progress afterwards is read from
+// the per-second workload snapshot, not from this initial response.
+export async function restartKubernetesWorkload(
+  resource: string,
+  namespace: string,
+  name: string,
+): Promise<{ restart: K8sRestartState }> {
+  return await api<{ restart: K8sRestartState }>(
+    `/v1/admin/k8s/workloads/${encodeURIComponent(resource)}/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}/restart`,
+    undefined,
+    { method: "POST" },
+  );
+}
+
 // formatPercent renders a 0-100 percentage with one decimal; a missing sample
 // stays 未知 instead of 0%.
 export function formatPercent(value?: number | null) {

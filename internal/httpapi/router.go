@@ -27,6 +27,11 @@ const (
 	// because the endpoint reports the credential's own scope
 	// (see tenantFromListingRequest).
 	authTenantList
+	// authAdminSession requires an administrator Console login session (plus
+	// CSRF on writes) and never accepts the trusted local break-glass that
+	// authAdmin still allows: the Kubernetes monitor/restart endpoints are
+	// only reachable by an explicitly signed-in administrator.
+	authAdminSession
 )
 
 // route is one method+path registration. Patterns use "{name}" for a single

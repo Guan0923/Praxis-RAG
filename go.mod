@@ -11,6 +11,7 @@ require (
 	github.com/redis/go-redis/v9 v9.23.0
 	github.com/segmentio/kafka-go v0.4.51
 	github.com/shirou/gopsutil/v4 v4.26.10
+	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/image v0.32.0
 	golang.org/x/sys v0.49.0
 	golang.org/x/text v0.43.0

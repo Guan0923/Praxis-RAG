@@ -28,9 +28,12 @@ spec:
         app.kubernetes.io/component: api
         app.kubernetes.io/part-of: praxis-rag
     spec:
-      # 监控页「worker 扩缩容」卡片用的 ServiceAccount（rbac-monitor-ops.yaml：
-      # 仅 rag-document-worker Deployment 的 get/patch）。未应用该清单时
-      # pod 仍可启动，只是 Console 的扩缩容卡片显示「未启用」。
+      # 监控页「Kubernetes」标签与「worker 扩缩容」卡片用的 ServiceAccount
+      # （rbac-monitor-ops.yaml：ClusterRole + ClusterRoleBinding，读取全部
+      # 命名空间的 8 类工作负载/Pod，并对 Deployment/StatefulSet/DaemonSet
+      # 授予滚动重启所需的 patch）。集群外部署改用 kubeconfig；ServiceAccount
+      # 与 kubeconfig 都未配置时进程仍可正常启动，只是 Kubernetes 标签显示
+      # 配置提示、扩缩容卡片显示「未启用」。
       serviceAccountName: rag-monitor-ops
       serviceAccount: rag-monitor-ops
       # 进程收到 SIGTERM 后先停止接受连接（5s），再关闭状态库连接池。

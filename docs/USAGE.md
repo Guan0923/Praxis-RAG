@@ -643,7 +643,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/document-batches `
 
 ### 系统监控（Console 页面、只读接口与运维操作）
 
-管理员（或本机直连）可在 Console 侧边栏打开「系统监控」（`#/monitor`），页面每 15 秒自动刷新。页面顶部是一排标签：`概览` + 每个系统组件（`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium`）+ `全部日志`；组件标签展示该组件的既有监控内容与该组件最近日志；`全部日志` 页的组件筛选显示各组件的最近日志条数。概览版式按重要性排列：页头总体状态 → 主机资源 → 关键指标 → 依赖与投递 → 队列与记录 → 服务信息；窄屏自动单列。
+管理员（或本机直连）可在 Console 侧边栏打开「系统监控」（`#/monitor`）。页面按固定每秒自动刷新（页面级 1 秒节拍）：页头只显示「自动刷新 · 每 1 秒」和最近一次成功更新时间，**没有**自动刷新开关、手动刷新按钮或失败手动重试按钮；请求失败时保留上次数据并在下一秒自动重试，每个数据类同一时间最多只有一个请求（慢请求不会堆叠），切换标签后停止上一标签专属数据的轮询，离开页面清理定时器与在途请求。页面顶部是一排标签：`概览` + 每个系统组件（`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium`）+ `全部日志`；管理员还会看到 `Kubernetes` 标签（见下文「Kubernetes 标签」）。组件标签展示该组件的既有监控内容与该组件最近日志；`全部日志` 页的组件筛选显示各组件的最近日志条数。概览版式按重要性排列：页头总体状态 → 主机资源 → 关键指标 → 依赖与投递 → 队列与记录 → 服务信息；窄屏自动单列。
 
 - **页头总体状态**：由状态库聚合与依赖探测共同推导的三态 `status`（`ok`/`degraded`/`error`，`ok` 为兼容字段，等于 `status == "ok"`）。任一依赖异常或状态库不可读 → `error`；任一依赖/Qdrant 已入库集合/文档 Worker 心跳/Debezium 运行检查降级，或 Kafka 消费进度读取失败 → `degraded`；未启用或未知不降级。`pipeline.document_jobs` 只反映任务负载，不参与总体状态。Qdrant 已降级时页头不再显示「运行正常」。
 - **关键指标**：有效文档数（只统计 `del_flag = 0`，不含软删除）、排队/处理中文档任务、上传进行中、近 24 小时检索次数、artifact 快照数（结果快照指标已随搜索同步化移除）。
@@ -680,19 +680,82 @@ curl.exe "http://127.0.0.1:8011/v1/admin/monitor/logs?component=mysql&level=warn
 curl.exe "http://127.0.0.1:8011/v1/admin/monitor/logs?source=file&query=timeout"
 ```
 
+#### Kubernetes 标签（仅管理员）
+
+「Kubernetes」标签读取 rag-service 已连接的**一个**集群：集群内运行时使用挂载的 ServiceAccount（清单里的 `rag-monitor-ops`），集群外运行时使用 `RAG_K8S_KUBECONFIG` 指向的 kubeconfig。首版不做多集群选择，也不把 kubeconfig/Token 下发到浏览器。该标签与「文档 Worker」标签页的 worker 扩缩容**共用同一份已解析的凭据**（集群内 ServiceAccount 或集群外 kubeconfig），差别只在接口鉴权边界。
+
+**入口与鉴权**：Console 侧边栏「系统监控」→「Kubernetes」，标签只对已登录的管理员渲染。这组接口使用严格的 `authAdminSession`：只接受 Console 登录会话（Cookie 或 Bearer 会话令牌），**没有本机直连（loopback）兜底**——即使请求来自 `127.0.0.1`，没有会话也返回 401；普通用户返回 403；API Key 与服务 Token 不是管理员会话，同样不能访问。Cookie 会话的写请求（滚动重启）必须带 `X-CSRF-Token`，Bearer 会话令牌不需要。
+
+**两个视图**：
+
+- **工作负载（默认）**：范围是已连接集群的**全部命名空间**，包含 `kube-system` 等系统命名空间和 Praxis-RAG 以外的应用。列出 Deployment、StatefulSet、DaemonSet、ReplicaSet、ReplicationController、Job、CronJob，列显示命名空间、类型、名称、状态，以及按类型的就绪副本数（`desired`/`ready`/`available`/`updated`）、Job 完成数（`completions`/`succeeded`/`failed`/`active`）或 CronJob 调度（`schedule`/`suspended`）。展开一行按 `ownerReferences` 显示归属 Pod（Deployment → ReplicaSet → Pod、CronJob → Job → Pod）。
+- **全部 Pod**：控制器创建的 Pod 和独立 Pod 都列出，显示命名空间、名称、就绪容器数（`ready_containers`/`total_containers`）、运行/等待原因（`phase`/`reason`/`message`）、重启次数、节点。
+
+两个视图都支持 `namespace`（精确匹配，空 = 全部命名空间）和 `name`（大小写不敏感子串，空 = 全部，最长 128 字符）筛选；命名空间列表随每次快照返回。每秒最多为每个数据类发一个请求，上一次未结束时跳过该次 tick；失败时保留上次成功数据并在下一秒自动重试。集群未配置或接口返回 503 时，标签页显示配置提示，而不是空表。
+
+**滚动重启**：
+
+- 只有 Deployment、StatefulSet、DaemonSet 中**可滚动更新**的对象可用；以下情况按钮不可用，并在行内显示不可用原因：Deployment `paused`、Deployment `Recreate` 更新策略、DaemonSet/StatefulSet `OnDelete` 更新策略、StatefulSet `partition > 0`。
+- 点击后确认框显示资源类型、命名空间、名称。确认后后端对 `spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"]` 发 merge patch，由对应控制器自己滚动更新；不会直接重建 Pod，也不会修改镜像、副本数等其它字段。
+- 状态按同一资源的每秒快照推进：**已提交** → **滚动中（已更新 X/Y，就绪 Z）** → **已完成**；资源被删除、更新被拒绝或超时会显示具体失败状态（如「工作负载不存在或已被删除」「ProgressDeadlineExceeded」、超时）。同一资源提交期间按钮禁用，避免重复提交（后端对进行中的重启返回 409）。
+- 接口失败语义：400 参数或资源类型不合法，401 无会话，403 非管理员或 CSRF 失败，404 工作负载不存在，409 更新策略不可滚动或已有重启在进行，502 集群读取失败/RBAC 拒绝，503 集群未配置或后端未接线。
+
+**连接配置**：
+
+| 部署方式 | 凭据 | 说明 |
+| --- | --- | --- |
+| 集群内 | 挂载的 ServiceAccount（`rag-monitor-ops`） | 默认 API 地址 `https://kubernetes.default.svc:443`，可用 `RAG_K8S_API_ENDPOINT` 覆盖；需要应用 `deploy/k8s/base/rbac-monitor-ops.yaml` 的 ClusterRole/ClusterRoleBinding。 |
+| 集群外（Compose/宿主机/独立进程） | `RAG_K8S_KUBECONFIG` 指向 kubeconfig | 可选 `RAG_K8S_CONTEXT` 选择 context，默认使用 `current-context`；支持 kubeconfig 中的 server/CA/insecure、token/tokenFile、client certificate/key；不支持的 `exec` 等外部插件会在启动时报明确的中文配置错误。 |
+| 都没有 | 无 | rag-service 正常启动；Kubernetes 标签显示配置提示，查询/重启接口返回 503，detail 为「Kubernetes 集群未配置：在集群内运行时请挂载 ServiceAccount 并应用 RBAC 清单；在集群外运行时请设置 `RAG_K8S_KUBECONFIG` 指向 kubeconfig（可用 `RAG_K8S_CONTEXT` 指定 context），然后重启 rag-service」。 |
+
+显式配置但无法解析（`RAG_K8S_API_ENDPOINT` 已设置却没有挂载 ServiceAccount、kubeconfig 不可读或 context 不存在等）会让 rag-service 启动失败，而不是静默降级。原有 worker 扩缩容变量 `RAG_K8S_API_ENDPOINT`、`RAG_K8S_WORKER_DEPLOYMENT`、`RAG_K8S_DEPLOYMENT_NAMESPACE` 保持不变；扩缩容与 Kubernetes 标签共用上述凭据来源。
+
+**所需 RBAC**：清单 `deploy/k8s/base/rbac-monitor-ops.yaml` 把原命名空间 Role 升级为 ClusterRole + ClusterRoleBinding（ServiceAccount 名不变），原因是默认展示全部命名空间：
+
+| API 组 | 资源 | verbs | 用途 |
+| --- | --- | --- | --- |
+| 核心组 `""` | `pods`、`replicationcontrollers` | `get`、`list`、`watch` | 全部 Pod 视图、ReplicationController 与 owner 展开 |
+| `apps` | `deployments`、`statefulsets`、`daemonsets`、`replicasets` | `get`、`list`、`watch` | 工作负载列表、副本数状态与 Deployment→ReplicaSet→Pod 展开 |
+| `batch` | `jobs`、`cronjobs` | `get`、`list`、`watch` | Job/CronJob 状态与 CronJob→Job→Pod 展开 |
+| `apps` | `deployments`、`statefulsets`、`daemonsets` | `patch` | 滚动重启只写 Pod 模板的 `kubectl.kubernetes.io/restartedAt` 注解 |
+
+清单**不授予** `create`/`update`/`delete`，也不授权 `pods/exec`、Secret、ConfigMap 等；页面没有创建或删除集群资源的入口。未应用清单或权限不足时，读接口返回 502「Kubernetes 数据读取失败」，重启接口返回 502「Kubernetes 拒绝操作，请检查 RBAC 清单」，页面显示对应错误提示。
+
+**接口示例**（全部 `Cache-Control: no-store`，仅管理员会话）：
+
+```powershell
+# 先登录，拿到 Cookie 与 csrf_token（响应体含 user/csrf_token/expires_at）
+curl.exe -c cookies.txt -X POST http://127.0.0.1:8011/v1/auth/login `
+  -H "Content-Type: application/json" `
+  -d '{"username":"admin","password":"<password>"}'
+
+# 工作负载 / 全部 Pod（空参数 = 全部命名空间）
+curl.exe -b cookies.txt "http://127.0.0.1:8011/v1/admin/k8s/workloads"
+curl.exe -b cookies.txt "http://127.0.0.1:8011/v1/admin/k8s/workloads?namespace=default&name=worker"
+curl.exe -b cookies.txt "http://127.0.0.1:8011/v1/admin/k8s/pods?namespace=kube-system"
+
+# 滚动重启：resource 仅 deployments / statefulsets / daemonsets
+# Cookie 会话的写请求必须带 X-CSRF-Token；Bearer 会话令牌不需要 CSRF
+curl.exe -b cookies.txt -X POST `
+  -H "X-CSRF-Token: <csrf_token>" `
+  "http://127.0.0.1:8011/v1/admin/k8s/workloads/deployments/default/rag-document-worker/restart"
+```
+
+也可以把已取得的 Console 会话令牌放在 `Authorization: Bearer <session-token>` 中（API Key 不是会话令牌）。成功重启返回 200 `{"restart": {...}}`，后续进度随 `GET /v1/admin/k8s/workloads` 返回的 `restart.status` 更新（`submitted`/`rolling`/`completed`/`failed`）。
+
 ### 监控页运维操作（立即重投 / 重启连接器 / worker 扩缩容）
 
-监控页的数据仍是只读快照，但页面上展示的几类「需要人工补救」的状态现在带了对应操作按钮。能力开关由 `overview` 顶层新增的 `actions` 块（`requeue_jobs`/`restart_connectors`/`scale_worker`/`worker_deployment`，均为布尔）驱动：老后端或未装配的能力返回 `false`/缺省，按钮直接不渲染，Console 不会去调一个会 503 的端点。三个操作端点都在 `/v1/admin/*` 边界内（管理员会话 + CSRF，或本机直连破窗），与只读监控接口同一鉴权、同样的 `Cache-Control: no-store`：
+监控页的数据仍是只读快照，但页面上展示的几类「需要人工补救」的状态现在带了对应操作按钮。能力开关由 `overview` 顶层新增的 `actions` 块（`requeue_jobs`/`restart_connectors`/`scale_worker`/`worker_deployment`，均为布尔）驱动：老后端或未装配的能力返回 `false`/缺省，按钮直接不渲染，Console 不会去调一个会 503 的端点。这三个操作端点都在 `/v1/admin/*` 边界内（管理员会话 + CSRF，或本机直连破窗），与只读监控接口同一鉴权、同样的 `Cache-Control: no-store`。Kubernetes 标签的查询与滚动重启不属于这三个端点，它们只接受已登录管理员会话，没有本机直连兜底（见上一小节）：
 
 | 操作 | 页面位置 | 端点 | 前提 |
 | --- | --- | --- | --- |
 | 立即重投 | MySQL / 文档 Worker 标签页「卡死处理中」行 | `POST /v1/admin/monitor/actions/requeue-jobs` | 无（只依赖 MySQL） |
 | 重启连接器 | Debezium 标签页失败采集行的按钮 | `POST /v1/admin/monitor/actions/connectors/{name}/restart` | `RAG_CONNECT_URLS` 已配置 |
-| worker 扩缩容 | 文档 Worker 标签页「副本数」卡片 | `GET/POST /v1/admin/monitor/actions/worker-deployment(/scale)` | Kubernetes 内部署 + RBAC |
+| worker 扩缩容 | 文档 Worker 标签页「副本数」卡片 | `GET/POST /v1/admin/monitor/actions/worker-deployment(/scale)` | 已解析 Kubernetes 凭据（ServiceAccount 或 kubeconfig）+ RBAC |
 
 - **立即重投**：把「到期重试」与「租约过期的卡死处理中」任务立即重新投递（worker 的周期扫描默认 30 秒一轮；这个按钮用于不想等扫描的人工补救）。语义与周期扫描完全一致：递增 `schedule_version`（Debezium 发一条替代通知）、尊重 3 次执行预算、终态判定共享，**不会**产生第四次执行或重复可检索版本。响应 `{"requeued": N}`。Compose/宿主机部署同样可用。
 - **重启连接器**：面向 supervisor 重启预算耗尽（`restart_exhausted`）或 FAILED task 的采集行；重启连接器及其任务（Kafka Connect REST 的 `includeTasks=true`）同时清空该连接器的自动重启预算。只接受两个固定连接器名（`praxis-document-cdc` / `praxis-cache-cdc`），未知名字 400。Kafka Connect 未配置时 503（`Kafka Connect 未配置`）。
-- **worker 扩缩容**：读 `rag-document-worker` Deployment 的期望/就绪副本数，输入目标副本数（0..64）后发 merge patch（与 `kubectl scale` 等价，admission/quota 同样生效）。仅在 Kubernetes 内部署且挂载了 ServiceAccount 时可用（清单 `deploy/k8s/base/rbac-monitor-ops.yaml`：仅 `apps` 组 `deployments` 的 `get`+`patch`，`resourceNames` 限定 `rag-document-worker`）；Compose/宿主机部署返回 503（`Kubernetes 操作未启用`），页面显示「未启用」说明而不是假装可用。RBAC 未授权时 403（提示应用 RBAC 清单），Deployment 不存在时 404。
+- **worker 扩缩容**：读 `rag-document-worker` Deployment 的期望/就绪副本数，输入目标副本数（0..64）后发 merge patch（与 `kubectl scale` 等价，admission/quota 同样生效）。与 Kubernetes 标签共用已解析的凭据来源：集群内使用挂载的 ServiceAccount，集群外使用 `RAG_K8S_KUBECONFIG`（可选 `RAG_K8S_CONTEXT`）。清单 `deploy/k8s/base/rbac-monitor-ops.yaml` 已升级为 ClusterRole + ClusterRoleBinding：`get` 包含在 `deployments` 的 list/watch 规则中，`patch` 授权覆盖扩缩容与滚动重启（扩缩容仍只对 Deployment 的 `spec.replicas` 做 merge patch）；原 `resourceNames` 限定 `rag-document-worker` 的单资源 Role 已不再使用，扩缩容卡片仍可用。两者都未配置（Compose/宿主机部署的默认情况）时返回 503（`Kubernetes 操作未启用`），页面显示「未启用」说明而不是假装可用；RBAC 未授权时返回 403（提示应用 RBAC 清单），Deployment 不存在时 404。
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:8011/v1/admin/monitor/actions/requeue-jobs
@@ -702,7 +765,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/monitor/actions/worker-deploymen
   -H "Content-Type: application/json" -d '{"replicas":2}'
 ```
 
-Kubernetes 侧的可调项（可选）：`RAG_K8S_API_ENDPOINT`（默认 `https://kubernetes.default.svc:443`）、`RAG_K8S_WORKER_DEPLOYMENT`（默认 `rag-document-worker`）、`RAG_K8S_DEPLOYMENT_NAMESPACE`（默认取挂载的 namespace 文件）。显式设置 endpoint 但没挂 ServiceAccount 时启动即报配置错误（要 Kubernetes 控制权却没给凭据）。
+Kubernetes 侧的可调项（可选）：`RAG_K8S_API_ENDPOINT`（默认 `https://kubernetes.default.svc:443`）、`RAG_K8S_WORKER_DEPLOYMENT`（默认 `rag-document-worker`）、`RAG_K8S_DEPLOYMENT_NAMESPACE`（默认取挂载的 namespace 文件）；集群外（Kubernetes 标签与 worker 扩缩容共用）用 `RAG_K8S_KUBECONFIG` / `RAG_K8S_CONTEXT`（见上文「Kubernetes 标签」）。显式设置 endpoint 或 kubeconfig 但凭据不完整/不可解析时启动即报配置错误（要 Kubernetes 控制权却没给凭据）；两者都未配置时服务正常运行，相关卡片与标签显示未启用/配置提示。
 
 ### API Key 管理（本机或登录会话）
 

@@ -415,6 +415,8 @@ describe("MonitorPage", () => {
       "Debezium",
       "全部日志",
     ]);
+    // 没有 role（legacy Console）时没有管理员专属的 Kubernetes 标签。
+    expect(screen.queryByRole("tab", { name: "Kubernetes" })).toBeNull();
 
     // 概览版式：状态告警（正常时不渲染）+ 双列网格（关键指标 | 服务信息）
     // + 整行的系统资源。DOM 顺序 = 网格填充顺序。
@@ -545,7 +547,7 @@ describe("MonitorPage", () => {
     expect(screen.getByText("监控统计不可用：timeout")).toBeTruthy();
   });
 
-  it("shows the load failure and retries with a fresh snapshot", async () => {
+  it("shows the load failure and recovers on the next per-second tick", async () => {
     fetchMock.mockImplementationOnce(async () => {
       throw new Error("GET /v1/admin/monitor/overview\\nHTTP 403：仅管理员可访问");
     });
@@ -553,14 +555,18 @@ describe("MonitorPage", () => {
 
     expect(await screen.findByText("监控数据加载失败")).toBeTruthy();
     expect(screen.getByText(/HTTP 403/)).toBeTruthy();
-    // 首次失败没有快照：不渲染任何标签页或统计卡片，只保留错误与重试入口。
+    // 首次失败没有快照：不渲染任何标签页或统计卡片；页头也没有手动重试入口。
     expect(screen.queryByRole("tab")).toBeNull();
     expect(screen.queryByText("关键指标")).toBeNull();
     expect(screen.queryByText("服务信息")).toBeNull();
+    expect(screen.queryByRole("button", { name: "重试" })).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "重试" }));
-    expect(await screen.findByText("0.4.0")).toBeTruthy();
-    await waitFor(() => expect(screen.queryByText("监控数据加载失败")).toBeNull());
+    // 下一秒自动重试（页面级 1 秒 tick），不需要手动按钮。
+    expect(await screen.findByText("0.4.0", undefined, { timeout: 4000 })).toBeTruthy();
+    await waitFor(
+      () => expect(screen.queryByText("监控数据加载失败")).toBeNull(),
+      { timeout: 4000 },
+    );
   });
 
   it("renders 未知 for every metric when the state database snapshot is unavailable", async () => {
@@ -689,13 +695,8 @@ describe("MonitorPage", () => {
     expect(await within(logPanel).findByText("MySQL 连接池等待")).toBeTruthy();
     expect(within(logPanel).getByText("WARN")).toBeTruthy();
 
-    // 组件面板的刷新按钮重新拉取同一组参数。
-    const before = logUrls.length;
-    const logRefresh = within(logCard("MySQL日志面板")).getByRole("button", { name: /刷新日志/ });
-    await waitFor(() => expect(logRefresh.className).not.toContain("ant-btn-loading"));
-    fireEvent.click(logRefresh);
-    await waitFor(() => expect(logUrls.length).toBeGreaterThan(before));
-    expect(logParams(lastLogUrl()).get("component")).toBe("mysql");
+    // 日志面板不再有自己的刷新按钮：轮询由页面级 1 秒 tick 驱动。
+    expect(within(logCard("MySQL日志面板")).queryByRole("button", { name: /刷新日志/ })).toBeNull();
   });
 
   it("shows the Redis dependency row and the cache watermark", async () => {
@@ -930,12 +931,11 @@ describe("MonitorPage", () => {
       within(heartbeatBlock).getByText("未收到独立文档 worker 心跳（确认 rag-document-worker 已启动）"),
     ).toBeTruthy();
 
-    // 下一次快照带回心跳后，该行切换为“正常”。
+    // 下一次快照带回心跳后，该行切换为“正常”（由页面 1 秒 tick 自动刷新）。
     overviewPayload = () => jsonResponse(overviewFixture());
-    const refreshButton = screen.getByRole("button", { name: "刷新监控数据" });
-    await waitFor(() => expect(refreshButton.className).not.toContain("ant-btn-loading"));
-    fireEvent.click(refreshButton);
-    expect(await screen.findByText("最近心跳 3.0 秒前，1 个实例运行中")).toBeTruthy();
+    expect(
+      await screen.findByText("最近心跳 3.0 秒前，1 个实例运行中", undefined, { timeout: 4000 }),
+    ).toBeTruthy();
   });
 
   it("filters the 全部日志 tab by level, component, keyword and source", async () => {
@@ -1061,22 +1061,16 @@ describe("MonitorPage", () => {
     expect(within(panel).getByText("暂无日志")).toBeTruthy();
   });
 
-  it("starts with auto refresh on and refreshes on demand", async () => {
+  it("shows the fixed per-second refresh copy without switch or refresh buttons", async () => {
     renderPage();
     await screen.findByText("0.4.0");
 
-    const toggle = screen.getByRole("switch");
-    expect(toggle.getAttribute("aria-checked")).toBe("true");
-
-    // 刷新按钮在首轮请求结束前处于 loading，antd 会忽略点击：等它恢复再点。
-    const refreshButton = screen.getByRole("button", { name: "刷新监控数据" });
-    await waitFor(() => expect(refreshButton.className).not.toContain("ant-btn-loading"));
-    const before = fetchMock.mock.calls.length;
-    fireEvent.click(refreshButton);
-    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(before));
-
-    fireEvent.click(toggle);
-    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    // 页头只保留固定文案与最近一次成功更新时间：没有开关、没有手动刷新按钮。
+    expect(screen.getByText("自动刷新 · 每 1 秒")).toBeTruthy();
+    expect(screen.getByText(/更新于/)).toBeTruthy();
+    expect(screen.queryByRole("switch")).toBeNull();
+    expect(screen.queryByRole("button", { name: "刷新监控数据" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "刷新" })).toBeNull();
   });
 
   // --- Operator actions -----------------------------------------------------

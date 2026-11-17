@@ -100,6 +100,26 @@ func (s *Server) requireSession(w http.ResponseWriter, r *http.Request) (*auth.S
 	return session, true
 }
 
+// requireAdminSession authenticates an authAdminSession route: a Console login
+// session is mandatory (requireSession writes 401 without one and 403 when a
+// cookie-authenticated write misses the CSRF header), and the account must be an
+// administrator (403 otherwise).
+//
+// Unlike requireAdmin there is deliberately no loopback break-glass fallback:
+// the Kubernetes monitor and rolling-restart endpoints act on the live cluster
+// and must only be reachable by an explicitly signed-in administrator.
+func (s *Server) requireAdminSession(w http.ResponseWriter, r *http.Request) (*auth.SessionUser, bool) {
+	session, ok := s.requireSession(w, r)
+	if !ok {
+		return nil, false
+	}
+	if !session.User.IsAdmin() {
+		writeDetail(w, http.StatusForbidden, "需要管理员权限")
+		return nil, false
+	}
+	return session, true
+}
+
 // withAccessScope resolves one session account's scope for a namespace and puts
 // it in the request context, so REST handlers and the MCP endpoint enforce the
 // same document visibility. It returns nil after writing the error response.

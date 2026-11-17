@@ -276,6 +276,17 @@ func run() error {
 		}
 	}
 	monitorService := monitor.New(monitorOptions)
+	// The Console Kubernetes tab reads the shared workload/pod cache and the
+	// rolling restart writes the pod-template annotation through the same
+	// client. A deployment with no cluster credentials stays usable: the
+	// backend is simply absent and the tab shows the configuration hint.
+	kubernetesCluster, err := kubernetesMonitorBuild(logger)
+	if err != nil {
+		return err
+	}
+	if kubernetesCluster != nil {
+		defer kubernetesCluster.Close()
+	}
 	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{
 		Runtime: wire.MCPRuntime{Service: service},
@@ -322,7 +333,7 @@ func run() error {
 	if !feishuService.Enabled() {
 		logger.Info("Feishu document import is disabled: set RAG_FEISHU_APP_ID, RAG_FEISHU_APP_SECRET and RAG_FEISHU_REDIRECT_URI to enable it")
 	}
-	api := httpapi.New(serviceSettings, service, nil, logger,
+	httpOptions := []httpapi.Option{
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseSelfCreateRuntime(wire.HTTPRuntime{Service: service}),
@@ -340,7 +351,13 @@ func run() error {
 		httpapi.WithAccountProfile(userAuth),
 		httpapi.WithMailAdmin(userAuth),
 		httpapi.WithFeishuService(feishuService),
-	)
+	}
+	// The Kubernetes monitor endpoints must only exist when a cluster client is
+	// configured; without it they answer 503 "未启用" instead of pretending.
+	if kubernetesCluster != nil {
+		httpOptions = append(httpOptions, httpapi.WithKubernetesRuntime(kubernetesCluster))
+	}
+	api := httpapi.New(serviceSettings, service, nil, logger, httpOptions...)
 
 	address := net.JoinHostPort(serviceSettings.Host, strconv.Itoa(serviceSettings.Port))
 	httpServer := &http.Server{
