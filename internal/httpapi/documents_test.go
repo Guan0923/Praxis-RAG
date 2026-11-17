@@ -185,7 +185,7 @@ func TestDocumentsEndpoints(t *testing.T) {
 	if docs, ok := body["documents"].([]any); !ok || len(docs) != 1 {
 		t.Fatalf("documents = %v", body["documents"])
 	}
-	if extensions, ok := body["supported_extensions"].([]any); !ok || len(extensions) != 5 {
+	if extensions, ok := body["supported_extensions"].([]any); !ok || len(extensions) != 7 {
 		t.Fatalf("extensions = %v", body["supported_extensions"])
 	}
 	if body["max_files_per_batch"] != float64(10) || body["max_file_bytes"] != float64(10485760) {
@@ -279,7 +279,7 @@ func TestDocumentsEndpoints(t *testing.T) {
 	if unsupported.Code != http.StatusBadRequest {
 		t.Fatalf("unsupported check status = %d body = %s", unsupported.Code, unsupported.Body.String())
 	}
-	wantMessage := "暂不支持该文件类型：bad.exe；请选择 .doc、.docx、.md、.pdf、.txt。"
+	wantMessage := "暂不支持该文件类型：bad.exe；请选择 .doc、.docx、.htm、.html、.md、.pdf、.txt。"
 	if body := decodeBody(t, unsupported); body["detail"] != wantMessage {
 		t.Fatalf("unsupported detail = %v, want %q", body["detail"], wantMessage)
 	}

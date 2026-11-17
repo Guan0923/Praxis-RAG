@@ -134,6 +134,37 @@ RAG_RESULT_TTL_SECONDS = "7200"
 	}
 }
 
+func TestDoclingServiceSettingsCanBeLoadedFromConfig(t *testing.T) {
+	isolateEnv(t)
+	// deploy/config.container.toml validates [environment] against the observed
+	// keys, so the Docling settings must be accepted there.
+	for _, key := range []string{"RAG_DOCLING_SERVICE_URL", "RAG_DOCLING_SERVICE_TIMEOUT"} {
+		if _, allowed := allowedConfigKeys[key]; !allowed {
+			t.Fatalf("allowedConfigKeys is missing %s", key)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `[environment]
+RAG_DOCLING_SERVICE_URL = "http://127.0.0.1:8092"
+RAG_DOCLING_SERVICE_TIMEOUT = "300"
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("RAG_CONFIG_FILE", path)
+	if _, err := LoadStartupConfig(); err != nil {
+		t.Fatalf("LoadStartupConfig() error = %v", err)
+	}
+	for key, expected := range map[string]string{
+		"RAG_DOCLING_SERVICE_URL":     "http://127.0.0.1:8092",
+		"RAG_DOCLING_SERVICE_TIMEOUT": "300",
+	} {
+		if got := os.Getenv(key); got != expected {
+			t.Fatalf("%s = %q, want %q", key, got, expected)
+		}
+	}
+}
+
 func TestLegacyDocumentTaskSettingsAreAcceptedButIgnored(t *testing.T) {
 	isolateEnv(t)
 	legacy := []string{

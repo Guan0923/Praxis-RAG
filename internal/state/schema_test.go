@@ -247,8 +247,10 @@ func TestMySQLSchemaCompilesWithLongColumns(t *testing.T) {
 }
 
 func TestBucketConstants(t *testing.T) {
-	if SourceBucket != "source" || PDFAssetBucket != "pdf-assets" || WordAssetBucket != "word-assets" {
-		t.Fatalf("unexpected bucket constants: %q %q %q", SourceBucket, PDFAssetBucket, WordAssetBucket)
+	if SourceBucket != "source" || PDFAssetBucket != "pdf-assets" ||
+		WordAssetBucket != "word-assets" || HTMLAssetBucket != "html-assets" {
+		t.Fatalf("unexpected bucket constants: %q %q %q %q",
+			SourceBucket, PDFAssetBucket, WordAssetBucket, HTMLAssetBucket)
 	}
 }
 

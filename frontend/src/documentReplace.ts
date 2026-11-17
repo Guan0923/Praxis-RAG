@@ -4,13 +4,45 @@ import { api, type AccessView, type Connection } from "./api";
 // supported type and no larger than 10 MiB.
 export const replaceMaxFileBytes = 10 * 1024 * 1024;
 
-const supportedReplaceExtensions = [".md", ".txt", ".pdf", ".docx", ".doc"];
+const supportedReplaceExtensions = [
+  ".md",
+  ".txt",
+  ".pdf",
+  ".docx",
+  ".doc",
+  ".html",
+  ".htm",
+];
 
 // documentExtension returns the lower-cased suffix (including the dot), or ""
 // when the name has none.
 export function documentExtension(name: string) {
   const index = name.lastIndexOf(".");
   return index > 0 ? name.slice(index).toLowerCase() : "";
+}
+
+// documentFormatFamily collapses suffixes that name the same document format.
+// HTML and HTM are two spellings of one format, so they may replace each other;
+// every other suffix stays its own family and must match exactly. The argument
+// is normalized here so callers may pass a raw suffix as well.
+export function documentFormatFamily(extension: string) {
+  const normalized = extension.toLowerCase();
+  return normalized === ".htm" ? ".html" : normalized;
+}
+
+// replaceAcceptAttribute is the accept filter of the replacement picker. It
+// offers both HTML spellings so either variant of an interchangeable pair stays
+// selectable in the file dialog.
+export function replaceAcceptAttribute(name: string) {
+  const family = documentFormatFamily(documentExtension(name));
+  return family === ".html" ? ".html,.htm" : family;
+}
+
+// replaceTypeLabel is the human-readable type hint of the replacement dialog:
+// the HTML family is shown as both spellings because either one is accepted.
+export function replaceTypeLabel(name: string) {
+  const family = documentFormatFamily(documentExtension(name));
+  return family === ".html" ? ".html 或 .htm" : family;
 }
 
 // canReplaceDocument reports whether the caller may replace one document. A
@@ -28,7 +60,8 @@ export function canReplaceDocument(
 
 // replaceFileError validates one replacement selection and returns a Chinese
 // reason, or null when the file may be submitted. The new file may have a
-// different name, but its type must match the original document.
+// different name, but its format family must match the original document
+// (HTML and HTM are the same family; every other suffix must match exactly).
 export function replaceFileError(
   originalName: string,
   file: { name: string; size: number } | undefined,
@@ -36,12 +69,12 @@ export function replaceFileError(
   if (!file) return "请选择要替换的文件";
   const uploaded = documentExtension(file.name);
   if (!supportedReplaceExtensions.includes(uploaded)) {
-    return "仅支持 Markdown、TXT、PDF、DOCX 和 DOC 文件";
+    return "仅支持 Markdown、TXT、PDF、DOCX、DOC、HTML 和 HTM 文件";
   }
   if (file.size <= 0) return "替换文件不能为空";
   if (file.size > replaceMaxFileBytes) return "单文件不超过 10 MiB";
   const original = documentExtension(originalName);
-  if (uploaded !== original) {
+  if (documentFormatFamily(uploaded) !== documentFormatFamily(original)) {
     return `文件类型必须与原文档一致：原文档为 ${original || "未知"}，新文件为 ${uploaded}`;
   }
   return null;

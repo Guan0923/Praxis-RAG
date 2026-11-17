@@ -67,7 +67,7 @@ func testPictureAsset(storage string) map[string]any {
 		"captions":       []any{map[string]any{"text": "caption note"}},
 		"footnotes":      []any{map[string]any{"text": "footnote note"}},
 	}
-	if storage == "word" {
+	if storage == "word" || storage == "html" {
 		asset["location"] = map[string]any{"headings": []any{"Chapter 1"}, "paragraph": 3.0}
 	} else {
 		asset["page"] = 2.0
@@ -131,6 +131,50 @@ func TestProjectAssetResultsImagePDF(t *testing.T) {
 	// The candidate metadata map must not be mutated.
 	if _, mutated := candidates[0].Metadata["asset_kind"]; mutated {
 		t.Errorf("candidate metadata was mutated: %v", candidates[0].Metadata)
+	}
+}
+
+// TestProjectAssetResultsImageHTML pins that Docling HTML pictures use the same
+// structured projection as Word (no page/bbox, location instead) and are loaded
+// from the html asset bucket.
+func TestProjectAssetResultsImageHTML(t *testing.T) {
+	fetcher := &fakeAssetFetcher{assets: map[string]map[string]any{
+		"doc-picture:picture-1": testPictureAsset("html"),
+	}}
+	objects := fakeAssetObjects{objects: map[string][]byte{
+		"version-1|" + state.HTMLAssetBucket + "|doc-picture/pictures/picture-1.png": []byte("html-image-bytes"),
+	}}
+	candidates := []contracts.Candidate{testCandidate(map[string]any{
+		"asset_id": "doc-picture:picture-1", "upload_version": "version-1",
+	})}
+
+	results := projectAssetResults(context.Background(), fetcher, objects, candidates)
+	if len(results) != 1 {
+		t.Fatalf("results = %v", results)
+	}
+	hit := results[0]
+	asset, ok := hit["asset"].(map[string]any)
+	if !ok {
+		t.Fatalf("asset = %#v", hit["asset"])
+	}
+	if asset["data"] != base64.StdEncoding.EncodeToString([]byte("html-image-bytes")) {
+		t.Errorf("image data = %v", asset["data"])
+	}
+	if _, has := asset["page"]; has {
+		t.Errorf("HTML image must not carry page: %v", asset)
+	}
+	if _, has := asset["bbox"]; has {
+		t.Errorf("HTML image must not carry bbox: %v", asset)
+	}
+	if asset["location"] == nil {
+		t.Errorf("HTML image must carry a location: %v", asset)
+	}
+	metadata, _ := hit["metadata"].(map[string]any)
+	if _, has := metadata["page"]; has {
+		t.Errorf("HTML metadata must not carry page: %v", metadata)
+	}
+	if metadata["location"] == nil {
+		t.Errorf("HTML metadata must carry a location: %v", metadata)
 	}
 }
 

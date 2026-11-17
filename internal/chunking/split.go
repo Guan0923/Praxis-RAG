@@ -378,7 +378,9 @@ func StructureRanges(content document.Content, suffix string) []Range {
 		switch {
 		case suffix == document.SuffixPDF:
 			key = structureKey{kind: "page", page: block.Page}
-		case (suffix == document.SuffixMD || suffix == document.SuffixDOCX || suffix == document.SuffixDOC) && len(block.Headings) > 0:
+		case (suffix == document.SuffixMD || suffix == document.SuffixDOCX ||
+			suffix == document.SuffixDOC || suffix == document.SuffixHTML ||
+			suffix == document.SuffixHTM) && len(block.Headings) > 0:
 			key = structureKey{kind: "section", section: section, headings: strings.Join(block.Headings, "\x00"), table: block.Table}
 		case block.Table != 0:
 			key = structureKey{kind: "table", table: block.Table}

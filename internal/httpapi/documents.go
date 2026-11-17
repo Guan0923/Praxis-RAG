@@ -20,7 +20,7 @@ const (
 )
 
 // SupportedExtensions is the accepted upload suffix set.
-var SupportedExtensions = []string{".doc", ".docx", ".md", ".pdf", ".txt"}
+var SupportedExtensions = []string{".doc", ".docx", ".htm", ".html", ".md", ".pdf", ".txt"}
 
 // UploadFile is one client-supplied document.
 type UploadFile struct {
@@ -304,7 +304,7 @@ func (s *Server) handleReplaceDocument(w http.ResponseWriter, r *http.Request) {
 		writeDetail(w, http.StatusBadRequest, unsupportedFileTypeMessage(file.Name))
 		return
 	}
-	if uploadSuffix != targetSuffix {
+	if uploadSuffix != targetSuffix && documentFormatFamily(uploadSuffix) != documentFormatFamily(targetSuffix) {
 		writeDetail(w, http.StatusBadRequest,
 			"替换文件的类型必须与原文档一致：原文档为 "+targetSuffix+"，新文件为 "+uploadSuffix+"。")
 		return
@@ -575,4 +575,17 @@ func supportedExtension(suffix string) bool {
 		}
 	}
 	return false
+}
+
+// documentFormatFamily groups suffixes that are interchangeable when replacing
+// a document. .html and .htm are the same family because both are parsed by the
+// Docling service and produce identical evidence; every other suffix is its own
+// family and must match the original name exactly.
+func documentFormatFamily(suffix string) string {
+	switch suffix {
+	case ".html", ".htm":
+		return ".html"
+	default:
+		return suffix
+	}
 }

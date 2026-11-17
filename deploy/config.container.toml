@@ -18,3 +18,11 @@ RAG_COLLECTION = "mini_agent_knowledge_pdf_assets_v1"
 RAG_MCP_ALLOWED_HOSTS = "127.0.0.1,127.0.0.1:*,localhost,localhost:*"
 RAG_MCP_ALLOWED_ORIGINS = "http://127.0.0.1,http://127.0.0.1:*,http://localhost,http://localhost:*,http://[::1],http://[::1]:*"
 RAG_WORD_CONVERT_TIMEOUT = "120"
+# Docling document parsing (.docx and .html/.htm; .doc is converted by
+# LibreOffice first and uploaded as .docx). An empty URL disables Docling:
+# .docx/.doc keep the in-process OOXML parser and .html/.htm cannot be
+# imported. Both keys must also be registered in observedKeys
+# (internal/config/startup.go); an unregistered key aborts startup with
+# "unknown setting or non-string value".
+RAG_DOCLING_SERVICE_URL = "http://docling-service:8092"
+RAG_DOCLING_SERVICE_TIMEOUT = "300"

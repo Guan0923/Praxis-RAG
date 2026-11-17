@@ -212,6 +212,7 @@ const (
 	SourceBucket    = "source"
 	PDFAssetBucket  = "pdf-assets"
 	WordAssetBucket = "word-assets"
+	HTMLAssetBucket = "html-assets"
 )
 
 func varchar(name string, length int) SchemaColumn {

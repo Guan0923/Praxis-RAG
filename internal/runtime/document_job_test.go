@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,11 +12,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Guan0923/xinghe_rag/internal/apierrors"
 	"github.com/Guan0923/xinghe_rag/internal/config"
 
 	"github.com/Guan0923/xinghe_rag/internal/chunking"
 	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/documentworker"
+	"github.com/Guan0923/xinghe_rag/internal/ingest"
 	"github.com/Guan0923/xinghe_rag/internal/sparse"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -92,6 +95,24 @@ func TestDocumentJobIngestErrorTreatsInvalidPDFServiceInputAsTerminal(t *testing
 		t.Fatalf("documentJobIngestError(%v) = %v, want *state.DocumentValidationError",
 			parseErr, converted)
 	}
+}
+
+func TestDocumentJobIngestErrorTreatsDoclingNotConfiguredAsTerminal(t *testing.T) {
+	// A queued HTML job whose Docling URL disappeared after admission cannot be
+	// fixed by retrying: classify it as a terminal configuration/validation
+	// error so the retry budget is not burned.
+	wrapped := fmt.Errorf("parsing: %w", ingest.ErrDoclingNotConfigured)
+	classified := documentJobIngestError(wrapped)
+	var validation *apierrors.KnowledgeValidationError
+	if !errors.As(classified, &validation) {
+		t.Fatalf("documentJobIngestError(%v) = %v, want *apierrors.KnowledgeValidationError",
+			wrapped, classified)
+	}
+	if validation.Message != doclingServiceRequiredMessage {
+		t.Fatalf("classified message = %q, want %q", validation.Message, doclingServiceRequiredMessage)
+	}
+	// apierrors.KnowledgeValidationError is one of the two types the worker's
+	// default terminal classifier recognizes (documentworker.defaultTerminalError).
 }
 
 func TestProcessDocumentJobSucceeds(t *testing.T) {

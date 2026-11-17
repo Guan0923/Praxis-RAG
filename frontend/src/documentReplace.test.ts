@@ -3,8 +3,12 @@ import type { AccessView, Connection } from "./api";
 import {
   canReplaceDocument,
   documentExtension,
+  documentFormatFamily,
+  replaceAcceptAttribute,
   replaceDocument,
   replaceFileError,
+  replaceMaxFileBytes,
+  replaceTypeLabel,
 } from "./documentReplace";
 
 const fetchMock = vi.fn();
@@ -89,6 +93,18 @@ describe("documentExtension", () => {
   });
 });
 
+describe("documentFormatFamily", () => {
+  it("collapses html and htm into one family", () => {
+    expect(documentFormatFamily(".html")).toBe(".html");
+    expect(documentFormatFamily(".htm")).toBe(".html");
+    expect(documentFormatFamily(".HTM")).toBe(".html");
+    expect(documentFormatFamily(".docx")).toBe(".docx");
+    expect(documentFormatFamily(".doc")).toBe(".doc");
+    expect(documentFormatFamily(".md")).toBe(".md");
+    expect(documentFormatFamily("")).toBe("");
+  });
+});
+
 describe("replaceFileError", () => {
   it("accepts a renamed file of the same type", () => {
     expect(replaceFileError("使用手册.pdf", { name: "使用手册-修订版.pdf", size: 1024 }))
@@ -97,26 +113,69 @@ describe("replaceFileError", () => {
       .toBeNull();
   });
 
-  it("rejects a different type", () => {
+  it("accepts html and htm files of the same, interchangeable family", () => {
+    expect(replaceFileError("index.html", { name: "index-v2.html", size: 1024 }))
+      .toBeNull();
+    expect(replaceFileError("index.htm", { name: "index-v2.htm", size: 1024 }))
+      .toBeNull();
+    // HTML and HTM are two spellings of one format, so either may replace the
+    // other even though the name changed.
+    expect(replaceFileError("index.html", { name: "index.htm", size: 1024 }))
+      .toBeNull();
+    expect(replaceFileError("使用说明.HTM", { name: "使用说明.html", size: 1024 }))
+      .toBeNull();
+  });
+
+  it("rejects a different type, including html against another format", () => {
     const problem = replaceFileError("manual.pdf", { name: "manual.txt", size: 10 });
     expect(problem).toContain("文件类型必须与原文档一致");
     expect(problem).toContain(".pdf");
     expect(problem).toContain(".txt");
+
+    const toHtml = replaceFileError("manual.md", { name: "manual.html", size: 10 });
+    expect(toHtml).toContain("文件类型必须与原文档一致");
+    expect(toHtml).toContain(".md");
+    expect(toHtml).toContain(".html");
+    expect(replaceFileError("manual.html", { name: "manual.md", size: 10 }))
+      .toContain("文件类型必须与原文档一致");
+    expect(replaceFileError("manual.html", { name: "manual.docx", size: 10 }))
+      .toContain("文件类型必须与原文档一致");
   });
 
   it("rejects unsupported, empty and oversized files", () => {
     expect(replaceFileError("manual.md", { name: "manual.exe", size: 10 }))
       .toContain("仅支持");
+    expect(replaceFileError("manual.md", { name: "manual.xhtml", size: 10 }))
+      .toContain("仅支持");
+    expect(replaceFileError("manual.html", { name: "manual.exe", size: 10 }))
+      .toContain("HTML");
     expect(replaceFileError("manual.md", { name: "manual.md", size: 0 }))
       .toContain("不能为空");
     expect(replaceFileError("manual.md", {
       name: "manual.md",
       size: 10 * 1024 * 1024 + 1,
     })).toContain("10 MiB");
+    expect(replaceFileError("manual.html", {
+      name: "manual.html",
+      size: replaceMaxFileBytes + 1,
+    })).toContain("10 MiB");
   });
 
   it("requires a selected file", () => {
     expect(replaceFileError("manual.md", undefined)).toContain("请选择");
+  });
+});
+
+describe("replace picker hints", () => {
+  it("offers both html spellings and one suffix for the other formats", () => {
+    expect(replaceAcceptAttribute("a.htm")).toBe(".html,.htm");
+    expect(replaceAcceptAttribute("a.HTML")).toBe(".html,.htm");
+    expect(replaceAcceptAttribute("a.pdf")).toBe(".pdf");
+    expect(replaceAcceptAttribute("README")).toBe("");
+
+    expect(replaceTypeLabel("a.htm")).toBe(".html 或 .htm");
+    expect(replaceTypeLabel("a.html")).toBe(".html 或 .htm");
+    expect(replaceTypeLabel("a.docx")).toBe(".docx");
   });
 });
 

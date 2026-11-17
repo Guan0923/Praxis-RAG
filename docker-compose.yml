@@ -284,6 +284,62 @@ services:
       retries: 10
       start_period: 30s
 
+  # Docling document parsing microservice: one HTTP endpoint (FastAPI on
+  # :8092) that turns .docx and .html/.htm uploads into Markdown plus assets.
+  # The Go app calls it over HTTP only when RAG_DOCLING_SERVICE_URL is set.
+  # With an empty URL Docling stays disabled: .docx/.doc keep the in-process
+  # OOXML parser and .html/.htm cannot be imported. The service never receives
+  # .doc directly: the Go app converts it with LibreOffice and uploads the
+  # resulting .docx.
+  # The PDF path is unchanged: PDF still goes through pdf-parser above.
+  # No profile: `docker compose up -d` starts it together with the
+  # infrastructure, so a deployment that only ingests .md/.txt/.pdf can skip it
+  # with `docker compose up -d mysql qdrant redis kafka` and/or
+  # `docker compose stop docling-service`.
+  # Dependency versions, the image build and the local (non-container) start
+  # command live in python-workers/docling-service/README.md.
+  docling-service:
+    build:
+      context: ./python-workers/docling-service
+      args:
+        # Override for restricted networks, e.g. a cached/mirrored python base
+        # or an internal package index (same knobs as pdf-parser).
+        BASE_IMAGE: ${RAG_DOCLING_BASE_IMAGE:-python:3.11-slim}
+        PIP_INDEX_URL: ${RAG_DOCLING_PIP_INDEX_URL:-https://pypi.org/simple}
+    image: ${RAG_DOCLING_IMAGE:-praxis-rag-docling-service:local}
+    container_name: praxis-rag-docling-service
+    restart: unless-stopped
+    environment:
+      # Fixed container port 8092: the healthcheck below and the published
+      # mapping assume it. Changing it means changing three places and the Go
+      # side RAG_DOCLING_SERVICE_URL.
+      RAG_DOCLING_SERVICE_HOST: "0.0.0.0"
+      # The service reads the listen port from PORT (default 8092) and has no
+      # prefixed port variable; keep it explicit so the listener, the
+      # healthcheck and the host mapping cannot drift apart.
+      PORT: "8092"
+      # Conservative default: one parse request at a time per process. Raise it
+      # together with the container CPU/memory while watching the parse queue.
+      RAG_DOCLING_SERVICE_CONCURRENCY: ${RAG_DOCLING_SERVICE_CONCURRENCY:-1}
+      # Request budget in seconds. The same variable name is read by the Go
+      # client, which uses it as its HTTP timeout for one Docling call.
+      RAG_DOCLING_SERVICE_TIMEOUT: ${RAG_DOCLING_SERVICE_TIMEOUT:-300}
+      # Parse budget inside the request (must stay below the timeout above).
+      RAG_DOCLING_SERVICE_PARSE_TIMEOUT: ${RAG_DOCLING_SERVICE_PARSE_TIMEOUT:-120}
+      RAG_DOCLING_SERVICE_LOG_LEVEL: ${RAG_DOCLING_SERVICE_LOG_LEVEL:-info}
+      RAG_DOCLING_SERVICE_LOG_FORMAT: ${RAG_DOCLING_SERVICE_LOG_FORMAT:-text}
+    ports:
+      # Internal service with no auth: publish on loopback only.
+      - "127.0.0.1:8092:8092"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/healthz').read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      # Parser library imports can be slow on first start; the grace window is
+      # wider than pdf-parser's on purpose.
+      start_period: 60s
+
   # Go backend service. Kept out of the default (infra-only) profile:
   #   docker compose --profile app up -d --build
   # The image builds the Console and every cmd/* entrypoint from this repo.
@@ -308,6 +364,8 @@ services:
       kafka:
         condition: service_healthy
       pdf-parser:
+        condition: service_started
+      docling-service:
         condition: service_started
       connect-init:
         condition: service_completed_successfully
@@ -361,6 +419,16 @@ services:
       RAG_PDF_ENGINE: ${RAG_PDF_ENGINE:-vision}
       RAG_PDF_SERVICE_URL: ${RAG_PDF_SERVICE_URL:-http://pdf-parser:8091}
       RAG_PDF_SERVICE_TIMEOUT: ${RAG_PDF_SERVICE_TIMEOUT:-900}
+      # Docling parsing: .docx and .html/.htm uploads are converted by the
+      # docling-service sidecar (zip: Markdown + assets); .doc is converted
+      # locally by LibreOffice and uploaded as .docx. An empty value disables
+      # Docling: .docx/.doc keep the in-process OOXML parser and .html/.htm
+      # cannot be imported (HTML requires the service). PDF parsing is
+      # unaffected and still uses the RAG_PDF_* pair above. The `-` (not `:-`)
+      # fallback keeps an explicit empty .env value empty, which is how this
+      # deployment disables the service.
+      RAG_DOCLING_SERVICE_URL: ${RAG_DOCLING_SERVICE_URL-http://docling-service:8092}
+      RAG_DOCLING_SERVICE_TIMEOUT: ${RAG_DOCLING_SERVICE_TIMEOUT:-300}
       RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
       RAG_CACHE_GROUP: ${RAG_CACHE_GROUP:-praxis_state_cache_refresh_workers}
       # Document lease backend. mysql (default) keeps the pre-migration SQL lease

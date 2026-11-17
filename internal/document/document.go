@@ -43,10 +43,17 @@ import (
 const (
 	SuffixDOC  = ".doc"
 	SuffixDOCX = ".docx"
+	SuffixHTML = ".html"
+	SuffixHTM  = ".htm"
 	SuffixMD   = ".md"
 	SuffixPDF  = ".pdf"
 	SuffixTXT  = ".txt"
 )
+
+// htmlSuffixes is the static HTML upload family parsed by the Docling
+// service. It is never read as plain text: the reader rejects it so an HTML
+// source can never be indexed as Markdown/TXT.
+var htmlSuffixes = map[string]struct{}{SuffixHTML: {}, SuffixHTM: {}}
 
 // Block kinds. "table_row" and "picture" are produced by the Word/PDF adapters
 // the same way document_readers transforms parser manifests.
@@ -76,7 +83,8 @@ var (
 )
 
 var supportedSuffixes = map[string]struct{}{
-	SuffixDOC: {}, SuffixDOCX: {}, SuffixMD: {}, SuffixPDF: {}, SuffixTXT: {},
+	SuffixDOC: {}, SuffixDOCX: {}, SuffixHTML: {}, SuffixHTM: {},
+	SuffixMD: {}, SuffixPDF: {}, SuffixTXT: {},
 }
 
 // IsSupportedSuffix reports whether suffix (with leading dot, case-insensitive)
@@ -193,6 +201,10 @@ func (r *Reader) ReadDocumentContext(ctx context.Context, path string) (Content,
 		return Content{}, unsupportedSuffixError(suffix)
 	}
 	switch suffix {
+	case SuffixHTML, SuffixHTM:
+		// Static HTML is only parsed by the Docling service; reading it as
+		// plain text would index raw markup.
+		return Content{}, htmlReaderError(name)
 	case SuffixPDF:
 		pages, err := r.pdfPages(ctx, resolved, name)
 		if err != nil {
@@ -252,6 +264,10 @@ func (r *Reader) ReadTextContext(ctx context.Context, path string) (string, erro
 		return "", unsupportedSuffixError(suffix)
 	}
 	switch suffix {
+	case SuffixHTML, SuffixHTM:
+		// Static HTML is only parsed by the Docling service; reading it as
+		// plain text would index raw markup.
+		return "", htmlReaderError(name)
 	case SuffixMD, SuffixTXT:
 		return readUTF8(resolved, name)
 	case SuffixPDF:
@@ -275,6 +291,13 @@ func unsupportedSuffixError(suffix string) *ReadError {
 		display = "<none>"
 	}
 	return invalidDocumentErrf("暂不支持该文件类型：%s", display)
+}
+
+// htmlReaderError keeps static HTML out of the plain-text reader: the format
+// is only parsed by the Docling HTTP service, whose structured output keeps
+// table and picture provenance that raw markup cannot provide.
+func htmlReaderError(name string) *ReadError {
+	return readErrf("HTML 文档需要通过 Docling 解析服务导入：%s", name)
 }
 
 // assembleBlocks joins non-blank blocks with "\n\n" and records rune spans,
