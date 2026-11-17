@@ -279,8 +279,8 @@ func (s *Service) UpdateKnowledgeBase(
 		input.EncryptionKey = s.stores.Settings.EncryptionKey
 	}
 	var published map[string]any
-	publish := func(*state.LockToken) error {
-		result, err := s.publishKnowledgeBase(ctx, namespace, input)
+	publish := func(token *state.LockToken) error {
+		result, err := s.publishKnowledgeBase(ctx, namespace, input, token)
 		if err != nil {
 			return err
 		}
@@ -308,6 +308,7 @@ func (s *Service) publishKnowledgeBase(
 	ctx context.Context,
 	namespace string,
 	input kbconfig.UpdateInput,
+	token *state.LockToken,
 ) (map[string]any, error) {
 	snapshot, err := s.stores.KnowledgeBases.Snapshot(ctx, namespace)
 	if err != nil {
@@ -342,6 +343,14 @@ func (s *Service) publishKnowledgeBase(
 	if latest == nil || latest.Version != snapshot.Version {
 		s.discardCollection(staging)
 		return nil, &apierrors.KnowledgeValidationError{Message: kbconfig.MessagePublicationRolledBack}
+	}
+	// The destructive configuration write is fenced by the exclusive lease: a
+	// request that lost it (for example after a takeover) must not publish.
+	if token != nil {
+		if err := s.stores.Uploads.AssertLock(ctx, token); err != nil {
+			s.discardCollection(staging)
+			return nil, err
+		}
 	}
 	if err := s.stores.KnowledgeBases.Update(ctx, updated); err != nil {
 		var lookup *state.LookupError
@@ -503,6 +512,10 @@ func (s *Service) PurgeKnowledgeBases(ctx context.Context, namespaces []string) 
 	}
 	report, err := s.stores.KnowledgeBases.Purge(ctx, ordered)
 	if err != nil {
+		var unavailable *state.LockUnavailable
+		if errors.As(err, &unavailable) {
+			return nil, &apierrors.KnowledgeError{Message: documentLockUnavailableMessage}
+		}
 		return nil, &apierrors.KnowledgeError{Message: "知识库配置无法删除"}
 	}
 	for index, namespace := range ordered {

@@ -23,6 +23,8 @@ Praxis-RAG 把分散的文档整理为可搜索、可追溯的知识库。你可
 
 相同内容与切分配置的重复上传会跳过；`add_document` 与异步 REST 上传不覆盖同名文档。需要保留原名换文件时，Console 文档行提供「替换文件」，或调用同步接口 `POST /v1/documents/{name}/replace`（新文件可改名但类型须一致，复用 `update_document` 的替换与重建索引逻辑）；MCP 侧仍用 `update_document`。状态用 MCP `get_document_status` 或 REST `GET /v1/document-jobs/{artifact_id}` 轮询，终态为 `succeeded` / `failed`，状态在 MySQL，不依赖 Redis TTL。
 
+文档写入的**长时互斥**默认仍由 MySQL `document_leases` 承担：上传 INTENT、覆盖发布、删除、恢复、清理与知识库独占操作都申请/续期该行。设置 `RAG_DOCUMENT_LOCK_MODE=redis`（并把 `rag-service`、`rag-document-worker`、`rag-mcp-ingest` 全部改成同一配置）后，长租约迁到 Redis，MySQL 继续保存任务领取/重试/终态、幂等与操作日志，以及单调递增的 `fencing_epoch`（所有破坏性事务提交前按当前持有者校验）。两种模式**不能混跑**，切换/回退步骤见[部署指南](docs/DEPLOYMENT.md) §13。
+
 知识文档页还提供「从飞书导入」：用户先用自己的飞书账号完成 OAuth 授权，然后按文件夹浏览或搜索自己有权限访问的飞书文档，勾选后一次导入当前知识库（单次最多 10 篇）。浏览、搜索和读取正文都使用该用户的 `user_access_token`，不会越权读取；导入只取新版飞书文档（docx）的纯文本，复用普通上传的知识库写权限校验、SHA-256 去重、同名跳过和异步索引，逐篇返回「已受理 / 已跳过 / 失败」并在后台轮询索引状态，只有索引成功后才可检索。导入后的副本属于目标知识库，可见范围由 Praxis-RAG 的知识库权限决定，与飞书原文档的分享范围无关。部署方需要配置 `RAG_FEISHU_APP_ID`、`RAG_FEISHU_APP_SECRET` 和 `RAG_FEISHU_REDIRECT_URI`，并在飞书应用申请 `drive:drive:readonly`、`docx:document:readonly`、`offline_access` 权限；未配置时入口会说明原因。文件列表中的旧版飞书文档（doc）、表格和附件会标记为不支持；搜索命中的旧版或不支持文档会作为该篇的失败原因返回，不影响同批其他文档。
 
 ### PDF 与 Word 解析
@@ -82,7 +84,7 @@ MCP 需要 `Authorization: Bearer <service token 或 API Key>` 与 `X-RAG-Namesp
 
 ### 独立部署与模型状态
 
-Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档任务、UploadJournal、文档清单、知识库配置、Console 模型列表（`model_profiles`）、MCP 配置、API Key 与 artifact 快照保存在共享状态数据库（MySQL）；读模型展示缓存放 Redis（可选）。Kafka 只传递通知（文档任务、缓存变更两类事件，均只含定位标识），由运行在分布式 Kafka Connect 上的两个 Debezium 连接器从 MySQL 表级采集；搜索为同步执行，不经过 Kafka。Embedding / Reranker 通过模型 API 调用，服务本身不加载模型权重。PDF 高保真解析由独立的 `pdf-parser` 容器通过 HTTP 调用远端视觉模型完成（本地不加载任何模型权重），Go 服务本身只加载纯文本引擎。
+Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档任务、UploadJournal、文档清单、知识库配置、Console 模型列表（`model_profiles`）、MCP 配置、API Key 与 artifact 快照保存在共享状态数据库（MySQL）；读模型展示缓存放 Redis（可选），文档长租约也可选择由 Redis 承担（默认仍在 MySQL）。Kafka 只传递通知（文档任务、缓存变更两类事件，均只含定位标识），由运行在分布式 Kafka Connect 上的两个 Debezium 连接器从 MySQL 表级采集；搜索为同步执行，不经过 Kafka。Embedding / Reranker 通过模型 API 调用，服务本身不加载模型权重。PDF 高保真解析由独立的 `pdf-parser` 容器通过 HTTP 调用远端视觉模型完成（本地不加载任何模型权重），Go 服务本身只加载纯文本引擎。
 
 ## 快速开始（Go 后端）
 
@@ -93,7 +95,7 @@ Qdrant 保存检索索引；源文件、PDF/Word 解析产物、异步文档任�
 - **Qdrant**（HTTP 模式；Go 不支持 `QDRANT_PATH` 本地文件模式）
 - **共享状态库**：MySQL 8（`utf8mb4`），必须配置 `RAG_STATE_URL` 或 `RAG_MYSQL_*`，不再提供本地文件回退
 - **文档处理必需**：Kafka + 分布式 Kafka Connect（其中注册两个 Debezium MySQL 连接器：文档连接器只采集 `document_jobs`，缓存连接器采集业务表）；未配置时上传仍可受理，但文档任务保持 `queued`、缓存刷新不生效。搜索为同步执行，不需要 Kafka。
-- **可选**：Redis（读模型展示缓存，可禁用）、LibreOffice（仅 .doc 转换）
+- **可选**：Redis（读模型展示缓存，可禁用；也可作为文档长租约后端）、LibreOffice（仅 .doc 转换）
 - **可选（PDF 高保真解析）**：PDF 视觉解析微服务（`python-workers/pdf-service`，独立镜像，容器端口 8091）。默认 `docker compose up -d` 会随基础设施一起启动；它本地不加载模型，只需能访问远端 OpenAI 兼容视觉模型。vision 引擎下每个知识库还需在 Console「模型配置」页添加 VLM 模型，并在建库/编辑知识库时选中，否则 PDF 上传会被拒绝并提示配置；也可用 `RAG_VLM_*` 作为服务级回退。只用纯文本引擎时可以不启动它（`RAG_PDF_ENGINE=go`）
 - **可选**：远端 OpenAI 兼容视觉模型（`RAG_VLM_BASE_URL`/`RAG_VLM_API_KEY`/`RAG_VLM_MODEL`）同时用于 PDF 视觉解析与 Word 无图注图片描述，`RAG_PDF_ENGINE=vision` 时作为知识库 VLM 设置的环境回退（Console 知识库 VLM 设置优先）；未配置 VLM 时 Word 图片保留占位描述（上传不会失败），vision 引擎则因知识库/环境都没有 VLM 而在上传受理阶段被拒绝
 
@@ -229,7 +231,7 @@ Go 镜像内包含 `/app/bin/` 下全部命令、`/app/web` Console 和 `/app/co
 MCP 客户端 -> /mcp（Streamable HTTP）-> rag-service
 REST /v1/* ------------------------> rag-service（同步搜索/管理/状态；上传默认异步受理）
 rag-service -> Qdrant（检索索引）、共享状态库（文档/KB/Key/任务/artifact/缓存水位）、
-               Redis（读模型展示缓存；可选）、Kafka（Debezium 文档/缓存通知；文档处理必需）
+               Redis（读模型展示缓存 + 可选文档长租约后端）、Kafka（Debezium 文档/缓存通知；文档处理必需）
 网页/REST 上传（默认）与 MCP add_document
                  -> 状态库单事务写入 document_jobs（schedule_version=1），返回 artifact_id
                  -> 有 Kafka：Kafka Connect 文档连接器（表级采集）-> Kafka 通知 -> rag-document-worker
@@ -250,7 +252,7 @@ MCP search / REST /v1/search（同步）-> runtime.Service.Search -> 检索 + �
 - **重发只在 MySQL 事务内发生**：可重试失败先记录原因与 `retry_at`，到期由 `Sweep` 递增 `schedule_version`；租约过期由 `Sweep` 递增版本重排。普通 `queued` 等待（worker/解析名额）不会递增版本，也不消耗执行次数。消费者只处理与数据库当前版本相等的通知；任务表初始快照的 `op=r` 事件用于存量切换补投。
 - **搜索永远同步**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，没有 `result_id`/`wait_seconds`/轮询；artifact 按 ID 独立读取，保留期由 `RAG_RESULT_TTL_SECONDS`（默认 3600 秒）控制。原排队搜索链路（`search_tasks`、`search_result_snapshots`、`praxis_search` topic、`rag-search-worker`、搜索 DLQ）已于 2026-11-13 下线，两张历史表保留数据但不再读写。
 - **缓存消费者 revision 水位**：业务表变更（包括手工 SQL）由缓存连接器投递，消费者递增 `cache_revisions.revision` 后重建并写 Redis；失败记录 `attempts/last_error`，由周期 `RefreshDirty` 收敛，不再有 `cache_outbox` 补发；因此 Redis 写失败不会把事件反复送进 DLQ。
-- Console「系统监控」采用顶部标签栏：`概览` 展示总体状态、关键指标、依赖探测、文档任务/上传、两个 Kafka Connect 采集连接器（`文档采集`/`缓存采集`，含 connector/task 状态、所在 worker、失败原因、自动重启与恢复结果）、两组 Kafka 消费组、缓存水位与 Worker 心跳，并新增主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络总速率与最忙网卡、进程 RSS/VMS/goroutine/heap）；`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` 标签展示该组件既有内容与该组件日志；`全部日志` 提供来源（内存/文件）、级别、关键字过滤与分页。读不到的进度显示「未知」。搜索同步化迁移与切换步骤见 [CDC 迁移契约](docs/cdc-migration.md) §12 与 [部署指南](docs/DEPLOYMENT.md) §12；采集层操作见 [Kafka Connect 手册](deploy/kafka-connect/README.md)。
+- Console「系统监控」采用顶部标签栏：`概览` 展示总体状态、关键指标、依赖探测、文档任务/上传、两个 Kafka Connect 采集连接器（`文档采集`/`缓存采集`，含 connector/task 状态、所在 worker、失败原因、自动重启与恢复结果）、两组 Kafka 消费组、缓存水位与 Worker 心跳，并新增主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络总速率与最忙网卡、进程 RSS/VMS/goroutine/heap）；`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` 标签展示该组件既有内容与该组件日志（概览的 `Redis` 依赖行在读模型缓存关闭时报告文档锁后端）；`全部日志` 提供来源（内存/文件）、级别、关键字过滤与分页。读不到的进度显示「未知」。搜索同步化迁移与切换步骤见 [CDC 迁移契约](docs/cdc-migration.md) §12 与 [部署指南](docs/DEPLOYMENT.md) §12；采集层操作见 [Kafka Connect 手册](deploy/kafka-connect/README.md)。
 
 ## 迁移状态
 
@@ -299,7 +301,7 @@ npm run build
 | --- | --- |
 | [使用与部署](docs/USAGE.md) | Go 后端的构建、运行、环境变量、REST/MCP 示例、worker、迁移 CLI。 |
 | [知识库权限管理](docs/PERMISSIONS.md) | 角色、知识库归属、可读/可修改与单文件/多文件/全库权限、邀请链接流程与接口。 |
-| [部署指南](docs/DEPLOYMENT.md) | Docker/Compose 与 systemd 示例、worker 重启策略、DLQ 监控、分布式 Kafka Connect 与升级/回滚。 |
+| [部署指南](docs/DEPLOYMENT.md) | Docker/Compose 与 systemd 示例、worker 重启策略、DLQ 监控、分布式 Kafka Connect、文档锁切换与升级/回滚。 |
 | [Kafka Connect 操作手册](deploy/kafka-connect/README.md) | 两个 Debezium 连接器的模板、注册、生产要求、FAILED task 自动重启与故障演练。 |
 | [Go 迁移总纲](docs/GO_MIGRATION.md) | 目标架构、兼容性硬约束、阶段与进度记录、当前切换状态。 |
 | [Go Parity 审计](docs/GO_PARITY_AUDIT.md) | Go 与 Python/前端契约差异、P0/P1/P2 清单与验证限制。 |

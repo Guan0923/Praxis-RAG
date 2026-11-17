@@ -8,7 +8,7 @@ Praxis-RAG：面向 AI 助手与业务应用的**独立知识库与检索服务*
 
 - 后端：**Go 1.27**（`cmd/` 入口 + `internal/` 实现）；`rag-service` + 3 个 worker（文档/缓存/死信）+ 若干 CLI。
 - 前端：`frontend/`（React 19 + TypeScript + Ant Design 6 + Vite），Go 服务在 `/console` 托管。
-- 状态：**MySQL 8**（唯一状态库）；向量：**Qdrant HTTP**；缓存：Redis（可选，只读模型展示缓存）；消息：Kafka（文档入库与缓存刷新必需；搜索为同步执行，不经过 Kafka）。搜索一次调用同步返回证据，无任务 ID/轮询/结果快照。
+- 状态：**MySQL 8**（唯一状态库）；向量：**Qdrant HTTP**；缓存：Redis（可选：只读模型展示缓存 + 可选的文档长租约后端，默认长租约仍在 MySQL）；消息：Kafka（文档入库与缓存刷新必需；搜索为同步执行，不经过 Kafka）。搜索一次调用同步返回证据，无任务 ID/轮询/结果快照。
 - PDF 高保真：可选独立微服务 `python-workers/pdf-service`（FastAPI + PyMuPDF，HTTP :8091）；本地只做 PDF 读取/渲染/裁图与清单组装，版面/OCR/表格/公式/图片描述统一调用知识库配置的远端 OpenAI 兼容视觉模型（VLM），进程内不加载任何模型权重。除此之外无 Python 依赖。
 
 ## 2. 硬性约束（任何改动都适用）

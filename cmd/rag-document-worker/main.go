@@ -138,6 +138,24 @@ func run() error {
 	if err := redisstate.Attach(stores, cache); err != nil {
 		return err
 	}
+	// The worker publishes documents through the same journal, so it must use
+	// the deployment's document lease backend (RAG_DOCUMENT_LOCK_MODE).
+	lockSettings, err := state.DocumentLockSettingsFromEnv()
+	if err != nil {
+		return configError(err)
+	}
+	if lockSettings.RedisMode() {
+		documentLock, lockErr := redisstate.NewDocumentLock(lockSettings)
+		if lockErr != nil {
+			return configError(lockErr)
+		}
+		defer func() { _ = documentLock.Close() }()
+		if attachErr := stores.AttachDocumentLocker(documentLock); attachErr != nil {
+			return attachErr
+		}
+	}
+	logger.Info("Document lease backend configured",
+		"mode", lockSettings.Mode, "ttl_seconds", lockSettings.TTLSeconds)
 	stores.CacheSync.Start()
 
 	service, err := runtime.New(ragConfig, stores, serviceSettings.DataRoot)

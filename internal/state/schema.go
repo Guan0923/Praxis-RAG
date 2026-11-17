@@ -401,6 +401,10 @@ var schemaTables = []*SchemaTable{
 			identifier("owner", 32),
 			identifier("operation_id", 32).Null(),
 			double("expires_at"),
+			// fencing_epoch is the durable takeover generation. It is appended
+			// last so a migrated database keeps the same column order, and it is
+			// monotonic: releasing a lease clears the holder but keeps the epoch.
+			bigint("fencing_epoch").Default("0"),
 		},
 	},
 	{

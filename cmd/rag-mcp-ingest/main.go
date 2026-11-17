@@ -23,6 +23,7 @@ import (
 	"github.com/Guan0923/xinghe_rag/internal/config"
 	"github.com/Guan0923/xinghe_rag/internal/document"
 	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
+	"github.com/Guan0923/xinghe_rag/internal/redisstate"
 	"github.com/Guan0923/xinghe_rag/internal/runtime"
 	"github.com/Guan0923/xinghe_rag/internal/state"
 )
@@ -152,6 +153,26 @@ func run(args []string, stdout, stderr *os.File) int {
 		return exitError
 	}
 	defer func() { _ = stores.Close() }()
+	// Ingestion writes documents through the shared journal, so it must join the
+	// deployment's document lease backend instead of holding a second, MySQL-only
+	// lock that the other processes cannot see.
+	lockSettings, err := state.DocumentLockSettingsFromEnv()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return exitError
+	}
+	if lockSettings.RedisMode() {
+		documentLock, lockErr := redisstate.NewDocumentLock(lockSettings)
+		if lockErr != nil {
+			fmt.Fprintln(stderr, lockErr)
+			return exitError
+		}
+		defer func() { _ = documentLock.Close() }()
+		if attachErr := stores.AttachDocumentLocker(documentLock); attachErr != nil {
+			fmt.Fprintln(stderr, attachErr)
+			return exitError
+		}
+	}
 	service, err := runtime.New(ragConfig, stores, serviceSettings.DataRoot)
 	if err != nil {
 		fmt.Fprintln(stderr, err)

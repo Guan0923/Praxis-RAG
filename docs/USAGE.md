@@ -302,21 +302,29 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 
 `RAG_SERVICE_DATA_ROOT` 只决定上传恢复工作区等本地文件的位置，不再决定数据库。两项都未配置时启动报错；表结构可用 §7 的 `rag-state-migrate` 检查/建表。
 
-### Redis 与 artifact
+### Redis、文档锁与 artifact
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RAG_REDIS_ENABLED` | 未设置 = 按 URL 自动启用 | `false/0/off` 显式禁用；禁用时只影响读模型展示缓存（读取回源 MySQL） |
+| `RAG_REDIS_ENABLED` | 未设置 = 按 URL 自动启用 | `false/0/off` 显式禁用；禁用时只影响读模型展示缓存（读取回源 MySQL），不影响文档锁后端 |
 | `RAG_REDIS_URL` | 空 | 例如 `redis://127.0.0.1:6379/0` |
 | `RAG_REDIS_PREFIX` | `rag:state:v1` | 读模型缓存键前缀 |
-| `RAG_REDIS_TTL_SECONDS` | `60` | 读模型展示缓存 TTL |
+| `RAG_REDIS_TTL_SECONDS` | `60` | 读模型展示缓存 TTL（与文档锁 TTL 无关） |
 | `RAG_REDIS_TIMEOUT_SECONDS` | `0.3` | Redis 连接/命令超时 |
+| `RAG_DOCUMENT_LOCK_MODE` | `mysql` | 文档长租约后端：`mysql`（默认，行为不变）或 `redis`。部署级开关，`rag-service`/`rag-document-worker`/`rag-mcp-ingest` 必须同值 |
+| `RAG_REDIS_LOCK_URL` | 空（回退 `RAG_REDIS_URL`） | 文档锁 Redis 地址；`redis` 模式解析不出 URL 时启动报错 |
+| `RAG_REDIS_LOCK_PREFIX` | `rag:lock:v1` | 锁键前缀；每个 namespace 一个 Hash：`<prefix>:{<sha256(namespace) 前 32 位>}:leases`，单键内多 field，兼容 Redis Cluster |
+| `RAG_REDIS_LOCK_TTL_SECONDS` | `120`（未显式设置时跟随 `RAG_UPLOAD_LEASE_SECONDS`） | 文档长租约时长；心跳按 1/3 周期续租 |
+| `RAG_REDIS_LOCK_TIMEOUT_SECONDS` | `1` | 单次 Redis 命令超时 |
+| `RAG_REDIS_LOCK_WAIT_SECONDS` | `2` | 后端暂时不可用时等待/重试的窗口，超时返回可重试错误；锁冲突不等待 |
 | `RAG_RESULT_TTL_SECONDS` | `3600` | **artifact 保留期**（变量名保留，语义已更正；不再用于搜索结果快照） |
 | `RAG_RESULT_MAX_BYTES` | `16777216` | 单次搜索 artifact 累计字节上限 |
 | `RAG_ARTIFACT_MAX_BYTES` | `67108864` | 单 artifact 上限 |
 | `RAG_RESULT_MAX_ARTIFACTS` | `100` | 每次搜索最多 artifact 数 |
 
 Redis 不可用时，持久读模型会回源状态库；搜索为同步直返，响应不写 Redis，artifact 以 MySQL `artifact_snapshots` 为事实来源并按 ID 独立读取，**清空 Redis 不影响搜索结果或已签发 artifact**。`RAG_RESULT_TTL_SECONDS` 到期后 MySQL artifact 被有界清理，再读取返回 410。
+
+**文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，`RAG_DOCUMENT_LOCK_MODE=redis` 时文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。默认 `mysql` 模式行为不变（`document_leases` 行 + 心跳续写 `expires_at`）；`redis` 模式只把长租约搬到 Redis，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询，展示读取可回源 MySQL。切换与回退见[部署指南](DEPLOYMENT.md) §13。
 
 ### Kafka 与队列
 
@@ -902,6 +910,8 @@ curl.exe "http://127.0.0.1:8011/v1/admin/upload-leases" -H "X-RAG-Namespace: def
 
 后两者属于只读展示模型，除租户认证外也要求本机管理边界。
 
+`GET /v1/admin/upload-leases` 的字段不变（`resource`/`holder_id`/`operation_id`/`expires_at`/`expired`）：`holder_id` 仍是 owner token 的短哈希，接口与日志都不返回原始 token；`redis` 模式下 `expires_at`/`expired` 按文档锁后端的实时 TTL 计算（长任务不再被误判过期、崩溃持有者会被判过期），Redis 不可用时回退 MySQL 登记值。响应仍带 `display_only: true`，不能用于授权或决定写入。
+
 ### 工具与提示词管理（本机管理）
 
 ```powershell
@@ -1100,6 +1110,7 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 - `scripts/build-go.ps1` 本机构建 + 冒烟：`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200。POSIX 的 `scripts/build-go.sh`/`make check` 未在当前 Windows 验证环境执行。
 - 四个 worker 二进制与切换/迁移 CLI 的 `--help`、缺少 Kafka、错误 backend、非法 `--kind` 的退出码行为。
 - Go 端 REST/MCP/检索/文档/资产投影/`document.md` 预览/上传事务的单元与集成测试（真实 MySQL + fake Qdrant/model）。
+- 文档长租约后端（`RAG_DOCUMENT_LOCK_MODE=redis`）：`internal/state` 覆盖冲突矩阵、迟到登记、接管围栏、Redis 丢失/不可用/释放失败与租约展示；`internal/runtime`、`internal/documentworker` 回归；`internal/redisstate` 用两个独立客户端对真实 Redis 验证 Lua、续租与 TTL。
 - Console 角色/知识库归属/邀请共享的**全栈 HTTP E2E**（真实登录会话与 CSRF、真实 access 服务、真实 MySQL）：`internal/e2e/permissions_http_test.go` 覆盖角色变更、归属可见性、邀请创建→收件箱→预览→接受、只读/读写闸门、模板建库、撤销授权。异步上传发布后读模型刷新的回归也由 `internal/e2e` 覆盖。
 
 **未验证**（不要据此宣称生产就绪）：
@@ -1107,6 +1118,7 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 - Docker 镜像构建、Compose `app` profile、systemd 单元未实际执行（本环境无 Docker/systemd）。
 - **历史实机验证（已下线链路）**：2026-11-09 在 Kafka 3.9.0 + Debezium Server 3.7.1 + MySQL 8.0 + Redis + Qdrant 上验证过当时的“事务 outbox + 单 Debezium 连接器”投递、Go worker 异步链路、显式 DLQ topic 与排队 MCP 搜索；该链路已于 2026-11-13 改造下线。仍未验证 SASL/TLS 外部 Kafka、MySQL 多实例锁与 systemd 部署。
 - **2026-11-13/15 CDC 与 Kafka Connect 改造未实机验证**：两个 Debezium MySQL 连接器运行在分布式 Connect 集群、Kafka 内部 topic 保存位点、固定名称幂等注册、worker failover、FAILED task 自动重启、缓存消费者 revision 收敛、存量切换与回滚演练均未在真实 Docker/Kafka Connect/Kafka/Redis 上执行；本工作树只做了文档一致性、前端类型自检与 Go 目标构建/单测，边界见 [VALIDATION.md](../VALIDATION.md)。操作步骤见 [Kafka Connect 操作手册](../deploy/kafka-connect/README.md) §6 与 [CDC 迁移契约 §11](cdc-migration.md#11-验收矩阵)。
+- 文档锁的 Redis Cluster/Sentinel 拓扑与 `-race` 压测未执行；切换/回退演练需按 [部署指南](DEPLOYMENT.md) §13 在预发环境完成。
 - PDF 默认引擎（vision）依赖的 pdf-parser 微服务：Python 侧测试覆盖 `GET /healthz`、`POST /v1/parse` 的 zip/manifest 与错误码，视觉客户端用 fake/mock transport 覆盖（不访问网络）；真实视觉端点推理、镜像构建未在本环境实机验证，正式上线前需在预发环境用真实 PDF 与真实视觉端点验证。Go 内置纯文本引擎（`RAG_PDF_ENGINE=go`）与 DOCX 解析有单元测试；.doc 转换依赖外部 LibreOffice，未与真实 LibreOffice 联调。远端视觉模型端点只做了配置/协议单测与 httptest 集成测试，未与真实端点做实机联调。
 - Console 有前端单元与契约测试（`frontend/src/*.test.ts`，Vitest：角色/权限文案、邀请过期计算、api 客户端的路径/CSRF/错误契约、路由与邀请 token 解析）与构建检查；但**没有浏览器级 E2E**，页面交互/样式仍由人工核对。
 - Tokenizer 是确定性近似，不保证与 Python/BGE-M3 的 token 计数一致（句子/段落/结构边界一致）。
@@ -1169,6 +1181,7 @@ PDF 默认由独立的 `pdf-parser` 微服务解析（本地 PyMuPDF 读取/渲�
 - **解析器**：PDF 默认走独立 `pdf-parser` 微服务（本地只做 PDF 读取/渲染/裁图，版面/OCR/表格/公式 LaTeX/图片描述统一由知识库配置的远端视觉模型完成；需要该服务与可用视觉端点，服务或模型不可用时 vision 上传会失败，`docling` 是 `vision` 的兼容别名）。`RAG_PDF_ENGINE=go` 时使用 Go 内置纯文本引擎（文字型 PDF；扫描件、PDF 表格/公式/图片资产不支持，需要时请先 OCR 或用其他工具预处理）。DOCX 解析在 Go 进程内完成；Word 无图注图片需要视觉模型端点才会生成描述，未配置时保留占位描述、上传不失败；.doc 转换仍需要外部 LibreOffice。
 - **异步投递**：Kafka 通知由运行在分布式 Kafka Connect 上的两个 Debezium 连接器从 MySQL 表级采集后写入 Kafka（`praxis-document-cdc` 只采集 `document_jobs` 的 INSERT 与 `schedule_version` 变化；`praxis-cache-cdc` 采集 8 张业务表全部 c/u/d）；必须配置 Kafka + Kafka Connect + 两个连接器并运行 `rag-document-worker`/`rag-cache-worker`，否则文档任务保持 `queued`、缓存刷新不生效。worker 故障由 Connect peer 接管并从 Kafka 保存位点恢复；FAILED task 由 `rag-service` supervisor 自动重启。
 - **同步搜索**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，无任务 ID/轮询/结果快照；总预算 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120 秒）。`search_tasks`/`search_result_snapshots` 为历史表、保留数据但不再读写，搜索 topic/消费组/DLQ 与 `rag-search-worker` 已下线；迁移与回滚见 [部署指南](DEPLOYMENT.md) §12。
+- **文档锁**：默认 `mysql`（MySQL `document_leases` 行），可整体切到 `redis`；两种模式不能混跑，同一部署内所有参与文档写入/恢复/清理的进程必须同值。切换/回退必须先停写并排空在途操作，见 [部署指南](DEPLOYMENT.md) §13。
 - **上传受理**：REST/Console 统一使用 `POST /v1/document-batches` 异步受理，通过批次或文档任务状态接口观察进度。`rag-service` 只受理，文档解析只由消费 Kafka 通知的 `rag-document-worker` 完成；未部署时任务保持 `queued`。MCP `update_document`/`delete_document` 仍同步执行，通过同名检查和发布事务内的 `ValidatePublication` 与在途文档任务互斥。
 - **权限与共享**：账号分为管理员 / VIP / 普通用户；知识库默认归创建者私有，共享靠邀请链接完成（权限：可读/可修改；范围：单文件/多文件/全库），只有 VIP 与管理员可发起邀请。邀请消息目前是站内通知（控制台铃铛），不发送邮件/IM；链接只展示一次，库内只存摘要。文件级写授权只能替换已授权的同名文档，不能上传新文件；历史无创建者的知识库仅管理员可用/可授权；受限账号在同步检索中按文档 scope 过滤，不再被拒绝。详见 [权限管理](PERMISSIONS.md)。
 - **管理边界**：`/v1/admin/*` 仅本机直连或管理员会话；**例外**是 `/v1/admin/api-keys` 的五条管理路由——任意登录角色的会话都可管理自己的 API Key（管理员管理全部，非管理员只能绑定本人拥有的知识库）。API Key 按创建账号归属隔离，历史无主密钥仅管理员/本机管理可见；管理凭证（Service Token / API Key）在请求时仍不做知识库归属校验，API Key 的 namespace 白名单仍然生效。详见 [权限管理](PERMISSIONS.md) §9。

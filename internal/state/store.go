@@ -91,6 +91,12 @@ type Stores struct {
 	DocumentJobs    *DocumentJobs
 	DocumentBatches *DocumentBatches
 
+	// DocumentLocks is the cross-instance lease backend (Redis in production)
+	// attached by the process entry point. Nil keeps the legacy MySQL lease mode;
+	// a redis-mode configuration without a backend fails writes instead of
+	// silently falling back.
+	DocumentLocks DocumentLocker
+
 	// FeishuConnections stores each Console account's Feishu OAuth grant;
 	// FeishuOAuthStates stores short-lived callback state digests.
 	FeishuConnections *FeishuConnectionRepository
@@ -252,6 +258,20 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 // StateStores.describe.
 func (s *Stores) Describe() map[string]any { return Describe(s.Settings) }
 
+// AttachDocumentLocker enables the cross-instance document lease backend on this
+// store and its upload journal. Every process that writes, recovers or cleans
+// document state must call it with the same configuration.
+func (s *Stores) AttachDocumentLocker(locker DocumentLocker) error {
+	if locker == nil {
+		return newValueError("document locker is required")
+	}
+	s.DocumentLocks = locker
+	if s.Uploads != nil {
+		return s.Uploads.SetDocumentLocker(locker)
+	}
+	return nil
+}
+
 // Ping runs the lightweight connectivity check used by StateStores.ping.
 func (s *Stores) Ping(ctx context.Context) error {
 	var one int
@@ -270,6 +290,11 @@ func (s *Stores) Close() error {
 		}
 		if s.Uploads != nil {
 			s.Uploads.Close()
+		}
+		if s.DocumentLocks != nil {
+			if err := s.DocumentLocks.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 		if err := s.DB.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -423,6 +448,9 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 		return err
 	}
 	if err := s.migrateCacheRevisionWatermark(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateDocumentLeaseFencing(ctx); err != nil {
 		return err
 	}
 	if err := s.migrateVisionModelConfig(ctx); err != nil {
@@ -733,6 +761,16 @@ func (s *Stores) migrateAddColumns(ctx context.Context, additions map[string][]c
 func (s *Stores) migrateScheduleVersions(ctx context.Context) error {
 	return s.migrateAddColumns(ctx, map[string][]columnAddition{
 		"document_jobs": {{name: "schedule_version", definition: "BIGINT NOT NULL DEFAULT 1"}},
+	})
+}
+
+// migrateDocumentLeaseFencing adds the durable fencing generation to
+// document_leases. Existing rows start at zero; the generation only ever
+// increases, so a registration that was paused across a takeover is rejected
+// even after the row was released and re-taken.
+func (s *Stores) migrateDocumentLeaseFencing(ctx context.Context) error {
+	return s.migrateAddColumns(ctx, map[string][]columnAddition{
+		"document_leases": {{name: "fencing_epoch", definition: "BIGINT NOT NULL DEFAULT 0"}},
 	})
 }
 

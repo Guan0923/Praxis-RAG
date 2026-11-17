@@ -2086,3 +2086,65 @@ search/import 路由）、Console「从飞书导入」弹窗与 OAuth 回跳提�
   `RAG_FEISHU_REDIRECT_URI` 完全一致的部署核对。
 - 真实 docx 正文的排版损失（只导入纯文本，不含图片/表格结构）与 10 MiB 正文上限的实际体验。
 - 多副本 `rag-service` 共享同一账号时的 refresh token 竞争：当前锁为进程内，部署需粘滞或单副本；未做多实例压测。
+
+## 文档分布式锁：Redis 长租约 + MySQL fencing（2026-11-17）
+
+工作树 `dsh-66abacb8-5df1`（Windows 11，Go 1.27.3，本地 MySQL 3307 / Redis 6379）。
+
+**改动范围**：新增 `internal/state/document_lock.go`（开关/配置/错误/Locker 契约）、
+`internal/state/upload_locks.go`（Redis 模式获取、代次登记、接管、续租）、
+`internal/redisstate/locks.go`（单 namespace 单 Hash + Lua 原子多资源脚本）；
+`internal/state/uploads.go` 把 `Begin`/`AcquireLock`/`ClaimRecovery`/`WithLock`/
+`owned`/`releaseLeases`/`RenewLock`/`ReleaseLock` 拆成 mysql/redis 两条路径；
+`document_leases` 追加 `fencing_epoch`（启动时幂等 `ALTER TABLE`）；`read_views` 的
+`leases` 展示改用锁后端实时 TTL；`purge` 在 redis 模式先取独占租约并在事务内 fencing；
+`run_step` 新增可取消 context（续租失败即取消在途解析/嵌入/Qdrant 调用）；
+`rag-service`/`rag-document-worker`/`rag-mcp-ingest` 接线同一套配置。
+
+**本仓库已执行**
+
+```powershell
+$env:RAG_TEST_MYSQL_URL = 'mysql+pymysql://rag:praxis-dev-pw@127.0.0.1:3307/praxis_unit_test?charset=utf8mb4'
+$env:RAG_TEST_REDIS_URL = 'redis://127.0.0.1:6379/15'
+
+go vet ./...                                                            # exit 0
+go test ./internal/state/ ./internal/runtime/ ./internal/documentworker/ ./internal/redisstate/ ./internal/config/ `
+        ./internal/cacheconsumer/ ./internal/httpapi/ ./internal/cdcacceptance/ ./internal/e2e/ `
+        -count=1 -p 1 -timeout 25m                                      # 9 包全 ok
+                                                                        # state 29.1s / runtime 28.5s / documentworker 3.0s / redisstate 0.6s /
+                                                                        # config 0.4s / cacheconsumer 0.4s / httpapi 1.9s / cdcacceptance 1.4s / e2e 2.8s
+go test ./internal/redisstate/ -run 'TestDocumentLock' -count=2 -p 1 -timeout 10m  # ok（子代理执行）
+```
+
+新增的定向用例（`internal/state/upload_redis_test.go`，MySQL 真实库 + 受控内存锁后端，
+不靠 sleep 构造时序）：
+
+- `TestDocumentLockRedisConflictMatrix`：同一文档、同名上传、KB 独占双向互斥与冲突响应；
+  不同文档并行；多资源获取失败不残留部分锁。
+- `TestDocumentLockRedisPausedRegistrationRejected`：A 取锁后停在 MySQL 登记前，租约消失，
+  B 登记并保持运行，A 恢复后迟到登记被拒（未产生第二个未完成操作，A 重新走了获取流程）。
+- `TestDocumentLockRedisStaleEpochRegistration`：代次 CAS 直接拒绝过期登记。
+- `TestDocumentLockRedisTakeoverFencesOldWorker`：A 失去租约、B 接管后，A 的续租/释放/
+  `AssertOwner`/`RunStep`/`Commit`/`Rollback` 全部失败，且不会执行清理回调；B 只补偿自己的版本。
+- `TestDocumentLockRedisLostLeaseStopsNextStep`：Redis 重启丢锁后步骤在边界停止并落 FAILED，
+  恢复程序可接管至终态。
+- `TestDocumentLockRedisHeartbeatCancelsInFlightWork`：续租失败取消在途 action context。
+- `TestDocumentLockRedisUnavailableIsRetryable`：Redis 不可用返回可重试错误，不落库、不回退。
+- `TestDocumentLockRedisReleaseFailureAfterCommit`：提交后释放失败不重复发布；幂等重放仍可用。
+- `TestDocumentLockRedisLeaseDisplayUsesLiveTTL`：管理端租约展示按实时 TTL 判定存活/过期，
+  `holder_id` 为短哈希且不暴露 owner token。
+
+`internal/redisstate/document_lock_state_test.go` 用两个独立 `redisstate.DocumentLock`（各自独立 go-redis 客户端）驱动**真实 MySQL + 真实 Redis** 的两个 `UploadJournal`，覆盖同一文档/同名冲突、不同文档并行、namespace 独占双向互斥与释放后再独占。`internal/redisstate/locks_test.go` 用**两个独立 go-redis 客户端**对真实 Redis 验证：
+原子多资源获取与冲突不残留、namespace 独占双向冲突、异主续租/释放无效、TTL 过期后
+续租返回 `LeaseLost`、`OwnerDigest` 投影、释放幂等；每组测试先 `FLUSHDB`（仅 /15 测试库）。
+
+**未实机验证**
+
+- Redis Cluster / Sentinel / `rediss://` TLS / 认证失败：单 key + hash tag 设计上同 slot，
+  但只在 standalone 7.4 上实测。
+- `-race` 与多进程高并发抢占压测；正确性依赖 Redis 单线程执行 Lua 与 MySQL 行锁。
+- Compose `app` profile 与多主机部署下的切换演练（`docs/DEPLOYMENT.md` §13 给了步骤）。
+- 旧版 `rag-service-migrate` 遗留导入是离线操作，不走 journal 锁；不是本次覆盖范围。
+
+
+
