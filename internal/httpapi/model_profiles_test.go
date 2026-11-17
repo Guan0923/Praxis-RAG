@@ -42,39 +42,55 @@ type fakeModelProfileRuntime struct {
 	modelsID      string
 	modelsPayload []string
 	modelsErr     error
+
+	// viewerUserID / viewerIsAdmin record the identity each handler derived from
+	// the session, so the isolation wiring is asserted without a real database.
+	viewerUserID  string
+	viewerIsAdmin bool
 }
 
-func (f *fakeModelProfileRuntime) ListModelProfiles(context.Context) ([]map[string]any, error) {
+func (f *fakeModelProfileRuntime) recordViewer(viewerUserID string, isAdmin bool) {
+	f.viewerUserID, f.viewerIsAdmin = viewerUserID, isAdmin
+}
+
+func (f *fakeModelProfileRuntime) ListModelProfiles(_ context.Context, viewerUserID string, isAdmin bool) ([]map[string]any, error) {
+	f.recordViewer(viewerUserID, isAdmin)
 	return f.listPayload, f.listErr
 }
 
-func (f *fakeModelProfileRuntime) ModelProfile(_ context.Context, id string) (map[string]any, error) {
+func (f *fakeModelProfileRuntime) ModelProfile(_ context.Context, viewerUserID string, isAdmin bool, id string) (map[string]any, error) {
+	f.recordViewer(viewerUserID, isAdmin)
 	f.getID = id
 	return f.getPayload, f.getErr
 }
 
-func (f *fakeModelProfileRuntime) CreateModelProfile(_ context.Context, input ModelProfileInput) (map[string]any, error) {
+func (f *fakeModelProfileRuntime) CreateModelProfile(_ context.Context, viewerUserID string, isAdmin bool, input ModelProfileInput) (map[string]any, error) {
+	f.recordViewer(viewerUserID, isAdmin)
 	f.createInput = input
 	return f.createPayload, f.createErr
 }
 
-func (f *fakeModelProfileRuntime) UpdateModelProfile(_ context.Context, id string, input ModelProfileInput) (map[string]any, error) {
+func (f *fakeModelProfileRuntime) UpdateModelProfile(_ context.Context, viewerUserID string, isAdmin bool, id string, input ModelProfileInput) (map[string]any, error) {
+	f.recordViewer(viewerUserID, isAdmin)
 	f.updateID = id
 	f.updateInput = input
 	return f.updatePayload, f.updateErr
 }
 
-func (f *fakeModelProfileRuntime) DeleteModelProfile(_ context.Context, id string) (bool, error) {
+func (f *fakeModelProfileRuntime) DeleteModelProfile(_ context.Context, viewerUserID string, isAdmin bool, id string) (bool, error) {
+	f.recordViewer(viewerUserID, isAdmin)
 	f.deleteID = id
 	return f.deletePayload, f.deleteErr
 }
 
-func (f *fakeModelProfileRuntime) ModelProfileKey(_ context.Context, id string) (string, error) {
+func (f *fakeModelProfileRuntime) ModelProfileKey(_ context.Context, viewerUserID string, isAdmin bool, id string) (string, error) {
+	f.recordViewer(viewerUserID, isAdmin)
 	f.keyID = id
 	return f.keyPayload, f.keyErr
 }
 
-func (f *fakeModelProfileRuntime) ModelProfileModels(_ context.Context, id string) ([]string, error) {
+func (f *fakeModelProfileRuntime) ModelProfileModels(_ context.Context, viewerUserID string, isAdmin bool, id string) ([]string, error) {
+	f.recordViewer(viewerUserID, isAdmin)
 	f.modelsID = id
 	return f.modelsPayload, f.modelsErr
 }
@@ -213,7 +229,6 @@ func TestModelProfileAdminCreate(t *testing.T) {
 	if input := runtime.createInput; input.HasAPIKey || input.APIKey != "" {
 		t.Fatalf("create without key input = %+v", input)
 	}
-
 
 	// JEV (TypeSafe System One) configurations are saved like VLM profiles: the
 	// endpoint and model id are entered by hand, and the kind is not selectable

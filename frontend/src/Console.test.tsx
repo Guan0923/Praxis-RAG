@@ -22,8 +22,9 @@ const user = { id: "u-1", username: "alice", role: "admin", enabled: true };
 
 // mockApi serves the small set of endpoints the console shell needs; unknown
 // paths get a 404 so unexpected page mounts show up as failed requests.
-function mockApi(namespaces: string[], options: { authEnabled?: boolean; owned?: string[] } = {}) {
+function mockApi(namespaces: string[], options: { authEnabled?: boolean; owned?: string[]; user?: typeof user } = {}) {
   const authEnabled = options.authEnabled ?? true;
+  const account = options.user ?? user;
   fetchMock.mockImplementation(async (path: string) => {
     if (path === "/v1/auth/status") {
       return jsonResponse({
@@ -32,7 +33,7 @@ function mockApi(namespaces: string[], options: { authEnabled?: boolean; owned?:
         authenticated: authEnabled,
       });
     }
-    if (path === "/v1/auth/me" && authEnabled) return jsonResponse({ user, csrf_token: "csrf" });
+    if (path === "/v1/auth/me" && authEnabled) return jsonResponse({ user: account, csrf_token: "csrf" });
     if (path === "/v1/invitations") return jsonResponse({ invitations: [] });
     if (path === "/v1/namespaces") {
       return jsonResponse({
@@ -383,6 +384,19 @@ describe("Console workspace selection", () => {
     await waitFor(() => expect(window.location.hash).toBe("#/workspaces/create"));
     // Creating the first knowledge base needs no workspace-scoped requests.
     expect(namespaceDependentRequests().length).toBe(before);
+  });
+
+  it("shows the model configuration page to a non-admin account", async () => {
+    // 模型配置按账号隔离：普通账号也能打开自己的配置页，不再是管理员专属入口。
+    mockApi(["kb-b"], { user: { ...user, role: "user" } });
+    window.history.replaceState(null, "", "#/model-profiles");
+    renderConsole();
+
+    await screen.findByRole("button", { name: "账号菜单" });
+    // 侧边栏入口对所有登录角色可见。
+    expect(screen.getByRole("button", { name: "模型配置" })).toBeTruthy();
+    // 直接打开该路由时，非管理员也渲染自己的模型配置页（数据请求失败不影响页面标题）。
+    expect(await screen.findByRole("heading", { name: "模型配置" })).toBeTruthy();
   });
 
   it("drops the previous account's document detail route when another account signs in", async () => {

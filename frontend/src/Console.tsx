@@ -733,8 +733,8 @@ export function Console({
           {view === "membership" && sessionMode && authUser && (
             <MembershipPage role={authUser.role} onPlanName={setPlanName} />
           )}
-          {view === "model-profiles" && (!sessionMode || authUser?.role === "admin") && (
-            <ModelProfilesPage disabled={uploading} />
+          {view === "model-profiles" && (!sessionMode || authUser) && (
+            <ModelProfilesPage disabled={uploading} role={authUser?.role} />
           )}
           {view === "knowledge-bases" && (!sessionMode || authUser?.role === "admin") && (
             <KnowledgeBasesPage disabled={uploading}
@@ -785,7 +785,7 @@ export function Console({
               <h1>创建知识库</h1>
             </div>
             <CreateKnowledgeBase active={view === "create"} disabled={uploading}
-              connection={connection} role={authUser?.role}
+              connection={connection}
               onOpenModelProfiles={() => navigate({ namespace, page: "model-profiles" })}
               onCreated={(next) => {
                 // Select the freshly created namespace and refresh the list so

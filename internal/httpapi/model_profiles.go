@@ -21,15 +21,19 @@ type ModelProfileInput struct {
 	HasAPIKey bool
 }
 
-// ModelProfileRuntime is the saved-model-configuration administration surface.
+// ModelProfileRuntime is the saved-model-configuration surface. Profiles are
+// per-account: every authenticated caller manages its own list, and an
+// administrator additionally gets a read-only view of every account's list.
+// The viewer identity is therefore part of every call
+// (viewerUserID, isAdmin).
 type ModelProfileRuntime interface {
-	ListModelProfiles(ctx context.Context) ([]map[string]any, error)
-	ModelProfile(ctx context.Context, id string) (map[string]any, error)
-	CreateModelProfile(ctx context.Context, input ModelProfileInput) (map[string]any, error)
-	UpdateModelProfile(ctx context.Context, id string, input ModelProfileInput) (map[string]any, error)
-	DeleteModelProfile(ctx context.Context, id string) (bool, error)
-	ModelProfileKey(ctx context.Context, id string) (string, error)
-	ModelProfileModels(ctx context.Context, id string) ([]string, error)
+	ListModelProfiles(ctx context.Context, viewerUserID string, isAdmin bool) ([]map[string]any, error)
+	ModelProfile(ctx context.Context, viewerUserID string, isAdmin bool, id string) (map[string]any, error)
+	CreateModelProfile(ctx context.Context, viewerUserID string, isAdmin bool, input ModelProfileInput) (map[string]any, error)
+	UpdateModelProfile(ctx context.Context, viewerUserID string, isAdmin bool, id string, input ModelProfileInput) (map[string]any, error)
+	DeleteModelProfile(ctx context.Context, viewerUserID string, isAdmin bool, id string) (bool, error)
+	ModelProfileKey(ctx context.Context, viewerUserID string, isAdmin bool, id string) (string, error)
+	ModelProfileModels(ctx context.Context, viewerUserID string, isAdmin bool, id string) ([]string, error)
 }
 
 // WithModelProfileRuntime wires the 模型配置 (saved model configuration) admin
@@ -66,6 +70,17 @@ type modelProfileModelsBody struct {
 }
 
 func (s *Server) registerModelProfileRoutes() {
+	// Session-scoped routes: every signed-in account manages its own profiles.
+	// The /v1/admin/* paths stay as the administrator's entry point; they resolve
+	// to the same owner-scoped handlers, with the administrator additionally
+	// seeing every account's list.
+	s.router.add("GET", "/v1/model-profiles", authSession, s.handleListModelProfiles)
+	s.router.add("POST", "/v1/model-profiles", authSession, s.handleCreateModelProfile)
+	s.router.add("GET", "/v1/model-profiles/{profile_id}", authSession, s.handleModelProfileDetails)
+	s.router.add("PATCH", "/v1/model-profiles/{profile_id}", authSession, s.handleUpdateModelProfile)
+	s.router.add("DELETE", "/v1/model-profiles/{profile_id}", authSession, s.handleDeleteModelProfile)
+	s.router.add("GET", "/v1/model-profiles/{profile_id}/key", authSession, s.handleModelProfileKey)
+	s.router.add("POST", "/v1/model-profiles/{profile_id}/models", authSession, s.handleModelProfileModels)
 	s.router.add("GET", "/v1/admin/model-profiles", authAdmin, s.handleListModelProfiles)
 	s.router.add("POST", "/v1/admin/model-profiles", authAdmin, s.handleCreateModelProfile)
 	s.router.add("GET", "/v1/admin/model-profiles/{profile_id}", authAdmin, s.handleModelProfileDetails)
@@ -73,6 +88,18 @@ func (s *Server) registerModelProfileRoutes() {
 	s.router.add("DELETE", "/v1/admin/model-profiles/{profile_id}", authAdmin, s.handleDeleteModelProfile)
 	s.router.add("GET", "/v1/admin/model-profiles/{profile_id}/key", authAdmin, s.handleModelProfileKey)
 	s.router.add("POST", "/v1/admin/model-profiles/{profile_id}/models", authAdmin, s.handleModelProfileModels)
+}
+
+// modelProfileViewer resolves the calling account for a profile operation. The
+// session layer guarantees a user for authSession/authAdmin routes; a nil
+// session (loopback break-glass on the admin paths) is treated as the
+// administrator so the existing local-console workflow keeps working.
+func (s *Server) modelProfileViewer(r *http.Request) (string, bool) {
+	session, ok := sessionUserFromContext(r.Context())
+	if !ok || session == nil {
+		return "", true
+	}
+	return session.User.ID, session.User.IsAdmin()
 }
 
 func (s *Server) requireModelProfiles(w http.ResponseWriter) bool {
@@ -87,7 +114,8 @@ func (s *Server) handleListModelProfiles(w http.ResponseWriter, r *http.Request)
 	if !s.requireModelProfiles(w) {
 		return
 	}
-	items, err := s.modelProfiles.ListModelProfiles(r.Context())
+	viewerUserID, isAdmin := s.modelProfileViewer(r)
+	items, err := s.modelProfiles.ListModelProfiles(r.Context(), viewerUserID, isAdmin)
 	if err != nil {
 		writeModelProfileError(w, err)
 		return
@@ -112,7 +140,8 @@ func (s *Server) handleCreateModelProfile(w http.ResponseWriter, r *http.Request
 		writeValidation(w, http.StatusUnprocessableEntity, details)
 		return
 	}
-	payload, err := s.modelProfiles.CreateModelProfile(r.Context(), ModelProfileInput{
+	viewerUserID, isAdmin := s.modelProfileViewer(r)
+	payload, err := s.modelProfiles.CreateModelProfile(r.Context(), viewerUserID, isAdmin, ModelProfileInput{
 		Kind:      body.Kind,
 		Name:      *body.Name,
 		BaseURL:   stringOrEmpty(body.BaseURL),
@@ -132,7 +161,8 @@ func (s *Server) handleModelProfileDetails(w http.ResponseWriter, r *http.Reques
 	if !s.requireModelProfiles(w) {
 		return
 	}
-	payload, err := s.modelProfiles.ModelProfile(r.Context(), pathParam(r, "profile_id"))
+	viewerUserID, isAdmin := s.modelProfileViewer(r)
+	payload, err := s.modelProfiles.ModelProfile(r.Context(), viewerUserID, isAdmin, pathParam(r, "profile_id"))
 	if err != nil {
 		writeModelProfileError(w, err)
 		return
@@ -168,7 +198,8 @@ func (s *Server) handleUpdateModelProfile(w http.ResponseWriter, r *http.Request
 		writeValidation(w, http.StatusUnprocessableEntity, details)
 		return
 	}
-	payload, err := s.modelProfiles.UpdateModelProfile(r.Context(), pathParam(r, "profile_id"), ModelProfileInput{
+	viewerUserID, isAdmin := s.modelProfileViewer(r)
+	payload, err := s.modelProfiles.UpdateModelProfile(r.Context(), viewerUserID, isAdmin, pathParam(r, "profile_id"), ModelProfileInput{
 		Name:      stringOrEmpty(body.Name),
 		BaseURL:   stringOrEmpty(body.BaseURL),
 		Model:     stringOrEmpty(body.Model),
@@ -187,7 +218,8 @@ func (s *Server) handleDeleteModelProfile(w http.ResponseWriter, r *http.Request
 	if !s.requireModelProfiles(w) {
 		return
 	}
-	deleted, err := s.modelProfiles.DeleteModelProfile(r.Context(), pathParam(r, "profile_id"))
+	viewerUserID, isAdmin := s.modelProfileViewer(r)
+	deleted, err := s.modelProfiles.DeleteModelProfile(r.Context(), viewerUserID, isAdmin, pathParam(r, "profile_id"))
 	if err != nil {
 		writeModelProfileError(w, err)
 		return
@@ -203,7 +235,8 @@ func (s *Server) handleModelProfileKey(w http.ResponseWriter, r *http.Request) {
 	if !s.requireModelProfiles(w) {
 		return
 	}
-	key, err := s.modelProfiles.ModelProfileKey(r.Context(), pathParam(r, "profile_id"))
+	viewerUserID, isAdmin := s.modelProfileViewer(r)
+	key, err := s.modelProfiles.ModelProfileKey(r.Context(), viewerUserID, isAdmin, pathParam(r, "profile_id"))
 	if err != nil {
 		writeModelProfileError(w, err)
 		return
@@ -222,7 +255,8 @@ func (s *Server) handleModelProfileModels(w http.ResponseWriter, r *http.Request
 		writeValidation(w, http.StatusUnprocessableEntity, details)
 		return
 	}
-	models, err := s.modelProfiles.ModelProfileModels(r.Context(), pathParam(r, "profile_id"))
+	viewerUserID, isAdmin := s.modelProfileViewer(r)
+	models, err := s.modelProfiles.ModelProfileModels(r.Context(), viewerUserID, isAdmin, pathParam(r, "profile_id"))
 	if err != nil {
 		writeModelProfileError(w, err)
 		return

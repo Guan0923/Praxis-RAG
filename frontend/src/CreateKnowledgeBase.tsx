@@ -3,7 +3,6 @@ import { Alert, App, Button, Descriptions, Form, Input, InputNumber, Select, Swi
 import { PlusOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
 import {
   api,
-  apiResponse,
   errorText,
   fetchModelProfiles,
   knowledgeBaseModelKinds,
@@ -14,7 +13,6 @@ import {
   type KnowledgeBase,
   type KnowledgeBaseModelKind,
   type ModelProfile,
-  type Role,
   type Strategy,
 } from "./api";
 import { namespacePattern } from "./navigation";
@@ -29,7 +27,6 @@ type Values = Chunking & {
   vlm_profile?: string;
   embedding_billing_source?: "platform" | "customer";
 };
-type TenantValues = Chunking & { namespace: string };
 type Defaults = { default: string; strategies: Strategy[] };
 // 创建草稿只保存 Namespace、切分参数、所选模型配置和开关，绝不保存 API Key。
 type Draft = {
@@ -89,162 +86,34 @@ const draftKey = "rag.knowledge-base-draft";
 // 草稿版本：2 起记录「默认全部开启」时代的显式开关状态。
 const draftVersion = 2;
 
-export function CreateKnowledgeBase({ active, disabled, onCreated, connection, role, onOpenModelProfiles }: {
+// CreateKnowledgeBase 保持表单在首次访问后挂载，切换页面不会丢失已填内容。
+// 所有登录角色使用同一套交互：从自己的「模型配置」中选择 Embedding / Reranker /
+// VLM，再提交这些配置对应的 provider 字段（模型配置按账号严格隔离）。
+export function CreateKnowledgeBase({ active, disabled, onCreated, connection, onOpenModelProfiles }: {
   active: boolean; disabled: boolean; onCreated: (namespace: string) => void;
-  connection: Connection; role?: Role; onOpenModelProfiles?: () => void;
+  connection: Connection; onOpenModelProfiles?: () => void;
 }) {
-  // Keep the form mounted after the first visit so switching pages does not
-  // discard what was typed.
   const [mounted, setMounted] = useState(active);
   useEffect(() => {
     if (active) setMounted(true);
   }, [active]);
   if (!mounted) return null;
-  // Admins pick saved model profiles; VIPs and ordinary users only choose the
-  // namespace and chunking because the server clones the model configuration
-  // from the administrator's default knowledge-base template.
-  const simple = role === "vip" || role === "user";
   return <div hidden={!active}>
-    {simple
-      ? <TenantKnowledgeBaseForm disabled={disabled} onCreated={onCreated} connection={connection} />
-      : <KnowledgeBaseForm disabled={disabled} active={active} onOpenModelProfiles={onOpenModelProfiles}
-          onSaved={(item) => onCreated(item.namespace)} />}
-  </div>;
-}
-
-function TenantKnowledgeBaseForm({ disabled, onCreated, connection }: {
-  disabled: boolean; onCreated: (namespace: string) => void; connection: Connection;
-}) {
-  const { message } = App.useApp();
-  const [form] = Form.useForm<TenantValues>();
-  const [catalog, setCatalog] = useState<Defaults>();
-  const [error, setError] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const lifetime = useRef(new AbortController());
-  const strategy = Form.useWatch("strategy", form);
-  const unit = catalog?.strategies.find((item) => item.id === strategy)?.unit === "characters" ? "字符" : "token";
-  const locked = disabled || saving;
-
-  async function loadCatalog() {
-    setLoading(true);
-    setError("");
-    try {
-      const data = await api<Defaults>("/v1/chunking/strategies", connection, { signal: lifetime.current.signal });
-      if (lifetime.current.signal.aborted) return;
-      setCatalog(data);
-      if (!form.getFieldValue("strategy")) {
-        const selected = data.strategies.find((item) => item.id === data.default) || data.strategies[0];
-        form.setFieldsValue({ strategy: selected?.id, chunk_size: selected?.chunk_size, chunk_overlap: selected?.chunk_overlap });
-      }
-    } catch (reason) {
-      if (!lifetime.current.signal.aborted) setError(errorText(reason));
-    } finally {
-      if (!lifetime.current.signal.aborted) setLoading(false);
-    }
-  }
-  useEffect(() => {
-    void loadCatalog();
-    return () => lifetime.current.abort();
-  }, []);
-
-  async function save(values: TenantValues) {
-    if (saving) return;
-    setSaving(true);
-    setError("");
-    try {
-      const response = await apiResponse("/v1/knowledge-bases", connection, {
-        method: "POST",
-        body: JSON.stringify({
-          namespace: values.namespace.trim(),
-          strategy: values.strategy,
-          chunk_size: values.chunk_size,
-          chunk_overlap: values.chunk_overlap,
-        }),
-      });
-      // The endpoint normally returns the created knowledge base; tolerate an
-      // empty 201 body as well.
-      let created: Partial<KnowledgeBase> = {};
-      try {
-        created = await response.json() as Partial<KnowledgeBase>;
-      } catch {
-        created = {};
-      }
-      if (lifetime.current.signal.aborted) return;
-      const namespace = created.namespace || values.namespace.trim();
-      void message.success("知识库已创建");
-      form.resetFields();
-      onCreated(namespace);
-      void loadCatalog();
-    } catch (reason) {
-      if (!lifetime.current.signal.aborted) setError(errorText(reason));
-    } finally {
-      if (!lifetime.current.signal.aborted) setSaving(false);
-    }
-  }
-
-  return <div className="knowledge-base-form knowledge-base-form-wide">
-    {error && <Alert type="error" showIcon className="page-alert" title="知识库创建失败" description={error}
-      action={!catalog ? <Button icon={<ReloadOutlined />} aria-label="重新读取切分配置" loading={loading} onClick={() => void loadCatalog()} /> : undefined} />}
-    <Form<TenantValues>
-      form={form}
-      layout="vertical"
-      disabled={locked}
-      scrollToFirstError
-      onFinish={(values) => void save(values)}
-      initialValues={{ namespace: "", strategy: undefined, chunk_size: undefined, chunk_overlap: undefined }}
-    >
-      <div className="knowledge-form-columns">
-        <Form.Item name="namespace" label="知识库标识（Namespace）" rules={[
-          { required: true, whitespace: true, message: "请输入知识库标识" },
-          { pattern: namespacePattern, message: "使用字母、数字、点、下划线或横线，首位为字母或数字" },
-        ]}>
-          <Input maxLength={64} autoComplete="off" />
-        </Form.Item>
-        <Form.Item name="strategy" label="切分方式" rules={[{ required: true, message: "请选择切分方式" }]}>
-          <Select
-            disabled={locked || !catalog}
-            virtual={false}
-            options={catalog?.strategies.map((item) => ({ value: item.id, label: item.label }))}
-            onChange={(id) => {
-              const selected = catalog?.strategies.find((item) => item.id === id);
-              form.setFieldsValue({ chunk_size: selected?.chunk_size, chunk_overlap: selected?.chunk_overlap });
-            }}
-          />
-        </Form.Item>
-        <Form.Item name="chunk_size" label={"块长度（" + unit + "）"} rules={[
-          { required: true, type: "integer", min: strategy === "character" ? 100 : 1, max: 100000 },
-        ]}>
-          <InputNumber disabled={locked || !catalog} min={strategy === "character" ? 100 : 1} max={100000} />
-        </Form.Item>
-        <Form.Item name="chunk_overlap" label={"重叠长度（" + unit + "）"} dependencies={["chunk_size"]} rules={[
-          { required: true, type: "integer", min: 0 },
-          ({ getFieldValue }) => ({
-            validator: (_, value) => value < getFieldValue("chunk_size")
-              ? Promise.resolve()
-              : Promise.reject(new Error("重叠长度必须小于块长度")),
-          }),
-        ]}>
-          <InputNumber disabled={locked || !catalog} min={0} />
-        </Form.Item>
-      </div>
-      <div className="toolbar">
-        <Button htmlType="submit" type="primary" loading={saving} disabled={disabled || !catalog}
-          icon={<PlusOutlined />}>
-          创建知识库
-        </Button>
-      </div>
-    </Form>
+    <KnowledgeBaseForm disabled={disabled} active={active} connection={connection}
+      onOpenModelProfiles={onOpenModelProfiles}
+      onSaved={(item) => onCreated(item.namespace)} />
   </div>;
 }
 
 type ResolvedProvider = { provider: ProviderValues; model: string };
 
-export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, active, onOpenModelProfiles }: {
+export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, active, connection, onOpenModelProfiles }: {
   initial?: KnowledgeBase; disabled: boolean; onSaved: (item: KnowledgeBase) => void;
   onBusyChange?: (busy: boolean) => void;
   // active 为 false 时页面被隐藏；重新激活时刷新模型列表，避免使用过期选项。
   active?: boolean;
+  // connection 提供创建页需要的 Namespace 头：切分策略目录是租户级接口。
+  connection?: Connection;
   onOpenModelProfiles?: () => void;
 }) {
   const { message, modal } = App.useApp();
@@ -267,7 +136,15 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
   const embeddingSelection = Form.useWatch("embedding_profile", form);
   const locked = disabled || saving;
   const unit = defaults?.strategies.find((item) => item.id === strategy)?.unit === "characters" ? "字符" : "token";
-  const embeddingProfile = profiles.find((profile) => profile.id === embeddingSelection);
+  // 模型配置按账号严格隔离：管理员的总览视图会带别人的行，但创建/编辑知识库只能
+  // 使用自己的配置——别人的 Key 不可读，服务端也不会接受。
+  const ownProfiles = profiles.filter((profile) => profile.mine);
+  const embeddingProfiles = ownProfiles.filter((profile) => profile.kind === "embedding");
+  // 创建知识库必须提交自己的 Embedding 连接：账号还没有 Embedding 配置时服务端
+  // 只会返回 409，这里提前禁用提交并引导到「模型配置」页。
+  const createBlocked = !initial && !profilesLoading
+    && (Boolean(profilesError) || embeddingProfiles.length === 0);
+  const embeddingProfile = ownProfiles.find((profile) => profile.id === embeddingSelection);
   const reembedRequired = profileNeedsReembed(initial, embeddingProfile);
 
   function currentUrl(kind: Kind) {
@@ -287,13 +164,19 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
   // matchedProfile 找出与知识库当前连接（服务地址 + 模型）完全一致的配置。
   function matchedProfile(kind: Kind) {
     if (!initial) return undefined;
-    return matchingProfile(profiles, kind, currentUrl(kind), currentModel(kind));
+    return matchingProfile(ownProfiles, kind, currentUrl(kind), currentModel(kind));
   }
 
   async function loadDefaults() {
     setError("");
     try {
-      const data = await api<Defaults>("/v1/admin/knowledge-bases/defaults", undefined, { signal: lifetime.current.signal });
+      // 编辑沿用管理员默认值接口；创建走会话级切分策略目录（普通账号没有
+      // /v1/admin 权限），两者返回同一份切分方式与默认参数。
+      const data = await api<Defaults>(
+        initial ? "/v1/admin/knowledge-bases/defaults" : "/v1/chunking/strategies",
+        initial ? undefined : connection,
+        { signal: lifetime.current.signal },
+      );
       if (lifetime.current.signal.aborted) return;
       setDefaults(data);
       if (!initial && !form.getFieldValue("strategy")) {
@@ -372,7 +255,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         if (match) form.setFieldValue(field, match.id);
         return;
       }
-      if (value && !profiles.some((profile) => profile.id === value))
+      if (value && !ownProfiles.some((profile) => profile.id === value))
         form.setFieldValue(field, undefined);
     });
   }, [profiles, profilesLoaded]);
@@ -410,7 +293,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
       if (!initial) throw new Error(`请选择 ${title} 模型`);
       return { provider: { base_url: currentUrl(kind) }, model: currentModel(kind) };
     }
-    const profile = profiles.find((item) => item.id === profileId);
+    const profile = ownProfiles.find((item) => item.id === profileId);
     if (!profile) throw new Error("所选模型配置已不存在，请刷新页面后重新选择");
     const base_url = cleanUrl(profile.base_url);
     // 没有保存 Key 的配置不提交 apikey：服务端在服务地址不变时保留知识库已有的
@@ -444,8 +327,10 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         embedding_billing_source: values.embedding_billing_source
           ?? initial?.embedding_billing_source ?? "platform",
       };
+      // 创建走会话级自建接口：任何角色都可以提交自己模型配置对应的 provider
+      // 字段（每个账号用自己的配置建库）；编辑仍沿用管理员的知识库配置接口。
       const result = await api<KnowledgeBase>(
-        "/v1/admin/knowledge-bases" + (initial ? "/" + initial.namespace : ""),
+        initial ? "/v1/admin/knowledge-bases/" + initial.namespace : "/v1/knowledge-bases",
         undefined,
         {
           method: initial ? "PATCH" : "POST",
@@ -497,7 +382,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
     const enabled = kind === "embedding"
       || (kind === "reranker" ? rerankerEnabled : vlmEnabled);
     const field = profileField[kind];
-    const kindProfiles = profiles.filter((profile) => profile.kind === kind);
+    const kindProfiles = ownProfiles.filter((profile) => profile.kind === kind);
     const options = kindProfiles.map((profile) => ({
       value: profile.id,
       label: <div className="model-profile-option">
@@ -527,7 +412,9 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         <Alert className="page-alert" type="warning" showIcon title={`暂无 ${title} 模型`}
           description={initial
             ? `当前知识库使用的 ${title} 连接不在模型列表中，保存时沿用当前配置；可在「模型配置」页面添加后再切换。`
-            : `创建知识库时只能选择已保存的 ${title} 模型，请先在「模型配置」页面添加。`}
+            : kind === "embedding"
+              ? "创建知识库必须选择自己的 Embedding 模型。请先在「模型配置」页添加并选择 Embedding 模型后重试。"
+              : `创建知识库时只能选择自己已保存的 ${title} 模型，请先在「模型配置」页面添加。`}
           action={!initial && onOpenModelProfiles
             ? <Button type="link" size="small" onClick={onOpenModelProfiles}>前往模型配置</Button>
             : undefined} />}
@@ -604,10 +491,13 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         </div>
       </section>
       <div className="toolbar">
-        <Button htmlType="submit" type="primary" loading={saving} disabled={disabled || !defaults}
+        <Button htmlType="submit" type="primary" loading={saving} disabled={disabled || !defaults || createBlocked}
           icon={!initial ? <PlusOutlined /> : reembedRequired ? <ReloadOutlined /> : <SaveOutlined />}>
           {!initial ? "创建知识库" : reembedRequired ? "重新向量化并保存" : "保存配置"}
         </Button>
+        {!initial && createBlocked && !profilesError && (
+          <span className="secondary">请先在「模型配置」页添加 Embedding 模型，再创建知识库。</span>
+        )}
         {initial && !reembedRequired && <Tooltip title="重新向量化并保存"><Button aria-label="重新向量化并保存"
           icon={<ReloadOutlined />} disabled={locked} onClick={() => void form.validateFields().then((values) => submit(values, true)).catch(() => {})} /></Tooltip>}
       </div>

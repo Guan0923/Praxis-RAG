@@ -24,9 +24,9 @@ export type ConsoleRoute = {
 };
 
 // adminOnlyPages require an administrator once Console login is enabled. The
-// API Key page is not listed: every account manages only its own keys there.
+// API Key and model-configuration pages are not listed: every account manages
+// only its own keys and its own saved model connections there.
 export const adminOnlyPages = new Set<ConsolePage>([
-  "model-profiles",
   "knowledge-bases",
   "users",
   "system-settings",

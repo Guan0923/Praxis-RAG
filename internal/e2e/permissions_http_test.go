@@ -370,9 +370,13 @@ func TestPermissionsInvitationFlowEndToEnd(t *testing.T) {
 		t.Fatalf("grant list = %v", payload)
 	}
 
-	// 3. VIP self-creation clones the default template and records ownership.
+	// 3. VIP self-creation selects its own embedding connection and records
+	// ownership (model configurations are per-account, so there is no
+	// administrator-template fallback for a normal account).
 	recorder, _ = vip.json(http.MethodPost, "/v1/knowledge-bases", "", map[string]any{
 		"namespace": "vip-kb", "strategy": "character", "chunk_size": 120, "chunk_overlap": 20,
+		"embedding":       map[string]any{"base_url": h.ModelURL},
+		"embedding_model": "embed-a",
 	})
 	requireStatus(t, recorder, http.StatusCreated, "vip self-creates knowledge base")
 	convergeAllViews(t, h)

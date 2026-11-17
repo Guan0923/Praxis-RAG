@@ -147,7 +147,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | `#/workspaces/search` | 检索调试 | 所有登录账号 | BM25/Embedding/Hybrid 检索、Cross-Encoder 重排开关、候选/Top-K 调整、三模式对比、耗时与证据状态、命中详情（分数、来源、页码/章节、图片、脚注） |
 | `#/workspaces/documents` | 知识文档 | 所有登录账号 | 文档列表（大小/块数/切分配置）、上传（批次受理：工具栏「保存中/已完成 x/y」徽标 + 逐文件独立进度条气泡，SSE 实时字节进度与每文件保存结果，可失败重试；面板在保存结果处结束、不展示解析阶段；刷新后恢复未完成批次）、「从飞书导入」（连接本人飞书账号 → 浏览文件夹/搜索 → 最多勾选 10 篇 → 目标知识库与可见范围提示 → 逐篇「已受理/已跳过/失败」+ 索引进度）、删除；只读授权时隐藏写操作 |
 | `#/workspaces/documents/{name}` | 文档详情 | 所有登录账号 | 正文预览、PDF 预览（pdfjs）、图片/表格资产查看 |
-| `#/workspaces/create` | 创建知识库 | 所有登录账号 | 管理员：namespace + 切分参数 + 从「模型配置」选择 Embedding/Reranker/VLM；VIP/普通用户：简化表单（从默认模板克隆模型配置） |
+| `#/workspaces/create` | 创建知识库 | 所有登录账号 | namespace + 切分参数 + 从**本人**「模型配置」选择 Embedding/Reranker/VLM；管理员未提交连接时可回退默认模板，普通账号必须选择本人模型 |
 | `#/knowledge-bases` | 知识库 | 管理员 | 知识库列表、编辑抽屉（模型/切分/重新向量化确认） |
 | `#/model-profiles` | 模型配置 | 管理员 | Embedding/Reranker/VLM/JEV 分页签，新增/编辑/删除、模型探测、Key 只写不读 |
 | `#/api-keys` | API Key | 所有登录账号 | 自己的密钥 CRUD/启停、一次性明文、复制 MCP 配置 |

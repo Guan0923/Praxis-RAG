@@ -18,6 +18,7 @@ import {
   updateModelProfile,
   type ModelKind,
   type ModelProfile,
+  type Role,
 } from "./api";
 
 type ProfileValues = {
@@ -42,14 +43,18 @@ const jevModelSuggestions = [
 const jevModelHint =
   "JEV 是 TypeSafe System One 决策模型，没有 /models 接口，可直接输入模型名且仅保存配置供后续使用";
 
-// ModelProfilesPage 维护可复用的 Embedding / Reranker / VLM / JEV 连接：
-// 创建和修改知识库时只能从知识库模型类型中选择，页面本身不保存任何明文 Key。
+// ModelProfilesPage 维护当前账号自己的 Embedding / Reranker / VLM / JEV 连接：
+// 每个账号只能编辑、删除和读取自己的 Key；管理员额外看到所有人的配置，但别人的
+// 行是只读的（服务端也会以 404 拒绝编辑、删除和读 Key）。创建和修改知识库时只能
+// 从自己的知识库模型类型中选择，页面本身不保存任何明文 Key。
 // VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 版面/OCR/表格/公式/图片描述都由它完成。
 // JEV（TypeSafe System One 决策模型）仅保存 Console 配置供后续使用，不会出现在
 // 知识库表单中，也没有 OpenAI /models 模型列表接口。
-export function ModelProfilesPage({ disabled, onChanged }: {
+export function ModelProfilesPage({ disabled, onChanged, role }: {
   disabled: boolean;
   onChanged?: () => void;
+  // role 为空表示历史本地模式（没有登录账号），此时沿用管理员视图。
+  role?: Role;
 }) {
   const { message } = App.useApp();
   const [profiles, setProfiles] = useState<ModelProfile[]>([]);
@@ -76,6 +81,8 @@ export function ModelProfilesPage({ disabled, onChanged }: {
   const modelsRequest = useRef<AbortController | null>(null);
   const keyRequest = useRef<AbortController | null>(null);
   const savingRef = useRef(false);
+  // 管理员会拿到所有人的配置（mine=false 的行只读）；普通账号只会拿到自己的。
+  const adminView = role === undefined || role === "admin";
 
   const load = useCallback(async () => {
     listRequest.current?.abort();
@@ -216,6 +223,13 @@ export function ModelProfilesPage({ disabled, onChanged }: {
         !values.apikey?.trim() &&
         baseUrl === cleanUrl(editing.base_url),
       );
+      // 探测未保存的连接只有管理员能走 /v1/admin/knowledge-bases/models/{kind}；
+      // 普通账号保存后可以用自己的 /v1/model-profiles/{id}/models，因此这里直接
+      // 给出提示而不是发一次注定 403 的请求。
+      if (!reuseSaved && !adminView) {
+        setModelHint("保存配置后可从该地址获取模型列表，也可直接输入模型名称");
+        return;
+      }
       const rows = reuseSaved
         ? await fetchModelProfileModels(editing!.id, controller.signal)
         : await api<{ models: string[] }>(
@@ -280,6 +294,18 @@ export function ModelProfilesPage({ disabled, onChanged }: {
       width: 160,
       render: (name: string) => <span className="break-text">{name}</span>,
     },
+    // 管理员拿到所有人的配置，用「所有者」列区分归属；普通账号只有自己的行，
+    // 不需要这一列。
+    ...(adminView
+      ? [{
+          title: "所有者",
+          dataIndex: "owner_username",
+          width: 140,
+          render: (username: string, profile: ModelProfile) => profile.mine
+            ? <Tag color="blue">自己</Tag>
+            : <span className="break-text">{username || profile.owner_user_id || "—"}</span>,
+        }]
+      : []),
     {
       title: "模型",
       dataIndex: "model",
@@ -315,15 +341,18 @@ export function ModelProfilesPage({ disabled, onChanged }: {
     {
       title: "操作",
       width: 80,
-      render: (_: unknown, profile: ModelProfile) => (
-        <div className="toolbar">
-          <Tooltip title="编辑模型配置">
+      render: (_: unknown, profile: ModelProfile) => {
+        // 别人的配置只读：管理员能看，但不能编辑、删除或读取 Key（服务端同样
+        // 以 404 拒绝），因此这里直接禁用入口而不是让请求失败。
+        const readonly = !profile.mine;
+        return <div className="toolbar">
+          <Tooltip title={readonly ? "只能编辑自己的模型配置" : "编辑模型配置"}>
             <Button
               type="text"
               size="small"
               aria-label={"编辑 " + profile.name}
               icon={<EditOutlined />}
-              disabled={disabled || saving || deletingId === profile.id}
+              disabled={disabled || saving || readonly || deletingId === profile.id}
               onClick={() => openEdit(profile)}
             />
           </Tooltip>
@@ -333,10 +362,10 @@ export function ModelProfilesPage({ disabled, onChanged }: {
             okText="删除"
             cancelText="取消"
             okButtonProps={{ danger: true }}
-            disabled={disabled || saving || deletingId === profile.id}
+            disabled={disabled || saving || readonly || deletingId === profile.id}
             onConfirm={() => void remove(profile)}
           >
-            <Tooltip title="删除模型配置">
+            <Tooltip title={readonly ? "只能删除自己的模型配置" : "删除模型配置"}>
               <Button
                 type="text"
                 size="small"
@@ -344,12 +373,12 @@ export function ModelProfilesPage({ disabled, onChanged }: {
                 aria-label={"删除 " + profile.name}
                 icon={<DeleteOutlined />}
                 loading={deletingId === profile.id}
-                disabled={disabled || saving}
+                disabled={disabled || saving || readonly}
               />
             </Tooltip>
           </Popconfirm>
-        </div>
-      ),
+        </div>;
+      },
     },
   ];
 
@@ -390,6 +419,15 @@ export function ModelProfilesPage({ disabled, onChanged }: {
         action={<Button icon={<ReloadOutlined />} aria-label="重新读取模型配置" loading={loading} onClick={() => void load()} />}
       />
     )}
+    {adminView && profiles.some((profile) => !profile.mine) && (
+      <Alert
+        className="page-alert"
+        type="info"
+        showIcon
+        title="管理员只读视图"
+        description="你正在查看所有账号的模型配置；只能编辑、删除和读取自己的配置，别人的配置只读。"
+      />
+    )}
     <Tabs
       activeKey={kind}
       onChange={(key) => setKind(key as ModelKind)}
@@ -403,7 +441,7 @@ export function ModelProfilesPage({ disabled, onChanged }: {
       dataSource={visible}
       loading={loading}
       size="small"
-      scroll={{ x: 780 }}
+      scroll={{ x: 920 }}
       locale={{ emptyText }}
       pagination={{ pageSize: 10, hideOnSinglePage: true, size: "small" }}
       columns={columns}

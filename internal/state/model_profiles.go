@@ -10,12 +10,19 @@ import (
 // VLM or JEV). Only the protected form of the API key is stored; decrypting it
 // stays in the kbconfig layer like knowledge-base provider credentials.
 type ModelProfile struct {
-	ID           string
-	Kind         string
-	Name         string
-	BaseURL      string
-	Model        string
-	ProtectedKey string
+	ID      string
+	Kind    string
+	Name    string
+	BaseURL string
+	Model   string
+	// OwnerUserID is the Console account that owns this profile. Every account
+	// manages its own list; an empty value marks a legacy row that predates
+	// ownership (the startup migration assigns those to the first administrator).
+	OwnerUserID string
+	// OwnerUsername is the read-only label joined from users for the
+	// administrator's view. It is empty when the owner no longer exists.
+	OwnerUsername string
+	ProtectedKey  string
 	// VectorSize is the probed dense dimension, recorded for embedding profiles
 	// only and NULL for the other kinds.
 	VectorSize *int
@@ -30,13 +37,20 @@ func newModelProfileRepository(db *sql.DB) *ModelProfileRepository {
 	return &ModelProfileRepository{db: db}
 }
 
-// modelProfileColumns is the shared SELECT list.
-const modelProfileColumns = "id, kind, name, base_url, model, protected_key, vector_size, created_at, updated_at"
+// modelProfileInsertColumns is the writable column list (owner_username is a
+// join-only label, never stored).
+const modelProfileInsertColumns = "id, kind, name, base_url, model, owner_user_id, protected_key, vector_size, created_at, updated_at"
 
-// List returns every profile ordered by kind then display name.
+// modelProfileSelect reads one row plus the read-only owner label. The LEFT JOIN
+// keeps a profile whose owner account was deleted visible to administrators.
+const modelProfileSelect = "SELECT p.id, p.kind, p.name, p.base_url, p.model, p.owner_user_id, " +
+	"COALESCE(u.username, ''), p.protected_key, p.vector_size, p.created_at, p.updated_at " +
+	"FROM model_profiles p LEFT JOIN users u ON u.id = p.owner_user_id"
+
+// List returns every profile ordered by kind then display name. It feeds the
+// administrator's read-only view; per-account lists use ListByOwner.
 func (r *ModelProfileRepository) List(ctx context.Context) ([]ModelProfile, error) {
-	rows, err := r.db.QueryContext(ctx,
-		"SELECT "+modelProfileColumns+" FROM model_profiles ORDER BY kind, name")
+	rows, err := r.db.QueryContext(ctx, modelProfileSelect+" ORDER BY p.kind, p.name")
 	if err != nil {
 		return nil, newStateError("模型配置读取失败")
 	}
@@ -44,10 +58,36 @@ func (r *ModelProfileRepository) List(ctx context.Context) ([]ModelProfile, erro
 	return scanModelProfiles(rows)
 }
 
-// ListByKind returns the profiles of one kind ordered by display name.
+// ListByOwner returns one account's profiles ordered by kind then display name.
+func (r *ModelProfileRepository) ListByOwner(ctx context.Context, ownerUserID string) ([]ModelProfile, error) {
+	rows, err := r.db.QueryContext(ctx,
+		modelProfileSelect+" WHERE p.owner_user_id = ? ORDER BY p.kind, p.name",
+		ownerUserID)
+	if err != nil {
+		return nil, newStateError("模型配置读取失败")
+	}
+	defer func() { _ = rows.Close() }()
+	return scanModelProfiles(rows)
+}
+
+// ListByOwnerAndKind returns one account's profiles of one kind.
+func (r *ModelProfileRepository) ListByOwnerAndKind(ctx context.Context, ownerUserID, kind string) ([]ModelProfile, error) {
+	rows, err := r.db.QueryContext(ctx,
+		modelProfileSelect+" WHERE p.owner_user_id = ? AND p.kind = ? ORDER BY p.name",
+		ownerUserID, kind)
+	if err != nil {
+		return nil, newStateError("模型配置读取失败")
+	}
+	defer func() { _ = rows.Close() }()
+	return scanModelProfiles(rows)
+}
+
+// ListByKind returns the profiles of one kind for every account. It keeps the
+// administrative view complete and is never used to resolve a knowledge base's
+// provider.
 func (r *ModelProfileRepository) ListByKind(ctx context.Context, kind string) ([]ModelProfile, error) {
 	rows, err := r.db.QueryContext(ctx,
-		"SELECT "+modelProfileColumns+" FROM model_profiles WHERE kind = ? ORDER BY name", kind)
+		modelProfileSelect+" WHERE p.kind = ? ORDER BY p.name", kind)
 	if err != nil {
 		return nil, newStateError("模型配置读取失败")
 	}
@@ -57,8 +97,7 @@ func (r *ModelProfileRepository) ListByKind(ctx context.Context, kind string) ([
 
 // Get returns one profile, or nil when it does not exist.
 func (r *ModelProfileRepository) Get(ctx context.Context, id string) (*ModelProfile, error) {
-	profile, err := scanModelProfile(r.db.QueryRowContext(ctx,
-		"SELECT "+modelProfileColumns+" FROM model_profiles WHERE id = ?", id))
+	profile, err := scanModelProfile(r.db.QueryRowContext(ctx, modelProfileSelect+" WHERE p.id = ?", id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -69,7 +108,8 @@ func (r *ModelProfileRepository) Get(ctx context.Context, id string) (*ModelProf
 }
 
 // Create inserts one profile, generating the id and timestamps when they are
-// empty. A duplicate (kind, name) pair is reported as StateConflict.
+// empty. A duplicate (owner, kind, name) triple is reported as StateConflict, so
+// two accounts can keep a profile with the same display name.
 func (r *ModelProfileRepository) Create(ctx context.Context, profile ModelProfile) (ModelProfile, error) {
 	if profile.ID == "" {
 		generated, err := randomHex(16)
@@ -86,10 +126,10 @@ func (r *ModelProfileRepository) Create(ctx context.Context, profile ModelProfil
 		profile.UpdatedAt = timestamp
 	}
 	if _, err := r.db.ExecContext(ctx,
-		"INSERT INTO model_profiles ("+modelProfileColumns+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"INSERT INTO model_profiles ("+modelProfileInsertColumns+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		profile.ID, profile.Kind, profile.Name, profile.BaseURL, profile.Model,
-		nullString(profile.ProtectedKey), nullInteger(profile.VectorSize),
-		profile.CreatedAt, profile.UpdatedAt); err != nil {
+		nullString(profile.OwnerUserID), nullString(profile.ProtectedKey),
+		nullInteger(profile.VectorSize), profile.CreatedAt, profile.UpdatedAt); err != nil {
 		if isUniqueViolation(err) {
 			return ModelProfile{}, newStateConflict("模型配置已存在")
 		}
@@ -98,8 +138,8 @@ func (r *ModelProfileRepository) Create(ctx context.Context, profile ModelProfil
 	return profile, nil
 }
 
-// Update rewrites one profile by id. The kind is immutable and always kept from
-// the stored row; a missing row is reported as LookupError.
+// Update rewrites one profile by id. The kind and the owner are immutable and
+// always kept from the stored row; a missing row is reported as LookupError.
 func (r *ModelProfileRepository) Update(ctx context.Context, profile ModelProfile) (ModelProfile, error) {
 	if profile.UpdatedAt == "" {
 		profile.UpdatedAt = nowISO()
@@ -109,8 +149,8 @@ func (r *ModelProfileRepository) Update(ctx context.Context, profile ModelProfil
 			"vector_size = ?, updated_at = ? WHERE id = ?",
 		profile.Name, profile.BaseURL, profile.Model, nullString(profile.ProtectedKey),
 		nullInteger(profile.VectorSize), profile.UpdatedAt, profile.ID); err != nil {
-		// A duplicate (kind, name) collision is a user-visible conflict, exactly
-		// like Create.
+		// A duplicate (owner, kind, name) collision is a user-visible conflict,
+		// exactly like Create.
 		if isUniqueViolation(err) {
 			return ModelProfile{}, newStateConflict("模型配置已存在")
 		}
@@ -158,12 +198,15 @@ func scanModelProfiles(rows *sql.Rows) ([]ModelProfile, error) {
 // scanModelProfile scans one row, mapping the nullable columns.
 func scanModelProfile(scanner rowScanner) (*ModelProfile, error) {
 	var profile ModelProfile
+	var owner sql.NullString
 	var protected sql.NullString
 	var vectorSize sql.NullInt64
 	if err := scanner.Scan(&profile.ID, &profile.Kind, &profile.Name, &profile.BaseURL,
-		&profile.Model, &protected, &vectorSize, &profile.CreatedAt, &profile.UpdatedAt); err != nil {
+		&profile.Model, &owner, &profile.OwnerUsername, &protected, &vectorSize,
+		&profile.CreatedAt, &profile.UpdatedAt); err != nil {
 		return nil, err
 	}
+	profile.OwnerUserID = owner.String
 	profile.ProtectedKey = protected.String
 	if vectorSize.Valid {
 		value := int(vectorSize.Int64)

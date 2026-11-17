@@ -1027,13 +1027,16 @@ export async function deleteUser(id: string): Promise<void> {
 
 // --- Model profiles (模型配置) ----------------------------------------------
 // A model profile is a reusable Embedding / Reranker / VLM / JEV connection
-// stored by an administrator; knowledge bases reference one profile per
-// knowledge-base-selectable kind instead of carrying their own base URL, key and
-// model id. VLM is the single remote OpenAI-compatible vision model for PDF
-// parsing: it also handles layout, OCR, tables, formulas and picture
-// descriptions in the parsing service. JEV (TypeSafe System One decision model)
-// is a Console-only kind: it is configured for later use, is never offered by
-// the knowledge-base forms, and has no OpenAI /models route.
+// owned by exactly one account (模型配置按账号严格隔离); knowledge bases
+// reference one profile per knowledge-base-selectable kind instead of carrying
+// their own base URL, key and model id. The /v1/model-profiles routes are
+// session-scoped: every signed-in account manages its own list, while an
+// administrator additionally sees every account's rows read-only. VLM is the
+// single remote OpenAI-compatible vision model for PDF parsing: it also handles
+// layout, OCR, tables, formulas and picture descriptions in the parsing
+// service. JEV (TypeSafe System One decision model) is a Console-only kind: it
+// is configured for later use, is never offered by the knowledge-base forms,
+// and has no OpenAI /models route.
 export type KnowledgeBaseModelKind = "embedding" | "reranker" | "vlm";
 export type ModelKind = KnowledgeBaseModelKind | "jev";
 export type ModelProfile = {
@@ -1044,6 +1047,12 @@ export type ModelProfile = {
   model: string;
   api_key_set: boolean;
   vector_size: number | null;
+  // owner_* names the account the profile belongs to, and mine marks the rows
+  // the current account owns: only those may be edited, deleted, revealed or
+  // used when creating a knowledge base.
+  owner_user_id: string;
+  owner_username: string;
+  mine: boolean;
   created_at?: string;
   updated_at?: string;
 };
@@ -1068,14 +1077,22 @@ export const modelKindLabels: Record<ModelKind, string> = {
 };
 
 // normalizeModelProfile keeps a nullable vector_size stable for the table and
-// profile pickers.
+// profile pickers, and tolerates a backend that predates account ownership:
+// missing owner fields read as "owned by the viewer" so a rolling upgrade never
+// empties the knowledge-base selection lists.
 function normalizeModelProfile(profile: ModelProfile): ModelProfile {
-  return { ...profile, vector_size: profile.vector_size ?? null };
+  return {
+    ...profile,
+    vector_size: profile.vector_size ?? null,
+    owner_user_id: profile.owner_user_id ?? "",
+    owner_username: profile.owner_username ?? "",
+    mine: profile.mine !== false,
+  };
 }
 
 export async function fetchModelProfiles(signal?: AbortSignal): Promise<ModelProfile[]> {
   const payload = await api<{ model_profiles: ModelProfile[] }>(
-    "/v1/admin/model-profiles",
+    "/v1/model-profiles",
     undefined,
     { signal, cache: "no-store" },
   );
@@ -1083,7 +1100,7 @@ export async function fetchModelProfiles(signal?: AbortSignal): Promise<ModelPro
 }
 
 export async function createModelProfile(input: ModelProfileInput): Promise<ModelProfile> {
-  const payload = await api<{ profile: ModelProfile }>("/v1/admin/model-profiles", undefined, {
+  const payload = await api<{ profile: ModelProfile }>("/v1/model-profiles", undefined, {
     method: "POST",
     body: JSON.stringify(input),
   });
@@ -1095,7 +1112,7 @@ export async function updateModelProfile(
   update: ModelProfileUpdate,
 ): Promise<ModelProfile> {
   const payload = await api<{ profile: ModelProfile }>(
-    `/v1/admin/model-profiles/${encodeURIComponent(id)}`,
+    `/v1/model-profiles/${encodeURIComponent(id)}`,
     undefined,
     { method: "PATCH", body: JSON.stringify(update) },
   );
@@ -1103,7 +1120,7 @@ export async function updateModelProfile(
 }
 
 export async function deleteModelProfile(id: string): Promise<void> {
-  await apiResponse(`/v1/admin/model-profiles/${encodeURIComponent(id)}`, undefined, {
+  await apiResponse(`/v1/model-profiles/${encodeURIComponent(id)}`, undefined, {
     method: "DELETE",
   });
 }
@@ -1113,7 +1130,7 @@ export async function revealModelProfileKey(
   signal?: AbortSignal,
 ): Promise<string> {
   const payload = await api<{ apikey: string }>(
-    `/v1/admin/model-profiles/${encodeURIComponent(id)}/key`,
+    `/v1/model-profiles/${encodeURIComponent(id)}/key`,
     undefined,
     { signal, cache: "no-store" },
   );
@@ -1125,7 +1142,7 @@ export async function fetchModelProfileModels(
   signal?: AbortSignal,
 ): Promise<string[]> {
   const payload = await api<{ models: string[] }>(
-    `/v1/admin/model-profiles/${encodeURIComponent(id)}/models`,
+    `/v1/model-profiles/${encodeURIComponent(id)}/models`,
     undefined,
     { method: "POST", signal },
   );

@@ -182,14 +182,15 @@ func (s *Server) handleCreateKnowledgeBaseForUser(w http.ResponseWriter, r *http
 		return
 	}
 	input := KnowledgeBaseCreateInput{Namespace: body.Namespace, Chunking: configuration}
-	isAdmin := false
-	if session.User.IsAdmin() {
-		if withProviders, complete := body.withProviderSettings(input); complete {
-			input = withProviders
-			isAdmin = true
-		}
+	// Every role may submit the provider fields it selected from its OWN saved
+	// model configurations. The Console resolves a profile's connection through
+	// /v1/model-profiles/{id}/key, which is owner-only, so an account can never
+	// build a knowledge base on another account's credentials. An administrator
+	// keeps the template fallback when no provider is submitted.
+	if withProviders, complete := body.withProviderSettings(input); complete {
+		input = withProviders
 	}
-	payload, err := s.kbSelfCreate.CreateKnowledgeBaseForUser(r.Context(), session.User.ID, isAdmin, input)
+	payload, err := s.kbSelfCreate.CreateKnowledgeBaseForUser(r.Context(), session.User.ID, session.User.IsAdmin(), input)
 	if err != nil {
 		writeKnowledgeBaseSelfCreateError(w, err)
 		return

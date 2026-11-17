@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { App, ConfigProvider } from "antd";
 import { ModelProfilesPage } from "./ModelProfilesPage";
-import type { ModelProfile } from "./api";
+import type { ModelProfile, Role } from "./api";
 
 // jsonResponse builds the minimal Response surface the client touches.
 function jsonResponse(payload: unknown, status = 200) {
@@ -26,6 +26,9 @@ const embeddingProfile: ModelProfile = {
   model: "bge-m3",
   api_key_set: true,
   vector_size: 1024,
+  owner_user_id: "user-self",
+  owner_username: "alice",
+  mine: true,
   updated_at: "2026-11-09T10:00:00Z",
 };
 
@@ -37,6 +40,9 @@ const rerankerProfile: ModelProfile = {
   model: "bge-reranker",
   api_key_set: false,
   vector_size: null,
+  owner_user_id: "user-self",
+  owner_username: "alice",
+  mine: true,
   updated_at: "2026-11-09T10:00:00Z",
 };
 
@@ -48,16 +54,35 @@ const vlmProfile: ModelProfile = {
   model: "qwen2.5-vl-72b",
   api_key_set: false,
   vector_size: null,
+  owner_user_id: "user-self",
+  owner_username: "alice",
+  mine: true,
   updated_at: "2026-11-09T10:00:00Z",
 };
 
-function renderPage(onChanged = vi.fn()) {
+// otherAccountProfile 模拟管理员在只读总览里看到的、别人拥有的配置。
+const otherAccountProfile: ModelProfile = {
+  id: "mp-bob",
+  kind: "embedding",
+  name: "Bob 的 Embedding",
+  base_url: "https://bob.example.com/v1",
+  model: "bge-large",
+  api_key_set: true,
+  vector_size: 1024,
+  owner_user_id: "user-bob",
+  owner_username: "bob",
+  mine: false,
+  updated_at: "2026-11-09T10:00:00Z",
+};
+
+function renderPage(options: { onChanged?: () => void; role?: Role } = {}) {
+  const onChanged = options.onChanged ?? vi.fn();
   return {
     onChanged,
     ...render(
       <ConfigProvider button={{ autoInsertSpace: false }}>
         <App>
-          <ModelProfilesPage disabled={false} onChanged={onChanged} />
+          <ModelProfilesPage disabled={false} onChanged={onChanged} role={options.role ?? "admin"} />
         </App>
       </ConfigProvider>,
     ),
@@ -111,7 +136,7 @@ describe("ModelProfilesPage", () => {
     expect(screen.queryByRole("tab", { name: /OCR/ })).toBeNull();
     // Only the active kind's rows are rendered.
     expect(screen.queryByText("默认 Reranker")).toBeNull();
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/admin/model-profiles");
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/model-profiles");
   });
 
   it("filters rows by kind and shows a per-kind empty hint", async () => {
@@ -154,7 +179,7 @@ describe("ModelProfilesPage", () => {
 
   it("creates a profile with the default kind and notifies the parent", async () => {
     fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
-      if (path === "/v1/admin/model-profiles" && options.method === "POST")
+      if (path === "/v1/model-profiles" && options.method === "POST")
         return jsonResponse({ profile: { ...embeddingProfile, id: "mp-new", name: "生产 Embedding" } }, 201);
       return jsonResponse({ model_profiles: [embeddingProfile] });
     });
@@ -172,7 +197,7 @@ describe("ModelProfilesPage", () => {
 
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     const post = fetchMock.mock.calls.find(
-      ([path, options]) => path === "/v1/admin/model-profiles" && (options as RequestInit | undefined)?.method === "POST",
+      ([path, options]) => path === "/v1/model-profiles" && (options as RequestInit | undefined)?.method === "POST",
     );
     expect(post).toBeTruthy();
     expect(JSON.parse(String((post![1] as RequestInit).body))).toEqual({
@@ -186,7 +211,7 @@ describe("ModelProfilesPage", () => {
 
   it("creates a configuration-only JEV profile without probing a model list", async () => {
     fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
-      if (path === "/v1/admin/model-profiles" && options.method === "POST")
+      if (path === "/v1/model-profiles" && options.method === "POST")
         return jsonResponse({
           profile: {
             ...embeddingProfile,
@@ -221,7 +246,7 @@ describe("ModelProfilesPage", () => {
 
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     const post = fetchMock.mock.calls.find(
-      ([path, options]) => path === "/v1/admin/model-profiles" && (options as RequestInit | undefined)?.method === "POST",
+      ([path, options]) => path === "/v1/model-profiles" && (options as RequestInit | undefined)?.method === "POST",
     );
     expect(post).toBeTruthy();
     expect(JSON.parse(String((post![1] as RequestInit).body))).toEqual({
@@ -237,7 +262,7 @@ describe("ModelProfilesPage", () => {
 
   it("clears a saved key with an explicit empty apikey on PATCH", async () => {
     fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
-      if (path === "/v1/admin/model-profiles/mp-embed" && options.method === "PATCH")
+      if (path === "/v1/model-profiles/mp-embed" && options.method === "PATCH")
         return jsonResponse({ profile: { ...embeddingProfile, api_key_set: false } });
       return jsonResponse({ model_profiles: [embeddingProfile] });
     });
@@ -255,7 +280,7 @@ describe("ModelProfilesPage", () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     const patch = fetchMock.mock.calls.find(
       ([path, options]) =>
-        path === "/v1/admin/model-profiles/mp-embed" && (options as RequestInit | undefined)?.method === "PATCH",
+        path === "/v1/model-profiles/mp-embed" && (options as RequestInit | undefined)?.method === "PATCH",
     );
     expect(patch).toBeTruthy();
     expect(JSON.parse(String((patch![1] as RequestInit).body))).toEqual({
@@ -268,7 +293,7 @@ describe("ModelProfilesPage", () => {
 
   it("omits apikey on PATCH while the key field is left untouched", async () => {
     fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
-      if (path === "/v1/admin/model-profiles/mp-embed" && options.method === "PATCH")
+      if (path === "/v1/model-profiles/mp-embed" && options.method === "PATCH")
         return jsonResponse({ profile: embeddingProfile });
       return jsonResponse({ model_profiles: [embeddingProfile] });
     });
@@ -282,7 +307,7 @@ describe("ModelProfilesPage", () => {
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     const patch = fetchMock.mock.calls.find(
       ([path, options]) =>
-        path === "/v1/admin/model-profiles/mp-embed" && (options as RequestInit | undefined)?.method === "PATCH",
+        path === "/v1/model-profiles/mp-embed" && (options as RequestInit | undefined)?.method === "PATCH",
     );
     expect(patch).toBeTruthy();
     expect(JSON.parse(String((patch![1] as RequestInit).body))).toEqual({
@@ -311,9 +336,70 @@ describe("ModelProfilesPage", () => {
     expect(screen.queryAllByTitle("OCR")).toHaveLength(0);
   });
 
+  it("marks the owner column and keeps other accounts' rows read-only for an administrator", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({
+      model_profiles: [embeddingProfile, otherAccountProfile],
+    }));
+    renderPage({ role: "admin" });
+
+    expect(await screen.findByText("默认 Embedding")).toBeTruthy();
+    // 管理员视图带「所有者」列：自己的行标记为「自己」，别人的行显示账号名。
+    expect(screen.getByRole("columnheader", { name: "所有者" })).toBeTruthy();
+    expect(screen.getByText("自己")).toBeTruthy();
+    expect(screen.getByText("bob")).toBeTruthy();
+    expect(screen.getByText("管理员只读视图")).toBeTruthy();
+
+    const ownEdit = screen.getByRole("button", { name: "编辑 默认 Embedding" }) as HTMLButtonElement;
+    const otherEdit = screen.getByRole("button", { name: "编辑 Bob 的 Embedding" }) as HTMLButtonElement;
+    const otherDelete = screen.getByRole("button", { name: "删除 Bob 的 Embedding" }) as HTMLButtonElement;
+    expect(ownEdit.disabled).toBe(false);
+    // 别人的配置只读：不能编辑、删除，也不会去读取别人的 Key。
+    expect(otherEdit.disabled).toBe(true);
+    expect(otherDelete.disabled).toBe(true);
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/key"))).toBe(false);
+    // 只读行不提供编辑抽屉入口。
+    fireEvent.click(otherEdit);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("hides the owner column for a normal account", async () => {
+    // 普通账号的列表由服务端限定为自己的配置，页面不需要所有者列。
+    fetchMock.mockResolvedValue(jsonResponse({ model_profiles: [embeddingProfile] }));
+    renderPage({ role: "user" });
+
+    expect(await screen.findByText("默认 Embedding")).toBeTruthy();
+    expect(screen.queryByRole("columnheader", { name: "所有者" })).toBeNull();
+    expect((screen.getByRole("button", { name: "编辑 默认 Embedding" }) as HTMLButtonElement).disabled)
+      .toBe(false);
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/model-profiles");
+  });
+
+  it("does not probe the administrator model-list route for a normal account", async () => {
+    fetchMock.mockImplementation(async (path: string) => {
+      if (path === "/v1/model-profiles") return jsonResponse({ model_profiles: [] });
+      return jsonResponse({});
+    });
+    renderPage({ role: "user" });
+    await screen.findByText(/还没有模型配置/);
+
+    fireEvent.click(screen.getAllByRole("button", { name: /添加模型/ })[0]);
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("服务地址"), {
+      target: { value: "https://api.example.com/v1" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /获取模型列表/ }));
+
+    // 未保存的连接只有管理员能探测；普通账号保存后可用自己的模型列表接口。
+    expect(await within(dialog).findByText("保存配置后可从该地址获取模型列表，也可直接输入模型名称"))
+      .toBeTruthy();
+    expect(fetchMock.mock.calls.some(
+      ([path]) => String(path).startsWith("/v1/admin/knowledge-bases/models/"),
+    )).toBe(false);
+  });
+
   it("creates a VLM profile with a remote vision connection and probes the model list", async () => {
     fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
-      if (path === "/v1/admin/model-profiles" && options.method === "POST")
+      if (path === "/v1/model-profiles" && options.method === "POST")
         return jsonResponse({
           profile: {
             ...embeddingProfile,
@@ -348,7 +434,7 @@ describe("ModelProfilesPage", () => {
       target: { value: "qwen2.5-vl-72b" },
     });
     fireEvent.click(within(dialog).getByRole("button", { name: /获取模型列表/ }));
-    // VLM 是远端 OpenAI 兼容模型：允许按服务地址探测模型列表。
+    // VLM 是远端 OpenAI 兼容模型：管理员允许按服务地址探测模型列表。
     await waitFor(() => expect(fetchMock.mock.calls.some(
       ([path]) => path === "/v1/admin/knowledge-bases/models/vlm",
     )).toBe(true));
@@ -356,7 +442,7 @@ describe("ModelProfilesPage", () => {
 
     await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
     const post = fetchMock.mock.calls.find(
-      ([path, options]) => path === "/v1/admin/model-profiles" && (options as RequestInit | undefined)?.method === "POST",
+      ([path, options]) => path === "/v1/model-profiles" && (options as RequestInit | undefined)?.method === "POST",
     );
     expect(post).toBeTruthy();
     expect(JSON.parse(String((post![1] as RequestInit).body))).toEqual({

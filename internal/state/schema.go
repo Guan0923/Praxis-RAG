@@ -662,6 +662,11 @@ var schemaTables = []*SchemaTable{
 	// selected connection, so editing or deleting a profile never mutates an
 	// existing knowledge base. The API key is protected like every other provider
 	// secret; it is appended last so a migrated database keeps the same shape.
+	//
+	// Profiles are per-account: owner_user_id scopes every row and the unique
+	// key includes it, so two accounts may hold a profile with the same
+	// (kind, name) without colliding. NULL marks a legacy row that predates
+	// ownership; the startup migration assigns those to the first administrator.
 	{
 		Name: "model_profiles",
 		Columns: []SchemaColumn{
@@ -674,9 +679,13 @@ var schemaTables = []*SchemaTable{
 			integer("vector_size").Null(),
 			varchar("created_at", 40),
 			varchar("updated_at", 40),
+			identifier("owner_user_id", 32).Null(),
 		},
-		Uniques: []SchemaUnique{unique("uq_model_profiles_kind_name", "kind", "name")},
-		Indexes: []SchemaIndex{index("ix_model_profiles_kind", "kind")},
+		Uniques: []SchemaUnique{unique("uq_model_profiles_owner_kind_name", "owner_user_id", "kind", "name")},
+		Indexes: []SchemaIndex{
+			index("ix_model_profiles_kind", "kind"),
+			index("ix_model_profiles_owner", "owner_user_id"),
+		},
 	},
 	// document_batches groups one batch upload submitted through
 	// POST /v1/document-batches. It is a Go-only addition appended after the

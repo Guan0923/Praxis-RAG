@@ -465,6 +465,9 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	if err := s.migrateVisionModelConfig(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateModelProfileOwners(ctx); err != nil {
+		return err
+	}
 	// Backfill one free membership row per existing account. The statement is
 	// INSERT IGNORE ... SELECT, so it is additive, idempotent and safe under
 	// concurrent startup: it never rewrites an account that already has a row.
@@ -472,6 +475,93 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 		return err
 	}
 	return s.migrateContentStore(ctx)
+}
+
+// migrateModelProfileOwners turns the shared model-configuration registry into a
+// per-account one:
+//
+//  1. add owner_user_id when the column is missing;
+//  2. assign every legacy row (owner NULL) to the first administrator, so the
+//     profiles that used to be global stay available to exactly one account and
+//     no other account silently inherits administrator credentials;
+//  3. replace the old global unique key (kind, name) with the per-owner one
+//     (owner_user_id, kind, name), otherwise two accounts could not both keep a
+//     profile named "default".
+//
+// Every step is idempotent and tolerates a concurrent startup: a failed ALTER or
+// index swap is only accepted after the resulting object is confirmed present.
+func (s *Stores) migrateModelProfileOwners(ctx context.Context) error {
+	const (
+		table       = "model_profiles"
+		column      = "owner_user_id"
+		legacyIndex = "uq_model_profiles_kind_name"
+		ownerIndex  = "uq_model_profiles_owner_kind_name"
+		ownerKeyIx  = "ix_model_profiles_owner"
+	)
+	exists, err := s.hasTable(ctx, table)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	columns, err := s.tableColumns(ctx, table)
+	if err != nil {
+		return err
+	}
+	if !containsString(columns, column) {
+		statement := "ALTER TABLE " + quoteIdentifier(table) +
+			" ADD COLUMN " + quoteIdentifier(column) + " VARCHAR(32) COLLATE utf8mb4_bin NULL"
+		if _, execErr := s.DB.ExecContext(ctx, statement); execErr != nil {
+			confirmed, confirmErr := s.tableColumns(ctx, table)
+			if confirmErr != nil || !containsString(confirmed, column) {
+				return execErr
+			}
+		}
+	}
+	// Backfill: legacy rows belong to the first administrator. When no
+	// administrator exists yet (a fresh database) there is nothing to own, so the
+	// rows keep NULL and stay administrator-only after the first admin is created
+	// by the Console bootstrap. A missing users table (a partially migrated
+	// database) skips the backfill instead of failing startup.
+	usersPresent, err := s.hasTable(ctx, "users")
+	if err != nil {
+		return err
+	}
+	if usersPresent {
+		if _, err := s.DB.ExecContext(ctx,
+			"UPDATE "+quoteIdentifier(table)+" SET "+quoteIdentifier(column)+
+				" = (SELECT id FROM users WHERE role = 'admin' ORDER BY created_at, id LIMIT 1)"+
+				" WHERE "+quoteIdentifier(column)+" IS NULL"); err != nil {
+			return err
+		}
+	}
+	present, err := s.hasIndex(ctx, table, legacyIndex)
+	if err != nil {
+		return err
+	}
+	if present {
+		if _, err := s.DB.ExecContext(ctx, "ALTER TABLE "+quoteIdentifier(table)+" DROP INDEX "+quoteIdentifier(legacyIndex)); err != nil {
+			if stillPresent, checkErr := s.hasIndex(ctx, table, legacyIndex); checkErr != nil || stillPresent {
+				return err
+			}
+		}
+	}
+	healthy, err := s.hasIndex(ctx, table, ownerIndex)
+	if err != nil {
+		return err
+	}
+	if !healthy {
+		statement := "CREATE UNIQUE INDEX " + quoteIdentifier(ownerIndex) + " ON " + quoteIdentifier(table) +
+			" (" + quoteIdentifier(column) + ", " + quoteIdentifier("kind") + ", " + quoteIdentifier("name") + ")"
+		if _, execErr := s.DB.ExecContext(ctx, statement); execErr != nil && !isAlreadyExists(execErr) {
+			confirmed, confirmErr := s.hasIndex(ctx, table, ownerIndex)
+			if confirmErr != nil || !confirmed {
+				return execErr
+			}
+		}
+	}
+	return s.ensureTableIndex(ctx, table, ownerKeyIx, column)
 }
 
 // migrateContentStore adds the content-addressed reference columns and indexes

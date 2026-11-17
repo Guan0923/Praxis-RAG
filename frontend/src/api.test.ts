@@ -683,6 +683,9 @@ describe("model-profile API contract", () => {
     model: "bge-m3",
     api_key_set: true,
     vector_size: 1024,
+    owner_user_id: "user-self",
+    owner_username: "alice",
+    mine: true,
     created_at: "2026-11-09T10:00:00Z",
     updated_at: "2026-11-09T10:00:00Z",
   };
@@ -706,11 +709,23 @@ describe("model-profile API contract", () => {
     const rows = await fetchModelProfiles();
     expect(rows).toHaveLength(1);
     expect(rows[0].vector_size).toBeNull();
-    expect(requestArgs(0)[0]).toBe("/v1/admin/model-profiles");
+    // 模型配置按账号隔离：列表带回所有者信息与 mine 标记。
+    expect(rows[0].owner_username).toBe("alice");
+    expect(rows[0].mine).toBe(true);
+    expect(requestArgs(0)[0]).toBe("/v1/model-profiles");
     expect(requestArgs(0)[1].cache).toBe("no-store");
 
     fetchMock.mockResolvedValue(jsonResponse({ model_profiles: null }));
     await expect(fetchModelProfiles()).resolves.toEqual([]);
+  });
+
+  it("treats a missing ownership projection as the viewer's own rows", async () => {
+    // 旧后端没有 mine / owner_* 字段：缺省视为自己的配置，避免升级瞬间清空选择列表。
+    fetchMock.mockResolvedValue(jsonResponse({
+      model_profiles: [{ id: "mp-old", kind: "embedding", name: "旧配置", base_url: "https://old.example.com/v1", model: "bge-m3", api_key_set: false, vector_size: null }],
+    }));
+    const rows = await fetchModelProfiles();
+    expect(rows[0]).toMatchObject({ owner_user_id: "", owner_username: "", mine: true });
   });
 
   it("creates a profile with the documented body", async () => {
@@ -725,7 +740,7 @@ describe("model-profile API contract", () => {
     expect(created.id).toBe("mp-1");
     expect(created.vector_size).toBe(1024);
     const [path, options] = requestArgs(0);
-    expect(path).toBe("/v1/admin/model-profiles");
+    expect(path).toBe("/v1/model-profiles");
     expect(options.method).toBe("POST");
     expect(JSON.parse(String(options.body))).toEqual({
       kind: "embedding",
@@ -773,7 +788,7 @@ describe("model-profile API contract", () => {
     expect(updated.name).toBe("生产 Embedding");
     expect(updated.vector_size).toBeNull();
     const [path, options] = requestArgs(0);
-    expect(path).toBe("/v1/admin/model-profiles/mp%2F1");
+    expect(path).toBe("/v1/model-profiles/mp%2F1");
     expect(options.method).toBe("PATCH");
     expect(JSON.parse(String(options.body))).toEqual({
       name: "生产 Embedding",
@@ -785,19 +800,19 @@ describe("model-profile API contract", () => {
     fetchMock.mockResolvedValue(jsonResponse({}, 204));
     await expect(deleteModelProfile("mp-1")).resolves.toBeUndefined();
     const [path, options] = requestArgs(0);
-    expect(path).toBe("/v1/admin/model-profiles/mp-1");
+    expect(path).toBe("/v1/model-profiles/mp-1");
     expect(options.method).toBe("DELETE");
   });
 
   it("reveals a saved key and lists models of a saved profile", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ apikey: "sk-secret" }));
     await expect(revealModelProfileKey("mp-1")).resolves.toBe("sk-secret");
-    expect(requestArgs(0)[0]).toBe("/v1/admin/model-profiles/mp-1/key");
+    expect(requestArgs(0)[0]).toBe("/v1/model-profiles/mp-1/key");
     expect(requestArgs(0)[1].cache).toBe("no-store");
 
     fetchMock.mockResolvedValue(jsonResponse({ models: ["bge-m3", "bge-large"] }));
     await expect(fetchModelProfileModels("mp-1")).resolves.toEqual(["bge-m3", "bge-large"]);
-    expect(requestArgs(1)[0]).toBe("/v1/admin/model-profiles/mp-1/models");
+    expect(requestArgs(1)[0]).toBe("/v1/model-profiles/mp-1/models");
     expect(requestArgs(1)[1].method).toBe("POST");
 
     fetchMock.mockResolvedValue(jsonResponse({ models: null }));
@@ -815,7 +830,7 @@ describe("model-profile API contract", () => {
       apikey: "",
       model: "qwen-vl",
     })).rejects.toThrow(
-      "POST /v1/admin/model-profiles\nHTTP 409：同名模型配置已存在",
+      "POST /v1/model-profiles\nHTTP 409：同名模型配置已存在",
     );
   });
 });

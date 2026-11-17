@@ -35,9 +35,11 @@ func newKBServiceWithConfig(t *testing.T, cfg config.RagConfig) (*Service, *stat
 // self-create contract: the caller's provider fields are ignored, the default
 // template's decrypted connections/models/vector size are cloned, the requested
 // namespace and chunking are kept, and the new row is owned by the creator.
+// TestCreateKnowledgeBaseForUserClonesDefaultTemplate keeps the administrator's
+// template fallback: an administrator who submits no provider selection still
+// gets the shared default template, and the clone replays the template's
+// validated configuration instead of probing the model APIs again.
 func TestCreateKnowledgeBaseForUserClonesDefaultTemplate(t *testing.T) {
-	// An unreachable provider proves the clone replays the template's validated
-	// configuration instead of probing the model APIs again.
 	const templateURL = "http://127.0.0.1:1"
 	service, stores := newKBService(t, templateURL)
 	ctx := context.Background()
@@ -48,18 +50,10 @@ func TestCreateKnowledgeBaseForUserClonesDefaultTemplate(t *testing.T) {
 	}
 
 	input := kbconfig.CreateInput{
-		Namespace:      "mine",
-		Chunking:       chunking.Config{Strategy: "character", ChunkSize: 200, ChunkOverlap: 25},
-		EmbeddingModel: " ignore-me ",
-		EmbeddingValues: map[string]any{
-			"base_url": "http://evil.invalid/v1", "apikey": "evil-key",
-		},
-		RerankerModel:  "ignore-me",
-		RerankerValues: map[string]any{"base_url": "http://evil.invalid/v1", "apikey": "evil-key"},
-		VLMModel:       "ignore-me",
-		VLMValues:      map[string]any{"base_url": "http://evil.invalid/v1", "apikey": "evil-key"},
+		Namespace: "mine",
+		Chunking:  chunking.Config{Strategy: "character", ChunkSize: 200, ChunkOverlap: 25},
 	}
-	created, err := service.CreateKnowledgeBaseForUser(ctx, "user-1", false, input)
+	created, err := service.CreateKnowledgeBaseForUser(ctx, "user-1", true, input)
 	if err != nil {
 		t.Fatalf("CreateKnowledgeBaseForUser() error = %v", err)
 	}
@@ -109,7 +103,33 @@ func TestCreateKnowledgeBaseForUserClonesDefaultTemplate(t *testing.T) {
 	}
 }
 
-// TestCreateKnowledgeBaseForUserMissingTemplate pins the 409 conflict.
+// TestCreateKnowledgeBaseForUserRequiresOwnModelSelection pins the per-account
+// rule: a normal account no longer inherits the administrator template, so an
+// empty selection is a 409 that points at the model-configuration page.
+func TestCreateKnowledgeBaseForUserRequiresOwnModelSelection(t *testing.T) {
+	service, stores := newKBService(t, "http://127.0.0.1:1")
+	ctx := context.Background()
+	if err := stores.KnowledgeBases.Create(ctx,
+		testKnowledgeBaseSettings(t, "default", "http://127.0.0.1:1", "knowledge_template")); err != nil {
+		t.Fatalf("KnowledgeBases.Create(template) error = %v", err)
+	}
+	_, err := service.CreateKnowledgeBaseForUser(ctx, "user-1", false, kbconfig.CreateInput{
+		Namespace: "mine",
+		Chunking:  chunking.Config{Strategy: "character", ChunkSize: 120, ChunkOverlap: 20},
+	})
+	var conflict *apierrors.KnowledgeConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("CreateKnowledgeBaseForUser() error = %v, want KnowledgeConflictError", err)
+	}
+	if conflict.Message != messageModelSelectionRequired {
+		t.Fatalf("message = %q", conflict.Message)
+	}
+	if stored, _ := stores.KnowledgeBases.Get(ctx, "mine"); stored != nil {
+		t.Fatalf("knowledge base was created without a model selection")
+	}
+}
+
+// TestCreateKnowledgeBaseForUserMissingTemplate pins the administrator 409 conflict\n// when no default template row exists.
 func TestCreateKnowledgeBaseForUserMissingTemplate(t *testing.T) {
 	service, stores := newKBService(t, "http://127.0.0.1:1")
 	ctx := context.Background()
@@ -117,7 +137,7 @@ func TestCreateKnowledgeBaseForUserMissingTemplate(t *testing.T) {
 		Namespace: "mine",
 		Chunking:  chunking.Config{Strategy: "character", ChunkSize: 120, ChunkOverlap: 20},
 	}
-	_, err := service.CreateKnowledgeBaseForUser(ctx, "user-1", false, input)
+	_, err := service.CreateKnowledgeBaseForUser(ctx, "user-1", true, input)
 	var conflict *apierrors.KnowledgeConflictError
 	if !errors.As(err, &conflict) {
 		t.Fatalf("CreateKnowledgeBaseForUser() error = %v, want KnowledgeConflictError", err)
@@ -156,7 +176,7 @@ func TestCreateKnowledgeBaseForUserCustomTemplateConfig(t *testing.T) {
 		testKnowledgeBaseSettings(t, "kb-template", "http://127.0.0.1:1", "knowledge_template")); err != nil {
 		t.Fatalf("KnowledgeBases.Create(template) error = %v", err)
 	}
-	created, err := service.CreateKnowledgeBaseForUser(ctx, "user-2", false, kbconfig.CreateInput{
+	created, err := service.CreateKnowledgeBaseForUser(ctx, "user-2", true, kbconfig.CreateInput{
 		Namespace: "custom",
 		Chunking:  chunking.Config{Strategy: "character", ChunkSize: 120, ChunkOverlap: 20},
 	})
