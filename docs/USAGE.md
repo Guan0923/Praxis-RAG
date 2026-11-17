@@ -189,9 +189,15 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `RAG_INVITATION_TTL_HOURS` | `168` | 知识库邀请链接有效期（小时，1..8760） |
-| `RAG_DEFAULT_KB_TEMPLATE` | `default` | VIP/普通用户创建知识库时克隆模型连接（Embedding/Reranker/VLM）与向量维度的模板知识库；模板不存在时自建返回 409 |
+| `RAG_DEFAULT_KB_TEMPLATE` | `default` | 管理员自建知识库未提交模型连接时克隆模板；普通账号必须从本人「模型配置」选择连接 |
 
-角色分管理员（`admin`）、VIP（`vip`）和普通用户（`user`），只有管理员可以改角色。知识库默认归创建者私有，共享通过邀请链接完成：仅 VIP 与管理员可邀请（VIP 只能邀请自己创建的知识库，管理员可邀请任意知识库），权限分「可读 / 可修改」、范围分「单文件 / 多文件 / 全库」；被邀请人登录后接受邀请才生效。完整流程见 [权限管理](PERMISSIONS.md)。
+角色分管理员（`admin`）、VIP（`vip`）和普通用户（`user`），只有管理员可以改角色。知识库默认归创建者私有，共享通过邀请链接完成：管理员、VIP 以及当前 Plus/Pro 会员可邀请（管理员可邀请任意知识库，其余只能邀请自己创建的知识库），权限分「可读 / 可修改」、范围分「单文件 / 多文件 / 全库」；被邀请人登录后接受邀请才生效。会员到期后已有共享保留并可撤销，但停止新发付费邀请。完整流程见 [权限管理](PERMISSIONS.md)。
+
+### 个人会员、额度与支付宝
+
+Console 侧边栏和账号菜单提供「会员与用量」。Free / Plus / Pro 的自有知识库数、每库文件数和平台文档 Embedding 字符额度由服务端套餐目录决定；Plus/Pro 可对自己拥有的知识库发邀请，购买和到期不改 `admin/vip/user` 角色。详细规则、有效期/升级算法和文件/Embedding 计量口径见 [个人会员与额度](PERSONAL_MEMBERSHIP.md)。
+
+支付使用支付宝电脑网站支付。开放购买前至少配置 `RAG_ALIPAY_APP_ID`、`RAG_ALIPAY_PRIVATE_KEY`、`RAG_ALIPAY_PUBLIC_KEY`、`RAG_ALIPAY_SELLER_ID`、公网 HTTPS 的 `RAG_ALIPAY_NOTIFY_URL` 和 `RAG_ALIPAY_RETURN_URL`，并设置 `RAG_MEMBERSHIP_PURCHASE_ENABLED=true`。不配置时会员页仍可查看套餐/用量，但下单按钮显示“暂不可购买”。通知入口为 `POST /v1/payments/alipay/notify`，只需反向代理公开该路径；它依赖 RSA2 验签和商户身份校验，不使用用户 Cookie/CSRF。沙箱联调设置 `RAG_ALIPAY_ENV=sandbox`。
 
 ### 飞书文档导入
 
@@ -901,10 +907,10 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/knowledge-bases/batch-delete `
 curl.exe http://127.0.0.1:8011/v1/namespaces
 curl.exe http://127.0.0.1:8011/v1/knowledge-bases/team-kb/access
 
-# VIP/普通用户自建知识库（模型配置沿用 RAG_DEFAULT_KB_TEMPLATE 模板）
+# VIP/普通用户自建知识库（embedding 连接来自本人「模型配置」）
 curl.exe -X POST http://127.0.0.1:8011/v1/knowledge-bases `
   -H "Content-Type: application/json" `
-  -d '{"namespace":"my-kb","strategy":"character","chunk_size":800,"chunk_overlap":100}'
+  -d '{"namespace":"my-kb","strategy":"character","chunk_size":800,"chunk_overlap":100,"embedding":{"base_url":"http://model.local/v1"},"embedding_model":"embed-a"}'
 
 # 邀请人（管理员或知识库创建者）创建邀请并拿到一次性链接
 curl.exe -X POST http://127.0.0.1:8011/v1/knowledge-bases/team-kb/invitations `

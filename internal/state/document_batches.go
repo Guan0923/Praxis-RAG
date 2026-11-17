@@ -44,6 +44,7 @@ const (
 	DocumentBatchReasonValidation = "validation"
 	DocumentBatchReasonConfig     = "config"
 	DocumentBatchReasonConflict   = "conflict"
+	DocumentBatchReasonQuota      = "quota"
 	DocumentBatchReasonInternal   = "internal"
 )
 

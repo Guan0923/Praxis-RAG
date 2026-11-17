@@ -169,8 +169,10 @@ export function PermissionsPage({
       const probes = await Promise.all(names.map(async (namespace) => {
         try {
           const access = await fetchAccess(namespace, connection);
-          const shareable = typeof access.can_share === "boolean" ? access.can_share : access.can_manage;
-          return access.can_manage && shareable ? { namespace, access } : undefined;
+          // Keep the namespace visible to its owner even after a membership
+          // expires, so existing grants can still be reviewed and revoked. The
+          // invite button itself follows can_share.
+          return access.can_manage ? { namespace, access } : undefined;
         } catch {
           return undefined;
         }
@@ -220,7 +222,7 @@ export function PermissionsPage({
 
   const aggregated = useMemo(() => aggregateGrants(grants), [grants]);
   const selectedAccess = selected ? accessByNamespace[selected] : undefined;
-  const canShare = selectedAccess ? selectedAccess.can_share || selectedAccess.can_manage : true;
+  const canShare = selectedAccess ? selectedAccess.can_share : true;
   const pendingInvitations = invitations.filter((item) => invitationStatus(item) === "pending").length;
 
   async function loadUsers() {
@@ -541,8 +543,8 @@ export function PermissionsPage({
           className="page-alert"
           type="info"
           showIcon
-          title="VIP 权限"
-          description="VIP 只能管理自己创建的知识库的授权与邀请；其他被邀请的知识库仅可按授权使用。"
+          title="共享权限"
+          description="只有自己拥有的知识库可以管理授权与邀请；Plus/Pro 会员与 VIP 均按此规则，其他被邀请的知识库仅可按授权使用。"
         />
       )}
       {namespacesError && (

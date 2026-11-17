@@ -37,6 +37,9 @@ type Service struct {
 	dataRoot      string
 	search        *SearchEngine
 	searchTimeout time.Duration
+	// clock is the test seam for membership/quota timestamps. Production
+	// leaves it nil and uses time.Now.
+	clock func() time.Time
 	// activityRecorder is the optional monitoring counter recorded once per
 	// Search call. It is set once at startup, before the service serves traffic.
 	activityRecorder ActivityRecorder

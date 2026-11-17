@@ -72,7 +72,7 @@ REST `/v1/search`、MCP `search`、Console 与本地调试**全部同步执行**
 
 | 入口 | 能力 |
 | --- | --- |
-| Web Console：`/console` | 账号登录/注册（可配置邮箱验证码）、个人信息（头像 / 年龄 / 性别 / 用户名 / 邮箱 / 密码）、角色与知识库权限管理、文档管理、检索调试、工作区切换、管理员「系统设置」邮件服务器（SMTP）与「系统监控」页面（概览/依赖/日志、Kubernetes 工作负载与滚动重启），「模型配置」模型列表（Embedding / Reranker / VLM / JEV）与知识库配置中的模型快速选择，以及知识库 / API Key 的批量删除（复选或鼠标框选）。 |
+| Web Console：`/console` | 账号登录/注册（可配置邮箱验证码）、个人信息（头像 / 年龄 / 性别 / 用户名 / 邮箱 / 密码）、个人会员与用量（Free/Plus/Pro、月/年卡、支付宝支付、订单与管理员对账）、角色与知识库权限管理、文档管理、检索调试、工作区切换、管理员「系统设置」邮件服务器（SMTP）与「系统监控」页面（概览/依赖/日志、Kubernetes 工作负载与滚动重启），「模型配置」模型列表（Embedding / Reranker / VLM / JEV）与知识库配置中的模型快速选择，以及知识库 / API Key 的批量删除（复选或鼠标框选）。 |
 | MCP：`/mcp` | 搜索、添加/更新/删除文档、分页读取正文、提示词模板及订阅变更。 |
 | REST API：`/v1/*` | 知识管理与检索接入现有应用；`/openapi.json` 与 `/docs` 提供 OpenAPI 3.1 契约。 |
 
@@ -80,7 +80,7 @@ MCP 需要 `Authorization: Bearer <service token 或 API Key>` 与 `X-RAG-Namesp
 
 ### 模型配置与知识库模型选择
 
-管理员在侧边栏「模型配置」页（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM / JEV 模型列表：Embedding / Reranker / VLM 条目保存名称、服务地址、模型标识和加密后的 API Key，Embedding 条目还记录保存时探测到的向量维度；VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 的版面/OCR/表格/公式/图片描述统一由它完成；JEV 条目（TypeSafe System One 决策模型）同样保存名称、服务地址、模型标识和加密后的 API Key，但保存时不做连接探测，也不出现在知识库表单中；检索模式 `sag2`（词法多跳：BM25 + JEV 必要证据判定 + 词项扩展）会在每次查询时读取**最近更新**的 JEV 配置调用云端决策接口（常见模板：TypeSafe `https://api.typesafe.ai/v1`，模型 `jev-latest` / `jev-preview` / `jev-1.13.0`；OpenRouter `https://openrouter.ai/api/alpha`，模型 `typesafe/jev-1.13`）。创建或修改知识库时，管理员表单只从这个列表快速选择 Embedding / Reranker / VLM 模型，不再手工输入 Base URL / API Key / 模型名；切换 Embedding 到不同连接仍要求重新向量化。vision 引擎上传 PDF 要求知识库选中 VLM，否则上传会被拒绝并提示配置。模型配置与知识库之间是保存时复制的引用关系，之后编辑或删除模型配置不会改动已保存连接的知识库。升级时一次性迁移会删除旧的 `kind='ocr'` 模型配置并清除知识库中的遗留 `ocr`/`ocr_model` 设置。VIP/普通用户建库表单不变，仍从 `RAG_DEFAULT_KB_TEMPLATE` 克隆模型配置。
+管理员在侧边栏「模型配置」页（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM / JEV 模型列表：Embedding / Reranker / VLM 条目保存名称、服务地址、模型标识和加密后的 API Key，Embedding 条目还记录保存时探测到的向量维度；VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 的版面/OCR/表格/公式/图片描述统一由它完成；JEV 条目（TypeSafe System One 决策模型）同样保存名称、服务地址、模型标识和加密后的 API Key，但保存时不做连接探测，也不出现在知识库表单中；检索模式 `sag2`（词法多跳：BM25 + JEV 必要证据判定 + 词项扩展）会在每次查询时读取**最近更新**的 JEV 配置调用云端决策接口（常见模板：TypeSafe `https://api.typesafe.ai/v1`，模型 `jev-latest` / `jev-preview` / `jev-1.13.0`；OpenRouter `https://openrouter.ai/api/alpha`，模型 `typesafe/jev-1.13`）。创建或修改知识库时，所有账号都从**本人**「模型配置」列表快速选择 Embedding / Reranker / VLM 模型，不再手工输入 Base URL / API Key / 模型名；切换 Embedding 到不同连接仍要求重新向量化。vision 引擎上传 PDF 要求知识库选中 VLM，否则上传会被拒绝并提示配置。模型配置与知识库之间是保存时复制的引用关系，之后编辑或删除模型配置不会改动已保存连接的知识库。升级时一次性迁移会删除旧的 `kind='ocr'` 模型配置并清除知识库中的遗留 `ocr`/`ocr_model` 设置。管理员自建知识库未提交模型连接时可回退 `RAG_DEFAULT_KB_TEMPLATE`；普通账号必须使用本人模型配置。
 
 ### 独立部署与模型状态
 
@@ -301,6 +301,7 @@ npm run build
 | --- | --- |
 | [使用与部署](docs/USAGE.md) | Go 后端的构建、运行、环境变量、REST/MCP 示例、worker、迁移 CLI。 |
 | [知识库权限管理](docs/PERMISSIONS.md) | 角色、知识库归属、可读/可修改与单文件/多文件/全库权限、邀请链接流程与接口。 |
+| [个人会员与额度](docs/PERSONAL_MEMBERSHIP.md) | Free/Plus/Pro 套餐、文件/字符额度、有效期与升级、支付宝支付和上线检查。 |
 | [部署指南](docs/DEPLOYMENT.md) | Docker/Compose 与 systemd 示例、worker 重启策略、DLQ 监控、分布式 Kafka Connect、文档锁切换与升级/回滚。 |
 | [Kafka Connect 操作手册](deploy/kafka-connect/README.md) | 两个 Debezium 连接器的模板、注册、生产要求、FAILED task 自动重启与故障演练。 |
 | [Go 迁移总纲](docs/GO_MIGRATION.md) | 目标架构、兼容性硬约束、阶段与进度记录、当前切换状态。 |

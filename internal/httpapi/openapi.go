@@ -100,6 +100,17 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "POST", Path: "/v1/feishu/import", Summary: "Import selected Feishu documents into the current knowledge base", Tag: "feishu", Request: "FeishuImportBody", Response: "202"},
 	{Method: "GET", Path: "/v1/knowledge-base", Summary: "Public knowledge-base settings", Tag: "knowledge-bases", Response: "200"},
 	{Method: "GET", Path: "/v1/namespaces", Summary: "List knowledge-base namespaces", Tag: "knowledge-bases", Response: "200"},
+	{Method: "GET", Path: "/v1/membership", Summary: "Read the current account's membership, quota and recent orders", Tag: "membership", Response: "200"},
+	{Method: "GET", Path: "/v1/membership/orders", Summary: "List the current account's membership orders", Tag: "membership", Response: "200"},
+	{Method: "POST", Path: "/v1/membership/orders", Summary: "Create or resume one server-priced membership order", Tag: "membership", Request: "CreateMembershipOrderBody", Response: "201"},
+	{Method: "GET", Path: "/v1/membership/orders/{order_id}", Summary: "Read one own order; refresh=1 queries Alipay", Tag: "membership", QueryBoolean: []string{"refresh"}, Response: "200"},
+	{Method: "POST", Path: "/v1/membership/orders/{order_id}/close", Summary: "Close one pending membership order", Tag: "membership", Response: "200"},
+	{Method: "GET", Path: "/v1/workspaces/{namespace}/entitlements", Summary: "Read the knowledge-base owner's file and Embedding entitlement", Tag: "membership", Response: "200"},
+	{Method: "GET", Path: "/v1/admin/billing/orders", Summary: "List membership orders for reconciliation", Tag: "membership", Query: []string{"status", "limit"}, Response: "200"},
+	{Method: "POST", Path: "/v1/admin/billing/orders/{order_id}/query", Summary: "Actively query Alipay for one order", Tag: "membership", Response: "200"},
+	{Method: "POST", Path: "/v1/admin/billing/orders/{order_id}/refund", Summary: "Refund one whole paid order", Tag: "membership", Request: "BillingRefundBody", Response: "200"},
+	{Method: "POST", Path: "/v1/admin/billing/orders/{order_id}/manual", Summary: "Mark one order for manual reconciliation", Tag: "membership", Request: "BillingManualBody", Response: "200"},
+	{Method: "POST", Path: "/v1/payments/alipay/notify", Summary: "Alipay asynchronous payment notification (RSA2 verified)", Tag: "membership", Response: "200"},
 	{Method: "GET", Path: "/v1/uploads", Summary: "List upload operations", Tag: "uploads", Response: "200"},
 	{Method: "GET", Path: "/v1/uploads/{operation_id}", Summary: "Upload operation details", Tag: "uploads", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/published-versions", Summary: "List published versions", Tag: "admin", Response: "200"},
@@ -127,6 +138,29 @@ var openAPIRoutes = []openAPIRoute{
 // openAPISchemas returns the component schemas referenced by the route table.
 func openAPISchemas() map[string]any {
 	return map[string]any{
+		"CreateMembershipOrderBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"plan":   map[string]any{"type": "string", "enum": []any{"plus", "pro"}, "title": "Plan"},
+				"period": map[string]any{"type": "string", "enum": []any{"month", "year"}, "title": "Period"},
+				"intent": map[string]any{"type": "string", "enum": []any{"purchase", "upgrade"}, "title": "Intent"},
+			},
+		},
+		"BillingRefundBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"reason": map[string]any{"type": "string", "maxLength": 500, "title": "Reason"},
+			},
+		},
+		"BillingManualBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"note": map[string]any{"type": "string", "maxLength": 1000, "title": "Note"},
+			},
+		},
 		"SearchBody": map[string]any{
 			"type":                 "object",
 			"additionalProperties": false,

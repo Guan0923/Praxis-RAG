@@ -55,6 +55,14 @@ var expectedSchema = []struct {
 	// optional Feishu document import, appended after the ported tables.
 	{"feishu_connections", []string{"user_id", "open_id", "union_id", "name", "avatar_url", "access_token", "refresh_token", "access_expires_at", "refresh_expires_at", "scope", "created_at", "updated_at"}},
 	{"feishu_oauth_states", []string{"state_digest", "user_id", "redirect_uri", "expires_at", "consumed", "created_at"}},
+	// Personal membership, quota ledger and Alipay order state (Go-only
+	// additions appended after the ported tables).
+	{"user_memberships", []string{"user_id", "plan", "source", "starts_at", "expires_at", "anchor_day", "entitlement_version", "created_at", "updated_at"}},
+	{"membership_terms", []string{"id", "user_id", "order_id", "plan", "billing_period", "kind", "starts_at", "ends_at", "anchor_day", "status", "created_at", "updated_at"}},
+	{"billing_orders", []string{"id", "user_id", "plan", "billing_period", "kind", "status", "amount_cents", "currency", "quote", "product_snapshot", "entitlement_version", "term_start", "term_end", "alipay_trade_no", "expires_at", "paid_at", "closed_at", "refund_request_no", "refund_amount_cents", "refund_status", "refund_reason", "manual_note", "created_at", "updated_at"}},
+	{"embedding_quota_periods", []string{"id", "user_id", "source", "period_start", "period_end", "plan", "allowance_chars", "used_chars", "reserved_chars", "created_at", "updated_at"}},
+	{"embedding_usage", []string{"id", "operation_id", "user_id", "quota_period_id", "namespace", "document_name", "document_version", "model", "purpose", "reserved_chars", "used_chars", "status", "expires_at", "created_at", "updated_at"}},
+	{"billing_events", []string{"id", "order_id", "event_key", "event_type", "alipay_trade_no", "amount_cents", "detail", "created_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -90,21 +98,32 @@ var expectedPrimaryKeys = map[string][]string{
 	"content_objects":          {"hash"},
 	"feishu_connections":       {"user_id"},
 	"feishu_oauth_states":      {"state_digest"},
+	"user_memberships":         {"user_id"},
+	"membership_terms":         {"id"},
+	"billing_orders":           {"id"},
+	"embedding_quota_periods":  {"id"},
+	"embedding_usage":          {"id"},
+	"billing_events":           {"id"},
 }
 
 var expectedUniques = map[string][]string{
-	"api_keys":           {"uq_api_keys_digest"},
-	"documents":          {"uq_documents_namespace_id"},
-	"upload_operations":  {"uq_upload_idempotency"},
-	"artifact_snapshots": {"uq_artifact_identity"},
-	"document_tasks":     {"uq_document_task_idempotency"},
-	"document_jobs":      {"uq_document_job_idempotency"},
-	"users":              {"uq_users_username", "uq_users_email"},
-	"user_sessions":      {"uq_user_sessions_token_digest"},
-	"kb_permissions":     {"uq_kb_permissions_scope"},
-	"kb_invitations":     {"uq_kb_invitations_token_digest"},
-	"model_profiles":     {"uq_model_profiles_owner_kind_name"},
-	"document_batches":   {"uq_document_batch_idempotency"},
+	"api_keys":                {"uq_api_keys_digest"},
+	"documents":               {"uq_documents_namespace_id"},
+	"upload_operations":       {"uq_upload_idempotency"},
+	"artifact_snapshots":      {"uq_artifact_identity"},
+	"document_tasks":          {"uq_document_task_idempotency"},
+	"document_jobs":           {"uq_document_job_idempotency"},
+	"users":                   {"uq_users_username", "uq_users_email"},
+	"user_sessions":           {"uq_user_sessions_token_digest"},
+	"kb_permissions":          {"uq_kb_permissions_scope"},
+	"kb_invitations":          {"uq_kb_invitations_token_digest"},
+	"model_profiles":          {"uq_model_profiles_owner_kind_name"},
+	"document_batches":        {"uq_document_batch_idempotency"},
+	"membership_terms":        {"uq_membership_terms_order"},
+	"billing_orders":          {"uq_billing_orders_trade", "uq_billing_orders_refund"},
+	"embedding_quota_periods": {"uq_embedding_period"},
+	"embedding_usage":         {"uq_embedding_usage_operation"},
+	"billing_events":          {"uq_billing_events_key"},
 }
 
 var expectedIndexes = map[string][]string{
@@ -129,6 +148,11 @@ var expectedIndexes = map[string][]string{
 	"email_verification_codes": {"ix_email_codes_lookup", "ix_email_codes_expiry"},
 	"runtime_heartbeats":       {"ix_runtime_heartbeats_role"},
 	"feishu_oauth_states":      {"ix_feishu_oauth_states_user", "ix_feishu_oauth_states_expiry"},
+	"membership_terms":         {"ix_membership_terms_user"},
+	"billing_orders":           {"ix_billing_orders_user", "ix_billing_orders_status"},
+	"embedding_quota_periods":  {"ix_embedding_period_user"},
+	"embedding_usage":          {"ix_embedding_usage_user", "ix_embedding_usage_review"},
+	"billing_events":           {"ix_billing_events_order"},
 }
 
 // expectedTableNames returns the schema table names in Python declaration order.

@@ -117,6 +117,11 @@ type CreateInput struct {
 	// (RAG_VLM_*) apply.
 	VLMModel  string
 	VLMValues map[string]any
+	// EmbeddingBillingSource marks who pays the embedding provider for
+	// document ingestion: "platform" (default) or "customer". Only an
+	// administrator may set "customer"; plain request fields never bypass
+	// metering by themselves.
+	EmbeddingBillingSource string
 	// TokenizerModel defaults to DefaultTokenizerModel when blank.
 	TokenizerModel string
 	// Collection overrides the generated collection name (tests/imports only).
@@ -211,21 +216,26 @@ func CreateSettings(ctx context.Context, input CreateInput, prober Prober) (map[
 	if createdAt.IsZero() {
 		createdAt = time.Now()
 	}
+	billingSource, err := normalizeBillingSource(input.EmbeddingBillingSource)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]any{
-		"namespace":       input.Namespace,
-		"vector_size":     vectorSize,
-		"embedding_model": embeddingModel,
-		"reranker_model":  rerankerModel,
-		"embedding":       storedEmbedding,
-		"reranker":        storedReranker,
-		"vlm":             storedVLM,
-		"vlm_model":       vlmConnection.Model,
-		"collection":      collection,
-		"tokenizer":       tokenizer,
-		"strategy":        input.Chunking.Strategy,
-		"chunk_size":      input.Chunking.ChunkSize,
-		"chunk_overlap":   input.Chunking.ChunkOverlap,
-		"created_at":      ISOTimestamp(createdAt),
+		"namespace":                input.Namespace,
+		"embedding_billing_source": billingSource,
+		"vector_size":              vectorSize,
+		"embedding_model":          embeddingModel,
+		"reranker_model":           rerankerModel,
+		"embedding":                storedEmbedding,
+		"reranker":                 storedReranker,
+		"vlm":                      storedVLM,
+		"vlm_model":                vlmConnection.Model,
+		"collection":               collection,
+		"tokenizer":                tokenizer,
+		"strategy":                 input.Chunking.Strategy,
+		"chunk_size":               input.Chunking.ChunkSize,
+		"chunk_overlap":            input.Chunking.ChunkOverlap,
+		"created_at":               ISOTimestamp(createdAt),
 	}, nil
 }
 
@@ -237,6 +247,9 @@ type UpdateInput struct {
 	// Reembed confirms that a changed embedding URL/model/dimension may proceed
 	// by reindexing into a staging collection.
 	Reembed bool
+	// EmbeddingBillingSource changes the platform/customer marker. Nil keeps
+	// the stored value; "platform" is the safe default for legacy rows.
+	EmbeddingBillingSource *string
 	// UpdatedAt defaults to time.Now() when zero.
 	UpdatedAt time.Time
 	// EncryptionKey optionally overrides RAG_STATE_ENCRYPTION_KEY.
@@ -387,6 +400,15 @@ func UpdateSettings(
 	updated["reranker_model"] = reranker.Model
 	updated["vector_size"] = vectorSize
 	updated["updated_at"] = ISOTimestamp(updatedAt)
+	if input.EmbeddingBillingSource != nil {
+		billingSource, sourceErr := normalizeBillingSource(*input.EmbeddingBillingSource)
+		if sourceErr != nil {
+			return UpdateResult{}, sourceErr
+		}
+		updated["embedding_billing_source"] = billingSource
+	} else if _, exists := updated["embedding_billing_source"]; !exists {
+		updated["embedding_billing_source"] = "platform"
+	}
 
 	staging := ""
 	if input.Reembed {
@@ -411,6 +433,20 @@ func ActivateReembed(settings map[string]any, collection string, reembeddedAt ti
 	activated["collection"] = collection
 	activated["reembedded_at"] = ISOTimestamp(reembeddedAt)
 	return activated
+}
+
+// normalizeBillingSource validates the model-connection billing owner marker.
+// Empty means the platform default; only the two explicit values are accepted
+// so a typo cannot silently bypass metering.
+func normalizeBillingSource(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "platform":
+		return "platform", nil
+	case "customer":
+		return "customer", nil
+	default:
+		return "", NewValidationError("Embedding 计费归属只能是 platform 或 customer")
+	}
 }
 
 // providerValues returns one nested provider draft object; absent or null is

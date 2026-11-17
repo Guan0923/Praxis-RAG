@@ -186,9 +186,17 @@ export function itemStatusText(item: ItemView) {
     if (item.reason === "exists") return "已存在，已跳过";
     if (item.reason === "queued" || item.reason === "duplicate")
       return "同名文件在处理中，已跳过";
+    // A quota rejection carries the server's Chinese text (plan/file limit).
+    if (item.reason === "quota") return item.error || "超出套餐配额，已跳过";
     return "已跳过";
   }
-  if (item.status === "failed") return `保存失败：${item.error || "上传失败"}`;
+  if (item.status === "failed") {
+    // quota keeps the server's explanation of which limit was hit instead of
+    // the generic save-failure wording.
+    if (item.reason === "quota")
+      return item.error ? `超出套餐配额：${item.error}` : "超出套餐配额，保存失败";
+    return `保存失败：${item.error || "上传失败"}`;
+  }
   return "已保存";
 }
 

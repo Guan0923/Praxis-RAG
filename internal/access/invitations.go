@@ -93,11 +93,15 @@ func (s *Service) Describe(ctx context.Context, user state.User, namespace strin
 	if err != nil {
 		return AccessView{}, err
 	}
+	canShare, err := s.CanShareAccount(ctx, user)
+	if err != nil {
+		return AccessView{}, err
+	}
 	return AccessView{
 		Namespace: namespace,
 		Owner:     owner != "" && owner == user.ID,
 		CanManage: manage,
-		CanShare:  user.CanShare() && manage,
+		CanShare:  canShare && manage,
 		Role:      user.Role,
 		CanRead:   scope.AllowsAnyRead(),
 		CanWrite:  scope.HasAnyWrite(),
@@ -113,7 +117,7 @@ func (s *Service) Describe(ctx context.Context, user state.User, namespace strin
 // ListGrants returns every grant of one knowledge base. Only the owner or an
 // administrator may list them.
 func (s *Service) ListGrants(ctx context.Context, user state.User, namespace string) ([]GrantView, error) {
-	if err := s.RequireSharePermission(ctx, user, namespace); err != nil {
+	if err := s.RequireManagePermission(ctx, user, namespace); err != nil {
 		return nil, err
 	}
 	rows, err := s.permissions.ListByNamespace(ctx, namespace)
@@ -139,7 +143,7 @@ func (s *Service) ListGrants(ctx context.Context, user state.User, namespace str
 
 // RevokeGrant removes every grant of one account inside one knowledge base.
 func (s *Service) RevokeGrant(ctx context.Context, user state.User, namespace, granteeUserID string) error {
-	if err := s.RequireSharePermission(ctx, user, namespace); err != nil {
+	if err := s.RequireManagePermission(ctx, user, namespace); err != nil {
 		return err
 	}
 	if strings.TrimSpace(granteeUserID) == "" {
@@ -158,7 +162,7 @@ func (s *Service) RevokeGrant(ctx context.Context, user state.User, namespace, g
 // ListNamespaceInvitations returns the invitations issued for one knowledge
 // base. Only the owner or an administrator may list them.
 func (s *Service) ListNamespaceInvitations(ctx context.Context, user state.User, namespace string) ([]InvitationView, error) {
-	if err := s.RequireSharePermission(ctx, user, namespace); err != nil {
+	if err := s.RequireManagePermission(ctx, user, namespace); err != nil {
 		return nil, err
 	}
 	rows, err := s.invitations.ListByNamespace(ctx, namespace, 200)
@@ -180,7 +184,11 @@ func (s *Service) CreateInvitation(
 	inviter state.User,
 	request CreateInvitationRequest,
 ) (InvitationView, string, error) {
-	if !inviter.CanShare() {
+	canShare, err := s.CanShareAccount(ctx, inviter)
+	if err != nil {
+		return InvitationView{}, "", err
+	}
+	if !canShare {
 		return InvitationView{}, "", NewError(KindForbidden, MessageForbidden)
 	}
 	permission := strings.TrimSpace(request.Permission)
@@ -295,6 +303,24 @@ func (s *Service) AcceptInvitation(ctx context.Context, user state.User, token s
 		_, _ = s.invitations.SetStatus(ctx, invitation.ID, state.InvitationRevoked, "")
 		return InvitationView{}, NewError(KindConflict, MessageInvitationExpiry)
 	}
+	// A paid inviter may have expired between sending and acceptance. Re-check
+	// the inviter's entitlement now; a manual VIP role keeps its historical
+	// sharing ability, while an expired Plus/Pro invitation must not create a
+	// new grant.
+	inviter, err := s.users.ByID(ctx, invitation.InviterUserID)
+	if err != nil {
+		return InvitationView{}, err
+	}
+	if inviter == nil || !inviter.Enabled {
+		return InvitationView{}, NewError(KindConflict, MessageInviterExpired)
+	}
+	canShare, err := s.CanShareAccount(ctx, *inviter)
+	if err != nil {
+		return InvitationView{}, err
+	}
+	if !canShare {
+		return InvitationView{}, NewError(KindConflict, MessageInviterExpired)
+	}
 	grants := make([]state.Permission, 0, len(invitation.DocumentNames)+1)
 	if invitation.Scope == state.InvitationScopeAll || len(invitation.DocumentNames) == 0 {
 		grants = append(grants, state.Permission{
@@ -379,7 +405,11 @@ func (s *Service) RevokeInvitation(ctx context.Context, user state.User, invitat
 
 // ListInvitableUsers returns the enabled accounts an inviter may pick from.
 func (s *Service) ListInvitableUsers(ctx context.Context, inviter state.User) ([]UserView, error) {
-	if !inviter.CanShare() {
+	canShare, err := s.CanShareAccount(ctx, inviter)
+	if err != nil {
+		return nil, err
+	}
+	if !canShare {
 		return nil, NewError(KindForbidden, MessageForbidden)
 	}
 	users, err := s.users.List(ctx)

@@ -7,6 +7,7 @@ export type ConsolePage =
   | "documents"
   | "create"
   | "api-keys"
+  | "membership"
   | "model-profiles"
   | "knowledge-bases"
   | "users"
@@ -36,8 +37,21 @@ export const adminOnlyPages = new Set<ConsolePage>([
 // direct #/<page> link, so a non-admin cannot open an admin-only page by URL.
 // With login disabled (legacy local mode) there is no account identity, so
 // management pages stay visible exactly as before.
-export function canViewConsolePage(page: ConsolePage, sessionMode: boolean, role?: Role) {
-  if (page === "permissions") return sessionMode && (role === "admin" || role === "vip");
+export function canViewConsolePage(
+  page: ConsolePage,
+  sessionMode: boolean,
+  role?: Role,
+  planName?: string,
+) {
+  if (page === "permissions") {
+    // Every signed-in owner may review and revoke existing sharing, including
+    // after a paid membership expires. The server still decides whether the
+    // account may create new invitations (admin/vip or active Plus/Pro).
+    return sessionMode && Boolean(role);
+  }
+  // Membership entitlements belong to one Console account. Legacy token-only
+  // mode has no account, so the page is hidden until login is enabled.
+  if (page === "membership") return sessionMode && Boolean(role);
   if (adminOnlyPages.has(page)) return !sessionMode || role === "admin";
   return true;
 }
@@ -99,6 +113,7 @@ export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRout
     }
     if (
       hash === "#/api-keys" ||
+      hash === "#/membership" ||
       hash === "#/model-profiles" ||
       hash === "#/knowledge-bases" ||
       hash === "#/users" ||
@@ -144,6 +159,7 @@ export function routeForNamespace(
 export function routeHash(route: ConsoleRoute) {
   if (
     route.page === "api-keys" ||
+    route.page === "membership" ||
     route.page === "model-profiles" ||
     route.page === "knowledge-bases" ||
     route.page === "users" ||
