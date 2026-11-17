@@ -11,14 +11,17 @@ import (
 // single table so new handlers only need one row here; the document is rebuilt
 // deterministically on every request.
 type openAPIRoute struct {
-	Method    string
-	Path      string
-	Summary   string
-	Tag       string
-	Request   string   // component schema name for the JSON body
-	Query     []string // query parameter names
-	Response  string   // success status code
-	Multipart bool     // request body is multipart/form-data
+	Method  string
+	Path    string
+	Summary string
+	Tag     string
+	Request string   // component schema name for the JSON body
+	Query   []string // query parameter names (rendered as integer)
+	// QueryBoolean lists boolean query parameters; the generic Query list keeps
+	// its integer rendering for the existing limit/offset-style parameters.
+	QueryBoolean []string
+	Response     string // success status code
+	Multipart    bool   // request body is multipart/form-data
 	// MultipartField is the single binary field of a multipart request. When
 	// empty, the legacy multi-file "files" array schema is generated.
 	MultipartField string
@@ -103,6 +106,10 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "GET", Path: "/v1/admin/upload-leases", Summary: "List upload leases", Tag: "admin", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/monitor/overview", Summary: "Read-only monitoring snapshot", Tag: "admin", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/monitor/logs", Summary: "Read-only monitor log page (memory ring or RAG_LOG_FILE)", Tag: "admin", Query: []string{"source", "component", "level", "query", "limit", "offset"}, Response: "200"},
+	{Method: "POST", Path: "/v1/admin/monitor/actions/requeue-jobs", Summary: "Requeue due retries and expired document-job leases now (sweep semantics)", Tag: "admin", Response: "200"},
+	{Method: "POST", Path: "/v1/admin/monitor/actions/connectors/{connector}/restart", Summary: "Restart one capture connector (fixed names only) and reset its restart budget", Tag: "admin", QueryBoolean: []string{"includeTasks"}, Response: "200"},
+	{Method: "GET", Path: "/v1/admin/monitor/actions/worker-deployment", Summary: "Read the document worker Deployment replica state (Kubernetes only)", Tag: "admin", Response: "200"},
+	{Method: "POST", Path: "/v1/admin/monitor/actions/worker-deployment/scale", Summary: "Scale the document worker Deployment (kubectl scale equivalent)", Tag: "admin", Request: "WorkerScaleBody", Response: "200"},
 	{Method: "GET", Path: "/v1/users", Summary: "List accounts available for an invitation", Tag: "sharing", Response: "200"},
 	{Method: "POST", Path: "/v1/knowledge-bases", Summary: "Create a knowledge base owned by the current account", Tag: "knowledge-bases", Request: "SelfCreateKnowledgeBaseBody", Response: "201"},
 	{Method: "GET", Path: "/v1/knowledge-bases/{namespace}/access", Summary: "Read the current account's knowledge-base access", Tag: "sharing", Response: "200"},
@@ -305,6 +312,14 @@ func openAPISchemas() map[string]any {
 				"apikey":   map[string]any{"type": "string", "title": "Apikey"},
 			},
 		},
+		"WorkerScaleBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"replicas"},
+			"properties": map[string]any{
+				"replicas": map[string]any{"type": "integer", "minimum": 0, "maximum": 64, "title": "Replicas"},
+			},
+		},
 		"CreateKnowledgeBaseBody": map[string]any{
 			"type":                 "object",
 			"additionalProperties": false,
@@ -409,6 +424,12 @@ func buildOpenAPIDocument() map[string]any {
 			parameters = append(parameters, map[string]any{
 				"name": name, "in": "query", "required": false,
 				"schema": map[string]any{"type": "integer"},
+			})
+		}
+		for _, name := range route.QueryBoolean {
+			parameters = append(parameters, map[string]any{
+				"name": name, "in": "query", "required": false,
+				"schema": map[string]any{"type": "boolean", "default": true},
 			})
 		}
 		if len(parameters) > 0 {
