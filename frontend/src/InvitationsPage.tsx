@@ -152,13 +152,6 @@ export function InvitationsPage({ onOpenInvite }: {
           </Tooltip>
         </div>
       </div>
-      <Alert
-        className="page-alert"
-        type="info"
-        showIcon
-        title="如何接受邀请"
-        description="邀请消息只用于提醒；接受或拒绝需要在邀请人发送的邀请链接中完成。可以把链接粘贴到下方「打开邀请链接」，登录对应账号后即可处理。"
-      />
       {error && (
         <Alert className="page-alert" type="error" showIcon title="邀请列表加载失败" description={error} />
       )}
