@@ -289,6 +289,27 @@ func (s *Supervisor) backoff(attempt int) time.Duration {
 	return delay
 }
 
+// ResetRestartBudget clears the exhausted flag and attempt budget of one
+// connector's tasks. It backs the Console "重启连接器" action: after the
+// supervisor gave up (restart_exhausted), an operator restart must not be
+// immediately re-flagged as exhausted by the stale bookkeeping. The next Tick
+// that observes a FAILED task then starts a fresh budget.
+func (s *Supervisor) ResetRestartBudget(connector string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, state := range s.tasks {
+		if key.connector != connector {
+			continue
+		}
+		state.attempts = 0
+		state.exhausted = false
+		state.nextAttempt = time.Time{}
+		state.lastRestartAt = time.Time{}
+		state.recoveredAt = time.Time{}
+		state.stableAt = time.Time{}
+	}
+}
+
 // Health reads one connector's live status and merges the supervisor's restart
 // bookkeeping. A REST failure returns the error and a partial placeholder; the
 // monitor renders the row as an error instead of inventing a healthy state.

@@ -1377,7 +1377,33 @@ export type MonitorOverview = {
   // system is optional (older backends omit it) and null when the host
   // collector is unavailable; the page renders 系统资源：未知（采集不可用）.
   system?: MonitorSystem | null;
+  // actions is the operator-action capability block: which Console buttons
+  // the backend accepts. Older backends omit it; the page then hides the
+  // buttons instead of calling endpoints that do not exist.
+  actions?: MonitorActionCapabilities;
   errors: string[];
+};
+
+// MonitorActionCapabilities reports whether each operator action is wired on
+// the backend. The requeue action needs the state store only; the connector
+// restart needs Kafka Connect; worker scaling needs the mounted Kubernetes
+// service account.
+export type MonitorActionCapabilities = {
+  requeue_jobs: boolean;
+  restart_connectors: boolean;
+  scale_worker: boolean;
+  worker_deployment: boolean;
+};
+
+// MonitorWorkerDeployment is the document worker Deployment replica state the
+// scale card shows. Numbers are null-safe through unknownOrNumber on the page.
+export type MonitorWorkerDeployment = {
+  name: string;
+  namespace: string;
+  desired_replicas: number;
+  ready_replicas: number;
+  available_replicas: number;
+  observed_generation: number;
 };
 
 export const monitorDependencyStatusLabels: Record<MonitorDependencyStatus, string> = {
@@ -1416,6 +1442,51 @@ export async function fetchMonitorOverview(signal?: AbortSignal): Promise<Monito
   return await api<MonitorOverview>("/v1/admin/monitor/overview", undefined, {
     signal,
     cache: "no-store",
+  });
+}
+
+// --- Monitor operator actions (监控操作) -------------------------------------
+//
+// These mirror the four admin endpoints behind the Console monitor buttons.
+// All are POSTs, so the shared CSRF header applies automatically for
+// cookie-authenticated sessions.
+
+// requeueDocumentJobs triggers the immediate requeue of due retries and
+// expired leases (the「立即重投」button). The backend keeps the attempt budget
+// and terminalization rules, so this never creates a fourth execution.
+export async function requeueDocumentJobs(): Promise<{ requeued: number }> {
+  return await api<{ requeued: number }>("/v1/admin/monitor/actions/requeue-jobs", undefined, {
+    method: "POST",
+  });
+}
+
+// restartMonitorConnector restarts one capture connector (with its tasks) and
+// resets the supervisor's restart budget for that connector. The backend only
+// accepts the two fixed connector names.
+export async function restartMonitorConnector(connector: string): Promise<{ restarted: boolean }> {
+  return await api<{ restarted: boolean }>(
+    `/v1/admin/monitor/actions/connectors/${encodeURIComponent(connector)}/restart`,
+    undefined,
+    { method: "POST" },
+  );
+}
+
+// fetchWorkerDeployment reads the document worker Deployment replica state.
+// The backend answers 503 when no Kubernetes service account is mounted.
+export async function fetchWorkerDeployment(signal?: AbortSignal): Promise<MonitorWorkerDeployment> {
+  const payload = await api<{ deployment: MonitorWorkerDeployment }>(
+    "/v1/admin/monitor/actions/worker-deployment",
+    undefined,
+    { signal, cache: "no-store" },
+  );
+  return payload.deployment;
+}
+
+// scaleWorker sets the document worker replica count (0..64).
+export async function scaleWorker(replicas: number): Promise<{ replicas: number }> {
+  return await api<{ replicas: number }>("/v1/admin/monitor/actions/worker-deployment/scale", undefined, {
+    method: "POST",
+    body: JSON.stringify({ replicas }),
   });
 }
 

@@ -95,6 +95,7 @@ type Server struct {
 	kbSelfCreate   KnowledgeBaseSelfCreateRuntime
 	modelProfiles  ModelProfileRuntime
 	monitor        MonitorRuntime
+	monitorActions MonitorActionsRuntime
 	notifier       ChangeNotifier
 	users          UserAuth
 	account        AccountProfile
@@ -178,6 +179,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/admin/upload-leases", authNone, s.handleUploadLeases)
 	s.router.add("GET", "/v1/admin/monitor/overview", authAdmin, s.handleMonitorOverview)
 	s.router.add("GET", "/v1/admin/monitor/logs", authAdmin, s.handleMonitorLogs)
+	s.registerMonitorActionRoutes()
 	s.registerDocumentationRoutes()
 	s.registerKnowledgeBaseAdminRoutes()
 	s.registerModelProfileRoutes()

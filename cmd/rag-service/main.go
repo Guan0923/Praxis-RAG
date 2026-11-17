@@ -193,7 +193,17 @@ func run() error {
 	if connectRuntime.Enabled() {
 		connectorProbe = connectRuntime
 	}
-	monitorService := monitor.New(monitor.Options{
+	// The Console operator actions (立即重投 / 重启连接器 / worker 扩缩容).
+	// Outside a Kubernetes pod the scale card degrades; the requeue and
+	// restart actions work wherever MySQL / Kafka Connect are reachable.
+	actions, err := monitorOpsBuild(stores, connectRuntime)
+	if err != nil {
+		return err
+	}
+	if actions.kubernetes == nil {
+		logger.Info("Kubernetes 操作未启用：未挂载 ServiceAccount（Compose/宿主机部署为预期行为），Console 的扩缩容卡片将显示为不可用")
+	}
+	monitorOptions := monitor.Options{
 		Stats:                 stores,
 		MySQL:                 stores,
 		DBStats:               stores.DB.Stats,
@@ -224,7 +234,21 @@ func run() error {
 		System:             systemSampler,
 		Logs:               logging.DefaultBuffer(),
 		LogFilePath:        logging.LogFilePath(),
-	})
+		// Operator-action capability flags for the Console buttons. The
+		// actions themselves run through httpapi.MonitorActionsRuntime; these
+		// funcs only report whether they are wired.
+		RequeueJobs: func(ctx context.Context) (int, error) {
+			return actions.RequeueStuckDocumentJobs(ctx)
+		},
+	}
+	// The scale funcs stay nil outside a Kubernetes pod so the Console card
+	// reports 未启用 instead of an endpoint that would answer 503.
+	if actions.kubernetes != nil {
+		monitorOptions.ScaleWorker = func(ctx context.Context, replicas int32) error {
+			return actions.ScaleWorker(ctx, replicas)
+		}
+	}
+	monitorService := monitor.New(monitorOptions)
 	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{
 		Runtime: wire.MCPRuntime{Service: service},
@@ -277,6 +301,7 @@ func run() error {
 		httpapi.WithKnowledgeBaseSelfCreateRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithModelProfileRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithMonitorRuntime(monitorService),
+		httpapi.WithMonitorActions(actions),
 		httpapi.WithAccessControl(accessService),
 		httpapi.WithAPIKeyStore(apikeys.New(stores.APIKeys)),
 		httpapi.WithCatalogStore(catalogStore),

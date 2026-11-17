@@ -863,6 +863,23 @@ func (d *DocumentJobs) DeadLetter(ctx context.Context, notification DocumentNoti
 //
 // No outbox row is written; the schedule_version change is the only signal.
 func (d *DocumentJobs) Sweep(ctx context.Context, limit int) (int, error) {
+	return d.sweep(ctx, limit, false)
+}
+
+// RequeueDueNow is the operator-triggered variant of Sweep: it requeues due
+// retry_wait jobs and lease-expired processing jobs immediately, ignoring the
+// one-sweep-window quiet rule for retry_wait rows. It exists for the Console
+// "立即重投" action so an operator does not have to wait for the periodic
+// sweep; the durability contract is identical to Sweep (schedule_version is
+// incremented in the same UPDATE, so Debezium emits exactly one replacement
+// notification, and the attempt budget / terminalization rules are shared).
+func (d *DocumentJobs) RequeueDueNow(ctx context.Context, limit int) (int, error) {
+	return d.sweep(ctx, limit, true)
+}
+
+// sweep implements both variants. immediate skips the retry_wait quiet rule
+// (the lease-expiry path never had it).
+func (d *DocumentJobs) sweep(ctx context.Context, limit int, immediate bool) (int, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -873,9 +890,16 @@ func (d *DocumentJobs) Sweep(ctx context.Context, limit int) (int, error) {
 		return 0, err
 	}
 	defer func() { _ = transaction.Rollback() }()
-	retryDue, err := d.selectJobsForSweep(ctx, transaction,
-		"status = ? AND stage = ? AND retry_at <= ? AND updated_at <= ? ORDER BY retry_at LIMIT ?"+d.stores.Uploads.forUpdate(),
-		DocumentJobQueued, "retry_wait", now, cutoff, limit)
+	var retryDue []*DocumentJob
+	if immediate {
+		retryDue, err = d.selectJobsForSweep(ctx, transaction,
+			"status = ? AND stage = ? AND retry_at <= ? ORDER BY retry_at LIMIT ?"+d.stores.Uploads.forUpdate(),
+			DocumentJobQueued, "retry_wait", now, limit)
+	} else {
+		retryDue, err = d.selectJobsForSweep(ctx, transaction,
+			"status = ? AND stage = ? AND retry_at <= ? AND updated_at <= ? ORDER BY retry_at LIMIT ?"+d.stores.Uploads.forUpdate(),
+			DocumentJobQueued, "retry_wait", now, cutoff, limit)
+	}
 	if err != nil {
 		return 0, err
 	}

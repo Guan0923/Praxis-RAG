@@ -633,9 +633,9 @@ curl.exe -X POST http://127.0.0.1:8011/v1/document-batches `
 - 流按 `(namespace, upload_id)` 隔离；hub 在进程内，**订阅与 POST 必须落在同一个 `rag-service` 实例**，没有订阅者时事件直接丢弃（不缓存、不阻塞上传）。多实例部署时需会话粘滞，否则可能收不到进度。
 - 不带 `X-Upload-ID` 时服务端不推送任何事件，行为与旧版完全一致；`upload_id` 只用于定位本次上传的流，不要跨批次复用。
 
-### 系统监控（Console 页面与只读接口）
+### 系统监控（Console 页面、只读接口与运维操作）
 
-管理员（或本机直连）可在 Console 侧边栏打开「系统监控」（`#/monitor`），页面每 15 秒自动刷新，全部为只读数据。页面顶部是一排标签：`概览` + 每个系统组件（`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium`）+ `全部日志`；组件标签展示该组件的既有监控内容与该组件最近日志；`全部日志` 页的组件筛选显示各组件的最近日志条数。概览版式按重要性排列：页头总体状态 → 主机资源 → 关键指标 → 依赖与投递 → 队列与记录 → 服务信息；窄屏自动单列。
+管理员（或本机直连）可在 Console 侧边栏打开「系统监控」（`#/monitor`），页面每 15 秒自动刷新。页面顶部是一排标签：`概览` + 每个系统组件（`MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium`）+ `全部日志`；组件标签展示该组件的既有监控内容与该组件最近日志；`全部日志` 页的组件筛选显示各组件的最近日志条数。概览版式按重要性排列：页头总体状态 → 主机资源 → 关键指标 → 依赖与投递 → 队列与记录 → 服务信息；窄屏自动单列。
 
 - **页头总体状态**：由状态库聚合与依赖探测共同推导的三态 `status`（`ok`/`degraded`/`error`，`ok` 为兼容字段，等于 `status == "ok"`）。任一依赖异常或状态库不可读 → `error`；任一依赖/Qdrant 已入库集合/文档 Worker 心跳/Debezium 运行检查降级，或 Kafka 消费进度读取失败 → `degraded`；未启用或未知不降级。`pipeline.document_jobs` 只反映任务负载，不参与总体状态。Qdrant 已降级时页头不再显示「运行正常」。
 - **关键指标**：有效文档数（只统计 `del_flag = 0`，不含软删除）、排队/处理中文档任务、上传进行中、近 24 小时检索次数、artifact 快照数（结果快照指标已随搜索同步化移除）。
@@ -648,7 +648,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/document-batches `
 - **主机资源（概览顶部）**：`system` 对象给出 CPU 使用率/逻辑核数/型号/load1/5/15、内存与 swap、网络总收发速率与最忙的 8 个网卡、本进程 RSS/VMS/goroutine/heap 用量。CPU 使用率与网络速率由两次采样差值计算，服务启动后的首次采样为 `null`；Windows 没有 load average，`load1/5/15` 为 `null` 并在 `system.notes` 说明；采集失败时 `system` 为 `null`，原因追加到顶层 `errors`，**不会**改变总体 `status`/`ok`（主机资源只做展示，不参与健康判定）。
 - **组件日志**：内存日志源是进程内环形缓冲（`RAG_LOG_BUFFER_SIZE`，默认 1000 条），按组件统计条数用于 `全部日志` 的组件筛选；文件日志源读取启动时配置的 `RAG_LOG_FILE`（最多最近 512 KiB，丢弃首个不完整行，无法解析的行计入提示）。组件按记录的显式 `component` 属性优先归类，否则按调用方源码包路径映射（`internal/state`→MySQL、`internal/redisstate`→Redis、`internal/qdrant`→Qdrant、`internal/mq`/`internal/cacheconsumer`→Kafka、`internal/documentworker`/`internal/ingest`/`internal/document`→文档 Worker、`internal/cdcacceptance`→Debezium、`internal/modelapi`→模型调用、`internal/retrieval`/`internal/searchrefs`/`internal/sparse`→检索、`internal/httpapi`/`internal/mcp`→HTTP API、`internal/monitor`→系统监控、`cmd/rag-service`→服务、其余→其他）。
 
-页面对应的只读接口是 `GET /v1/admin/monitor/overview`（仅本机直连或管理员会话，响应 `Cache-Control: no-store`）。依赖降级时接口仍返回 200，用顶层 `status` 与 `dependencies[].status`（`ok`/`degraded`/`error`/`disabled`/`unknown`）区分；`queues.uploads` 同时提供 `by_status` 与 `in_progress`/`failed`/`rolling_back`/`cleanup_pending`；`pipeline.debezium` 为 `{tasks, cache}` 两个连接器（各含 `status/detail/capture_progress`），`pipeline.kafka.groups` 为 `document`/`cache` 两组位点，`pipeline.cache` 为 `{status, dirty_keys, refresh_failures}`，`service.delivery` 固定为 `debezium`；`library` 只含有效文档/知识库/artifact 快照计数（原 `result_snapshots` 字段已移除）。顶层新增 `system`（主机资源，见上一节；采集不可用时为 `null`，原有字段一律不变）；`dependencies[].points` 是兼容旧 Console 的保留字段，Qdrant 行不再返回单一聚合点数（每个知识库各有一个集合）。状态库不可读时 `queues`/`library`/`activity` 为 `null`、`pipeline.cache.dirty_keys/refresh_failures` 为 `null`，`pipeline.document_jobs.status` 为 `unknown`，`pipeline.debezium`/`pipeline.kafka`/`pipeline.worker` 仍各自探测，并附带 `errors` 中文说明。数字 `null` 表示未知，不要当作 0。该接口只做聚合查询，不读取任务/文档正文，也不记录查询内容：
+页面对应的只读接口是 `GET /v1/admin/monitor/overview`（仅本机直连或管理员会话，响应 `Cache-Control: no-store`；顶层含 `actions` 能力块，见下一节）。依赖降级时接口仍返回 200，用顶层 `status` 与 `dependencies[].status`（`ok`/`degraded`/`error`/`disabled`/`unknown`）区分；`queues.uploads` 同时提供 `by_status` 与 `in_progress`/`failed`/`rolling_back`/`cleanup_pending`；`pipeline.debezium` 为 `{tasks, cache}` 两个连接器（各含 `status/detail/capture_progress`），`pipeline.kafka.groups` 为 `document`/`cache` 两组位点，`pipeline.cache` 为 `{status, dirty_keys, refresh_failures}`，`service.delivery` 固定为 `debezium`；`library` 只含有效文档/知识库/artifact 快照计数（原 `result_snapshots` 字段已移除）。顶层新增 `system`（主机资源，见上一节；采集不可用时为 `null`，原有字段一律不变）；`dependencies[].points` 是兼容旧 Console 的保留字段，Qdrant 行不再返回单一聚合点数（每个知识库各有一个集合）。状态库不可读时 `queues`/`library`/`activity` 为 `null`、`pipeline.cache.dirty_keys/refresh_failures` 为 `null`，`pipeline.document_jobs.status` 为 `unknown`，`pipeline.debezium`/`pipeline.kafka`/`pipeline.worker` 仍各自探测，并附带 `errors` 中文说明。数字 `null` 表示未知，不要当作 0。该接口只做聚合查询，不读取任务/文档正文，也不记录查询内容：
 
 ```powershell
 curl.exe http://127.0.0.1:8011/v1/admin/monitor/overview
@@ -671,6 +671,30 @@ curl.exe http://127.0.0.1:8011/v1/admin/monitor/overview
 curl.exe "http://127.0.0.1:8011/v1/admin/monitor/logs?component=mysql&level=warn&limit=50"
 curl.exe "http://127.0.0.1:8011/v1/admin/monitor/logs?source=file&query=timeout"
 ```
+
+### 监控页运维操作（立即重投 / 重启连接器 / worker 扩缩容）
+
+监控页的数据仍是只读快照，但页面上展示的几类「需要人工补救」的状态现在带了对应操作按钮。能力开关由 `overview` 顶层新增的 `actions` 块（`requeue_jobs`/`restart_connectors`/`scale_worker`/`worker_deployment`，均为布尔）驱动：老后端或未装配的能力返回 `false`/缺省，按钮直接不渲染，Console 不会去调一个会 503 的端点。三个操作端点都在 `/v1/admin/*` 边界内（管理员会话 + CSRF，或本机直连破窗），与只读监控接口同一鉴权、同样的 `Cache-Control: no-store`：
+
+| 操作 | 页面位置 | 端点 | 前提 |
+| --- | --- | --- | --- |
+| 立即重投 | MySQL / 文档 Worker 标签页「卡死处理中」行 | `POST /v1/admin/monitor/actions/requeue-jobs` | 无（只依赖 MySQL） |
+| 重启连接器 | Debezium 标签页失败采集行的按钮 | `POST /v1/admin/monitor/actions/connectors/{name}/restart` | `RAG_CONNECT_URLS` 已配置 |
+| worker 扩缩容 | 文档 Worker 标签页「副本数」卡片 | `GET/POST /v1/admin/monitor/actions/worker-deployment(/scale)` | Kubernetes 内部署 + RBAC |
+
+- **立即重投**：把「到期重试」与「租约过期的卡死处理中」任务立即重新投递（worker 的周期扫描默认 30 秒一轮；这个按钮用于不想等扫描的人工补救）。语义与周期扫描完全一致：递增 `schedule_version`（Debezium 发一条替代通知）、尊重 3 次执行预算、终态判定共享，**不会**产生第四次执行或重复可检索版本。响应 `{"requeued": N}`。Compose/宿主机部署同样可用。
+- **重启连接器**：面向 supervisor 重启预算耗尽（`restart_exhausted`）或 FAILED task 的采集行；重启连接器及其任务（Kafka Connect REST 的 `includeTasks=true`）同时清空该连接器的自动重启预算。只接受两个固定连接器名（`praxis-document-cdc` / `praxis-cache-cdc`），未知名字 400。Kafka Connect 未配置时 503（`Kafka Connect 未配置`）。
+- **worker 扩缩容**：读 `rag-document-worker` Deployment 的期望/就绪副本数，输入目标副本数（0..64）后发 merge patch（与 `kubectl scale` 等价，admission/quota 同样生效）。仅在 Kubernetes 内部署且挂载了 ServiceAccount 时可用（清单 `deploy/k8s/base/rbac-monitor-ops.yaml`：仅 `apps` 组 `deployments` 的 `get`+`patch`，`resourceNames` 限定 `rag-document-worker`）；Compose/宿主机部署返回 503（`Kubernetes 操作未启用`），页面显示「未启用」说明而不是假装可用。RBAC 未授权时 403（提示应用 RBAC 清单），Deployment 不存在时 404。
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/monitor/actions/requeue-jobs
+curl.exe -X POST "http://127.0.0.1:8011/v1/admin/monitor/actions/connectors/praxis-document-cdc/restart"
+curl.exe http://127.0.0.1:8011/v1/admin/monitor/actions/worker-deployment
+curl.exe -X POST http://127.0.0.1:8011/v1/admin/monitor/actions/worker-deployment/scale `
+  -H "Content-Type: application/json" -d '{"replicas":2}'
+```
+
+Kubernetes 侧的可调项（可选）：`RAG_K8S_API_ENDPOINT`（默认 `https://kubernetes.default.svc:443`）、`RAG_K8S_WORKER_DEPLOYMENT`（默认 `rag-document-worker`）、`RAG_K8S_DEPLOYMENT_NAMESPACE`（默认取挂载的 namespace 文件）。显式设置 endpoint 但没挂 ServiceAccount 时启动即报配置错误（要 Kubernetes 控制权却没给凭据）。
 
 ### API Key 管理（本机或登录会话）
 
@@ -1077,6 +1101,33 @@ curl.exe http://127.0.0.1:8091/healthz
 - pdf-parser 镜像与 Go 镜像相互独立：`pdf-parser` 属于默认 profile，compose 的 `app` profile 会通过 `depends_on` 一并拉起它（因此用 app profile 时不能跳过）；只用纯文本引擎时 Go 进程不调用它（`RAG_PDF_ENGINE=go`），也可以不使用 app profile、直接运行 Go 二进制，此时无需构建/启动 pdf-parser。它本地不加载模型，使用前只需在 Console 为知识库选择 VLM 或配置 `RAG_VLM_*`。
 - Compose `app` 服务只运行 `rag-service`；worker 没有内置 compose 服务，可用一次性容器（把入口覆盖为 worker 二进制或 `/app/bin/rag-document-worker`、连接到同一网络并复用同一环境）或参考 [DEPLOYMENT](DEPLOYMENT.md) 的 systemd/override 示例。
 - **已验证/未验证**：历史 2026-11-09 的实机记录针对已下线的 Debezium Server/outbox 链路。当前分布式 Kafka Connect 双 worker、固定名称注册、worker failover、FAILED task 自动重启、缓存消费者 revision 收敛与双 topic 实链路**尚未在本环境实机验证**（本环境无 Docker daemon）；`scripts/verify-debezium-e2e.py` 已加入验收 2/3/4 与真实消息解码检查，需在预发环境执行。Go 镜像构建、compose `app` profile 与 worker 容器仍未经实机验证；pdf-parser 镜像与真实视觉端点推理同样未在本环境验证（联调使用 `RAG_PDF_SERVICE_CONVERTER=fake`，测试不访问网络）。
+
+### Kubernetes（Kustomize）
+
+应用层清单在 [`deploy/k8s/`](../deploy/k8s/README.md)：`overlays/go` 与 `overlays/vision`
+是两个**完整**安装入口（后者额外拉起 `pdf-parser` 高保真 PDF 服务），
+需要展示缓存时用 `overlays/go-cache` / `overlays/vision-cache`。
+MySQL、Qdrant、Kafka、分布式 Kafka Connect（含匹配版本的 Debezium MySQL 插件）以及
+可选 Redis 都由使用方提供。
+
+```bash
+kubectl create namespace praxis-rag
+kubectl apply -k deploy/k8s/common                        # ConfigMap（改掉占位域名）
+# 先按下面的「Secret 键」创建 praxis-rag-secrets
+kubectl apply -k deploy/k8s/bootstrap/state-migrate       # schema（先于应用；副本不执行 DDL）
+kubectl apply -k deploy/k8s/bootstrap/connect-register    # 注册两个 Debezium 连接器并等 RUNNING
+kubectl apply -k deploy/k8s/overlays/go                   # 或 overlays/vision
+kubectl -n praxis-rag port-forward svc/rag-service 8011:8011
+```
+
+- Secret 键名是契约：`RAG_SERVICE_TOKEN`、`RAG_MYSQL_PASSWORD`、`RAG_STATE_ENCRYPTION_KEY`
+  必填；`RAG_MYSQL_DEBEZIUM_PASSWORD`/`RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD` 只给注册 Job；
+  启用缓存再加 `RAG_REDIS_URL`。
+- 三个 worker 复用同一个 Go 镜像，用 `command` 覆盖入口；文档 worker 起步 1 副本，
+  扩缩容与验收、Pod 重建后的重投行为、存储/临时目录与权限、升级回退顺序都写在
+  [`deploy/k8s/README.md`](../deploy/k8s/README.md)。
+- `/health` 与 `/healthz` 固定返回 200，只证明进程能响应；依赖就绪与队列状态用
+  `GET /v1/admin/monitor/overview`（经 `port-forward` 属于本机直连）检查。
 
 ## 9. Token 与远程部署
 
