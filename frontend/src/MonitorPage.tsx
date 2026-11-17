@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, createContext, useContext, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, createContext, useContext, type ReactNode } from "react";
 import {
   Alert,
   App,
@@ -406,6 +406,114 @@ function PipelineRow({ label, status, detail, children }: {
   );
 }
 
+// MonitorMasonry packs its blocks into columns so a short card can be followed
+// by the next card instead of waiting for its tall neighbour to end. Native CSS
+// masonry is not available in stable browsers yet (Chrome/Edge 140 gate it
+// behind about:flags; Safari 26.4 exposes display:grid-lanes), so the columns are
+// distributed here: every block is measured once per layout pass and placed in
+// the currently shortest column. Blocks keep their relative order inside a
+// column, and a single-column flow (narrow screens, or a browser that reports no
+// width) is the same as the previous stacked layout.
+type MonitorMasonryBlock = { key: string; node: ReactNode };
+
+function MonitorMasonry({ blocks, dense = false }: { blocks: MonitorMasonryBlock[]; dense?: boolean }) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  const itemRefs = useRef(new Map<string, HTMLDivElement>());
+  const lastSignature = useRef("");
+  const keys = blocks.map((block) => block.key).join("|");
+  const [columnCount, setColumnCount] = useState(1);
+  const [columns, setColumns] = useState<string[][]>(() => [blocks.map((block) => block.key)]);
+
+  // Column count follows the container, not the viewport, so the layout still
+  // works when the Console is embedded in a narrower pane.
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const resolve = () => {
+      const width = host.clientWidth;
+      const next = width >= 1200 && dense ? 3 : width >= 992 ? 2 : 1;
+      setColumnCount((current) => (current === next ? current : next));
+    };
+    resolve();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(resolve);
+    observer.observe(host);
+    return () => observer.disconnect();
+  }, [dense]);
+
+  // A changed block set or column count resets to an even distribution; the
+  // measuring pass below then repacks by real height.
+  useEffect(() => {
+    setColumns((current) => {
+      const next: string[][] = Array.from({ length: columnCount }, () => []);
+      blocks.forEach((block, index) => next[index % columnCount].push(block.key));
+      const same = current.length === next.length
+        && current.every((column, index) => column.join("|") === next[index].join("|"));
+      if (same) return current;
+      lastSignature.current = "";
+      return next;
+    });
+    // blocks identity changes every render; the key string is the real input.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keys, columnCount]);
+
+  // Repack by measured height. The signature guard keeps this from looping:
+  // column width does not change with the assignment, so heights are stable.
+  useLayoutEffect(() => {
+    if (columnCount <= 1) return;
+    const measured = blocks.map((block) => ({
+      key: block.key,
+      height: itemRefs.current.get(block.key)?.offsetHeight ?? 0,
+    }));
+    if (measured.every((item) => item.height === 0)) return;
+    const signature = `${columnCount}:${measured.map((item) => item.height).join(",")}`;
+    if (signature === lastSignature.current) return;
+    lastSignature.current = signature;
+    const totals = new Array(columnCount).fill(0) as number[];
+    const next: string[][] = Array.from({ length: columnCount }, () => []);
+    for (const item of measured) {
+      let target = 0;
+      for (let index = 1; index < totals.length; index += 1) {
+        if (totals[index] < totals[target]) target = index;
+      }
+      next[target].push(item.key);
+      totals[target] += item.height + 12;
+    }
+    setColumns(next);
+  });
+
+  // Blocks added between renders stay visible until the packing pass runs.
+  const placed = new Set(columns.flat());
+  const pending = blocks.filter((block) => !placed.has(block.key)).map((block) => block.key);
+  const rendered = columns.length
+    ? columns.map((column, index) => (
+      (index === 0 && pending.length ? [...column, ...pending] : column)
+    ))
+    : [blocks.map((block) => block.key)];
+  const byKey = new Map(blocks.map((block) => [block.key, block.node]));
+
+  return (
+    <div className="monitor-masonry" ref={hostRef} data-columns={rendered.length}>
+      {rendered.map((column, index) => (
+        <div className="monitor-masonry-column" key={index}>
+          {column.map((key) => (
+            <div
+              className="monitor-masonry-item"
+              key={key}
+              ref={(node) => {
+                if (node) itemRefs.current.set(key, node);
+                else itemRefs.current.delete(key);
+              }}
+            >
+              {byKey.get(key)}
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // KeyMetricsCard carries the page's first screen: task health instead of static
 // service configuration. Each value degrades to 未知 when its section is
 // unavailable rather than pretending the queue is empty.
@@ -621,13 +729,13 @@ function OverviewTab({ overview }: { overview: MonitorOverview }) {
           ) : "后端未返回具体降级详情，请查看下方依赖状态。"}
         />
       )}
-      <div className="monitor-grid">
-        {/* 关键指标整行铺开（五个指标一行），下面服务信息与系统资源并排。 */}
-        <div className="monitor-grid-span-full">
-          <KeyMetricsCard overview={overview} />
-        </div>
-        <ServiceInfoCard service={overview.service} />
-        <SystemResourcesCard system={overview.system} />
+      <div className="monitor-stack">
+        {/* 关键指标整行铺开（五个指标一行），其余两块按最小列高填充。 */}
+        <KeyMetricsCard overview={overview} />
+        <MonitorMasonry blocks={[
+          { key: "service", node: <ServiceInfoCard service={overview.service} /> },
+          { key: "system", node: <SystemResourcesCard system={overview.system} /> },
+        ]} />
       </div>
     </Flex>
   );
@@ -1342,141 +1450,162 @@ function ComponentTab({ tab, overview, autoRefresh, active }: {
   switch (tab) {
     case "mysql":
       return (
-        <Flex vertical gap={16}>
-          {/* 依赖表需要整行宽度；其余三块信息量小，宽屏上三列并排。 */}
-          <div className="monitor-grid monitor-grid--dense">
-            <div className="monitor-grid-span-full">
-              <DependencyCard overview={overview} names={["mysql"]} />
-            </div>
-            <Card size="small" title="文档任务队列">
-              <DocumentJobsBlock queues={overview.queues} />
-            </Card>
-            <Card size="small" title="上传操作">
-              <UploadsBlock uploads={overview.queues?.uploads} />
-            </Card>
-            <Card size="small" title="库与活动">
-              <LibraryActivityBlock library={overview.library} activity={overview.activity} />
-            </Card>
-          </div>
+        <div className="monitor-stack">
+          {/* 依赖表需要整行宽度；其余三块按最小列高填充（宽屏三列）。 */}
+          <DependencyCard overview={overview} names={["mysql"]} />
+          <MonitorMasonry dense blocks={[
+            { key: "jobs", node: (
+              <Card size="small" title="文档任务队列">
+                <DocumentJobsBlock queues={overview.queues} />
+              </Card>
+            ) },
+            { key: "uploads", node: (
+              <Card size="small" title="上传操作">
+                <UploadsBlock uploads={overview.queues?.uploads} />
+              </Card>
+            ) },
+            { key: "library", node: (
+              <Card size="small" title="库与活动">
+                <LibraryActivityBlock library={overview.library} activity={overview.activity} />
+              </Card>
+            ) },
+          ]} />
           {logPanel}
-        </Flex>
+        </div>
       );
     case "redis":
       return (
-        <Flex vertical gap={16}>
-          <div className="monitor-grid">
-            <DependencyCard overview={overview} names={["redis"]} />
-            <Card size="small" title="缓存水位">
-              <CacheBlock pipeline={overview.pipeline} />
-            </Card>
-          </div>
+        <div className="monitor-stack">
+          <MonitorMasonry blocks={[
+            { key: "dependency", node: <DependencyCard overview={overview} names={["redis"]} /> },
+            { key: "cache", node: (
+              <Card size="small" title="缓存水位">
+                <CacheBlock pipeline={overview.pipeline} />
+              </Card>
+            ) },
+          ]} />
           {logPanel}
-        </Flex>
+        </div>
       );
     case "qdrant":
       return (
-        <Flex vertical gap={16}>
-          <div className="monitor-grid">
-            <DependencyCard overview={overview} names={["qdrant"]} />
-            <Card size="small" title="Qdrant 集合">
-              <section className="monitor-block" aria-label="Qdrant 集合">
-                <Descriptions
-                  size="small"
-                  column={1}
-                  items={[
-                    { key: "collection", label: "集合名", children: overview.service?.collection || "未知" },
-                  ]}
-                />
-                <p className="secondary monitor-note">
-                  依赖行中的“向量点”为该集合当前存储的点数；集合名来自服务配置。
-                </p>
-              </section>
-            </Card>
-          </div>
+        <div className="monitor-stack">
+          <MonitorMasonry blocks={[
+            { key: "dependency", node: <DependencyCard overview={overview} names={["qdrant"]} /> },
+            { key: "collection", node: (
+              <Card size="small" title="Qdrant 集合">
+                <section className="monitor-block" aria-label="Qdrant 集合">
+                  <Descriptions
+                    size="small"
+                    column={1}
+                    items={[
+                      { key: "collection", label: "集合名", children: overview.service?.collection || "未知" },
+                    ]}
+                  />
+                  <p className="secondary monitor-note">
+                    依赖行中的“向量点”为该集合当前存储的点数；集合名来自服务配置。
+                  </p>
+                </section>
+              </Card>
+            ) },
+          ]} />
           {logPanel}
-        </Flex>
+        </div>
       );
     case "kafka":
       return (
-        <Flex vertical gap={16}>
-          <div className="monitor-grid">
-            <DependencyCard overview={overview} names={["kafka"]} />
-            <Card size="small" title="文档任务投递状态">
-              <DocumentJobsStatusBlock pipeline={overview.pipeline} />
-            </Card>
-            {/* 消费进度行包含 topic/group/位点长文本，保留整行宽度换行。 */}
-            <div className="monitor-grid-span-full">
-              <Card size="small" title="Kafka 消费进度">
-                <KafkaGroupsBlock pipeline={overview.pipeline} />
+        <div className="monitor-stack">
+          <MonitorMasonry blocks={[
+            { key: "dependency", node: <DependencyCard overview={overview} names={["kafka"]} /> },
+            { key: "delivery", node: (
+              <Card size="small" title="文档任务投递状态">
+                <DocumentJobsStatusBlock pipeline={overview.pipeline} />
               </Card>
-            </div>
-          </div>
+            ) },
+          ]} />
+          {/* 消费进度行包含 topic/group/位点长文本，保留整行宽度换行。 */}
+          <Card size="small" title="Kafka 消费进度">
+            <KafkaGroupsBlock pipeline={overview.pipeline} />
+          </Card>
           {logPanel}
-        </Flex>
+        </div>
       );
     case "pdf":
       return (
-        <Flex vertical gap={16}>
-          <div className="monitor-grid">
-            <DependencyCard overview={overview} names={["pdf-service"]} />
-            <Card size="small" title="PDF 引擎">
-              <section className="monitor-block" aria-label="PDF 引擎">
-                <Descriptions
-                  size="small"
-                  column={1}
-                  items={[
-                    { key: "engine", label: "引擎", children: overview.service?.pdf_engine || "未知" },
-                  ]}
-                />
-                <p className="secondary monitor-note">
-                  PDF 解析服务是可选独立微服务；依赖行的延迟与详情来自其健康探针。版面/OCR/表格/公式/图片描述由服务端配置的远端视觉模型提供。
-                </p>
-              </section>
-            </Card>
-          </div>
+        <div className="monitor-stack">
+          <MonitorMasonry blocks={[
+            { key: "dependency", node: <DependencyCard overview={overview} names={["pdf-service"]} /> },
+            { key: "engine", node: (
+              <Card size="small" title="PDF 引擎">
+                <section className="monitor-block" aria-label="PDF 引擎">
+                  <Descriptions
+                    size="small"
+                    column={1}
+                    items={[
+                      { key: "engine", label: "引擎", children: overview.service?.pdf_engine || "未知" },
+                    ]}
+                  />
+                  <p className="secondary monitor-note">
+                    PDF 解析服务是可选独立微服务；依赖行的延迟与详情来自其健康探针。版面/OCR/表格/公式/图片描述由服务端配置的远端视觉模型提供。
+                  </p>
+                </section>
+              </Card>
+            ) },
+          ]} />
           {logPanel}
-        </Flex>
+        </div>
       );
     case "worker":
       return (
-        <Flex vertical gap={16}>
-          <div className="monitor-grid">
-            <Card size="small" title="Worker 心跳">
-              <WorkerBlock pipeline={overview.pipeline} />
-            </Card>
-            <Card size="small" title="文档任务状态">
-              <DocumentJobsStatusBlock pipeline={overview.pipeline} />
-            </Card>
-            <Card size="small" title="副本数（Kubernetes）">
-              <WorkerScaleCard active={active} />
-            </Card>
-            <Card size="small" title="阶段分布">
-              <StageDistributionBlock queues={overview.queues} />
-            </Card>
-          </div>
+        <div className="monitor-stack">
+          <MonitorMasonry dense blocks={[
+            { key: "heartbeat", node: (
+              <Card size="small" title="Worker 心跳">
+                <WorkerBlock pipeline={overview.pipeline} />
+              </Card>
+            ) },
+            { key: "delivery", node: (
+              <Card size="small" title="文档任务状态">
+                <DocumentJobsStatusBlock pipeline={overview.pipeline} />
+              </Card>
+            ) },
+            { key: "scale", node: (
+              <Card size="small" title="副本数（Kubernetes）">
+                <WorkerScaleCard active={active} />
+              </Card>
+            ) },
+            { key: "stages", node: (
+              <Card size="small" title="阶段分布">
+                <StageDistributionBlock queues={overview.queues} />
+              </Card>
+            ) },
+          ]} />
           {logPanel}
-        </Flex>
+        </div>
       );
     case "debezium":
       return (
-        <Flex vertical gap={16}>
-          {/* 文档与缓存采集是两条独立链路：拆成并排的两张卡各自成行，
-              保持“互不合并”的同时让两行内容共享一行高度。 */}
+        <div className="monitor-stack">
+          {/* 文档与缓存采集是两条独立链路：各占一列，保持“互不合并”。 */}
           <section aria-label="采集连接器">
-            <div className="monitor-grid">
-              <Card size="small" title="文档采集连接器">
-                <CaptureRow label="文档采集" connector={overview.pipeline?.debezium?.tasks} />
-              </Card>
-              <Card size="small" title="缓存采集连接器">
-                <CaptureRow label="缓存采集" connector={overview.pipeline?.debezium?.cache} />
-              </Card>
-            </div>
+            <MonitorMasonry blocks={[
+              { key: "document", node: (
+                <Card size="small" title="文档采集连接器">
+                  <CaptureRow label="文档采集" connector={overview.pipeline?.debezium?.tasks} />
+                </Card>
+              ) },
+              { key: "cache", node: (
+                <Card size="small" title="缓存采集连接器">
+                  <CaptureRow label="缓存采集" connector={overview.pipeline?.debezium?.cache} />
+                </Card>
+              ) },
+            ]} />
           </section>
           <Card size="small" title="文档任务投递状态">
             <DocumentJobsStatusBlock pipeline={overview.pipeline} />
           </Card>
           {logPanel}
-        </Flex>
+        </div>
       );
     default:
       return null;
