@@ -1,0 +1,26 @@
+# 缓存组件：Redis 读模型消费者 + 缓存死信消费者 + 应用侧的 Redis 连接。
+#
+# 启用方式（两种都基于已有入口，避免维护重复的完整清单）：
+#   kubectl kustomize deploy/k8s/overlays/go-cache       # go + 缓存
+#   kubectl kustomize deploy/k8s/overlays/vision-cache   # vision + 缓存
+# 也可以在自己的 overlay 里加：
+#   components: [../../components/cache]
+#
+# Redis 本身由使用方提供（集群可达的 Redis 7），本组件不部署 Redis。
+# 必需的 Secret 键：RAG_REDIS_URL（形如 redis://:password@redis.infra:6379/0）。
+#
+# 为什么需要它：缓存服务的是 Console/读模型的展示缓存。没有缓存消费者时
+# 应用照常工作（只是读模型不走 Redis），但一旦打开 RAG_REDIS_ENABLED=true
+# 就必须有消费者把 CDC 变更写进 Redis，否则读到的会是旧视图。
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - deployment-rag-cache-worker.yaml
+  - deployment-rag-dead-letter-cache.yaml
+
+patches:
+  # 普通参数：打开缓存并给出独立前缀/水位。
+  - path: configmap-patch.yaml
+  # 应用侧需要 Redis 连接（缓存命中路径由 rag-service 读取）。
+  - path: patch-service-redis.yaml

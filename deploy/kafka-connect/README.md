@@ -78,8 +78,8 @@ dist/bin/rag-connect.exe register --offline --connector-dir deploy/kafka-connect
 
 # 注册/更新并等待两个 connector 与 task 都 RUNNING
 $env:RAG_CONNECT_URLS = "http://127.0.0.1:8083,http://127.0.0.1:8084"
-dist/bin/rag-connect.exe register --wait 180
-dist/bin/rag-connect.exe wait --wait 180
+dist/bin/rag-connect.exe register --wait 180s
+dist/bin/rag-connect.exe wait --wait 180s
 dist/bin/rag-connect.exe status
 ```
 
@@ -137,7 +137,7 @@ dist/bin/rag-connect.exe status
 docker stop praxis-rag-connect-1        # 换成实际 worker
 
 # 在接管窗口内提交一个文档；存活 worker 应接管 task 并从保存位点继续
-dist/bin/rag-connect.exe wait --wait 180
+dist/bin/rag-connect.exe wait --wait 180s
 
 docker start praxis-rag-connect-1
 ```

@@ -4,7 +4,7 @@
 // Usage:
 //
 //	rag-connect register [--urls ...] [--connector-dir DIR] [--expected-version V]
-//	rag-connect wait     [--timeout 180] [--poll 2]
+//	rag-connect wait     [--timeout 180s] [--poll 2s]
 //	rag-connect status   [--json]
 //	rag-connect plugins  [--expected-version V]
 //	rag-connect supervise

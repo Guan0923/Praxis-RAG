@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, createContext, useContext, type ReactNode } from "react";
 import {
   Alert,
+  App,
   Button,
   Card,
   Col,
   Descriptions,
   Flex,
   Input,
+  InputNumber,
   Row,
   Segmented,
   Select,
@@ -23,6 +25,7 @@ import {
   errorText,
   fetchMonitorLogs,
   fetchMonitorOverview,
+  fetchWorkerDeployment,
   formatBytes,
   formatDateTime,
   formatDuration,
@@ -32,7 +35,11 @@ import {
   monitorDependencyStatusColors,
   monitorDependencyStatusLabels,
   monitorTabComponents,
+  requeueDocumentJobs,
+  restartMonitorConnector,
+  scaleWorker,
   uploadJobStageLabels,
+  type MonitorActionCapabilities,
   type MonitorActivity,
   type MonitorDependency,
   type MonitorDependencyStatus,
@@ -50,6 +57,7 @@ import {
   type MonitorService,
   type MonitorSystem,
   type MonitorTabComponent,
+  type MonitorWorkerDeployment,
 } from "./api";
 
 // monitorRefreshMs is the auto-refresh period: the backend does not push
@@ -61,6 +69,35 @@ const monitorRefreshMs = 15_000;
 // tab asks for a wider client-paginated window instead.
 const monitorComponentLogLimit = 50;
 const monitorAllLogLimit = 100;
+
+// --- Operator actions (监控操作) ---------------------------------------------
+//
+// The monitor page is read-only by construction, but a handful of rows name a
+// concrete operator remedy (stuck jobs, exhausted connector restarts, worker
+// capacity). Those rows carry their action button. Every action is
+// admin-scoped on the backend; the page hides a button whose capability flag
+// is false (older backend or unwired deployment) instead of calling an
+// endpoint that answers 503.
+
+// MonitorActionContext carries the action runners and the capability flags
+// down to the blocks, so each block stays presentational. Each runner takes
+// the thunk to call, surfaces the result message, refreshes the snapshot, and
+// resolves when the underlying call settles so the button spinner stops.
+type MonitorActionContextValue = {
+  capabilities?: MonitorActionCapabilities;
+  refresh: () => void;
+  requeueJobs: (run: () => Promise<{ requeued: number }>) => Promise<void>;
+  restartConnector: (run: () => Promise<{ restarted: boolean }>, connector: string) => Promise<void>;
+  scale: (run: () => Promise<{ replicas: number }>) => Promise<void>;
+};
+
+const MonitorActionContext = createContext<MonitorActionContextValue | null>(null);
+
+// useMonitorActions is the block-side accessor. A null context (unit tests
+// rendering a block standalone) simply hides the buttons.
+function useMonitorActions(): MonitorActionContextValue | null {
+  return useContext(MonitorActionContext);
+}
 
 // The three-state overall status ranks the snapshot. An older backend omits the
 // field entirely, in which case the boolean fallback keeps the header honest.
@@ -600,9 +637,149 @@ function DependencyCard({ overview, names }: { overview: MonitorOverview; names:
   );
 }
 
-// DocumentJobsBlock is the queue view shared by the MySQL and Worker tabs:
-// status counts, the oldest queue age, stuck/failed counters and the stage
-// distribution the queue worker reports.
+// RequeueJobsAction is the「立即重投」button placed under the stuck-jobs
+// counter. It requeues due retries and expired leases now instead of waiting
+// for the worker's periodic sweep; the backend keeps the attempt budget, so
+// this cannot force a fourth execution. The result count and follow-up
+// refresh are handled by the shared runner in MonitorPage.
+function RequeueJobsAction() {
+  const actions = useMonitorActions();
+  const [running, setRunning] = useState(false);
+  if (!actions?.capabilities?.requeue_jobs) return null;
+  return (
+    <Button
+      size="small"
+      loading={running}
+      onClick={() => {
+        setRunning(true);
+        void actions.requeueJobs(() => requeueDocumentJobs()).finally(() => setRunning(false));
+      }}
+    >
+      立即重投
+    </Button>
+  );
+}
+
+// RestartConnectorAction is the「重启连接器」button on one capture row. It
+// shows when the connector reports failed tasks or an exhausted restart
+// budget — the two states an operator remedies by hand.
+function RestartConnectorAction({ connector }: { connector?: MonitorPipelineConnector | null }) {
+  const actions = useMonitorActions();
+  const [running, setRunning] = useState(false);
+  const name = connector?.connector;
+  const needed = !!connector && (connector.failed_tasks > 0 || connector.restart_exhausted);
+  if (!actions?.capabilities?.restart_connectors || !needed || !name) return null;
+  return (
+    <Button
+      size="small"
+      loading={running}
+      onClick={() => {
+        setRunning(true);
+        void actions
+          .restartConnector(() => restartMonitorConnector(name), name)
+          .finally(() => setRunning(false));
+      }}
+    >
+      重启连接器
+    </Button>
+  );
+}
+
+// WorkerScaleCard is the document-worker capacity card on the Worker tab. It
+// reads the Deployment replica state (desired vs ready) and applies a new
+// replica count through the same merge patch kubectl scale uses. Outside a
+// cluster (no service account / RBAC) the card reports 未启用 instead of
+// pretending to work.
+function WorkerScaleCard({ active }: { active: boolean }) {
+  const actions = useMonitorActions();
+  const [deployment, setDeployment] = useState<MonitorWorkerDeployment>();
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [replicas, setReplicas] = useState<number | null>(null);
+  const [applying, setApplying] = useState(false);
+  const request = useRef<AbortController | null>(null);
+  const enabled = !!actions?.capabilities?.scale_worker;
+
+  const load = useCallback(async () => {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setLoading(true);
+    try {
+      const view = await fetchWorkerDeployment(controller.signal);
+      if (!controller.signal.aborted) {
+        setDeployment(view);
+        setReplicas(view.desired_replicas);
+        setError("");
+      }
+    } catch (cause) {
+      if (!controller.signal.aborted) setError(errorText(cause));
+    } finally {
+      if (!controller.signal.aborted) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!enabled || !active) return;
+    void load();
+    return () => request.current?.abort();
+  }, [enabled, active, load]);
+
+  if (!enabled) {
+    return (
+      <section className="monitor-block" aria-label="Worker 扩缩容">
+        <p className="secondary monitor-note">
+          扩缩容操作未启用：需要在 Kubernetes 内部署 rag-service 并应用 RBAC 清单
+          （deploy/k8s/base/rbac-monitor-ops.yaml）。Compose/宿主机部署不受影响。
+        </p>
+      </section>
+    );
+  }
+  if (error) {
+    return (
+      <section className="monitor-block" aria-label="Worker 扩缩容">
+        <Alert type="error" showIcon title="副本状态读取失败" description={<span className="preserve-lines">{error}</span>} />
+      </section>
+    );
+  }
+  return (
+    <section className="monitor-block" aria-label="Worker 扩缩容">
+      <Flex vertical gap={8}>
+        <Flex wrap gap={12} align="center">
+          <span className="secondary">
+            {deployment
+              ? `期望副本 ${deployment.desired_replicas}　就绪 ${deployment.ready_replicas}`
+              : loading ? "正在读取副本状态" : "副本状态未知"}
+          </span>
+          <InputNumber
+            size="small"
+            min={0}
+            max={64}
+            value={replicas}
+            onChange={(value) => setReplicas(typeof value === "number" ? value : null)}
+            aria-label="目标副本数"
+          />
+          <Button
+            size="small"
+            loading={applying}
+            disabled={replicas === null || (deployment !== undefined && replicas === deployment.desired_replicas)}
+            onClick={() => {
+              if (replicas === null || !actions) return;
+              setApplying(true);
+              void actions.scale(() => scaleWorker(replicas)).finally(() => setApplying(false));
+            }}
+          >
+            应用副本数
+          </Button>
+        </Flex>
+        <p className="secondary monitor-note">
+          缩容时正在处理的分区会 rebalance 给存活副本；未提交消息重新投递，由 schedule_version 与租约保证幂等。
+          修改的是 Deployment 的 spec.replicas（与 kubectl scale 等价）。
+        </p>
+      </Flex>
+    </section>
+  );
+}
 function DocumentJobsBlock({ queues }: { queues: MonitorQueues | null }) {
   const jobs = queues?.document_jobs;
   const stages = Object.entries(jobs?.by_stage || {}).map(([stage, count]) => ({ stage, count }));
@@ -614,7 +791,16 @@ function DocumentJobsBlock({ queues }: { queues: MonitorQueues | null }) {
         column={1}
         items={[
           { key: "oldest", label: "最老排队", children: queues ? formatDuration(jobs?.oldest_queued_seconds) : "未知" },
-          { key: "stuck", label: "卡死处理中", children: queues ? `${jobs?.stuck_processing ?? 0} 个` : "未知" },
+          {
+            key: "stuck",
+            label: "卡死处理中",
+            children: (
+              <Flex gap={8} align="center">
+                <span>{queues ? `${jobs?.stuck_processing ?? 0} 个` : "未知"}</span>
+                <RequeueJobsAction />
+              </Flex>
+            ),
+          },
           { key: "failed", label: "近 24 小时失败", children: queues ? `${jobs?.failed_recent ?? 0} 个` : "未知" },
         ]}
       />
@@ -777,6 +963,7 @@ function CaptureRow({ label, connector }: {
         {failure ? <span>{failure}</span> : null}
         <span>{connectorRestartText(connector)}</span>
         <span>{captureProgressText(connector?.capture_progress)}</span>
+        <RestartConnectorAction connector={connector} />
       </Flex>
     </PipelineRow>
   );
@@ -1247,6 +1434,9 @@ function ComponentTab({ tab, overview, autoRefresh, active }: {
           <Card size="small" title="Worker 心跳">
             <WorkerBlock pipeline={overview.pipeline} />
           </Card>
+          <Card size="small" title="副本数（Kubernetes）">
+            <WorkerScaleCard active={active} />
+          </Card>
           <Card size="small" title="文档任务状态">
             <DocumentJobsStatusBlock pipeline={overview.pipeline} />
           </Card>
@@ -1322,6 +1512,7 @@ export function MonitorPage() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [activeTab, setActiveTab] = useState("overview");
   const request = useRef<AbortController | null>(null);
+  const { message } = App.useApp();
 
   const load = useCallback(async () => {
     // A new request supersedes the previous one, so a slow response can never
@@ -1345,6 +1536,32 @@ export function MonitorPage() {
       }
     }
   }, []);
+
+  // The three operator-action runners. Each surfaces a result message and
+  // refreshes the snapshot, so the operator immediately sees the effect
+  // (requeued counters, connector state, replica counts).
+  const actionContext = useMemo<MonitorActionContextValue>(() => ({
+    capabilities: overview?.actions,
+    refresh: () => void load(),
+    requeueJobs: (run) => run().then((result) => {
+      message.success(`已重投 ${result.requeued} 个到期/租约过期任务`);
+      void load();
+    }).catch((cause: unknown) => {
+      message.error(`任务重投失败：${errorText(cause)}`);
+    }),
+    restartConnector: (run, connector) => run().then(() => {
+      message.success(`已请求重启连接器 ${connector}（含任务）`);
+      void load();
+    }).catch((cause: unknown) => {
+      message.error(`连接器重启失败：${errorText(cause)}`);
+    }),
+    scale: (run) => run().then((result) => {
+      message.success(`已应用副本数 ${result.replicas}`);
+      void load();
+    }).catch((cause: unknown) => {
+      message.error(`副本数修改失败：${errorText(cause)}`);
+    }),
+  }), [overview?.actions, load, message]);
 
   useEffect(() => {
     void load();
@@ -1404,12 +1621,14 @@ export function MonitorPage() {
       {loading && !overview ? (
         <Spin description="正在读取监控快照…" />
       ) : overview ? (
-        <Tabs
-          className="monitor-tabs"
-          activeKey={activeTab}
-          onChange={setActiveTab}
-          items={monitorTabs(overview, autoRefresh, activeTab)}
-        />
+        <MonitorActionContext.Provider value={actionContext}>
+          <Tabs
+            className="monitor-tabs"
+            activeKey={activeTab}
+            onChange={setActiveTab}
+            items={monitorTabs(overview, autoRefresh, activeTab)}
+          />
+        </MonitorActionContext.Provider>
       ) : null}
     </section>
   );

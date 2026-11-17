@@ -1,0 +1,27 @@
+# 一次性 Job：建表 / 增量迁移（--apply）。
+#
+# 前提：先执行 `kubectl apply -k deploy/k8s/common` 创建 ConfigMap。
+# 本目录刻意不声明 ConfigMap（避免重跑 Job 时覆盖 overlay 的键）。
+#
+#   kubectl apply -k deploy/k8s/bootstrap/state-migrate
+#   kubectl -n praxis-rag wait --for=condition=complete job/rag-state-migrate --timeout=300s
+#   kubectl -n praxis-rag logs job/rag-state-migrate
+#
+# 只在干净安装或升级需要补齐 schema 时执行一次。应用副本用
+# RAG_STATE_AUTO_SCHEMA=false 启动，所以**必须**先让它成功，否则 API 的
+# 第一批请求会报缺少表（不是启动失败）。
+#
+# 重跑前必须删除旧 Job（spec.template 不可变）：
+#   kubectl -n praxis-rag delete job rag-state-migrate --ignore-not-found
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: praxis-rag
+
+resources:
+  - job.yaml
+
+images:
+  - name: praxis-rag
+    newName: praxis-rag
+    newTag: "1.0.0"

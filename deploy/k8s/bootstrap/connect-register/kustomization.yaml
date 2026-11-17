@@ -1,0 +1,27 @@
+# 一次性 Job：注册两个 Debezium MySQL 连接器并等待它们就绪。
+#
+# 前提：先执行 `kubectl apply -k deploy/k8s/common` 创建 ConfigMap，
+# 且 schema 迁移 Job 已成功（CDC 开始采集时目标表必须已经存在）。
+#
+#   kubectl apply -k deploy/k8s/bootstrap/connect-register
+#   kubectl -n praxis-rag wait --for=condition=complete job/rag-connect-register --timeout=420s
+#   kubectl -n praxis-rag logs job/rag-connect-register
+#
+# 必须在应用启动之前执行；本目录刻意不声明 ConfigMap（避免重跑时覆盖
+# overlay 的键）。
+#
+# 注册是幂等的：按固定名称 PUT，配置完全相同就不发更新，
+# 所以重复执行不会打断健康的采集 task。重跑前删除旧 Job：
+#   kubectl -n praxis-rag delete job rag-connect-register --ignore-not-found
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: praxis-rag
+
+resources:
+  - job.yaml
+
+images:
+  - name: praxis-rag
+    newName: praxis-rag
+    newTag: "1.0.0"

@@ -1,0 +1,76 @@
+# 文档死信消费者。
+#
+# broker 重投耗尽（RAG_DOCUMENT_BROKER_MAX_RETRIES）后，消息被投到
+# RAG_DOCUMENT_DLQ_TOPIC；本进程用独立 group（RAG_DOCUMENT_DLQ_GROUP）
+# 把「重试预算耗尽」写成 document_jobs 的终态 failed，客户端随后通过
+# 普通状态接口看到结果。它不重跑推理、不重新入队。
+#
+# 独立成一个 Deployment 而不是塞进 document worker：死信进程
+# （MaxAttempts=0，永不 ack 掉无法落库的死信）必须长期在线且，
+# 且它的消费组与业务消费组不同，扩缩容互不影响。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-dead-letter-document
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: document-dlq
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: praxis-rag
+      app.kubernetes.io/component: document-dlq
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: document-dlq
+        app.kubernetes.io/part-of: praxis-rag
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-dead-letter-document
+          image: praxis-rag:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["/app/bin/rag-dead-letter-worker", "--kind", "document"]
+          envFrom:
+            - configMapRef:
+                name: praxis-rag-config
+          env:
+            - name: RAG_SERVICE_HOST
+              value: "127.0.0.1"
+            - name: RAG_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MYSQL_PASSWORD
+            - name: RAG_STATE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_STATE_ENCRYPTION_KEY
+            - name: TMPDIR
+              value: /var/tmp/rag
+          volumeMounts:
+            - name: tmp
+              mountPath: /var/tmp/rag
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi

@@ -1,0 +1,23 @@
+# 只给 Console 日志文件的持久卷。
+#
+# ReadWriteOnce：单节点读写。它可以被同一节点上的多个 Pod 挂载，
+# **不能**作为跨节点多副本的共享目录，也不能作为文档 worker 的解析暂存区
+# （workspace 归属按 Pod hostname 判定，见 README §10）。
+#
+# 需要指定 StorageClass 时取消下面 storageClassName 的注释；
+# 留空表示使用集群默认 StorageClass。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: praxis-rag-data
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: storage
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # storageClassName: standard
+  resources:
+    requests:
+      storage: 10Gi

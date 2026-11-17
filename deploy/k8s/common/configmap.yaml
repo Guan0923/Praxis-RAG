@@ -1,0 +1,122 @@
+# Praxis-RAG 公共非机密配置（ConfigMap）。
+#
+# 用法：所有工作负载用 envFrom.configMapRef 注入本 ConfigMap，再用各自的
+# env 覆盖角色相关的少量变量（RAG_SERVICE_HOST、TMPDIR）。
+# 这些键名就是代码读取的环境变量名，改名等于改契约。
+#
+# ---------------------------------------------------------------------------
+# 按环境必须替换的值（`*.infra.svc.cluster.local` 是占位域名）：
+#   QDRANT_URL                    -> 使用方提供的 Qdrant HTTP 地址
+#   RAG_MYSQL_HOST / PORT         -> 使用方提供的 MySQL 8 地址
+#   RAG_KAFKA_BOOTSTRAP_SERVERS   -> 使用方提供的 Kafka 地址
+#   RAG_CONNECT_URLS              -> 分布式 Kafka Connect 的 REST 地址（每个 worker 一条）
+# 同时要确认（见 README §5）：
+#   RAG_CONNECT_KAFKA_BOOTSTRAP_SERVERS 会写进 Debezium 连接器配置，
+#   必须是 **Kafka Connect worker 进程**能解析和访问的地址，而不是本 Pod 的视角。
+#   RAG_MYSQL_HOST 同理：它同时是应用的状态库地址和连接器的 database.hostname。
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: praxis-rag-config
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/part-of: praxis-rag
+    app.kubernetes.io/component: config
+data:
+  # --- 进程与数据根目录 ------------------------------------------------
+  RAG_BACKEND: qdrant
+  RAG_SERVICE_PORT: "8011"
+  # 只用作进程工作目录与（可选的）日志文件父目录。
+  # 文档正文、切块、artifact 与向量分别存在 MySQL / Qdrant，
+  # 上传解析的暂存目录是 os.TempDir()（本部署用 TMPDIR 指向 emptyDir）。
+  RAG_SERVICE_DATA_ROOT: /app/data
+  # 由 bootstrap/state-migrate 的一次性 Job 创建 schema；应用副本不执行 DDL。
+  # 设为 "false" 时缺表不会在启动阶段报错，而是在第一次访问时报缺少表，
+  # 所以必须先跑迁移 Job（README §6.2）。
+  RAG_STATE_AUTO_SCHEMA: "false"
+  RAG_STATE_POOL_SIZE: "10"
+  RAG_STATE_MAX_OVERFLOW: "20"
+
+  # --- 检索后端 --------------------------------------------------------
+  QDRANT_URL: http://qdrant.infra.svc.cluster.local:6333
+  RAG_COLLECTION: mini_agent_knowledge_pdf_assets_v1
+
+  # --- 状态库（唯一事实来源）-------------------------------------------
+  RAG_MYSQL_HOST: mysql.infra.svc.cluster.local
+  RAG_MYSQL_PORT: "3306"
+  RAG_MYSQL_DATABASE: praxis_rag
+  RAG_MYSQL_USER: rag
+
+  # --- Kafka：两个业务 topic 与两个死信 topic --------------------------
+  RAG_KAFKA_BOOTSTRAP_SERVERS: kafka.infra.svc.cluster.local:9092
+  RAG_KAFKA_CLIENT_ID: praxis-rag
+  RAG_DOCUMENT_TOPIC: praxis_document_ingest
+  RAG_DOCUMENT_GROUP: praxis_document_ingest_workers
+  RAG_DOCUMENT_DLQ_TOPIC: praxis_document_ingest_dead_letters
+  RAG_DOCUMENT_DLQ_GROUP: praxis_document_dead_letters
+  RAG_CACHE_TOPIC: praxis_state_cache_refresh
+  RAG_CACHE_GROUP: praxis_state_cache_refresh_workers
+  RAG_CACHE_DLQ_TOPIC: praxis_state_cache_refresh_dead_letters
+  RAG_CACHE_DLQ_GROUP: praxis_state_cache_refresh_dead_letters
+
+  # --- Kafka Connect（Debezium）REST 与固定契约名 ----------------------
+  # 任意一个 worker 都能回答集群级连接器状态；列出全部 worker 才能在
+  # 某个 worker 不可达时仍看到状态。
+  RAG_CONNECT_URLS: http://connect.infra.svc.cluster.local:8083
+  RAG_CONNECT_DOCUMENT_CONNECTOR: praxis-document-cdc
+  RAG_CONNECT_CACHE_CONNECTOR: praxis-cache-cdc
+  # rag-service 进程内的 supervisor：只重启 FAILED task，指数退避。
+  RAG_CONNECT_SUPERVISOR_INTERVAL_SECONDS: "15"
+  RAG_CONNECT_RESTART_MAX_ATTEMPTS: "5"
+  RAG_CONNECT_RESTART_BASE_BACKOFF_SECONDS: "2"
+  RAG_CONNECT_RESTART_MAX_BACKOFF_SECONDS: "300"
+
+  # --- CDC 注册 Job 用的连接器参数（模板占位符）------------------------
+  # 镜像内模板在 /app/connect/connectors（Dockerfile 已复制）。
+  RAG_CONNECT_CONNECTOR_DIR: /app/connect/connectors
+  DEBEZIUM_CONNECT_VERSION: 3.7.1.Final
+  DEBEZIUM_SERVER_ID: "184054"
+  DEBEZIUM_CACHE_SERVER_ID: "184055"
+  RAG_CDC_DOCUMENT_SCHEMA_HISTORY_TOPIC: praxis_cdc_document_schema_history
+  RAG_CDC_CACHE_SCHEMA_HISTORY_TOPIC: praxis_cdc_cache_schema_history
+  RAG_CONNECT_KAFKA_BOOTSTRAP_SERVERS: kafka.infra.svc.cluster.local:9092
+  # 两个连接器各用一个 MySQL 账号（只在这里写用户名，口令在 Secret 里）。
+  RAG_MYSQL_DEBEZIUM_USER: debezium
+  RAG_MYSQL_DEBEZIUM_CACHE_USER: debezium_cache
+
+  # --- 文档 worker ----------------------------------------------------
+  # 每个副本的 handler goroutine 数（mq.MaxConsumerConcurrency=64）。
+  # 首版保守取 1：一个 PDF 解析在内存里可能占用数百 MiB。
+  RAG_DOCUMENT_WORKER_CONCURRENCY: "1"
+  RAG_DOCUMENT_WORKER_RECOVER_SECONDS: "30"
+  # 进程心跳（写 runtime_heartbeats，供 Console 证明 worker 真的在跑）。
+  RAG_DOCUMENT_WORKER_HEARTBEAT_SECONDS: "15"
+  # 单任务租约与续租间隔：Pod 被强制删除后，最多约
+  # lease(300s) + recover(30s) 才会被下一次扫描重新投递。
+  RAG_DOCUMENT_JOB_LEASE_SECONDS: "300"
+  RAG_DOCUMENT_JOB_HEARTBEAT_SECONDS: "20"
+  # broker 重投上限；与 document_jobs.attempts（单文档预算 3）互相独立。
+  RAG_DOCUMENT_BROKER_MAX_RETRIES: "3"
+
+  # --- 缓存 worker（只在启用 components/cache 时被使用）---------------
+  RAG_CACHE_WORKER_CONCURRENCY: "1"
+
+  # --- PDF 解析引擎 ---------------------------------------------------
+  # go 入口用进程内的纯文本解析器；vision 入口由 overlays/vision 覆盖为 vision
+  # 并补上 RAG_PDF_SERVICE_URL=http://pdf-parser:8091。
+  # 显式写 go 而不是留空：留空时「配置了 URL 就选 vision」的隐式规则会让
+  # 一次配置回退悄悄改变解析语义。
+  RAG_PDF_ENGINE: go
+  RAG_PDF_SERVICE_TIMEOUT: "900"
+  RAG_WORD_CONVERT_TIMEOUT: "120"
+
+  # --- MCP Host / Origin 白名单 --------------------------------------
+  # 默认只允许 kubectl port-forward 的 loopback 访问（见 README §7）。
+  # 换成正式域名前，MCP 请求会被 403；in-cluster 客户端也要显式加进来。
+  RAG_MCP_ALLOWED_HOSTS: "127.0.0.1,127.0.0.1:*,localhost,localhost:*"
+  RAG_MCP_ALLOWED_ORIGINS: "http://127.0.0.1,http://127.0.0.1:*,http://localhost,http://localhost:*"
+
+  # --- 日志 -----------------------------------------------------------
+  RAG_LOG_LEVEL: info
+  RAG_LOG_FORMAT: text

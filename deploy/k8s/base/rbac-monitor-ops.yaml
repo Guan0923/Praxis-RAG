@@ -1,0 +1,65 @@
+# rag-service 的 Kubernetes 操作专用 ServiceAccount + 最小 RBAC。
+#
+# 背景：Console 监控页的「worker 扩缩容」卡片通过 rag-service 进程内的
+# k8sops 客户端调用 Kubernetes API（GET/PATCH deployments 的
+# spec.replicas，即 kubectl scale 的服务端等价物）。本清单只授权这一个
+# 动词、这一个资源、这一个 Deployment 命名空间内的访问：
+#
+#   - ServiceAccount  rag-monitor-ops      —— 只有 rag-service 使用；
+#   - Role            rag-monitor-ops      —— 仅 apps 组 deployments 的
+#                                            get + patch（scale 的实现），
+#                                            不含 create/delete/escalate；
+#   - RoleBinding     rag-monitor-ops      —— 绑定到上述 ServiceAccount。
+#
+# 不可用时的行为：未挂载 ServiceAccount（Compose/宿主机部署、或未应用
+# 本清单）时，rag-service 启动不受影响，监控页的扩缩容卡片显示
+# 「未启用」；应用本清单后无需重启即生效（token 由 kubelet 投影轮换，
+# 客户端每次调用重新读取）。
+#
+# 安全边界：
+#   - Role 限定在 praxis-rag 命名空间（kustomize namespace 字段）；
+#   - 资源名限定 rag-document-worker：进程可以读写自己部署的 worker
+#     副本数，但读不到其他 Deployment（`resourceNames` 同时约束 get）。
+#     注意：resourceNames 对 patch 的 verbs 约束同样生效，扩展部署其它
+#     worker 前先改这里；
+#   - 不授予 list/watch：监控页不展示集群全量信息。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rag-monitor-ops
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: praxis-rag
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rag-monitor-ops
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: praxis-rag
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    # get+patch 是 deployments/scale 子资源读写的等价最小集；
+    # 实际走主资源路径的 merge patch（与 kubectl scale 相同）。
+    verbs: ["get", "patch"]
+    resourceNames: ["rag-document-worker"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rag-monitor-ops
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: praxis-rag
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rag-monitor-ops
+subjects:
+  - kind: ServiceAccount
+    name: rag-monitor-ops

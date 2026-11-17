@@ -1,0 +1,24 @@
+# 可选：为「需要跨重建保留」的数据提供 PVC。
+#
+# 结论（依据代码，见 README §10）：Praxis-RAG 的持久数据已经在
+# MySQL（文档/切块/artifact/任务）、Qdrant（向量）和 Kafka（offset）里；
+# RAG_SERVICE_DATA_ROOT=/app/data 在运行期**只**用于：
+#   1) runtime.New 确保目录存在；
+#   2) 可选的 RAG_LOG_FILE（Console 日志页读的 JSON Lines 文件）。
+# 所以默认部署用容器可写层即可，不需要 PVC。需要把 Console 日志视图的
+# 文件跨重建保留时，再叠加本组件。
+#
+# 用法（必须叠在某个完整入口之上）：
+#   components: [../../components/persistence]
+#
+# 限制：ReadWriteOnce 只保证同一个节点上的多 Pod 挂载；不要把它当
+# 「多副本共享目录」。文档 worker 的解析暂存目录必须保持 per-Pod emptyDir，
+# 因为 workspace 归属按 Pod hostname 判定。
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - pvc.yaml
+
+patches:
+  - path: patch-rag-service-volume.yaml

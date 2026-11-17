@@ -1,0 +1,14 @@
+# 把公共 ConfigMap 的 PDF 配置切到 pdf-parser。
+#
+# 这两个键由应用和文档 worker 共同读取（两者都会解析文档）：
+#   RAG_PDF_ENGINE=vision        -> 走 HTTP 调用远端解析服务
+#   RAG_PDF_SERVICE_URL          -> 与 overlays/vision 里的 Service 同名
+# 超时仍沿用 ConfigMap 的 RAG_PDF_SERVICE_TIMEOUT=900（Go 侧 HTTP 预算），
+# 与服务端 RAG_PDF_SERVICE_TIMEOUT 保持一致。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: praxis-rag-config
+data:
+  RAG_PDF_ENGINE: vision
+  RAG_PDF_SERVICE_URL: http://pdf-parser:8091

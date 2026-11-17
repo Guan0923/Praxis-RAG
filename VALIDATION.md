@@ -16,6 +16,145 @@
 > `search_result_snapshots` 表保留数据但不再读写。当前搜索验证以同步检索、超时/取消与
 > artifact 独立读取为准（见 [产物引用](docs/result-references.md)）。
 
+## Kubernetes 应用层部署（Kustomize）— 2026-11-17
+
+工作树 `dsh-0a7946b7-479b`（Windows 11，kubectl v1.36.1 / kustomize v5.8.1）。
+本轮交付的是**应用层 Kubernetes 清单**（`deploy/k8s/`）：MySQL / Qdrant / Kafka /
+Kafka Connect 与可选 Redis 仍由使用方提供，清单只部署 API/MCP/Console、三个 worker
+和可选的 pdf-parser。
+
+离线部分（渲染 + 534 项契约断言）见下；真实集群实测见「真实集群补测」。
+
+### 已验证（可复核，全部离线）
+
+```powershell
+# 1) 渲染全部入口（四个完整 overlay + 四个 bootstrap + 公共 ConfigMap）
+foreach ($o in 'go','vision','go-cache','vision-cache') { kubectl kustomize "deploy/k8s/overlays/$o" > $null }
+foreach ($b in 'state-check','state-migrate','connect-precheck','connect-register') { kubectl kustomize "deploy/k8s/bootstrap/$b" > $null }
+kubectl kustomize deploy/k8s/common > $null
+# 全部 exit 0；bootstrap 各只产出 1 个 Job，common 只产出 1 个 ConfigMap
+
+# 2) 清单契约断言：命令、镜像、Service selector、Secret 键、DNS、探针、资源、安全上下文
+python deploy/k8s/tests/verify_manifests.py        # checks=534 failures=0
+
+# 3) 连接器模板用清单实际注入的变量展开（环境取自渲染出的 ConfigMap + Secret 键）
+go run ./cmd/rag-connect register --offline --connector-dir deploy/kafka-connect/connectors --wait 180s
+# → praxis-cache-cdc / praxis-document-cdc 各 31 项配置已展开，exit 0
+
+# 4) --wait 的单位：裸数字不可用（Go duration 标志）
+go run ./cmd/rag-connect register --offline --wait 180
+# → invalid value "180" for flag -wait: parse error（exit 2）
+```
+
+第 4 项是本轮发现的既有缺陷：`docker-compose.yml` 的 `connect-init`、
+`scripts/start-stack.ps1`、`deploy/kafka-connect/README.md` 与 `cmd/rag-connect/main.go`
+的使用注释都写成 `--wait 180`，会让注册流程直接退出 2（start-stack 随后抛
+「Connector registration failed」）。已统一改为 `180s`，Kubernetes 的注册 Job 也用 `180s`。
+
+```powershell
+go build ./cmd/rag-connect     # exit 0
+go vet ./cmd/rag-connect       # exit 0
+```
+
+镜像运行时用户（决定 securityContext 的写法；按 Dockerfile 运行时阶段的同样步骤实测）：
+
+```powershell
+docker run --rm alpine:3.21 sh -c 'apk add --no-cache ca-certificates tzdata wget >/dev/null 2>&1; addgroup -S rag; adduser -S -D -G rag rag; id rag'
+# → uid=100(rag) gid=101(rag)
+```
+
+`USER rag` 是**名字**用户：kubelet 无法校验非 root，设 `runAsNonRoot: true` 会以
+`image has non-numeric user (rag)` 拒绝启动；写死 `runAsUser` 又会在基础镜像换 UID 时
+丢掉 `/app` 写权限。因此 Go 工作负载不设置这两个字段，改用
+`allowPrivilegeEscalation: false` + `capabilities.drop: [ALL]` + `seccompProfile: RuntimeDefault`；
+pdf-service 的 UID 在构建期固定为 10001，可以设置 `runAsNonRoot: true` + `runAsUser: 10001`。
+
+### 实测环境（2026-11-17 下午补测，见下方「真实集群补测」）
+
+kind v0.27.0 单节点集群（`praxis-accept`，node 镜像 `kindest/node:v1.32.2` 经 daocloud 镜像源拉取）+ 本机 Docker 栈（MySQL 8 / Kafka / Qdrant / Redis / pdf-parser / 两个 Kafka Connect worker）。应用镜像为本仓库 `Dockerfile` 的等价最小镜像（同一 `/app/bin` 契约、`rag` 100:101 用户），kind 加载后由 kubelet 调度。
+
+### 真实集群补测（2026-11-17 下午，逐项实测）
+
+1. **server-side dry-run**：8 个入口（4 overlay + 4 bootstrap Job）`kubectl apply --server-side --dry-run=server -k` 全部 `serverside-applied (server dry run)`，exit 0。
+2. **真实 apply**：`go+persistence` 变体真实落盘——ConfigMap / Service / PVC（`standard` StorageClass，Bound 10Gi）/ 3 个 Deployment 全部创建；3 个 Pod `Running`，资源 requests/limits、`/health` 探针、Recreate 策略、`data`+`tmp` 卷均按清单生效；无 Warning 事件。
+3. **bootstrap Job**：`state-check`（3s Complete，`schema=ready tables=32`）、`state-migrate`（4s Complete，`mode=apply ... schema=ready`）集群内实测；`connect-precheck`/`connect-register` 亦在集群内跑通（见 4）。
+4. **CDC 注册与 binlog 位点**：两连接器 `RUNNING`（task0 RUNNING，分布在两个 Connect worker）；上传后 `mysql-bin.000040 pos 29012747 → 29403665`（document 连接器位点实测推进）。Kafka 重建后以全新内部 topic 重新注册，`register --wait 180s` + `wait --wait 180s` 全通过（0 退出）。
+5. **上传 → succeeded → 同步检索带出处**：宿主机与集群内（port-forward → Service → rag-service Pod → CDC → 集群内 document-worker Pod 消费）双路径实测；`e2e-k8s.txt` `succeeded/completed`，检索 `evidence_status=found`，命中含 `source/chunk_id/page/artifact resource_uri`。
+6. **一次 MCP 调用**：`initialize`（拿 `Mcp-Session-Id`）→ `notifications/initialized`（202）→ `tools/call search`（200，SSE data 行）→ 内层 JSON `evidence_status=found`，宿主机与集群内各跑一遍。
+7. **vision 真实 VLM**：pdf-parser 容器日志见 `POST aihub-api…/v1/chat/completions 200`；1 页 PDF 证据 `page=1`、`pdf_parser_version=docling-service-v1`、source/markdown/manifest 3 个 artifact。集群内 pdf-parser Pod 同样跑通（含一次 VLM 网关偶发 500 后 job 自愈重试成功）。
+8. **worker 1→2**：消费组 `praxis_accept_document_workers` 从 1 成员（4 分区全占）到 2 成员各占 `(0,2)`/`(1,3)`；心跳实例=Pod 名（`rag-document-worker-<pod>-1`）。
+9. **§9 终止演练**：SIGTERM（容器级，`Upload failure record pending → context canceled` 后优雅停止）与 `--grace-period=0 --force` 等价 SIGKILL 两种；默认参数（租约 300s + 扫描 30s）下删除唯一 worker 并立即起新副本，任务在 **+301s** 由新副本重投并 `succeeded`；残留核对：旧 Pod 的 `upload_operations.workspace_node` 行为 `ROLLED_BACK`（旧执行）+ 新执行 `COMMITTED`，`workspace_node=NULL`，`cleanup_pending=1`，唯一可检索版本无重复。容器级对照（60s 短租约）同样验证了 skip→re-emit→接管全链路。
+10. **文档 worker Pod 删除（集群内）**：`kubectl delete pod` 处理中文档，+301s 后由存活副本完成，`podkill.pdf` 证据 `page=1`、provenance `#/texts/0`。
+
+补测期间的环境事实（对复现重要）：本机 Kafka 通告 `127.0.0.1:9092`，kind Pod 内回连不可达——实测中给 broker 临时加了 `EXTERNAL_KIND` listener 并经 Service+Endpoints 暴露；Kafka 容器重建导致内部 topic 与 accept 业务 topic 重建，连接器以 `snapshot=initial` 重新采集。这些是**本机验收环境的补丁**，不属于交付清单内容；生产集群按 README §5 提供可达的 `kafka.infra.svc.cluster.local:9092` 即无此问题。
+
+### 未验证（缺集群与外部依赖）
+
+- 无。六项原「未验证」条目已在 2026-11-17 下午的真实集群补测中全部实测（见上方「真实集群补测」）。
+- 以下为补测中的已知边界，非清单缺陷：
+  - 本机 VLM 网关偶发 500（一次 `/v1/parse 500`），job 3 次预算内自愈；8 页 PDF 曾 3 次耗尽转 `failed`（属远端模型稳定性）。
+  - 本机 Kafka advertised listener 限制（见上）；生产按 README §5 配置无此问题。
+  - `scale` 下游「限流」项：实测了分区再平衡与心跳；限流（QPS/带宽）在本机栈无对应指标，未测。
+
+验收步骤、判定标准与失败排查见 [deploy/k8s/README.md](deploy/k8s/README.md) §6/§8/§9/§15。
+
+## Console 监控页运维操作（立即重投 / 重启连接器 / worker 扩缩容）— 2026-11-17
+
+工作树 `dsh-0a7946b7-479b`。本轮把监控页从「只读」升级为「按能力渲染操作按钮」：
+`overview` 顶层新增 `actions` 能力块（4 个布尔），三个操作端点全部在
+`/v1/admin/*` 边界（管理员会话 + CSRF，或本机直连破窗）。
+
+### 已验证（可复核）
+
+```powershell
+# Go（串行，MySQL 容器 praxis-rag-mysql 在 127.0.0.1:3307）
+$env:RAG_TEST_MYSQL_URL = 'mysql://rag:<密码>@127.0.0.1:3307/praxis_unit_test'
+go test -p 1 -count=1 ./internal/k8sops ./internal/state ./internal/connect ./internal/httpapi ./internal/monitor
+# ok × 5；新增：k8sops 6 例（GET/PATCH 契约、403/404 哨兵、范围校验、非集群降级）
+#   state 1 例（RequeueDueNow 到期重试+租约过期、不动 queued/活租约）
+#   connect 2 例（ResetRestartBudget 清空耗尽预算、未知连接器无操作）
+#   httpapi 7 例（重投/重启/扩缩容的传输契约、管理边界、参数校验、未装配 503）
+#   monitor 既有用例回归（actions 能力块不破坏现有快照契约）
+
+# 前端
+cd frontend; npx tsc --noEmit          # exit 0
+npx vitest run src/MonitorPage.test.tsx   # 33/33（新增 5 例：能力开关隐藏、
+#   重投 POST+CSRF+toast、失败行重启按钮、扩缩容读+改副本、未启用卡片说明）
+npx vite build                         # ✓（build/ 产物不提交）
+
+# 清单
+python deploy/k8s/tests/verify_manifests.py   # checks=546 failures=0
+#   （新增 12 项断言覆盖 rbac-monitor-ops.yaml 的 SA/Role/RoleBinding 与
+#    rag-service 的 serviceAccountName 接线）
+```
+
+### 宿主机真实栈实测（2026-11-17 傍晚，MySQL/Kafka/遗留 Debezium Server 栈）
+
+- `actions` 能力块：宿主机（未挂 ServiceAccount）返回
+  `requeue_jobs:true, restart_connectors:true, scale_worker:false, worker_deployment:false`——
+  与「未启用降级」设计一致。
+- **立即重投**：手工把一个 `failed` 终态任务改成 `processing + lease_until=0` 制造卡死行
+  → overview `stuck_processing:1` → `POST /actions/requeue-jobs` 返回 `{"requeued":1}`
+  → 数据库回到 `queued/retry_wait` 且 `schedule_version` 1226→1227（Debezium 的替代通知信号），
+  `attempts` 保持 1（预算未额外消耗）。测试后已把该行恢复为 `failed/failed`。
+- **K8s 未启用降级**：`GET /actions/worker-deployment` 与 `POST .../scale`
+  均返回 503 `Kubernetes 操作未启用（未挂载 ServiceAccount）`；宿主机启动日志输出对应 INFO。
+- **鉴权边界**：`Host: example.com` 的管理调用 403 `仅允许本机直接访问管理接口`。
+- **参数校验**：未知连接器名 400 `未知连接器`；非 JSON body 422（FastAPI 形状）；
+  `replicas` 越界（-1/65）400。
+- **重启连接器**（REST 交互）：宿主机遗留部署是 Debezium Server 而非 Kafka Connect
+  （8083/8084 无 Connect REST），实测返回 502 `连接器重启请求失败`（正确错误映射）；
+  Connect REST 的 `includeTasks=true` 请求形状、403/404 映射与 supervisor 预算清空
+  由 Go 单测覆盖（fakeStatusClient + RestartConnector patch 断言）。真实 Connect 集群
+  上的端到端重启在下次集群验收时补测。
+
+### 未验证
+
+- kind 集群内的扩缩容按钮端到端（需要重建集群；RBAC/patch 形状已由 verify_manifests.py
+  与 k8sops 单测覆盖，kubectl scale 等价性见 README §8.1）。
+- 真实 Kafka Connect 集群上的「重启连接器」按钮端到端（见上；宿主机栈为遗留 Debezium
+  Server，不提供 Connect REST）。
+
 ## 当前验证范围：搜索同步化（MCP/REST 一次调用直返证据）— 2026-11-13
 
 工作树 `dsh-07b26c03-826a`（Windows 11，Go 1.27.3）。本轮验证目标是**搜索同步化改造**：MCP `search` 与 REST `POST /v1/search` 一次调用返回证据；删除搜索任务、结果快照、轮询、SQL 任务逻辑、搜索队列/worker/DLQ 与 Debezium 搜索采集；artifact 独立读取与缓存同步链路保留。代码/文档/Console 变更范围见 [PROGRESS.md](PROGRESS.md) 最后一轮。

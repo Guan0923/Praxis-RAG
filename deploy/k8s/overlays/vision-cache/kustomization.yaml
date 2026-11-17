@@ -1,0 +1,17 @@
+# vision 入口 + 展示缓存：在 overlays/vision（含 pdf-parser）之上再加
+# rag-cache-worker / rag-dead-letter-cache 与 Redis 连接配置。
+#
+#   kubectl kustomize deploy/k8s/overlays/vision-cache
+#   kubectl apply -k deploy/k8s/overlays/vision-cache
+#
+# 前提：Secret 里已有 RAG_REDIS_URL，且集群内可达该 Redis。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: praxis-rag
+
+resources:
+  - ../vision
+
+components:
+  - ../../components/cache

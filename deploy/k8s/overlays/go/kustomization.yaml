@@ -1,0 +1,25 @@
+# go 入口：完整安装清单，使用 Go 进程内的纯文本 PDF 解析器。
+#
+# 适用于只上传 txt/md/docx/纯文本 PDF 的场景：不部署 pdf-parser，也不访问
+# 任何视觉模型端点。需要扫描件、版面/OCR/表格/公式与图片描述时用
+# overlays/vision。
+#
+#   kubectl kustomize deploy/k8s/overlays/go     # 只渲染，不落盘
+#   kubectl apply -k deploy/k8s/overlays/go      # 应用到集群
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: praxis-rag
+
+resources:
+  - ../../base
+
+# 镜像仓库/标签按环境替换；name 必须与 base 里的 image 名一致。
+images:
+  - name: praxis-rag
+    newName: praxis-rag
+    newTag: "1.0.0"
+
+# RAG_PDF_ENGINE=go 已写在 common/configmap.yaml 里（显式优先于
+# "配置了 URL 就选 vision" 的隐式规则）。本 overlay 不需要额外 patch：
+# go 入口与 base 工作负载完全一致，便于对照排查。

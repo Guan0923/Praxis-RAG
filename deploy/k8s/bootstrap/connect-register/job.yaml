@@ -1,0 +1,73 @@
+# 连接器注册 + 就绪等待。
+#
+# 两条命令必须**串行**在同一容器里执行（不要拆成两个 Job 靠 apply 顺序）：
+#   rag-connect register --wait 180s   等所有 Connect worker 可访问、校验插件版本、
+#                                      按固定名称创建/更新两个连接器
+#   rag-connect wait     --wait 180s   等两个连接器与全部 task 都 RUNNING
+# --wait 是 Go duration 标志：必须写 180s。写成 180 会以
+# `invalid value "180" for flag -wait: parse error` 退出 2（已实测）。
+#
+# 模板来自镜像内的 /app/connect/connectors（Dockerfile 复制 deploy/kafka-connect），
+# 占位符由本 Job 的环境变量展开：
+#   RAG_MYSQL_DEBEZIUM_PASSWORD / RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD  <- Secret
+#   其余（地址、topic、server id、schema history topic）              <- ConfigMap
+#
+# 这两个口令只注入本 Job：运行中的应用和 worker 用不到 CDC 账号。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-connect-register
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: bootstrap
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  # 注册失败几乎都是配置/网络问题，重复重试会掩盖真实原因。
+  backoffLimit: 1
+  # register 最多 180s + wait 最多 180s，留出镜像拉取余量。
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: Never
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-connect-register
+          image: praxis-rag:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              /app/bin/rag-connect register --wait 180s
+              /app/bin/rag-connect wait --wait 180s
+          envFrom:
+            - configMapRef:
+                name: praxis-rag-config
+          env:
+            - name: RAG_MYSQL_DEBEZIUM_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MYSQL_DEBEZIUM_PASSWORD
+            - name: RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { ConfigProvider } from "antd";
+import { App as AntApp, ConfigProvider } from "antd";
 import { MonitorPage } from "./MonitorPage";
 import {
   formatDuration,
+  setCSRFToken,
   type MonitorLogEntry,
   type MonitorLogPage,
   type MonitorOverview,
@@ -353,6 +354,8 @@ function logCard(panelLabel: string) {
 
 beforeEach(() => {
   fetchMock.mockReset();
+  // 操作按钮的 POST 断言需要一个非空 CSRF token（api.ts 仅在有 token 时带头）。
+  setCSRFToken("test-csrf");
   vi.stubGlobal("fetch", fetchMock);
   vi.stubGlobal("ResizeObserver", class {
     observe() { /* jsdom has no layout */ }
@@ -1073,6 +1076,181 @@ describe("MonitorPage", () => {
 
     fireEvent.click(toggle);
     await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
+  // --- Operator actions -----------------------------------------------------
+  // 三个操作按钮都在能力开关（overview.actions）为真时才渲染；POST 都带 CSRF
+  // 头（fetchMock 断言 headers）；成功后刷新快照。
+
+  function renderPageWithActions() {
+    return render(
+      <ConfigProvider button={{ autoInsertSpace: false }}>
+        <AntApp>
+          <MonitorPage />
+        </AntApp>
+      </ConfigProvider>,
+    );
+  }
+
+  it("hides every action button when the backend does not report capabilities", async () => {
+    // 老 backend 没有 actions 块：三个按钮都不得出现（不会去调 503 端点）。
+    renderPage();
+    await waitFor(() => expect(screen.getByText("0.4.0")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "立即重投" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "重启连接器" })).toBeNull();
+
+    await openTab("文档 Worker");
+    // 能力开关关闭时，扩缩容卡片解释原因而不是假装可用。
+    const scaleBlock = await screen.findByLabelText("Worker 扩缩容");
+    expect(within(scaleBlock).getByText(/扩缩容操作未启用/)).toBeTruthy();
+  });
+
+  it("posts the requeue action from the stuck counter and refreshes", async () => {
+    overviewPayload = () => jsonResponse(overviewFixture({
+      actions: { requeue_jobs: true, restart_connectors: false, scale_worker: false, worker_deployment: false },
+    }));
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/v1/admin/monitor/logs")) {
+        logUrls.push(url);
+        return jsonResponse(logsResponder(url));
+      }
+      if (url.includes("/v1/admin/monitor/actions/requeue-jobs")) {
+        return jsonResponse({ requeued: 2 });
+      }
+      return overviewPayload();
+    });
+    renderPageWithActions();
+    await waitFor(() => expect(screen.getByText("0.4.0")).toBeTruthy());
+
+    // MySQL tab 的文档任务队列：卡死处理中行带上「立即重投」。
+    await openTab("MySQL");
+    const jobsBlock = await screen.findByLabelText("文档任务队列");
+    expect(within(jobsBlock).getByText("卡死处理中")).toBeTruthy();
+    const requeue = within(jobsBlock).getByRole("button", { name: "立即重投" });
+    await waitFor(() => expect(requeue.className).not.toContain("ant-btn-loading"));
+    fireEvent.click(requeue);
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find((item) => String(item[0]).includes("/v1/admin/monitor/actions/requeue-jobs"));
+      expect(call).toBeTruthy();
+    });
+    const call = fetchMock.mock.calls.find((item) => String(item[0]).includes("/v1/admin/monitor/actions/requeue-jobs"))!;
+    expect((call[1] as RequestInit).method).toBe("POST");
+    // headers 经 apiResponse 组装为 Headers 实例（CSRF 双提交头）。
+    const headers = new Headers((call[1] as RequestInit).headers);
+    expect(headers.get("X-CSRF-Token")).toBe("test-csrf");
+    // 成功后的 toast 文案带重投计数。
+    expect(await screen.findByText(/已重投 2 个/)).toBeTruthy();
+  });
+
+  it("shows the restart button only on a failed capture connector and posts the restart", async () => {
+    const fixture = overviewFixture({
+      actions: { requeue_jobs: false, restart_connectors: true, scale_worker: false, worker_deployment: false },
+    });
+    fixture.pipeline!.debezium.cache = {
+      ...fixture.pipeline!.debezium.cache,
+      status: "error",
+      failed_tasks: 1,
+      restart_exhausted: true,
+      restart_attempts: 5,
+      recovery: "exhausted",
+      failure_reason: "Access denied",
+    };
+    overviewPayload = () => jsonResponse(fixture);
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/v1/admin/monitor/logs")) {
+        logUrls.push(url);
+        return jsonResponse(logsResponder(url));
+      }
+      if (url.includes("/actions/connectors/")) {
+        return jsonResponse({ connector: "praxis-cache-cdc", restarted: true });
+      }
+      return overviewPayload();
+    });
+    renderPageWithActions();
+    await waitFor(() => expect(screen.getByText("0.4.0")).toBeTruthy());
+
+    await openTab("Debezium");
+    const connectorBlock = await screen.findByLabelText("采集连接器");
+    // 只有失败的一路渲染按钮；健康的一路（文档采集）没有。
+    const restart = within(connectorBlock).getByRole("button", { name: "重启连接器" });
+    expect(within(connectorBlock).getAllByRole("button", { name: "重启连接器" })).toHaveLength(1);
+    fireEvent.click(restart);
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        (item) => String(item[0]).includes("/actions/connectors/praxis-cache-cdc/restart"),
+      );
+      expect(call).toBeTruthy();
+    });
+    expect(await screen.findByText(/已请求重启连接器 praxis-cache-cdc/)).toBeTruthy();
+  });
+
+  it("renders the worker scale card, reads the deployment and applies a new replica count", async () => {
+    overviewPayload = () => jsonResponse(overviewFixture({
+      actions: { requeue_jobs: false, restart_connectors: false, scale_worker: true, worker_deployment: true },
+    }));
+    const deploymentPayload = {
+      deployment: {
+        name: "rag-document-worker",
+        namespace: "praxis-rag",
+        desired_replicas: 1,
+        ready_replicas: 1,
+        available_replicas: 1,
+        observed_generation: 3,
+      },
+    };
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/v1/admin/monitor/logs")) {
+        logUrls.push(url);
+        return jsonResponse(logsResponder(url));
+      }
+      if (url.includes("/v1/admin/monitor/actions/worker-deployment")) {
+        return url.includes("/scale")
+          ? jsonResponse({ replicas: 2 })
+          : jsonResponse(deploymentPayload);
+      }
+      return overviewPayload();
+    });
+    renderPageWithActions();
+    await waitFor(() => expect(screen.getByText("0.4.0")).toBeTruthy());
+
+    await openTab("文档 Worker");
+    const scaleBlock = await screen.findByLabelText("Worker 扩缩容");
+    // 副本读数分两个文本节点（数字与标签间的全角空格被拆分）。
+    await waitFor(() => expect(within(scaleBlock).getByText(/期望副本 1/)).toBeTruthy());
+    await waitFor(() => expect(within(scaleBlock).getByText(/就绪 1/)).toBeTruthy());
+
+    // InputNumber: 改成 2 后按钮可用并 POST {"replicas":2}。
+    const input = within(scaleBlock).getByRole("spinbutton", { name: "目标副本数" });
+    fireEvent.change(input, { target: { value: "2" } });
+    const apply = within(scaleBlock).getByRole("button", { name: "应用副本数" });
+    await waitFor(() => expect((apply as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(apply);
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find((item) => String(item[0]).includes("/actions/worker-deployment/scale"));
+      expect(call).toBeTruthy();
+    });
+    const call = fetchMock.mock.calls.find((item) => String(item[0]).includes("/actions/worker-deployment/scale"))!;
+    expect((call[1] as RequestInit).method).toBe("POST");
+    expect((call[1] as RequestInit).body).toBe('{"replicas":2}');
+    expect(await screen.findByText(/已应用副本数 2/)).toBeTruthy();
+  });
+
+  it("reports the scale card as unavailable when the Kubernetes actions are disabled", async () => {
+    // scale_worker=false：卡片渲染未启用说明（并且不去读 Deployment）。
+    renderPage();
+    await waitFor(() => expect(screen.getByText("0.4.0")).toBeTruthy());
+
+    await openTab("文档 Worker");
+    const scaleBlock = await screen.findByLabelText("Worker 扩缩容");
+    expect(within(scaleBlock).getByText(/需要在 Kubernetes 内部署/)).toBeTruthy();
+    const calls = fetchMock.mock.calls.filter((item) => String(item[0]).includes("worker-deployment"));
+    expect(calls).toHaveLength(0);
   });
 });
 

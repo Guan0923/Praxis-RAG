@@ -150,6 +150,14 @@ type Options struct {
 	// never choose it: only this wiring does, so a caller cannot read arbitrary
 	// files through the log endpoint.
 	LogFilePath string
+
+	// Operator-action wiring (the Console "立即重投"/"重启连接器" buttons and the
+	// worker scale card). Each nil func means the action is unavailable and the
+	// snapshot's actions block reports it false. They are pure capability
+	// probes: the actions themselves are executed by httpapi through
+	// MonitorActionsRuntime, not by the read-only snapshot.
+	RequeueJobs func(ctx context.Context) (int, error)
+	ScaleWorker func(ctx context.Context, replicas int32) error
 }
 
 // Service renders monitoring snapshots. It is safe for concurrent use.
@@ -550,8 +558,31 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 		"library":      library,
 		"activity":     activity,
 		"system":       systemView,
+		"actions":     s.actionsView(),
 		"errors":       errorsList,
 	}
+}
+
+// actionsView reports which operator actions the Console may render. The
+// booleans come from the runtime wiring (nil func = action unavailable), not
+// from health: a broken dependency still allows "requeue now" because the
+// durable row lives in MySQL itself; the connector restart requires Connect.
+func (s *Service) actionsView() monitorActions {
+	return monitorActions{
+		RequeueJobs:   s.options.RequeueJobs != nil,
+		RestartTasks:  s.options.ConnectorProbe != nil,
+		ScaleWorker:   s.options.ScaleWorker != nil,
+		WorkerReplica: s.options.ScaleWorker != nil,
+	}
+}
+
+// monitorActions is the capability block of the snapshot. An older Console
+// build ignores it entirely; the fields are additive.
+type monitorActions struct {
+	RequeueJobs   bool `json:"requeue_jobs"`
+	RestartTasks  bool `json:"restart_connectors"`
+	ScaleWorker   bool `json:"scale_worker"`
+	WorkerReplica bool `json:"worker_deployment"`
 }
 
 // monitorUploadsView renders the upload operations. The old single

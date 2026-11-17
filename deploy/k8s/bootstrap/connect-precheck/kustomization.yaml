@@ -1,0 +1,28 @@
+# 一次性 Job：CDC 采集现状检查（只读，不注册、不改配置）。
+#
+# 前提：先执行 `kubectl apply -k deploy/k8s/common` 创建 ConfigMap。
+#
+#   kubectl apply -k deploy/k8s/bootstrap/connect-precheck
+#   kubectl -n praxis-rag logs job/rag-connect-precheck
+#
+# 就地复用/接管已有 Kafka Connect 时**先跑这个**：
+#   * rag-connect plugins 校验每个 worker 上报的 Debezium MySQL Connector
+#     版本都必须等于 DEBEZIUM_CONNECT_VERSION（混合版本会被拒绝注册）；
+#   * rag-connect status  打印两个固定连接器以及集群内其他连接器的状态与
+#     承载 worker（--all）。
+# 干净安装时 status 会因「连接器不存在」而返回非零（这是预期结果，
+# 说明没有历史采集在跑），plugins 通过即可继续注册。
+#
+# 本 Job 只读，不需要 CDC 数据库口令。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: praxis-rag
+
+resources:
+  - job.yaml
+
+images:
+  - name: praxis-rag
+    newName: praxis-rag
+    newTag: "1.0.0"

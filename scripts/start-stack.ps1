@@ -361,11 +361,13 @@ function Invoke-ConnectRegistration {
         Set-Item -Path "Env:$name" -Value $overrides[$name]
     }
     try {
-        & $Executable register --urls $Urls --expected-version $ExpectedVersion --wait 180
+        # --wait 是 Go duration 标志：必须带单位（180s）。裸数字会让
+        # rag-connect 以 `invalid value "180" for flag -wait` 退出 2。
+        & $Executable register --urls $Urls --expected-version $ExpectedVersion --wait 180s
         if ($LASTEXITCODE -ne 0) {
             throw "Connector registration failed. Check docker compose logs connect-1 connect-2."
         }
-        & $Executable wait --urls $Urls --wait 180
+        & $Executable wait --urls $Urls --wait 180s
         if ($LASTEXITCODE -ne 0) {
             throw "Kafka Connect connectors/tasks did not become RUNNING. Run: dist\bin\rag-connect.exe status"
         }

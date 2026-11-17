@@ -1,0 +1,30 @@
+# vision 入口：完整安装清单 = API/MCP/Console + 文档 worker + 死信 worker
+# + pdf-parser（高保真 PDF 解析）。
+#
+#   kubectl kustomize deploy/k8s/overlays/vision
+#   kubectl apply -k deploy/k8s/overlays/vision
+#
+# 与 go 入口的唯一语义差别：RAG_PDF_ENGINE=vision，且应用与文档 worker
+# 都指向 http://pdf-parser:8091（见 configmap-patch.yaml）。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: praxis-rag
+
+resources:
+  - ../../base
+  - service-pdf-parser.yaml
+  - deployment-pdf-parser.yaml
+
+patches:
+  - path: configmap-patch.yaml
+
+images:
+  # Go 镜像：API、文档 worker、死信 worker 共用同一个镜像。
+  - name: praxis-rag
+    newName: praxis-rag
+    newTag: "1.0.0"
+  # PDF 微服务镜像（python-workers/pdf-service 独立构建）。
+  - name: praxis-rag-pdf-parser
+    newName: praxis-rag-pdf-parser
+    newTag: "1.0.0"
