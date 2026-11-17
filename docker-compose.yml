@@ -196,8 +196,8 @@ services:
       - /bin/sh
       - -c
       - >-
-        /app/bin/rag-connect register --wait 180 &&
-        /app/bin/rag-connect wait --wait 180
+        /app/bin/rag-connect register --wait 180s &&
+        /app/bin/rag-connect wait --wait 180s
     environment:
       RAG_CONNECT_URLS: http://connect-1:8083,http://connect-2:8083
       RAG_CONNECT_CONNECTOR_DIR: /app/connect/connectors

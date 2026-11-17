@@ -1,0 +1,21 @@
+# 给 rag-service 注入 Redis 连接串。
+#
+# 只给「读缓存」的 API 进程：文档/缓存 worker 通过 MySQL 的 cache_revisions
+# 标记脏 key，Redis 视图由 rag-cache-worker 重建，worker 不需要直连 Redis。
+# 覆盖 default/rag-service 容器里同名 env 的合并按 name 进行，因此这里只追加
+# RAG_REDIS_URL，不动已有条目。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-service
+spec:
+  template:
+    spec:
+      containers:
+        - name: rag-service
+          env:
+            - name: RAG_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_REDIS_URL

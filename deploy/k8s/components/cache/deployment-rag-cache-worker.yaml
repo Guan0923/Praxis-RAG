@@ -1,0 +1,79 @@
+# 缓存刷新消费者。
+#
+# 数据流：8 张读模型表 -> Debezium（praxis-cache-cdc）-> RAG_CACHE_TOPIC
+# -> 本进程。它按变更表/op 更新 MySQL 的 cache_revisions（脏水位），
+# 再重建/失效 Redis 视图；与 API 进程完全解耦，所以 API 扩缩容不影响它。
+#
+# 单独的消费组 RAG_CACHE_GROUP，因此它从不与文档队列竞争分区。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-cache-worker
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: cache-worker
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: praxis-rag
+      app.kubernetes.io/component: cache-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: cache-worker
+        app.kubernetes.io/part-of: praxis-rag
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-cache-worker
+          image: praxis-rag:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["/app/bin/rag-cache-worker"]
+          envFrom:
+            - configMapRef:
+                name: praxis-rag-config
+          env:
+            - name: RAG_SERVICE_HOST
+              value: "127.0.0.1"
+            - name: RAG_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MYSQL_PASSWORD
+            - name: RAG_STATE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_STATE_ENCRYPTION_KEY
+            # 写端连接串：只有本进程和 rag-service 需要它。
+            - name: RAG_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_REDIS_URL
+            - name: TMPDIR
+              value: /var/tmp/rag
+          volumeMounts:
+            - name: tmp
+              mountPath: /var/tmp/rag
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi

@@ -1,0 +1,107 @@
+# 文档入库消费者。
+#
+# 数据流：Console/REST 上传 -> MySQL document_jobs 单事务 -> Debezium
+# （praxis-document-cdc）采集 -> RAG_DOCUMENT_TOPIC -> 本 Deployment。
+# 通知只带定位标识与 schedule_version，参数回 MySQL 读。
+#
+# 关键语义（internal/documentworker、internal/state/document_jobs.go）：
+#   * 每个副本加入**同一个** consumer group（RAG_DOCUMENT_GROUP），
+#     分区在副本之间互斥分配；实例身份仍是 hostname-pid，所以扩容后
+#     心跳表能看到多个不同实例。
+#   * 单任务租约默认 300s、每 20s 续租；Pod 被强制删除后，任务在租约
+#     到期（+30s 扫描间隔）后由 Sweep 递增 schedule_version 重新投递，
+#     不需要人工重放。
+#   * SIGTERM 会立刻取消消费循环，进行中的解析随 context 取消；因此
+#     terminationGracePeriodSeconds 给再大也救不回一次长时间解析，
+#     重投由租约完成。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-document-worker
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: document-worker
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  # 起始 1 副本；扩容方式与验收见 README §8。
+  replicas: 1
+  # 保留默认 RollingUpdate：worker 之间是同一消费组的正常 rebalance，
+  # 新旧实例短暂重叠不会重复处理同一分区。
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: praxis-rag
+      app.kubernetes.io/component: document-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: document-worker
+        app.kubernetes.io/part-of: praxis-rag
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # 同 rag-service：镜像用名字用户 `rag`，不设置 runAsNonRoot。
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-document-worker
+          image: praxis-rag:1.0.0
+          imagePullPolicy: IfNotPresent
+          # 镜像 ENTRYPOINT 是 rag-service，必须显式覆盖；不覆盖会启动
+          # 第二个 HTTP 服务（并因端口冲突反复重启）。
+          command: ["/app/bin/rag-document-worker"]
+          envFrom:
+            - configMapRef:
+                name: praxis-rag-config
+          env:
+            # worker 不监听端口，但仍会解析 ServiceSettingsFromEnv。
+            # 镜像内 /app/config.toml 把 RAG_SERVICE_HOST 设为 0.0.0.0，
+            # 那样会要求 RAG_SERVICE_TOKEN；显式改回 loopback，
+            # 让服务 Token 只存在于需要它的 API 副本里（最小权限）。
+            - name: RAG_SERVICE_HOST
+              value: "127.0.0.1"
+            - name: RAG_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MYSQL_PASSWORD
+            # 与 API 完全相同的状态加密密钥：知识库的 enc:v1: 模型凭据
+            # 由 worker 自己解密使用。
+            - name: RAG_STATE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_STATE_ENCRYPTION_KEY
+            - name: RAG_VLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_VLM_API_KEY
+                  optional: true
+            - name: TMPDIR
+              value: /var/tmp/rag
+          volumeMounts:
+            - name: tmp
+              mountPath: /var/tmp/rag
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          # 没有 HTTP 端口，因此没有 readiness/liveness 探针：
+          # 存活判定 = 进程退出后由 kubelet 重启 + runtime_heartbeats
+          # + Kafka 消费进度（README §8）。
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          # 每个副本独立的暂存空间。不要改成 PVC：workspace 归属按
+          # upload_operations.workspace_node（= Pod hostname）判定，
+          # 共享卷不会让新 Pod 接管旧 Pod 的目录（README §10）。
+          emptyDir:
+            sizeLimit: 20Gi

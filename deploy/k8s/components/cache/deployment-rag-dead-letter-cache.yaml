@@ -1,0 +1,74 @@
+# 缓存死信消费者。
+#
+# 缓存刷新是派生状态：毒消息被投到 RAG_CACHE_DLQ_TOPIC 后，本进程只按
+# 类别记录并 ack；受影响 key 的脏水位仍留在 MySQL，等缓存 worker 的补偿
+# 扫描在根因修好后收敛。因此它不会重放，也不会阻塞业务 topic。
+#
+# 消费组必须与业务消费组互不相同（代码启动时会校验），这里用
+# RAG_CACHE_DLQ_GROUP。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-dead-letter-cache
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: cache-dlq
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: praxis-rag
+      app.kubernetes.io/component: cache-dlq
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: cache-dlq
+        app.kubernetes.io/part-of: praxis-rag
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-dead-letter-cache
+          image: praxis-rag:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["/app/bin/rag-dead-letter-worker", "--kind", "cache"]
+          envFrom:
+            - configMapRef:
+                name: praxis-rag-config
+          env:
+            - name: RAG_SERVICE_HOST
+              value: "127.0.0.1"
+            - name: RAG_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MYSQL_PASSWORD
+            - name: RAG_STATE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_STATE_ENCRYPTION_KEY
+            - name: TMPDIR
+              value: /var/tmp/rag
+          volumeMounts:
+            - name: tmp
+              mountPath: /var/tmp/rag
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi

@@ -1,0 +1,73 @@
+# schema 迁移（幂等、增量）。
+#
+# 迁移账号隔离（可选）：如果 Secret 里同时提供了
+#   RAG_MIGRATE_MYSQL_USER / RAG_MIGRATE_MYSQL_PASSWORD
+# 本 Job 会用它们覆盖应用账号；这两把凭据只注入到本 Job，
+# 运行中的应用与 worker 完全看不到（它们只引用 RAG_MYSQL_PASSWORD）。
+# 这就是「迁移凭据只给迁移 Job」的落地方式，不需要改任何清单。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-state-migrate
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: bootstrap
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  # DDL 失败通常需要人工判断（权限、磁盘、锁）；重试一次足够。
+  backoffLimit: 1
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: Never
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-state-migrate
+          image: praxis-rag:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              if [ -n "${RAG_MIGRATE_MYSQL_USER:-}" ]; then RAG_MYSQL_USER="$RAG_MIGRATE_MYSQL_USER"; export RAG_MYSQL_USER; fi
+              if [ -n "${RAG_MIGRATE_MYSQL_PASSWORD:-}" ]; then RAG_MYSQL_PASSWORD="$RAG_MIGRATE_MYSQL_PASSWORD"; export RAG_MYSQL_PASSWORD; fi
+              exec /app/bin/rag-state-migrate --apply
+          envFrom:
+            - configMapRef:
+                name: praxis-rag-config
+          env:
+            - name: RAG_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MYSQL_PASSWORD
+            # 可选：独立迁移账号（不在 Secret 里就是空字符串，走应用账号）。
+            - name: RAG_MIGRATE_MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MIGRATE_MYSQL_USER
+                  optional: true
+            - name: RAG_MIGRATE_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MIGRATE_MYSQL_PASSWORD
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

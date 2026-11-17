@@ -1,0 +1,48 @@
+# CDC 采集现状检查（版本 + 连接器状态），只读。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-connect-precheck
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: bootstrap
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: Never
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-connect-precheck
+          image: praxis-rag:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              echo "== Debezium MySQL Connector 插件版本 =="
+              /app/bin/rag-connect plugins
+              echo "== 现有连接器状态 =="
+              /app/bin/rag-connect status --all
+          envFrom:
+            - configMapRef:
+                name: praxis-rag-config
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

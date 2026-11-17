@@ -1,0 +1,14 @@
+# 打开展示缓存。
+#
+# RAG_REDIS_ENABLED=true 后缺少 RAG_REDIS_URL 会启动失败（fail-fast），
+# 这是刻意的：静默降级成「每次都打 MySQL」会掩盖缓存链路故障。
+# PREFIX 必须与共享同一 Redis 的其他部署区分开。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: praxis-rag-config
+data:
+  RAG_REDIS_ENABLED: "true"
+  RAG_REDIS_PREFIX: rag:state:v1
+  RAG_REDIS_TTL_SECONDS: "60"
+  RAG_REDIS_TIMEOUT_SECONDS: "0.3"

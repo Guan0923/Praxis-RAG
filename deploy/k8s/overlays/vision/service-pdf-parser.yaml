@@ -1,0 +1,22 @@
+# PDF 高保真服务的集群内入口。
+#
+# 只允许受信的内部调用：无认证，且会代表调用方使用知识库配置的 VLM 凭据。
+# 不要为它创建 Ingress/NodePort。
+apiVersion: v1
+kind: Service
+metadata:
+  name: pdf-parser
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: pdf-parser
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: pdf-parser
+  ports:
+    - name: http
+      port: 8091
+      targetPort: http
+      protocol: TCP

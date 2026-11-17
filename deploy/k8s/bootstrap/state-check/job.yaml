@@ -1,0 +1,51 @@
+# schema 状态检查（只读）。与 rag-state-migrate 的 report 模式一一对应。
+#
+# 注意：本目录只创建 ConfigMap + Job，不会创建任何 Deployment，
+# 所以可以在应用启动之前安全执行（干净安装的第一步）。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-state-check
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: bootstrap
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  # 只读检查，重试没有意义；失败保留 Pod 供查看日志。
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: bootstrap
+    spec:
+      restartPolicy: Never
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-state-check
+          image: praxis-rag:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["/app/bin/rag-state-migrate"]
+          envFrom:
+            - configMapRef:
+                name: praxis-rag-config
+          env:
+            - name: RAG_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MYSQL_PASSWORD
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

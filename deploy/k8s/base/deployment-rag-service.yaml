@@ -1,0 +1,129 @@
+# API / MCP / Console。仓库已有 /app/web，镜像里已构建好 Console。
+#
+# 单实例首版：MCP Streamable HTTP 会话保存在进程内（internal/mcp），
+# 多个副本之间不共享，因此先固定 1 副本；多副本的前置验证见 README §13。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-service
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  replicas: 1
+  # 避免新旧实例重叠：更新期间旧 Pod 先终止，新 Pod 随后启动，
+  # 因此 Console/REST/MCP 会有一次短暂中断（体积小、启动快的代价）。
+  # 需要零中断时先做 §13 的多副本前置验证，再换 RollingUpdate。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: praxis-rag
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: praxis-rag
+    spec:
+      # 监控页「worker 扩缩容」卡片用的 ServiceAccount（rbac-monitor-ops.yaml：
+      # 仅 rag-document-worker Deployment 的 get/patch）。未应用该清单时
+      # pod 仍可启动，只是 Console 的扩缩容卡片显示「未启用」。
+      serviceAccountName: rag-monitor-ops
+      serviceAccount: rag-monitor-ops
+      # 进程收到 SIGTERM 后先停止接受连接（5s），再关闭状态库连接池。
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # 刻意不设置 runAsNonRoot / runAsUser：Go 镜像的运行时用户是名字用户
+        # `rag`（Dockerfile `USER rag`），kubelet 无法用数字校验，设置
+        # runAsNonRoot=true 会以 "image has non-numeric user (rag)" 拒绝启动；
+        # 写死 runAsUser 又会在基础镜像调整 UID 时让进程丢失 /app 的写权限。
+        # 当前运行时实测 uid=100/gid=101（alpine:3.21），见 README §10。
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-service
+          image: praxis-rag:1.0.0
+          imagePullPolicy: IfNotPresent
+          # 镜像 ENTRYPOINT 也是这个二进制；显式写出便于逐组件核对。
+          command: ["/app/bin/rag-service"]
+          ports:
+            - name: http
+              containerPort: 8011
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: praxis-rag-config
+          env:
+            # 容器内必须绑定 0.0.0.0 才能通过 Service 访问；非 loopback 时
+            # 代码强制要求 Token 与非空 MCP 白名单（白名单在 ConfigMap 里）。
+            - name: RAG_SERVICE_HOST
+              value: "0.0.0.0"
+            - name: RAG_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_SERVICE_TOKEN
+            - name: RAG_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MYSQL_PASSWORD
+            # 同一把状态加密密钥要和应用、文档 worker、缓存 worker、
+            # 死信 worker 完全一致，否则读不出 enc:v1: 凭据。
+            - name: RAG_STATE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_STATE_ENCRYPTION_KEY
+            # 可选：服务级 VLM 兜底（知识库未单独配置视觉模型时使用）。
+            - name: RAG_VLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_VLM_API_KEY
+                  optional: true
+            # 解析暂存目录 = os.TempDir()。上传 workspace（rag-txn-*）、
+            # Word/PDF 解析临时目录都落在这里，必须可写且容量足够。
+            - name: TMPDIR
+              value: /var/tmp/rag
+          volumeMounts:
+            - name: tmp
+              mountPath: /var/tmp/rag
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          # /health 固定返回 200（handleHealth 不探测依赖），所以这两个探针
+          # 只证明「进程能响应 HTTP」。MySQL/Qdrant/Kafka/Connect 是否就绪
+          # 必须用 README §7 的独立验收命令检查。
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir:
+            # 单份 PDF 大小 × 并发 × 2~3；超过会被 kubelet 驱逐，见 README §10。
+            sizeLimit: 2Gi

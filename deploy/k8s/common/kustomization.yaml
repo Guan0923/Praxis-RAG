@@ -1,0 +1,16 @@
+# 公共「非机密配置」目录。
+#
+# 单独成目录的原因：bootstrap/ 下的一次性 Job（schema 迁移、CDC 注册）与
+# 应用工作负载必须读到**同一份** ConfigMap，但干净安装时要先跑 Job，
+# 再启动 Deployment。base/ 会把 ConfigMap 和 Deployment 一起渲染，无法只取配置；
+# 因此 ConfigMap 放在 common/，由 base/ 和 bootstrap/*/ 各自引用。
+#
+# 机密（token、数据库口令、加密密钥、Redis URL）不在这里，见
+# deploy/k8s/examples/secret.example.yaml 与 deploy/k8s/README.md §4。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: praxis-rag
+
+resources:
+  - configmap.yaml

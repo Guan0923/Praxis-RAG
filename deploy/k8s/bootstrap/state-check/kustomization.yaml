@@ -1,0 +1,27 @@
+# 一次性 Job：schema 状态检查（只读）。
+#
+# 前提：先执行 `kubectl apply -k deploy/k8s/common` 创建 ConfigMap
+# praxis-rag-config 与 `kubectl create namespace praxis-rag`。
+# 本目录刻意**不**声明 ConfigMap：Job 若也声明它，升级时重跑 Job 会用
+# 「基础配置」覆盖 overlay 写进去的键（例如 vision 的 RAG_PDF_SERVICE_URL）。
+#
+#   kubectl apply -k deploy/k8s/bootstrap/state-check
+#   kubectl -n praxis-rag wait --for=condition=complete job/rag-state-check --timeout=120s
+#   kubectl -n praxis-rag logs job/rag-state-check
+#
+# 语义（cmd/rag-state-migrate/main.go）：不带 --apply 时只报告
+# mode=report ... schema=ready|incomplete，并逐行打印 MISSING <表名>。
+# schema 不完整时进程退出码为 1，因此 Job 会被标记为 Failed：
+# 「Job Failed + 日志里有 MISSING」= 需要跑 state-migrate。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: praxis-rag
+
+resources:
+  - job.yaml
+
+images:
+  - name: praxis-rag
+    newName: praxis-rag
+    newTag: "1.0.0"

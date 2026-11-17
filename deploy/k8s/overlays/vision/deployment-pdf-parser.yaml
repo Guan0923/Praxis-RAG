@@ -1,0 +1,121 @@
+# 高保真 PDF 微服务（python-workers/pdf-service）。
+#
+# 职责边界：PyMuPDF 在本地读取/渲染/裁图，版面、OCR、表格、公式与图片描述
+# 全部交给**知识库配置的**远端 OpenAI 兼容视觉模型；进程内不加载任何模型
+# 权重，也没有模型卷。请求体里带 options.vision 时用它，否则回落到
+# 服务级 RAG_VLM_*（BASE_URL 与 MODEL 必须同时配置）。
+#
+# 内部服务、无认证：只给本命名空间的应用与文档 worker 调用，不发布到集群外。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pdf-parser
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: pdf-parser
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: praxis-rag
+      app.kubernetes.io/component: pdf-parser
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: pdf-parser
+        app.kubernetes.io/part-of: praxis-rag
+    spec:
+      # 一次转换最长 RAG_PDF_SERVICE_TIMEOUT(900s)；宽限期只用于让
+      # 已经接近完成的请求收尾，超时后由 worker 侧重投（README §10）。
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        # 这个镜像的 UID 是构建期固定的（useradd --uid 10001 pdfservice），
+        # 因此可以给出数字用户并让 kubelet 校验非 root。
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pdf-parser
+          image: praxis-rag-pdf-parser:1.0.0
+          imagePullPolicy: IfNotPresent
+          # 镜像 CMD 是 `python -m app.main`（uvicorn），保持默认，不覆盖。
+          ports:
+            - name: http
+              containerPort: 8091
+              protocol: TCP
+          env:
+            - name: RAG_PDF_SERVICE_HOST
+              value: "0.0.0.0"
+            - name: RAG_PDF_SERVICE_PORT
+              value: "8091"
+            # uvicorn 进程数 × 每进程转换槽位 = 本 Pod 的并发上限。
+            # 首版保守 1×1，避免多个 Pod 一起打满远端 VLM 配额（README §12）。
+            - name: RAG_PDF_SERVICE_WORKERS
+              value: "1"
+            - name: RAG_PDF_SERVICE_CONCURRENCY
+              value: "1"
+            # 排队等待 + 总请求预算；Go 侧 RAG_PDF_SERVICE_TIMEOUT 用同一个值。
+            - name: RAG_PDF_SERVICE_TIMEOUT
+              value: "900"
+            # 拿到转换槽位后的实际预算，必须小于上面的总预算，超时返回 504。
+            - name: RAG_PDF_SERVICE_PARSE_TIMEOUT
+              value: "120"
+            # 生产必须保持 vision；fake 只返回固定清单，仅用于协议冒烟。
+            - name: RAG_PDF_SERVICE_CONVERTER
+              value: vision
+            - name: RAG_PDF_SERVICE_LOG_LEVEL
+              value: info
+            - name: RAG_PDF_SERVICE_LOG_FORMAT
+              value: text
+            # 可选的远端 VLM API Key（与服务级兜底一起用）。
+            - name: RAG_VLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_VLM_API_KEY
+                  optional: true
+          volumeMounts:
+            # 镜像内 TMPDIR=/tmp/rag-pdf-service；挂 emptyDir 覆盖它，
+            # 页面 PNG 与裁图不会写进容器可写层。
+            - name: tmp
+              mountPath: /tmp/rag-pdf-service
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          # /healthz 始终返回 200，配置错误只体现在响应体 status=degraded，
+          # 所以探针只证明进程能响应；真实可用性用 §7 的解析验收检查。
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir:
+            # 大页面 PDF 渲染所需空间约为源文件的 3~10 倍（README §12）。
+            sizeLimit: 10Gi

@@ -1,0 +1,24 @@
+# API / MCP / Console 的集群内入口。
+#
+# 首版只做 ClusterIP：验收通过 kubectl port-forward 访问（README §7）。
+# 公网入口（Ingress/Gateway）留给后续版本；加 Ingress 时必须同时把
+# 域名写进 RAG_MCP_ALLOWED_HOSTS / RAG_MCP_ALLOWED_ORIGINS。
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-service
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  type: ClusterIP
+  selector:
+    # 与 Deployment 的 pod 标签逐项一致；改标签必须两边同时改。
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 8011
+      targetPort: http
+      protocol: TCP

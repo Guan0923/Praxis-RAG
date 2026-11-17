@@ -1,0 +1,30 @@
+# 把 PVC 挂到 rag-service 的 /app/data，并把 Console 日志文件指向它。
+#
+# 注意两个容易踩的点：
+#   1) RAG_LOG_FILE 的父目录必须已存在（openLogFile 不会 MkdirAll），
+#      所以直接写在挂载根下，而不是 /app/data/logs/xxx.jsonl。
+#   2) fsGroup 用镜像里 rag 组的 GID（alpine:3.21 实测 gid=101）。
+#      如果构建基础镜像变了，用 `kubectl exec ... -- id` 复核后同步修改。
+#
+# 只有 rag-service 挂这个卷：worker 的日志走 stdout，由集群日志收集处理。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-service
+spec:
+  template:
+    spec:
+      securityContext:
+        fsGroup: 101
+      containers:
+        - name: rag-service
+          env:
+            - name: RAG_LOG_FILE
+              value: /app/data/praxis-rag.jsonl
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: praxis-rag-data
