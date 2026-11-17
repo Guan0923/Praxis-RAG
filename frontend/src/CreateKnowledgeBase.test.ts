@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { App, ConfigProvider } from "antd";
 import { createElement } from "react";
-import { KnowledgeBaseForm, matchingProfile, profileNeedsReembed } from "./CreateKnowledgeBase";
-import type { KnowledgeBase, ModelProfile } from "./api";
+import { CreateKnowledgeBase, KnowledgeBaseForm, matchingProfile, profileNeedsReembed } from "./CreateKnowledgeBase";
+import type { Connection, KnowledgeBase, ModelProfile } from "./api";
 
 function profile(overrides: Partial<ModelProfile> = {}): ModelProfile {
   return {
@@ -14,6 +14,9 @@ function profile(overrides: Partial<ModelProfile> = {}): ModelProfile {
     model: "bge-m3",
     api_key_set: true,
     vector_size: 1024,
+    owner_user_id: "user-self",
+    owner_username: "alice",
+    mine: true,
     ...overrides,
   };
 }
@@ -27,9 +30,15 @@ function vlmProfile(overrides: Partial<ModelProfile> = {}): ModelProfile {
     model: "qwen2.5-vl-72b",
     api_key_set: false,
     vector_size: null,
+    owner_user_id: "user-self",
+    owner_username: "alice",
+    mine: true,
     ...overrides,
   };
 }
+
+// connection 是创建页的 Namespace 头：切分策略目录是租户级接口。
+const connection: Connection = { namespace: "team-kb", token: "" };
 
 const defaults = {
   default: "recursive",
@@ -148,14 +157,18 @@ function installAntdBrowserStubs() {
   });
 }
 
-// mockApi answers the defaults, profile list and the create/update endpoints the
-// form talks to. Saved keys and remote model lists are deliberately unsupported:
-// the VLM path must never request them.
+// mockApi answers the chunking catalog, the account's own profile list, the
+// owner-only key reveal and the session/administrator knowledge-base endpoints.
+// Remote model lists are deliberately unsupported.
 function mockApi(profiles: ModelProfile[], saved?: KnowledgeBase) {
   fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
     if (path === "/v1/admin/knowledge-bases/defaults") return jsonResponse(defaults);
-    if (path === "/v1/admin/model-profiles") return jsonResponse({ model_profiles: profiles });
+    if (path === "/v1/chunking/strategies") return jsonResponse(defaults);
+    if (path === "/v1/model-profiles") return jsonResponse({ model_profiles: profiles });
+    if (path.endsWith("/key")) return jsonResponse({ apikey: "sk-revealed" });
     const method = options.method || "GET";
+    if (path === "/v1/knowledge-bases" && method === "POST")
+      return jsonResponse({ ...editInitial(), namespace: "vision-kb" }, 201);
     if (path === "/v1/admin/knowledge-bases" && method === "POST")
       return jsonResponse({ ...editInitial(), namespace: "vision-kb" }, 201);
     if (path.startsWith("/v1/admin/knowledge-bases/") && method === "PATCH")
@@ -179,13 +192,14 @@ function renderForm(options: { initial?: KnowledgeBase; onSaved?: () => void } =
         initial: options.initial,
         disabled: false,
         active: true,
+        connection,
         onSaved,
         onOpenModelProfiles,
       }))));
   return { onSaved, onOpenModelProfiles };
 }
 
-async function waitForAdminDefaults() {
+async function waitForDefaults() {
   await waitFor(() => {
     const submit = screen.getByRole("button", { name: /创建知识库|保存配置/ }) as HTMLButtonElement;
     expect(submit.disabled).toBe(false);
@@ -217,7 +231,7 @@ describe("optional model settings in the knowledge-base form", () => {
     const initialKb = editInitial();
     mockApi([profile({ api_key_set: false })], initialKb);
     renderForm({ initial: initialKb });
-    await waitForAdminDefaults();
+    await waitForDefaults();
 
     for (const name of ["启用 Reranker", "启用 VLM"]) {
       expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("false");
@@ -227,7 +241,7 @@ describe("optional model settings in the knowledge-base form", () => {
   it("submits the selected VLM connection and model", async () => {
     mockApi([profile({ api_key_set: false }), vlmProfile()]);
     const { onSaved } = renderForm();
-    await waitForAdminDefaults();
+    await waitForDefaults();
 
     fireEvent.change(screen.getByLabelText("知识库标识（Namespace）"), {
       target: { value: "vision-kb" },
@@ -239,7 +253,7 @@ describe("optional model settings in the knowledge-base form", () => {
     fireEvent.click(screen.getByRole("button", { name: /创建知识库/ }));
 
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
-    const body = requestBody("/v1/admin/knowledge-bases", "POST");
+    const body = requestBody("/v1/knowledge-bases", "POST");
     expect(body).toMatchObject({
       namespace: "vision-kb",
       embedding: { base_url: "https://api.example.com/v1" },
@@ -255,7 +269,7 @@ describe("optional model settings in the knowledge-base form", () => {
   it("enables reranker and VLM by default on the create form", async () => {
     mockApi([profile({ api_key_set: false }), vlmProfile()]);
     renderForm();
-    await waitForAdminDefaults();
+    await waitForDefaults();
 
     for (const name of ["启用 Reranker", "启用 VLM"]) {
       expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("true");
@@ -270,7 +284,7 @@ describe("optional model settings in the knowledge-base form", () => {
     }));
     mockApi([profile({ api_key_set: false }), vlmProfile()]);
     renderForm();
-    await waitForAdminDefaults();
+    await waitForDefaults();
 
     for (const name of ["启用 Reranker", "启用 VLM"]) {
       expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("false");
@@ -286,7 +300,7 @@ describe("optional model settings in the knowledge-base form", () => {
     }));
     mockApi([profile({ api_key_set: false }), vlmProfile()]);
     renderForm();
-    await waitForAdminDefaults();
+    await waitForDefaults();
 
     expect((screen.getByLabelText("知识库标识（Namespace）") as HTMLInputElement).value)
       .toBe("legacy-draft");
@@ -298,7 +312,7 @@ describe("optional model settings in the knowledge-base form", () => {
   it("submits empty optional models while they stay disabled", async () => {
     mockApi([profile({ api_key_set: false })]);
     const { onSaved } = renderForm();
-    await waitForAdminDefaults();
+    await waitForDefaults();
 
     fireEvent.change(screen.getByLabelText("知识库标识（Namespace）"), {
       target: { value: "plain-kb" },
@@ -310,7 +324,7 @@ describe("optional model settings in the knowledge-base form", () => {
     fireEvent.click(screen.getByRole("button", { name: /创建知识库/ }));
 
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
-    const body = requestBody("/v1/admin/knowledge-bases", "POST");
+    const body = requestBody("/v1/knowledge-bases", "POST");
     expect(body.vlm_model).toBe("");
     expect(body).not.toHaveProperty("ocr_model");
   });
@@ -318,12 +332,12 @@ describe("optional model settings in the knowledge-base form", () => {
   it("guides to the model configuration page when no VLM profile exists", async () => {
     mockApi([profile({ api_key_set: false })]);
     const { onOpenModelProfiles } = renderForm();
-    await waitForAdminDefaults();
+    await waitForDefaults();
 
     // VLM 默认开启；没有 VLM 模型时表单直接给出提示。
     expect(screen.getByRole("switch", { name: "启用 VLM" }).getAttribute("aria-checked")).toBe("true");
     expect(await screen.findByText("暂无 VLM 模型")).toBeTruthy();
-    expect(screen.getByText(/创建知识库时只能选择已保存的 VLM 模型/)).toBeTruthy();
+    expect(screen.getByText(/创建知识库时只能选择自己已保存的 VLM 模型/)).toBeTruthy();
     // Reranker / VLM 默认开启且都没有模型时，各自都有「前往模型配置」入口。
     const vlmSection = screen.getByRole("region", { name: "VLM 配置" });
     fireEvent.click(within(vlmSection).getByRole("button", { name: "前往模型配置" }));
@@ -337,7 +351,7 @@ describe("optional model settings in the knowledge-base form", () => {
     });
     mockApi([profile({ api_key_set: false }), vlmProfile()], initialKb);
     const { onSaved } = renderForm({ initial: initialKb });
-    await waitForAdminDefaults();
+    await waitForDefaults();
 
     expect(screen.getByRole("switch", { name: "启用 VLM" }).getAttribute("aria-checked"))
       .toBe("true");
@@ -360,7 +374,7 @@ describe("optional model settings in the knowledge-base form", () => {
     });
     mockApi([profile({ api_key_set: false })], initialKb);
     const { onSaved } = renderForm({ initial: initialKb });
-    await waitForAdminDefaults();
+    await waitForDefaults();
 
     expect(await screen.findByText(/当前配置 · qwen2.5-vl-72b/)).toBeTruthy();
     expect(screen.getByText("暂无 VLM 模型")).toBeTruthy();
@@ -371,5 +385,86 @@ describe("optional model settings in the knowledge-base form", () => {
       vlm_model: "qwen2.5-vl-72b",
       reembed: false,
     });
+  });
+
+  it("requires an Embedding profile and guides to the model configuration page", async () => {
+    // 账号只有 VLM：没有可提交的 Embedding 连接，服务端只会返回 409。
+    mockApi([vlmProfile()]);
+    const { onOpenModelProfiles } = renderForm();
+
+    expect(await screen.findByText("暂无 Embedding 模型")).toBeTruthy();
+    expect(screen.getByText(/请先在「模型配置」页添加并选择 Embedding 模型后重试/)).toBeTruthy();
+    // 等默认切分参数到达，确认提交按钮只是因为缺少 Embedding 配置而禁用。
+    expect(await screen.findByText("递归切分")).toBeTruthy();
+    expect((screen.getByRole("button", { name: /创建知识库/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("请先在「模型配置」页添加 Embedding 模型，再创建知识库。")).toBeTruthy();
+
+    const embeddingSection = screen.getByRole("region", { name: "Embedding 配置" });
+    fireEvent.click(within(embeddingSection).getByRole("button", { name: "前往模型配置" }));
+    expect(onOpenModelProfiles).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores another account's profiles and never reveals their key", async () => {
+    // 管理员的总览视图会带别人的行：建库只能用自己的配置。
+    mockApi([profile({
+      id: "mp-other",
+      owner_user_id: "user-bob",
+      owner_username: "bob",
+      mine: false,
+    })]);
+    renderForm();
+
+    expect(await screen.findByText("暂无 Embedding 模型")).toBeTruthy();
+    expect((screen.getByRole("button", { name: /创建知识库/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/key"))).toBe(false);
+    expect(screen.queryByText(/bob/)).toBeNull();
+  });
+
+  it("reveals the selected profile's key and submits the session create endpoint", async () => {
+    mockApi([profile(), vlmProfile()]);
+    const { onSaved } = renderForm();
+    await waitForDefaults();
+
+    fireEvent.change(screen.getByLabelText("知识库标识（Namespace）"), {
+      target: { value: "team-kb" },
+    });
+    await selectProfile("Embedding 模型", /默认 Embedding · bge-m3/);
+    // Reranker / VLM 默认开启，本用例只验证 Embedding 的 Key 解析与提交路径。
+    fireEvent.click(screen.getByRole("switch", { name: "启用 Reranker" }));
+    fireEvent.click(screen.getByRole("switch", { name: "启用 VLM" }));
+    fireEvent.click(screen.getByRole("button", { name: /创建知识库/ }));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    // 所有者可以用自己的模型配置读取 Key，再用它提交 provider。
+    expect(fetchMock.mock.calls.some(
+      ([path]) => path === "/v1/model-profiles/mp-embed/key",
+    )).toBe(true);
+    expect(requestBody("/v1/knowledge-bases", "POST")).toMatchObject({
+      namespace: "team-kb",
+      embedding: { base_url: "https://api.example.com/v1", apikey: "sk-revealed" },
+      embedding_model: "bge-m3",
+      vlm_model: "",
+    });
+    // 创建不再走管理员接口。
+    expect(fetchMock.mock.calls.some(([path]) => path === "/v1/admin/knowledge-bases")).toBe(false);
+  });
+
+  it("uses the model-aware form for every role", async () => {
+    mockApi([profile({ api_key_set: false })]);
+    render(createElement(ConfigProvider, null, createElement(App, null,
+      createElement(CreateKnowledgeBase, {
+        active: true,
+        disabled: false,
+        connection,
+        onCreated: vi.fn(),
+        onOpenModelProfiles: vi.fn(),
+      }))));
+
+    // 普通账号也使用带模型选择的那套交互，而不是只填 Namespace 的简化表单。
+    expect(await screen.findByLabelText("Embedding 模型")).toBeTruthy();
+    expect(screen.getByLabelText("Reranker 模型")).toBeTruthy();
+    expect(screen.getByLabelText("VLM 模型")).toBeTruthy();
+    expect(screen.getByLabelText("知识库标识（Namespace）")).toBeTruthy();
+    expect(screen.getByLabelText("切分方式")).toBeTruthy();
   });
 });

@@ -23,7 +23,13 @@ describe("canViewConsolePage", () => {
 
   it("keeps management pages visible in legacy no-session mode", () => {
     expect(canViewConsolePage("monitor", false, undefined)).toBe(true);
-    expect(canViewConsolePage("model-profiles", false, undefined)).toBe(true);
+  });
+
+  it("shows the model configuration page to every signed-in account", () => {
+    // 模型配置按账号隔离：每个账号管理自己的配置，管理员额外只读查看全部。
+    for (const role of ["admin", "vip", "user"] as const) {
+      expect(canViewConsolePage("model-profiles", true, role)).toBe(true);
+    }
   });
 
   it("keeps permissions to administrators and VIPs", () => {
