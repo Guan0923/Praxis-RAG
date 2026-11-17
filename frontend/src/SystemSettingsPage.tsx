@@ -116,13 +116,6 @@ export function SystemSettingsPage() {
       <div className="page-heading">
         <h1>系统设置</h1>
       </div>
-      <Alert
-        className="page-alert"
-        type="info"
-        showIcon
-        title="邮件服务器"
-        description="未配置邮件服务器时，注册与修改邮箱不会发送验证邮件；注册仍可使用用户名和密码完成。"
-      />
       {error && (
         <Alert className="page-alert" type="error" showIcon title="操作失败" description={error} />
       )}

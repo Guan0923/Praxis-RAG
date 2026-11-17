@@ -368,7 +368,7 @@ export const retrievalLabels = {
   bm25: "BM25",
   embedding: "Embedding",
   hybrid: "Hybrid",
-  sag2: "SAG2（词法多跳）",
+  sag2: "SAG2",
 };
 export const rerankLabels = {
   none: "不重排",
