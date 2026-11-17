@@ -445,11 +445,10 @@ function KeyMetricsCard({ overview }: { overview: MonitorOverview }) {
 
   return (
     <Card size="small" title="关键指标">
-      <Row gutter={[16, 16]}>
+      <Row gutter={[16, 12]}>
         {metrics.map((metric) => (
-          // 关键指标与「服务信息」分享一行（双列网格）：指标卡按 3/行折行，
-          // 窄屏回落 2/行，避免四格挤成一排。
-          <Col key={metric.key} xs={12} md={8}>
+          // 整行铺开：五个指标在宽屏上排成一行，窄屏回落 2/行。
+          <Col key={metric.key} xs={12} sm={8} lg={4}>
             <Statistic className="monitor-stat" title={metric.title} value={metric.value} />
           </Col>
         ))}
@@ -475,8 +474,9 @@ function SystemResourcesCard({ system }: { system?: MonitorSystem | null }) {
   const systemNotes = system.notes ?? [];
   return (
     <Card size="small" title="系统资源" className="monitor-system-card">
-      <Row gutter={[24, 16]}>
-        <Col xs={24} md={12} xl={6}>
+      <Row gutter={[20, 12]}>
+        {/* 卡片现在只占半行，四组资源按 2×2 排布，避免每组被压到 100px 宽。 */}
+        <Col xs={24} sm={12}>
           <h4 className="monitor-subheading">CPU</h4>
           <Descriptions
             size="small"
@@ -489,7 +489,7 @@ function SystemResourcesCard({ system }: { system?: MonitorSystem | null }) {
             ]}
           />
         </Col>
-        <Col xs={24} md={12} xl={6}>
+        <Col xs={24} sm={12}>
           <h4 className="monitor-subheading">内存</h4>
           <Descriptions
             size="small"
@@ -510,7 +510,7 @@ function SystemResourcesCard({ system }: { system?: MonitorSystem | null }) {
             ]}
           />
         </Col>
-        <Col xs={24} md={12} xl={6}>
+        <Col xs={24} sm={12}>
           <h4 className="monitor-subheading">网络</h4>
           <Descriptions
             size="small"
@@ -523,7 +523,7 @@ function SystemResourcesCard({ system }: { system?: MonitorSystem | null }) {
             ]}
           />
         </Col>
-        <Col xs={24} md={12} xl={6}>
+        <Col xs={24} sm={12}>
           <h4 className="monitor-subheading">进程</h4>
           <Descriptions
             size="small"
@@ -586,9 +586,9 @@ function ServiceInfoCard({ service }: { service?: MonitorService }) {
 }
 
 // OverviewTab keeps the page-level health banner together with the metrics,
-// host resources and static service facts. The two short fact cards (关键指标
-// / 服务信息) share one row of the two-column grid; the wide host-resource
-// sample keeps the full row below them.
+// host resources and static service facts. 关键指标 runs the full width so its
+// five counters sit on one line; 服务信息 and the host-resource sample then
+// share the two-column row below it.
 function OverviewTab({ overview }: { overview: MonitorOverview }) {
   const status = overallStatusOf(overview);
   const errors = overview.errors ?? [];
@@ -622,11 +622,12 @@ function OverviewTab({ overview }: { overview: MonitorOverview }) {
         />
       )}
       <div className="monitor-grid">
-        <KeyMetricsCard overview={overview} />
-        <ServiceInfoCard service={overview.service} />
+        {/* 关键指标整行铺开（五个指标一行），下面服务信息与系统资源并排。 */}
         <div className="monitor-grid-span-full">
-          <SystemResourcesCard system={overview.system} />
+          <KeyMetricsCard overview={overview} />
         </div>
+        <ServiceInfoCard service={overview.service} />
+        <SystemResourcesCard system={overview.system} />
       </div>
     </Flex>
   );
@@ -841,17 +842,17 @@ function UploadsBlock({ uploads }: { uploads?: MonitorQueues["uploads"] | null }
   }
   return (
     <section className="monitor-block" aria-label="上传队列">
-      <Row gutter={[12, 12]}>
-        <Col xs={12} sm={6}>
+      <Row gutter={[12, 8]}>
+        <Col xs={12} sm={12}>
           <Statistic className="monitor-stat" title="进行中" value={unknownOrNumber(uploads.in_progress)} />
         </Col>
-        <Col xs={12} sm={6}>
+        <Col xs={12} sm={12}>
           <Statistic className="monitor-stat" title="失败" value={unknownOrNumber(uploads.failed)} />
         </Col>
-        <Col xs={12} sm={6}>
+        <Col xs={12} sm={12}>
           <Statistic className="monitor-stat" title="回滚中" value={unknownOrNumber(uploads.rolling_back)} />
         </Col>
-        <Col xs={12} sm={6}>
+        <Col xs={12} sm={12}>
           <Statistic className="monitor-stat" title="待清理" value={unknownOrNumber(uploads.cleanup_pending)} />
         </Col>
       </Row>
@@ -875,7 +876,7 @@ function LibraryActivityBlock({ library, activity }: {
     <section className="monitor-block" aria-label="库与活动">
       <Descriptions
         size="small"
-        column={{ xs: 1, sm: 2, lg: 4 }}
+        column={{ xs: 1, sm: 2 }}
         items={[
           { key: "documents", label: "有效文档", children: library ? unknownOrNumber(library.documents) : "未知" },
           { key: "knowledge-bases", label: "知识库", children: library ? unknownOrNumber(library.knowledge_bases) : "未知" },
@@ -1342,8 +1343,11 @@ function ComponentTab({ tab, overview, autoRefresh, active }: {
     case "mysql":
       return (
         <Flex vertical gap={16}>
-          <div className="monitor-grid">
-            <DependencyCard overview={overview} names={["mysql"]} />
+          {/* 依赖表需要整行宽度；其余三块信息量小，宽屏上三列并排。 */}
+          <div className="monitor-grid monitor-grid--dense">
+            <div className="monitor-grid-span-full">
+              <DependencyCard overview={overview} names={["mysql"]} />
+            </div>
             <Card size="small" title="文档任务队列">
               <DocumentJobsBlock queues={overview.queues} />
             </Card>

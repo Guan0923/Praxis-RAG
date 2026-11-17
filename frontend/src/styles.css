@@ -1263,7 +1263,7 @@ body.drag-selecting * {
    column, matching the phone layout. */
 .monitor-grid {
   display: grid;
-  gap: 16px;
+  gap: 12px 16px;
   grid-template-columns: minmax(0, 1fr);
   align-items: start;
 }
@@ -1277,6 +1277,39 @@ body.drag-selecting * {
   .monitor-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+}
+/* Dense tier: short blocks (queue counts, upload buckets, library totals) pack
+   three per row on wide screens so a tab does not turn into two half-empty
+   columns. Long blocks keep .monitor-grid-span-full. */
+@media (min-width: 1200px) {
+  .monitor-grid--dense {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+/* Snapshot blocks are read at a glance: trim the default card padding and the
+   value sizes inside the grids so a tab fits a screen instead of scrolling. */
+.monitor-grid .ant-card-body {
+  padding: 12px 14px;
+}
+.monitor-grid .ant-card-head {
+  min-height: 40px;
+  padding: 0 14px;
+}
+.monitor-grid .ant-descriptions-item {
+  padding-bottom: 4px;
+}
+.monitor-grid .ant-descriptions-item-label,
+.monitor-grid .ant-descriptions-item-content {
+  font-size: 12px;
+  line-height: 1.5;
+}
+.monitor-grid .monitor-note {
+  font-size: 11px;
+  line-height: 1.55;
+}
+.monitor-grid .monitor-subheading {
+  font-size: 12px;
+  margin: 2px 0 0;
 }
 .monitor-block {
   display: flex;
@@ -1333,11 +1366,11 @@ body.drag-selecting * {
   border-top: 1px solid var(--line);
 }
 .monitor-stat .ant-statistic-title {
-  font-size: 12px;
+  font-size: 11px;
   overflow-wrap: anywhere;
 }
 .monitor-stat .ant-statistic-content {
-  font-size: 22px;
+  font-size: 18px;
 }
 /* Long collection names, dependency details and paths must wrap inside the
    card instead of widening it. */
