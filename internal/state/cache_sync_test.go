@@ -63,7 +63,7 @@ func (m *memoryCache) Get(_ context.Context, kind, scope string) (bool, any, err
 	return true, detached, nil
 }
 
-func (m *memoryCache) Put(_ context.Context, kind, scope string, revision int64, value any, _ bool) (bool, error) {
+func (m *memoryCache) Put(_ context.Context, kind, scope, token string, revision int64, value any, _ bool) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.puts++
@@ -71,6 +71,9 @@ func (m *memoryCache) Put(_ context.Context, kind, scope string, revision int64,
 		return false, newCacheUnavailable("unreachable")
 	}
 	key := CacheKey{Kind: kind, Scope: scope}
+	if m.backfillLocks[key] != token {
+		return false, ErrCacheBackfillLeaseLost
+	}
 	if watermark, ok := m.watermarks[key]; ok && revision < watermark {
 		return false, nil
 	}
@@ -278,8 +281,15 @@ func TestRevalidatePublishesLatestRevisionAndWatermarkRejectsStale(t *testing.T)
 	if err != nil || updated["collection"] != "updated" {
 		t.Fatalf("KnowledgeBase() after refresh = %+v, %v", updated, err)
 	}
-	if accepted, err := cache.Put(ctx, "kb_public", "ns", oldRevision, oldValue, false); err != nil || accepted {
+	token := newBackfillToken()
+	if held, err := cache.AcquireBackfillLock(ctx, "kb_public", "ns", token, time.Second); err != nil || !held {
+		t.Fatalf("AcquireBackfillLock() = %v, %v", held, err)
+	}
+	if accepted, err := cache.Put(ctx, "kb_public", "ns", token, oldRevision, oldValue, false); err != nil || accepted {
 		t.Fatalf("stale Put() = %v, %v; want false", accepted, err)
+	}
+	if err := cache.ReleaseBackfillLock(ctx, "kb_public", "ns", token); err != nil {
+		t.Fatalf("ReleaseBackfillLock() error = %v", err)
 	}
 	if value, err := stores.Views.KnowledgeBase(ctx, "ns"); err != nil || value["collection"] != "updated" {
 		t.Fatalf("stale fill resurrected an old view: %+v, %v", value, err)
@@ -887,7 +897,7 @@ func (h heldOnlyCache) Get(context.Context, string, string) (bool, any, error) {
 	return false, nil, nil
 }
 
-func (h heldOnlyCache) Put(context.Context, string, string, int64, any, bool) (bool, error) {
+func (h heldOnlyCache) Put(context.Context, string, string, string, int64, any, bool) (bool, error) {
 	return false, nil
 }
 
@@ -1101,8 +1111,8 @@ func (s leaseStealingCache) Get(ctx context.Context, kind, scope string) (bool, 
 	return s.inner.Get(ctx, kind, scope)
 }
 
-func (s leaseStealingCache) Put(ctx context.Context, kind, scope string, revision int64, value any, deleted bool) (bool, error) {
-	return s.inner.Put(ctx, kind, scope, revision, value, deleted)
+func (s leaseStealingCache) Put(ctx context.Context, kind, scope, token string, revision int64, value any, deleted bool) (bool, error) {
+	return s.inner.Put(ctx, kind, scope, token, revision, value, deleted)
 }
 
 func (s leaseStealingCache) AcquireBackfillLock(ctx context.Context, kind, scope, token string, ttl time.Duration) (bool, error) {

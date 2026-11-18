@@ -86,7 +86,7 @@ func (c *scriptedCache) Get(ctx context.Context, kind, scope string) (bool, any,
 	return true, detached, nil
 }
 
-func (c *scriptedCache) Put(_ context.Context, kind, scope string, revision int64, value any, _ bool) (bool, error) {
+func (c *scriptedCache) Put(_ context.Context, kind, scope, token string, revision int64, value any, _ bool) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.puts++
@@ -94,6 +94,9 @@ func (c *scriptedCache) Put(_ context.Context, kind, scope string, revision int6
 		return false, NewCacheUnavailableNetwork("unreachable")
 	}
 	key := CacheKey{Kind: kind, Scope: scope}
+	if c.locks[key] != token {
+		return false, ErrCacheBackfillLeaseLost
+	}
 	if watermark, ok := c.watermarks[key]; ok && revision < watermark {
 		return false, nil
 	}

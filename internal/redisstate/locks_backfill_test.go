@@ -139,6 +139,42 @@ func TestBackfillLockTakeoverAfterExpiry(t *testing.T) {
 	}
 }
 
+func TestBackfillPutRejectsExpiredHolderBeforeSuccessorPublishes(t *testing.T) {
+	backend, server := newTestBackend(t)
+	ctx := context.Background()
+	const kind, scope = "documents", "manuals"
+	const oldToken, newToken = "old-token", "new-token"
+
+	if held, err := backend.AcquireBackfillLock(ctx, kind, scope, oldToken, time.Second); err != nil || !held {
+		t.Fatalf("acquire old lease = (%v, %v)", held, err)
+	}
+	if stored, err := backend.Put(ctx, kind, scope, oldToken, 19, []string{"published.pdf"}, false); err != nil || !stored {
+		t.Fatalf("publish existing list = (%v, %v)", stored, err)
+	}
+	server.FastForward(time.Second)
+	if stored, err := backend.Put(ctx, kind, scope, oldToken, 20, []string{"stale.pdf"}, false); stored || !errors.Is(err, state.ErrCacheBackfillLeaseLost) {
+		t.Fatalf("publish after expiry = (%v, %v), want lease loss", stored, err)
+	}
+
+	if held, err := backend.AcquireBackfillLock(ctx, kind, scope, newToken, time.Second); err != nil || !held {
+		t.Fatalf("acquire successor lease = (%v, %v)", held, err)
+	}
+	if stored, err := backend.Put(ctx, kind, scope, oldToken, 20, []string{"stale.pdf"}, false); stored || !errors.Is(err, state.ErrCacheBackfillLeaseLost) {
+		t.Fatalf("publish after takeover = (%v, %v), want lease loss", stored, err)
+	}
+	if revision, err := server.Get(backend.RevisionKey(kind, scope)); err != nil || revision != "19:0" {
+		t.Fatalf("revision after rejected writes = (%q, %v), want 19:0", revision, err)
+	}
+	if hit, cached, err := backend.Get(ctx, kind, scope); err != nil || !hit {
+		t.Fatalf("read existing list = (%v, %v, %v)", hit, cached, err)
+	} else if list, ok := cached.([]any); !ok || len(list) != 1 || list[0] != "published.pdf" {
+		t.Fatalf("list after rejected writes = %v, want existing list", cached)
+	}
+	if stored, err := backend.Put(ctx, kind, scope, newToken, 21, []string{"published.pdf", "new.pdf"}, false); err != nil || !stored {
+		t.Fatalf("publish as successor = (%v, %v)", stored, err)
+	}
+}
+
 // TestBackfillLockUnreachableBackendIsUnavailable covers the outage semantics:
 // an unreachable backend is a sanitized CacheUnavailable, never a silent
 // "lock is free" answer.

@@ -78,6 +78,10 @@ const (
 	cacheLeaseRetryableMessage = "State cache backfill lease was lost; retry later"
 )
 
+// ErrCacheBackfillLeaseLost means the snapshot was not published because the
+// caller no longer owns the backfill lock.
+var ErrCacheBackfillLeaseLost = errors.New(cacheLeaseRetryableMessage)
+
 // NewCacheUnavailableNetwork builds an availability failure (connection error,
 // timeout, closed backend).
 func NewCacheUnavailableNetwork(message string) *CacheUnavailable {
@@ -136,12 +140,14 @@ func IsViewBackpressure(err error) bool {
 // cache key: AcquireBackfillLock is a SET NX PX with a caller-supplied token,
 // RenewBackfillLock extends the lease only for that token, and
 // ReleaseBackfillLock deletes the lock only when the token still owns it.
+// Put verifies the same token atomically with publication. Lease loss returns
+// ErrCacheBackfillLeaseLost; a rejected revision returns (false, nil).
 // A backend outage is reported as *CacheUnavailable and leaves ownership
 // unknown to the caller.
 type StateCache interface {
 	Enabled() bool
 	Get(ctx context.Context, kind, scope string) (bool, any, error)
-	Put(ctx context.Context, kind, scope string, revision int64, value any, deleted bool) (bool, error)
+	Put(ctx context.Context, kind, scope, token string, revision int64, value any, deleted bool) (bool, error)
 	AcquireBackfillLock(ctx context.Context, kind, scope, token string, ttl time.Duration) (bool, error)
 	RenewBackfillLock(ctx context.Context, kind, scope, token string, ttl time.Duration) (bool, error)
 	ReleaseBackfillLock(ctx context.Context, kind, scope, token string) error
@@ -160,7 +166,7 @@ func (DisabledStateCache) Get(context.Context, string, string) (bool, any, error
 }
 
 // Put is a no-op.
-func (DisabledStateCache) Put(context.Context, string, string, int64, any, bool) (bool, error) {
+func (DisabledStateCache) Put(context.Context, string, string, string, int64, any, bool) (bool, error) {
 	return false, nil
 }
 

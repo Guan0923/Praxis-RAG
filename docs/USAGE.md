@@ -369,7 +369,7 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_ARTIFACT_MAX_BYTES` | `67108864` | 单 artifact 上限 |
 | `RAG_RESULT_MAX_ARTIFACTS` | `100` | 每次搜索最多 artifact 数 |
 
-持久读模型展示缓存启用时，读取先查 Redis，未命中按 `kind+scope` 争 Redis 回源锁（`SET NX PX` + 唯一 token，同一知识库的文档列表共用一把锁、不同知识库并行），拿到锁后复读 Redis、仍未命中才查 MySQL 并回填；等待者短暂退避并每次醒来先复读 Redis。**Redis 故障（含锁后端故障）按熔断与回源限流的既有语义直接回源 MySQL**；等待超时/租约丢失返回**可重试**错误。显式禁用缓存（`RAG_REDIS_ENABLED=false`）时读取仍直接回源 MySQL。搜索为同步直返，响应不写 Redis，artifact 以 MySQL `artifact_snapshots` 为事实来源并按 ID 独立读取，**清空 Redis 不影响搜索结果或已签发 artifact**。`RAG_RESULT_TTL_SECONDS` 到期后 MySQL artifact 被有界清理，再读取返回 410。
+持久读模型展示缓存启用时，读取先查 Redis，未命中按 `kind+scope` 争 Redis 回源锁（`SET NX PX` + 唯一 token，同一知识库的文档列表共用一把锁、不同知识库并行），拿到锁后复读 Redis、仍未命中才查 MySQL 并回填；等待者短暂退避并每次醒来先复读 Redis。**Redis 故障（含锁后端故障）按熔断与回源限流的既有语义直接回源 MySQL**；等锁超时返回可重试错误。前台回填和后台刷新写 Redis 时，Lua 原子校验回源锁 token 和缓存版本。写入时租约已过期或换主，前台可返回已完成的 MySQL 查询结果，后台保留待刷新版本供后续补刷。显式禁用缓存（`RAG_REDIS_ENABLED=false`）时读取仍直接回源 MySQL。搜索为同步直返，响应不写 Redis，artifact 以 MySQL `artifact_snapshots` 为事实来源并按 ID 独立读取，**清空 Redis 不影响搜索结果或已签发 artifact**。`RAG_RESULT_TTL_SECONDS` 到期后 MySQL artifact 被有界清理，再读取返回 410。
 
 **展示缓存熔断与回源限流**：Redis 持续超时/连接失败时，展示读取（文档列表、知识库列表、上传列表等读模型视图）按 `RAG_REDIS_BREAKER_THRESHOLD` 计数，达到阈值后熔断——后续展示请求**跳过 Redis 读写**、直接回源 MySQL，不再为每个请求支付一次 0.3 秒超时；一次读取已因可用性故障失败时，回源成功后也不回填这个故障后端。冷却（`RAG_REDIS_BREAKER_COOLDOWN_SECONDS`）到期后，每个实例只放**一个**请求探测 Redis（其他请求继续回源）：探测成功——包括 Redis 正常回答“key 不存在”——即恢复正常缓存；探测失败则重新冷却。熔断只统计可用性故障：单条缓存内容损坏只影响该条（由该请求回源修复）、调用方主动取消不计为 Redis 故障，均不触发熔断。`RAG_REDIS_ENABLED=false` 的部署继续沿用直读 MySQL 模式，不经过熔断器。
 

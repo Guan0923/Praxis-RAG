@@ -319,6 +319,9 @@ func canonicalRevision(value string) bool {
 
 // Compare decimal revisions as strings to preserve the full int64 range in Lua.
 var putSnapshotScript = redis.NewScript(`
+if redis.call("GET", KEYS[3]) ~= ARGV[5] then
+    return -1
+end
 local revision, deleted = ARGV[1], ARGV[2]
 local current = redis.call("GET", KEYS[2])
 if current then
@@ -338,14 +341,14 @@ redis.call("SET", KEYS[2], revision .. ":" .. deleted)
 return 1
 `)
 
-// Put atomically publishes a snapshot unless a newer revision already exists.
+// Put checks the backfill lock token and revision atomically with publication.
 // Equal revisions can refill expired payloads but cannot undo a deletion; the
 // deletion value is discarded. It mirrors RedisStateCache.put. Failures keep
 // the same cause classification as Get: network outages, single-entry encoding
 // problems and caller cancellations stay distinguishable. The payload TTL is
 // randomized per write in [T-floor(T/5), T] (48~60s by default) so synchronized
 // expiries stagger, while the revision watermark never expires.
-func (c *Client) Put(ctx context.Context, kind, scope string, revision int64, value any, deleted bool) (bool, error) {
+func (c *Client) Put(ctx context.Context, kind, scope, token string, revision int64, value any, deleted bool) (bool, error) {
 	if !c.enabled {
 		return false, nil
 	}
@@ -370,13 +373,17 @@ func (c *Client) Put(ctx context.Context, kind, scope string, revision int64, va
 		deletedMarker = "1"
 	}
 	payloadKey, revisionKey := KeyPair(c.settings.Prefix, kind, scope)
+	lockKey := backfillLockKey(c.settings.Prefix, kind, scope)
 	ttl := state.RandomTTLSeconds(c.settings.TTLSeconds)
-	stored, err := putSnapshotScript.Run(ctx, connection, []string{payloadKey, revisionKey},
-		newRevision, deletedMarker, payload, ttl).Int64()
+	result, err := putSnapshotScript.Run(ctx, connection, []string{payloadKey, revisionKey, lockKey},
+		newRevision, deletedMarker, payload, ttl, token).Int64()
 	if err != nil {
 		return false, classifyCacheUnavailable(ctx, err, "State cache write unavailable")
 	}
-	return stored == 1, nil
+	if result == -1 {
+		return false, state.ErrCacheBackfillLeaseLost
+	}
+	return result == 1, nil
 }
 
 // classifyCacheUnavailable wraps one backend transport failure, keeping the

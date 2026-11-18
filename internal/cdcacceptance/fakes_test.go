@@ -66,10 +66,8 @@ func (f *fakeStateCache) Get(_ context.Context, kind, scope string) (bool, any, 
 	return found, value, nil
 }
 
-// Put stores a snapshot only when its revision is not older than the published
-// one: the production backend rejects a stale write so a slow refresh can never
-// overwrite a newer value.
-func (f *fakeStateCache) Put(_ context.Context, kind, scope string, revision int64, value any, deleted bool) (bool, error) {
+// Put checks ownership and the revision before storing a snapshot.
+func (f *fakeStateCache) Put(_ context.Context, kind, scope, token string, revision int64, value any, deleted bool) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if !f.enabled {
@@ -80,6 +78,9 @@ func (f *fakeStateCache) Put(_ context.Context, kind, scope string, revision int
 		return false, &state.CacheUnavailable{Message: "redis write failed"}
 	}
 	key := transientKey(kind, scope)
+	if f.locks[key] != token {
+		return false, state.ErrCacheBackfillLeaseLost
+	}
 	if published, exists := f.revisions[key]; exists && revision < published {
 		return false, nil
 	}

@@ -34,6 +34,16 @@ func newTestBackend(t *testing.T) (*Client, *miniredis.Miniredis) {
 	return backend, server
 }
 
+// lockManuals prepares a live lease for the document-list cache tests.
+func lockManuals(t *testing.T, backend *Client, ctx context.Context) string {
+	t.Helper()
+	const token = "manuals-lease"
+	if held, err := backend.AcquireBackfillLock(ctx, "documents", "manuals", token, time.Second); err != nil || !held {
+		t.Fatalf("AcquireBackfillLock = (%v, %v), want (true, nil)", held, err)
+	}
+	return token
+}
+
 func TestDisabledModeIsANoop(t *testing.T) {
 	backend := NewDisabled()
 	if backend.Enabled() {
@@ -43,7 +53,7 @@ func TestDisabledModeIsANoop(t *testing.T) {
 	if err != nil || hit || value != nil {
 		t.Fatalf("Get = (%v, %v, %v), want a miss", hit, value, err)
 	}
-	stored, err := backend.Put(context.Background(), "documents", "manuals", 1, map[string]any{"a": 1}, false)
+	stored, err := backend.Put(context.Background(), "documents", "manuals", "disabled", 1, map[string]any{"a": 1}, false)
 	if err != nil || stored {
 		t.Fatalf("Put = (%v, %v), want (false, nil)", stored, err)
 	}
@@ -80,9 +90,13 @@ func TestKeyPairAndCacheRoundTrip(t *testing.T) {
 		t.Fatalf("payload and revision must share one hash slot")
 	}
 
-	stored, err := backend.Put(ctx, "documents", "manuals", 7, value, false)
+	token := lockManuals(t, backend, ctx)
+	stored, err := backend.Put(ctx, "documents", "manuals", token, 7, value, false)
 	if err != nil || !stored {
 		t.Fatalf("Put = (%v, %v)", stored, err)
+	}
+	if err := backend.ReleaseBackfillLock(ctx, "documents", "manuals", token); err != nil {
+		t.Fatalf("ReleaseBackfillLock: %v", err)
 	}
 	if keys := server.Keys(); len(keys) != 2 {
 		t.Fatalf("redis keys = %v", keys)
@@ -118,22 +132,23 @@ func TestKeyPairAndCacheRoundTrip(t *testing.T) {
 func TestCacheRevisionWatermarkRules(t *testing.T) {
 	backend, server := newTestBackend(t)
 	ctx := context.Background()
-	if stored, err := backend.Put(ctx, "documents", "manuals", 5, map[string]any{"v": "five"}, false); err != nil || !stored {
+	token := lockManuals(t, backend, ctx)
+	if stored, err := backend.Put(ctx, "documents", "manuals", token, 5, map[string]any{"v": "five"}, false); err != nil || !stored {
 		t.Fatalf("initial Put = (%v, %v)", stored, err)
 	}
 	// A newer revision wins.
-	if stored, err := backend.Put(ctx, "documents", "manuals", 6, map[string]any{"v": "six"}, false); err != nil || !stored {
+	if stored, err := backend.Put(ctx, "documents", "manuals", token, 6, map[string]any{"v": "six"}, false); err != nil || !stored {
 		t.Fatalf("newer Put = (%v, %v)", stored, err)
 	}
 	// An older revision is ignored.
-	if stored, err := backend.Put(ctx, "documents", "manuals", 5, map[string]any{"v": "stale"}, false); err != nil || stored {
+	if stored, err := backend.Put(ctx, "documents", "manuals", token, 5, map[string]any{"v": "stale"}, false); err != nil || stored {
 		t.Fatalf("older Put = (%v, %v), want (false, nil)", stored, err)
 	}
 	// Equal revision refills a payload and may publish a deletion.
-	if stored, err := backend.Put(ctx, "documents", "manuals", 6, map[string]any{"v": "refill"}, false); err != nil || !stored {
+	if stored, err := backend.Put(ctx, "documents", "manuals", token, 6, map[string]any{"v": "refill"}, false); err != nil || !stored {
 		t.Fatalf("equal revision Put = (%v, %v)", stored, err)
 	}
-	if stored, err := backend.Put(ctx, "documents", "manuals", 6, nil, true); err != nil || !stored {
+	if stored, err := backend.Put(ctx, "documents", "manuals", token, 6, nil, true); err != nil || !stored {
 		t.Fatalf("deletion Put = (%v, %v)", stored, err)
 	}
 	hit, value, err := backend.Get(ctx, "documents", "manuals")
@@ -141,7 +156,7 @@ func TestCacheRevisionWatermarkRules(t *testing.T) {
 		t.Fatalf("deleted Get = (%v, %#v, %v)", hit, value, err)
 	}
 	// Equal revision cannot undo a deletion.
-	if stored, err := backend.Put(ctx, "documents", "manuals", 6, map[string]any{"v": "resurrected"}, false); err != nil || stored {
+	if stored, err := backend.Put(ctx, "documents", "manuals", token, 6, map[string]any{"v": "resurrected"}, false); err != nil || stored {
 		t.Fatalf("resurrection Put = (%v, %v), want (false, nil)", stored, err)
 	}
 	// An expired payload is a miss even though the watermark persists.
@@ -156,10 +171,11 @@ func TestCacheRevisionBeyondLuaIntegerPrecision(t *testing.T) {
 	backend, _ := newTestBackend(t)
 	ctx := context.Background()
 	const older int64 = 1 << 53
-	if stored, err := backend.Put(ctx, "documents", "manuals", older+1, "new", false); err != nil || !stored {
+	token := lockManuals(t, backend, ctx)
+	if stored, err := backend.Put(ctx, "documents", "manuals", token, older+1, "new", false); err != nil || !stored {
 		t.Fatalf("newer Put = (%v, %v)", stored, err)
 	}
-	if stored, err := backend.Put(ctx, "documents", "manuals", older, "old", false); err != nil || stored {
+	if stored, err := backend.Put(ctx, "documents", "manuals", token, older, "old", false); err != nil || stored {
 		t.Fatalf("older Put = (%v, %v), want (false, nil)", stored, err)
 	}
 }

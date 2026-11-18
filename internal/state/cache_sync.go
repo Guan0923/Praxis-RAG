@@ -310,15 +310,12 @@ func (c *CacheSynchronizer) fillUnderLock(ctx context.Context, kind, scope, toke
 		}
 		return nil, err
 	}
-	_, putErr := c.Backend.Put(ctx, kind, scope, revision, value, value == nil)
+	_, putErr := c.Backend.Put(ctx, kind, scope, token, revision, value, value == nil)
 	c.releaseFill(ctx, kind, scope, token)
-	if putErr != nil {
-		// A tolerated publish outage: the value was still read from MySQL, so
-		// the read succeeds while the payload stays absent for the next reader
-		// (the dirty-key sweep retries the publish). Other errors surface.
-		if !isCacheUnavailable(putErr) {
-			return nil, putErr
-		}
+	// A completed MySQL read can still answer this request if publication
+	// fails or the lease expires before Redis runs Put.
+	if putErr != nil && !isCacheUnavailable(putErr) && !errors.Is(putErr, ErrCacheBackfillLeaseLost) {
+		return nil, putErr
 	}
 	return value, nil
 }
@@ -337,8 +334,8 @@ type cacheFillGuard struct {
 // fillLocked runs the revision-latched MySQL snapshot for one guarded fill. A
 // renewer goroutine extends the lease while the query is in flight; when the
 // lease is lost or its ownership becomes unverifiable the query is cancelled
-// and marked lost, and this function returns a retryable error so a stale
-// holder can never publish its result.
+// and marked lost. Put checks ownership again atomically with publication
+// because the lease can expire after this function returns.
 func (c *CacheSynchronizer) fillLocked(ctx context.Context, guard *cacheFillGuard, loader ViewLoader) (int64, any, error) {
 	queryCtx, cancelQuery := context.WithCancel(ctx)
 	defer cancelQuery()
@@ -567,8 +564,11 @@ func (c *CacheSynchronizer) RefreshKey(ctx context.Context, kind, scope string) 
 		}
 		return false, err
 	}
-	_, putErr := c.Backend.Put(ctx, kind, scope, revision, value, value == nil)
+	_, putErr := c.Backend.Put(ctx, kind, scope, token, revision, value, value == nil)
 	c.releaseFill(ctx, kind, scope, token)
+	if errors.Is(putErr, ErrCacheBackfillLeaseLost) {
+		return false, nil
+	}
 	if putErr != nil {
 		c.recordRefreshFailure(ctx, kind, scope, putErr)
 		return false, nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/Guan0923/Praxis-RAG/internal/cacheconsumer"
 	"github.com/Guan0923/Praxis-RAG/internal/state"
@@ -328,7 +329,11 @@ func TestCacheChainRedisFailureRecordsErrorAndRecovers(t *testing.T) {
 	if !found || published <= 0 {
 		t.Fatalf("documents(%s) published revision = %d, found = %v", namespace, published, found)
 	}
-	if ok, err := backend.Put(ctx, "documents", namespace, published-1, []any{
+	const token = "stale-refresh"
+	if held, err := backend.AcquireBackfillLock(ctx, "documents", namespace, token, time.Second); err != nil || !held {
+		t.Fatalf("AcquireBackfillLock() = %v, %v", held, err)
+	}
+	if ok, err := backend.Put(ctx, "documents", namespace, token, published-1, []any{
 		map[string]any{"name": "stale.txt"},
 	}, false); err != nil || ok {
 		t.Fatalf("stale Put() = %v, %v; want rejected by the watermark", ok, err)
