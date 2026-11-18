@@ -10,6 +10,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 	"github.com/Guan0923/Praxis-RAG/internal/runtime"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // SearchRuntime runs one synchronous retrieval action.
@@ -75,6 +76,13 @@ func runtimeErrorStatus(err error) (int, string) {
 	var operation *contracts.RagOperationError
 	if errors.As(err, &operation) {
 		return http.StatusServiceUnavailable, operation.Message
+	}
+	// The display-query MySQL fallback budget is exhausted: the request was
+	// rejected to protect the database, so REST answers the shared busy detail
+	// on the existing error envelope instead of retrying anywhere else.
+	var backpressure *state.ViewBackpressureError
+	if errors.As(err, &backpressure) {
+		return http.StatusServiceUnavailable, backpressure.Message
 	}
 	return http.StatusInternalServerError, "Internal Server Error"
 }

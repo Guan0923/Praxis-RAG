@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -224,6 +225,12 @@ type cacheEnvelope struct {
 // corrupt envelope, watermark mismatch or backend failure behaves exactly like
 // RedisStateCache.get: corruption/unavailability is a CacheUnavailable error,
 // while a watermark mismatch is reported as a miss.
+//
+// The returned *state.CacheUnavailable keeps the internal cause distinguishable:
+// connection errors and timeouts carry the network reason (they feed the
+// display-cache circuit breaker), an undecodable payload carries the corrupt
+// reason (only this entry is affected), and a caller cancellation carries the
+// canceled reason (not a Redis fault).
 func (c *Client) Get(ctx context.Context, kind, scope string) (bool, any, error) {
 	if !c.enabled {
 		return false, nil, nil
@@ -235,18 +242,18 @@ func (c *Client) Get(ctx context.Context, kind, scope string) (bool, any, error)
 	payloadKey, revisionKey := KeyPair(c.settings.Prefix, kind, scope)
 	values, err := connection.MGet(ctx, payloadKey, revisionKey).Result()
 	if err != nil {
-		return false, nil, &state.CacheUnavailable{Message: "State cache read unavailable"}
+		return false, nil, classifyCacheUnavailable(ctx, err, "State cache read unavailable")
 	}
 	if len(values) < 2 || values[0] == nil {
 		return false, nil, nil
 	}
 	rawPayload, ok := cacheText(values[0])
 	if !ok {
-		return false, nil, &state.CacheUnavailable{Message: "State cache read unavailable"}
+		return false, nil, state.NewCacheUnavailableCorrupt("State cache read unavailable")
 	}
 	envelope, err := decodeCacheEnvelope(rawPayload)
 	if err != nil {
-		return false, nil, &state.CacheUnavailable{Message: "State cache read unavailable"}
+		return false, nil, state.NewCacheUnavailableCorrupt("State cache read unavailable")
 	}
 	watermark, _ := cacheText(values[1])
 	deletedMarker := "0"
@@ -308,7 +315,9 @@ func canonicalRevision(value string) bool {
 
 // Put atomically publishes a snapshot unless a newer revision already exists.
 // Equal revisions can refill expired payloads but cannot undo a deletion; the
-// deletion value is discarded. It mirrors RedisStateCache.put.
+// deletion value is discarded. It mirrors RedisStateCache.put. Failures keep
+// the same cause classification as Get: network outages, single-entry encoding
+// problems and caller cancellations stay distinguishable.
 func (c *Client) Put(ctx context.Context, kind, scope string, revision int64, value any, deleted bool) (bool, error) {
 	if !c.enabled {
 		return false, nil
@@ -326,7 +335,7 @@ func (c *Client) Put(ctx context.Context, kind, scope string, revision int64, va
 	}
 	payload, err := encodeCacheEnvelope(envelope)
 	if err != nil {
-		return false, &state.CacheUnavailable{Message: "State cache write unavailable"}
+		return false, state.NewCacheUnavailableCorrupt("State cache write unavailable")
 	}
 	newRevision := envelope.Revision
 	deletedMarker := "0"
@@ -368,11 +377,21 @@ func (c *Client) Put(ctx context.Context, kind, scope string, revision int64, va
 			continue
 		}
 		if watchErr != nil {
-			return false, &state.CacheUnavailable{Message: "State cache write unavailable"}
+			return false, classifyCacheUnavailable(ctx, watchErr, "State cache write unavailable")
 		}
 		return !skip, nil
 	}
-	return false, &state.CacheUnavailable{Message: "State cache write unavailable"}
+	return false, state.NewCacheUnavailableNetwork("State cache write unavailable")
+}
+
+// classifyCacheUnavailable wraps one backend transport failure, keeping the
+// caller's active cancellation distinguishable from a backend availability
+// fault: only the latter feeds the display-cache circuit breaker.
+func classifyCacheUnavailable(ctx context.Context, cause error, message string) *state.CacheUnavailable {
+	if ctx.Err() != nil && errors.Is(ctx.Err(), context.Canceled) {
+		return state.NewCacheUnavailableCanceled(message)
+	}
+	return state.NewCacheUnavailableNetwork(message)
 }
 
 // parseWatermark parses "<revision>:<0|1>" exactly like the Lua PUT script.
