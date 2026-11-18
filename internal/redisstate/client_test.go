@@ -152,6 +152,18 @@ func TestCacheRevisionWatermarkRules(t *testing.T) {
 	}
 }
 
+func TestCacheRevisionBeyondLuaIntegerPrecision(t *testing.T) {
+	backend, _ := newTestBackend(t)
+	ctx := context.Background()
+	const older int64 = 1 << 53
+	if stored, err := backend.Put(ctx, "documents", "manuals", older+1, "new", false); err != nil || !stored {
+		t.Fatalf("newer Put = (%v, %v)", stored, err)
+	}
+	if stored, err := backend.Put(ctx, "documents", "manuals", older, "old", false); err != nil || stored {
+		t.Fatalf("older Put = (%v, %v), want (false, nil)", stored, err)
+	}
+}
+
 func TestCacheCorruptionAndMiss(t *testing.T) {
 	backend, server := newTestBackend(t)
 	ctx := context.Background()

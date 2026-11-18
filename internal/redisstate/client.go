@@ -317,6 +317,27 @@ func canonicalRevision(value string) bool {
 	return len(value) == 1 || value[0] != '0'
 }
 
+// Compare decimal revisions as strings to preserve the full int64 range in Lua.
+var putSnapshotScript = redis.NewScript(`
+local revision, deleted = ARGV[1], ARGV[2]
+local current = redis.call("GET", KEYS[2])
+if current then
+    local previous, wasDeleted = string.match(current, "^([0-9]+):([01])$")
+    if not previous then
+        return redis.error_reply("invalid state cache watermark")
+    end
+    if #previous > #revision or (#previous == #revision and previous > revision) then
+        return 0
+    end
+    if previous == revision and wasDeleted == "1" and deleted == "0" then
+        return 0
+    end
+end
+redis.call("SET", KEYS[1], ARGV[3], "EX", ARGV[4])
+redis.call("SET", KEYS[2], revision .. ":" .. deleted)
+return 1
+`)
+
 // Put atomically publishes a snapshot unless a newer revision already exists.
 // Equal revisions can refill expired payloads but cannot undo a deletion; the
 // deletion value is discarded. It mirrors RedisStateCache.put. Failures keep
@@ -349,45 +370,13 @@ func (c *Client) Put(ctx context.Context, kind, scope string, revision int64, va
 		deletedMarker = "1"
 	}
 	payloadKey, revisionKey := KeyPair(c.settings.Prefix, kind, scope)
-	ttl := time.Duration(state.RandomTTLSeconds(c.settings.TTLSeconds)) * time.Second
-	for range 32 {
-		skip := false
-		watchErr := connection.Watch(ctx, func(transaction *redis.Tx) error {
-			current, err := transaction.Get(ctx, revisionKey).Result()
-			if err != nil && err != redis.Nil {
-				return err
-			}
-			if err == nil {
-				oldRevision, oldDeleted, ok := parseWatermark(current)
-				if !ok {
-					return fmt.Errorf("invalid state cache watermark")
-				}
-				if len(oldRevision) > len(newRevision) ||
-					(len(oldRevision) == len(newRevision) && oldRevision > newRevision) {
-					skip = true
-					return nil
-				}
-				if oldRevision == newRevision && oldDeleted && !deleted {
-					skip = true
-					return nil
-				}
-			}
-			_, err = transaction.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.Set(ctx, payloadKey, payload, ttl)
-				pipe.Set(ctx, revisionKey, newRevision+":"+deletedMarker, 0)
-				return nil
-			})
-			return err
-		}, payloadKey, revisionKey)
-		if watchErr == redis.TxFailedErr {
-			continue
-		}
-		if watchErr != nil {
-			return false, classifyCacheUnavailable(ctx, watchErr, "State cache write unavailable")
-		}
-		return !skip, nil
+	ttl := state.RandomTTLSeconds(c.settings.TTLSeconds)
+	stored, err := putSnapshotScript.Run(ctx, connection, []string{payloadKey, revisionKey},
+		newRevision, deletedMarker, payload, ttl).Int64()
+	if err != nil {
+		return false, classifyCacheUnavailable(ctx, err, "State cache write unavailable")
 	}
-	return false, state.NewCacheUnavailableNetwork("State cache write unavailable")
+	return stored == 1, nil
 }
 
 // classifyCacheUnavailable wraps one backend transport failure, keeping the
@@ -398,27 +387,6 @@ func classifyCacheUnavailable(ctx context.Context, cause error, message string) 
 		return state.NewCacheUnavailableCanceled(message)
 	}
 	return state.NewCacheUnavailableNetwork(message)
-}
-
-// parseWatermark parses "<revision>:<0|1>" exactly like the Lua PUT script.
-func parseWatermark(value string) (revision string, deleted bool, ok bool) {
-	revision, marker, found := strings.Cut(value, ":")
-	if !found || revision == "" {
-		return "", false, false
-	}
-	for index := 0; index < len(revision); index++ {
-		if revision[index] < '0' || revision[index] > '9' {
-			return "", false, false
-		}
-	}
-	switch marker {
-	case "0":
-		return revision, false, true
-	case "1":
-		return revision, true, true
-	default:
-		return "", false, false
-	}
 }
 
 // renewBackfillLockScript and releaseBackfillLockScript keep the token check
