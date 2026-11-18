@@ -137,19 +137,40 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeRuntimeError(w, err, true)
 		return
 	}
-	// A file-level grantee only retrieves the documents they may read: the
+	// A restricted grantee only retrieves the documents they may read: the
 	// runtime filters results and snapshots by these ids (nil = unrestricted,
 	// empty slice = nothing visible).
 	if hasScope && scope.Restricted() {
+		// The SAG event-entity mode expands a dynamic hyperedge whose
+		// expansion cannot be bounded to the readable set before recall; a
+		// restricted account is refused explicitly instead of silently
+		// leaking evidence.
+		if request.Retrieval == contracts.RetrievalSAG {
+			writeDetail(w, http.StatusForbidden, "该检索模式暂不支持受限账号调用：sag")
+			return
+		}
 		request.DocumentIDs = []string{}
 		if s.access != nil {
-			ids, resolveErr := s.access.ResolveDocumentIDs(r.Context(), namespace, scope.ReadDocumentNames())
-			if resolveErr != nil {
-				writeAccessError(w, resolveErr)
-				return
-			}
-			if ids != nil {
-				request.DocumentIDs = ids
+			if resolver, ok := s.access.(interface {
+				ResolveVisibleDocumentIDs(ctx context.Context, namespace string, scope access.ScopeSet) ([]string, error)
+			}); ok {
+				ids, resolveErr := resolver.ResolveVisibleDocumentIDs(r.Context(), namespace, scope)
+				if resolveErr != nil {
+					writeAccessError(w, resolveErr)
+					return
+				}
+				if ids != nil {
+					request.DocumentIDs = ids
+				}
+			} else {
+				ids, resolveErr := s.access.ResolveDocumentIDs(r.Context(), namespace, scope.ReadDocumentNames())
+				if resolveErr != nil {
+					writeAccessError(w, resolveErr)
+					return
+				}
+				if ids != nil {
+					request.DocumentIDs = ids
+				}
 			}
 		}
 	}
@@ -191,6 +212,7 @@ func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request
 		writeDetail(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	ctx := runtime.WithDocumentReadGate(r.Context(), artifactDocumentGate(r))
 	offset, details := intQuery(r, "offset", 0, 0, maxIntValue)
 	if details != nil {
 		writeValidation(w, http.StatusBadRequest, details)
@@ -205,7 +227,6 @@ func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request
 		writeDetail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ctx := runtime.WithDocumentReadGate(r.Context(), artifactDocumentGate(r))
 	payload, err := s.runtime.GetArtifact(ctx, namespace, artifactID, offset, length)
 	if err != nil {
 		writeRuntimeError(w, err, true)

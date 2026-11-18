@@ -5,6 +5,7 @@ import {
   avatarUrl,
   changeEmail,
   changePassword,
+  clearKnowledgeBaseDeny,
   closeMembershipOrder,
   createInvitation,
   createMembershipOrder,
@@ -14,6 +15,7 @@ import {
   deleteAvatar,
   deleteKnowledgeBases,
   deleteModelProfile,
+  effectiveScopeMask,
   errorText,
   fetchAccess,
   fetchAdminBillingOrders,
@@ -32,25 +34,37 @@ import {
   formatQuota,
   formatRate,
   formatScore,
+  hasMask,
   invitationLink,
   invitationStatus,
   invitationStatusLabels,
   knowledgeBaseModelKinds,
+  maskToText,
+  mergeMasks,
   modelKindLabels,
   monitorComponentLabels,
   monitorTabComponents,
   modelKinds,
+  normalizeMask,
   permissionLabels,
+  permissionBits,
+  PERM_CREATE,
+  PERM_DELETE,
+  PERM_FULL,
+  PERM_READ,
+  PERM_UPDATE,
   refundAdminBillingOrder,
   registerAccount,
   requestEmailChange,
   requestRegisterCode,
   revealModelProfileKey,
+  revokeGrant,
   roleLabel,
   saveMailSettings,
   scopeLabels,
   sendTestMail,
   setCSRFToken,
+  setKnowledgeBasePermission,
   setUnauthorizedHandler,
   submitDocumentBatch,
   subscribeUploadProgress,
@@ -129,6 +143,7 @@ function invitation(overrides: Partial<InvitationView> = {}): InvitationView {
     invitee_user_id: "u-vip",
     invitee_username: "vip",
     permission: "read",
+    allow_mask: 1,
     scope: "all",
     document_names: [],
     status: "pending",
@@ -525,34 +540,111 @@ describe("sharing API paths and payloads", () => {
     expect(headers.get("X-RAG-Namespace")).toBe("team kb");
   });
 
-  it("posts invitations and normalizes a null document list", async () => {
+  it("posts invitations with the normalized allow_mask and document list", async () => {
     fetchMock.mockResolvedValue(
-      jsonResponse({ invitation: { ...invitation({ scope: "files" }), document_names: null } }),
+      jsonResponse({ invitation: { ...invitation({ scope: "files" }), document_names: null, allow_mask: 5 } }),
     );
     const result = await createInvitation(
       "team-kb",
-      { username: "vip", permission: "read", scope: "files", document_names: ["a.md"] },
+      {
+        username: "vip",
+        allow_mask: PERM_READ | PERM_UPDATE,
+        scope: "files",
+        document_names: ["a.md"],
+      },
       connection,
     );
     expect(result.invitation.document_names).toEqual([]);
+    expect(result.invitation.allow_mask).toBe(5);
     const [path, options] = requestArgs(0);
     expect(path).toBe("/v1/knowledge-bases/team-kb/invitations");
     expect(options.method).toBe("POST");
     expect(JSON.parse(String(options.body))).toEqual({
       username: "vip",
-      permission: "read",
+      allow_mask: 5,
       scope: "files",
       document_names: ["a.md"],
     });
   });
 
+  it("clamps out-of-range invitation masks on submit and response", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ invitation: { ...invitation({ allow_mask: 31 }) } }),
+    );
+    const result = await createInvitation(
+      "team-kb",
+      { username: "vip", allow_mask: 31, scope: "all", document_names: [] },
+      connection,
+    );
+    expect(result.invitation.allow_mask).toBe(15);
+    expect(JSON.parse(String(requestArgs(0)[1].body)).allow_mask).toBe(15);
+  });
+
+  it("puts permission rules with both masks and returns the grant view", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({
+      permission: {
+        user_id: "u-vip",
+        username: "vip",
+        document_name: "",
+        permission: "",
+        allow_mask: 13,
+        deny_mask: 2,
+        granted_by: "u-admin",
+        granted_by_username: "admin",
+        created_at: "2026-11-18T10:00:00Z",
+        updated_at: "2026-11-18T10:00:00Z",
+      },
+    }));
+    const view = await setKnowledgeBasePermission(
+      "team-kb",
+      "u-vip",
+      { document_name: "", allow_mask: 13, deny_mask: 2 },
+      connection,
+    );
+    expect(view.allow_mask).toBe(13);
+    expect(view.deny_mask).toBe(2);
+    const [path, options] = requestArgs(0);
+    expect(path).toBe("/v1/knowledge-bases/team-kb/permissions/u-vip");
+    expect(options.method).toBe("PUT");
+    expect(JSON.parse(String(options.body))).toEqual({
+      document_name: "",
+      allow_mask: 13,
+      deny_mask: 2,
+    });
+  });
+
+  it("clears deny bits via clear-deny with the document name", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({}, 204));
+    await clearKnowledgeBaseDeny("team-kb", "u-vip", "使用手册.md", connection);
+    const [path, options] = requestArgs(0);
+    expect(path).toBe(
+      "/v1/knowledge-bases/team-kb/permissions/u-vip/clear-deny",
+    );
+    expect(options.method).toBe("POST");
+    expect(JSON.parse(String(options.body))).toEqual({ document_name: "使用手册.md" });
+  });
+
+  it("revokes allow for one document via the DELETE query", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({}, 204));
+    await revokeGrant("team-kb", "u-vip", connection, "使用手册.md");
+    const [path, options] = requestArgs(0);
+    expect(path).toBe(
+      "/v1/knowledge-bases/team-kb/permissions/u-vip?document_name=%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C.md",
+    );
+    expect(options.method).toBe("DELETE");
+    // 不传文件名时不带 query，撤销该用户全部 allow。
+    await revokeGrant("team-kb", "u-vip", connection);
+    expect(requestArgs(1)[0]).toBe("/v1/knowledge-bases/team-kb/permissions/u-vip");
+  });
+
   it("treats missing permission lists as empty", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ permissions: null }));
     await expect(fetchGrants("team-kb", connection)).resolves.toEqual([]);
-    fetchMock.mockResolvedValue(jsonResponse({ invitations: [{ ...invitation(), document_names: null }] }));
+    fetchMock.mockResolvedValue(jsonResponse({ invitations: [{ ...invitation(), document_names: null, allow_mask: undefined }] }));
     const inbox = await fetchInvitationInbox();
     expect(inbox).toHaveLength(1);
     expect(inbox[0].document_names).toEqual([]);
+    expect(inbox[0].allow_mask).toBe(0);
   });
 
   it("builds the invite link from the server path", () => {
@@ -564,6 +656,61 @@ describe("sharing API paths and payloads", () => {
   it("returns decoded JSON through api()", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ users: [{ id: "u1" }] }));
     await expect(api("/v1/users")).resolves.toEqual({ users: [{ id: "u1" }] });
+  });
+});
+
+describe("permission bitmask helpers", () => {
+  it("keeps the four operation bits and full mask", () => {
+    expect(PERM_READ).toBe(1);
+    expect(PERM_CREATE).toBe(2);
+    expect(PERM_UPDATE).toBe(4);
+    expect(PERM_DELETE).toBe(8);
+    expect(PERM_FULL).toBe(15);
+    expect(permissionBits.map((item) => item.label)).toEqual(["阅读", "新增", "修改", "删除"]);
+  });
+
+  it("merges masks with deny precedence (Go &^ semantics)", () => {
+    expect(mergeMasks(15, 0)).toBe(15);
+    expect(mergeMasks(15, 2)).toBe(13);
+    expect(mergeMasks(1 | 4, 4)).toBe(1);
+    expect(mergeMasks(0, 15)).toBe(0);
+  });
+
+  it("computes the effective mask of one document from scope fields", () => {
+    const scope = {
+      whole_read: true,
+      whole_write: false,
+      read_documents: [],
+      write_documents: [],
+      default_allow: 1,
+      default_deny: 0,
+      whole_allow: 4,
+      whole_deny: 0,
+      file_allow: { "a.md": 8 },
+      file_deny: { "a.md": 8 },
+    };
+    expect(effectiveScopeMask(scope, "a.md")).toBe(1 | 4);
+    expect(effectiveScopeMask(scope, "b.md")).toBe(1 | 4);
+  });
+
+  it("translates masks into Chinese labels", () => {
+    expect(maskToText(1)).toBe("阅读");
+    expect(maskToText(5)).toBe("阅读、修改");
+    expect(maskToText(13)).toBe("阅读、修改、删除");
+    expect(maskToText(15)).toBe("阅读、修改、删除、新增");
+    expect(maskToText(2)).toBe("新增");
+    expect(maskToText(0)).toBe("未设置");
+    expect(maskToText(undefined, "无")).toBe("无");
+  });
+
+  it("normalizes and inspects bits", () => {
+    expect(normalizeMask(undefined)).toBe(0);
+    expect(normalizeMask(31)).toBe(15);
+    expect(normalizeMask(-1)).toBe(15);
+    expect(normalizeMask(3.7)).toBe(3);
+    expect(hasMask(5, PERM_UPDATE)).toBe(true);
+    expect(hasMask(5, PERM_DELETE)).toBe(false);
+    expect(hasMask(undefined, PERM_READ)).toBe(false);
   });
 });
 

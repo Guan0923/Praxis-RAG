@@ -28,12 +28,18 @@ const (
 
 // Invitation is one issued share invitation. Only the SHA-256 digest of the
 // link token is stored, so a database leak cannot replay a pending link.
+//
+// AllowMask carries the invitation's granted operation bits (read=1,
+// create=2, update=4, delete=8). Rows created before the mask column existed
+// read as 0 together with a read/write Permission value; the access layer
+// then derives the mask from that legacy value.
 type Invitation struct {
 	ID            string
 	Namespace     string
 	InviterUserID string
 	InviteeUserID string
 	Permission    string
+	AllowMask     uint16
 	Scope         string
 	DocumentNames []string
 	TokenDigest   string
@@ -44,6 +50,25 @@ type Invitation struct {
 	UpdatedAt     string
 }
 
+// InvitationAllowMask resolves the invitation's allow mask, falling back to
+// the legacy permission projection for rows that predate the mask column.
+func (i Invitation) InvitationAllowMask() uint16 {
+	if i.AllowMask == 0 && (i.Permission == PermissionRead || i.Permission == PermissionWrite) {
+		whole := i.Scope == InvitationScopeAll || len(i.DocumentNames) == 0
+		return DeriveAllowMask(i.Permission, documentNameForScope(whole))
+	}
+	return i.AllowMask
+}
+
+// documentNameForScope maps the whole/file scope onto the permission
+// derivation's document-name convention ("" = whole library).
+func documentNameForScope(whole bool) string {
+	if whole {
+		return ""
+	}
+	return "file"
+}
+
 // InvitationRepository persists knowledge-base share invitations.
 type InvitationRepository struct{ db *sql.DB }
 
@@ -51,8 +76,8 @@ func newInvitationRepository(db *sql.DB) *InvitationRepository {
 	return &InvitationRepository{db: db}
 }
 
-const invitationColumns = "id, namespace, inviter_user_id, invitee_user_id, permission, scope, " +
-	"document_names, token_digest, status, created_at, expires_at, accepted_at, updated_at"
+const invitationColumns = "id, namespace, inviter_user_id, invitee_user_id, permission, " +
+	"COALESCE(allow_mask, 0), scope, document_names, token_digest, status, created_at, expires_at, accepted_at, updated_at"
 
 // Create inserts one invitation, generating its id/timestamps and validating the
 // document-name JSON payload. The raw token is never passed to the repository.
@@ -77,10 +102,12 @@ func (r *InvitationRepository) Create(ctx context.Context, invitation Invitation
 		return Invitation{}, newStateError("邀请无法创建")
 	}
 	if _, err := r.db.ExecContext(ctx,
-		"INSERT INTO kb_invitations ("+invitationColumns+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+		"INSERT INTO kb_invitations (id, namespace, inviter_user_id, invitee_user_id, permission, "+
+			"allow_mask, scope, document_names, token_digest, status, created_at, expires_at, accepted_at, updated_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
 		invitation.ID, invitation.Namespace, invitation.InviterUserID, invitation.InviteeUserID,
-		invitation.Permission, invitation.Scope, encoded, invitation.TokenDigest, invitation.Status,
-		invitation.CreatedAt, invitation.ExpiresAt, invitation.UpdatedAt); err != nil {
+		invitation.Permission, invitation.AllowMask, invitation.Scope, encoded, invitation.TokenDigest,
+		invitation.Status, invitation.CreatedAt, invitation.ExpiresAt, invitation.UpdatedAt); err != nil {
 		if isUniqueViolation(err) {
 			return Invitation{}, newStateConflict("邀请已存在")
 		}
@@ -140,15 +167,19 @@ func (r *InvitationRepository) ListByNamespace(ctx context.Context, namespace st
 	return scanInvitations(rows)
 }
 
-// SetStatus applies one status transition. acceptedAt may be empty.
+// SetStatus applies one status transition. Only a pending invitation may be
+// declined, revoked or expired: the guarded UPDATE makes a concurrent accept
+// (or another decline/revoke) the single winner, and the caller checks the
+// reported change. acceptedAt may be empty.
 func (r *InvitationRepository) SetStatus(ctx context.Context, id, status, acceptedAt string) (bool, error) {
 	var accepted any
 	if acceptedAt != "" {
 		accepted = acceptedAt
 	}
 	result, err := r.db.ExecContext(ctx,
-		"UPDATE kb_invitations SET status = ?, accepted_at = COALESCE(?, accepted_at), updated_at = ? WHERE id = ?",
-		status, accepted, nowISO(), id)
+		"UPDATE kb_invitations SET status = ?, accepted_at = COALESCE(?, accepted_at), updated_at = ? "+
+			"WHERE id = ? AND status = ?",
+		status, accepted, nowISO(), id, InvitationPending)
 	if err != nil {
 		return false, newStateError("邀请无法更新")
 	}
@@ -190,7 +221,10 @@ func (r *InvitationRepository) AcceptPending(ctx context.Context, id, acceptedAt
 	if changed > 0 {
 		timestamp := nowISO()
 		for _, grant := range grants {
-			if err := upsertPermissionRow(ctx, transaction, grant, timestamp); err != nil {
+			// The accepted invitation writes its allow side only: re-issuing
+			// the same scope overwrites the previous allow while any stored
+			// deny rule stays in force.
+			if err := upsertPermissionRow(ctx, transaction, grant.withDerivedMasks(), timestamp, true); err != nil {
 				return nil, err
 			}
 		}
@@ -247,8 +281,8 @@ func scanInvitation(row interface{ Scan(dest ...any) error }) (*Invitation, erro
 		acceptedAt sql.NullString
 	)
 	if err := row.Scan(&invitation.ID, &invitation.Namespace, &invitation.InviterUserID,
-		&invitation.InviteeUserID, &invitation.Permission, &invitation.Scope, &documents,
-		&invitation.TokenDigest, &invitation.Status, &invitation.CreatedAt, &invitation.ExpiresAt,
+		&invitation.InviteeUserID, &invitation.Permission, &invitation.AllowMask, &invitation.Scope,
+		&documents, &invitation.TokenDigest, &invitation.Status, &invitation.CreatedAt, &invitation.ExpiresAt,
 		&acceptedAt, &invitation.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil

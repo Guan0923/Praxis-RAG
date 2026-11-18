@@ -132,3 +132,24 @@ func asMap(filters map[string]any) map[string]any {
 	}
 	return filters
 }
+
+// visibilityFilters merges a server-side document-id restriction into the
+// retriever filter set as the closed-vocabulary document_id condition. An
+// empty restriction (nothing visible) uses an impossible condition so recall
+// returns no evidence at all; a non-empty one becomes a match-any list the
+// Qdrant store, the SAG2 lexical index and the graph adapter all apply during
+// recall.
+func visibilityFilters(filters map[string]any, documentIDs []string) map[string]any {
+	merged := make(map[string]any, len(filters)+1)
+	for key, value := range filters {
+		merged[key] = value
+	}
+	if len(documentIDs) == 0 {
+		// No document is visible: keep the key present so the filter is
+		// applied, but with a value no stored document can match.
+		merged["document_id"] = []string{"\x00__no_visible_document__"}
+		return merged
+	}
+	merged["document_id"] = append([]string(nil), documentIDs...)
+	return merged
+}

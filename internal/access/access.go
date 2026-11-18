@@ -10,7 +10,6 @@ package access
 import (
 	"context"
 	"errors"
-	"sort"
 	"strings"
 	"time"
 
@@ -59,6 +58,9 @@ const (
 	MessageUserDisabled     = "该账号已被禁用"
 	MessageSelfInvite       = "不能邀请自己"
 	MessagePermissionBad    = "权限只能是 read 或 write"
+	MessageMaskBad          = "权限掩码必须是 0 到 15 之间的整数"
+	MessageMaskCreateFile   = "新增权限只能设置在知识库级别，不能针对单个文件"
+	MessageRuleMissing      = "授权规则不存在"
 	MessageScopeBad         = "范围只能是 all 或 files"
 	MessageDocumentsEmpty   = "请选择要授权的文件"
 	MessageDocumentsBad     = "文件名不合法："
@@ -74,8 +76,9 @@ const (
 )
 
 // Document permission bits, shared with the group grant contract: read=0001,
-// create=0010, update=0100, delete=1000. Personal grants keep the historical
-// read/write levels and map onto the same bits.
+// create=0010, update=0100, delete=1000. The personal-rule bitmask model of
+// bitmask.go uses the same four bits, so personal allow/deny masks and group
+// allow masks merge in one place.
 const (
 	PermissionBitRead   = state.PermissionBitRead
 	PermissionBitCreate = state.PermissionBitCreate
@@ -85,235 +88,71 @@ const (
 )
 
 // IsValidAllowMask reports whether value is a non-empty subset of the four
-// permission bits.
+// permission bits (the group grant contract's validation).
 func IsValidAllowMask(value int) bool { return state.IsValidAllowMask(value) }
 
-// ScopeSet is the effective access of one account inside one knowledge base.
+// ScopeSet is the effective access of one account inside one knowledge base,
+// expressed with the operation bit masks of bitmask.go. It carries the raw
+// rule state (role defaults, whole-library masks and per-file masks, plus the
+// group-merged allow bits); every allows/denies question is answered by the
+// shared merge in scope.go so REST, MCP and retrieval enforce the same
+// judgement.
 type ScopeSet struct {
-	WholeRead      bool
-	WholeWrite     bool
-	ReadDocuments  map[string]struct{}
-	WriteDocuments map[string]struct{}
-	// WholeUpdate reports whether every document may be updated (replaced).
-	// A whole-library write grant implies it; a group grant can set it alone.
-	WholeUpdate bool
-	// WholeDelete reports whether every document may be deleted. A
-	// whole-library write grant implies it; a group grant can set it alone.
-	WholeDelete bool
-	// UpdateDocuments are the explicitly replaceable document names beyond
-	// WholeUpdate and the write set.
-	UpdateDocuments map[string]struct{}
-	// DeleteDocuments are the explicitly deletable document names beyond
-	// WholeDelete and the write set.
-	DeleteDocuments map[string]struct{}
+	// DefaultAllow/DefaultDeny are the role defaults: administrators and the
+	// knowledge-base owner start with every operation allowed, everyone else
+	// starts with nothing. Both still participate in the deny merge, so an
+	// explicit deny rule restricts administrators and owners too.
+	DefaultAllow PermissionMask
+	DefaultDeny  PermissionMask
+	// WholeAllow/WholeDeny are the whole-knowledge-base rule masks (the
+	// personal grant row with an empty document name).
+	WholeAllow PermissionMask
+	WholeDeny  PermissionMask
+	// FileAllow/FileDeny are the per-document rule masks.
+	FileAllow map[string]PermissionMask
+	FileDeny  map[string]PermissionMask
+	// GroupAllow holds the group-merged allow bits: the whole-library bits in
+	// the "" key and the per-document bits per name. Group grants only ever
+	// add permissions, so they never contribute deny bits.
+	GroupAllow map[string]PermissionMask
 }
 
 // NewScopeSet returns an empty (no access) scope.
 func NewScopeSet() ScopeSet {
 	return ScopeSet{
-		ReadDocuments:   map[string]struct{}{},
-		WriteDocuments:  map[string]struct{}{},
-		UpdateDocuments: map[string]struct{}{},
-		DeleteDocuments: map[string]struct{}{},
+		FileAllow:  map[string]PermissionMask{},
+		FileDeny:  map[string]PermissionMask{},
+		GroupAllow: map[string]PermissionMask{},
 	}
 }
 
-// fullScope is the owner/administrator scope: every document, read and write.
-func fullScope() ScopeSet {
-	return ScopeSet{WholeRead: true, WholeWrite: true,
-		ReadDocuments: map[string]struct{}{}, WriteDocuments: map[string]struct{}{},
-		UpdateDocuments: map[string]struct{}{}, DeleteDocuments: map[string]struct{}{}}
-}
+// AllowsAnyRead/HasAnyWrite/ReadsWhole/WritesWhole/CanCreate/CanReadDocument/
+// CanUpdateDocument/CanDeleteDocument/CanWriteDocument/Restricted/
+// ReadDocumentNames/WriteDocumentNames live in scope.go, where the mask merge
+// is implemented once for personal rules, group grants and role defaults.
 
-// AllowsAnyRead reports whether the account may read anything in the knowledge
-// base.
-func (s ScopeSet) AllowsAnyRead() bool {
-	return s.WholeRead || len(s.ReadDocuments) > 0 || s.WholeWrite
-}
-
-// HasAnyWrite reports whether the account may modify anything in the knowledge
-// base.
-func (s ScopeSet) HasAnyWrite() bool {
-	return s.WholeWrite || len(s.WriteDocuments) > 0
-}
-
-// ReadsWhole reports whether the account may read every document.
-func (s ScopeSet) ReadsWhole() bool { return s.WholeRead || s.WholeWrite }
-
-// WritesWhole reports whether the account may modify every document.
-func (s ScopeSet) WritesWhole() bool { return s.WholeWrite }
-
-// CanCreate reports whether the account may create (upload) new documents.
-func (s ScopeSet) CanCreate() bool { return s.WholeWrite }
-
-// CanReadDocument reports whether one document name is readable.
-func (s ScopeSet) CanReadDocument(name string) bool {
-	if s.ReadsWhole() {
-		return true
-	}
-	if _, ok := s.ReadDocuments[name]; ok {
-		return true
-	}
-	if _, ok := s.WriteDocuments[name]; ok {
-		return true
-	}
-	if _, ok := s.UpdateDocuments[name]; ok {
-		return true
-	}
-	_, ok := s.DeleteDocuments[name]
-	return ok
-}
-
-// CanWriteDocument reports whether one document name is writable (the union of
-// replace and delete rights).
-func (s ScopeSet) CanWriteDocument(name string) bool {
-	return s.CanUpdateDocument(name) || s.CanDeleteDocument(name)
-}
-
-// CanUpdateDocument reports whether one document name may be replaced.
-func (s ScopeSet) CanUpdateDocument(name string) bool {
-	if s.WholeWrite || s.WholeUpdate {
-		return true
-	}
-	if _, ok := s.WriteDocuments[name]; ok {
-		return true
-	}
-	_, ok := s.UpdateDocuments[name]
-	return ok
-}
-
-// CanDeleteDocument reports whether one document name may be deleted.
-func (s ScopeSet) CanDeleteDocument(name string) bool {
-	if s.WholeWrite || s.WholeDelete {
-		return true
-	}
-	if _, ok := s.WriteDocuments[name]; ok {
-		return true
-	}
-	_, ok := s.DeleteDocuments[name]
-	return ok
-}
-
-// ReadDocumentNames returns the explicitly readable document names, sorted.
-func (s ScopeSet) ReadDocumentNames() []string {
-	seen := make(map[string]struct{}, len(s.ReadDocuments)+len(s.WriteDocuments)+
-		len(s.UpdateDocuments)+len(s.DeleteDocuments))
-	names := make([]string, 0, len(seen))
-	for name := range s.ReadDocuments {
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
-			names = append(names, name)
-		}
-	}
-	for name := range s.WriteDocuments {
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
-			names = append(names, name)
-		}
-	}
-	for name := range s.UpdateDocuments {
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
-			names = append(names, name)
-		}
-	}
-	for name := range s.DeleteDocuments {
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	return names
-}
-
-// WriteDocumentNames returns the explicitly writable document names, sorted.
-func (s ScopeSet) WriteDocumentNames() []string {
-	seen := make(map[string]struct{}, len(s.WriteDocuments)+len(s.UpdateDocuments)+len(s.DeleteDocuments))
-	names := make([]string, 0, len(seen))
-	for name := range s.WriteDocuments {
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
-			names = append(names, name)
-		}
-	}
-	for name := range s.UpdateDocuments {
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
-			names = append(names, name)
-		}
-	}
-	for name := range s.DeleteDocuments {
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	return names
-}
-
-// AllowsCreate reports whether at least one whole-library source allows
-// creating documents (upload). Only the unified entry merges this; legacy
-// file-level write keeps replacing only.
-func (s ScopeSet) AllowsCreate() bool { return s.WholeWrite }
-
-// UpdateDocumentNames returns the explicitly replaceable document names,
-// sorted.
-func (s ScopeSet) UpdateDocumentNames() []string {
-	names := make([]string, 0, len(s.UpdateDocuments))
-	for name := range s.UpdateDocuments {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-// DeleteDocumentNames returns the explicitly deletable document names, sorted.
-func (s ScopeSet) DeleteDocumentNames() []string {
-	names := make([]string, 0, len(s.DeleteDocuments))
-	for name := range s.DeleteDocuments {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-// Restricted reports whether reads must be limited to an explicit document set.
-func (s ScopeSet) Restricted() bool { return !s.ReadsWhole() }
-
-// DocumentAllowMask returns the group-merged allow bits of one document: the
-// union of every whole-library bit and this document's file-level bits.
+// DocumentAllowMask returns the merged allow bits of one document before any
+// deny is subtracted: the role defaults, whole-library bits and this
+// document's file-level bits from every source (personal rules and group
+// grants). DescribePermissionSources uses it to explain where each allowed
+// operation came from.
 func (s ScopeSet) DocumentAllowMask(name string) int {
-	mask := 0
-	if s.WholeRead {
-		mask |= PermissionBitRead
+	mask := int(s.DefaultAllow | s.WholeAllow | s.FileAllow[name])
+	if group := s.GroupAllow[""]; group != 0 && name == "" {
+		mask |= int(group)
 	}
-	if s.WholeWrite {
-		mask |= PermissionBitRead | PermissionBitCreate | PermissionBitUpdate | PermissionBitDelete
+	if name != "" {
+		mask |= int(s.GroupAllow[name])
 	}
-	if s.WholeUpdate {
-		mask |= PermissionBitUpdate
-	}
-	if s.WholeDelete {
-		mask |= PermissionBitDelete
-	}
-	if name == "" {
-		return mask
-	}
-	if _, ok := s.ReadDocuments[name]; ok {
-		mask |= PermissionBitRead
-	}
-	if _, ok := s.WriteDocuments[name]; ok {
-		mask |= PermissionBitRead | PermissionBitUpdate | PermissionBitDelete
-	}
-	if _, ok := s.UpdateDocuments[name]; ok {
-		mask |= PermissionBitUpdate
-	}
-	if _, ok := s.DeleteDocuments[name]; ok {
-		mask |= PermissionBitDelete
-	}
-	return mask
+	return mask & int(MaskAll)
+}
+
+// LibraryAllowMask returns the merged whole-library allow bits (role defaults,
+// the personal whole-library rule and the group whole-library grant). It backs
+// DescribePermissionSources for the library-level create bit.
+func (s ScopeSet) LibraryAllowMask() int {
+	mask := int(s.DefaultAllow | s.WholeAllow | s.GroupAllow[""])
+	return mask & int(MaskAll)
 }
 
 // EntitlementProvider reports whether an account's current personal membership
@@ -438,43 +277,46 @@ func (s *Service) CanManage(ctx context.Context, user state.User, namespace stri
 }
 
 // ScopeSet computes the effective access of one account inside one knowledge
-// base. Administrators and owners get full access; everyone else gets the union
-// of their personal grants and, through their current effective memberships,
-// the allow bits of every group grant.
+// base. Administrators and the owner keep the historical default full-library
+// grant, but they no longer short-circuit: their explicit rules are read and
+// merged too, so a deny rule restricts them exactly like anyone else. Everyone
+// else gets the union of their personal grants and, through their current
+// effective memberships, the allow bits of every group grant (group grants
+// only ever add permissions; they never deny).
 func (s *Service) ScopeSet(ctx context.Context, user state.User, namespace string) (ScopeSet, error) {
 	if !user.Enabled {
 		return NewScopeSet(), nil
 	}
+	scope := NewScopeSet()
 	if user.IsAdmin() {
-		return fullScope(), nil
-	}
-	owner, err := s.knowledgeBases.OwnerOf(ctx, namespace)
-	if err != nil {
-		return NewScopeSet(), err
-	}
-	if owner != "" && owner == user.ID {
-		return fullScope(), nil
+		scope.DefaultAllow = uint16(MaskAll)
+	} else {
+		owner, err := s.knowledgeBases.OwnerOf(ctx, namespace)
+		if err != nil {
+			return NewScopeSet(), err
+		}
+		if owner != "" && owner == user.ID {
+			scope.DefaultAllow = uint16(MaskAll)
+		}
 	}
 	grants, err := s.permissions.ListFor(ctx, namespace, user.ID)
 	if err != nil {
 		return NewScopeSet(), err
 	}
-	scope := NewScopeSet()
 	for _, grant := range grants {
-		write := grant.Permission == state.PermissionWrite
 		if grant.DocumentName == "" {
-			if write {
-				scope.WholeWrite = true
-			} else {
-				scope.WholeRead = true
-			}
+			scope.WholeAllow |= grant.AllowMask
+			scope.WholeDeny |= grant.DenyMask
 			continue
 		}
-		if write {
-			scope.WriteDocuments[grant.DocumentName] = struct{}{}
-		} else {
-			scope.ReadDocuments[grant.DocumentName] = struct{}{}
+		if scope.FileAllow == nil {
+			scope.FileAllow = map[string]PermissionMask{}
 		}
+		if scope.FileDeny == nil {
+			scope.FileDeny = map[string]PermissionMask{}
+		}
+		scope.FileAllow[grant.DocumentName] |= grant.AllowMask
+		scope.FileDeny[grant.DocumentName] |= grant.DenyMask
 	}
 	// Group allow bits: every current effective membership contributes its
 	// whole-library and per-document masks, all merged by union.
@@ -486,34 +328,53 @@ func (s *Service) ScopeSet(ctx context.Context, user state.User, namespace strin
 	return scope, nil
 }
 
-// mergedWithGroup unions one group-merged allow-mask view into a personal
-// scope and returns the result.
+// ResolveVisibleDocumentIDs translates one scope into the server-side
+// retrieval restriction: nil when retrieval is unrestricted, otherwise the
+// document ids of every existing document whose read bit survives the merge
+// (an empty non-nil slice means nothing is visible and retrieval returns no
+// evidence at all).
+func (s *Service) ResolveVisibleDocumentIDs(ctx context.Context, namespace string, scope ScopeSet) ([]string, error) {
+	if !scope.Restricted() {
+		return nil, nil
+	}
+	documents, err := s.documents.List(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(documents))
+	seen := make(map[string]struct{}, len(documents))
+	for _, document := range documents {
+		if !scope.CanReadDocument(document.Name) {
+			continue
+		}
+		if document.DocumentID == "" {
+			continue
+		}
+		if _, duplicate := seen[document.DocumentID]; duplicate {
+			continue
+		}
+		seen[document.DocumentID] = struct{}{}
+		ids = append(ids, document.DocumentID)
+	}
+	return ids, nil
+}
+
+// mergedWithGroup folds the group contribution into one scope's GroupAllow
+// map. Group grants only ever add allow bits; a group never reduces a
+// member's existing permissions, so nothing lands on the deny side.
 func (s ScopeSet) mergedWithGroup(group DocumentMaskScope) ScopeSet {
-	if group.WholeMask&PermissionBitRead != 0 {
-		s.WholeRead = true
+	if s.GroupAllow == nil {
+		s.GroupAllow = map[string]PermissionMask{}
 	}
-	if group.WholeMask&PermissionBitCreate != 0 {
-		// create only ever applies at whole-library level; it also implies
-		// whole update/delete for the unified entry (a whole-write grant
-		// keeps the historical meaning).
-		s.WholeWrite = true
-	}
-	if group.WholeMask&PermissionBitUpdate != 0 {
-		s.WholeUpdate = true
-	}
-	if group.WholeMask&PermissionBitDelete != 0 {
-		s.WholeDelete = true
+	if group.WholeMask != 0 {
+		s.GroupAllow[""] |= PermissionMask(group.WholeMask)
 	}
 	for name, mask := range group.Documents {
-		if mask&PermissionBitRead != 0 {
-			s.ReadDocuments[name] = struct{}{}
+		if name == "" {
+			s.GroupAllow[""] |= PermissionMask(mask)
+			continue
 		}
-		if mask&PermissionBitUpdate != 0 {
-			s.UpdateDocuments[name] = struct{}{}
-		}
-		if mask&PermissionBitDelete != 0 {
-			s.DeleteDocuments[name] = struct{}{}
-		}
+		s.GroupAllow[name] |= PermissionMask(mask)
 	}
 	return s
 }

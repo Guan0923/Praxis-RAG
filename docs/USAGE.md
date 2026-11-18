@@ -199,7 +199,7 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_INVITATION_TTL_HOURS` | `168` | 知识库邀请链接有效期（小时，1..8760） |
 | `RAG_DEFAULT_KB_TEMPLATE` | `default` | 管理员自建知识库未提交模型连接时克隆模板；普通账号必须从本人「模型配置」选择连接 |
 
-角色分管理员（`admin`）、VIP（`vip`）和普通用户（`user`），只有管理员可以改角色。知识库默认归创建者私有，共享通过邀请链接完成：管理员、VIP 以及当前 Plus/Pro 会员可邀请（管理员可邀请任意知识库，其余只能邀请自己创建的知识库），权限分「可读 / 可修改」、范围分「单文件 / 多文件 / 全库」；被邀请人登录后接受邀请才生效。会员到期后已有共享保留并可撤销，但停止新发付费邀请。完整流程见 [权限管理](PERMISSIONS.md)。
+角色分管理员（`admin`）、VIP（`vip`）和普通用户（`user`），只有管理员可以改角色。知识库默认归创建者私有，共享通过邀请链接完成：管理员、VIP 以及当前 Plus/Pro 会员可邀请（管理员可邀请任意知识库，其余只能邀请自己创建的知识库）。权限按四项操作（阅读 `read` / 新建 `create` / 更新 `update` / 删除 `delete`）分别授予，范围分「单文件 / 多文件 / 全库」；每项操作三态——未设置、允许（allow）、拒绝（deny），**同一操作上任何 deny 都优先于 allow**：全库拒绝可以压过单文件允许，单文件拒绝也可以限制全库允许；合并后没有获得允许的操作默认拒绝。账号上的拒绝只约束**该账号的登录会话**：独立 API Key 仍按自身绑定的知识库范围授权，不套用账号 ACL；服务令牌与本机直连凭据语义不变。SAG（事件-实体）检索对受限账号（任何非全库可读账号）会被明确拒绝，其余检索模式按可读文档过滤。会员到期后已有共享保留并可撤销，但停止新发付费邀请。完整流程见 [权限管理](PERMISSIONS.md)。
 
 **用户组**：`vip` 和 `admin` 可以在 Console 的「用户组」页面创建组并邀请成员（普通账号可以查看自己的邀请、接受或退出组）。组创建者可以在「权限管理」页把自己拥有的知识库授权给某个组：权限位为「阅读 1 / 新增 2 / 修改 4 / 删除 8」，范围分全库或指定文件（「新增」仅全库）。成员的最终权限是其个人授权与所有当前有效组授权的按位并集（个人显式拒绝仍优先生效）；移除成员、退出组、撤销组授权或解散组后，下一个请求立即失去对应权限。邀请人降级为 `user` 后不能再发新邀请（接受旧邀请时服务端会重新校验），但已有成员和授权继续有效。组规则、组邀请链接与权限来源说明见 [权限管理](PERMISSIONS.md)。
 
@@ -211,7 +211,7 @@ Console 侧边栏和账号菜单提供「会员与用量」。Free / Plus / Pro 
 
 ### 飞书文档导入
 
-Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账号且对当前知识库有整体写权限时显示）。点击后先连接用户自己的飞书账号，再按文件夹浏览或按标题搜索该账号有权限访问的飞书文档，勾选后一次导入当前知识库，单次最多 10 篇。该功能依赖 Console 登录会话（`RAG_AUTH_ENABLED=true`）；纯 API Key / Service Token 模式没有“用户本人”的飞书身份，因此不显示入口，直接调用接口会返回未登录。
+Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账号且对当前知识库具备有效 `create` 时显示）。点击后先连接用户自己的飞书账号，再按文件夹浏览或按标题搜索该账号有权限访问的飞书文档，勾选后一次导入当前知识库，单次最多 10 篇。该功能依赖 Console 登录会话（`RAG_AUTH_ENABLED=true`）；纯 API Key / Service Token 模式没有“用户本人”的飞书身份，因此不显示入口，直接调用接口会返回未登录。
 
 - **使用用户自己的权限**：浏览、搜索、读取正文都用当前 Console 账号的飞书 `user_access_token`；服务端不会用应用身份越权读取。`App ID` / `App Secret` 由部署方配置，普通用户只需点击授权。
 - **复用现有入库规则**：只取新版飞书文档（docx）的纯文本，复用普通上传的知识库写权限校验、SHA-256 去重、同名跳过和异步索引。`document_id` 只用于本次选择和读取，不建立长期映射。
@@ -545,7 +545,7 @@ Console 默认启用账号登录（`RAG_AUTH_ENABLED=true`）：
 1. 打开 `/console` 会进入登录页；切到"注册"创建账号，**第一个注册的账号自动成为管理员**。用户名不区分大小写（统一按小写保存）。
 2. 管理员在侧边栏"用户管理"页可以：把账号设为管理员 / VIP / 普通用户、启用/禁用、删除。系统始终保留至少一名启用状态的管理员（最后一个管理员不能被降级、禁用或删除）。
 3. 普通用户只能使用自己创建的知识库以及被邀请授权的知识库；管理员可以使用全部知识库并管理知识库配置、全部 API Key 和用户；VIP 额外可以邀请他人共享自己创建的知识库。所有登录角色都能打开「API Key」页管理自己的密钥，但非管理员只能绑定本人创建的知识库（详见[权限管理](PERMISSIONS.md) §9）。
-4. 共享入口在侧边栏「权限管理」（管理员与 VIP 可见）：选择知识库 → 邀请用户（权限：可读/可修改；范围：全库 / 若干文件）→ 复制邀请链接发给对方。被邀请人会在控制台通知铃铛看到待处理邀请，登录后打开链接即可接受；接受后权限立即生效。详见 [权限管理](PERMISSIONS.md)。
+4. 共享入口在侧边栏「权限管理」（管理员与 VIP 可见）：选择知识库 → 邀请用户（按操作授予：阅读/新建/更新/删除；范围：全库 / 若干文件）→ 复制邀请链接发给对方。被邀请人会在控制台通知铃铛看到待处理邀请，登录后打开链接即可接受；接受后授权立即生效。详见 [权限管理](PERMISSIONS.md)。
 5. 知识库与 API Key 页面支持批量删除：勾选行首复选框，或按住鼠标左键在表格上拖出框选。框选只增不减：拖动或缩小框选区域、开始新一轮框选、上下滚动页面都不会取消已选中的行；要取消某一行请点它的行首复选框（Esc 只取消本次拖动并恢复拖动前的选中）。工具栏「批量删除」按钮会显示已选数量。知识库批量删除会删除所选知识库的全部文档并移除配置记录，**删除后无法恢复**；只要有一个文档删除失败，该知识库就保留并列出失败原因，可重试。API Key 批量删除对已不存在的 id 视为已删除，失败项保留选中。
 
 会话使用 HttpOnly Cookie（`rag_session`）保存，默认有效期 7 天（`RAG_AUTH_SESSION_TTL_HOURS`），所有写操作要求 `X-CSRF-Token`（Console 自动带上）。判定规则：
@@ -589,7 +589,7 @@ worker 必须与 `rag-service` 使用**同一** `RAG_CONFIG_FILE`、`RAG_SERVICE
 3. REST `/v1/documents` 需要认证，未认证返回 401。
 4. MCP 初始化成功，`tools/list` 返回 5 个工具。
 5. 异步链路：默认异步上传与 MCP `add_document` 得到 `artifact_id`；配置 Kafka/Debezium 并启动 document worker 后，轮询 `get_document_status` 至 `succeeded`；未运行 worker 时任务保持 `queued`。
-6. 同步搜索：MCP `search` 与 `POST /v1/search` 一次调用直接返回 `results`/`artifacts`/`evidence_status`；响应无 `result_id`，`GET /v1/search-results/<uuid>` 返回 404；受限账号检索按 scope 过滤。
+6. 同步搜索：MCP `search` 与 `POST /v1/search` 一次调用直接返回 `results`/`artifacts`/`evidence_status`；响应无 `result_id`，`GET /v1/search-results/<uuid>` 返回 404；受限账号检索按有效 `read` 过滤（SAG 模式对受限账号明确拒绝，见 [权限管理](PERMISSIONS.md) §11）。
 7. 缓存收敛：直接 `UPDATE`/`DELETE` 一张缓存相关业务表，等待 `rag-cache-worker` 消费后 Redis 读模型与 MySQL 一致；监控页缓存 dirty/failures 归零。
 8. PDF 解析（vision 引擎）：`curl.exe http://127.0.0.1:8091/healthz` 返回 200 且 `status=ok`，在 Console 为测试知识库选择 VLM 后上传一个 PDF，任务 `succeeded` 且该文档的 PDF 清单版本为 `docling-service-v1`；`RAG_PDF_ENGINE=go` 时清单版本为 `go-native-v1`。
 9. Word/HTML 解析：`curl.exe http://127.0.0.1:8092/healthz` 返回 200 且 `config_error` 为 `null`（该接口始终 200），上传一个 `.docx` 与一个 `.html`（`RAG_DOCLING_SERVICE_URL` 已配置），任务 `succeeded` 后确认 HTML 预览显示为纯文本而不是渲染后的页面。
@@ -668,7 +668,7 @@ curl.exe -X POST "http://127.0.0.1:8011/v1/documents/%E4%BD%BF%E7%94%A8%E6%89%8B
 ```
 
 - `{name}` 是目标文档的现有名称（URL 编码），multipart 字段固定为 `file`，一次只接受一个文件。
-- 需要目标文档的写权限：全库写权限，或该文档的单文件写权限；只被授权其他文件时返回 403。
+- 需要对目标文档的有效 `update`（全库授权，或该文档的单文件授权）；没有 `update` 时返回 403。
 - 新文件类型必须与目标文档一致（400）；目标文档不存在返回 404；非法/超限文件返回 400。
 - 响应与 MCP `update_document` 同步语义一致：`status`（通常为 `updated`，内容与切分配置都未变化时为 `unchanged`）、`document` 和 `documents`（替换后的文档列表）。替换失败不会发布部分索引，原文档仍可预览与检索。
 
@@ -987,13 +987,13 @@ curl.exe http://127.0.0.1:8011/v1/invitations
 curl.exe -X POST http://127.0.0.1:8011/v1/invitations/preview -H "Content-Type: application/json" -d '{"token":"<link-token>"}'
 curl.exe -X POST http://127.0.0.1:8011/v1/invitations/accept  -H "Content-Type: application/json" -d '{"token":"<link-token>"}'
 
-# 管理已有授权与未接受的邀请
+# 管理已有授权与未接受的邀请（旧撤销授权只清除 allow，不移除拒绝规则）
 curl.exe http://127.0.0.1:8011/v1/knowledge-bases/team-kb/permissions
 curl.exe -X DELETE http://127.0.0.1:8011/v1/knowledge-bases/team-kb/permissions/<user_id>
 curl.exe -X DELETE http://127.0.0.1:8011/v1/invitations/<invitation_id>
 ```
 
-邀请链接形如 `http://127.0.0.1:8011/console#/invite?token=<一次性token>`；数据库只保存 token 的 SHA-256 摘要，链接只在创建响应中出现一次。邀请只能由被邀请的账号接受。
+邀请链接形如 `http://127.0.0.1:8011/console#/invite?token=<一次性token>`；数据库只保存 token 的 SHA-256 摘要，链接只在创建响应中出现一次。邀请只能由被邀请的账号接受。旧的 `permission: "read"|"write"` 请求字段继续接受并转换为位掩码，精确的 allow/deny 掩码通过新增字段表达；除邀请外，也可以按「账号 + 全库或单文件」直接设置规则——设置 deny 立即生效，无需对方接受邀请。字段级 schema 见服务端契约，行为语义见 [权限管理](PERMISSIONS.md)。
 
 ### 文档管理
 
@@ -1088,6 +1088,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/search `
 - 可以搭配任意 `rerank`（`none` 或 `cross_encoder`）：排序是种子分与超边共享实体数的融合分，cross-encoder 二段精排合法（区别于 `sag2`）。
 - 每文档抽取上限 512 chunk（超出部分留给回填 CLI），实体归一化为 casefold；抽取结果含 `metadata.sag_event`（该 chunk 的事件句），便于核对证据链。
 - 删除文档时事件与关联级联清理，实体行保留（共享数据），不会留下悬空超边。
+- 受限账号（任何非全库可读账号，含全库 `read` + 文件级 deny）调用 `sag` 会被**明确拒绝**：该模式的动态超边扩展无法在召回前可靠限定文档范围，这是明确的拒绝而非静默泄露；其余检索模式按可读文档过滤（见 [权限管理](PERMISSIONS.md) §11）。
 
 ```powershell
 # 存量文档补建索引（先 dry-run 看清单）
@@ -1416,7 +1417,7 @@ PDF 默认由独立的 `pdf-parser` 微服务解析（本地 PyMuPDF 读取/渲�
 - **同步搜索**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，无任务 ID/轮询/结果快照；总预算 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120 秒）。`search_tasks`/`search_result_snapshots` 为历史表、保留数据但不再读写，搜索 topic/消费组/DLQ 与 `rag-search-worker` 已下线；迁移与回滚见 [部署指南](DEPLOYMENT.md) §12。
 - **文档锁**：默认 `mysql`（MySQL `document_leases` 行），可整体切到 `redis`；两种模式不能混跑，同一部署内所有参与文档写入/恢复/清理的进程必须同值。切换/回退必须先停写并排空在途操作，见 [部署指南](DEPLOYMENT.md) §13。
 - **上传受理**：REST/Console 统一使用 `POST /v1/document-batches` 异步受理，通过批次或文档任务状态接口观察进度。`rag-service` 只受理，文档解析只由消费 Kafka 通知的 `rag-document-worker` 完成；未部署时任务保持 `queued`。MCP `update_document`/`delete_document` 仍同步执行，通过同名检查和发布事务内的 `ValidatePublication` 与在途文档任务互斥。
-- **权限与共享**：账号分为管理员 / VIP / 普通用户；知识库默认归创建者私有，共享靠邀请链接完成（权限：可读/可修改；范围：单文件/多文件/全库），只有 VIP 与管理员可发起邀请。邀请消息目前是站内通知（控制台铃铛），不发送邮件/IM；链接只展示一次，库内只存摘要。文件级写授权只能替换已授权的同名文档，不能上传新文件；历史无创建者的知识库仅管理员可用/可授权；受限账号在同步检索中按文档 scope 过滤，不再被拒绝。详见 [权限管理](PERMISSIONS.md)。
+- **权限与共享**：账号分为管理员 / VIP / 普通用户；知识库默认归创建者私有，共享靠邀请链接完成（按操作授予：`read`/`create`/`update`/`delete`；范围：单文件/多文件/全库），只有 VIP 与管理员可发起邀请；每项操作三态（未设置/允许/拒绝），同一操作上 deny 优先于 allow，合并后未获允许的操作默认拒绝。邀请消息目前是站内通知（控制台铃铛），不发送邮件/IM；链接只展示一次，库内只存摘要。只有 `create` 的账号能上传新文件但不能覆盖已有文件（覆盖需要 `update`），只有 `update` 的账号能替换授权文件但不能删除；历史无创建者的知识库仅管理员可用/可授权；受限账号在同步检索中按有效 `read` 过滤，SAG 模式对受限账号明确拒绝。详见 [权限管理](PERMISSIONS.md)。
 - **管理边界**：`/v1/admin/*` 仅本机直连或管理员会话；**例外**是 `/v1/admin/api-keys` 的五条管理路由——任意登录角色的会话都可管理自己的 API Key（管理员管理全部，非管理员只能绑定本人拥有的知识库）。API Key 按创建账号归属隔离，历史无主密钥仅管理员/本机管理可见；管理凭证（Service Token / API Key）在请求时仍不做知识库归属校验，API Key 的 namespace 白名单仍然生效。详见 [权限管理](PERMISSIONS.md) §9。
 - **数据**：状态表用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧任务/旧结果快照不迁移也不读取；artifact 以 MySQL `artifact_snapshots` 为事实来源（保留期 `RAG_RESULT_TTL_SECONDS`），`search_tasks`/`search_result_snapshots` 保留历史数据、不再读写，物理删除另行安排。
 - 具体契约差异（cached read views、静态目录列表等剩余的 P1/P2）见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。

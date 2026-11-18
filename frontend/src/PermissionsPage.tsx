@@ -3,6 +3,7 @@ import {
   Alert,
   App,
   Button,
+  Checkbox,
   Empty,
   Form,
   Modal,
@@ -17,15 +18,19 @@ import {
   type TableColumnsType,
 } from "antd";
 import {
+  ClearOutlined,
   CopyOutlined,
   DeleteOutlined,
+  MinusCircleOutlined,
   PlusOutlined,
   ReloadOutlined,
   SafetyOutlined,
+  SaveOutlined,
   TeamOutlined,
 } from "@ant-design/icons";
 import {
   api,
+  clearKnowledgeBaseDeny,
   createInvitation,
   errorText,
   fetchAccess,
@@ -40,14 +45,19 @@ import {
   invitationStatus,
   invitationStatusColors,
   invitationStatusLabels,
+  maskToText,
+  normalizeMask,
   permissionBits,
   permissionLabels,
   permissionSourceKindLabels,
+  PERM_CREATE,
+  PERM_READ,
   revokeGrant,
   revokeGroupGrant,
   revokeInvitation,
   roleLabel,
   setGroupGrant,
+  setKnowledgeBasePermission,
   type AccessView,
   type Connection,
   type CreateInvitationResult,
@@ -66,9 +76,18 @@ import { InvitationScope } from "./InvitationsPage";
 
 type InviteFormValues = {
   username: string;
-  permission: PermissionLevel;
+  allow_mask: number;
   scope: ShareScope;
   document_names?: string[];
+};
+
+// TriStateValue is one operation's edit state: unset / allow / deny.
+export type TriStateValue = "unset" | "allow" | "deny";
+
+const triStateLabels: Record<TriStateValue, string> = {
+  unset: "未设置",
+  allow: "允许",
+  deny: "拒绝",
 };
 
 type GrantFormValues = {
@@ -89,8 +108,108 @@ type AggregatedGrant = {
   updated_at: string;
 };
 
-// aggregateGrants folds the per-row permission model (one row per file) into one
-// row per user, keeping whole-library and per-file read/write scopes apart.
+// grantRuleKey 稳定标识一条规则（账号 × 文件名，""＝全库）。
+export function grantRuleKey(userId: string, documentName: string) {
+  return `${userId}\u0000${documentName}`;
+}
+
+// triStateOf 把一条规则的掩码解析为某个操作的三态值。
+export function triStateOf(allow: number | undefined, deny: number | undefined, bit: number): TriStateValue {
+  if ((deny || 0) & bit) return "deny";
+  if ((allow || 0) & bit) return "allow";
+  return "unset";
+}
+
+// masksOfTriStates 把每个操作的三态值折回 allow_mask / deny_mask 两个 0-15 掩码。
+export function masksOfTriStates(states: Record<number, TriStateValue>) {
+  let allow = 0;
+  let deny = 0;
+  for (const { bit } of permissionBits) {
+    const state = states[bit];
+    if (state === "allow") allow |= bit;
+    else if (state === "deny") deny |= bit;
+  }
+  return { allow_mask: allow, deny_mask: deny };
+}
+
+// TriStateSelect is the per-operation control (未设置 / 允许 / 拒绝).
+export function TriStateSelect({
+  value,
+  onChange,
+  disabled,
+  ariaLabel,
+}: {
+  value: TriStateValue;
+  onChange: (value: TriStateValue) => void;
+  disabled?: boolean;
+  ariaLabel: string;
+}) {
+  return (
+    <Select<TriStateValue>
+      size="small"
+      style={{ width: 92 }}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      value={value}
+      onChange={onChange}
+      popupMatchSelectWidth={false}
+      options={(Object.keys(triStateLabels) as TriStateValue[]).map((key) => ({
+        value: key,
+        label: triStateLabels[key],
+      }))}
+    />
+  );
+}
+
+// RuleMaskEditor renders one rule row's operation controls. Whole-library
+// rules show create; file rules hide it (create only applies at the library
+// level per the contract).
+export function RuleMaskEditor({
+  rule,
+  states,
+  onChange,
+  saving,
+  fileLevel,
+}: {
+  rule: { user_id: string; username: string; document_name: string };
+  states: Record<number, TriStateValue>;
+  onChange: (bit: number, value: TriStateValue) => void;
+  saving: boolean;
+  fileLevel: boolean;
+}) {
+  const bits = permissionBits.filter(({ bit }) => !fileLevel || bit !== PERM_CREATE);
+  return (
+    <div className="rule-mask-editor">
+      <span className="rule-mask-title secondary">
+        {rule.document_name || "全库"}
+        {fileLevel ? "" : "（含新增）"}
+      </span>
+      <Space size={4} wrap>
+        {bits.map(({ bit, label }) => (
+          <label key={bit} className="rule-mask-item">
+            <span className="rule-mask-op">{label}</span>
+            <TriStateSelect
+              ariaLabel={`${rule.username} ${rule.document_name || "全库"} ${label} 权限`}
+              value={states[bit] ?? "unset"}
+              disabled={saving}
+              onChange={(value) => onChange(bit, value)}
+            />
+          </label>
+        ))}
+      </Space>
+    </div>
+  );
+}
+
+// triStatesFromMasks unfolds one rule's masks into per-operation tri-states.
+export function triStatesFromMasks(allow?: number, deny?: number) {
+  const states: Record<number, TriStateValue> = {};
+  for (const { bit } of permissionBits) states[bit] = triStateOf(allow, deny, bit);
+  return states;
+}
+
+// aggregateGrants folds the per-row grants (one row per file) into one row
+// per user for the legacy summary listing.
 function aggregateGrants(grants: GrantView[]): AggregatedGrant[] {
   const byUser = new Map<string, AggregatedGrant & { grantedBy: Set<string> }>();
   for (const grant of grants) {
@@ -201,6 +320,14 @@ export function PermissionsPage({
   const [revision, setRevision] = useState(0);
   const [listRevision, setListRevision] = useState(0);
 
+  // 规则三态编辑态：key 为 grantRuleKey(user_id, document_name)，value 为该
+  // 规则每个操作位的未设置/允许/拒绝。保存时折回 allow_mask / deny_mask 提交。
+  const [triStates, setTriStates] = useState<Record<string, Record<number, TriStateValue>>>({});
+  const [dirtyKeys, setDirtyKeys] = useState<Set<string>>(new Set());
+  const [savingKey, setSavingKey] = useState("");
+  const [revokingKey, setRevokingKey] = useState("");
+  const [clearingKey, setClearingKey] = useState("");
+
   const [users, setUsers] = useState<InviteUser[]>([]);
   const [usersLoading, setUsersLoading] = useState(false);
   const [usersError, setUsersError] = useState("");
@@ -214,7 +341,6 @@ export function PermissionsPage({
   const [inviteError, setInviteError] = useState("");
   const [created, setCreated] = useState<(CreateInvitationResult & { link: string })>();
   const [copied, setCopied] = useState(false);
-  const [revokingGrantUser, setRevokingGrantUser] = useState("");
   const [revokingInvitationId, setRevokingInvitationId] = useState("");
 
   // 用户组授权：组列表 + 该知识库的组授权 + 授权弹窗。
@@ -280,13 +406,24 @@ export function PermissionsPage({
       setInvitations([]);
       setGrantsError("");
       setInvitationsError("");
+      setTriStates({});
+      setDirtyKeys(new Set());
       return;
     }
     let cancelled = false;
     setGrantsLoading(true);
     setGrantsError("");
     void fetchGrants(selected, connection)
-      .then((rows) => { if (!cancelled) setGrants(rows); })
+      .then((rows) => {
+        if (cancelled) return;
+        setGrants(rows);
+        // 每次重载都把服务端的掩码展开为三态草稿；未保存的本地改动会被丢弃。
+        setTriStates(Object.fromEntries(rows.map((row) => [
+          grantRuleKey(row.user_id, row.document_name),
+          triStatesFromMasks(row.allow_mask, row.deny_mask),
+        ])));
+        setDirtyKeys(new Set());
+      })
       .catch((cause) => { if (!cancelled) setGrantsError(errorText(cause)); })
       .finally(() => { if (!cancelled) setGrantsLoading(false); });
     setInvitationsLoading(true);
@@ -315,6 +452,7 @@ export function PermissionsPage({
   const selectedAccess = selected ? accessByNamespace[selected] : undefined;
   const canShare = selectedAccess ? selectedAccess.can_share : true;
   const pendingInvitations = invitations.filter((item) => invitationStatus(item) === "pending").length;
+  const dirtyCount = dirtyKeys.size;
 
   // 自己创建的用户组加载一次；组授权对象选择器使用它。
   useEffect(() => {
@@ -366,7 +504,7 @@ export function PermissionsPage({
     setInviteError("");
     setCopied(false);
     form.resetFields();
-    form.setFieldsValue({ permission: "read", scope: "all", document_names: [] });
+    form.setFieldsValue({ allow_mask: PERM_READ, scope: "all", document_names: [] });
     setInviteOpen(true);
     if (!users.length && !usersLoading) void loadUsers();
     if (documentsFor !== selected) void loadDocuments(selected);
@@ -381,12 +519,21 @@ export function PermissionsPage({
       setInviteError("请至少选择一个文件");
       return;
     }
+    const allowMask = normalizeMask(values.allow_mask || 0);
+    if (values.scope === "files" && (allowMask & PERM_CREATE)) {
+      setInviteError("文件级邀请不允许包含「新增」操作");
+      return;
+    }
+    if (!allowMask) {
+      setInviteError("请至少勾选一个允许的操作");
+      return;
+    }
     setCreating(true);
     setInviteError("");
     try {
       const result = await createInvitation(selected, {
         username: values.username,
-        permission: values.permission,
+        allow_mask: allowMask,
         scope: values.scope,
         document_names: documentNames,
       }, connection);
@@ -428,17 +575,59 @@ export function PermissionsPage({
     }
   }
 
-  async function revokeGrantFor(item: AggregatedGrant) {
+  async function revokeGrantFor(item: GrantView) {
     if (!selected) return;
-    setRevokingGrantUser(item.user_id);
+    setRevokingKey(grantRuleKey(item.user_id, item.document_name));
     try {
-      await revokeGrant(selected, item.user_id, connection);
-      void message.success(`已撤销 ${item.username} 的授权`);
+      // DELETE 只撤销 allow：清除 allow_mask、保留 deny_mask。传文件名时只
+      // 撤该文件的 allow，缺省撤销该用户全部 allow。
+      await revokeGrant(selected, item.user_id, connection, item.document_name);
+      void message.success(`已撤销 ${item.username} 的允许（${item.document_name || "全库"}）`);
       setListRevision((value) => value + 1);
     } catch (cause) {
       void message.error(errorText(cause));
     } finally {
-      setRevokingGrantUser("");
+      setRevokingKey("");
+    }
+  }
+
+  async function clearDenyFor(item: GrantView) {
+    if (!selected) return;
+    setClearingKey(grantRuleKey(item.user_id, item.document_name));
+    try {
+      await clearKnowledgeBaseDeny(selected, item.user_id, item.document_name, connection);
+      void message.success(`已清除 ${item.username} 的拒绝（${item.document_name || "全库"}）`);
+      setListRevision((value) => value + 1);
+    } catch (cause) {
+      void message.error(errorText(cause));
+    } finally {
+      setClearingKey("");
+    }
+  }
+
+  async function saveRule(item: GrantView) {
+    if (!selected) return;
+    const key = grantRuleKey(item.user_id, item.document_name);
+    const states = triStates[key];
+    if (!states) return;
+    const { allow_mask, deny_mask } = masksOfTriStates(states);
+    if (item.document_name && (allow_mask & PERM_CREATE)) {
+      void message.error("文件级规则不允许包含「新增」操作（新增只作用于知识库级）");
+      return;
+    }
+    setSavingKey(key);
+    try {
+      await setKnowledgeBasePermission(selected, item.user_id, {
+        document_name: item.document_name,
+        allow_mask,
+        deny_mask,
+      }, connection);
+      void message.success(`已保存 ${item.username} 的规则（${item.document_name || "全库"}）`);
+      setListRevision((value) => value + 1);
+    } catch (cause) {
+      void message.error(errorText(cause));
+    } finally {
+      setSavingKey("");
     }
   }
 
@@ -510,7 +699,7 @@ export function PermissionsPage({
     }
   }
 
-  const grantColumns: TableColumnsType<AggregatedGrant> = [
+  const grantColumns: TableColumnsType<GrantView> = [
     {
       title: "用户",
       dataIndex: "username",
@@ -518,36 +707,50 @@ export function PermissionsPage({
       render: (value: string) => <span className="break-text">{value}</span>,
     },
     {
-      title: "权限",
-      key: "permission",
-      width: 90,
+      title: "范围",
+      key: "scope",
+      width: 150,
+      render: (_, item) => (
+        <span className="break-text">
+          {item.document_name
+            ? <Tag className="break-text">{item.document_name}</Tag>
+            : <Tag color="blue">全库</Tag>}
+        </span>
+      ),
+    },
+    {
+      title: "操作权限（未设置 / 允许 / 拒绝）",
+      key: "masks",
       render: (_, item) => {
-        const hasWrite = item.wholeWrite || item.writeDocuments.length > 0;
-        return <Tag color={hasWrite ? "blue" : "default"}>{hasWrite ? "读写" : "只读"}</Tag>;
+        const key = grantRuleKey(item.user_id, item.document_name);
+        const states = triStates[key] ?? triStatesFromMasks(item.allow_mask, item.deny_mask);
+        return (
+          <RuleMaskEditor
+            rule={item}
+            states={states}
+            saving={savingKey === key}
+            fileLevel={!!item.document_name}
+            onChange={(bit, value) => {
+              setTriStates((current) => ({
+                ...current,
+                [key]: { ...states, [bit]: value },
+              }));
+              setDirtyKeys((current) => new Set(current).add(key));
+            }}
+          />
+        );
       },
     },
     {
-      title: "范围",
-      key: "scope",
-      render: (_, item) => {
-        const files = [
-          ...item.writeDocuments.map((name) => ({ name, write: true })),
-          ...item.readDocuments.map((name) => ({ name, write: false })),
-        ];
-        return (
-          <div className="scope-files">
-            <span>{item.wholeWrite ? "全库" : item.wholeRead ? "全库（只读）" : ""}</span>
-            {files.length > 0 && !item.wholeWrite && (
-              <>
-                <Tag>指定文件 {files.length} 个</Tag>
-                <span className="secondary break-text">
-                  {files.map((file) => `${file.name}${file.write ? "（可写）" : ""}`).join("、")}
-                </span>
-              </>
-            )}
-          </div>
-        );
-      },
+      title: "当前允许",
+      key: "allow",
+      width: 170,
+      render: (_, item) => (
+        <span className="break-text">
+          <Tag color={item.allow_mask ? "blue" : "default"}>允许：{maskToText(item.allow_mask, "无")}</Tag>
+          {!!item.deny_mask && <Tag color="red">拒绝：{maskToText(item.deny_mask, "无")}</Tag>}
+        </span>
+      ),
     },
     {
       title: "授权人",
@@ -564,28 +767,64 @@ export function PermissionsPage({
     {
       title: "操作",
       key: "actions",
-      width: 90,
-      render: (_, item) => (
-        <Popconfirm
-          title="撤销授权"
-          description={`将撤销 ${item.username} 在该知识库的全部授权（${item.wholeWrite ? "全库读写" : item.wholeRead ? "全库只读" : `${item.readDocuments.length + item.writeDocuments.length} 个文件`}）。`}
-          okText="撤销"
-          cancelText="取消"
-          okButtonProps={{ danger: true }}
-          onConfirm={() => void revokeGrantFor(item)}
-        >
-          <Tooltip title="撤销授权">
-            <Button
-              danger
-              type="text"
-              size="small"
-              aria-label={`撤销 ${item.username} 的授权`}
-              icon={<DeleteOutlined />}
-              loading={revokingGrantUser === item.user_id}
-            />
-          </Tooltip>
-        </Popconfirm>
-      ),
+      width: 210,
+      render: (_, item) => {
+        const key = grantRuleKey(item.user_id, item.document_name);
+        const busy = savingKey === key || revokingKey === key || clearingKey === key;
+        const dirty = dirtyKeys.has(key);
+        return (
+          <Space size={4} wrap>
+            <Tooltip title={dirty ? "保存该规则的允许与拒绝" : "没有未保存的改动"}>
+              <Button
+                type="primary"
+                size="small"
+                icon={<SaveOutlined />}
+                disabled={!dirty || busy}
+                loading={savingKey === key}
+                onClick={() => void saveRule(item)}
+              >
+                保存
+              </Button>
+            </Tooltip>
+            <Popconfirm
+              title="撤销允许"
+              description={`将清除 ${item.username} 在${item.document_name ? `「${item.document_name}」` : "全库"}的全部允许位，拒绝位保持不变。`}
+              okText="撤销允许"
+              cancelText="取消"
+              okButtonProps={{ danger: true }}
+              onConfirm={() => void revokeGrantFor(item)}
+            >
+              <Tooltip title="撤销允许（保留拒绝）">
+                <Button
+                  danger
+                  type="text"
+                  size="small"
+                  aria-label={`撤销 ${item.username} 在${item.document_name || "全库"}的允许`}
+                  icon={<MinusCircleOutlined />}
+                  loading={revokingKey === key}
+                />
+              </Tooltip>
+            </Popconfirm>
+            <Popconfirm
+              title="清除拒绝"
+              description={`将清除 ${item.username} 在${item.document_name ? `「${item.document_name}」` : "全库"}的全部拒绝位，允许位保持不变。`}
+              okText="清除拒绝"
+              cancelText="取消"
+              onConfirm={() => void clearDenyFor(item)}
+            >
+              <Tooltip title="清除拒绝（保留允许）">
+                <Button
+                  type="text"
+                  size="small"
+                  aria-label={`清除 ${item.username} 在${item.document_name || "全库"}的拒绝`}
+                  icon={<ClearOutlined />}
+                  loading={clearingKey === key}
+                />
+              </Tooltip>
+            </Popconfirm>
+          </Space>
+        );
+      },
     },
   ];
 
@@ -597,12 +836,21 @@ export function PermissionsPage({
       render: (value: string) => <span className="break-text">{value}</span>,
     },
     {
-      title: "权限",
-      dataIndex: "permission",
-      width: 90,
-      render: (value: PermissionLevel) => (
-        <Tag color={value === "write" ? "blue" : "default"}>{permissionLabels[value] || value}</Tag>
-      ),
+      title: "允许的操作",
+      key: "allow_mask",
+      width: 170,
+      render: (_, invitation) => {
+        // 优先展示掩码翻译的中文操作标签；旧邀请没有掩码时回退到只读/读写投影。
+        if (invitation.allow_mask !== undefined && invitation.allow_mask !== 0)
+          return <Tag color="blue">{maskToText(invitation.allow_mask)}</Tag>;
+        if (invitation.allow_mask === 0)
+          return <Tag color="default">未设置</Tag>;
+        return (
+          <Tag color={invitation.permission === "write" ? "blue" : "default"}>
+            {permissionLabels[invitation.permission] || invitation.permission}
+          </Tag>
+        );
+      },
     },
     {
       title: "范围",
@@ -829,11 +1077,13 @@ export function PermissionsPage({
           <Space size={6} wrap>
             <Tag color="blue">{selectedAccessLabel}</Tag>
             <span className="secondary">
-              {selectedAccess.scope.whole_write
-                ? "全库读写"
-                : selectedAccess.scope.whole_read
-                  ? "全库只读"
-                  : "文件级权限"}
+              {selectedAccess.scope.effective_library !== undefined
+                ? `有效操作：${maskToText(selectedAccess.scope.effective_library, "无")}`
+                : selectedAccess.scope.whole_write
+                  ? "全库读写"
+                  : selectedAccess.scope.whole_read
+                    ? "全库只读"
+                    : "文件级权限"}
             </span>
           </Space>
         )}
@@ -851,22 +1101,24 @@ export function PermissionsPage({
       ) : (
         <>
           <div className="section-heading">
-            <h2><TeamOutlined /> 授权列表</h2>
-            <span className="secondary">{aggregated.length} 位用户</span>
+            <h2><TeamOutlined /> 授权规则</h2>
+            <span className="secondary">
+              {grants.length} 条规则{dirtyCount > 0 ? ` · ${dirtyCount} 条未保存` : ""}
+            </span>
           </div>
           {grantsError && (
             <Alert className="page-alert" type="error" showIcon title="授权列表加载失败" description={grantsError} />
           )}
-          <Table<AggregatedGrant>
+          <Table<GrantView>
             className="permissions-table"
-            rowKey="user_id"
-            dataSource={aggregated}
+            rowKey={(record) => grantRuleKey(record.user_id, record.document_name)}
+            dataSource={grants}
             loading={grantsLoading}
             size="middle"
-            scroll={{ x: 860 }}
+            scroll={{ x: 1080 }}
             pagination={{ pageSize: 10, hideOnSinglePage: true }}
             locale={{
-              emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有授权记录，可创建邀请让其他用户加入。" />,
+              emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有授权记录，可创建邀请或直接新增规则。" />,
             }}
             columns={grantColumns}
           />
@@ -951,7 +1203,7 @@ export function PermissionsPage({
                 setCopied(false);
                 setInviteError("");
                 form.resetFields();
-                form.setFieldsValue({ permission: "read", scope: "all", document_names: [] });
+                form.setFieldsValue({ allow_mask: PERM_READ, scope: "all", document_names: [] });
                 if (selected && documentsFor !== selected) void loadDocuments(selected);
               }}>继续邀请</Button>,
               <Button key="close" type="primary" onClick={() => setInviteOpen(false)}>关闭</Button>,
@@ -1004,16 +1256,32 @@ export function PermissionsPage({
                   notFoundContent={usersLoading ? <Spin size="small" /> : "没有可邀请的用户"}
                 />
               </Form.Item>
-              <Form.Item name="permission" label="权限" rules={[{ required: true, message: "请选择权限" }]}>
-                <Radio.Group
-                  optionType="button"
-                  buttonStyle="solid"
-                  options={[
-                    { value: "read", label: permissionLabels.read },
-                    { value: "write", label: permissionLabels.write },
-                  ]}
+              <Form.Item name="allow_mask" label="允许的操作" initialValue={PERM_READ}
+                rules={[{
+                  validator: (_, value: number | undefined) => value
+                    ? Promise.resolve()
+                    : Promise.reject(new Error("请至少勾选一个操作")),
+                }]}>
+                <Checkbox.Group
+                  options={(scopeValue === "files"
+                    ? permissionBits.filter(({ bit }) => bit !== PERM_CREATE)
+                    : permissionBits
+                  ).map(({ bit, label }) => ({ value: bit, label }))}
+                  onChange={(checked) => {
+                    // scope=files 时不允许带 create 位：切换范围时立即剪掉。
+                    const next = normalizeMask(
+                      Array.isArray(checked) ? (checked as number[]).reduce((mask, bit) => mask | bit, 0) : 0,
+                    );
+                    form.setFieldValue(
+                      "allow_mask",
+                      scopeValue === "files" ? next & ~PERM_CREATE : next,
+                    );
+                  }}
                 />
               </Form.Item>
+              {scopeValue === "files" && (
+                <div className="secondary">文件级授权不包含「新增」操作；新增只在全库范围生效。</div>
+              )}
               <Form.Item name="scope" label="范围" rules={[{ required: true, message: "请选择授权范围" }]}>
                 <Radio.Group
                   optionType="button"

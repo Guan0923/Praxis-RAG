@@ -301,7 +301,9 @@ func (x *LexicalIndex) RejectedKeys(filters map[string]any) map[string]struct{} 
 }
 
 // lexicalDocMatchesFilters applies the closed filter vocabulary with the same
-// equality semantics as the mock retriever (type mismatches do not match).
+// equality semantics as the mock retriever (type mismatches do not match). A
+// []string document_id condition (the server-side visibility allow-list)
+// accepts any listed document; the impossible marker value matches nothing.
 func lexicalDocMatchesFilters(doc LexicalDoc, filters map[string]any) bool {
 	if len(filters) == 0 {
 		return true
@@ -312,6 +314,22 @@ func lexicalDocMatchesFilters(doc LexicalDoc, filters map[string]any) bool {
 		"title":       doc.Title,
 	}
 	for key, want := range filters {
+		if list, isList := want.([]string); isList {
+			if key != "document_id" {
+				return false
+			}
+			matched := false
+			for _, allowed := range list {
+				if allowed == doc.DocumentID {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return false
+			}
+			continue
+		}
 		if !pythonEqual(values[key], want) {
 			return false
 		}

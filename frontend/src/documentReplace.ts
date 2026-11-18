@@ -1,4 +1,13 @@
-import { api, type AccessView, type Connection } from "./api";
+import {
+  api,
+  effectiveScopeMask,
+  hasMask,
+  PERM_DELETE,
+  PERM_READ,
+  PERM_UPDATE,
+  type AccessView,
+  type Connection,
+} from "./api";
 
 // Replacement reuses the ordinary document limits: the new file must be a
 // supported type and no larger than 10 MiB.
@@ -45,17 +54,67 @@ export function replaceTypeLabel(name: string) {
   return family === ".html" ? ".html 或 .htm" : family;
 }
 
-// canReplaceDocument reports whether the caller may replace one document. A
-// file-level write grant is enough for its own document; whole-write covers
-// every document. Legacy API-key mode and a failed access probe keep the
-// historical optimistic behaviour because the server still enforces the rule.
+// scopeMaskOf resolves the mask view of an access response: new backends carry
+// the explicit default/whole/file masks (whole_allow etc.), and the effective
+// mask of one document is computed by effectiveScopeMask(). When the response
+// predates the mask fields, the effective mask is derived from the legacy
+// read/write projection so older deployments keep working.
+export function effectiveDocumentMask(access: AccessView, name: string) {
+  const scope = access.scope;
+  if (scope.whole_allow !== undefined || scope.whole_deny !== undefined
+    || scope.default_allow !== undefined || scope.default_deny !== undefined
+    || scope.file_allow !== undefined || scope.file_deny !== undefined) {
+    return effectiveScopeMask(scope, name);
+  }
+  if (scope.whole_write) return PERM_READ | PERM_UPDATE | PERM_DELETE;
+  if (scope.whole_read) {
+    return scope.write_documents.includes(name)
+      ? PERM_READ | PERM_UPDATE | PERM_DELETE
+      : PERM_READ;
+  }
+  return scope.write_documents.includes(name)
+    ? PERM_READ | PERM_UPDATE | PERM_DELETE
+    : scope.read_documents.includes(name)
+      ? PERM_READ
+      : 0;
+}
+
+// canReplaceDocument reports whether the caller may replace one document: the
+// effective mask must carry the update bit (4). Legacy API-key mode and a
+// failed access probe keep the historical optimistic behaviour because the
+// server still enforces the rule.
 export function canReplaceDocument(
   access: AccessView | undefined,
   authEnabled: boolean,
   name: string,
 ) {
   if (!authEnabled || !access) return true;
-  return access.scope.whole_write || access.scope.write_documents.includes(name);
+  return hasMask(effectiveDocumentMask(access, name), PERM_UPDATE);
+}
+
+// canDeleteDocument reports whether the caller may delete one document: the
+// effective mask must carry the delete bit (8).
+export function canDeleteDocument(
+  access: AccessView | undefined,
+  authEnabled: boolean,
+  name: string,
+) {
+  if (!authEnabled || !access) return true;
+  return hasMask(effectiveDocumentMask(access, name), PERM_DELETE);
+}
+
+// canCreateDocument reports whether the caller may upload into the library:
+// the effective library mask must carry the create bit (2).
+export function canCreateDocument(
+  access: AccessView | undefined,
+  authEnabled: boolean,
+) {
+  if (!authEnabled || !access) return true;
+  if (access.scope.effective_library !== undefined)
+    return hasMask(access.scope.effective_library, 2);
+  if (access.scope.whole_allow !== undefined)
+    return hasMask(access.scope.whole_allow, 2);
+  return access.can_write || access.scope.whole_write;
 }
 
 // replaceFileError validates one replacement selection and returns a Chinese

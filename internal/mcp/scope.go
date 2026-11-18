@@ -41,34 +41,54 @@ const (
 	// messageDocumentWriteRequired rejects a write tool targeting a document the
 	// caller may not modify.
 	messageDocumentWriteRequired = "没有该文档的修改权限"
+	// messageDocumentReadRequired rejects a read tool targeting a document the
+	// caller may not read.
+	messageDocumentReadRequired = "没有该文档的阅读权限"
+	// messageCreateRequired rejects a new-document tool without the
+	// knowledge-base create operation.
+	messageCreateRequired = "没有该知识库的新增权限"
+	// messageRetrievalRestricted rejects a retrieval mode that cannot apply the
+	// document visibility restriction before recall: a restricted account is
+	// refused explicitly instead of silently leaking evidence.
+	messageRetrievalRestricted = "该检索模式暂不支持受限账号调用"
 )
 
 // scopeEnvelope is the compact wire form of access.ScopeSet used only inside the
 // process, between Handler.ServeHTTP and the SDK handlers.
 type scopeEnvelope struct {
-	WholeRead   bool     `json:"whole_read,omitempty"`
-	WholeWrite  bool     `json:"whole_write,omitempty"`
-	WholeUpdate bool     `json:"whole_update,omitempty"`
-	WholeDelete bool     `json:"whole_delete,omitempty"`
-	Read        []string `json:"read,omitempty"`
-	Write       []string `json:"write,omitempty"`
-	Update      []string `json:"update,omitempty"`
-	Delete      []string `json:"delete,omitempty"`
+	DefaultAllow uint16            `json:"default_allow,omitempty"`
+	DefaultDeny  uint16            `json:"default_deny,omitempty"`
+	WholeAllow   uint16            `json:"whole_allow,omitempty"`
+	WholeDeny    uint16            `json:"whole_deny,omitempty"`
+	FileAllow    map[string]uint16 `json:"file_allow,omitempty"`
+	FileDeny     map[string]uint16 `json:"file_deny,omitempty"`
+	GroupAllow   map[string]uint16 `json:"group_allow,omitempty"`
 }
 
 // encodeScopeHeader renders one scope for the internal request header. The
 // Write/Update/Delete lists keep their distinct meanings (full write,
 // update-only, delete-only) so the decoder can rebuild the exact sets.
 func encodeScopeHeader(scope access.ScopeSet) string {
+	fileAllow := scope.FileAllow
+	if fileAllow == nil {
+		fileAllow = map[string]uint16{}
+	}
+	fileDeny := scope.FileDeny
+	if fileDeny == nil {
+		fileDeny = map[string]uint16{}
+	}
+	groupAllow := scope.GroupAllow
+	if groupAllow == nil {
+		groupAllow = map[string]uint16{}
+	}
 	envelope := scopeEnvelope{
-		WholeRead:   scope.WholeRead,
-		WholeWrite:  scope.WholeWrite,
-		WholeUpdate: scope.WholeUpdate,
-		WholeDelete: scope.WholeDelete,
-		Read:        documentSetNames(scope.ReadDocuments),
-		Write:       documentSetNames(scope.WriteDocuments),
-		Update:      scope.UpdateDocumentNames(),
-		Delete:      scope.DeleteDocumentNames(),
+		DefaultAllow: scope.DefaultAllow,
+		DefaultDeny:  scope.DefaultDeny,
+		WholeAllow:   scope.WholeAllow,
+		WholeDeny:    scope.WholeDeny,
+		FileAllow:    fileAllow,
+		FileDeny:     fileDeny,
+		GroupAllow:   groupAllow,
 	}
 	encoded, err := json.Marshal(envelope)
 	if err != nil {
@@ -107,33 +127,27 @@ func decodeScopeHeader(value string) (access.ScopeSet, bool) {
 		return access.NewScopeSet(), true
 	}
 	scope := access.ScopeSet{
-		WholeRead:      envelope.WholeRead,
-		WholeWrite:     envelope.WholeWrite,
-		WholeUpdate:    envelope.WholeUpdate,
-		WholeDelete:    envelope.WholeDelete,
-		ReadDocuments:  make(map[string]struct{}, len(envelope.Read)),
-		WriteDocuments: make(map[string]struct{}, len(envelope.Write)),
-		UpdateDocuments: make(map[string]struct{}, len(envelope.Update)),
-		DeleteDocuments: make(map[string]struct{}, len(envelope.Delete)),
+		DefaultAllow: envelope.DefaultAllow,
+		DefaultDeny:  envelope.DefaultDeny,
+		WholeAllow:   envelope.WholeAllow,
+		WholeDeny:    envelope.WholeDeny,
+		FileAllow:    map[string]access.PermissionMask{},
+		FileDeny:     map[string]access.PermissionMask{},
+		GroupAllow:   map[string]access.PermissionMask{},
 	}
-	for _, name := range envelope.Read {
+	for name, mask := range envelope.FileAllow {
 		if name != "" {
-			scope.ReadDocuments[name] = struct{}{}
+			scope.FileAllow[name] = mask
 		}
 	}
-	for _, name := range envelope.Write {
+	for name, mask := range envelope.FileDeny {
 		if name != "" {
-			scope.WriteDocuments[name] = struct{}{}
+			scope.FileDeny[name] = mask
 		}
 	}
-	for _, name := range envelope.Update {
+	for name, mask := range envelope.GroupAllow {
 		if name != "" {
-			scope.UpdateDocuments[name] = struct{}{}
-		}
-	}
-	for _, name := range envelope.Delete {
-		if name != "" {
-			scope.DeleteDocuments[name] = struct{}{}
+			scope.GroupAllow[name] = mask
 		}
 	}
 	return scope, true
@@ -184,8 +198,9 @@ func withRequestScope(ctx context.Context, extra *sdk.RequestExtra) context.Cont
 }
 
 // restrictedScope returns the scope only when reads must be limited to explicit
-// documents. An absent scope (management credentials) or a whole-knowledge-base
-// scope keeps the historical unrestricted behavior.
+// documents (the whole-library read bit does not survive the merge, or a
+// file-level deny narrows the readable set). An absent scope (management
+// credentials) or an unrestricted scope keeps the historical behavior.
 func restrictedScope(ctx context.Context) (access.ScopeSet, bool) {
 	scope, ok := scopeFor(ctx)
 	if !ok || !scope.Restricted() {
@@ -194,12 +209,43 @@ func restrictedScope(ctx context.Context) (access.ScopeSet, bool) {
 	return scope, true
 }
 
-// resolvedDocumentIDs translates the caller's readable document names into the
-// document ids retrieval payloads carry. The empty set stays a non-nil slice so
-// the runtime treats the search as restricted-to-nothing rather than as
-// unrestricted.
+// readableDocumentNames returns the document names the caller may read given
+// the knowledge base's existing documents: every name when unrestricted,
+// otherwise the names whose read bit survives the merge. A restricted caller
+// with no readable document yields an empty non-nil slice (restricted to
+// nothing rather than unrestricted).
+func readableDocumentNames(ctx context.Context, namespace string, scope access.ScopeSet, existing []string) []string {
+	if !scope.Restricted() {
+		return existing
+	}
+	readable := make([]string, 0, len(existing))
+	for _, name := range existing {
+		if scope.CanReadDocument(name) {
+			readable = append(readable, name)
+		}
+	}
+	return readable
+}
+
+// resolvedDocumentIDs translates one restricted scope into the document ids
+// retrieval payloads carry. The visible name set is the knowledge base's
+// existing documents filtered by the effective read bit (a whole-library
+// allow minus file denies cannot be expressed as a name allow-list), and the
+// name-to-id mapping stays the runtime's ResolveDocumentIDs contract. The
+// empty set stays a non-nil slice so the runtime treats the search as
+// restricted-to-nothing rather than as unrestricted.
 func (e *Endpoint) resolvedDocumentIDs(ctx context.Context, namespace string, scope access.ScopeSet) ([]string, error) {
-	ids, err := e.opts.Runtime.ResolveDocumentIDs(ctx, namespace, scope.ReadDocumentNames())
+	documents, err := e.opts.Runtime.ListDocuments(ctx, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("文档权限解析失败：%w", err)
+	}
+	names := make([]string, 0, len(documents))
+	for _, document := range documents {
+		if scope.CanReadDocument(document.Name()) {
+			names = append(names, document.Name())
+		}
+	}
+	ids, err := e.opts.Runtime.ResolveDocumentIDs(ctx, namespace, names)
 	if err != nil {
 		return nil, fmt.Errorf("文档权限解析失败：%w", err)
 	}

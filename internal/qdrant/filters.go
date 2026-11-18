@@ -36,7 +36,9 @@ type payloadField struct {
 }
 
 // payloadFilter builds Filter(must=[FieldCondition(key, MatchValue(value))...])
-// with keys sorted like sorted(values.items()).
+// with keys sorted like sorted(values.items()). A []string value (the
+// document_id visibility allow-list) uses MatchAny so one condition accepts
+// any of the listed documents.
 func payloadFilter(values map[string]any) *Filter {
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -45,6 +47,14 @@ func payloadFilter(values map[string]any) *Filter {
 	sort.Strings(keys)
 	must := make([]any, 0, len(keys))
 	for _, key := range keys {
+		if list, isList := values[key].([]string); isList {
+			any := make([]any, 0, len(list))
+			for _, item := range list {
+				any = append(any, item)
+			}
+			must = append(must, fieldCondition{Key: key, Match: matchAny{Any: any}})
+			continue
+		}
 		must = append(must, fieldCondition{Key: key, Match: matchValue{Value: values[key]}})
 	}
 	return &Filter{Must: must}

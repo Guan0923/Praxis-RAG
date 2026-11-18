@@ -242,7 +242,7 @@ func (s *Server) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.requireScopeWriteDocument(w, r, pathParam(r, "name")) {
+	if !s.requireScopeDeleteDocument(w, r, pathParam(r, "name")) {
 		return
 	}
 	if s.runtime == nil {
@@ -279,10 +279,10 @@ func (s *Server) handleReplaceDocument(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Only the target document's writer may replace it; a file-level grant for
+	// Only the target document's updater may replace it; an update grant for
 	// this exact name is enough, and a grant for another file is refused.
 	name := pathParam(r, "name")
-	if !s.requireScopeWriteDocument(w, r, name) {
+	if !s.requireScopeUpdateDocument(w, r, name) {
 		return
 	}
 	if s.runtime == nil {

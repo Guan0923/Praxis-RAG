@@ -162,7 +162,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 | `#/users` | 用户管理 | 管理员 | 角色（admin/vip/user）、启用/禁用、删除；服务端保证至少保留一名启用的管理员 |
 | `#/monitor` | 系统监控 | 管理员 | 只读监控 + 运维操作：顶部标签栏 = `概览` + `MySQL`/`Redis`/`Qdrant`/`Kafka`/`PDF 解析服务`/`文档 Worker`/`Debezium` + `全部日志`，组件标签含该组件既有内容与该组件日志，`全部日志` 的组件筛选显示各组件日志条数。管理员另有 `Kubernetes` 标签：工作负载（Deployment/StatefulSet/DaemonSet/ReplicaSet/ReplicationController/Job/CronJob，7 类）与「全部 Pod」两个视图，覆盖全部命名空间，支持命名空间/名称筛选，展开行按 ownerReferences 显示归属 Pod；仅对可滚动更新的 Deployment/StatefulSet/DaemonSet 提供滚动重启（paused/Recreate/OnDelete/`partition>0` 行内说明不可用原因）。概览：页头三态状态与降级告警、主机资源卡片（CPU 使用率/核数/型号/load、内存与 swap、网络速率与最忙网卡、进程 RSS/VMS/goroutine/heap；首次采样与 Windows load 显示「—」）、关键指标（有效文档/任务/上传/检索）、MySQL/Redis/Qdrant/Kafka/pdf-service 依赖状态（Kafka 校验元数据与主题、PDF 校验转换器）、`document_jobs` 队列与阶段、上传互斥分类、`文档采集`/`缓存采集` 两行（connector/task 状态、所在 worker、失败原因、自动重启次数与恢复结果）、两组 Kafka 消费组滞后、缓存 dirty/failures、文档 Worker 心跳（读不到显示「未知」）、服务信息；全部日志支持内存/文件来源、最低级别、关键字过滤与分页；每秒自动刷新（页头固定「自动刷新 · 每 1 秒」与最近一次成功更新时间，无自动刷新开关/手动刷新/失败重试；失败保留上次数据并自动重试，慢请求不堆叠），窄屏单列 |
 | `#/membership` | 会员与用量 | 所有登录账号 | Free/Plus/Pro 目录、月/年卡、到期/刷新日、自有库与文件额度、Embedding 字符总额/已用/预留、下单并跳转支付宝、本人订单与继续支付/关单；管理员额外显示订单对账/查单/整单退款/人工处理 |
-| `#/permissions` | 权限管理 | 所有登录账号（仅自有库可管理；新建邀请限管理员/VIP/Plus/Pro） | 选择知识库、按用户聚合授权、创建邀请（可读/可修改 × 全库/若干文件）、复制链接、撤销授权/邀请；到期后仍可查看和撤销已有共享 |
+| `#/permissions` | 权限管理 | 所有登录账号（仅自有库可管理；新建邀请限管理员/VIP/Plus/Pro） | 选择知识库、按用户聚合授权（阅读/新增/修改/删除四操作三态：未设置/允许/拒绝 × 全库/若干文件，文件级不含新增）、创建邀请（精确操作位掩码）、复制链接、撤销允许/清除拒绝/撤销邀请；到期后仍可查看和撤销已有共享 |
 | `#/invitations` | 邀请中心 | 登录账号 | 待处理邀请、粘贴邀请链接、接受/拒绝（顶部铃铛轮询） |
 | `#/invite?token=` | 受邀预览 | 登录账号 | 预览邀请并接受/拒绝，随后切换到该知识库 |
 
@@ -173,7 +173,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 
 - 角色只有 `admin`、`vip`、`user`；只有管理员能改角色，且最后一个启用的管理员不能被降级/禁用/删除。
 - Console 会话：HttpOnly Cookie `rag_session`（默认 7 天，`RAG_AUTH_SESSION_TTL_HOURS`）；Cookie 会话的写操作要求 `X-CSRF-Token`，Bearer 会话/API Key 不需要。
-- 知识库权限：管理员或创建者拥有全部读写；其他人取授权的并集——授权分 `read`/`write`，范围分全库或指定文件；写授权隐含可读。**文件级写授权只能替换已授权的同名文档，不能上传新文件**。
+- 知识库权限：按「账号 × 知识库 × 文件名（空 = 全库）」规则的 allow/deny 位掩码（read=1、create=2、update=4、delete=8）合并，每项操作三态，任何 deny 优先于同一操作的 allow，合并后未获允许默认拒绝；管理员默认全开，`create` 只在角色默认与全库级规则生效（文件级规则不接受 create 位）。详见 [权限管理](../PERMISSIONS.md)。
 - 邀请：管理员、VIP 以及当前 Plus/Pro 会员可发起（管理员可邀请任意知识库，其余只能邀请自己创建的；手工 VIP 保留原权限）；邀请链接一次性，数据库只存 token 的 SHA-256 摘要；被邀请人必须存在且启用，不能邀请自己；默认 TTL 168 小时。到期后已有共享保留，但停止新发付费邀请；接受过期会员先前发出的未使用邀请会重新校验邀请人资格。
 - API Key：`prk_` 前缀，明文只在创建时返回一次；按命名空间白名单生效；密钥归创建账号所有，非管理员看不到别人的密钥（返回 404）。
 

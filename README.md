@@ -46,6 +46,10 @@ flowchart LR
 
 [完整部署拓扑](docs/DEPLOYMENT.md#1-进程拓扑) · [REST API](docs/USAGE.md#5-rest-api-示例) · [MCP 接入](docs/USAGE.md#6-mcp-使用)
 
+## 权限与共享
+
+知识库默认归创建者私有。共享按四项操作（阅读 / 新建 / 更新 / 删除）分别授予，每项操作三态（未设置 / 允许 / 拒绝）；**同一操作上任何拒绝都优先于允许**——全库拒绝可以压过单文件允许。独立 API Key 按自身绑定的知识库范围授权，不套用账号 ACL；SAG 事件-实体检索对受限账号（任何非全库可读账号）会被明确拒绝。详见 [权限管理](docs/PERMISSIONS.md)。
+
 ## 指标
 
 | 指标 | 默认值 | 请求上限 |
@@ -56,4 +60,4 @@ flowchart LR
 | 搜索超时预算 | 120 秒 | — |
 | 证据产物保留期 | 1 小时 | — |
 
-[配置与运行说明](docs/USAGE.md) · [证据引用与保留策略](docs/result-references.md) · [验证记录](VALIDATION.md)
+[配置与运行说明](docs/USAGE.md) · [权限管理](docs/PERMISSIONS.md) · [证据引用与保留策略](docs/result-references.md) · [验证记录](VALIDATION.md)

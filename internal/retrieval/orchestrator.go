@@ -60,8 +60,19 @@ func (o *Orchestrator) Search(ctx context.Context, request contracts.SearchReque
 	if !ok {
 		return nil, fmt.Errorf("Unsupported retrieval mode: %s", request.Retrieval)
 	}
+	// A server-side document visibility restriction is applied *before*
+	// recall: the restriction rides the closed filter vocabulary as a
+	// document_id condition, so dense/sparse/hybrid recall and every
+	// expansion round only ever see allowed documents, and the reranker/JEV
+	// only receives allowed candidates. (The mock backend ignores filters,
+	// and search_engine.searchTenant still runs the post-retrieval filter as
+	// defense in depth for non-Qdrant paths.)
+	filters := asMap(request.Filters)
+	if request.DocumentIDs != nil {
+		filters = visibilityFilters(filters, request.DocumentIDs)
+	}
 	retrievalStarted := time.Now()
-	candidates, err := retriever.Search(ctx, request.Query, request.CandidateK, asMap(request.Filters))
+	candidates, err := retriever.Search(ctx, request.Query, request.CandidateK, filters)
 	if err != nil {
 		return nil, err
 	}
