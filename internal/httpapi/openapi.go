@@ -133,6 +133,23 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "POST", Path: "/v1/invitations/accept", Summary: "Accept a share invitation", Tag: "sharing", Request: "InvitationTokenBody", Response: "200"},
 	{Method: "POST", Path: "/v1/invitations/decline", Summary: "Decline a share invitation", Tag: "sharing", Request: "InvitationTokenBody", Response: "200"},
 	{Method: "DELETE", Path: "/v1/invitations/{invitation_id}", Summary: "Revoke a pending invitation", Tag: "sharing", Response: "204"},
+	// User-group management surface.
+	{Method: "GET", Path: "/v1/groups", Summary: "List the user groups the current account created or joined", Tag: "groups", Response: "200"},
+	{Method: "POST", Path: "/v1/groups", Summary: "Create a user group (vip/admin)", Tag: "groups", Request: "CreateGroupBody", Response: "201"},
+	{Method: "GET", Path: "/v1/groups/{group_id}", Summary: "Read one user group with members and invitations", Tag: "groups", Response: "200"},
+	{Method: "DELETE", Path: "/v1/groups/{group_id}", Summary: "Dissolve one user group", Tag: "groups", Response: "204"},
+	{Method: "POST", Path: "/v1/groups/{group_id}/invitations", Summary: "Create a group-membership invitation", Tag: "groups", Request: "CreateGroupInvitationBody", Response: "201"},
+	{Method: "DELETE", Path: "/v1/groups/{group_id}/members/{user_id}", Summary: "Remove one group member", Tag: "groups", Response: "204"},
+	{Method: "DELETE", Path: "/v1/groups/{group_id}/membership", Summary: "Leave one user group", Tag: "groups", Response: "204"},
+	{Method: "GET", Path: "/v1/group-invitations", Summary: "List the group invitations addressed to the current account", Tag: "groups", Response: "200"},
+	{Method: "POST", Path: "/v1/group-invitations/preview", Summary: "Preview a group invitation link", Tag: "groups", Request: "InvitationTokenBody", Response: "200"},
+	{Method: "POST", Path: "/v1/group-invitations/accept", Summary: "Accept a group invitation", Tag: "groups", Request: "InvitationTokenBody", Response: "200"},
+	{Method: "POST", Path: "/v1/group-invitations/decline", Summary: "Decline a group invitation", Tag: "groups", Request: "InvitationTokenBody", Response: "200"},
+	{Method: "DELETE", Path: "/v1/group-invitations/{invitation_id}", Summary: "Revoke a pending group invitation", Tag: "groups", Response: "204"},
+	{Method: "GET", Path: "/v1/knowledge-bases/{namespace}/group-permissions", Summary: "List the user-group grants of one knowledge base", Tag: "groups", Response: "200"},
+	{Method: "PUT", Path: "/v1/knowledge-bases/{namespace}/group-permissions/{group_id}", Summary: "Set a whole-library or per-file user-group grant", Tag: "groups", Request: "SetGroupGrantBody", Response: "204"},
+	{Method: "DELETE", Path: "/v1/knowledge-bases/{namespace}/group-permissions/{group_id}", Summary: "Revoke a user-group grant", Tag: "groups", Response: "204"},
+	{Method: "GET", Path: "/v1/knowledge-bases/{namespace}/permission-sources", Summary: "Explain the origins of the current account's effective permissions", Tag: "groups", Query: []string{"document_name"}, Response: "200"},
 }
 
 // openAPISchemas returns the component schemas referenced by the route table.
@@ -336,6 +353,31 @@ func openAPISchemas() map[string]any {
 			"required":             []any{"token"},
 			"properties": map[string]any{
 				"token": map[string]any{"type": "string", "title": "Token"},
+			},
+		},
+		"CreateGroupBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"name"},
+			"properties": map[string]any{
+				"name": map[string]any{"type": "string", "minLength": 1, "maxLength": 100, "title": "Name"},
+			},
+		},
+		"CreateGroupInvitationBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"username"},
+			"properties": map[string]any{
+				"username": map[string]any{"type": "string", "title": "Username"},
+			},
+		},
+		"SetGroupGrantBody": map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []any{"allow_mask"},
+			"properties": map[string]any{
+				"document_names": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "default": []any{}, "title": "Document Names"},
+				"allow_mask":     map[string]any{"type": "integer", "minimum": 1, "maximum": 15, "title": "Allow Mask"},
 			},
 		},
 		"ProviderSettingsBody": map[string]any{

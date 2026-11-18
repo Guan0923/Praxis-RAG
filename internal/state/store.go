@@ -77,6 +77,17 @@ type Stores struct {
 	AppSettings    *AppSettingsRepository
 	Permissions    *PermissionRepository
 	Invitations    *InvitationRepository
+
+	// UserGroups / UserGroupMembers / GroupInvitations / GroupPermissions back
+	// the user-group feature: a vip/admin account creates groups, invites
+	// members through digest-only link tokens and grants allow bits on its own
+	// knowledge bases. Membership and grants are inputs of the permission
+	// merge resolved by internal/access.
+	UserGroups        *UserGroupRepository
+	UserGroupMembers  *UserGroupMemberRepository
+	GroupInvitations  *GroupInvitationRepository
+	GroupPermissions  *KBGroupPermissionRepository
+
 	ModelProfiles  *ModelProfileRepository
 	KnowledgeBases *KnowledgeBaseRepository
 	Documents      *DocumentRepository
@@ -214,6 +225,10 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.AppSettings = newAppSettingsRepository(database)
 	stores.Permissions = newPermissionRepository(database)
 	stores.Invitations = newInvitationRepository(database)
+	stores.UserGroups = newUserGroupRepository(database)
+	stores.UserGroupMembers = newUserGroupMemberRepository(database)
+	stores.GroupInvitations = newGroupInvitationRepository(database)
+	stores.GroupPermissions = newKBGroupPermissionRepository(database)
 	stores.ModelProfiles = newModelProfileRepository(database)
 	stores.KnowledgeBases = newKnowledgeBaseRepository(database, cacheSync)
 	stores.Documents = newDocumentRepository(database, cacheSync)

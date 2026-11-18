@@ -190,6 +190,7 @@ func (s *Server) registerRoutes() {
 	s.registerUserAuthRoutes()
 	s.registerProfileRoutes()
 	s.registerAccessRoutes()
+	s.registerGroupRoutes()
 	s.registerFeishuRoutes()
 	s.router.add("POST", "/mcp", authMCP, s.handleMCP)
 	s.router.add("GET", "/mcp", authMCP, s.handleMCP)

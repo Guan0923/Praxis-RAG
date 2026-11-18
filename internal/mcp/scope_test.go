@@ -558,3 +558,41 @@ func TestScopeHeaderRoundTrip(t *testing.T) {
 		t.Fatalf("tampered header must deny everything: %#v present=%v", tampered, present)
 	}
 }
+
+// TestScopeHeaderRoundTripGroupMasks pins the group-contribution fields of the
+// internal wire form: whole update/delete and the per-file update/delete sets
+// all survive the round trip.
+func TestScopeHeaderRoundTripGroupMasks(t *testing.T) {
+	scope := access.NewScopeSet()
+	scope.WholeRead = true
+	scope.WholeUpdate = true
+	scope.UpdateDocuments["spec.md"] = struct{}{}
+	scope.DeleteDocuments["old.md"] = struct{}{}
+	decoded, present := decodeScopeHeader(encodeScopeHeader(scope))
+	if !present {
+		t.Fatalf("scope header must report a present scope")
+	}
+	if !decoded.ReadsWhole() {
+		t.Fatalf("decoded lost whole read: %#v", decoded)
+	}
+	if !decoded.CanUpdateDocument("anything.md") {
+		t.Fatalf("whole update did not survive: %#v", decoded)
+	}
+	// WholeUpdate alone only covers update, not delete.
+	if decoded.CanDeleteDocument("anything.md") {
+		t.Fatalf("whole update leaked into delete: %#v", decoded)
+	}
+	if !decoded.CanUpdateDocument("spec.md") {
+		t.Fatalf("file-level update lost: %#v", decoded)
+	}
+	if !decoded.CanDeleteDocument("old.md") {
+		t.Fatalf("file-level delete lost: %#v", decoded)
+	}
+	// WholeUpdate covers update everywhere; delete stays per-file.
+	if !decoded.CanUpdateDocument("other.md") {
+		t.Fatalf("whole update must cover every document: %#v", decoded)
+	}
+	if decoded.CanDeleteDocument("spec.md") {
+		t.Fatalf("decoded scope grants delete without a delete rule: %#v", decoded)
+	}
+}
