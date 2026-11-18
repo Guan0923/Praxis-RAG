@@ -9,6 +9,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/access"
 	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/runtime"
 )
 
 // SearchRuntime runs one synchronous retrieval action.
@@ -62,6 +63,10 @@ func runtimeErrorStatus(err error) (int, string) {
 	var unavailable *apierrors.SnapshotUnavailable
 	if errors.As(err, &unavailable) {
 		return http.StatusGone, unavailable.Message
+	}
+	var forbidden *apierrors.ArtifactForbiddenError
+	if errors.As(err, &forbidden) {
+		return http.StatusForbidden, forbidden.Message
 	}
 	var knowledge *apierrors.KnowledgeError
 	if errors.As(err, &knowledge) {
@@ -169,59 +174,17 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, payload)
 }
 
-// requireScopeArtifactRead enforces read visibility on one artifact: the
-// artifact's owning document must be within the caller's visible set. When
-// the artifact carries no trustworthy owning document (or the resolution
-// fails), a scope-restricted request is refused; management credentials keep
-// the historical unrestricted behaviour.
-func (s *Server) requireScopeArtifactRead(w http.ResponseWriter, r *http.Request, namespace, artifactID string) bool {
-	if _, ok := s.requireScopeRead(w, r); !ok {
-		return false
+// artifactDocumentGate builds the document-level read gate for the two artifact
+// entries from the caller's resolved scope. It is nil for management
+// credentials and whole-knowledge-base readers (historical unrestricted
+// behaviour); a restricted scope may only read artifacts of documents it may
+// read.
+func artifactDocumentGate(r *http.Request) func(string) bool {
+	scope, ok := access.ScopeFromContext(r.Context())
+	if !ok || !scope.Restricted() {
+		return nil
 	}
-	scope, hasScope := access.ScopeFromContext(r.Context())
-	if !hasScope || !scope.Restricted() {
-		return true
-	}
-	// Resolve the artifact's owning document id and check it against the
-	// caller's visible document set.
-	artifact, err := s.runtime.GetArtifact(r.Context(), namespace, artifactID, 0, 1)
-	if err != nil || artifact == nil {
-		// An unreadable or missing artifact cannot prove a trusted owner:
-		// fail closed for the restricted caller.
-		writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
-		return false
-	}
-	documentID, _ := artifact["document_id"].(string)
-	if documentID == "" {
-		writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
-		return false
-	}
-	ids, resolveErr := s.resolveVisibleDocumentIDs(r, namespace, scope)
-	if resolveErr != nil {
-		writeAccessError(w, resolveErr)
-		return false
-	}
-	for _, visible := range ids {
-		if visible == documentID {
-			return true
-		}
-	}
-	writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
-	return false
-}
-
-// resolveVisibleDocumentIDs resolves one scope's visible document ids through
-// the wired access service (the mask-aware resolver when available).
-func (s *Server) resolveVisibleDocumentIDs(r *http.Request, namespace string, scope access.ScopeSet) ([]string, error) {
-	if s.access == nil {
-		return nil, nil
-	}
-	if resolver, ok := s.access.(interface {
-		ResolveVisibleDocumentIDs(ctx context.Context, namespace string, scope access.ScopeSet) ([]string, error)
-	}); ok {
-		return resolver.ResolveVisibleDocumentIDs(r.Context(), namespace, scope)
-	}
-	return s.access.ResolveDocumentIDs(r.Context(), namespace, scope.ReadDocumentNames())
+	return scope.CanReadDocument
 }
 
 func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request) {
@@ -236,14 +199,12 @@ func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request
 	if _, ok := s.requireScopeRead(w, r); !ok {
 		return
 	}
-	if !s.requireScopeArtifactRead(w, r, namespace, pathParam(r, "artifact_id")) {
-		return
-	}
 	artifactID, err := contracts.ValidateUUID(pathParam(r, "artifact_id"))
 	if err != nil {
 		writeDetail(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	ctx := runtime.WithDocumentReadGate(r.Context(), artifactDocumentGate(r))
 	offset, details := intQuery(r, "offset", 0, 0, maxIntValue)
 	if details != nil {
 		writeValidation(w, http.StatusBadRequest, details)
@@ -258,7 +219,7 @@ func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request
 		writeDetail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	payload, err := s.runtime.GetArtifact(r.Context(), namespace, artifactID, offset, length)
+	payload, err := s.runtime.GetArtifact(ctx, namespace, artifactID, offset, length)
 	if err != nil {
 		writeRuntimeError(w, err, true)
 		return
@@ -304,15 +265,13 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 	if _, ok := s.requireScopeRead(w, r); !ok {
 		return
 	}
-	if !s.requireScopeArtifactRead(w, r, namespace, pathParam(r, "artifact_id")) {
-		return
-	}
 	artifactID, err := contracts.ValidateUUID(pathParam(r, "artifact_id"))
 	if err != nil {
 		writeDetail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	content, mimeType, name, err := s.runtime.DownloadArtifact(r.Context(), namespace, artifactID)
+	ctx := runtime.WithDocumentReadGate(r.Context(), artifactDocumentGate(r))
+	content, mimeType, name, err := s.runtime.DownloadArtifact(ctx, namespace, artifactID)
 	if err != nil {
 		writeRuntimeError(w, err, true)
 		return

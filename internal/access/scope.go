@@ -4,29 +4,32 @@ import "sort"
 
 // The merge rule shared by every enforcement point:
 //
-//	allow := defaultAllow | libraryAllow | fileAllow
+//	allow := defaultAllow | libraryAllow | fileAllow | groupAllow
 //	deny := defaultDeny | libraryDeny | fileDeny
 //	effective := allow &^ deny
 //	allowed := required != 0 && effective&required == required
 //
 // Any applicable deny wins over the same operation's allow, so a
 // whole-library deny can override a file allow and a file deny can restrict a
-// whole-library allow. Operations combine independently.
+// whole-library allow. Operations combine independently. Group grants only
+// contribute allow bits: a group never reduces a member's existing
+// permissions, so nothing from the group side lands on deny.
 
 // EffectiveLibrary returns the effective operation mask at knowledge-base
-// level: the role defaults merged with the whole-library rule. File rules
-// never contribute (the create bit is only decided here).
+// level: the role defaults merged with the whole-library rule and the
+// whole-library group grant. File rules never contribute (the create bit is
+// only decided here).
 func (s ScopeSet) EffectiveLibrary() PermissionMask {
-	allow := s.DefaultAllow | s.WholeAllow
+	allow := s.DefaultAllow | s.WholeAllow | s.GroupAllow[""]
 	deny := s.DefaultDeny | s.WholeDeny
 	return allow &^ deny
 }
 
 // EffectiveDocument returns the effective operation mask for one document:
-// role defaults, the whole-library rule and the document's own rule all
-// merge, then every applicable deny is subtracted.
+// role defaults, the whole-library rule, the document's own rule and the
+// document's group grant all merge, then every applicable deny is subtracted.
 func (s ScopeSet) EffectiveDocument(name string) PermissionMask {
-	allow := s.DefaultAllow | s.WholeAllow | s.FileAllow[name]
+	allow := s.DefaultAllow | s.WholeAllow | s.GroupAllow[""] | s.FileAllow[name] | s.GroupAllow[name]
 	deny := s.DefaultDeny | s.WholeDeny | s.FileDeny[name]
 	return allow &^ deny
 }
@@ -35,7 +38,7 @@ func (s ScopeSet) EffectiveDocument(name string) PermissionMask {
 // fallback for zero-valued ScopeSet literals constructed outside
 // NewScopeSet.
 func (s ScopeSet) EffectiveDocumentOrDefault(name string) PermissionMask {
-	if s.FileAllow == nil && s.FileDeny == nil {
+	if s.FileAllow == nil && s.FileDeny == nil && s.GroupAllow == nil {
 		allow := s.DefaultAllow | s.WholeAllow
 		deny := s.DefaultDeny | s.WholeDeny
 		return allow &^ deny
@@ -86,6 +89,14 @@ func (s ScopeSet) AllowsAnyRead() bool {
 			return true
 		}
 	}
+	for name, allow := range s.GroupAllow {
+		if name == "" {
+			continue
+		}
+		if Operation(s.EffectiveDocumentOrDefault(name))&OpRead != 0 && Operation(allow)&OpRead != 0 {
+			return true
+		}
+	}
 	return false
 }
 
@@ -98,6 +109,11 @@ func (s ScopeSet) HasAnyWrite() bool {
 	}
 	for name := range s.FileAllow {
 		if Operation(s.EffectiveDocumentOrDefault(name))&(OpUpdate|OpDelete) != 0 {
+			return true
+		}
+	}
+	for name := range s.GroupAllow {
+		if name != "" && Operation(s.EffectiveDocumentOrDefault(name))&(OpUpdate|OpDelete) != 0 {
 			return true
 		}
 	}

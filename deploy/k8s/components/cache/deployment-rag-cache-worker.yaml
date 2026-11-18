@@ -1,6 +1,6 @@
 # 缓存刷新消费者。
 #
-# 数据流：8 张读模型表 -> Debezium（praxis-cache-cdc）-> RAG_CACHE_TOPIC
+# 数据流：7 张读模型表 -> Debezium（praxis-cache-cdc）-> RAG_CACHE_TOPIC
 # -> 本进程。它按变更表/op 更新 MySQL 的 cache_revisions（脏水位），
 # 再重建/失效 Redis 视图；与 API 进程完全解耦，所以 API 扩缩容不影响它。
 #

@@ -297,9 +297,7 @@ func (r *UserRepository) Delete(ctx context.Context, id string) (bool, error) {
 	if _, err := transaction.ExecContext(ctx, "DELETE FROM user_sessions WHERE user_id = ?", id); err != nil {
 		return false, newStateError("用户无法删除")
 	}
-	if _, err := touch(ctx, transaction, apiKeyKeys()...); err != nil {
-		return false, newStateError("用户无法删除")
-	}
+
 	if _, err := transaction.ExecContext(ctx, "DELETE FROM api_keys WHERE owner_user_id = ?", id); err != nil {
 		return false, newStateError("用户无法删除")
 	}
@@ -308,6 +306,34 @@ func (r *UserRepository) Delete(ctx context.Context, id string) (bool, error) {
 	}
 	if _, err := transaction.ExecContext(ctx,
 		"DELETE FROM kb_invitations WHERE inviter_user_id = ? OR invitee_user_id = ?", id, id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	// The account's user groups are dissolved with their members, invitations
+	// and knowledge-base grants, and its own memberships and invitations are
+	// removed, so no residual group row keeps effect after the account is gone.
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM kb_group_permissions WHERE group_id IN (SELECT id FROM user_groups WHERE owner_user_id = ?)", id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM user_group_invitations WHERE group_id IN (SELECT id FROM user_groups WHERE owner_user_id = ?)", id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM user_group_members WHERE group_id IN (SELECT id FROM user_groups WHERE owner_user_id = ?)", id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM user_groups WHERE owner_user_id = ?", id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM user_group_members WHERE user_id = ?", id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM user_group_invitations WHERE inviter_user_id = ? OR invitee_user_id = ?", id, id); err != nil {
+		return false, newStateError("用户无法删除")
+	}
+	if _, err := transaction.ExecContext(ctx, "DELETE FROM kb_group_permissions WHERE granted_by = ?", id); err != nil {
 		return false, newStateError("用户无法删除")
 	}
 	if _, err := transaction.ExecContext(ctx,

@@ -126,6 +126,84 @@ export type CreateInvitationResult = {
   invite_path: string;
 };
 
+// ---- 用户组（user groups）----
+export type GroupStatus = "active" | "dissolved";
+export type GroupView = {
+  id: string;
+  name: string;
+  owner_user_id: string;
+  owner_username: string;
+  status: GroupStatus;
+  member_count: number;
+  created_at: string;
+  updated_at: string;
+  dissolved_at: string | null;
+};
+export type GroupMemberView = {
+  user_id: string;
+  username: string;
+  role: Role;
+  enabled: boolean;
+  joined_at: string;
+};
+export type GroupInvitationView = {
+  id: string;
+  group_id: string;
+  group_name: string;
+  inviter_user_id: string;
+  inviter_username: string;
+  invitee_user_id: string;
+  invitee_username: string;
+  status: InvitationStatus;
+  created_at: string;
+  expires_at: string;
+  accepted_at: string | null;
+};
+export type GroupGrantView = {
+  group_id: string;
+  group_name: string;
+  namespace: string;
+  document_name: string;
+  allow_mask: number;
+  granted_by: string;
+  granted_by_username: string;
+  created_at: string;
+  updated_at: string;
+};
+export type PermissionSourceView = {
+  bit: number;
+  bit_name: string;
+  kind: "role" | "personal" | "group";
+  origin: string;
+  document_name: string;
+};
+export type SetGroupGrantInput = {
+  document_names: string[];
+  allow_mask: number;
+};
+
+export const groupStatusLabels: Record<GroupStatus, string> = {
+  active: "使用中",
+  dissolved: "已解散",
+};
+// permissionBits maps the four document permission bits (read=1, create=2,
+// update=4, delete=8) to their Chinese labels.
+export const permissionBits: { bit: number; value: number; name: string; key: string; label: string }[] = [
+  { bit: 1, value: 1, name: "read", key: "read", label: "阅读" },
+  { bit: 2, value: 2, name: "create", key: "create", label: "新增" },
+  { bit: 4, value: 4, name: "update", key: "update", label: "修改" },
+  { bit: 8, value: 8, name: "delete", key: "delete", label: "删除" },
+];
+export const permissionSourceKindLabels: Record<PermissionSourceView["kind"], string> = {
+  role: "角色",
+  personal: "个人授权",
+  group: "用户组",
+};
+
+export function groupInvitationLink(invitePath: string) {
+  return `${location.origin}${invitePath}`;
+}
+
 export const permissionLabels: Record<PermissionLevel, string> = {
   read: "只读",
   write: "读写",
@@ -141,13 +219,6 @@ export const PERM_UPDATE = 4;
 export const PERM_DELETE = 8;
 export const PERM_FULL = 15;
 
-// permissionBits 按位列出全部操作，顺序即界面展示顺序。
-export const permissionBits = [
-  { bit: PERM_READ, key: "read", label: "阅读" },
-  { bit: PERM_CREATE, key: "create", label: "新增" },
-  { bit: PERM_UPDATE, key: "update", label: "修改" },
-  { bit: PERM_DELETE, key: "delete", label: "删除" },
-] as const;
 
 export const permissionBitLabels: Record<number, string> = {
   [PERM_READ]: "阅读",
@@ -214,6 +285,11 @@ export const invitationStatusColors: Record<string, string> = {
   declined: "default",
   revoked: "default",
   expired: "error",
+};
+// groupInvitationStatusLabels shares the invitation status wording; group
+// invitations use the same pending/accepted/declined/revoked/expired states.
+export const groupInvitationStatusLabels: Record<string, string> = {
+  ...invitationStatusLabels,
 };
 // invitationStatus renders the display status: a pending invitation whose
 // expires_at already passed is expired for the invitee even before the server
@@ -2053,6 +2129,156 @@ export async function revokeInvitation(invitationId: string): Promise<void> {
 export async function fetchInvitableUsers(): Promise<InviteUser[]> {
   const payload = await api<{ users: InviteUser[] }>("/v1/users", undefined, { cache: "no-store" });
   return payload.users || [];
+}
+
+// ---- 用户组 API ----
+
+// fetchGroups lists the groups the current account created or joined.
+export async function fetchGroups(): Promise<{ owned: GroupView[]; joined: GroupView[] }> {
+  const payload = await api<{ owned_groups: GroupView[]; joined_groups: GroupView[] }>(
+    "/v1/groups", undefined, { cache: "no-store" });
+  return {
+    owned: (payload.owned_groups || []).map(normalizeGroup),
+    joined: (payload.joined_groups || []).map(normalizeGroup),
+  };
+}
+
+// normalizeGroup tolerates a null member_count in JSON.
+function normalizeGroup(group: GroupView): GroupView {
+  return { ...group, member_count: group.member_count ?? 0 };
+}
+
+// createGroup creates one user group owned by the current account (vip/admin).
+export async function createGroup(name: string): Promise<GroupView> {
+  const payload = await api<{ group: GroupView }>("/v1/groups", undefined, {
+    method: "POST", body: JSON.stringify({ name }),
+  });
+  return normalizeGroup(payload.group);
+}
+
+// fetchGroupDetail returns one group with members and invitations.
+export async function fetchGroupDetail(
+  groupId: string,
+): Promise<{ group: GroupView; members: GroupMemberView[]; invitations: GroupInvitationView[] }> {
+  const payload = await api<{ group: GroupView; members: GroupMemberView[]; invitations: GroupInvitationView[] }>(
+    `/v1/groups/${encodeURIComponent(groupId)}`, undefined, { cache: "no-store" });
+  return {
+    group: normalizeGroup(payload.group),
+    members: payload.members || [],
+    invitations: payload.invitations || [],
+  };
+}
+
+// dissolveGroup deactivates one group and clears members/invitations/grants.
+export async function dissolveGroup(groupId: string): Promise<void> {
+  await apiResponse(`/v1/groups/${encodeURIComponent(groupId)}`, undefined, { method: "DELETE" });
+}
+
+// createGroupInvitation issues one membership invitation link (group owner,
+// still vip/admin). The raw token appears only in this response.
+export async function createGroupInvitation(
+  groupId: string, username: string,
+): Promise<{ invitation: GroupInvitationView; invite_path: string }> {
+  return await api<{ invitation: GroupInvitationView; invite_path: string }>(
+    `/v1/groups/${encodeURIComponent(groupId)}/invitations`, undefined,
+    { method: "POST", body: JSON.stringify({ username }) });
+}
+
+// removeGroupMember removes one member from the owner's group.
+export async function removeGroupMember(groupId: string, userId: string): Promise<void> {
+  await apiResponse(`/v1/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(userId)}`, undefined, {
+    method: "DELETE",
+  });
+}
+
+// leaveGroup removes the current account's own membership.
+export async function leaveGroup(groupId: string): Promise<void> {
+  await apiResponse(`/v1/groups/${encodeURIComponent(groupId)}/membership`, undefined, { method: "DELETE" });
+}
+
+// fetchGroupInvitationInbox lists the group invitations addressed to the
+// current account, pending first.
+export async function fetchGroupInvitationInbox(
+  options: { signal?: AbortSignal } = {},
+): Promise<GroupInvitationView[]> {
+  const payload = await api<{ invitations: GroupInvitationView[] }>(
+    "/v1/group-invitations", undefined, { cache: "no-store", signal: options.signal });
+  return payload.invitations || [];
+}
+
+// previewGroupInvitation resolves one group invitation link for its invitee.
+export async function previewGroupInvitation(token: string): Promise<GroupInvitationView> {
+  const payload = await api<{ invitation: GroupInvitationView }>("/v1/group-invitations/preview", undefined, {
+    method: "POST", body: JSON.stringify({ token }),
+  });
+  return payload.invitation;
+}
+
+// acceptGroupInvitation turns one pending membership invitation into a
+// membership. Idempotent retries never re-add a member that left.
+export async function acceptGroupInvitation(token: string): Promise<GroupInvitationView> {
+  const payload = await api<{ invitation: GroupInvitationView }>("/v1/group-invitations/accept", undefined, {
+    method: "POST", body: JSON.stringify({ token }),
+  });
+  return payload.invitation;
+}
+
+// declineGroupInvitation declines one pending membership invitation.
+export async function declineGroupInvitation(token: string): Promise<GroupInvitationView> {
+  const payload = await api<{ invitation: GroupInvitationView }>("/v1/group-invitations/decline", undefined, {
+    method: "POST", body: JSON.stringify({ token }),
+  });
+  return payload.invitation;
+}
+
+// revokeGroupInvitation withdraws one pending group invitation (group owner).
+export async function revokeGroupInvitation(invitationId: string): Promise<void> {
+  await apiResponse(`/v1/group-invitations/${encodeURIComponent(invitationId)}`, undefined, { method: "DELETE" });
+}
+
+// fetchGroupGrants lists the user-group grants of one knowledge base.
+export async function fetchGroupGrants(
+  namespace: string, connection: Connection,
+): Promise<GroupGrantView[]> {
+  const payload = await api<{ group_permissions: GroupGrantView[] }>(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/group-permissions`,
+    { ...connection, namespace }, { cache: "no-store" });
+  return payload.group_permissions || [];
+}
+
+// setGroupGrant writes one whole-library or per-file group grant.
+export async function setGroupGrant(
+  namespace: string, groupId: string, input: SetGroupGrantInput, connection: Connection,
+): Promise<void> {
+  await apiResponse(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/group-permissions/${encodeURIComponent(groupId)}`,
+    { ...connection, namespace },
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+// revokeGroupGrant removes every group grant of one group inside one
+// knowledge base.
+export async function revokeGroupGrant(
+  namespace: string, groupId: string, connection: Connection,
+): Promise<void> {
+  await apiResponse(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/group-permissions/${encodeURIComponent(groupId)}`,
+    { ...connection, namespace },
+    { method: "DELETE" },
+  );
+}
+
+// fetchPermissionSources explains the origins of the current account's
+// effective permissions for one namespace (all documents, or one document).
+export async function fetchPermissionSources(
+  namespace: string, connection: Connection, documentName = "",
+): Promise<PermissionSourceView[]> {
+  const query = documentName ? `?document_name=${encodeURIComponent(documentName)}` : "";
+  const payload = await api<{ sources: PermissionSourceView[] }>(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/permission-sources${query}`,
+    { ...connection, namespace }, { cache: "no-store" });
+  return payload.sources || [];
 }
 
 // invitationLink makes the shareable absolute URL from the invite_path returned

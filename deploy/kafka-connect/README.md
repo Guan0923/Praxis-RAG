@@ -32,7 +32,7 @@ Server 进程。
 | 连接器 | 模板 | 采集范围 | 目标 topic | schema history |
 | --- | --- | --- | --- | --- |
 | `praxis-document-cdc` | `connectors/document-cdc.json` | 仅 `document_jobs`，仅 INSERT 与 `schedule_version` 增长的 UPDATE | `RAG_DOCUMENT_TOPIC`（默认 `praxis_document_ingest`） | `praxis_cdc_document_schema_history` |
-| `praxis-cache-cdc` | `connectors/cache-cdc.json` | 8 张读模型表，全部 c/u/d | `RAG_CACHE_TOPIC`（默认 `praxis_state_cache_refresh`） | `praxis_cdc_cache_schema_history` |
+| `praxis-cache-cdc` | `connectors/cache-cdc.json` | 7 张读模型表，全部 c/u/d | `RAG_CACHE_TOPIC`（默认 `praxis_state_cache_refresh`） | `praxis_cdc_cache_schema_history` |
 
 连接器名称是**固定契约**：注册、监控、自动重启都按这两个名字寻址。修改名称需要
 同时修改 `.env`、监控与脚本。

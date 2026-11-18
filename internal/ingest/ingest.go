@@ -6,11 +6,14 @@
 // Dispatch (mirrors DenseDocumentIngester.ingest_and_publish):
 //   - .pdf: the injected PDFParser (default: in-process NativePDFParser)
 //     produces a manifest, then BuildPDFContent + pdfcontent.ContentChunks.
-//   - .doc/.docx: when Docling.Parser is configured, the file (legacy .doc
-//     converted first) is parsed by the Docling HTTP service; otherwise the
-//     in-process OOXML parser (ParseWordPackage) is used. Both feed the same
-//     Word asset/chunk builder so table structure, captions and images reach
-//     the evidence. HTML (.html/.htm) is Docling-only.
+//   - .doc/.docx/.html/.htm: the independent Docling HTTP service parses the
+//     file (legacy .doc is LibreOffice-converted first); there is no
+//     in-process Word parser any more, so the Docling parser is required and
+//     prepareDocling fails with ErrDoclingNotConfigured when it is missing.
+//     The Docling manifest feeds the same Word asset/chunk builder so table
+//     structure, captions and images reach the evidence.
+//   - .md/.txt (and any other suffix, which fails in the reader): the
+//     rag_mcp.chunking.chunk_document port (chunking.ChunkDocument).
 //   - .md/.txt (and any other suffix, which fails in the reader): the
 //     rag_mcp.chunking.chunk_document port (chunking.ChunkDocument).
 //
@@ -52,8 +55,9 @@ type PDFOptions struct {
 
 // WordOptions selects Word parsing dependencies.
 type WordOptions struct {
-	// Converter converts legacy .doc files before OOXML parsing. nil means a
-	// document.SofficeConverter (environment auto-detection) is used.
+	// Converter converts legacy .doc files to .docx before the Docling
+	// upload. nil means a document.SofficeConverter (environment
+	// auto-detection) is used.
 	Converter document.DOCConverter
 	// Vision describes uncaptioned pictures through the remote VLM before
 	// chunking. nil keeps generated_description empty.
@@ -77,8 +81,10 @@ type Options struct {
 	PDF PDFOptions
 	// Word configures legacy conversion and vision descriptions.
 	Word WordOptions
-	// Docling selects the remote Docling service for DOCX/HTML parsing. When
-	// Parser is nil, DOCX keeps the in-process parser and HTML import fails.
+	// Docling selects the remote Docling service, the only Word/HTML parser.
+	// When Parser is nil, DOC/DOCX/HTML imports fail with
+	// ErrDoclingNotConfigured (the runtime always injects the service client
+	// when RAG_DOCLING_SERVICE_URL is set).
 	Docling DoclingOptions
 	// Counter overrides the token counter (default chunking.DefaultCounter).
 	Counter chunking.TokenCounter
@@ -157,23 +163,14 @@ func Prepare(ctx context.Context, sourcePath string, options Options) (Result, e
 	switch suffix {
 	case document.SuffixPDF:
 		return preparePDF(ctx, sourcePath, options)
-	case document.SuffixHTML, document.SuffixHTM:
+	case document.SuffixHTML, document.SuffixHTM,
+		document.SuffixDOC, document.SuffixDOCX:
+		// Word (and static HTML) is parsed only by the Docling service; the
+		// in-process OOXML parser was removed.
 		return prepareDocling(ctx, sourcePath, options)
-	case document.SuffixDOC, document.SuffixDOCX:
-		if doclingEnabledFor(options) {
-			return prepareDocling(ctx, sourcePath, options)
-		}
-		return prepareWord(ctx, sourcePath, options)
 	default:
 		return prepareText(ctx, sourcePath, options)
 	}
-}
-
-// doclingEnabledFor reports whether the configured Docling parser handles DOCX
-// uploads. It exists so the dispatch condition reads once even though the
-// caller only sets Docling.Parser.
-func doclingEnabledFor(options Options) bool {
-	return options.Docling.Parser != nil
 }
 
 // effectiveConfig validates the requested configuration, mapping the zero value
@@ -216,90 +213,8 @@ func prepareText(ctx context.Context, sourcePath string, options Options) (Resul
 	}, nil
 }
 
-// prepareWord ports word_assets.parse_word + word_chunks.
-func prepareWord(ctx context.Context, sourcePath string, options Options) (Result, error) {
-	staging, cleanup, err := ensureStaging(options.StagingDir)
-	if err != nil {
-		return Result{}, err
-	}
-	fail := func(err error) (Result, error) {
-		cleanup()
-		return Result{}, err
-	}
-	parsePath := sourcePath
-	if strings.ToLower(filepath.Ext(sourcePath)) == document.SuffixDOC {
-		converter := options.Word.Converter
-		if converter == nil {
-			converter = &document.SofficeConverter{}
-		}
-		converted, convertCleanup, err := converter.Convert(ctx, sourcePath)
-		if err != nil {
-			return fail(err)
-		}
-		if convertCleanup != nil {
-			defer convertCleanup()
-		}
-		parsePath = converted
-	}
-	pkg, err := document.ParseWordPackage(parsePath)
-	if err != nil {
-		return fail(err)
-	}
-	if err := pkg.WriteStaging(staging); err != nil {
-		return fail(err)
-	}
-	if options.Word.Vision != nil && len(document.MissingPictureCaptions(pkg.Manifest)) > 0 {
-		if err := options.Word.Vision.DescribeMissingCaptions(ctx, staging); err != nil {
-			return fail(err)
-		}
-		if err := pkg.ReloadFromStaging(staging); err != nil {
-			return fail(err)
-		}
-	}
-	documentID := chunking.DocumentID(options.SourceName)
-	content, err := document.BuildWordContent(documentID, pkg)
-	if err != nil {
-		return fail(err)
-	}
-	title := sourceStem(options.SourceName)
-	chunks, err := buildWordChunks(content.Manifest, documentID, options.SourceName, title,
-		options.Chunking, options.TokenizerModel, options.Counter,
-		"word_parser_version", document.WordParserVersion)
-	if err != nil {
-		return fail(err)
-	}
-	if len(chunks) == 0 {
-		// word_assets.parse_word reports the original path name, not source name.
-		return fail(noIndexableError("Word document has no indexable content: " + filepath.Base(sourcePath)))
-	}
-	if err := content.WriteArtifacts(staging); err != nil {
-		return fail(err)
-	}
-	return Result{
-		Chunks:             chunks,
-		Title:              title,
-		Metadata:           wordMetadata(content, options),
-		Assets:             content.Assets,
-		Diagnostics:        content.Diagnostics,
-		SkippedObjectCount: content.SkippedObjectCount,
-		StagingDir:         staging,
-	}, nil
-}
-
-func wordMetadata(content *document.WordContent, options Options) map[string]any {
-	metadata := documentConfiguration(options.Chunking, options.TokenizerModel, "word_parser_version", document.WordParserVersion)
-	diagnostics := content.Diagnostics
-	if diagnostics == nil {
-		diagnostics = []document.Diagnostic{}
-	}
-	return map[string]any{
-		"document_suffix":      strings.ToLower(filepath.Ext(options.SourceName)),
-		"chunking":             metadata,
-		"parser_version":       document.WordParserVersion,
-		"diagnostics":          diagnostics,
-		"skipped_object_count": content.SkippedObjectCount,
-	}
-}
+// prepareWord and wordMetadata were removed with the in-process OOXML
+// parser: DOC/DOCX now always flows through prepareDocling.
 
 // preparePDF ports pdf_assets.parse_pdf + pdf_content.content_chunks.
 func preparePDF(ctx context.Context, sourcePath string, options Options) (Result, error) {

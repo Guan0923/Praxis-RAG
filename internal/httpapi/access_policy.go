@@ -39,6 +39,29 @@ type AccessControl interface {
 	ListInvitableUsers(ctx context.Context, inviter state.User) ([]access.UserView, error)
 }
 
+// GroupControl is the user-group management surface. The concrete
+// implementation is *access.Service; the interface keeps the httpapi layer
+// compilable against the sharing fakes that predate the feature. Servers
+// without a group-capable access service answer 503 on these routes.
+type GroupControl interface {
+	CreateGroup(ctx context.Context, user state.User, request access.CreateGroupRequest) (access.GroupView, error)
+	ListGroups(ctx context.Context, user state.User) (owned []access.GroupView, joined []access.GroupView, err error)
+	GroupDetail(ctx context.Context, user state.User, groupID string) (access.GroupView, []access.GroupMemberView, []access.GroupInvitationView, error)
+	CreateGroupInvitation(ctx context.Context, inviter state.User, request access.CreateGroupInvitationRequest) (access.GroupInvitationView, string, error)
+	GroupInvitationInbox(ctx context.Context, user state.User) ([]access.GroupInvitationView, error)
+	PreviewGroupInvitation(ctx context.Context, user state.User, token string) (access.GroupInvitationView, error)
+	AcceptGroupInvitation(ctx context.Context, user state.User, token string) (access.GroupInvitationView, error)
+	DeclineGroupInvitation(ctx context.Context, user state.User, token string) (access.GroupInvitationView, error)
+	RevokeGroupInvitation(ctx context.Context, user state.User, invitationID string) error
+	RemoveGroupMember(ctx context.Context, user state.User, groupID, memberUserID string) error
+	LeaveGroup(ctx context.Context, user state.User, groupID string) error
+	DissolveGroup(ctx context.Context, user state.User, groupID string) error
+	ListGroupGrants(ctx context.Context, user state.User, namespace string) ([]access.GroupGrantView, error)
+	SetGroupGrant(ctx context.Context, user state.User, request access.SetGroupGrantRequest) error
+	RevokeGroupGrant(ctx context.Context, user state.User, namespace, groupID string) error
+	DescribePermissionSources(ctx context.Context, user state.User, namespace, documentName string) ([]access.PermissionSourceView, error)
+}
+
 // KnowledgeBaseSelfCreateRuntime clones the default knowledge-base template for
 // one owning account. The admin route keeps the full provider configuration;
 // this surface only accepts namespace/chunking fields.

@@ -257,9 +257,12 @@ func TestScopeResourcesFiltered(t *testing.T) {
 		t.Fatalf("granted document read = %#v, %v", result, err)
 	}
 
-	// Artifacts embed their source document name and follow the same grant.
+	// Artifacts follow the caller's document-level grant: the permission
+	// subject is the artifact's parent document, not the artifact's own name
+	// (which is an asset label for non-source kinds).
+	runtime.artifactDocument = "b.md"
 	runtime.artifactPayload = map[string]any{
-		"artifact_id": artifactFixtureID, "name": "b.md", "encoding": "base64",
+		"artifact_id": artifactFixtureID, "name": "document.md", "encoding": "base64",
 		"data": "aGk=", "total_bytes": 2, "offset": 0, "next_offset": nil,
 	}
 	if _, err := endpoint.readResource(fileScope, manualsNS, &sdk.ReadResourceParams{
@@ -267,7 +270,7 @@ func TestScopeResourcesFiltered(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), access.MessageKnowledgeAccess) {
 		t.Fatalf("ungranted artifact read error = %v", err)
 	}
-	runtime.artifactPayload["name"] = "a.md"
+	runtime.artifactDocument = "a.md"
 	artifact, err := endpoint.readResource(fileScope, manualsNS, &sdk.ReadResourceParams{
 		URI: artifactURI(manualsNS, artifactFixtureID),
 	})
@@ -384,6 +387,67 @@ func TestScopeModernStatelessSearch(t *testing.T) {
 	}
 }
 
+// TestScopeArtifactResourceOverHTTP pins the artifact resource read under a
+// file-level scope: an artifact of an ungranted document is a protocol denial,
+// and an artifact of a granted document is readable even when the artifact's
+// own name is an asset label ("document.md"), because the permission subject
+// is the parent document.
+func TestScopeArtifactResourceOverHTTP(t *testing.T) {
+	artifactID := "3c1b9d0e-1111-4c2a-9f3e-9d0e11114c2a"
+	runtime := newFakeRuntime()
+	runtime.artifactDocument = "b.md"
+	runtime.artifactPayload = map[string]any{
+		"artifact_id": artifactID,
+		"offset":      0,
+		"length":      3,
+		"data":        "YWJj",
+		"name":        "document.md",
+		"next_offset": 3,
+	}
+	scopes := map[string]access.ScopeSet{
+		"full":  testWholeScope(),
+		"files": testFileScope([]string{"a.md"}, nil),
+	}
+	_, server := newScopeTestServer(t, runtime, Options{}, scopes)
+	rpc := newRawRPC(t, server.URL, manualsNS)
+	initializeScoped(t, rpc, "files")
+
+	// The artifact belongs to "b.md", which the files scope may not read.
+	_, denied := rpc.doScoped("files", map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "resources/read",
+		"params": map[string]any{"uri": artifactURI(manualsNS, artifactID) + "?offset=0&length=3"},
+	}, nil)
+	errorObject, _ := denied["error"].(map[string]any)
+	if errorObject == nil {
+		t.Fatalf("ungranted artifact read must be a protocol error: %#v", denied)
+	}
+	if message, _ := errorObject["message"].(string); message != access.MessageKnowledgeAccess {
+		t.Fatalf("ungranted artifact read message = %q", message)
+	}
+
+	// A whole-knowledge-base scope reads the same artifact without a gate.
+	_, whole := rpc.doScoped("full", map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+		"params": map[string]any{"uri": artifactURI(manualsNS, artifactID) + "?offset=0&length=3"},
+	}, nil)
+	result, _ := whole["result"].(map[string]any)
+	if result == nil {
+		t.Fatalf("whole-scope artifact read failed: %#v", whole)
+	}
+
+	// Grant the parent document: the artifact is readable although its own
+	// name ("document.md") is not a granted document name.
+	scopes["files"] = testFileScope([]string{"b.md"}, nil)
+	_, granted := rpc.doScoped("files", map[string]any{
+		"jsonrpc": "2.0", "id": 3, "method": "resources/read",
+		"params": map[string]any{"uri": artifactURI(manualsNS, artifactID) + "?offset=0&length=3"},
+	}, nil)
+	grantedResult, _ := granted["result"].(map[string]any)
+	if grantedResult == nil {
+		t.Fatalf("granted artifact read failed: %#v", granted)
+	}
+}
+
 func TestScopeResourcesOverHTTP(t *testing.T) {
 	runtime := newFakeRuntime()
 	runtime.listDocuments = []DocumentRecord{{"name": "a.md"}, {"name": "b.md"}}
@@ -489,5 +553,42 @@ func TestScopeHeaderRoundTrip(t *testing.T) {
 	}
 	if tampered, present := decodeScopeHeader("!!!not-base64!!!"); !present || tampered.AllowsAnyRead() || tampered.HasAnyWrite() {
 		t.Fatalf("tampered header must deny everything: %#v present=%v", tampered, present)
+	}
+}
+
+// TestScopeHeaderRoundTripGroupMasks pins the group-contribution fields of the
+// internal wire form: whole update/delete and the per-file update/delete sets
+// all survive the round trip.
+func TestScopeHeaderRoundTripGroupMasks(t *testing.T) {
+	scope := access.NewScopeSet()
+	scope.WholeAllow = uint16(access.OpRead | access.OpUpdate)
+	scope.GroupAllow["spec.md"] = uint16(access.OpUpdate)
+	scope.GroupAllow["old.md"] = uint16(access.OpDelete)
+	decoded, present := decodeScopeHeader(encodeScopeHeader(scope))
+	if !present {
+		t.Fatalf("scope header must report a present scope")
+	}
+	if !decoded.ReadsWhole() {
+		t.Fatalf("decoded lost whole read: %#v", decoded)
+	}
+	if !decoded.CanUpdateDocument("anything.md") {
+		t.Fatalf("whole update did not survive: %#v", decoded)
+	}
+	// WholeUpdate alone only covers update, not delete.
+	if decoded.CanDeleteDocument("anything.md") {
+		t.Fatalf("whole update leaked into delete: %#v", decoded)
+	}
+	if !decoded.CanUpdateDocument("spec.md") {
+		t.Fatalf("file-level update lost: %#v", decoded)
+	}
+	if !decoded.CanDeleteDocument("old.md") {
+		t.Fatalf("file-level delete lost: %#v", decoded)
+	}
+	// WholeUpdate covers update everywhere; delete stays per-file.
+	if !decoded.CanUpdateDocument("other.md") {
+		t.Fatalf("whole update must cover every document: %#v", decoded)
+	}
+	if decoded.CanDeleteDocument("spec.md") {
+		t.Fatalf("decoded scope grants delete without a delete rule: %#v", decoded)
 	}
 }

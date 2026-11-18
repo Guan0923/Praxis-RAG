@@ -75,11 +75,28 @@ const (
 	ScopeFiles      = state.InvitationScopeFiles
 )
 
+// Document permission bits, shared with the group grant contract: read=0001,
+// create=0010, update=0100, delete=1000. The personal-rule bitmask model of
+// bitmask.go uses the same four bits, so personal allow/deny masks and group
+// allow masks merge in one place.
+const (
+	PermissionBitRead   = state.PermissionBitRead
+	PermissionBitCreate = state.PermissionBitCreate
+	PermissionBitUpdate = state.PermissionBitUpdate
+	PermissionBitDelete = state.PermissionBitDelete
+	PermissionMaskAll   = state.PermissionMaskAll
+)
+
+// IsValidAllowMask reports whether value is a non-empty subset of the four
+// permission bits (the group grant contract's validation).
+func IsValidAllowMask(value int) bool { return state.IsValidAllowMask(value) }
+
 // ScopeSet is the effective access of one account inside one knowledge base,
 // expressed with the operation bit masks of bitmask.go. It carries the raw
-// rule state (role defaults, whole-library masks and per-file masks); every
-// allows/denies question is answered by the shared merge in scope.go so
-// REST, MCP and retrieval enforce the same judgement.
+// rule state (role defaults, whole-library masks and per-file masks, plus the
+// group-merged allow bits); every allows/denies question is answered by the
+// shared merge in scope.go so REST, MCP and retrieval enforce the same
+// judgement.
 type ScopeSet struct {
 	// DefaultAllow/DefaultDeny are the role defaults: administrators and the
 	// knowledge-base owner start with every operation allowed, everyone else
@@ -88,17 +105,54 @@ type ScopeSet struct {
 	DefaultAllow PermissionMask
 	DefaultDeny  PermissionMask
 	// WholeAllow/WholeDeny are the whole-knowledge-base rule masks (the
-	// grant row with an empty document name).
+	// personal grant row with an empty document name).
 	WholeAllow PermissionMask
 	WholeDeny  PermissionMask
 	// FileAllow/FileDeny are the per-document rule masks.
 	FileAllow map[string]PermissionMask
 	FileDeny  map[string]PermissionMask
+	// GroupAllow holds the group-merged allow bits: the whole-library bits in
+	// the "" key and the per-document bits per name. Group grants only ever
+	// add permissions, so they never contribute deny bits.
+	GroupAllow map[string]PermissionMask
 }
 
 // NewScopeSet returns an empty (no access) scope.
 func NewScopeSet() ScopeSet {
-	return ScopeSet{FileAllow: map[string]PermissionMask{}, FileDeny: map[string]PermissionMask{}}
+	return ScopeSet{
+		FileAllow:  map[string]PermissionMask{},
+		FileDeny:  map[string]PermissionMask{},
+		GroupAllow: map[string]PermissionMask{},
+	}
+}
+
+// AllowsAnyRead/HasAnyWrite/ReadsWhole/WritesWhole/CanCreate/CanReadDocument/
+// CanUpdateDocument/CanDeleteDocument/CanWriteDocument/Restricted/
+// ReadDocumentNames/WriteDocumentNames live in scope.go, where the mask merge
+// is implemented once for personal rules, group grants and role defaults.
+
+// DocumentAllowMask returns the merged allow bits of one document before any
+// deny is subtracted: the role defaults, whole-library bits and this
+// document's file-level bits from every source (personal rules and group
+// grants). DescribePermissionSources uses it to explain where each allowed
+// operation came from.
+func (s ScopeSet) DocumentAllowMask(name string) int {
+	mask := int(s.DefaultAllow | s.WholeAllow | s.FileAllow[name])
+	if group := s.GroupAllow[""]; group != 0 && name == "" {
+		mask |= int(group)
+	}
+	if name != "" {
+		mask |= int(s.GroupAllow[name])
+	}
+	return mask & int(MaskAll)
+}
+
+// LibraryAllowMask returns the merged whole-library allow bits (role defaults,
+// the personal whole-library rule and the group whole-library grant). It backs
+// DescribePermissionSources for the library-level create bit.
+func (s ScopeSet) LibraryAllowMask() int {
+	mask := int(s.DefaultAllow | s.WholeAllow | s.GroupAllow[""])
+	return mask & int(MaskAll)
 }
 
 // EntitlementProvider reports whether an account's current personal membership
@@ -130,6 +184,11 @@ type Service struct {
 	entitlements   EntitlementProvider
 	now            func() time.Time
 	invitationTTL  time.Duration
+
+	groups     *state.UserGroupRepository
+	members    *state.UserGroupMemberRepository
+	groupInvites *state.GroupInvitationRepository
+	groupPerms   *state.KBGroupPermissionRepository
 }
 
 // NewService builds the access service on the shared state stores.
@@ -142,7 +201,7 @@ func NewService(stores *state.Stores, options Options) *Service {
 	if ttl <= 0 {
 		ttl = 7 * 24 * time.Hour
 	}
-	return &Service{
+	service := &Service{
 		users:          stores.Users,
 		knowledgeBases: stores.KnowledgeBases,
 		permissions:    stores.Permissions,
@@ -152,6 +211,13 @@ func NewService(stores *state.Stores, options Options) *Service {
 		now:            clock,
 		invitationTTL:  ttl,
 	}
+	if stores.UserGroups != nil {
+		service.groups = stores.UserGroups
+		service.members = stores.UserGroupMembers
+		service.groupInvites = stores.GroupInvitations
+		service.groupPerms = stores.GroupPermissions
+	}
+	return service
 }
 
 // CanShareAccount reports whether the account may issue new share invitations:
@@ -213,7 +279,10 @@ func (s *Service) CanManage(ctx context.Context, user state.User, namespace stri
 // ScopeSet computes the effective access of one account inside one knowledge
 // base. Administrators and the owner keep the historical default full-library
 // grant, but they no longer short-circuit: their explicit rules are read and
-// merged too, so a deny rule restricts them exactly like anyone else.
+// merged too, so a deny rule restricts them exactly like anyone else. Everyone
+// else gets the union of their personal grants and, through their current
+// effective memberships, the allow bits of every group grant (group grants
+// only ever add permissions; they never deny).
 func (s *Service) ScopeSet(ctx context.Context, user state.User, namespace string) (ScopeSet, error) {
 	if !user.Enabled {
 		return NewScopeSet(), nil
@@ -249,6 +318,13 @@ func (s *Service) ScopeSet(ctx context.Context, user state.User, namespace strin
 		scope.FileAllow[grant.DocumentName] |= grant.AllowMask
 		scope.FileDeny[grant.DocumentName] |= grant.DenyMask
 	}
+	// Group allow bits: every current effective membership contributes its
+	// whole-library and per-document masks, all merged by union.
+	groupScope, err := s.groupScope(ctx, user.ID, namespace)
+	if err != nil {
+		return NewScopeSet(), err
+	}
+	scope = scope.mergedWithGroup(groupScope)
 	return scope, nil
 }
 
@@ -281,6 +357,64 @@ func (s *Service) ResolveVisibleDocumentIDs(ctx context.Context, namespace strin
 		ids = append(ids, document.DocumentID)
 	}
 	return ids, nil
+}
+
+// mergedWithGroup folds the group contribution into one scope's GroupAllow
+// map. Group grants only ever add allow bits; a group never reduces a
+// member's existing permissions, so nothing lands on the deny side.
+func (s ScopeSet) mergedWithGroup(group DocumentMaskScope) ScopeSet {
+	if s.GroupAllow == nil {
+		s.GroupAllow = map[string]PermissionMask{}
+	}
+	if group.WholeMask != 0 {
+		s.GroupAllow[""] |= PermissionMask(group.WholeMask)
+	}
+	for name, mask := range group.Documents {
+		if name == "" {
+			s.GroupAllow[""] |= PermissionMask(mask)
+			continue
+		}
+		s.GroupAllow[name] |= PermissionMask(mask)
+	}
+	return s
+}
+
+// DocumentMaskScope is the group contribution to one namespace: the whole-
+// library allow bits and per-document allow bits of every applicable group
+// rule.
+type DocumentMaskScope struct {
+	WholeMask int
+	Documents map[string]int
+}
+
+// groupScope reads the group rules of one account inside one knowledge base.
+// Only active memberships participate: leaving, being removed, having a group
+// authorization revoked, or dissolving the group removes its contribution from
+// the next request on.
+func (s *Service) groupScope(ctx context.Context, userID, namespace string) (DocumentMaskScope, error) {
+	group := DocumentMaskScope{Documents: map[string]int{}}
+	if s.groups == nil || s.groupPerms == nil || s.members == nil {
+		return group, nil
+	}
+	groupIDs, err := s.members.ActiveGroupIDsForUser(ctx, userID)
+	if err != nil {
+		return group, err
+	}
+	if len(groupIDs) == 0 {
+		return group, nil
+	}
+	grants, err := s.groupPerms.ListForGroups(ctx, namespace, groupIDs)
+	if err != nil {
+		return group, err
+	}
+	for _, grant := range grants {
+		if grant.DocumentName == "" {
+			group.WholeMask |= grant.AllowMask
+			continue
+		}
+		group.Documents[grant.DocumentName] |= grant.AllowMask
+	}
+	return group, nil
 }
 
 // CanShareKnowledgeBase reports whether the account may create invitations and
@@ -347,6 +481,24 @@ func (s *Service) VisibleNamespaces(ctx context.Context, user state.User) ([]str
 	}
 	for _, grant := range grants {
 		visible[grant.Namespace] = struct{}{}
+	}
+	// A group grant makes every granted namespace visible to its current
+	// members: the account sees and can use the knowledge base even without a
+	// personal grant.
+	if s.members != nil && s.groupPerms != nil {
+		groupIDs, err := s.members.ActiveGroupIDsForUser(ctx, user.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(groupIDs) > 0 {
+			namespaces, err := s.groupPerms.NamespacesForGroups(ctx, groupIDs)
+			if err != nil {
+				return nil, err
+			}
+			for _, namespace := range namespaces {
+				visible[namespace] = struct{}{}
+			}
+		}
 	}
 	names := make([]string, 0, len(visible))
 	for _, namespace := range all {

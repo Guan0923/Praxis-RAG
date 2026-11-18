@@ -157,14 +157,6 @@ func TestDecodeCacheChange(t *testing.T) {
 		}
 	})
 
-	t.Run("nullable locator column may be null", func(t *testing.T) {
-		body := []byte(`{"after":{"id":"key-1","owner_user_id":null,"enabled":true},"source":{"table":"api_keys"},"op":"u"}`)
-		change, err := DecodeCacheChange(body)
-		if err != nil || change.Table != "api_keys" || change.After["enabled"] != true {
-			t.Fatalf("change = %+v, %v", change, err)
-		}
-	})
-
 	t.Run("native schema-1 envelope", func(t *testing.T) {
 		body := []byte(`{"schema":1,"table":"mcp_catalogs","op":"u","before":null,"after":{"namespace":"manuals"}}`)
 		change, err := DecodeCacheChange(body)

@@ -1,5 +1,23 @@
 # Historical UUID results/artifacts and logical deletion — 2026-10-23
 
+## 当前验证范围：用户组（组创建/邀请/成员/组授权/权限合并）— 2026-11-18
+
+### 已验证（可复核）
+
+- **Go 编译与静态检查**：`go build ./...`、`go vet ./internal/state ./internal/access ./internal/httpapi ./internal/mcp` 通过。
+- **Go 测试**（`go test -p 1 -count=1 -timeout 25m`，`RAG_TEST_MYSQL_URL` 指向一次性 MySQL 测试库）：
+  - `./internal/state/`（全量，含新增组仓库用例）：`user_groups`/`user_group_members`/`user_group_invitations`/`kb_group_permissions` 四表的 schema 结构断言（列/主键/唯一键/索引）；组-成员-授权的 MySQL 往返；解散级联清成员/撤销待接受邀请/清组授权；账号删除级联清组；知识库清库同步删组授权；`AcceptPending` 的并发语义（先撤销/先拒绝后接受均返回类型化冲突且不写成员）、幂等重试不把已退出/被移除成员加回、过期链接拒绝并落库 revoked、事务内组有效性与邀请人角色重查。
+  - `./internal/access/`（全量）：`TestGroupCreateRoleRules`（vip/admin 可建组，user/禁用账号被拒）；`TestGroupInvitationFlow`（仅目标账号可接受、邀请人降级后不能发新邀请）；`TestGroupInvitationAcceptRechecksInviterRole`（降级后旧邀请不再添加成员、已有成员和授权继续生效）；`TestGroupPermissionMerge`（个人 0100+组 0110 合并为全位，组 0110 单独保留）；`TestGroupMultipleGroupsUnion`（两组 0001/0100 并集为 0101）；`TestGroupFileLevelGrant`（文件级组授权只覆盖指定文件、create 位拒绝在文件级）；`TestGroupMembershipRemovalKillsAccess`（移除成员/撤销组授权/解散组后新请求失去对应位、个人来源保留）；`TestGroupInvitationIdempotentRetry`（旧链接重试幂等且不重加成员）；`TestGroupGrantOwnership`（他人的组/他人的库被拒）；`TestGroupVisibleNamespaces`（组授权决定命名空间可见性）；`TestGroupPermissionSources`（来源说明含组名与位）；以及原有个人共享/邀请全部用例不回归。
+  - `./internal/httpapi/`（全量，含一处陈旧断言修正：`TestSearchEndpoint` 的 `retrieval` 校验文案与 `internal/contracts` 的 SAG/graph 枚举对齐）：`TestGroupRoutesRequireSessionAndCsrf`（无会话 401、缺 CSRF 403、no-store）；`TestGroupTransportRoundTrip`（组列表/详情/创建/邀请 invite_path 形如 `/console#/group-invite?token=…`、移除成员/退出/解散/撤销邀请/组授权 PUT-DELETE/权限来源查询的 JSON 契约与参数透传）；`TestGroupRoutesRefusePlainUserByService`（普通账号建组 403）；OpenAPI 路径与 `SetGroupGrantBody.allow_mask` schema 断言。
+  - `./internal/mcp/`（全量）：`TestScopeHeaderRoundTripGroupMasks`（内部作用域头携带 whole update/delete 与文件级 update/delete 集合并完整往返；全库 update 不泄漏为 delete）；原有 scope 往返与工具用例不回归。
+- **前端**：`npm run typecheck` 通过；`npx vitest run` → `23 files / 326 tests passed`（新增 `GroupsPage.test.tsx` 5 例：组列表渲染/成员详情与解散入口/普通账号禁用创建/粘贴邀请链接解析 token/邀请过期态计算；`navigation.test.ts` 增加用户组页面可见性与 `#/group-invite` 路由往返断言）。
+- **契约面**：新增 `/v1/groups*`、`/v1/group-invitations*`、`/v1/knowledge-bases/{ns}/group-permissions*`、`/v1/knowledge-bases/{ns}/permission-sources` 共 17 条路由，全部走 `authSession`（登录会话 + CSRF 写校验 + `Cache-Control: no-store`）；OpenAPI 表与 `/docs` 同步；既有共享接口不变。
+- **数据面**：四张新表由现有 `ensureSchema` 建表迁移自动创建（`CREATE TABLE` + 索引，容忍并发启动）；`users.Delete` 与知识库 purge 级联清理组数据；无 `ALTER` 迁移。
+
+### 未验证（缺外部依赖）
+
+- 未在真实多副本部署上验证组权限合并的跨请求一致性（单元/集成测试以单进程 MySQL 事务覆盖）。
+
 > **Transport note (2026-11-09):** The dated records in this file were produced
 > while the repository still used RocketMQ. The current transport is Kafka
 > (`RAG_KAFKA_*`, explicit `RAG_*_DLQ_TOPIC`); the Kafka/MySQL/Debezium live check
@@ -2419,3 +2437,67 @@ docker compose --env-file .env.example config --quiet              # exit 0
 - K8s 清单与 `scripts/start-stack.ps1` 尚未接入 Docling（仅 Compose / `.env.example` /
   `deploy/config.container.toml`）。
 - HTML 预览的浏览器级同源安全验证（代码保持纯文本渲染、无 `dangerouslySetInnerHTML`）。
+
+## 删除进程内 DOCX 解析，Word/HTML 只走 Docling — 2026-11-18
+
+工作树 `dsh-d97760d6-1b2f`（Windows 11，Go 1.27.3，本地 MySQL 3307）。按用户要求
+彻底删除 Go 进程内 OOXML/DOCX 解析：`internal/document` 的 `word.go`（wordReader）、
+`formula.go`（OMML→LaTeX）、`xmltree.go`（OOXML DOM）、`docconvert.go` 的
+`docxDocument`、`wordmanifest.go` 的 `DocumentBlocks`/`joinDOCX` 与 `assets.go` 的
+`ValidateWordParserVersion` 全部移除；`docx.go` 只保留 `validateDOCX` 上传边界校验
+（成员数/加密/解压总量，保护发给 docling-service 的本地文件）。
+
+### 行为变化
+
+- `ingest.Prepare` 中 `.docx`/`.doc`（先经 LibreOffice 转 `.docx`）与 `.html`/`.htm`
+  一律走 `prepareDocling`；`prepareWord` 与 `WordParserVersion` 写入路径删除。
+  未配置 Docling parser 时这些格式报 `ErrDoclingNotConfigured`（新文案
+  「Word/HTML 文档需要配置 Docling 解析服务」）。
+- 受理层：`validateDoclingHTMLUpload` 更名 `validateDoclingDocumentUpload`，
+  `.docx`/`.doc` 与 HTML 一样在未配置 `RAG_DOCLING_SERVICE_URL` 时被拒绝
+  （固定文案「Word/HTML 文档需要配置 Docling 解析服务（RAG_DOCLING_SERVICE_URL）。」），
+  同步上传、异步受理（async/document_batch）与 worker 终态分类共用该闸门。
+- `indexConfiguration` 恒记录 `word_parser_version=docling-word-v1`（`docling`
+  参数删除）；历史 `word-assets-v1` 记录仍可读（`IsSupportedWordParserVersion`
+  保留两值），`ReadDocument`/重复检测的资产桶选择不变。
+- `document.Reader` 删除 `DOC` 字段；`ReadText`/`ReadDocument` 对 `.doc`/`.docx`
+  返回「Word 文档需要通过 Docling 解析服务导入：<name>」（不再本地解析）。
+- `WordOptions.Converter` 语义不变（LibreOffice 转换仍在 Go 侧，服务只收
+  `.docx`/HTML）；`formula.go` 的删除使 OMML 公式转换随解析一起移入 Docling。
+
+### 已验证（可复核）
+
+```powershell
+# 1) 全量构建与静态检查
+go build ./...                                                   # exit 0
+go vet ./...                                                     # exit 0
+
+# 2) 全量串行测试（MySQL 一次性 schema，含 e2e/httpapi/runtime/state）
+$env:RAG_TEST_MYSQL_URL = 'mysql://rag:praxis-dev-pw@127.0.0.1:3307/praxis_unit_test'
+go test -p 1 -count=1 -timeout 25m ./...
+# 全部 ok（runtime 34.4s / state 37.6s / e2e 3.4s / document 0.99s / ingest 0.39s）。
+
+# 3) 关键行为断言（包内单测）
+go test -count=1 ./internal/ingest/ -run 'TestWordPrepareWithoutDoclingIsRejected|TestPrepareUsesDoclingForDOCX|TestPrepareConvertsDOCBeforeDocling|TestWordChunkStrategiesPreserveTableHeaders|TestPrepareWordVisionIntegration' -v
+# 无 Docling parser 时 .docx 报 ErrDoclingNotConfigured；配置后表格/图片/公式
+# 保护、.doc 转换、VLM 描述均按 Docling 清单驱动；Word chunk 元数据带
+# docling-word-v1。
+go test -count=1 ./internal/runtime/ -run 'TestValidateDoclingDocumentUploadRequiresService|TestUploadRejectsDoclingOnlyFormatsWithoutService|TestIndexConfigurationRecordsDoclingParserVersions' -v
+# 未配置时 page.html/manual.docx/manual.DOC 同步上传均被受理层拒绝且不写
+# journal；索引元数据恒为 docling-word-v1；word-assets-v1 历史记录仍可读。
+go test -count=1 ./internal/document/ -run 'TestMissingFileErrors|TestBuildWordContentAssetRecords|TestWordPackageStagingRoundTrip' -v
+# ReadText(.docx) 返回 Docling 必需错误；BuildWordContent/staging 往返基于
+# Docling 清单 fixture。
+
+# 4) 真实 Docling 集成测试（需要本机 venv 服务，未在本次环境运行）
+$env:RAG_DOCLING_SERVICE_URL = 'http://127.0.0.1:8092'
+go test -count=1 -run TestDoclingIntegration -v ./internal/ingest/
+# 前一节（2026-11-17）已在本机真实 Docling 2.150.1 上全 PASS；本轮 ingest 分发
+# 只是把 .docx 的无条件 Docling 路径变成唯一路径，未改传输/解压/清单契约。
+```
+
+### 未实机验证
+
+- 真实 Docling 服务的本轮回归（本机 venv 未随本轮重跑；契约未变，上一节记录覆盖）。
+- Docker 镜像构建与容器端到端（与上一节相同的限制）。
+- K8s 清单与 `scripts/start-stack.ps1` 的 Docling 注入（同上一节遗留）。

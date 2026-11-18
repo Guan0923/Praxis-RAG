@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -61,9 +62,12 @@ type scopeEnvelope struct {
 	WholeDeny    uint16            `json:"whole_deny,omitempty"`
 	FileAllow    map[string]uint16 `json:"file_allow,omitempty"`
 	FileDeny     map[string]uint16 `json:"file_deny,omitempty"`
+	GroupAllow   map[string]uint16 `json:"group_allow,omitempty"`
 }
 
-// encodeScopeHeader renders one scope for the internal request header.
+// encodeScopeHeader renders one scope for the internal request header. The
+// Write/Update/Delete lists keep their distinct meanings (full write,
+// update-only, delete-only) so the decoder can rebuild the exact sets.
 func encodeScopeHeader(scope access.ScopeSet) string {
 	fileAllow := scope.FileAllow
 	if fileAllow == nil {
@@ -73,6 +77,10 @@ func encodeScopeHeader(scope access.ScopeSet) string {
 	if fileDeny == nil {
 		fileDeny = map[string]uint16{}
 	}
+	groupAllow := scope.GroupAllow
+	if groupAllow == nil {
+		groupAllow = map[string]uint16{}
+	}
 	envelope := scopeEnvelope{
 		DefaultAllow: scope.DefaultAllow,
 		DefaultDeny:  scope.DefaultDeny,
@@ -80,6 +88,7 @@ func encodeScopeHeader(scope access.ScopeSet) string {
 		WholeDeny:    scope.WholeDeny,
 		FileAllow:    fileAllow,
 		FileDeny:     fileDeny,
+		GroupAllow:   groupAllow,
 	}
 	encoded, err := json.Marshal(envelope)
 	if err != nil {
@@ -87,6 +96,19 @@ func encodeScopeHeader(scope access.ScopeSet) string {
 		return base64.RawURLEncoding.EncodeToString([]byte("{}"))
 	}
 	return base64.RawURLEncoding.EncodeToString(encoded)
+}
+
+// documentSetNames renders one document-name set, sorted.
+func documentSetNames(set map[string]struct{}) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(set))
+	for name := range set {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // decodeScopeHeader parses a header written by encodeScopeHeader. It reports
@@ -111,6 +133,7 @@ func decodeScopeHeader(value string) (access.ScopeSet, bool) {
 		WholeDeny:    envelope.WholeDeny,
 		FileAllow:    map[string]access.PermissionMask{},
 		FileDeny:     map[string]access.PermissionMask{},
+		GroupAllow:   map[string]access.PermissionMask{},
 	}
 	for name, mask := range envelope.FileAllow {
 		if name != "" {
@@ -120,6 +143,11 @@ func decodeScopeHeader(value string) (access.ScopeSet, bool) {
 	for name, mask := range envelope.FileDeny {
 		if name != "" {
 			scope.FileDeny[name] = mask
+		}
+	}
+	for name, mask := range envelope.GroupAllow {
+		if name != "" {
+			scope.GroupAllow[name] = mask
 		}
 	}
 	return scope, true

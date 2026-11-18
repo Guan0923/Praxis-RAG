@@ -14,7 +14,7 @@
 | `internal/mq/consumer.go` | `mq.Handler`（true=ACK、false=nack 重试）、DLQ 发布、offset 提交 |
 | `internal/state/cache_sync.go` | `Invalidate/RefreshKey/Revalidate/DirtyKeys/RefreshDirty/MarkAllDirty` 与 Redis watermark |
 | `internal/state/cache_events.go` | 写路径 `touch()`：`cache_revisions.revision+1`、`updated_at`，不再写 outbox |
-| `deploy/debezium/application-cache.properties` | 缓存连接器：8 张表、定位列、单 topic 路由 |
+| `deploy/debezium/application-cache.properties` | 缓存连接器：7 张表、定位列、单 topic 路由 |
 
 ## 1. 数据流
 
@@ -22,7 +22,7 @@
 业务写事务（MySQL）
   └─ touch(keys) 只更新 cache_revisions（revision+1、updated_at）
         └─ binlog
-             └─ Debezium 缓存连接器（8 张表、只采集定位列）
+             └─ Debezium 缓存连接器（7 张表、只采集定位列）
                   └─ Kafka RAG_CACHE_TOPIC（单 topic，按表路由）
                        └─ rag-cache-worker（mq.PullConsumer + cacheconsumer.Processor）
                             ├─ 解码：表 + op + before/after 定位列
@@ -41,7 +41,7 @@
 配置文件 `deploy/debezium/application-cache.properties`，与任务连接器完全独立
 （独立 `database.server.id`、独立 offset/schema-history 文件、独立健康端口）：
 
-- 8 张表全量行变更（c/u/d，含 DELETE）投递到 `RAG_CACHE_TOPIC`；
+- 7 张表全量行变更（c/u/d，含 DELETE）投递到 `RAG_CACHE_TOPIC`；
 - `skip.messages.without.change=false`：即使本次只改了非定位列（正文摘要、settings 等）
   也投递一条“这一行变了”，消费端据此递增 revision；
 - `include.schema.changes=false`：DDL/DDL 合成记录不进入 topic；
@@ -62,7 +62,6 @@
 | `knowledge_bases` | `namespace`, `version` | `namespace` 是缓存 scope |
 | `documents` | `namespace`, `name`, `document_id`, `del_flag` | `del_flag` 用于软删事件 |
 | `mcp_catalogs` | `namespace` | |
-| `api_keys` | `id`, `owner_user_id`(可空), `enabled` | 映射只用全局 key |
 | `document_heads` | `namespace`, `document_id`, `version` | |
 | `document_leases` | `namespace`, `resource`, `owner`, `operation_id`(可空) | |
 | `upload_operations` | `id`, `namespace`, `name`, `status` | |
@@ -92,7 +91,7 @@
 | --- | --- | --- |
 | 空 body / JSON `null`（tombstone） | ignorable | ACK，不做任何状态变更 |
 | `op=t`（TRUNCATE） | ignorable | ACK |
-| 表不在 8 张白名单内 | ignorable | ACK |
+| 表不在 7 张白名单内 | ignorable | ACK |
 | 无 `table`/`op` 的 DDL 合成记录 | ignorable | ACK |
 | 合法 JSON 但不是对象 / 信封 schema 非法 | `ErrPayloadInvalid` | nack（重试→DLQ） |
 | 已知表但 c/u/r 缺 after 镜像 | `ErrPayloadInvalid` | nack |
@@ -140,7 +139,6 @@ TTL（默认 60s）和下一次业务写入兜底。
 | `knowledge_bases` | `kb_list("")`、`kb_public(ns)`、`documents(ns)` |
 | `documents` | `kb_list("")`、`documents(ns)` |
 | `mcp_catalogs` | `catalog(ns)` |
-| `api_keys` | `api_keys("")` |
 | `document_heads` | `heads(ns)`、`documents(ns)`* |
 | `document_leases` | `leases(ns)` |
 | `upload_operations` | `upload_list(ns)`、`upload_status(id)` |
@@ -157,7 +155,6 @@ TTL（默认 60s）和下一次业务写入兜底。
 - 表名允许带库名前缀，比较前会去掉并转小写。
 - 同一事件内 key 去重；状态层还会按 `(kind, scope)` 排序后再加锁，避免交叉锁序。
 - `upload_steps` 不刷新 `upload_list`：列表摘要不包含步骤。
-- `api_keys` 只刷新全局 key：视图不 join 其他表，也不缓存摘要/密文。
 
 ### 4.1 与 `MarkAllDirty` 基线覆盖集合的一致性
 
@@ -167,7 +164,6 @@ TTL（默认 60s）和下一次业务写入兜底。
 | kind | scope 来源 |
 | --- | --- |
 | `kb_list` | 固定 `""` |
-| `api_keys` | 固定 `""` |
 | `kb_public`、`documents` | `SELECT DISTINCT namespace FROM knowledge_bases` |
 | `catalog` | `SELECT DISTINCT namespace FROM mcp_catalogs` |
 | `heads` | `SELECT DISTINCT namespace FROM document_heads` |
@@ -324,7 +320,7 @@ RAG_TEST_MYSQL_URL='mysql://rag:...@127.0.0.1:3307/praxis_unit_test?charset=utf8
   go test -count=1 ./internal/state/ -run 'Cache|ReadViews'
 ```
 
-`internal/cacheconsumer` 的测试覆盖：8 张表的 c/u/d 映射、带库名前缀、未知表/缺定位
+`internal/cacheconsumer` 的测试覆盖：7 张表的 c/u/d 映射、带库名前缀、未知表/缺定位
 列/缺 before 镜像的忽略、`Handle` 成功与状态层失败（nack）、decoder 的
 ignorable/malformed 契约、`RunRecovery` 立即执行并可按 `Stop()` 退出、以及 JSON
 行镜像解码。状态层的 Invalidate/RefreshKey/watermark/脏扫描/Redis 故障记录/

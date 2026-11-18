@@ -137,13 +137,14 @@ func (s *Stores) MonitorStats(ctx context.Context, now time.Time, recentWindow t
 	// Cache convergence is observable from the revision watermark rows: a key is
 	// dirty while its refreshed_revision is behind revision (or its last refresh
 	// failed), no outbox table is involved anymore.
+	filter, kinds := activeCacheKindFilter()
 	stats.CacheDirtyKeys, err = s.monitorCount(ctx,
-		"SELECT COUNT(*) FROM cache_revisions WHERE refreshed_revision < revision")
+		"SELECT COUNT(*) FROM cache_revisions WHERE refreshed_revision < revision AND "+filter, kinds...)
 	if err != nil {
 		return nil, fmt.Errorf("cache_revisions 脏 key 统计失败：%w", err)
 	}
 	stats.CacheRefreshFailures, err = s.monitorCount(ctx,
-		"SELECT COUNT(*) FROM cache_revisions WHERE last_error IS NOT NULL")
+		"SELECT COUNT(*) FROM cache_revisions WHERE last_error IS NOT NULL AND "+filter, kinds...)
 	if err != nil {
 		return nil, fmt.Errorf("cache_revisions 刷新失败统计失败：%w", err)
 	}

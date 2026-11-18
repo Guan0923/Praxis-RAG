@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Alert,
   App,
@@ -34,9 +34,12 @@ import {
   createInvitation,
   errorText,
   fetchAccess,
+  fetchGroupGrants,
+  fetchGroups,
   fetchGrants,
   fetchInvitableUsers,
   fetchNamespaceInvitations,
+  fetchPermissionSources,
   formatDateTime,
   invitationLink,
   invitationStatus,
@@ -46,19 +49,26 @@ import {
   normalizeMask,
   permissionBits,
   permissionLabels,
+  permissionSourceKindLabels,
   PERM_CREATE,
   PERM_READ,
   revokeGrant,
+  revokeGroupGrant,
   revokeInvitation,
   roleLabel,
+  setGroupGrant,
   setKnowledgeBasePermission,
   type AccessView,
   type Connection,
   type CreateInvitationResult,
   type DocumentInfo,
   type GrantView,
+  type GroupGrantView,
+  type GroupView,
   type InvitationView,
   type InviteUser,
+  type PermissionLevel,
+  type PermissionSourceView,
   type Role,
   type ShareScope,
 } from "./api";
@@ -78,6 +88,24 @@ const triStateLabels: Record<TriStateValue, string> = {
   unset: "未设置",
   allow: "允许",
   deny: "拒绝",
+};
+
+type GrantFormValues = {
+  group_id: string;
+  scope: "all" | "files";
+  document_names?: string[];
+  bits: number[];
+};
+
+type AggregatedGrant = {
+  user_id: string;
+  username: string;
+  wholeRead: boolean;
+  wholeWrite: boolean;
+  readDocuments: string[];
+  writeDocuments: string[];
+  granted_by_username: string;
+  updated_at: string;
 };
 
 // grantRuleKey 稳定标识一条规则（账号 × 文件名，""＝全库）。
@@ -180,6 +208,88 @@ export function triStatesFromMasks(allow?: number, deny?: number) {
   return states;
 }
 
+// aggregateGrants folds the per-row grants (one row per file) into one row
+// per user for the legacy summary listing.
+function aggregateGrants(grants: GrantView[]): AggregatedGrant[] {
+  const byUser = new Map<string, AggregatedGrant & { grantedBy: Set<string> }>();
+  for (const grant of grants) {
+    let item = byUser.get(grant.user_id);
+    if (!item) {
+      item = {
+        user_id: grant.user_id,
+        username: grant.username,
+        wholeRead: false,
+        wholeWrite: false,
+        readDocuments: [],
+        writeDocuments: [],
+        granted_by_username: "",
+        updated_at: "",
+        grantedBy: new Set<string>(),
+      };
+      byUser.set(grant.user_id, item);
+    }
+    const write = grant.permission === "write";
+    if (!grant.document_name) {
+      item.wholeRead = true;
+      if (write) item.wholeWrite = true;
+    } else if (write) {
+      if (!item.writeDocuments.includes(grant.document_name)) item.writeDocuments.push(grant.document_name);
+    } else if (!item.readDocuments.includes(grant.document_name)) {
+      item.readDocuments.push(grant.document_name);
+    }
+    if (grant.granted_by_username) item.grantedBy.add(grant.granted_by_username);
+    if (grant.updated_at > item.updated_at) item.updated_at = grant.updated_at;
+  }
+  return Array.from(byUser.values(), ({ grantedBy, ...item }) => ({
+    ...item,
+    granted_by_username: Array.from(grantedBy).join("、"),
+  }));
+}
+
+type AggregatedGroupGrant = {
+  group_id: string;
+  group_name: string;
+  wholeBits: number;
+  fileBits: { name: string; mask: number }[];
+  granted_by_username: string;
+  updated_at: string;
+};
+
+// aggregateGroupGrants folds the per-row group grants (one row per file) into
+// one row per group, keeping whole-library and per-file masks apart.
+function aggregateGroupGrants(grants: GroupGrantView[]): AggregatedGroupGrant[] {
+  const byGroup = new Map<string, AggregatedGroupGrant>();
+  for (const grant of grants) {
+    let item = byGroup.get(grant.group_id);
+    if (!item) {
+      item = {
+        group_id: grant.group_id,
+        group_name: grant.group_name,
+        wholeBits: 0,
+        fileBits: [],
+        granted_by_username: grant.granted_by_username,
+        updated_at: grant.updated_at,
+      };
+      byGroup.set(grant.group_id, item);
+    }
+    if (!grant.document_name) {
+      item.wholeBits |= grant.allow_mask;
+    } else if (!item.fileBits.some((entry) => entry.name === grant.document_name)) {
+      item.fileBits.push({ name: grant.document_name, mask: grant.allow_mask });
+    }
+    if (grant.updated_at > item.updated_at) item.updated_at = grant.updated_at;
+  }
+  return Array.from(byGroup.values());
+}
+
+// renderPermissionBits renders the readable names of one allow-mask value.
+function renderPermissionBits(mask: number) {
+  return permissionBits
+    .filter((bit) => mask & bit.value)
+    .map((bit) => bit.label)
+    .join("、") || "—";
+}
+
 export function PermissionsPage({
   connection,
   currentUserId,
@@ -232,6 +342,23 @@ export function PermissionsPage({
   const [created, setCreated] = useState<(CreateInvitationResult & { link: string })>();
   const [copied, setCopied] = useState(false);
   const [revokingInvitationId, setRevokingInvitationId] = useState("");
+
+  // 用户组授权：组列表 + 该知识库的组授权 + 授权弹窗。
+  const [ownGroups, setOwnGroups] = useState<GroupView[]>([]);
+  const [groupsLoading, setGroupsLoading] = useState(false);
+  const [groupGrants, setGroupGrants] = useState<GroupGrantView[]>([]);
+  const [groupGrantsLoading, setGroupGrantsLoading] = useState(false);
+  const [groupGrantsError, setGroupGrantsError] = useState("");
+  const [grantOpen, setGrantOpen] = useState(false);
+  const [grantForm] = Form.useForm<GrantFormValues>();
+  const [grantScopeValue, setGrantScopeValue] = useState<"all" | "files">("all");
+  const [granting, setGranting] = useState(false);
+  const [grantError, setGrantError] = useState("");
+  const [revokingGroupGrantId, setRevokingGroupGrantId] = useState("");
+
+  // 我的权限来源说明（当前账号在选中知识库上的合并来源）。
+  const [sources, setSources] = useState<PermissionSourceView[]>([]);
+  const [sourcesLoading, setSourcesLoading] = useState(false);
 
   const loadNamespaces = useCallback(async () => {
     setLoadingNamespaces(true);
@@ -305,13 +432,39 @@ export function PermissionsPage({
       .then((rows) => { if (!cancelled) setInvitations(rows); })
       .catch((cause) => { if (!cancelled) setInvitationsError(errorText(cause)); })
       .finally(() => { if (!cancelled) setInvitationsLoading(false); });
+    // 组授权与权限来源一并刷新。
+    setGroupGrantsLoading(true);
+    setGroupGrantsError("");
+    void fetchGroupGrants(selected, connection)
+      .then((rows) => { if (!cancelled) setGroupGrants(rows); })
+      .catch((cause) => { if (!cancelled) setGroupGrantsError(errorText(cause)); })
+      .finally(() => { if (!cancelled) setGroupGrantsLoading(false); });
+    setSourcesLoading(true);
+    void fetchPermissionSources(selected, connection)
+      .then((rows) => { if (!cancelled) setSources(rows); })
+      .catch(() => { if (!cancelled) setSources([]); })
+      .finally(() => { if (!cancelled) setSourcesLoading(false); });
     return () => { cancelled = true; };
   }, [selected, revision, listRevision, connection]);
 
+  const aggregated = useMemo(() => aggregateGrants(grants), [grants]);
+  const aggregatedGroupGrants = useMemo(() => aggregateGroupGrants(groupGrants), [groupGrants]);
   const selectedAccess = selected ? accessByNamespace[selected] : undefined;
   const canShare = selectedAccess ? selectedAccess.can_share : true;
   const pendingInvitations = invitations.filter((item) => invitationStatus(item) === "pending").length;
   const dirtyCount = dirtyKeys.size;
+
+  // 自己创建的用户组加载一次；组授权对象选择器使用它。
+  useEffect(() => {
+    if (!canShare) return;
+    let cancelled = false;
+    setGroupsLoading(true);
+    void fetchGroups()
+      .then((data) => { if (!cancelled) setOwnGroups(data.owned.filter((group) => group.status === "active")); })
+      .catch(() => { if (!cancelled) setOwnGroups([]); })
+      .finally(() => { if (!cancelled) setGroupsLoading(false); });
+    return () => { cancelled = true; };
+  }, [canShare]);
 
   async function loadUsers() {
     setUsersLoading(true);
@@ -488,6 +641,61 @@ export function PermissionsPage({
       void message.error(errorText(cause));
     } finally {
       setRevokingInvitationId("");
+    }
+  }
+
+  function openGrantDialog() {
+    if (!selected || !canShare) return;
+    setGrantError("");
+    grantForm.resetFields();
+    grantForm.setFieldsValue({ group_id: undefined, scope: "all", document_names: [], bits: [1] });
+    setGrantScopeValue("all");
+    setGrantOpen(true);
+    if (documentsFor !== selected) void loadDocuments(selected);
+  }
+
+  async function submitGrant(values: GrantFormValues) {
+    if (!selected || granting) return;
+    const bits = (values.bits || []).reduce((sum, bit) => sum | bit, 0);
+    const documentNames = values.scope === "files"
+      ? (values.document_names || []).filter(Boolean)
+      : [];
+    if (values.scope === "files" && !documentNames.length) {
+      setGrantError("请至少选择一个文件");
+      return;
+    }
+    if (values.scope === "files" && bits & 2) {
+      setGrantError("新增权限只能设置在整库授权上");
+      return;
+    }
+    setGranting(true);
+    setGrantError("");
+    try {
+      await setGroupGrant(selected, values.group_id, {
+        document_names: documentNames,
+        allow_mask: bits,
+      }, connection);
+      void message.success("组授权已保存");
+      setGrantOpen(false);
+      setListRevision((value) => value + 1);
+    } catch (cause) {
+      setGrantError(errorText(cause));
+    } finally {
+      setGranting(false);
+    }
+  }
+
+  async function revokeGroupGrantFor(groupID: string, groupName: string) {
+    if (!selected) return;
+    setRevokingGroupGrantId(groupID);
+    try {
+      await revokeGroupGrant(selected, groupID, connection);
+      void message.success(`已撤销 ${groupName} 的组授权`);
+      setListRevision((value) => value + 1);
+    } catch (cause) {
+      void message.error(errorText(cause));
+    } finally {
+      setRevokingGroupGrantId("");
     }
   }
 
@@ -703,6 +911,102 @@ export function PermissionsPage({
     },
   ];
 
+  const groupGrantColumns: TableColumnsType<AggregatedGroupGrant> = [
+    {
+      title: "用户组",
+      dataIndex: "group_name",
+      width: 160,
+      render: (value: string) => <span className="break-text">{value}</span>,
+    },
+    {
+      title: "全库权限",
+      key: "whole",
+      width: 150,
+      render: (_, item) => renderPermissionBits(item.wholeBits),
+    },
+    {
+      title: "文件权限",
+      key: "files",
+      render: (_, item) => item.fileBits.length ? (
+        <div className="scope-files">
+          <Tag>指定文件 {item.fileBits.length} 个</Tag>
+          <span className="secondary break-text">
+            {item.fileBits.map((entry) => `${entry.name}（${renderPermissionBits(entry.mask)}）`).join("、")}
+          </span>
+        </div>
+      ) : "—",
+    },
+    {
+      title: "授权人",
+      dataIndex: "granted_by_username",
+      width: 130,
+      render: (value: string) => <span className="break-text">{value || "—"}</span>,
+    },
+    {
+      title: "更新时间",
+      dataIndex: "updated_at",
+      width: 180,
+      render: (value: string) => <span className="secondary">{formatDateTime(value)}</span>,
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: 90,
+      render: (_, item) => (
+        <Popconfirm
+          title="撤销组授权"
+          description={`将撤销 ${item.group_name} 在该知识库的全部组授权，组成员将立即失去对应权限。`}
+          okText="撤销"
+          cancelText="取消"
+          okButtonProps={{ danger: true }}
+          onConfirm={() => void revokeGroupGrantFor(item.group_id, item.group_name)}
+        >
+          <Tooltip title="撤销组授权">
+            <Button
+              danger
+              type="text"
+              size="small"
+              aria-label={`撤销 ${item.group_name} 的组授权`}
+              icon={<DeleteOutlined />}
+              loading={revokingGroupGrantId === item.group_id}
+            />
+          </Tooltip>
+        </Popconfirm>
+      ),
+    },
+  ];
+
+  const sourceColumns: TableColumnsType<PermissionSourceView> = [
+    {
+      title: "权限",
+      dataIndex: "bit_name",
+      width: 90,
+      render: (_, source) => (
+        <Tag>{permissionBits.find((bit) => bit.value === source.bit)?.label || source.bit_name}</Tag>
+      ),
+    },
+    {
+      title: "来源",
+      dataIndex: "kind",
+      width: 110,
+      render: (value: PermissionSourceView["kind"]) => (
+        <Tag color={value === "group" ? "geekblue" : value === "personal" ? "blue" : "gold"}>
+          {permissionSourceKindLabels[value]}
+        </Tag>
+      ),
+    },
+    {
+      title: "说明",
+      dataIndex: "origin",
+      render: (value: string, source) => (
+        <span className="break-text">
+          {value}
+          {source.document_name ? ` · ${source.document_name}` : ""}
+        </span>
+      ),
+    },
+  ];
+
   const selectedAccessLabel = selectedAccess
     ? selectedAccess.owner
       ? "创建者"
@@ -732,6 +1036,15 @@ export function PermissionsPage({
               onClick={openInviteDialog}
             >
               创建邀请
+            </Button>
+          </Tooltip>
+          <Tooltip title={canShare ? "用户组授权" : "没有该知识库的组授权权限"}>
+            <Button
+              icon={<TeamOutlined />}
+              disabled={!selected || !canShare || !ownGroups.length}
+              onClick={openGrantDialog}
+            >
+              用户组授权
             </Button>
           </Tooltip>
         </div>
@@ -831,6 +1144,46 @@ export function PermissionsPage({
             }}
             columns={invitationColumns}
           />
+          <div className="section-heading section-heading-spaced">
+            <h2><TeamOutlined /> 用户组授权</h2>
+            <span className="secondary">{aggregatedGroupGrants.length} 个组</span>
+          </div>
+          {groupGrantsError && (
+            <Alert className="page-alert" type="error" showIcon title="组授权加载失败" description={groupGrantsError} />
+          )}
+          <Table<AggregatedGroupGrant>
+            className="permissions-table"
+            rowKey="group_id"
+            dataSource={aggregatedGroupGrants}
+            loading={groupGrantsLoading}
+            size="middle"
+            scroll={{ x: 860 }}
+            pagination={{ pageSize: 10, hideOnSinglePage: true }}
+            locale={{
+              emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有用户组授权；可用自己的用户组对该知识库设置全库或单文件权限。" />,
+            }}
+            columns={groupGrantColumns}
+          />
+          <div className="section-heading section-heading-spaced">
+            <h2>我的权限来源</h2>
+            <span className="secondary">{sources.length} 条</span>
+          </div>
+          {sourcesLoading ? (
+            <Spin size="small" />
+          ) : (
+            <Table<PermissionSourceView>
+              className="permissions-table"
+              rowKey={(source) => `${source.kind}:${source.origin}:${source.bit}`}
+              dataSource={sources}
+              size="middle"
+              scroll={{ x: 760 }}
+              pagination={{ pageSize: 10, hideOnSinglePage: true }}
+              locale={{
+                emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前账号在该知识库暂无权限来源。" />,
+              }}
+              columns={sourceColumns}
+            />
+          )}
         </>
       )}
       <Modal
@@ -962,6 +1315,89 @@ export function PermissionsPage({
             </Form>
           </div>
         )}
+      </Modal>
+      <Modal
+        title={`用户组授权${selected ? " · " + selected : ""}`}
+        open={grantOpen}
+        width={560}
+        forceRender
+        onCancel={() => { if (!granting) setGrantOpen(false); }}
+        closable={!granting}
+        footer={[
+          <Button key="cancel" disabled={granting} onClick={() => setGrantOpen(false)}>取消</Button>,
+          <Button key="submit" type="primary" icon={<TeamOutlined />} loading={granting}
+            onClick={() => void grantForm.validateFields().then((values) => submitGrant(values)).catch(() => {})}>
+            保存授权
+          </Button>,
+        ]}
+      >
+        <div className="invite-dialog">
+          {grantError && <Alert className="page-alert" type="error" showIcon title="组授权失败" description={grantError} />}
+          {canShare && !ownGroups.length && !groupsLoading ? (
+            <Alert
+              className="page-alert"
+              type="info"
+              showIcon
+              title="还没有可用的用户组"
+              description="只有自己创建且未解散的用户组可以作为授权对象；请先在「用户组」页面创建。"
+            />
+          ) : null}
+          <Form form={grantForm} layout="vertical" requiredMark={false}
+            disabled={granting}
+            onFinish={(values) => void submitGrant(values)}>
+            <Form.Item name="group_id" label="用户组" rules={[{ required: true, message: "请选择要授权的用户组" }]}>
+              <Select
+                showSearch
+                optionFilterProp="label"
+                loading={groupsLoading}
+                placeholder={groupsLoading ? "正在加载用户组…" : "选择自己创建的用户组"}
+                options={ownGroups.map((group) => ({
+                  value: group.id, label: `${group.name}（${group.member_count ?? 0} 名成员）`,
+                }))}
+                notFoundContent={groupsLoading ? <Spin size="small" /> : "没有可授权的用户组"}
+              />
+            </Form.Item>
+            <Form.Item name="scope" label="范围" rules={[{ required: true, message: "请选择授权范围" }]}>
+              <Radio.Group
+                optionType="button"
+                buttonStyle="solid"
+                onChange={(event) => setGrantScopeValue(event.target.value)}
+                options={[
+                  { value: "all", label: "全库" },
+                  { value: "files", label: "指定文件" },
+                ]}
+              />
+            </Form.Item>
+            {grantScopeValue === "files" && (
+              <Form.Item name="document_names" label="文件" rules={[{ required: true, message: "请至少选择一个文件" }]}>
+                <Select
+                  mode="multiple"
+                  showSearch
+                  optionFilterProp="label"
+                  loading={documentsLoading}
+                  placeholder={documentsLoading ? "正在加载文件…" : "选择要授权的文件"}
+                  options={documents.map((document) => ({ value: document.name, label: document.name }))}
+                  notFoundContent={documentsLoading ? <Spin size="small" /> : "该知识库暂无文件"}
+                />
+              </Form.Item>
+            )}
+            <Form.Item name="bits" label="权限" rules={[{ required: true, message: "请选择至少一项权限" }]}>
+              <Select
+                mode="multiple"
+                aria-label="选择权限位"
+                placeholder="选择要授予的权限"
+                options={permissionBits.map((bit) => ({
+                  value: bit.value,
+                  label: bit.label,
+                  disabled: grantScopeValue === "files" && bit.value === 2,
+                }))}
+              />
+            </Form.Item>
+            <div className="secondary">
+              组权限与成员个人授权取并集；「新增」只能设置在全库范围。重复保存同一对象会覆盖上次的权限位。
+            </div>
+          </Form>
+        </div>
       </Modal>
     </section>
   );

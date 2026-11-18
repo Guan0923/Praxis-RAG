@@ -22,7 +22,6 @@ var cacheKinds = map[string]struct{}{
 	"kb_list":       {},
 	"documents":     {},
 	"catalog":       {},
-	"api_keys":      {},
 	"heads":         {},
 	"leases":        {},
 	"upload_status": {},
@@ -46,7 +45,6 @@ func documentKeys(namespace string) []CacheKey {
 	}
 }
 
-func apiKeyKeys() []CacheKey { return []CacheKey{{Kind: "api_keys", Scope: ""}} }
 func catalogKeys(namespace string) []CacheKey {
 	return []CacheKey{{Kind: "catalog", Scope: namespace}}
 }

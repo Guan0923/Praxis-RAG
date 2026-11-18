@@ -171,10 +171,11 @@ func documentJobIngestError(err error) error {
 	if errors.As(err, &operationError) {
 		inner = operationError.Err
 	}
-	// HTML is only importable through the Docling service. If the URL was
-	// removed after the job was admitted, retrying the same request cannot fix
-	// it: fail the job as a terminal configuration/validation error instead of
-	// burning the retry budget.
+	// Word and HTML are only importable through the Docling service (the
+	// in-process OOXML parser was removed). If the URL was removed after the
+	// job was admitted, retrying the same request cannot fix it: fail the job
+	// as a terminal configuration/validation error instead of burning the
+	// retry budget.
 	if errors.Is(inner, ingest.ErrDoclingNotConfigured) {
 		return &apierrors.KnowledgeValidationError{Message: doclingServiceRequiredMessage}
 	}
