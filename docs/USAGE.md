@@ -1019,6 +1019,8 @@ curl.exe -X POST http://127.0.0.1:8011/v1/search `
 # artifact（源文件/图片/表格 JSON）
 curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>" -H $headers
 curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>/content" -H $headers
+# 文件级（受限）授权只能读取自己可读文档的附件：权限按附件所属文档在同一事务内校验，
+# 无权限返回 403，父文档已删除同样拒绝（fail closed）；详见 docs/PERMISSIONS.md。
 ```
 
 搜索**同步执行**：一次请求完成检索 + 重排并直接返回 `retrieval`、`rerank`、`evidence_status`、`results`、`debug`、`snapshot_context`、`artifacts`；资产命中带 `asset`（图片 base64 或表格结构）。响应**不含** `result_id`/`created_at`/`expires_at`/`snapshot_available`/`snapshot_error`，`GET /v1/search-results/{result_id}` 已删除。分页/偏移参数越界返回 400；超过 `RAG_SEARCH_TIMEOUT_SECONDS` 返回搜索错误，重试等于重新检索。

@@ -8,8 +8,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/Guan0923/Praxis-RAG/internal/access"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 	"github.com/Guan0923/Praxis-RAG/internal/catalog"
 	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/runtime"
 )
 
 // newTestEndpoint builds an Endpoint with in-memory catalog storage and a
@@ -53,6 +56,9 @@ type fakeRuntime struct {
 	artifactPayload map[string]any
 	artifactErr     error
 	artifactCalls   []fakeArtifactCall
+	// artifactDocument is the parent document name the fake resolves for a
+	// requested artifact; the document read gate decides on it.
+	artifactDocument string
 
 	addPayload map[string]any
 	addErr     error
@@ -119,13 +125,18 @@ func (f *fakeRuntime) Search(_ context.Context, namespace string, request contra
 	return f.searchPayload, nil
 }
 
-func (f *fakeRuntime) GetArtifact(_ context.Context, namespace, artifactID string, offset, length int) (map[string]any, error) {
+func (f *fakeRuntime) GetArtifact(ctx context.Context, namespace, artifactID string, offset, length int) (map[string]any, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.namespaces = append(f.namespaces, namespace)
 	f.artifactCalls = append(f.artifactCalls, fakeArtifactCall{
 		Namespace: namespace, ArtifactID: artifactID, Offset: offset, Length: length,
 	})
+	// The fake mirrors the real runtime: a document read gate denies an
+	// artifact whose parent document the caller may not read.
+	if gate := runtime.DocumentReadGate(ctx); gate != nil && !gate(f.artifactDocument) {
+		return nil, &apierrors.ArtifactForbiddenError{Message: access.MessageKnowledgeAccess}
+	}
 	return f.artifactPayload, f.artifactErr
 }
 

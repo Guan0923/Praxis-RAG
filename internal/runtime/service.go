@@ -508,18 +508,42 @@ func (s *Service) CheckDocuments(ctx context.Context, namespace string, files []
 	return map[string]any{"files": result}, nil
 }
 
-// GetArtifact reads one bounded byte chunk of an expiring artifact.
+// documentReadGateContextKey carries the per-request document-name read gate
+// used by the artifact read paths.
+type documentReadGateContextKey struct{}
+
+// WithDocumentReadGate attaches one request's document-level read gate for
+// artifact reads. The transport layers resolve it from the caller's access
+// scope, so REST and MCP enforce the same document visibility. A nil gate keeps
+// the historical unrestricted behaviour (management credentials,
+// whole-knowledge-base readers, or callers that resolved no scope).
+func WithDocumentReadGate(ctx context.Context, mayReadDocument func(string) bool) context.Context {
+	return context.WithValue(ctx, documentReadGateContextKey{}, mayReadDocument)
+}
+
+// DocumentReadGate returns the gate attached by WithDocumentReadGate (nil when
+// absent). Adapters and tests use it to mirror the runtime's enforcement.
+func DocumentReadGate(ctx context.Context) func(string) bool {
+	gate, _ := ctx.Value(documentReadGateContextKey{}).(func(string) bool)
+	return gate
+}
+
+// GetArtifact reads one bounded byte chunk of an expiring artifact. When the
+// request carries a document read gate (a restricted file-level scope), the
+// registry resolves the artifact's parent document and enforces the gate inside
+// the same transaction as the content read.
 func (s *Service) GetArtifact(ctx context.Context, namespace, artifactID string, offset, length int) (map[string]any, error) {
-	chunk, err := s.stores.Artifacts.Chunk(ctx, namespace, artifactID, offset, length)
+	chunk, err := s.stores.Artifacts.ChunkAuthorized(ctx, namespace, artifactID, offset, length, DocumentReadGate(ctx))
 	if err != nil {
 		return nil, artifactError(err)
 	}
 	return marshalToMap(chunk)
 }
 
-// DownloadArtifact returns the artifact bytes plus its MIME type and name.
+// DownloadArtifact returns the artifact bytes plus its MIME type and name,
+// enforcing the request's document read gate in the same transaction.
 func (s *Service) DownloadArtifact(ctx context.Context, namespace, artifactID string) ([]byte, string, string, error) {
-	artifact, content, err := s.stores.Artifacts.Read(ctx, namespace, artifactID)
+	artifact, content, err := s.stores.Artifacts.ReadAuthorized(ctx, namespace, artifactID, DocumentReadGate(ctx))
 	if err != nil {
 		return nil, "", "", artifactError(err)
 	}
@@ -527,6 +551,10 @@ func (s *Service) DownloadArtifact(ctx context.Context, namespace, artifactID st
 }
 
 func artifactError(err error) error {
+	var forbidden *state.ArtifactForbidden
+	if errors.As(err, &forbidden) {
+		return &apierrors.ArtifactForbiddenError{Message: forbidden.Message}
+	}
 	var unavailable *state.ArtifactUnavailable
 	if errors.As(err, &unavailable) {
 		return &apierrors.SnapshotUnavailable{Message: unavailable.Message}
