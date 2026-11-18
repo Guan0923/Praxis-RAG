@@ -104,28 +104,26 @@ func run() error {
 		return err
 	}
 	// The document lock is independent of the display cache: it has its own
-	// switch and TTL, and disabling the cache must not disable it. When enabled,
-	// every process that writes, recovers or cleans document state must use the
-	// same configuration (rag-service, rag-document-worker, rag-mcp-ingest).
+	// TTL, and disabling the cache must not disable it. Redis is the required
+	// lease backend, so every process that writes, recovers or cleans document
+	// state must resolve the same RAG_REDIS_LOCK_* configuration
+	// (rag-service, rag-document-worker, rag-mcp-ingest).
 	lockSettings, err := state.DocumentLockSettingsFromEnv()
 	if err != nil {
 		return err
 	}
-	var documentLock *redisstate.DocumentLock
-	if lockSettings.RedisMode() {
-		documentLock, err = redisstate.NewDocumentLock(lockSettings)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = documentLock.Close() }()
-		if err := stores.AttachDocumentLocker(documentLock); err != nil {
-			return err
-		}
+	documentLock, err := redisstate.NewDocumentLock(lockSettings)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = documentLock.Close() }()
+	if err := stores.AttachDocumentLocker(documentLock); err != nil {
+		return err
 	}
 	logger.Info("Document lease backend configured",
-		"mode", lockSettings.Mode, "ttl_seconds", lockSettings.TTLSeconds)
+		"mode", "redis", "ttl_seconds", lockSettings.TTLSeconds)
 	var redisProbe monitor.RedisProbe = cache
-	if !cache.Enabled() && documentLock != nil {
+	if !cache.Enabled() {
 		// The Console dependency row reports the lease backend when the display
 		// cache is disabled.
 		redisProbe = leaseLivenessProbe{lock: documentLock}

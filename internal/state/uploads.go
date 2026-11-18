@@ -235,10 +235,15 @@ func NewUploadJournal(stores *Stores, options ...JournalOption) (*UploadJournal,
 	if resolved.autoHeartbeat != nil {
 		autoHeartbeat = *resolved.autoHeartbeat
 	}
+	// Redis is the only lease backend. When the environment carries a lock
+	// address the settings are validated eagerly so a broken TTL/prefix fails
+	// construction; without an address (and without an injected backend) the
+	// journal starts unconfigured and every write path that needs the lease
+	// reports *LockUnavailable instead of falling back to MySQL leases.
 	lockSettings := DefaultDocumentLockSettings()
 	if resolved.documentLock != nil {
 		lockSettings = *resolved.documentLock
-	} else {
+	} else if documentLockURLFromEnv() != "" {
 		parsed, err := DocumentLockSettingsFromEnv()
 		if err != nil {
 			return nil, err
@@ -255,12 +260,9 @@ func NewUploadJournal(stores *Stores, options ...JournalOption) (*UploadJournal,
 	if locker != nil {
 		// An injected backend is authoritative; the URL requirement only applies
 		// when the journal has to rely on the environment.
-		lockSettings.Mode = DocumentLockModeRedis
 		if lockSettings.TTLSeconds <= 0 {
 			lockSettings.TTLSeconds = leaseSeconds
 		}
-	} else if err := lockSettings.Validate(); err != nil {
-		return nil, err
 	}
 	node, _ := os.Hostname()
 	return &UploadJournal{
@@ -503,130 +505,11 @@ type BeginOptions struct {
 }
 
 // Begin persists INTENT and the resource leases atomically; a committed
-// idempotency key replays the stored result. In redis mode the long-lived lease
-// is taken in Redis first and the holder is then registered in MySQL under the
-// observed fencing generation.
+// idempotency key replays the stored result. The long-lived lease is taken in
+// Redis first and the holder is then registered in MySQL under the observed
+// fencing generation.
 func (j *UploadJournal) Begin(ctx context.Context, namespace, name, documentID, collection string, options BeginOptions) (*UploadOperation, error) {
-	if j.redisLeaseMode() {
-		return j.beginRedis(ctx, namespace, name, documentID, collection, options)
-	}
-	return j.beginLegacy(ctx, namespace, name, documentID, collection, options)
-}
-
-// beginLegacy is the pre-migration Begin: the MySQL lease rows hold the lease
-// and every heartbeat renews them.
-func (j *UploadJournal) beginLegacy(ctx context.Context, namespace, name, documentID, collection string, options BeginOptions) (*UploadOperation, error) {
-	operationID, err := randomHex(16)
-	if err != nil {
-		return nil, err
-	}
-	owner, err := randomHex(16)
-	if err != nil {
-		return nil, err
-	}
-	transaction, err := j.stores.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = transaction.Rollback() }()
-	if err := j.guard(ctx, transaction, namespace); err != nil {
-		if isUniqueViolation(err) {
-			return nil, newUploadConflict("Concurrent upload conflicts with this intent")
-		}
-		return nil, err
-	}
-	if options.IdempotencyKey != nil {
-		existing, err := scanUploadOperation(transaction.QueryRowContext(ctx,
-			"SELECT "+uploadOperationColumns+" FROM upload_operations WHERE namespace = ? AND idempotency_key = ?"+j.forUpdate(),
-			namespace, *options.IdempotencyKey))
-		if err == nil {
-			fingerprintMismatch := options.Fingerprint != nil &&
-				(existing.Fingerprint == nil || *existing.Fingerprint != *options.Fingerprint)
-			if fingerprintMismatch || existing.Name != name || existing.DocumentID != documentID ||
-				existing.Collection != collection {
-				return nil, newUploadConflict("Idempotency key has different input")
-			}
-			if existing.Status == UploadCommitted {
-				loaded, err := j.loadSteps(ctx, existing)
-				if err != nil {
-					return nil, err
-				}
-				if err := transaction.Commit(); err != nil {
-					return nil, err
-				}
-				return loaded, nil
-			}
-			return nil, newUploadConflict("Idempotency key is unfinished; recover its operation")
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return nil, err
-		}
-	}
-	var unresolved string
-	err = transaction.QueryRowContext(ctx,
-		"SELECT id FROM upload_operations WHERE namespace = ? AND status IN (?, ?, ?, ?, ?) "+
-			"AND (document_id = ? OR name = ?) LIMIT 1",
-		namespace, UploadIntent, UploadRunning, UploadFailed, UploadRollingBack, UploadRollbackFailed,
-		documentID, name).Scan(&unresolved)
-	if err == nil {
-		return nil, newUploadConflict("Previous upload must be recovered before another intent")
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	resources := []string{documentUploadResource(documentID), nameUploadResource(name)}
-	if err := j.acquire(ctx, transaction, namespace, resources, owner, &operationID); err != nil {
-		if isUniqueViolation(err) {
-			return nil, newUploadConflict("Concurrent upload conflicts with this intent")
-		}
-		return nil, err
-	}
-	var oldVersion sql.NullString
-	query := "SELECT version FROM document_heads WHERE namespace = ? AND document_id = ?" + j.forUpdate()
-	if err := transaction.QueryRowContext(ctx, query, namespace, documentID).Scan(&oldVersion); err != nil &&
-		!errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	now, err := j.dbNow(ctx, transaction)
-	if err != nil {
-		return nil, err
-	}
-	row := &UploadOperation{
-		ID:             operationID,
-		Namespace:      namespace,
-		Name:           name,
-		DocumentID:     documentID,
-		Collection:     collection,
-		IdempotencyKey: options.IdempotencyKey,
-		Fingerprint:    options.Fingerprint,
-		Owner:          owner,
-		OldVersion:     nullStringPointer(oldVersion),
-		Status:         UploadIntent,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		Version:        operationID,
-	}
-	if _, err := transaction.ExecContext(ctx,
-		"INSERT INTO upload_operations (id, namespace, name, document_id, collection, idempotency_key, "+
-			"fingerprint, owner, old_version, status, result, error, cleanup_pending, workspace, "+
-			"workspace_node, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, NULL, NULL, ?, ?)",
-		row.ID, row.Namespace, row.Name, row.DocumentID, row.Collection, row.IdempotencyKey, row.Fingerprint,
-		row.Owner, row.OldVersion, row.Status, row.CreatedAt, row.UpdatedAt); err != nil {
-		if isUniqueViolation(err) {
-			return nil, newUploadConflict("Concurrent upload conflicts with this intent")
-		}
-		return nil, err
-	}
-	if options.OnBegin != nil {
-		if err := options.OnBegin(ctx, transaction, row); err != nil {
-			return nil, err
-		}
-	}
-	if err := transaction.Commit(); err != nil {
-		return nil, err
-	}
-	j.startHeartbeat(row)
-	return row, nil
+	return j.beginRedis(ctx, namespace, name, documentID, collection, options)
 }
 
 // forShare returns the shared row-locking suffix: concurrent readers of the
@@ -721,39 +604,6 @@ func (j *UploadJournal) leaseRows(ctx context.Context, querier viewQuerier, name
 	return records, rows.Err()
 }
 
-func (j *UploadJournal) acquire(ctx context.Context, tx *sql.Tx, namespace string, resources []string, owner string, operationID *string) error {
-	now, err := j.dbNow(ctx, tx)
-	if err != nil {
-		return err
-	}
-	held, err := j.leaseRows(ctx, tx, namespace, false)
-	if err != nil {
-		return err
-	}
-	namespaceExclusive := containsString(resources, UploadNamespaceResource)
-	for _, row := range held {
-		overlaps := namespaceExclusive || row.Resource == UploadNamespaceResource ||
-			containsString(resources, row.Resource)
-		if overlaps && row.ExpiresAt > now && row.Owner != owner {
-			return newUploadConflict("Upload resource is leased")
-		}
-	}
-	if err := j.touchCache(ctx, tx, namespace, operationID, false, true); err != nil {
-		return err
-	}
-	for _, resource := range resources {
-		if err := j.insertIgnoreLease(ctx, tx, namespace, resource, owner, operationID, now+j.LeaseSeconds); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx,
-			"UPDATE document_leases SET owner = ?, operation_id = ?, expires_at = ? WHERE namespace = ? AND resource = ?",
-			owner, nilIfNil(operationID), now+j.LeaseSeconds, namespace, resource); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func nilIfNil(value *string) any {
 	if value == nil {
 		return nil
@@ -783,27 +633,13 @@ func (j *UploadJournal) owned(ctx context.Context, tx *sql.Tx, operation *Upload
 	for _, lease := range held {
 		leaseByResource[lease.Resource] = lease
 	}
-	if j.redisLeaseMode() {
-		// Liveness is authoritative in Redis and was checked when this step
-		// started; the SQL row is the fencing record, so only the holder identity
-		// matters here (no expiry check, no periodic SQL renewal).
-		for _, resource := range j.resources(row) {
-			lease, ok := leaseByResource[resource]
-			if !ok || lease.Owner != row.Owner || !lease.OperationID.Valid ||
-				lease.OperationID.String != row.ID {
-				return nil, newLeaseLost("Upload lease expired or was replaced")
-			}
-		}
-		return row, nil
-	}
-	now, err := j.dbNow(ctx, tx)
-	if err != nil {
-		return nil, err
-	}
+	// Liveness is authoritative in Redis and was checked when this step
+	// started; the SQL row is the fencing record, so only the holder identity
+	// matters here (no expiry check, no periodic SQL renewal).
 	for _, resource := range j.resources(row) {
 		lease, ok := leaseByResource[resource]
-		if !ok || lease.Owner != operation.Owner || !lease.OperationID.Valid ||
-			lease.OperationID.String != row.ID || lease.ExpiresAt <= now {
+		if !ok || lease.Owner != row.Owner || !lease.OperationID.Valid ||
+			lease.OperationID.String != row.ID {
 			return nil, newLeaseLost("Upload lease expired or was replaced")
 		}
 	}
@@ -815,25 +651,19 @@ func (j *UploadJournal) resources(operation *UploadOperation) []string {
 }
 
 func (j *UploadJournal) releaseLeases(ctx context.Context, tx *sql.Tx, operation *UploadOperation) error {
-	if j.redisLeaseMode() {
-		// Keep the row so its fencing generation stays monotonic; only the holder
-		// fields are cleared. Deleting the row would reset the generation to zero
-		// and let a stale request match it again.
-		_, err := tx.ExecContext(ctx,
-			"UPDATE document_leases SET owner = '', operation_id = NULL, expires_at = 0 "+
-				"WHERE namespace = ? AND owner = ? AND operation_id = ?",
-			operation.Namespace, operation.Owner, operation.ID)
-		return err
-	}
+	// Keep the row so its fencing generation stays monotonic; only the holder
+	// fields are cleared. Deleting the row would reset the generation to zero
+	// and let a stale request match it again.
 	_, err := tx.ExecContext(ctx,
-		"DELETE FROM document_leases WHERE namespace = ? AND owner = ? AND operation_id = ?",
+		"UPDATE document_leases SET owner = '', operation_id = NULL, expires_at = 0 "+
+			"WHERE namespace = ? AND owner = ? AND operation_id = ?",
 		operation.Namespace, operation.Owner, operation.ID)
 	return err
 }
 
 // AssertOwner revalidates ownership and lease liveness in its own transaction.
-// In redis mode the Redis lease is renewed first (outside the SQL transaction),
-// so a lost lease stops the pipeline before the next side effect.
+// The Redis lease is renewed first (outside the SQL transaction), so a lost
+// lease stops the pipeline before the next side effect.
 func (j *UploadJournal) AssertOwner(ctx context.Context, operation *UploadOperation) (*UploadOperation, error) {
 	if err := j.assertRedisLease(ctx, operation); err != nil {
 		return nil, err
@@ -1041,78 +871,11 @@ func (j *UploadJournal) Fail(ctx context.Context, operation *UploadOperation, ca
 }
 
 // ClaimRecovery returns a fresh owner for expired work, or nil for live and
-// terminal work. In redis mode a takeover is only allowed after the Redis lease
-// proves the previous holder is gone; a valid MySQL expires_at alone never
-// authorizes stealing a running upload.
+// terminal work. A takeover is only allowed after the Redis lease proves the
+// previous holder is gone; a valid MySQL expires_at alone never authorizes
+// stealing a running upload.
 func (j *UploadJournal) ClaimRecovery(ctx context.Context, operationID string) (*UploadOperation, error) {
-	if j.redisLeaseMode() {
-		return j.claimRecoveryRedis(ctx, operationID)
-	}
-	return j.claimRecoveryLegacy(ctx, operationID)
-}
-
-func (j *UploadJournal) claimRecoveryLegacy(ctx context.Context, operationID string) (*UploadOperation, error) {
-	snapshot, err := j.Get(ctx, operationID)
-	if err != nil {
-		return nil, err
-	}
-	transaction, err := j.stores.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = transaction.Rollback() }()
-	if err := j.guard(ctx, transaction, snapshot.Namespace); err != nil {
-		return nil, err
-	}
-	row, err := j.operationByID(ctx, transaction, operationID, true)
-	if err != nil {
-		return nil, err
-	}
-	if _, active := uploadActiveStatuses[row.Status]; !active {
-		return nil, nil
-	}
-	now, err := j.dbNow(ctx, transaction)
-	if err != nil {
-		return nil, err
-	}
-	held, err := j.leaseRows(ctx, transaction, row.Namespace, false)
-	if err != nil {
-		return nil, err
-	}
-	for _, lease := range held {
-		if lease.OperationID.Valid && lease.OperationID.String == operationID && lease.ExpiresAt > now {
-			return nil, nil
-		}
-	}
-	owner, err := randomHex(16)
-	if err != nil {
-		return nil, err
-	}
-	if err := j.acquire(ctx, transaction, row.Namespace, j.resources(row), owner, &operationID); err != nil {
-		var conflict *UploadConflict
-		if errors.As(err, &conflict) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	row.Owner = owner
-	row.Status = UploadRollingBack
-	row.UpdatedAt = now
-	if _, err := transaction.ExecContext(ctx,
-		"UPDATE upload_operations SET owner = ?, status = ?, updated_at = ? WHERE id = ?",
-		owner, UploadRollingBack, now, operationID); err != nil {
-		return nil, err
-	}
-	if err := transaction.Commit(); err != nil {
-		return nil, err
-	}
-	j.stopHeartbeat(snapshot)
-	claimed, err := j.loadSteps(ctx, row)
-	if err != nil {
-		return nil, err
-	}
-	j.startHeartbeat(claimed)
-	return claimed, nil
+	return j.claimRecoveryRedis(ctx, operationID)
 }
 
 // Rollback compensates this version, then deletes staged objects; it never
@@ -1721,40 +1484,10 @@ func (j *UploadJournal) RegisterWorkspace(ctx context.Context, operation *Upload
 }
 
 // AcquireLock takes the generic exclusive namespace lock (documentID nil) or the
-// document lock shared with uploads. In redis mode the lease is taken in Redis
-// and the holder is registered in MySQL before the caller starts side effects.
+// document lock shared with uploads. The lease is taken in Redis and the holder
+// is registered in MySQL before the caller starts side effects.
 func (j *UploadJournal) AcquireLock(ctx context.Context, namespace string, documentID *string) (*LockToken, error) {
-	if j.redisLeaseMode() {
-		return j.acquireLockRedis(ctx, namespace, documentID)
-	}
-	return j.acquireLockLegacy(ctx, namespace, documentID)
-}
-
-func (j *UploadJournal) acquireLockLegacy(ctx context.Context, namespace string, documentID *string) (*LockToken, error) {
-	owner, err := randomHex(16)
-	if err != nil {
-		return nil, err
-	}
-	resource := UploadNamespaceResource
-	if documentID != nil {
-		resource = documentUploadResource(*documentID)
-	}
-	token := &LockToken{Namespace: namespace, Resource: resource, Owner: owner}
-	transaction, err := j.stores.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = transaction.Rollback() }()
-	if err := j.guard(ctx, transaction, namespace); err != nil {
-		return nil, err
-	}
-	if err := j.acquire(ctx, transaction, namespace, []string{resource}, owner, nil); err != nil {
-		return nil, err
-	}
-	if err := transaction.Commit(); err != nil {
-		return nil, err
-	}
-	return token, nil
+	return j.acquireLockRedis(ctx, namespace, documentID)
 }
 
 // AssertLock validates a token in its own transaction.
@@ -1795,60 +1528,23 @@ func (j *UploadJournal) AssertLockTx(ctx context.Context, tx *sql.Tx, token *Loc
 	if owner != token.Owner {
 		return newLeaseLost("Generic lock expired or was replaced")
 	}
-	if j.redisLeaseMode() {
-		// The SQL row is the fencing record; liveness lives in Redis and a
-		// takeover rewrites the owner, so no expiry check is needed (and the row
-		// is deliberately not renewed on a timer).
-		return nil
-	}
-	now, nowErr := j.dbNow(ctx, tx)
-	if nowErr != nil {
-		return nowErr
-	}
-	if expires <= now {
-		return newLeaseLost("Generic lock expired or was replaced")
-	}
+	// The SQL row is the fencing record; liveness lives in Redis and a
+	// takeover rewrites the owner, so no expiry check is needed (and the row
+	// is deliberately not renewed on a timer).
 	return nil
 }
 
-// RenewLock extends a generic lock lease. In redis mode it only touches Redis.
+// RenewLock extends a generic lock lease; it only touches Redis.
 func (j *UploadJournal) RenewLock(ctx context.Context, token *LockToken) error {
-	if j.redisLeaseMode() {
-		locker, err := j.documentLocker()
-		if err != nil {
-			return err
-		}
-		return locker.Renew(ctx, token.Namespace, []string{token.Resource}, token.Owner, j.lockTTL())
-	}
-	transaction, err := j.stores.DB.BeginTx(ctx, nil)
+	locker, err := j.documentLocker()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = transaction.Rollback() }()
-	if err := j.AssertLockTx(ctx, transaction, token); err != nil {
-		return err
-	}
-	now, err := j.dbNow(ctx, transaction)
-	if err != nil {
-		return err
-	}
-	if err := j.touchCache(ctx, transaction, token.Namespace, nil, false, true); err != nil {
-		return err
-	}
-	if _, err := transaction.ExecContext(ctx,
-		"UPDATE document_leases SET expires_at = ? WHERE namespace = ? AND resource = ? AND owner = ?",
-		now+j.LeaseSeconds, token.Namespace, token.Resource, token.Owner); err != nil {
-		return err
-	}
-	if err := transaction.Commit(); err != nil {
-		return err
-	}
-	return nil
+	return locker.Renew(ctx, token.Namespace, []string{token.Resource}, token.Owner, j.lockTTL())
 }
 
 // ReleaseLock removes a generic lock when the caller still owns it.
 func (j *UploadJournal) ReleaseLock(ctx context.Context, token *LockToken) error {
-	redisMode := j.redisLeaseMode()
 	transaction, err := j.stores.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1862,11 +1558,9 @@ func (j *UploadJournal) ReleaseLock(ctx context.Context, token *LockToken) error
 		"SELECT resource FROM document_leases WHERE namespace = ? AND resource = ? AND owner = ?",
 		token.Namespace, token.Resource, token.Owner).Scan(&marker)
 	if errors.Is(err, sql.ErrNoRows) {
-		if redisMode {
-			// Nothing recorded; make sure our own Redis field is gone anyway.
-			if locker, lockerErr := j.documentLocker(); lockerErr == nil {
-				return locker.Release(ctx, token.Namespace, []string{token.Resource}, token.Owner)
-			}
+		// Nothing recorded; make sure our own Redis field is gone anyway.
+		if locker, lockerErr := j.documentLocker(); lockerErr == nil {
+			return locker.Release(ctx, token.Namespace, []string{token.Resource}, token.Owner)
 		}
 		return nil
 	}
@@ -1876,25 +1570,17 @@ func (j *UploadJournal) ReleaseLock(ctx context.Context, token *LockToken) error
 	if err := j.touchCache(ctx, transaction, token.Namespace, nil, false, true); err != nil {
 		return err
 	}
-	if redisMode {
-		if _, err := transaction.ExecContext(ctx,
-			"UPDATE document_leases SET owner = '', operation_id = NULL, expires_at = 0 "+
-				"WHERE namespace = ? AND resource = ? AND owner = ?",
-			token.Namespace, token.Resource, token.Owner); err != nil {
-			return err
-		}
-	} else if _, err := transaction.ExecContext(ctx,
-		"DELETE FROM document_leases WHERE namespace = ? AND resource = ? AND owner = ?",
+	if _, err := transaction.ExecContext(ctx,
+		"UPDATE document_leases SET owner = '', operation_id = NULL, expires_at = 0 "+
+			"WHERE namespace = ? AND resource = ? AND owner = ?",
 		token.Namespace, token.Resource, token.Owner); err != nil {
 		return err
 	}
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	if redisMode {
-		if locker, lockerErr := j.documentLocker(); lockerErr == nil {
-			return locker.Release(ctx, token.Namespace, []string{token.Resource}, token.Owner)
-		}
+	if locker, lockerErr := j.documentLocker(); lockerErr == nil {
+		return locker.Release(ctx, token.Namespace, []string{token.Resource}, token.Owner)
 	}
 	return nil
 }
@@ -1947,9 +1633,10 @@ func (j *UploadJournal) WithHeartbeatContext(ctx context.Context, operation *Upl
 		return newLeaseLost("Upload heartbeat failed")
 	}
 	// A step may outlive the last heartbeat tick, so confirm the Redis lease is
-	// still ours before recording DONE (redis mode only; a no-op otherwise).
-	// Callers must not commit the operation inside the action.
-	if err := j.assertRedisLease(ctx, operation); err != nil {
+	// still ours before recording DONE. Callers must not commit the operation
+	// inside the action; a caller that does commit (publishDocument releases the
+	// lease right after its transaction) must not fail this confirmation.
+	if err := j.confirmLeaseAfterAction(ctx, operation); err != nil {
 		return err
 	}
 	transaction, err := j.stores.DB.BeginTx(ctx, nil)
@@ -1972,46 +1659,24 @@ func (j *UploadJournal) WithHeartbeatContext(ctx context.Context, operation *Upl
 	return transaction.Commit()
 }
 
+// confirmLeaseAfterAction renews the Redis lease after the action returns, but
+// only while the operation is still owned by this caller and unfinished: a
+// caller that committed inside the action also released the lease, and that
+// durable commit must not be reported as a lost lease.
+func (j *UploadJournal) confirmLeaseAfterAction(ctx context.Context, operation *UploadOperation) error {
+	saved, err := j.operationByID(ctx, j.stores.DB, operation.ID, false)
+	if err != nil {
+		return err
+	}
+	if saved.Owner == operation.Owner &&
+		(saved.Status == UploadCommitted || saved.Status == UploadRolledBack) {
+		return nil
+	}
+	return j.assertRedisLease(ctx, operation)
+}
+
 func (j *UploadJournal) renew(operation *UploadOperation) error {
-	if j.redisLeaseMode() {
-		return j.renewRedis(operation)
-	}
-	transaction, err := j.stores.DB.BeginTx(context.Background(), nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = transaction.Rollback() }()
-	ctx := context.Background()
-	if err := j.guard(ctx, transaction, operation.Namespace); err != nil {
-		return err
-	}
-	row, err := j.operationByID(ctx, transaction, operation.ID, true)
-	if err != nil {
-		return err
-	}
-	if row.Owner == operation.Owner && (row.Status == UploadCommitted || row.Status == UploadRolledBack) {
-		j.stopHeartbeat(operation)
-		return transaction.Commit()
-	}
-	if _, err := j.owned(ctx, transaction, operation, uploadActiveStatuses); err != nil {
-		return err
-	}
-	now, err := j.dbNow(ctx, transaction)
-	if err != nil {
-		return err
-	}
-	if err := j.touchCache(ctx, transaction, operation.Namespace, nil, false, true); err != nil {
-		return err
-	}
-	if _, err := transaction.ExecContext(ctx,
-		"UPDATE document_leases SET expires_at = ? WHERE namespace = ? AND owner = ? AND operation_id = ?",
-		now+j.LeaseSeconds, operation.Namespace, operation.Owner, operation.ID); err != nil {
-		return err
-	}
-	if err := transaction.Commit(); err != nil {
-		return err
-	}
-	return nil
+	return j.renewRedis(operation)
 }
 
 // leaseHeartbeat renews a lease on a background interval, mirroring

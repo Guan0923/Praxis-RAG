@@ -193,7 +193,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 - 缓存消费者按 `cache_revisions` 的 revision 水位刷新：读取事件 → 事务内 `revision+1` → 重建脱敏视图 → 提交后写 Redis；失败记录 `attempts/last_error` 并照常 ACK，由周期 `RefreshDirty` 补偿，Redis 写失败不丢收敛、不会造成 DLQ 风暴。
 - 消费语义至少一次：成功提交 offset；失败同进程指数退避重试（100ms 起、上限 5s），达到 `MaxAttempts`（默认 3）后写 DLQ 再提交；重复投递由幂等与 MySQL 租约吸收。文档执行次数另由 `document_jobs.attempts` 记录（上限 3，跨消息/worker/重启），第 3 次失败写 `failed`。
 - 文档 worker 只有 Kafka 消费模式：`rag-service` 不内嵌消费者，`rag-document-worker` 消费 Kafka Connect 的 `praxis-document-cdc` 投递的 `RAG_DOCUMENT_TOPIC`；未配置 Kafka 或未运行该 worker 时，上传仍受理但任务保持 `queued`。
-- Redis 用途：默认只承担读模型展示缓存（短 TTL）；搜索响应与 artifact 事实都不在 Redis（artifact 在 MySQL，按 ID 独立读取）。可选把文档长租约后端切到 Redis（`RAG_DOCUMENT_LOCK_MODE=redis`，部署级开关，MySQL 仍保存持有者登记与 `fencing_epoch`）；展示缓存开关不控制文档锁，切换见 [部署指南](../DEPLOYMENT.md) §13。
+- Redis 用途：读模型展示缓存（短 TTL，可选）与文档长租约（**Redis 是唯一锁后端**：`RAG_REDIS_LOCK_URL` 空则回退 `RAG_REDIS_URL`，必须配置；MySQL 仍保存持有者登记与 `fencing_epoch`；旧 `RAG_DOCUMENT_LOCK_MODE` 已移除、残留值被忽略）；搜索响应与 artifact 事实都不在 Redis（artifact 在 MySQL，按 ID 独立读取）；展示缓存开关不控制文档锁，升级与回退见 [部署指南](../DEPLOYMENT.md) §13。
 - 搜索为同步执行：一次调用完成检索 + 重排并返回证据；总预算由 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120s）约束，客户端取消会终止下游调用。
 
 ## 13. 运维与 CLI

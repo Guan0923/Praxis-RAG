@@ -7,7 +7,7 @@
 
 ## 范围
 
-Redis 主要承担**持久数据展示缓存**；另有可选的**文档长租约后端**（`RAG_DOCUMENT_LOCK_MODE=redis`，默认关闭），两者共用同一 Redis 实例，但键空间、开关与 TTL 完全独立：
+Redis 主要承担**持久数据展示缓存**与**文档长租约**（Redis 是唯一锁后端，旧 `RAG_DOCUMENT_LOCK_MODE` 开关已移除、残留值被忽略），两者共用同一 Redis 实例，但键空间、开关与 TTL 完全独立：
 
 - **异步文档入库的任务状态与文件字节保存在 MySQL**（`document_jobs`、`blobs`）：没有 Redis TTL，不会因 Redis 丢失、过期或不可用而失效；进度只由 Debezium 任务连接器 → `rag-document-worker` 推进。
 - **持久数据展示缓存**：MySQL 继续保存异步文档任务、已发布文档/源文件/解析产物、KB/API Key/catalog、artifact 快照和 UploadJournal 操作/租约；Qdrant 继续检索。下面第一、二批读模型仍可在 Redis 故障时回源 MySQL；缓存刷新由 Debezium 表级事件驱动 revision 水位，`cache_outbox` 已于 2026-11-13 下线（下文的 outbox 描述仅作历史）。
@@ -30,7 +30,7 @@ Redis 主要承担**持久数据展示缓存**；另有可选的**文档长租�
 | `upload_list` | namespace | 最近 100 条操作状态摘要，不用于恢复扫描 |
 | `upload_status` | operation_id | namespace、操作阶段、错误类型、步骤/回滚状态；最多 256 个步骤 |
 
-**严格边界**：真实 API Key 鉴权、密钥导出、检索可见版本与提交/回滚校验仍直接访问 MySQL；文档租约默认也在 MySQL（`document_leases` 行承担申请/续期/认领）。设 `RAG_DOCUMENT_LOCK_MODE=redis` 时，长租约的申请/续期/认领改在 Redis 原子完成，但 **fencing、持有者登记与提交/回滚校验仍以 MySQL 为准**，锁键不进入任何读模型，缓存中的 enabled、版本、owner 展示值均不能授予执行权。即使缓存故意置旧，也不能导致已停用 Key 被放行或过期节点成功提交。
+**严格边界**：真实 API Key 鉴权、密钥导出、检索可见版本与提交/回滚校验仍直接访问 MySQL。Redis 是文档长租约的唯一后端：长租约的申请/续期/认领在 Redis 原子完成，但 **fencing、持有者登记与提交/回滚校验仍以 MySQL 为准**，锁键不进入任何读模型，缓存中的 enabled、版本、owner 展示值均不能授予执行权。即使缓存故意置旧，也不能导致已停用 Key 被放行或过期节点成功提交。
 
 租约 owner 原始所有权 token 不放 Redis；holder_id 是 token 的短哈希，仅用于区分执行者。操作详情不缓存 idempotency_key、workspace、fingerprint、result 原文、步骤输入 details、文件内容或密钥。upload_status 的返回值再次验证 namespace，UUID 不授予访问权。API Key 列表直接读取 MySQL，按账号可见（管理员/本机管理为全部，普通账号仅本人；见 [权限管理](PERMISSIONS.md) §9）。
 
@@ -40,17 +40,17 @@ Redis 主要承担**持久数据展示缓存**；另有可选的**文档长租�
 
 ## 搜索不再使用 Redis 短期状态
 
-搜索已改为**同步直返**：`POST /v1/search` 与 MCP `search` 一次调用完成检索 + 重排并直接返回证据，没有任务 ID、`wait_seconds`、轮询、结果快照或 Redis 短期缓存。原 `search_tasks`/`search_result_snapshots` 表保留历史数据、不再读写；搜索 topic/消费组/DLQ 与 `rag-search-worker` 已下线（见 [部署指南 §12](DEPLOYMENT.md#12-搜索同步化迁移与切换)）。**文档入库的受理阶段同样不依赖 Redis**：`add_document` 只提交一个 MySQL 事务（`document_jobs` 完整任务），Kafka 只传 schema 4 纯通知；启用文档锁 Redis 后端时，后续解析/发布阶段才依赖锁后端。
+搜索已改为**同步直返**：`POST /v1/search` 与 MCP `search` 一次调用完成检索 + 重排并直接返回证据，没有任务 ID、`wait_seconds`、轮询、结果快照或 Redis 短期缓存。原 `search_tasks`/`search_result_snapshots` 表保留历史数据、不再读写；搜索 topic/消费组/DLQ 与 `rag-search-worker` 已下线（见 [部署指南 §12](DEPLOYMENT.md#12-搜索同步化迁移与切换)）。**文档入库的受理与展示不依赖 Redis**：`add_document` 只提交一个 MySQL 事务（`document_jobs` 完整任务），Kafka 只传 schema 4 纯通知；后续解析/发布阶段才依赖锁后端（Redis 是必需依赖）。
 
-文档侧默认没有 Redis 参与：**入库任务**的状态、领取、心跳、重试与终态全部由 MySQL 提供（`document_jobs`），worker 用 SQL 租约 claim 并心跳续租，只有 MySQL 记录领取/终态后才 ACK；`get_document_status` 直接读 MySQL，无 TTL。**文档长租约**默认也在 MySQL（`document_leases`），设 `RAG_DOCUMENT_LOCK_MODE=redis` 时改由 Redis 原子获取/续租，MySQL 只保留持有者登记与单调递增的 `fencing_epoch`（见下文「文档锁」）。UploadJournal 继续保障文档发布版本一致性，不存在 Redis+MySQL 原子事务问题，也没有 Redis 回源。事务 outbox 已于 2026-11-13 下线：重发只通过 `schedule_version + 1`（到期重试或文档任务租约过期时由 `Sweep` 执行），不再有 outbox 行或保留期清理。日志仅记录任务/操作 ID 与安全错误类别，不记录查询、文件/消息正文或凭据。
+文档侧的**入库任务**状态、领取、心跳、重试与终态全部由 MySQL 提供（`document_jobs`），worker 用 SQL 租约 claim 并心跳续租，只有 MySQL 记录领取/终态后才 ACK；`get_document_status` 直接读 MySQL，无 TTL。**文档长租约**由 Redis 原子获取/续租（Redis 是唯一后端，`RAG_DOCUMENT_LOCK_MODE` 已移除），MySQL 只保留持有者登记与单调递增的 `fencing_epoch`（见下文「文档锁」）。UploadJournal 继续保障文档发布版本一致性，不存在 Redis+MySQL 原子事务问题，也没有 Redis 回源。事务 outbox 已于 2026-11-13 下线：重发只通过 `schedule_version + 1`（到期重试或文档任务租约过期时由 `Sweep` 执行），不再有 outbox 行或保留期清理。日志仅记录任务/操作 ID 与安全错误类别，不记录查询、文件/消息正文或凭据。
 
 2026-11-13 搜索同步化：搜索不再有 Kafka 通知（原 schema 3 搜索消息、`praxis_search` topic、搜索消费组与搜索 DLQ 一并下线），文档通知仍为 schema 4。切换步骤见 [部署指南 §12](DEPLOYMENT.md#12-搜索同步化迁移与切换)；`search_tasks`/`search_result_snapshots` 保留历史数据、不再读写，artifact 保留边界见 [产物引用](result-references.md)。旧 outbox 表仍可由 `rag-service-migrate --retire-outbox --yes` 删除；`document_tasks` 作为历史表保留但不再读写。
 
-## 文档锁（可选 Redis 后端）
+## 文档锁（Redis 唯一后端）
 
-文档写入的长时互斥（上传 INTENT、覆盖发布、删除、恢复、清理与知识库独占操作）默认由 MySQL `document_leases` 行承担；设 `RAG_DOCUMENT_LOCK_MODE=redis` 后改由 Redis 租约控制，MySQL 只保存持有者登记与单调递增的 `fencing_epoch`，提交/回滚仍由 MySQL 事务校验持有者。入库任务领取、任务心跳、重试、终态与 Kafka 去重不受影响，仍在 `document_jobs`。
+文档写入的长时互斥（上传 INTENT、覆盖发布、删除、恢复、清理与知识库独占操作）由 Redis 租约控制（Redis 是唯一后端，旧 `RAG_DOCUMENT_LOCK_MODE` 开关已移除、残留值被忽略）；MySQL 只保存持有者登记与单调递增的 `fencing_epoch`，提交/回滚仍由 MySQL 事务校验持有者。入库任务领取、任务心跳、重试、终态与 Kafka 去重不受影响，仍在 `document_jobs`。
 
-- **与展示缓存解耦**：`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，文档锁仍可用 Redis；缓存 TTL（`RAG_REDIS_TTL_SECONDS`）与锁 TTL（`RAG_REDIS_LOCK_TTL_SECONDS`，默认 120，未显式设置时跟随 `RAG_UPLOAD_LEASE_SECONDS`）是两套配置。开关是部署级的：`rag-service`、`rag-document-worker`、`rag-mcp-ingest` 必须同值。
+- **与展示缓存解耦**：`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，文档锁仍用 Redis；缓存 TTL（`RAG_REDIS_TTL_SECONDS`）与锁 TTL（`RAG_REDIS_LOCK_TTL_SECONDS`，默认 120，未显式设置时跟随 `RAG_UPLOAD_LEASE_SECONDS`）是两套配置。锁配置是部署级的：`rag-service`、`rag-document-worker`、`rag-mcp-ingest` 必须使用同一 Redis 实例、逻辑库、`RAG_REDIS_LOCK_URL`（为空回退 `RAG_REDIS_URL`）、前缀与 TTL；缺失锁地址时这些进程启动即报配置错误。
 - **键空间**：每个 namespace 一个 Redis Hash `<prefix>:{<sha256(namespace) 前 32 位>}:leases`（`RAG_REDIS_LOCK_PREFIX` 默认 `rag:lock:v1`），field 为资源（`document:<hash>`、`name:<hash>`、`namespace:exclusive`），单键 + hash tag，天然兼容 Redis Cluster。每次获取是一条 Lua 脚本，原子且全有或全无；时间基准用 Redis `TIME`；释放只删除本次 owner token 的 field；owner token 不出现在接口、日志或展示里（展示用 sha256 前 16 位）。
 - **失败语义**：Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**禁止单实例回退到 MySQL 锁**；续租失去所有权或无法确认时停止启动新步骤，并通过可取消的 context 通知在途解析/嵌入/Qdrant 调用；提交成功但释放锁失败时不重复执行已提交操作，最多等到租约 TTL 过期；Redis 重启丢失租约后该实例在下一个步骤边界停止推进，由恢复程序接管。
 - **恢复扫描**：只有 Redis 租约已释放（过期）才允许接管，MySQL 登记行的 `expires_at` 只是登记/展示兜底，不再随心跳续写，也不会仅凭它接管仍在运行的上传。
@@ -124,7 +124,7 @@ RAG_CONNECT_DOCUMENT_CONNECTOR=praxis-document-cdc
 RAG_CONNECT_CACHE_CONNECTOR=praxis-cache-cdc
 ```
 
-`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存；artifact 保留期用 `RAG_RESULT_TTL_SECONDS=3600`（变量名保留，语义已更正为 artifact TTL）。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis：**搜索同步直返、artifact 按 ID 从 MySQL 读取，均不依赖 Redis**；被禁用的只是读模型展示缓存（读取回源 MySQL）。**文档锁与展示缓存解耦**：`RAG_DOCUMENT_LOCK_MODE` 默认 `mysql`，设 `redis` 时需要能解析出 `RAG_REDIS_LOCK_URL`（为空回退 `RAG_REDIS_URL`），且所有参与文档写入/恢复/清理的进程必须同值；`RAG_REDIS_ENABLED=false` 不影响文档锁。文档异步新增不依赖 Redis：禁用后仍可提交、查询状态并完成 MySQL 持久发布（Kafka 部署需 Debezium 完成通知投递，但不影响受理与状态查询）。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；持久数据展示读取可回源 MySQL。多实例共享相同 Redis、前缀、MySQL 和各自的 cache/document topic/group（以及两个显式 DLQ topic）。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；Kafka SASL/TLS 凭据仅从 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*` 读取。
+`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存；artifact 保留期用 `RAG_RESULT_TTL_SECONDS=3600`（变量名保留，语义已更正为 artifact TTL）。`RAG_REDIS_ENABLED=false` 只禁用读模型展示缓存（读取回源 MySQL），**不禁用文档锁**：**文档锁与展示缓存解耦，Redis 是文档锁的必需依赖**——`RAG_REDIS_LOCK_URL`（为空回退 `RAG_REDIS_URL`）必须能解析，且所有参与文档写入/恢复/清理的进程必须使用同一 Redis 实例、逻辑库与前缀；缺失锁地址时进程启动报配置错误。文档异步受理与状态查询不依赖 Redis 锁（受理只写 MySQL，解析/发布阶段才取锁）。多实例共享相同 Redis、前缀、MySQL 和各自的 cache/document topic/group（以及两个显式 DLQ topic）。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；Kafka SASL/TLS 凭据仅从 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*` 读取。
 
 ## Docker 与启动
 

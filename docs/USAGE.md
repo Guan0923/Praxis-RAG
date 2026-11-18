@@ -344,8 +344,7 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_REDIS_PREFIX` | `rag:state:v1` | 读模型缓存键前缀 |
 | `RAG_REDIS_TTL_SECONDS` | `60` | 读模型展示缓存 TTL（与文档锁 TTL 无关） |
 | `RAG_REDIS_TIMEOUT_SECONDS` | `0.3` | Redis 连接/命令超时 |
-| `RAG_DOCUMENT_LOCK_MODE` | `mysql` | 文档长租约后端：`mysql`（默认，行为不变）或 `redis`。部署级开关，`rag-service`/`rag-document-worker`/`rag-mcp-ingest` 必须同值 |
-| `RAG_REDIS_LOCK_URL` | 空（回退 `RAG_REDIS_URL`） | 文档锁 Redis 地址；`redis` 模式解析不出 URL 时启动报错 |
+| `RAG_REDIS_LOCK_URL` | 空（回退 `RAG_REDIS_URL`） | 文档锁 Redis 地址；**Redis 是文档锁的唯一后端**，解析不出 URL 时启动报配置错误（旧变量 `RAG_DOCUMENT_LOCK_MODE` 已移除，残留值被忽略） |
 | `RAG_REDIS_LOCK_PREFIX` | `rag:lock:v1` | 锁键前缀；每个 namespace 一个 Hash：`<prefix>:{<sha256(namespace) 前 32 位>}:leases`，单键内多 field，兼容 Redis Cluster |
 | `RAG_REDIS_LOCK_TTL_SECONDS` | `120`（未显式设置时跟随 `RAG_UPLOAD_LEASE_SECONDS`） | 文档长租约时长；心跳按 1/3 周期续租 |
 | `RAG_REDIS_LOCK_TIMEOUT_SECONDS` | `1` | 单次 Redis 命令超时 |
@@ -357,7 +356,7 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 
 Redis 不可用时，持久读模型会回源状态库；搜索为同步直返，响应不写 Redis，artifact 以 MySQL `artifact_snapshots` 为事实来源并按 ID 独立读取，**清空 Redis 不影响搜索结果或已签发 artifact**。`RAG_RESULT_TTL_SECONDS` 到期后 MySQL artifact 被有界清理，再读取返回 410。
 
-**文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，`RAG_DOCUMENT_LOCK_MODE=redis` 时文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。默认 `mysql` 模式行为不变（`document_leases` 行 + 心跳续写 `expires_at`）；`redis` 模式只把长租约搬到 Redis，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询，展示读取可回源 MySQL。切换与回退见[部署指南](DEPLOYMENT.md) §13。
+**文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。Redis 是文档长租约的**唯一后端**（`RAG_DOCUMENT_LOCK_MODE` 已移除）：长租约的申请/续期/接管在 Redis 原子完成，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者；`RAG_REDIS_LOCK_URL`（为空回退 `RAG_REDIS_URL`）必须能解析，否则启动报配置错误。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询，展示读取可回源 MySQL。升级与代码回退见[部署指南](DEPLOYMENT.md) §13。
 
 ### Kafka 与队列
 
@@ -1333,7 +1332,7 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 - `scripts/build-go.ps1` 本机构建 + 冒烟：`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200。POSIX 的 `scripts/build-go.sh`/`make check` 未在当前 Windows 验证环境执行。
 - 四个 worker 二进制与切换/迁移 CLI 的 `--help`、缺少 Kafka、错误 backend、非法 `--kind` 的退出码行为。
 - Go 端 REST/MCP/检索/文档/资产投影/`document.md` 预览/上传事务的单元与集成测试（真实 MySQL + fake Qdrant/model）。
-- 文档长租约后端（`RAG_DOCUMENT_LOCK_MODE=redis`）：`internal/state` 覆盖冲突矩阵、迟到登记、接管围栏、Redis 丢失/不可用/释放失败与租约展示；`internal/runtime`、`internal/documentworker` 回归；`internal/redisstate` 用两个独立客户端对真实 Redis 验证 Lua、续租与 TTL。
+- 文档长租约后端（Redis 唯一后端，旧 `RAG_DOCUMENT_LOCK_MODE` 已移除）：`internal/state` 覆盖冲突矩阵、迟到登记、接管围栏、Redis 丢失/不可用/释放失败与租约展示；`internal/runtime`、`internal/documentworker` 回归；`internal/redisstate` 用两个独立客户端对真实 Redis 验证 Lua、续租与 TTL。
 - Console 角色/知识库归属/邀请共享的**全栈 HTTP E2E**（真实登录会话与 CSRF、真实 access 服务、真实 MySQL）：`internal/e2e/permissions_http_test.go` 覆盖角色变更、归属可见性、邀请创建→收件箱→预览→接受、只读/读写闸门、模板建库、撤销授权。异步上传发布后读模型刷新的回归也由 `internal/e2e` 覆盖。
 
 **未验证**（不要据此宣称生产就绪）：

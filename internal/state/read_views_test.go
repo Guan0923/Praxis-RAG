@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func activeKnowledgeBaseSettings() map[string]any {
@@ -247,6 +248,12 @@ func TestUploadReadViews(t *testing.T) {
 		"alpha", "namespace:exclusive", "secret-holder", "op-1", now+100); err != nil {
 		t.Fatalf("document_leases insert error = %v", err)
 	}
+	// The lease read model is live when the Redis backend still holds the
+	// resource, so mirror the SQL row into the fake backend.
+	if err := testLocker(t, stores).Acquire(ctx, "alpha",
+		[]string{"namespace:exclusive"}, "secret-holder", 100*time.Second); err != nil {
+		t.Fatalf("fake acquire error = %v", err)
+	}
 	if _, err := stores.DB.ExecContext(ctx,
 		"INSERT INTO document_leases (namespace, resource, owner, operation_id, expires_at) VALUES (?, ?, ?, NULL, ?)",
 		"alpha", "namespace:guard", "secret-holder", now+100); err != nil {
@@ -340,18 +347,23 @@ func TestLeaseExpiryRecalculatedWithoutCacheWrite(t *testing.T) {
 		"alpha", "resource:one", "holder", unixSeconds()-1); err != nil {
 		t.Fatalf("document_leases insert error = %v", err)
 	}
+	// Liveness is authoritative in the backend: a live Redis lease makes the
+	// display view report the lease as live even though the stale SQL
+	// registration says it expired.
+	if err := testLocker(t, stores).Acquire(ctx, "alpha",
+		[]string{"resource:one"}, "holder", 100*time.Second); err != nil {
+		t.Fatalf("fake acquire error = %v", err)
+	}
 	leases, err := stores.Views.Leases(ctx, "alpha")
-	if err != nil || len(leases) != 1 || leases[0]["expired"] != true {
+	if err != nil || len(leases) != 1 || leases[0]["expired"] != false {
 		t.Fatalf("Leases() = %+v, %v", leases, err)
 	}
-	// Mutating the cached payload only changes the display recalculation.
-	cache.mu.Lock()
-	entry := cache.entries[CacheKey{Kind: "leases", Scope: "alpha"}].([]any)
-	entry[0].(map[string]any)["expires_at"] = unixSeconds() + 1000
-	cache.mu.Unlock()
+	// Once the backend drops the lease the same view recalculates to expired
+	// without writing the recalculation into the cache.
+	testLocker(t, stores).expireAll()
 	leases, err = stores.Views.Leases(ctx, "alpha")
-	if err != nil || len(leases) != 1 || leases[0]["expired"] != false {
-		t.Fatalf("Leases() after cache mutation = %+v, %v", leases, err)
+	if err != nil || len(leases) != 1 || leases[0]["expired"] != true {
+		t.Fatalf("Leases() after expiry = %+v, %v", leases, err)
 	}
 	cache.mu.Lock()
 	stored := cache.entries[CacheKey{Kind: "leases", Scope: "alpha"}].([]any)[0].(map[string]any)

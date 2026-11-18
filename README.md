@@ -41,10 +41,12 @@ flowchart LR
     Service -->|"向量化 · 可选重排"| Model["模型 API"]
     Worker -->|"文档向量化"| Model
     Kafka -->|"读模型变更"| Cache["缓存 Worker"]
-    Cache --> Redis[("Redis · 可选")]
+    Cache --> Redis[("Redis · 展示缓存（可选）+ 文档分布式锁（必需）")]
 ```
 
 [完整部署拓扑](docs/DEPLOYMENT.md#1-进程拓扑) · [REST API](docs/USAGE.md#5-rest-api-示例) · [MCP 接入](docs/USAGE.md#6-mcp-使用)
+
+> 状态与发布事实保存在 MySQL；Redis 承担读模型展示缓存（可选，故障时回源 MySQL）与**文档分布式锁（必需，`RAG_REDIS_LOCK_URL`，空则回退 `RAG_REDIS_URL`）**——所有执行文档写入、恢复或清理的进程必须使用同一 Redis 实例、逻辑库与锁前缀。锁后端异常时相关写操作等待重试；检索与状态查询不受影响。
 
 ## 指标
 
