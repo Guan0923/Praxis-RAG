@@ -201,6 +201,8 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 
 角色分管理员（`admin`）、VIP（`vip`）和普通用户（`user`），只有管理员可以改角色。知识库默认归创建者私有，共享通过邀请链接完成：管理员、VIP 以及当前 Plus/Pro 会员可邀请（管理员可邀请任意知识库，其余只能邀请自己创建的知识库），权限分「可读 / 可修改」、范围分「单文件 / 多文件 / 全库」；被邀请人登录后接受邀请才生效。会员到期后已有共享保留并可撤销，但停止新发付费邀请。完整流程见 [权限管理](PERMISSIONS.md)。
 
+**用户组**：`vip` 和 `admin` 可以在 Console 的「用户组」页面创建组并邀请成员（普通账号可以查看自己的邀请、接受或退出组）。组创建者可以在「权限管理」页把自己拥有的知识库授权给某个组：权限位为「阅读 1 / 新增 2 / 修改 4 / 删除 8」，范围分全库或指定文件（「新增」仅全库）。成员的最终权限是其个人授权与所有当前有效组授权的按位并集（个人显式拒绝仍优先生效）；移除成员、退出组、撤销组授权或解散组后，下一个请求立即失去对应权限。邀请人降级为 `user` 后不能再发新邀请（接受旧邀请时服务端会重新校验），但已有成员和授权继续有效。组规则、组邀请链接与权限来源说明见 [权限管理](PERMISSIONS.md)。
+
 ### 个人会员、额度与支付宝
 
 Console 侧边栏和账号菜单提供「会员与用量」。Free / Plus / Pro 的自有知识库数、每库文件数和平台文档 Embedding 字符额度由服务端套餐目录决定；Plus/Pro 可对自己拥有的知识库发邀请，购买和到期不改 `admin/vip/user` 角色。详细规则、有效期/升级算法和文件/Embedding 计量口径见 [个人会员与额度](PERSONAL_MEMBERSHIP.md)。
@@ -344,6 +346,9 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_REDIS_PREFIX` | `rag:state:v1` | 读模型缓存键前缀 |
 | `RAG_REDIS_TTL_SECONDS` | `60` | 读模型展示缓存 TTL（与文档锁 TTL 无关） |
 | `RAG_REDIS_TIMEOUT_SECONDS` | `0.3` | Redis 连接/命令超时 |
+| `RAG_REDIS_BREAKER_THRESHOLD` | `5` | 展示缓存熔断阈值：连续 `N` 次 Redis **可用性故障**（连接错误/超时）后熔断 |
+| `RAG_REDIS_BREAKER_COOLDOWN_SECONDS` | `10` | 熔断冷却时长；到期后每个实例只放一个请求探测 Redis，探测成功（含“key 不存在”）即恢复 |
+| `RAG_CACHE_FALLBACK_CONCURRENCY` | `4` | 单实例展示查询回源 MySQL 的并发上限；等待相同结果的请求不占名额 |
 | `RAG_DOCUMENT_LOCK_MODE` | `mysql` | 文档长租约后端：`mysql`（默认，行为不变）或 `redis`。部署级开关，`rag-service`/`rag-document-worker`/`rag-mcp-ingest` 必须同值 |
 | `RAG_REDIS_LOCK_URL` | 空（回退 `RAG_REDIS_URL`） | 文档锁 Redis 地址；`redis` 模式解析不出 URL 时启动报错 |
 | `RAG_REDIS_LOCK_PREFIX` | `rag:lock:v1` | 锁键前缀；每个 namespace 一个 Hash：`<prefix>:{<sha256(namespace) 前 32 位>}:leases`，单键内多 field，兼容 Redis Cluster |
@@ -366,6 +371,10 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_RESULT_MAX_ARTIFACTS` | `100` | 每次搜索最多 artifact 数 |
 
 Redis 不可用时，持久读模型会回源状态库；搜索为同步直返，响应不写 Redis，artifact 以 MySQL `artifact_snapshots` 为事实来源并按 ID 独立读取，**清空 Redis 不影响搜索结果或已签发 artifact**。`RAG_RESULT_TTL_SECONDS` 到期后 MySQL artifact 被有界清理，再读取返回 410。
+
+**展示缓存熔断与回源限流**：Redis 持续超时/连接失败时，展示读取（文档列表、知识库列表、上传列表等读模型视图）按 `RAG_REDIS_BREAKER_THRESHOLD` 计数，达到阈值后熔断——后续展示请求**跳过 Redis 读写**、直接回源 MySQL，不再为每个请求支付一次 0.3 秒超时；一次读取已因可用性故障失败时，回源成功后也不回填这个故障后端。冷却（`RAG_REDIS_BREAKER_COOLDOWN_SECONDS`）到期后，每个实例只放**一个**请求探测 Redis（其他请求继续回源）：探测成功——包括 Redis 正常回答“key 不存在”——即恢复正常缓存；探测失败则重新冷却。熔断只统计可用性故障：单条缓存内容损坏只影响该条（由该请求回源修复）、调用方主动取消不计为 Redis 故障，均不触发熔断。`RAG_REDIS_ENABLED=false` 的部署继续沿用直读 MySQL 模式，不经过熔断器。
+
+回源 MySQL 前，请求先按完整的 `kind + scope`（例如“文档列表 + 某知识库”）合并：同一实例内并发查询同一知识库文档列表的请求共用一次数据库查询，等待者不占用额外名额；只有真正执行查询的请求才获取 `RAG_CACHE_FALLBACK_CONCURRENCY` 的一个名额——拿到名额才开启 MySQL 事务，额度已满时**立即**返回 503「服务繁忙，请稍后重试」（REST 沿用现有 `{"detail": ...}` 错误结构；MCP 走现有工具错误通道），不再排队、也不会在 runtime 再查一次。名额在查库结束时释放，不等 Redis 回填。正常缓存未命中与故障回源共用这道保护，多个列表集中过期时同样有效；Redis 命中则无需名额。名额按**实例**生效：多副本部署的总回源并发约为各实例额度之和，设置时请为上传、发布等写操作保留数据库余量。此约束只作用于前台展示读取；后台 `rag-cache-worker` 的失败补偿（`RefreshDirty`）是独立路径，不占用也不受此额度约束。Console 在刷新收到 503 时保留当前知识库上一次成功加载的列表并提示「刷新失败，当前显示上次加载的数据」；首次加载（或刚切换知识库）失败则显示错误与重试入口，不会把故障显示成「暂无文档」。
 
 **文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，`RAG_DOCUMENT_LOCK_MODE=redis` 时文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。默认 `mysql` 模式行为不变（`document_leases` 行 + 心跳续写 `expires_at`）；`redis` 模式只把长租约搬到 Redis，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询，展示读取可回源 MySQL。切换与回退见[部署指南](DEPLOYMENT.md) §13。
 

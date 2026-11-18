@@ -52,6 +52,15 @@ describe("canViewConsolePage", () => {
     // Legacy token-only mode has no account to own an entitlement.
     expect(canViewConsolePage("membership", false, undefined)).toBe(false);
   });
+
+  it("shows the user-group page to every signed-in account", () => {
+    // 所有账号都能查看自己创建或加入的组与自己的邀请；服务端决定
+    // 能否创建组或发邀请（vip/admin）。
+    for (const role of ["admin", "vip", "user"] as const) {
+      expect(canViewConsolePage("groups", true, role)).toBe(true);
+    }
+    expect(canViewConsolePage("groups", false, undefined)).toBe(false);
+  });
 });
 
 describe("parseInviteToken", () => {
@@ -88,8 +97,21 @@ describe("parseRoute", () => {
     expect(parseRoute("#/invite", "team")).toEqual({ namespace: "team", page: "invite" });
   });
 
+  it("parses the group-invite route with and without a token", () => {
+    expect(parseRoute("#/group-invite?token=g1", "default")).toEqual({
+      namespace: "default",
+      page: "group-invite",
+      token: "g1",
+    });
+    expect(parseRoute("#/group-invite", "team")).toEqual({ namespace: "team", page: "group-invite" });
+    expect(routeHash({ namespace: "team", page: "group-invite", token: "g1" })).toBe(
+      "#/group-invite?token=g1",
+    );
+    expect(routeHash({ namespace: "team", page: "group-invite" })).toBe("#/group-invite");
+  });
+
   it("parses the static Console pages", () => {
-    for (const page of ["api-keys", "membership", "model-profiles", "knowledge-bases", "users", "system-settings", "monitor", "permissions", "invitations"]) {
+    for (const page of ["api-keys", "membership", "model-profiles", "knowledge-bases", "users", "system-settings", "monitor", "permissions", "invitations", "groups"]) {
       expect(parseRoute("#/" + page, "default")).toEqual({ namespace: "default", page });
     }
   });

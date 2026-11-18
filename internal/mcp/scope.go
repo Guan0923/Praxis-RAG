@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -45,19 +46,29 @@ const (
 // scopeEnvelope is the compact wire form of access.ScopeSet used only inside the
 // process, between Handler.ServeHTTP and the SDK handlers.
 type scopeEnvelope struct {
-	WholeRead  bool     `json:"whole_read,omitempty"`
-	WholeWrite bool     `json:"whole_write,omitempty"`
-	Read       []string `json:"read,omitempty"`
-	Write      []string `json:"write,omitempty"`
+	WholeRead   bool     `json:"whole_read,omitempty"`
+	WholeWrite  bool     `json:"whole_write,omitempty"`
+	WholeUpdate bool     `json:"whole_update,omitempty"`
+	WholeDelete bool     `json:"whole_delete,omitempty"`
+	Read        []string `json:"read,omitempty"`
+	Write       []string `json:"write,omitempty"`
+	Update      []string `json:"update,omitempty"`
+	Delete      []string `json:"delete,omitempty"`
 }
 
-// encodeScopeHeader renders one scope for the internal request header.
+// encodeScopeHeader renders one scope for the internal request header. The
+// Write/Update/Delete lists keep their distinct meanings (full write,
+// update-only, delete-only) so the decoder can rebuild the exact sets.
 func encodeScopeHeader(scope access.ScopeSet) string {
 	envelope := scopeEnvelope{
-		WholeRead:  scope.WholeRead,
-		WholeWrite: scope.WholeWrite,
-		Read:       scope.ReadDocumentNames(),
-		Write:      scope.WriteDocumentNames(),
+		WholeRead:   scope.WholeRead,
+		WholeWrite:  scope.WholeWrite,
+		WholeUpdate: scope.WholeUpdate,
+		WholeDelete: scope.WholeDelete,
+		Read:        documentSetNames(scope.ReadDocuments),
+		Write:       documentSetNames(scope.WriteDocuments),
+		Update:      scope.UpdateDocumentNames(),
+		Delete:      scope.DeleteDocumentNames(),
 	}
 	encoded, err := json.Marshal(envelope)
 	if err != nil {
@@ -65,6 +76,19 @@ func encodeScopeHeader(scope access.ScopeSet) string {
 		return base64.RawURLEncoding.EncodeToString([]byte("{}"))
 	}
 	return base64.RawURLEncoding.EncodeToString(encoded)
+}
+
+// documentSetNames renders one document-name set, sorted.
+func documentSetNames(set map[string]struct{}) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(set))
+	for name := range set {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // decodeScopeHeader parses a header written by encodeScopeHeader. It reports
@@ -85,8 +109,12 @@ func decodeScopeHeader(value string) (access.ScopeSet, bool) {
 	scope := access.ScopeSet{
 		WholeRead:      envelope.WholeRead,
 		WholeWrite:     envelope.WholeWrite,
+		WholeUpdate:    envelope.WholeUpdate,
+		WholeDelete:    envelope.WholeDelete,
 		ReadDocuments:  make(map[string]struct{}, len(envelope.Read)),
 		WriteDocuments: make(map[string]struct{}, len(envelope.Write)),
+		UpdateDocuments: make(map[string]struct{}, len(envelope.Update)),
+		DeleteDocuments: make(map[string]struct{}, len(envelope.Delete)),
 	}
 	for _, name := range envelope.Read {
 		if name != "" {
@@ -96,6 +124,16 @@ func decodeScopeHeader(value string) (access.ScopeSet, bool) {
 	for _, name := range envelope.Write {
 		if name != "" {
 			scope.WriteDocuments[name] = struct{}{}
+		}
+	}
+	for _, name := range envelope.Update {
+		if name != "" {
+			scope.UpdateDocuments[name] = struct{}{}
+		}
+	}
+	for _, name := range envelope.Delete {
+		if name != "" {
+			scope.DeleteDocuments[name] = struct{}{}
 		}
 	}
 	return scope, true

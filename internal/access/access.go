@@ -73,23 +73,56 @@ const (
 	ScopeFiles      = state.InvitationScopeFiles
 )
 
+// Document permission bits, shared with the group grant contract: read=0001,
+// create=0010, update=0100, delete=1000. Personal grants keep the historical
+// read/write levels and map onto the same bits.
+const (
+	PermissionBitRead   = state.PermissionBitRead
+	PermissionBitCreate = state.PermissionBitCreate
+	PermissionBitUpdate = state.PermissionBitUpdate
+	PermissionBitDelete = state.PermissionBitDelete
+	PermissionMaskAll   = state.PermissionMaskAll
+)
+
+// IsValidAllowMask reports whether value is a non-empty subset of the four
+// permission bits.
+func IsValidAllowMask(value int) bool { return state.IsValidAllowMask(value) }
+
 // ScopeSet is the effective access of one account inside one knowledge base.
 type ScopeSet struct {
 	WholeRead      bool
 	WholeWrite     bool
 	ReadDocuments  map[string]struct{}
 	WriteDocuments map[string]struct{}
+	// WholeUpdate reports whether every document may be updated (replaced).
+	// A whole-library write grant implies it; a group grant can set it alone.
+	WholeUpdate bool
+	// WholeDelete reports whether every document may be deleted. A
+	// whole-library write grant implies it; a group grant can set it alone.
+	WholeDelete bool
+	// UpdateDocuments are the explicitly replaceable document names beyond
+	// WholeUpdate and the write set.
+	UpdateDocuments map[string]struct{}
+	// DeleteDocuments are the explicitly deletable document names beyond
+	// WholeDelete and the write set.
+	DeleteDocuments map[string]struct{}
 }
 
 // NewScopeSet returns an empty (no access) scope.
 func NewScopeSet() ScopeSet {
-	return ScopeSet{ReadDocuments: map[string]struct{}{}, WriteDocuments: map[string]struct{}{}}
+	return ScopeSet{
+		ReadDocuments:   map[string]struct{}{},
+		WriteDocuments:  map[string]struct{}{},
+		UpdateDocuments: map[string]struct{}{},
+		DeleteDocuments: map[string]struct{}{},
+	}
 }
 
 // fullScope is the owner/administrator scope: every document, read and write.
 func fullScope() ScopeSet {
 	return ScopeSet{WholeRead: true, WholeWrite: true,
-		ReadDocuments: map[string]struct{}{}, WriteDocuments: map[string]struct{}{}}
+		ReadDocuments: map[string]struct{}{}, WriteDocuments: map[string]struct{}{},
+		UpdateDocuments: map[string]struct{}{}, DeleteDocuments: map[string]struct{}{}}
 }
 
 // AllowsAnyRead reports whether the account may read anything in the knowledge
@@ -110,8 +143,8 @@ func (s ScopeSet) ReadsWhole() bool { return s.WholeRead || s.WholeWrite }
 // WritesWhole reports whether the account may modify every document.
 func (s ScopeSet) WritesWhole() bool { return s.WholeWrite }
 
-// Restricted reports whether reads must be limited to an explicit document set.
-func (s ScopeSet) Restricted() bool { return !s.ReadsWhole() }
+// CanCreate reports whether the account may create (upload) new documents.
+func (s ScopeSet) CanCreate() bool { return s.WholeWrite }
 
 // CanReadDocument reports whether one document name is readable.
 func (s ScopeSet) CanReadDocument(name string) bool {
@@ -121,27 +154,72 @@ func (s ScopeSet) CanReadDocument(name string) bool {
 	if _, ok := s.ReadDocuments[name]; ok {
 		return true
 	}
-	_, ok := s.WriteDocuments[name]
+	if _, ok := s.WriteDocuments[name]; ok {
+		return true
+	}
+	if _, ok := s.UpdateDocuments[name]; ok {
+		return true
+	}
+	_, ok := s.DeleteDocuments[name]
 	return ok
 }
 
-// CanWriteDocument reports whether one document name is writable.
+// CanWriteDocument reports whether one document name is writable (the union of
+// replace and delete rights).
 func (s ScopeSet) CanWriteDocument(name string) bool {
-	if s.WholeWrite {
+	return s.CanUpdateDocument(name) || s.CanDeleteDocument(name)
+}
+
+// CanUpdateDocument reports whether one document name may be replaced.
+func (s ScopeSet) CanUpdateDocument(name string) bool {
+	if s.WholeWrite || s.WholeUpdate {
 		return true
 	}
-	_, ok := s.WriteDocuments[name]
+	if _, ok := s.WriteDocuments[name]; ok {
+		return true
+	}
+	_, ok := s.UpdateDocuments[name]
+	return ok
+}
+
+// CanDeleteDocument reports whether one document name may be deleted.
+func (s ScopeSet) CanDeleteDocument(name string) bool {
+	if s.WholeWrite || s.WholeDelete {
+		return true
+	}
+	if _, ok := s.WriteDocuments[name]; ok {
+		return true
+	}
+	_, ok := s.DeleteDocuments[name]
 	return ok
 }
 
 // ReadDocumentNames returns the explicitly readable document names, sorted.
 func (s ScopeSet) ReadDocumentNames() []string {
-	names := make([]string, 0, len(s.ReadDocuments)+len(s.WriteDocuments))
+	seen := make(map[string]struct{}, len(s.ReadDocuments)+len(s.WriteDocuments)+
+		len(s.UpdateDocuments)+len(s.DeleteDocuments))
+	names := make([]string, 0, len(seen))
 	for name := range s.ReadDocuments {
-		names = append(names, name)
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
 	}
 	for name := range s.WriteDocuments {
-		if _, ok := s.ReadDocuments[name]; !ok {
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	for name := range s.UpdateDocuments {
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	for name := range s.DeleteDocuments {
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
 			names = append(names, name)
 		}
 	}
@@ -151,12 +229,91 @@ func (s ScopeSet) ReadDocumentNames() []string {
 
 // WriteDocumentNames returns the explicitly writable document names, sorted.
 func (s ScopeSet) WriteDocumentNames() []string {
-	names := make([]string, 0, len(s.WriteDocuments))
+	seen := make(map[string]struct{}, len(s.WriteDocuments)+len(s.UpdateDocuments)+len(s.DeleteDocuments))
+	names := make([]string, 0, len(seen))
 	for name := range s.WriteDocuments {
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	for name := range s.UpdateDocuments {
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	for name := range s.DeleteDocuments {
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// AllowsCreate reports whether at least one whole-library source allows
+// creating documents (upload). Only the unified entry merges this; legacy
+// file-level write keeps replacing only.
+func (s ScopeSet) AllowsCreate() bool { return s.WholeWrite }
+
+// UpdateDocumentNames returns the explicitly replaceable document names,
+// sorted.
+func (s ScopeSet) UpdateDocumentNames() []string {
+	names := make([]string, 0, len(s.UpdateDocuments))
+	for name := range s.UpdateDocuments {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	return names
+}
+
+// DeleteDocumentNames returns the explicitly deletable document names, sorted.
+func (s ScopeSet) DeleteDocumentNames() []string {
+	names := make([]string, 0, len(s.DeleteDocuments))
+	for name := range s.DeleteDocuments {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// Restricted reports whether reads must be limited to an explicit document set.
+func (s ScopeSet) Restricted() bool { return !s.ReadsWhole() }
+
+// DocumentAllowMask returns the group-merged allow bits of one document: the
+// union of every whole-library bit and this document's file-level bits.
+func (s ScopeSet) DocumentAllowMask(name string) int {
+	mask := 0
+	if s.WholeRead {
+		mask |= PermissionBitRead
+	}
+	if s.WholeWrite {
+		mask |= PermissionBitRead | PermissionBitCreate | PermissionBitUpdate | PermissionBitDelete
+	}
+	if s.WholeUpdate {
+		mask |= PermissionBitUpdate
+	}
+	if s.WholeDelete {
+		mask |= PermissionBitDelete
+	}
+	if name == "" {
+		return mask
+	}
+	if _, ok := s.ReadDocuments[name]; ok {
+		mask |= PermissionBitRead
+	}
+	if _, ok := s.WriteDocuments[name]; ok {
+		mask |= PermissionBitRead | PermissionBitUpdate | PermissionBitDelete
+	}
+	if _, ok := s.UpdateDocuments[name]; ok {
+		mask |= PermissionBitUpdate
+	}
+	if _, ok := s.DeleteDocuments[name]; ok {
+		mask |= PermissionBitDelete
+	}
+	return mask
 }
 
 // EntitlementProvider reports whether an account's current personal membership
@@ -188,6 +345,11 @@ type Service struct {
 	entitlements   EntitlementProvider
 	now            func() time.Time
 	invitationTTL  time.Duration
+
+	groups     *state.UserGroupRepository
+	members    *state.UserGroupMemberRepository
+	groupInvites *state.GroupInvitationRepository
+	groupPerms   *state.KBGroupPermissionRepository
 }
 
 // NewService builds the access service on the shared state stores.
@@ -200,7 +362,7 @@ func NewService(stores *state.Stores, options Options) *Service {
 	if ttl <= 0 {
 		ttl = 7 * 24 * time.Hour
 	}
-	return &Service{
+	service := &Service{
 		users:          stores.Users,
 		knowledgeBases: stores.KnowledgeBases,
 		permissions:    stores.Permissions,
@@ -210,6 +372,13 @@ func NewService(stores *state.Stores, options Options) *Service {
 		now:            clock,
 		invitationTTL:  ttl,
 	}
+	if stores.UserGroups != nil {
+		service.groups = stores.UserGroups
+		service.members = stores.UserGroupMembers
+		service.groupInvites = stores.GroupInvitations
+		service.groupPerms = stores.GroupPermissions
+	}
+	return service
 }
 
 // CanShareAccount reports whether the account may issue new share invitations:
@@ -270,7 +439,8 @@ func (s *Service) CanManage(ctx context.Context, user state.User, namespace stri
 
 // ScopeSet computes the effective access of one account inside one knowledge
 // base. Administrators and owners get full access; everyone else gets the union
-// of their grants.
+// of their personal grants and, through their current effective memberships,
+// the allow bits of every group grant.
 func (s *Service) ScopeSet(ctx context.Context, user state.User, namespace string) (ScopeSet, error) {
 	if !user.Enabled {
 		return NewScopeSet(), nil
@@ -306,7 +476,84 @@ func (s *Service) ScopeSet(ctx context.Context, user state.User, namespace strin
 			scope.ReadDocuments[grant.DocumentName] = struct{}{}
 		}
 	}
+	// Group allow bits: every current effective membership contributes its
+	// whole-library and per-document masks, all merged by union.
+	groupScope, err := s.groupScope(ctx, user.ID, namespace)
+	if err != nil {
+		return NewScopeSet(), err
+	}
+	scope = scope.mergedWithGroup(groupScope)
 	return scope, nil
+}
+
+// mergedWithGroup unions one group-merged allow-mask view into a personal
+// scope and returns the result.
+func (s ScopeSet) mergedWithGroup(group DocumentMaskScope) ScopeSet {
+	if group.WholeMask&PermissionBitRead != 0 {
+		s.WholeRead = true
+	}
+	if group.WholeMask&PermissionBitCreate != 0 {
+		// create only ever applies at whole-library level; it also implies
+		// whole update/delete for the unified entry (a whole-write grant
+		// keeps the historical meaning).
+		s.WholeWrite = true
+	}
+	if group.WholeMask&PermissionBitUpdate != 0 {
+		s.WholeUpdate = true
+	}
+	if group.WholeMask&PermissionBitDelete != 0 {
+		s.WholeDelete = true
+	}
+	for name, mask := range group.Documents {
+		if mask&PermissionBitRead != 0 {
+			s.ReadDocuments[name] = struct{}{}
+		}
+		if mask&PermissionBitUpdate != 0 {
+			s.UpdateDocuments[name] = struct{}{}
+		}
+		if mask&PermissionBitDelete != 0 {
+			s.DeleteDocuments[name] = struct{}{}
+		}
+	}
+	return s
+}
+
+// DocumentMaskScope is the group contribution to one namespace: the whole-
+// library allow bits and per-document allow bits of every applicable group
+// rule.
+type DocumentMaskScope struct {
+	WholeMask int
+	Documents map[string]int
+}
+
+// groupScope reads the group rules of one account inside one knowledge base.
+// Only active memberships participate: leaving, being removed, having a group
+// authorization revoked, or dissolving the group removes its contribution from
+// the next request on.
+func (s *Service) groupScope(ctx context.Context, userID, namespace string) (DocumentMaskScope, error) {
+	group := DocumentMaskScope{Documents: map[string]int{}}
+	if s.groups == nil || s.groupPerms == nil || s.members == nil {
+		return group, nil
+	}
+	groupIDs, err := s.members.ActiveGroupIDsForUser(ctx, userID)
+	if err != nil {
+		return group, err
+	}
+	if len(groupIDs) == 0 {
+		return group, nil
+	}
+	grants, err := s.groupPerms.ListForGroups(ctx, namespace, groupIDs)
+	if err != nil {
+		return group, err
+	}
+	for _, grant := range grants {
+		if grant.DocumentName == "" {
+			group.WholeMask |= grant.AllowMask
+			continue
+		}
+		group.Documents[grant.DocumentName] |= grant.AllowMask
+	}
+	return group, nil
 }
 
 // CanShareKnowledgeBase reports whether the account may create invitations and
@@ -373,6 +620,24 @@ func (s *Service) VisibleNamespaces(ctx context.Context, user state.User) ([]str
 	}
 	for _, grant := range grants {
 		visible[grant.Namespace] = struct{}{}
+	}
+	// A group grant makes every granted namespace visible to its current
+	// members: the account sees and can use the knowledge base even without a
+	// personal grant.
+	if s.members != nil && s.groupPerms != nil {
+		groupIDs, err := s.members.ActiveGroupIDsForUser(ctx, user.ID)
+		if err != nil {
+			return nil, err
+		}
+		if len(groupIDs) > 0 {
+			namespaces, err := s.groupPerms.NamespacesForGroups(ctx, groupIDs)
+			if err != nil {
+				return nil, err
+			}
+			for _, namespace := range namespaces {
+				visible[namespace] = struct{}{}
+			}
+		}
 	}
 	names := make([]string, 0, len(visible))
 	for _, namespace := range all {

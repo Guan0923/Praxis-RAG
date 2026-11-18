@@ -77,6 +77,14 @@ func NewCachedReadViews(stores *Stores) *CachedReadViews {
 func (v *CachedReadViews) getOrLoad(ctx context.Context, kind, scope string) (any, error) {
 	value, err := v.stores.CacheSync.GetOrLoad(ctx, kind, scope)
 	if err != nil {
+		// The display-query fallback budget being exhausted must stay
+		// recognizable all the way to REST/MCP: retrying it against MySQL
+		// elsewhere is exactly what the guard refuses to allow. Every other
+		// error keeps its existing sanitized business semantics.
+		var backpressure *ViewBackpressureError
+		if errors.As(err, &backpressure) {
+			return nil, err
+		}
 		var stateErr *StateError
 		if errors.As(err, &stateErr) {
 			return nil, err
@@ -670,7 +678,7 @@ func (v *CachedReadViews) UploadOperation(ctx context.Context, namespace, operat
 // uploadBloomGate builds the cache-miss guard for one operation ID. A nil
 // guard (no filter, or reads not gated in this process) keeps the historical
 // behavior.
-func (v *CachedReadViews) uploadBloomGate(operationID string) cacheMissGuard {
+func (v *CachedReadViews) uploadBloomGate(operationID string) cacheMissGate {
 	filter := v.stores.UploadBloom
 	if filter == nil || !filter.Settings().GatesReads() {
 		return nil

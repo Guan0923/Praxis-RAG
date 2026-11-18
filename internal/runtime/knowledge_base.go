@@ -32,6 +32,9 @@ const genericKnowledgeBaseMessage = "知识库操作失败，请稍后重试"
 func (s *Service) ListKnowledgeBases(ctx context.Context) ([]map[string]any, error) {
 	items, err := s.stores.Views.KnowledgeBases(ctx)
 	if err != nil {
+		if state.IsViewBackpressure(err) {
+			return nil, err
+		}
 		return nil, &apierrors.KnowledgeError{Message: "知识库列表读取失败"}
 	}
 	return items, nil

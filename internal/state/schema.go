@@ -657,6 +657,72 @@ var schemaTables = []*SchemaTable{
 			index("ix_kb_invitations_namespace", "namespace"),
 		},
 	},
+	// user_groups, user_group_members, user_group_invitations and
+	// kb_group_permissions back the user-group feature: a vip/admin account may
+	// create groups, invite enabled members through digest-only link tokens,
+	// and grant whole-library or per-document allow bits to a group. The group
+	// owner administers members/invitations; membership and grants are the only
+	// inputs of the group permission merge.
+	{
+		Name: "user_groups",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("name", 100),
+			identifier("owner_user_id", 32),
+			identifier("status", 16),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+			varchar("dissolved_at", 40).Null(),
+		},
+		Indexes: []SchemaIndex{index("ix_user_groups_owner", "owner_user_id")},
+	},
+	{
+		Name: "user_group_members",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("group_id", 32),
+			identifier("user_id", 32),
+			varchar("joined_at", 40),
+			varchar("created_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_user_group_members_pair", "group_id", "user_id")},
+		Indexes: []SchemaIndex{index("ix_user_group_members_user", "user_id")},
+	},
+	{
+		Name: "user_group_invitations",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("group_id", 32),
+			identifier("inviter_user_id", 32),
+			identifier("invitee_user_id", 32),
+			identifier("token_digest", 64),
+			identifier("status", 16),
+			varchar("created_at", 40),
+			varchar("expires_at", 40),
+			varchar("accepted_at", 40).Null(),
+			varchar("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_user_group_invitations_token_digest", "token_digest")},
+		Indexes: []SchemaIndex{
+			index("ix_user_group_invitations_invitee", "invitee_user_id"),
+			index("ix_user_group_invitations_group", "group_id"),
+		},
+	},
+	{
+		Name: "kb_group_permissions",
+		Columns: []SchemaColumn{
+			identifier("id", 32).PK(),
+			identifier("namespace", 64),
+			identifier("group_id", 32),
+			identifier("document_name", 200),
+			integer("allow_mask"),
+			identifier("granted_by", 32),
+			varchar("created_at", 40),
+			varchar("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_kb_group_permissions_scope", "namespace", "group_id", "document_name")},
+		Indexes: []SchemaIndex{index("ix_kb_group_permissions_group", "group_id")},
+	},
 	// model_profiles is a Console-only registry of reusable model
 	// configurations (Embedding / Reranker / VLM / JEV). A knowledge base
 	// still stores its own copy of the

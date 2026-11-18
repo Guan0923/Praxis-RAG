@@ -58,6 +58,7 @@ import { ProfileModal } from "./ProfileModal";
 import { SystemSettingsPage } from "./SystemSettingsPage";
 import { UsersPage } from "./UsersPage";
 import { InvitationsPage, InvitePage } from "./InvitationsPage";
+import { GroupsPage, GroupInvitePage } from "./GroupsPage";
 import { MembershipPage } from "./MembershipPage";
 import { PermissionsPage } from "./PermissionsPage";
 import {
@@ -75,6 +76,7 @@ const pages = [
   { key: "documents", label: "知识文档", icon: <DatabaseOutlined /> },
   { key: "create", label: "创建知识库", icon: <ApiOutlined /> },
   { key: "permissions", label: "权限管理", icon: <SafetyOutlined /> },
+  { key: "groups", label: "用户组", icon: <TeamOutlined /> },
   { key: "api-keys", label: "API Key", icon: <KeyOutlined /> },
   { key: "membership", label: "会员与用量", icon: <CrownOutlined /> },
   { key: "model-profiles", label: "模型配置", icon: <AppstoreOutlined /> },
@@ -293,15 +295,18 @@ export function Console({
 
   // Keep the raw invitation token while the visitor authenticates: the login
   // screen replaces the console but the token must survive until preview runs.
+  // Group invitations share the same session-storage slot (one pending link
+  // at a time).
   useEffect(() => {
     if (route.page === "invite" && route.token) storeInviteToken(route.token);
+    if (route.page === "group-invite" && route.token) storeInviteToken(route.token);
   }, [route.page, route.token]);
 
   useEffect(() => {
     if (!sessionMode || !authUser) return;
-    if (route.page !== "invite" || route.token) return;
+    if ((route.page !== "invite" && route.page !== "group-invite") || route.token) return;
     const token = readStoredInviteToken();
-    if (token) navigate({ namespace, page: "invite", token }, true);
+    if (token) navigate({ namespace, page: route.page === "invite" ? "invite" : "group-invite", token }, true);
   }, [sessionMode, authUser, route.page, route.token, namespace, navigate]);
 
   // A page this account may not view redirects to the search page; the rule is
@@ -778,6 +783,19 @@ export function Console({
                 void workspaces.reload();
               }}
               onBack={() => navigate({ namespace, page: "invitations" })}
+            />
+          )}
+          {view === "groups" && (!sessionMode || authUser) && (
+            <GroupsPage
+              role={authUser?.role || "user"}
+              onOpenInvite={(next) => navigate({ namespace, page: "group-invite", token: next })}
+            />
+          )}
+          {view === "group-invite" && (
+            <GroupInvitePage
+              token={route.token || readStoredInviteToken() || undefined}
+              onHandled={() => setInboxRevision((value) => value + 1)}
+              onBack={() => navigate({ namespace, page: "groups" })}
             />
           )}
           <section hidden={view !== "create"} aria-label="创建知识库页面">

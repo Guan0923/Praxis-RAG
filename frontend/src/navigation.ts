@@ -15,7 +15,9 @@ export type ConsolePage =
   | "monitor"
   | "permissions"
   | "invitations"
-  | "invite";
+  | "groups"
+  | "invite"
+  | "group-invite";
 export type ConsoleRoute = {
   namespace: string;
   page: ConsolePage;
@@ -47,6 +49,11 @@ export function canViewConsolePage(
     // Every signed-in owner may review and revoke existing sharing, including
     // after a paid membership expires. The server still decides whether the
     // account may create new invitations (admin/vip or active Plus/Pro).
+    return sessionMode && Boolean(role);
+  }
+  // 用户组：所有账号都可以查看自己创建或加入的组与自己的邀请；服务端
+  // 决定当前账号能否创建组或发邀请（vip/admin）。
+  if (page === "groups") {
     return sessionMode && Boolean(role);
   }
   // Membership entitlements belong to one Console account. Legacy token-only
@@ -111,6 +118,12 @@ export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRout
         ? { namespace: fallbackNamespace, page: "invite", token }
         : { namespace: fallbackNamespace, page: "invite" };
     }
+    if (hash === "#/group-invite" || hash.startsWith("#/group-invite?")) {
+      const token = hash.includes("token=") ? parseInviteToken(hash) : "";
+      return token
+        ? { namespace: fallbackNamespace, page: "group-invite", token }
+        : { namespace: fallbackNamespace, page: "group-invite" };
+    }
     if (
       hash === "#/api-keys" ||
       hash === "#/membership" ||
@@ -120,7 +133,8 @@ export function parseRoute(hash: string, fallbackNamespace: string): ConsoleRout
       hash === "#/system-settings" ||
       hash === "#/monitor" ||
       hash === "#/permissions" ||
-      hash === "#/invitations"
+      hash === "#/invitations" ||
+      hash === "#/groups"
     ) {
       return { namespace: fallbackNamespace, page: hash.slice(2) as ConsolePage };
     }
@@ -166,11 +180,14 @@ export function routeHash(route: ConsoleRoute) {
     route.page === "system-settings" ||
     route.page === "monitor" ||
     route.page === "permissions" ||
-    route.page === "invitations"
+    route.page === "invitations" ||
+    route.page === "groups"
   )
     return "#/" + route.page;
   if (route.page === "invite")
     return route.token ? `#/invite?token=${encodeURIComponent(route.token)}` : "#/invite";
+  if (route.page === "group-invite")
+    return route.token ? `#/group-invite?token=${encodeURIComponent(route.token)}` : "#/group-invite";
   const base = `#/workspaces/${route.page}`;
   return route.page === "documents" && route.documentName !== undefined
     ? `${base}/${encodeURIComponent(route.documentName)}` : base;

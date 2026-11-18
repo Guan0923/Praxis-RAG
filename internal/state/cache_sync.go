@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Guan0923/Praxis-RAG/internal/logging"
 )
 
 // ViewLoader loads one read-model value using only the supplied querier, which
 // is the transaction holding the revision latch during a cache miss/refresh.
-type ViewLoader func(ctx context.Context, querier viewQuerier, scope string) (any, error)
+type ViewLoader func(ctx context.Context, querier ViewQuerier, scope string) (any, error)
 
 // viewQuerier is implemented by *sql.DB and *sql.Tx.
 type viewQuerier interface {
@@ -21,6 +22,10 @@ type viewQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
+
+// ViewQuerier is the exported alias of the loader querier so directed tests in
+// other packages can register their own (for example blockable) loaders.
+type ViewQuerier = viewQuerier
 
 // defaultCacheDirtyLimit bounds one dirty-key retry sweep.
 const defaultCacheDirtyLimit = 100
@@ -39,6 +44,15 @@ type CacheSynchronizer struct {
 	Backend StateCache
 
 	loaders map[string]ViewLoader
+
+	// clock is the test seam for the display-cache breaker cooldown; production
+	// leaves it nil and uses time.Now. It must be set before the first read.
+	clock func() time.Time
+	// setupMu guards the lazy construction of breaker/guard so tests can
+	// override Settings after New() but before the first display read.
+	setupMu sync.Mutex
+	breaker *cacheBreaker
+	guard   *fallbackGuard
 
 	closeMu sync.Mutex
 	closed  bool
@@ -81,57 +95,123 @@ func (c *CacheSynchronizer) Loader(kind string) (ViewLoader, bool) {
 
 // GetOrLoad implements the read-through cache-miss path: a hit returns directly;
 // a miss/unavailable cache takes a revision-latched consistent snapshot.
+//
+// The display fallback is protected in two steps, in this order: concurrent
+// fallbacks for the same kind+scope are merged into one query, and only the
+// merged query needs one of the instance-level fallback slots (see
+// cache_guard.go). While the display-cache breaker is open, the Redis read and
+// the backfill are both skipped so the request does not pay a socket timeout
+// on a backend known to be down; a read that already failed on an availability
+// fault also skips the backfill after its fallback succeeds. A deployment with
+// the cache explicitly disabled keeps the original direct-read mode.
 func (c *CacheSynchronizer) GetOrLoad(ctx context.Context, kind, scope string) (any, error) {
 	return c.GetOrLoadGuarded(ctx, kind, scope, nil)
 }
 
-// cacheMissGuard answers one question for a cache miss: may the loader consult
+// cacheMissGate answers one question for a cache miss: may the loader consult
 // MySQL? It returns false only when the scope is provably absent without the
 // database (the upload bloom filter's "definitely absent" answer). Every error
-// or uncertainty inside the guard must resolve to true so the original query
+// or uncertainty inside the gate must resolve to true so the original query
 // path is preserved.
-type cacheMissGuard func(ctx context.Context) bool
+type cacheMissGate func(ctx context.Context) bool
 
-// GetOrLoadGuarded is GetOrLoad with an optional miss guard: after a cache
-// miss (or an unavailable cache backend) and before the MySQL snapshot, the
-// guard can decline the load. A declined load returns (nil, nil) without
-// writing the cache, so the answer stays per-request and MySQL remains the
-// authority.
-func (c *CacheSynchronizer) GetOrLoadGuarded(ctx context.Context, kind, scope string, guard cacheMissGuard) (any, error) {
+// GetOrLoadGuarded is GetOrLoad with an optional miss gate: after a cache miss
+// (or an unavailable cache backend) and before the MySQL fallback, the gate can
+// decline the load. A declined load returns (nil, nil) without writing the
+// cache and without joining the single-flight fallback group, so the answer
+// stays per-request and MySQL remains the authority. The gate is consulted
+// while the display-cache breaker may be open; a gate whose own backend is
+// unavailable must answer true (fall back), which the upload bloom filter's
+// DefinitelyAbsent already guarantees.
+func (c *CacheSynchronizer) GetOrLoadGuarded(ctx context.Context, kind, scope string, missGate cacheMissGate) (any, error) {
 	loader, ok := c.loaders[kind]
 	if !ok {
 		return nil, fmt.Errorf("Unknown state cache kind %q", kind)
 	}
 	if !c.Enabled() {
-		if guard != nil && !guard(ctx) {
+		if missGate != nil && !missGate(ctx) {
 			return nil, nil
 		}
 		return loader(ctx, c.stores.DB, scope)
 	}
-	hit, cached, err := c.Backend.Get(ctx, kind, scope)
-	if err == nil && hit {
-		return cached, nil
-	}
-	if err != nil {
-		var unavailable *CacheUnavailable
-		if !errors.As(err, &unavailable) {
-			return nil, err
+	breaker, guard := c.displayProtections()
+	readAllowed, probe := breaker.allowRead()
+	backfill := true
+	if readAllowed {
+		hit, cached, err := c.Backend.Get(ctx, kind, scope)
+		if err == nil {
+			breaker.recordReadResult(nil, probe)
+			if hit {
+				return cached, nil
+			}
+		} else {
+			var unavailable *CacheUnavailable
+			if !errors.As(err, &unavailable) {
+				// Unexpected backend error: record the read first so a
+				// half-open probe cannot wedge, then keep the historical
+				// contract and abort the request.
+				breaker.recordReadResult(err, probe)
+				return nil, err
+			}
+			breaker.recordReadResult(err, probe)
+			if unavailable.AvailabilityFailure() {
+				// The backend could not answer this read; after the fallback
+				// succeeds, do not backfill the backend that just failed.
+				backfill = false
+			}
+			// A corrupt single entry (repaired by this request's backfill) and
+			// a caller cancellation do not change the backfill decision.
 		}
+	} else {
+		// Circuit open (or half-open with another probe in flight): skip the
+		// Redis read and the backfill, go straight to the gated fallback.
+		backfill = false
 	}
-	if guard != nil && !guard(ctx) {
+	// The miss gate runs after the cache miss and before the fallback group:
+	// a scope provably absent (the upload bloom filter) neither joins the
+	// single-flight fallback nor occupies one of its concurrency slots.
+	if missGate != nil && !missGate(ctx) {
 		return nil, nil
 	}
-	revision, value, err := c.snapshot(ctx, kind, scope, loader)
+	var revision int64
+	value, err, executed := guard.execute(ctx, callKey{kind: kind, scope: scope}, func(runCtx context.Context) (any, error) {
+		loadedRevision, loaded, loadErr := c.snapshot(runCtx, kind, scope, loader)
+		if loadErr == nil {
+			revision = loadedRevision
+		}
+		return loaded, loadErr
+	})
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.Backend.Put(ctx, kind, scope, revision, value, value == nil); err != nil {
-		var unavailable *CacheUnavailable
-		if !errors.As(err, &unavailable) {
-			return nil, err
+	// Only the caller whose query ran (the leader) observed the loaded
+	// revision; waiters reuse its result without a second backfill.
+	if backfill && executed {
+		if _, err := c.Backend.Put(ctx, kind, scope, revision, value, value == nil); err != nil {
+			var unavailable *CacheUnavailable
+			if !errors.As(err, &unavailable) {
+				return nil, err
+			}
 		}
 	}
 	return value, nil
+}
+
+// displayProtections lazily builds the display-cache breaker and fallback guard
+// from the current settings. Building on first use lets tests (and operators
+// wiring Stores by hand) override Settings after construction but before the
+// first display read.
+func (c *CacheSynchronizer) displayProtections() (*cacheBreaker, *fallbackGuard) {
+	c.setupMu.Lock()
+	defer c.setupMu.Unlock()
+	if c.breaker == nil {
+		cooldown := time.Duration(c.Settings.BreakerCooldownSeconds) * time.Second
+		c.breaker = newCacheBreaker(c.Settings.BreakerThreshold, cooldown, c.clock)
+	}
+	if c.guard == nil {
+		c.guard = newFallbackGuard(c.Settings.FallbackConcurrency)
+	}
+	return c.breaker, c.guard
 }
 
 // snapshot locks the revision before the first consistent read. Writers acquire
