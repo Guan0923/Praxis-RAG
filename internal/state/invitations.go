@@ -159,6 +159,56 @@ func (r *InvitationRepository) SetStatus(ctx context.Context, id, status, accept
 	return changed > 0, nil
 }
 
+// AcceptPending turns one pending invitation into effective grants inside a
+// single transaction: the status flip matches only a pending row and the
+// grants are written in the same commit, so either both the grants and the
+// accepted status land together, or neither does. A row that was
+// concurrently declined, revoked or already accepted keeps its grants
+// untouched. acceptedAt may be empty. The returned invitation is the row's
+// final state; nil means the row no longer exists.
+func (r *InvitationRepository) AcceptPending(ctx context.Context, id, acceptedAt string, grants []Permission) (*Invitation, error) {
+	transaction, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, newStateError("邀请无法更新")
+	}
+	defer func() { _ = transaction.Rollback() }()
+	var accepted any
+	if acceptedAt != "" {
+		accepted = acceptedAt
+	}
+	result, err := transaction.ExecContext(ctx,
+		"UPDATE kb_invitations SET status = ?, accepted_at = COALESCE(?, accepted_at), updated_at = ? "+
+			"WHERE id = ? AND status = ?",
+		InvitationAccepted, accepted, nowISO(), id, InvitationPending)
+	if err != nil {
+		return nil, newStateError("邀请无法更新")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return nil, newStateError("邀请无法更新")
+	}
+	if changed > 0 {
+		timestamp := nowISO()
+		for _, grant := range grants {
+			if err := upsertPermissionRow(ctx, transaction, grant, timestamp); err != nil {
+				return nil, err
+			}
+		}
+	}
+	final, err := scanInvitation(transaction.QueryRowContext(ctx,
+		"SELECT "+invitationColumns+" FROM kb_invitations WHERE id = ?", id))
+	if err != nil {
+		return nil, err
+	}
+	if changed == 0 {
+		return final, nil
+	}
+	if err := transaction.Commit(); err != nil {
+		return nil, newStateError("邀请无法更新")
+	}
+	return final, nil
+}
+
 // RevokePending marks every pending invitation of one invitee in one knowledge
 // base as revoked, so re-inviting a user invalidates older links.
 func (r *InvitationRepository) RevokePending(ctx context.Context, namespace, inviteeUserID string) (int64, error) {
