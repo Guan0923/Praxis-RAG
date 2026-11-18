@@ -15,8 +15,9 @@ import (
 )
 
 // DOCConverter converts legacy .doc files to .docx through an external
-// converter. It mirrors the contextmanager in rag_mcp.word_converter: the
-// caller receives the converted path plus a cleanup function.
+// converter so the Docling parse service can ingest them. It mirrors the
+// contextmanager in rag_mcp.word_converter: the caller receives the converted
+// path plus a cleanup function.
 type DOCConverter interface {
 	Convert(ctx context.Context, source string) (converted string, cleanup func(), err error)
 }
@@ -168,35 +169,4 @@ func lastRunes(text string, n int) string {
 		return text
 	}
 	return string(runes[len(runes)-n:])
-}
-
-// docxDocument mirrors document_readers._docx_blocks: legacy conversion when
-// needed, archive validation, parse, then the Python error wrapping semantics.
-func (r *Reader) docxDocument(ctx context.Context, resolved, name, suffix string) ([]Block, string, error) {
-	source := resolved
-	if suffix == SuffixDOC {
-		converter := r.DOC
-		if converter == nil {
-			converter = &SofficeConverter{}
-		}
-		converted, cleanup, err := converter.Convert(ctx, resolved)
-		if err != nil {
-			return nil, "", readErrf("Word 解析失败：%s；%v", name, err)
-		}
-		if cleanup != nil {
-			defer cleanup()
-		}
-		source = converted
-	}
-	pkg, err := ParseWordPackage(source)
-	if err != nil {
-		// Validation errors are already DocumentReadError equivalents and
-		// propagate unchanged, like document_readers._docx_blocks.
-		if _, ok := AsReadError(err); ok {
-			return nil, "", err
-		}
-		return nil, "", readErrf("Word 解析失败：%s；%v", name, err)
-	}
-	blocks := pkg.Manifest.DocumentBlocks()
-	return blocks, joinDOCX(blocks), nil
 }

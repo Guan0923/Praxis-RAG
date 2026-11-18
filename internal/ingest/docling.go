@@ -22,17 +22,18 @@ type DoclingParser interface {
 	ParseInto(ctx context.Context, sourcePath, sourceName, stagingDir string) (*document.WordPackage, error)
 }
 
-// DoclingOptions selects the Docling service for Word and static HTML parsing.
-// When Parser is nil, DOCX keeps the in-process OOXML parser and HTML import
-// fails with a configuration error; DOC conversion is unchanged.
+// DoclingOptions selects the Docling service, the only Word/HTML parser.
+// When Parser is nil every DOC/DOCX/HTML import fails with
+// ErrDoclingNotConfigured; the runtime injects the service client whenever
+// RAG_DOCLING_SERVICE_URL is configured.
 type DoclingOptions struct {
-	// Parser calls the Docling service. nil disables the Docling path.
+	// Parser calls the Docling service. nil disables the Word/HTML path.
 	Parser DoclingParser
 }
 
-// ErrDoclingNotConfigured marks an HTML import without a configured Docling
-// parser; callers can map it to their validation error type.
-var ErrDoclingNotConfigured = fmt.Errorf("HTML 文档需要配置 Docling 解析服务")
+// ErrDoclingNotConfigured marks a Word or HTML import without a configured
+// Docling parser; callers can map it to their validation error type.
+var ErrDoclingNotConfigured = fmt.Errorf("Word/HTML 文档需要配置 Docling 解析服务")
 
 // prepareDocling parses .docx, .doc (after LibreOffice conversion) and
 // .html/.htm through the Docling service, then reuses the Word asset/chunk

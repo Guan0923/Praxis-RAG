@@ -96,7 +96,7 @@ func TestMissingFileErrors(t *testing.T) {
 	}
 	missingDOCX := filepath.Join(t.TempDir(), "missing.docx")
 	_, err = ReadText(missingDOCX)
-	if err == nil || err.Error() != "Word 文件损坏或格式无效：missing.docx" {
+	if err == nil || err.Error() != "Word 文档需要通过 Docling 解析服务导入：missing.docx" {
 		t.Fatalf("missing docx error = %v", err)
 	}
 	missingPDF := filepath.Join(t.TempDir(), "missing.pdf")

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"image"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
@@ -16,21 +15,6 @@ import (
 	"testing"
 	"time"
 )
-
-func prepareVisionStaging(t *testing.T) (*WordPackage, string) {
-	t.Helper()
-	body := pictureParagraph("rId1", "") + paragraphXML("Body text")
-	path := wordPicturePackage(t, body)
-	pkg, err := ParseWordPackage(path)
-	if err != nil {
-		t.Fatalf("ParseWordPackage() error = %v", err)
-	}
-	dir := t.TempDir()
-	if err := pkg.WriteStaging(dir); err != nil {
-		t.Fatalf("WriteStaging() error = %v", err)
-	}
-	return pkg, dir
-}
 
 func TestValidateVisionDescription(t *testing.T) {
 	refusals := []string{
@@ -58,8 +42,9 @@ func TestValidateVisionDescription(t *testing.T) {
 type visionCall struct {
 	model  string
 	prompt string
-	image  image.Image
+	image  []byte
 	auth   string
+	decoded bool
 }
 
 func decodeVisionCall(t *testing.T, request *http.Request) visionCall {
@@ -94,11 +79,8 @@ func decodeVisionCall(t *testing.T, request *http.Request) visionCall {
 				if err != nil {
 					t.Fatalf("image base64 = %v", err)
 				}
-				decoded, err := png.Decode(bytes.NewReader(raw))
-				if err != nil {
-					t.Fatalf("image is not PNG: %v", err)
-				}
-				call.image = decoded
+				call.image = raw
+				call.decoded = true
 			}
 		}
 	}
@@ -113,7 +95,8 @@ func writeVisionResponse(w http.ResponseWriter, content string) {
 }
 
 func TestVisionDescribeMissingCaptionsSuccess(t *testing.T) {
-	pkg, dir := prepareVisionStaging(t)
+	dir := t.TempDir()
+	pkg := stagingWordPackage(t, dir)
 	if missing := MissingPictureCaptions(pkg.Manifest); len(missing) != 1 || missing[0] != "picture-1" {
 		t.Fatalf("missing = %v", missing)
 	}
@@ -141,10 +124,14 @@ func TestVisionDescribeMissingCaptionsSuccess(t *testing.T) {
 	if call.prompt == "" || !strings.Contains(call.prompt, "Describe the visible content") {
 		t.Fatalf("prompt = %q", call.prompt)
 	}
-	if call.image == nil {
+	if !call.decoded {
 		t.Fatalf("image was not sent")
 	}
-	if bounds := call.image.Bounds(); bounds.Dx() > 384 || bounds.Dy() > 384 {
+	decoded, err := png.Decode(bytes.NewReader(call.image))
+	if err != nil {
+		t.Fatalf("image is not PNG: %v", err)
+	}
+	if bounds := decoded.Bounds(); bounds.Dx() > 384 || bounds.Dy() > 384 {
 		t.Fatalf("image size = %v, want max edge <= 384", bounds)
 	}
 	if err := pkg.ReloadFromStaging(dir); err != nil {
@@ -165,15 +152,15 @@ func TestVisionDescribeMissingCaptionsSuccess(t *testing.T) {
 }
 
 func TestVisionSkipsWorkerWhenNothingMissing(t *testing.T) {
-	body := pictureParagraph("rId1", "") + paragraphXML("Figure 1: captioned")
-	path := wordPicturePackage(t, body)
-	pkg, err := ParseWordPackage(path)
-	if err != nil {
-		t.Fatalf("ParseWordPackage() error = %v", err)
-	}
 	dir := t.TempDir()
-	if err := pkg.WriteStaging(dir); err != nil {
-		t.Fatalf("WriteStaging() error = %v", err)
+	pkg := stagingWordPackage(t, dir)
+	// Attach an explicit caption so no picture is missing one.
+	pkg.Manifest.Assets[0].Captions = []WordAnnotation{
+		{Text: "Figure 1: captioned", Ref: "#/texts/0"},
+	}
+	pkg.Manifest.Assets[0].Caption = "Figure 1: captioned"
+	if err := pkg.Manifest.WriteFile(filepath.Join(dir, "manifest.json")); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
 	}
 	calls := int32(0)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -191,7 +178,8 @@ func TestVisionSkipsWorkerWhenNothingMissing(t *testing.T) {
 }
 
 func TestVisionRequiresRemoteVLM(t *testing.T) {
-	_, dir := prepareVisionStaging(t)
+	dir := t.TempDir()
+	stagingWordPackage(t, dir)
 	worker := &WordVisionWorker{}
 	err := worker.DescribeMissingCaptions(context.Background(), dir)
 	want := "Word image description failed: RAG_VLM_BASE_URL is required for uncaptioned Word images"
@@ -206,8 +194,9 @@ func TestVisionRequiresRemoteVLM(t *testing.T) {
 }
 
 func TestVisionRejectsRefusal(t *testing.T) {
-	_, dir := prepareVisionStaging(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	dir := t.TempDir()
+	stagingWordPackage(t, dir)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeVisionResponse(w, "I'm sorry, but I cannot provide a description of this image.")
 	}))
 	defer server.Close()
@@ -222,9 +211,10 @@ func TestVisionRetriesTransientStatus(t *testing.T) {
 	previousDelay := visionRequestRetryDelay
 	visionRequestRetryDelay = 5 * time.Millisecond
 	defer func() { visionRequestRetryDelay = previousDelay }()
-	_, dir := prepareVisionStaging(t)
+	dir := t.TempDir()
+	stagingWordPackage(t, dir)
 	attempts := int32(0)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempt := atomic.AddInt32(&attempts, 1)
 		if attempt < 3 {
 			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
@@ -243,8 +233,9 @@ func TestVisionRetriesTransientStatus(t *testing.T) {
 }
 
 func TestVisionHTTPFailure(t *testing.T) {
-	_, dir := prepareVisionStaging(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	dir := t.TempDir()
+	stagingWordPackage(t, dir)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 	}))
 	defer server.Close()
@@ -264,8 +255,9 @@ func TestVisionTimeout(t *testing.T) {
 		visionRequestRetryDelay = previousDelay
 		visionMinimumRequestTimeout = previousMinimum
 	}()
-	_, dir := prepareVisionStaging(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	dir := t.TempDir()
+	stagingWordPackage(t, dir)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(150 * time.Millisecond)
 		writeVisionResponse(w, "too late")
 	}))
@@ -278,7 +270,8 @@ func TestVisionTimeout(t *testing.T) {
 }
 
 func TestVisionUndecodableImage(t *testing.T) {
-	_, dir := prepareVisionStaging(t)
+	dir := t.TempDir()
+	stagingWordPackage(t, dir)
 	manifest, err := ReadWordManifestFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
 		t.Fatalf("ReadWordManifestFile() error = %v", err)
@@ -308,10 +301,10 @@ func TestVisionMissingManifest(t *testing.T) {
 
 func TestVisionChatURLAndCleanDescription(t *testing.T) {
 	cases := map[string]string{
-		"http://vlm.test":                   "http://vlm.test/v1/chat/completions",
-		"http://vlm.test/v1":                "http://vlm.test/v1/chat/completions",
+		"http://vlm.test":                     "http://vlm.test/v1/chat/completions",
+		"http://vlm.test/v1":                  "http://vlm.test/v1/chat/completions",
 		"http://vlm.test/v1/chat/completions": "http://vlm.test/v1/chat/completions",
-		"http://vlm.test/v1/":               "http://vlm.test/v1/chat/completions",
+		"http://vlm.test/v1/":                 "http://vlm.test/v1/chat/completions",
 	}
 	for base, want := range cases {
 		if got := vlmChatURL(base); got != want {

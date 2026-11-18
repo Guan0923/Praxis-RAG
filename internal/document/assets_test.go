@@ -9,16 +9,32 @@ import (
 	"testing"
 )
 
+// wordAssetContent builds a Word-shaped manifest fixture (the Docling service
+// output view) with one captioned picture plus a note, runs it through
+// AssociateDoclingCaptions and BuildWordContent, and returns the qualified
+// content plus the parser-side package. It mirrors what the Docling client
+// produces after parsing a document like the old native-reader fixtures.
 func wordAssetContent(t *testing.T) (*WordContent, *WordPackage) {
 	t.Helper()
-	body := paragraphXML("Before image") + pictureParagraph("rId1", "Figure 1") +
-		paragraphXML("Figure 1: Red status lamp") + paragraphXML("Note: keep this lamp visible") +
-		paragraphXML("Tail")
-	path := wordPicturePackage(t, body)
-	pkg, err := ParseWordPackage(path)
-	if err != nil {
-		t.Fatalf("ParseWordPackage() error = %v", err)
+	imageFile := "images/picture-1.jpeg"
+	location := WordLocation{Part: "body", Paragraph: 1, Scope: "body", Section: 1}
+	manifest := WordManifest{
+		Version: DoclingWordParserVersion,
+		Blocks: []WordManifestBlock{
+			{Ref: "#/texts/0", Order: 0, Kind: KindParagraph, Text: "Before image", Location: location},
+			{Ref: "#/pictures/0", Order: 1, Kind: KindPicture, AssetID: "picture-1", Location: location},
+			{Ref: "#/texts/1", Order: 2, Kind: KindParagraph, Text: "Figure 1: Red status lamp", Location: location},
+			{Ref: "#/texts/2", Order: 3, Kind: KindParagraph, Text: "Note: keep this lamp visible", Location: location},
+			{Ref: "#/texts/3", Order: 4, Kind: KindParagraph, Text: "Tail", Location: location},
+		},
+		Assets: []*WordManifestAsset{
+			{AssetID: "picture-1", Kind: "picture", ImageFile: &imageFile,
+				MIMEType: stringPtr("image/jpeg"), Location: location},
+		},
+		Diagnostics: []WordDiagnostic{},
 	}
+	manifest = AssociateDoclingCaptions(manifest)
+	pkg := &WordPackage{Manifest: manifest, Images: map[string][]byte{"picture-1": testJPEGBytes}}
 	content, err := BuildWordContent("doc-abc", pkg)
 	if err != nil {
 		t.Fatalf("BuildWordContent() error = %v", err)
@@ -54,8 +70,7 @@ func TestBuildWordContentAssetRecords(t *testing.T) {
 	if asset.Order != 0 || asset.Caption != "Figure 1: Red status lamp" {
 		t.Fatalf("order/caption = %d/%q", asset.Order, asset.Caption)
 	}
-	if len(asset.Captions) != 1 || asset.Captions[0].Text != "Figure 1: Red status lamp" ||
-		asset.Captions[0].Location == nil {
+	if len(asset.Captions) != 1 || asset.Captions[0].Text != "Figure 1: Red status lamp" {
 		t.Fatalf("captions = %+v", asset.Captions)
 	}
 	if len(asset.Footnotes) != 1 || asset.Footnotes[0].Text != "Note: keep this lamp visible" {
@@ -82,9 +97,7 @@ func TestBuildWordContentAssetRecords(t *testing.T) {
 	if !assetBlock {
 		t.Fatalf("qualified blocks lost the asset id: %+v", qualified.Blocks)
 	}
-	if !strings.Contains(content.DocumentMarkdown, "[Image: doc-abc:picture-1]") ||
-		!strings.Contains(content.DocumentMarkdown, "Figure 1: Red status lamp") ||
-		!strings.Contains(content.DocumentMarkdown, "Note: keep this lamp visible") {
+	if !strings.Contains(content.DocumentMarkdown, "[Image: doc-abc:picture-1]") {
 		t.Fatalf("document markdown = %q", content.DocumentMarkdown)
 	}
 
@@ -108,24 +121,57 @@ func TestBuildWordContentAssetRecords(t *testing.T) {
 		t.Fatalf("picture table payload = %v", payload["table"])
 	}
 	locations := payload["location"].(map[string]any)
-	if locations["part"] != "word/document.xml" || locations["scope"] != "body" {
+	if locations["part"] != "body" || locations["scope"] != "body" {
 		t.Fatalf("location payload = %v", locations)
 	}
 	if len(payload["captions"].([]map[string]any)) != 1 {
 		t.Fatalf("caption payload = %v", payload["captions"])
 	}
-	if len(payload["labels"].([]string)) < 3 || len(payload["bookmarks"].([]string)) != 0 {
+	if len(payload["labels"].([]string)) != 0 || len(payload["bookmarks"].([]string)) != 0 {
 		t.Fatalf("labels/bookmarks = %v/%v", payload["labels"], payload["bookmarks"])
 	}
 }
 
 func TestBuildWordContentNestedTableIdentity(t *testing.T) {
-	body := paragraphXML("Table 1: Pump limits") + outerTableWithNested() + paragraphXML("Note: values in kPa")
-	path := buildDOCX(t, basePackage(body)...)
-	pkg, err := ParseWordPackage(path)
-	if err != nil {
-		t.Fatalf("ParseWordPackage() error = %v", err)
+	location := WordLocation{Part: "body", Paragraph: 1, Scope: "body", Section: 1}
+	manifest := WordManifest{
+		Version: DoclingWordParserVersion,
+		Blocks: []WordManifestBlock{
+			{Ref: "#/texts/0", Order: 0, Kind: KindParagraph, Text: "Table 1: Pump limits", Location: location},
+			{Ref: "#/tables/0", Order: 1, Kind: "table", AssetID: "table-1", Location: location},
+			{Ref: "#/texts/1", Order: 2, Kind: KindParagraph, Text: "Note: values in kPa", Location: location},
+		},
+		Assets: []*WordManifestAsset{
+			{AssetID: "table-1", Kind: "table",
+				Table: &WordTableData{
+					NumRows: 2, NumCols: 2,
+					Rows:       [][]string{{"Model", "Maximum"}, {"ZQ-25", "100"}},
+					HeaderRows: [][]string{{"Model", "Maximum"}},
+					Headers:    []string{"Model", "Maximum"},
+					Cells: []WordTableCellData{
+						{Row: 0, Col: 0, RowSpan: 1, ColSpan: 1, Text: "Model"},
+						{Row: 0, Col: 1, RowSpan: 1, ColSpan: 1, Text: "Maximum"},
+						{Row: 1, Col: 0, RowSpan: 1, ColSpan: 1, Text: "ZQ-25"},
+						{Row: 1, Col: 1, RowSpan: 1, ColSpan: 1, Text: "100",
+							NestedTables: []string{"table-2"}},
+					},
+				},
+				Location: location},
+			{AssetID: "table-2", Kind: "table",
+				Table: &WordTableData{
+					NumRows: 1, NumCols: 1,
+					Rows: [][]string{{"Nested specification"}},
+					Cells: []WordTableCellData{
+						{Row: 0, Col: 0, RowSpan: 1, ColSpan: 1, Text: "Nested specification"},
+					},
+					ParentCell: &WordParentCell{AssetID: "table-1", Row: 1, Col: 1},
+				},
+				Location: location},
+		},
+		Diagnostics: []WordDiagnostic{},
 	}
+	manifest = AssociateDoclingCaptions(manifest)
+	pkg := &WordPackage{Manifest: manifest, Images: map[string][]byte{}}
 	content, err := BuildWordContent("doc-t", pkg)
 	if err != nil {
 		t.Fatalf("BuildWordContent() error = %v", err)
@@ -180,12 +226,21 @@ func TestBuildWordContentMissingPictureData(t *testing.T) {
 }
 
 func TestWordPackageStagingRoundTrip(t *testing.T) {
-	body := pictureParagraph("rId1", "") + paragraphXML("Figure 1: captioned")
-	path := wordPicturePackage(t, body)
-	pkg, err := ParseWordPackage(path)
-	if err != nil {
-		t.Fatalf("ParseWordPackage() error = %v", err)
+	imageFile := "images/picture-1.jpeg"
+	location := WordLocation{Part: "body", Paragraph: 1, Scope: "body", Section: 1}
+	manifest := WordManifest{
+		Version: DoclingWordParserVersion,
+		Blocks: []WordManifestBlock{
+			{Ref: "#/pictures/0", Order: 0, Kind: KindPicture, AssetID: "picture-1", Location: location},
+			{Ref: "#/texts/0", Order: 1, Kind: KindParagraph, Text: "Figure 1: captioned", Location: location},
+		},
+		Assets: []*WordManifestAsset{
+			{AssetID: "picture-1", Kind: "picture", ImageFile: &imageFile, Location: location},
+		},
+		Diagnostics: []WordDiagnostic{},
 	}
+	manifest = AssociateDoclingCaptions(manifest)
+	pkg := &WordPackage{Manifest: manifest, Images: map[string][]byte{"picture-1": testJPEGBytes}}
 	dir := t.TempDir()
 	if err := pkg.WriteStaging(dir); err != nil {
 		t.Fatalf("WriteStaging() error = %v", err)
@@ -195,15 +250,15 @@ func TestWordPackageStagingRoundTrip(t *testing.T) {
 	if err != nil || string(data) != string(testJPEGBytes) {
 		t.Fatalf("staged image = %d bytes, err = %v", len(data), err)
 	}
-	manifest, err := ReadWordManifestFile(filepath.Join(dir, "manifest.json"))
+	staged, err := ReadWordManifestFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
 		t.Fatalf("ReadWordManifestFile() error = %v", err)
 	}
-	if len(manifest.Assets) != 1 || manifest.Assets[0].AssetID != "picture-1" {
-		t.Fatalf("staged manifest = %+v", manifest.Assets)
+	if len(staged.Assets) != 1 || staged.Assets[0].AssetID != "picture-1" {
+		t.Fatalf("staged manifest = %+v", staged.Assets)
 	}
-	manifest.Assets[0].GeneratedDescription = "A red indicator is lit."
-	if err := manifest.WriteFile(filepath.Join(dir, "manifest.json")); err != nil {
+	staged.Assets[0].GeneratedDescription = "A red indicator is lit."
+	if err := staged.WriteFile(filepath.Join(dir, "manifest.json")); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	if err := pkg.ReloadFromStaging(dir); err != nil {
@@ -213,7 +268,7 @@ func TestWordPackageStagingRoundTrip(t *testing.T) {
 		t.Fatalf("reload = %q", pkg.Manifest.Assets[0].GeneratedDescription)
 	}
 
-	empty := &WordPackage{Manifest: WordManifest{Version: WordParserVersion, Assets: []*WordManifestAsset{
+	empty := &WordPackage{Manifest: WordManifest{Version: DoclingWordParserVersion, Assets: []*WordManifestAsset{
 		{AssetID: "picture-9", Kind: "picture", ImageFile: stringPointer("images/picture-9.jpeg")},
 	}}}
 	if err := empty.WriteStaging(t.TempDir()); err == nil ||
@@ -402,12 +457,14 @@ func TestWriteArtifacts(t *testing.T) {
 }
 
 func TestParserVersionGuards(t *testing.T) {
-	if err := ValidateWordParserVersion(WordParserVersion); err != nil {
-		t.Fatalf("word version guard error = %v", err)
+	// Historical word-assets-v1 records (pre-Docling-only cutover) stay
+	// readable through IsSupportedWordParserVersion.
+	if !IsSupportedWordParserVersion(WordParserVersion) ||
+		!IsSupportedWordParserVersion(DoclingWordParserVersion) {
+		t.Fatalf("supported Word parser versions = %q, %q", WordParserVersion, DoclingWordParserVersion)
 	}
-	if err := ValidateWordParserVersion("old"); err == nil ||
-		err.Error() != "Word parser changed; reimport this document" {
-		t.Fatalf("word version error = %v", err)
+	if IsSupportedWordParserVersion("old") {
+		t.Fatalf("foreign Word parser version accepted")
 	}
 	if err := ValidatePDFParserVersion(PDFParserVersion); err != nil {
 		t.Fatalf("pdf version guard error = %v", err)

@@ -130,10 +130,10 @@ func MissingPictureCaptions(manifest WordManifest) []string {
 	return missing
 }
 
-// WordVisionWorker describes uncaptioned Word pictures with the remote
-// OpenAI-compatible vision endpoint. It runs in-process: no Python worker or
-// subprocess is involved. When no endpoint is configured the caller keeps the
-// pictures as placeholders instead of invoking the worker.
+// WordVisionWorker describes uncaptioned Word/HTML pictures (Docling output)
+// with the remote OpenAI-compatible vision endpoint. It runs in-process: no
+// Python worker or subprocess is involved. When no endpoint is configured the
+// caller keeps the pictures as placeholders instead of invoking the worker.
 type WordVisionWorker struct {
 	// VLM configures the remote vision-language endpoint. Required when the
 	// document has uncaptioned pictures.
@@ -149,9 +149,9 @@ type WordVisionWorker struct {
 // stored in stagingDir/manifest.json, rewrites that manifest with
 // generated_description filled in, and validates every produced description.
 //
-// The caller workflow is: ParseWordPackage -> WriteStaging -> (if
-// MissingPictureCaptions) DescribeMissingCaptions -> ReloadFromStaging ->
-// BuildWordContent.
+// The caller workflow is: DoclingServiceParser (or a test fake) produces the
+// staging directory -> (if MissingPictureCaptions) DescribeMissingCaptions ->
+// ReloadFromStaging -> BuildWordContent.
 func (w *WordVisionWorker) DescribeMissingCaptions(ctx context.Context, stagingDir string) error {
 	manifestPath := filepath.Join(stagingDir, "manifest.json")
 	manifest, err := ReadWordManifestFile(manifestPath)

@@ -2419,3 +2419,67 @@ docker compose --env-file .env.example config --quiet              # exit 0
 - K8s 清单与 `scripts/start-stack.ps1` 尚未接入 Docling（仅 Compose / `.env.example` /
   `deploy/config.container.toml`）。
 - HTML 预览的浏览器级同源安全验证（代码保持纯文本渲染、无 `dangerouslySetInnerHTML`）。
+
+## 删除进程内 DOCX 解析，Word/HTML 只走 Docling — 2026-11-18
+
+工作树 `dsh-d97760d6-1b2f`（Windows 11，Go 1.27.3，本地 MySQL 3307）。按用户要求
+彻底删除 Go 进程内 OOXML/DOCX 解析：`internal/document` 的 `word.go`（wordReader）、
+`formula.go`（OMML→LaTeX）、`xmltree.go`（OOXML DOM）、`docconvert.go` 的
+`docxDocument`、`wordmanifest.go` 的 `DocumentBlocks`/`joinDOCX` 与 `assets.go` 的
+`ValidateWordParserVersion` 全部移除；`docx.go` 只保留 `validateDOCX` 上传边界校验
+（成员数/加密/解压总量，保护发给 docling-service 的本地文件）。
+
+### 行为变化
+
+- `ingest.Prepare` 中 `.docx`/`.doc`（先经 LibreOffice 转 `.docx`）与 `.html`/`.htm`
+  一律走 `prepareDocling`；`prepareWord` 与 `WordParserVersion` 写入路径删除。
+  未配置 Docling parser 时这些格式报 `ErrDoclingNotConfigured`（新文案
+  「Word/HTML 文档需要配置 Docling 解析服务」）。
+- 受理层：`validateDoclingHTMLUpload` 更名 `validateDoclingDocumentUpload`，
+  `.docx`/`.doc` 与 HTML 一样在未配置 `RAG_DOCLING_SERVICE_URL` 时被拒绝
+  （固定文案「Word/HTML 文档需要配置 Docling 解析服务（RAG_DOCLING_SERVICE_URL）。」），
+  同步上传、异步受理（async/document_batch）与 worker 终态分类共用该闸门。
+- `indexConfiguration` 恒记录 `word_parser_version=docling-word-v1`（`docling`
+  参数删除）；历史 `word-assets-v1` 记录仍可读（`IsSupportedWordParserVersion`
+  保留两值），`ReadDocument`/重复检测的资产桶选择不变。
+- `document.Reader` 删除 `DOC` 字段；`ReadText`/`ReadDocument` 对 `.doc`/`.docx`
+  返回「Word 文档需要通过 Docling 解析服务导入：<name>」（不再本地解析）。
+- `WordOptions.Converter` 语义不变（LibreOffice 转换仍在 Go 侧，服务只收
+  `.docx`/HTML）；`formula.go` 的删除使 OMML 公式转换随解析一起移入 Docling。
+
+### 已验证（可复核）
+
+```powershell
+# 1) 全量构建与静态检查
+go build ./...                                                   # exit 0
+go vet ./...                                                     # exit 0
+
+# 2) 全量串行测试（MySQL 一次性 schema，含 e2e/httpapi/runtime/state）
+$env:RAG_TEST_MYSQL_URL = 'mysql://rag:praxis-dev-pw@127.0.0.1:3307/praxis_unit_test'
+go test -p 1 -count=1 -timeout 25m ./...
+# 全部 ok（runtime 34.4s / state 37.6s / e2e 3.4s / document 0.99s / ingest 0.39s）。
+
+# 3) 关键行为断言（包内单测）
+go test -count=1 ./internal/ingest/ -run 'TestWordPrepareWithoutDoclingIsRejected|TestPrepareUsesDoclingForDOCX|TestPrepareConvertsDOCBeforeDocling|TestWordChunkStrategiesPreserveTableHeaders|TestPrepareWordVisionIntegration' -v
+# 无 Docling parser 时 .docx 报 ErrDoclingNotConfigured；配置后表格/图片/公式
+# 保护、.doc 转换、VLM 描述均按 Docling 清单驱动；Word chunk 元数据带
+# docling-word-v1。
+go test -count=1 ./internal/runtime/ -run 'TestValidateDoclingDocumentUploadRequiresService|TestUploadRejectsDoclingOnlyFormatsWithoutService|TestIndexConfigurationRecordsDoclingParserVersions' -v
+# 未配置时 page.html/manual.docx/manual.DOC 同步上传均被受理层拒绝且不写
+# journal；索引元数据恒为 docling-word-v1；word-assets-v1 历史记录仍可读。
+go test -count=1 ./internal/document/ -run 'TestMissingFileErrors|TestBuildWordContentAssetRecords|TestWordPackageStagingRoundTrip' -v
+# ReadText(.docx) 返回 Docling 必需错误；BuildWordContent/staging 往返基于
+# Docling 清单 fixture。
+
+# 4) 真实 Docling 集成测试（需要本机 venv 服务，未在本次环境运行）
+$env:RAG_DOCLING_SERVICE_URL = 'http://127.0.0.1:8092'
+go test -count=1 -run TestDoclingIntegration -v ./internal/ingest/
+# 前一节（2026-11-17）已在本机真实 Docling 2.150.1 上全 PASS；本轮 ingest 分发
+# 只是把 .docx 的无条件 Docling 路径变成唯一路径，未改传输/解压/清单契约。
+```
+
+### 未实机验证
+
+- 真实 Docling 服务的本轮回归（本机 venv 未随本轮重跑；契约未变，上一节记录覆盖）。
+- Docker 镜像构建与容器端到端（与上一节相同的限制）。
+- K8s 清单与 `scripts/start-stack.ps1` 的 Docling 注入（同上一节遗留）。
