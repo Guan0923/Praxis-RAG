@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccessView, Connection } from "./api";
 import {
+  canCreateDocument,
+  canDeleteDocument,
   canReplaceDocument,
+  effectiveDocumentMask,
   documentExtension,
   documentFormatFamily,
   replaceAcceptAttribute,
@@ -72,6 +75,43 @@ const readOnly = access({
     whole_write: false,
     read_documents: [],
     write_documents: [],
+  },
+});
+
+// maskWrite carries the new scope masks: default allow=read, whole allow=0,
+// file allow for a.md = update|delete. deny bits are empty.
+const maskWrite = access({
+  can_write: false,
+  scope: {
+    whole_read: true,
+    whole_write: false,
+    read_documents: [],
+    write_documents: [],
+    default_allow: 1,
+    default_deny: 0,
+    whole_allow: 0,
+    whole_deny: 0,
+    file_allow: { "a.md": 12 },
+    file_deny: {},
+    effective_library: 1,
+  },
+});
+// maskDenied has the file allow bit but the whole deny bit clears update for
+// every file: deny always wins over allow.
+const maskDenied = access({
+  can_write: true,
+  scope: {
+    whole_read: true,
+    whole_write: true,
+    read_documents: [],
+    write_documents: [],
+    default_allow: 15,
+    default_deny: 0,
+    whole_allow: 15,
+    whole_deny: 4,
+    file_allow: { "a.md": 15 },
+    file_deny: {},
+    effective_library: 15 & ~4,
   },
 });
 
@@ -187,6 +227,51 @@ describe("canReplaceDocument", () => {
     expect(canReplaceDocument(readOnly, true, "a.md")).toBe(false);
     expect(canReplaceDocument(undefined, true, "a.md")).toBe(true);
     expect(canReplaceDocument(undefined, false, "a.md")).toBe(true);
+  });
+
+  it("follows the effective mask: file update bit, deny clears update", () => {
+    // a.md carries update|delete at file level → replaceable; b.md only read.
+    expect(canReplaceDocument(maskWrite, true, "a.md")).toBe(true);
+    expect(canReplaceDocument(maskWrite, true, "b.md")).toBe(false);
+    // whole deny bit 4 clears update for every file even though allow is 15.
+    expect(canReplaceDocument(maskDenied, true, "a.md")).toBe(false);
+  });
+});
+
+describe("effectiveDocumentMask", () => {
+  it("merges default, whole and file masks with deny precedence", () => {
+    expect(effectiveDocumentMask(maskWrite, "a.md")).toBe(1 | 12);
+    expect(effectiveDocumentMask(maskWrite, "b.md")).toBe(1);
+    expect(effectiveDocumentMask(maskDenied, "a.md")).toBe(15 & ~4);
+  });
+
+  it("falls back to the legacy read/write projection without masks", () => {
+    expect(effectiveDocumentMask(wholeWrite, "a.md")).toBe(1 | 4 | 8);
+    expect(effectiveDocumentMask(fileWrite, "a.md")).toBe(1 | 4 | 8);
+    expect(effectiveDocumentMask(fileWrite, "b.md")).toBe(0);
+    expect(effectiveDocumentMask(readOnly, "a.md")).toBe(1);
+  });
+});
+
+describe("canDeleteDocument", () => {
+  it("requires the delete bit on the effective mask", () => {
+    expect(canDeleteDocument(maskWrite, true, "a.md")).toBe(true);
+    expect(canDeleteDocument(maskWrite, true, "b.md")).toBe(false);
+    expect(canDeleteDocument(readOnly, true, "a.md")).toBe(false);
+    expect(canDeleteDocument(undefined, true, "a.md")).toBe(true);
+    expect(canDeleteDocument(undefined, false, "a.md")).toBe(true);
+  });
+});
+
+describe("canCreateDocument", () => {
+  it("requires the create bit on the effective library mask", () => {
+    expect(canCreateDocument(maskWrite, true)).toBe(false);
+    expect(canCreateDocument(maskDenied, true)).toBe(true);
+    // legacy projection falls back to whole_write / can_write.
+    expect(canCreateDocument(wholeWrite, true)).toBe(true);
+    expect(canCreateDocument(readOnly, true)).toBe(false);
+    expect(canCreateDocument(undefined, true)).toBe(true);
+    expect(canCreateDocument(undefined, false)).toBe(true);
   });
 });
 

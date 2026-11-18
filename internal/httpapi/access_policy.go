@@ -135,6 +135,46 @@ func (s *Server) withAccessScope(w http.ResponseWriter, r *http.Request, user st
 	return r.WithContext(access.ContextWithScope(r.Context(), scope))
 }
 
+// scopeReadCheck reports whether the request's scope grants one operation on
+// one target document. Without a scope (management credentials, ownership
+// enforcement disabled) the historical unrestricted behaviour applies.
+func scopeReadCheck(r *http.Request, required access.Operation, name string) bool {
+	scope, ok := access.ScopeFromContext(r.Context())
+	if !ok {
+		return true
+	}
+	effective := scope.EffectiveDocumentOrDefault(name)
+	return required != 0 && access.Operation(effective)&required == required
+}
+
+// scopeLibraryCheck reports whether the request's scope grants one operation at
+// knowledge-base level (the create bit).
+func scopeLibraryCheck(r *http.Request, required access.Operation) bool {
+	scope, ok := access.ScopeFromContext(r.Context())
+	if !ok {
+		return true
+	}
+	effective := scope.EffectiveLibrary()
+	return required != 0 && access.Operation(effective)&required == required
+}
+
+// scopeAnyCheck reports whether any document satisfies one operation bit.
+func scopeAnyCheck(r *http.Request, required access.Operation) bool {
+	scope, ok := access.ScopeFromContext(r.Context())
+	if !ok {
+		return true
+	}
+	if access.Operation(scope.EffectiveLibrary())&required != 0 {
+		return true
+	}
+	for name, allow := range scope.FileAllow {
+		if access.Operation(allow)&required != 0 && access.Operation(scope.EffectiveDocumentOrDefault(name))&required != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // requireScopeRead enforces read visibility on one tenant read endpoint. When no
 // scope was resolved (no session, or ownership enforcement disabled) the request
 // keeps the historical unrestricted behaviour.
@@ -152,35 +192,38 @@ func (s *Server) requireScopeRead(w http.ResponseWriter, r *http.Request) (acces
 
 // requireScopeReadDocument checks one document-level read grant.
 func (s *Server) requireScopeReadDocument(w http.ResponseWriter, r *http.Request, name string) bool {
-	scope, ok := access.ScopeFromContext(r.Context())
-	if !ok || scope.CanReadDocument(name) {
-		return true
+	if !scopeReadCheck(r, access.OpRead, name) {
+		writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
+		return false
 	}
-	writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
-	return false
+	return true
 }
 
-// requireScopeWriteDocument checks one document-level write grant.
-func (s *Server) requireScopeWriteDocument(w http.ResponseWriter, r *http.Request, name string) bool {
-	scope, ok := access.ScopeFromContext(r.Context())
-	if !ok || scope.CanWriteDocument(name) {
-		return true
+// requireScopeUpdateDocument checks one document-level update grant (the
+// replace entry point).
+func (s *Server) requireScopeUpdateDocument(w http.ResponseWriter, r *http.Request, name string) bool {
+	if !scopeReadCheck(r, access.OpUpdate, name) {
+		writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
+		return false
 	}
-	writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
-	return false
+	return true
 }
 
-// requireScopeWriteBatch checks every file name of one upload batch.
-func (s *Server) requireScopeWriteBatch(w http.ResponseWriter, r *http.Request, files []UploadFile) bool {
-	scope, ok := access.ScopeFromContext(r.Context())
-	if !ok {
-		return true
+// requireScopeDeleteDocument checks one document-level delete grant.
+func (s *Server) requireScopeDeleteDocument(w http.ResponseWriter, r *http.Request, name string) bool {
+	if !scopeReadCheck(r, access.OpDelete, name) {
+		writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
+		return false
 	}
-	for _, file := range files {
-		if !scope.CanWriteDocument(file.Name) {
-			writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
-			return false
-		}
+	return true
+}
+
+// requireScopeCreate checks the library-level create grant used by every
+// new-document entry point.
+func (s *Server) requireScopeCreate(w http.ResponseWriter, r *http.Request) bool {
+	if !scopeLibraryCheck(r, access.OpCreate) {
+		writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
+		return false
 	}
 	return true
 }
@@ -195,7 +238,7 @@ func scopedDocuments(r *http.Request, documents []map[string]any) []map[string]a
 	filtered := make([]map[string]any, 0, len(documents))
 	for _, document := range documents {
 		name, _ := document["name"].(string)
-		if name != "" && scope.CanReadDocument(name) {
+		if name != "" && scopeReadCheck(r, access.OpRead, name) {
 			filtered = append(filtered, document)
 		}
 	}

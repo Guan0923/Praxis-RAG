@@ -62,6 +62,13 @@ func (r DocumentRecord) Name() string {
 	return name
 }
 
+// DocumentID returns the retrieval-side document identifier, or "" when the
+// record is malformed.
+func (r DocumentRecord) DocumentID() string {
+	identifier, _ := r["document_id"].(string)
+	return identifier
+}
+
 // DocumentContent is the stored text and version of one knowledge document.
 type DocumentContent struct {
 	Text    string

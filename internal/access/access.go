@@ -10,7 +10,6 @@ package access
 import (
 	"context"
 	"errors"
-	"sort"
 	"strings"
 	"time"
 
@@ -59,6 +58,9 @@ const (
 	MessageUserDisabled     = "该账号已被禁用"
 	MessageSelfInvite       = "不能邀请自己"
 	MessagePermissionBad    = "权限只能是 read 或 write"
+	MessageMaskBad          = "权限掩码必须是 0 到 15 之间的整数"
+	MessageMaskCreateFile   = "新增权限只能设置在知识库级别，不能针对单个文件"
+	MessageRuleMissing      = "授权规则不存在"
 	MessageScopeBad         = "范围只能是 all 或 files"
 	MessageDocumentsEmpty   = "请选择要授权的文件"
 	MessageDocumentsBad     = "文件名不合法："
@@ -73,90 +75,30 @@ const (
 	ScopeFiles      = state.InvitationScopeFiles
 )
 
-// ScopeSet is the effective access of one account inside one knowledge base.
+// ScopeSet is the effective access of one account inside one knowledge base,
+// expressed with the operation bit masks of bitmask.go. It carries the raw
+// rule state (role defaults, whole-library masks and per-file masks); every
+// allows/denies question is answered by the shared merge in scope.go so
+// REST, MCP and retrieval enforce the same judgement.
 type ScopeSet struct {
-	WholeRead      bool
-	WholeWrite     bool
-	ReadDocuments  map[string]struct{}
-	WriteDocuments map[string]struct{}
+	// DefaultAllow/DefaultDeny are the role defaults: administrators and the
+	// knowledge-base owner start with every operation allowed, everyone else
+	// starts with nothing. Both still participate in the deny merge, so an
+	// explicit deny rule restricts administrators and owners too.
+	DefaultAllow PermissionMask
+	DefaultDeny  PermissionMask
+	// WholeAllow/WholeDeny are the whole-knowledge-base rule masks (the
+	// grant row with an empty document name).
+	WholeAllow PermissionMask
+	WholeDeny  PermissionMask
+	// FileAllow/FileDeny are the per-document rule masks.
+	FileAllow map[string]PermissionMask
+	FileDeny  map[string]PermissionMask
 }
 
 // NewScopeSet returns an empty (no access) scope.
 func NewScopeSet() ScopeSet {
-	return ScopeSet{ReadDocuments: map[string]struct{}{}, WriteDocuments: map[string]struct{}{}}
-}
-
-// fullScope is the owner/administrator scope: every document, read and write.
-func fullScope() ScopeSet {
-	return ScopeSet{WholeRead: true, WholeWrite: true,
-		ReadDocuments: map[string]struct{}{}, WriteDocuments: map[string]struct{}{}}
-}
-
-// AllowsAnyRead reports whether the account may read anything in the knowledge
-// base.
-func (s ScopeSet) AllowsAnyRead() bool {
-	return s.WholeRead || len(s.ReadDocuments) > 0 || s.WholeWrite
-}
-
-// HasAnyWrite reports whether the account may modify anything in the knowledge
-// base.
-func (s ScopeSet) HasAnyWrite() bool {
-	return s.WholeWrite || len(s.WriteDocuments) > 0
-}
-
-// ReadsWhole reports whether the account may read every document.
-func (s ScopeSet) ReadsWhole() bool { return s.WholeRead || s.WholeWrite }
-
-// WritesWhole reports whether the account may modify every document.
-func (s ScopeSet) WritesWhole() bool { return s.WholeWrite }
-
-// Restricted reports whether reads must be limited to an explicit document set.
-func (s ScopeSet) Restricted() bool { return !s.ReadsWhole() }
-
-// CanReadDocument reports whether one document name is readable.
-func (s ScopeSet) CanReadDocument(name string) bool {
-	if s.ReadsWhole() {
-		return true
-	}
-	if _, ok := s.ReadDocuments[name]; ok {
-		return true
-	}
-	_, ok := s.WriteDocuments[name]
-	return ok
-}
-
-// CanWriteDocument reports whether one document name is writable.
-func (s ScopeSet) CanWriteDocument(name string) bool {
-	if s.WholeWrite {
-		return true
-	}
-	_, ok := s.WriteDocuments[name]
-	return ok
-}
-
-// ReadDocumentNames returns the explicitly readable document names, sorted.
-func (s ScopeSet) ReadDocumentNames() []string {
-	names := make([]string, 0, len(s.ReadDocuments)+len(s.WriteDocuments))
-	for name := range s.ReadDocuments {
-		names = append(names, name)
-	}
-	for name := range s.WriteDocuments {
-		if _, ok := s.ReadDocuments[name]; !ok {
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	return names
-}
-
-// WriteDocumentNames returns the explicitly writable document names, sorted.
-func (s ScopeSet) WriteDocumentNames() []string {
-	names := make([]string, 0, len(s.WriteDocuments))
-	for name := range s.WriteDocuments {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
+	return ScopeSet{FileAllow: map[string]PermissionMask{}, FileDeny: map[string]PermissionMask{}}
 }
 
 // EntitlementProvider reports whether an account's current personal membership
@@ -269,44 +211,76 @@ func (s *Service) CanManage(ctx context.Context, user state.User, namespace stri
 }
 
 // ScopeSet computes the effective access of one account inside one knowledge
-// base. Administrators and owners get full access; everyone else gets the union
-// of their grants.
+// base. Administrators and the owner keep the historical default full-library
+// grant, but they no longer short-circuit: their explicit rules are read and
+// merged too, so a deny rule restricts them exactly like anyone else.
 func (s *Service) ScopeSet(ctx context.Context, user state.User, namespace string) (ScopeSet, error) {
 	if !user.Enabled {
 		return NewScopeSet(), nil
 	}
+	scope := NewScopeSet()
 	if user.IsAdmin() {
-		return fullScope(), nil
-	}
-	owner, err := s.knowledgeBases.OwnerOf(ctx, namespace)
-	if err != nil {
-		return NewScopeSet(), err
-	}
-	if owner != "" && owner == user.ID {
-		return fullScope(), nil
+		scope.DefaultAllow = uint16(MaskAll)
+	} else {
+		owner, err := s.knowledgeBases.OwnerOf(ctx, namespace)
+		if err != nil {
+			return NewScopeSet(), err
+		}
+		if owner != "" && owner == user.ID {
+			scope.DefaultAllow = uint16(MaskAll)
+		}
 	}
 	grants, err := s.permissions.ListFor(ctx, namespace, user.ID)
 	if err != nil {
 		return NewScopeSet(), err
 	}
-	scope := NewScopeSet()
 	for _, grant := range grants {
-		write := grant.Permission == state.PermissionWrite
 		if grant.DocumentName == "" {
-			if write {
-				scope.WholeWrite = true
-			} else {
-				scope.WholeRead = true
-			}
+			scope.WholeAllow |= grant.AllowMask
+			scope.WholeDeny |= grant.DenyMask
 			continue
 		}
-		if write {
-			scope.WriteDocuments[grant.DocumentName] = struct{}{}
-		} else {
-			scope.ReadDocuments[grant.DocumentName] = struct{}{}
+		if scope.FileAllow == nil {
+			scope.FileAllow = map[string]PermissionMask{}
 		}
+		if scope.FileDeny == nil {
+			scope.FileDeny = map[string]PermissionMask{}
+		}
+		scope.FileAllow[grant.DocumentName] |= grant.AllowMask
+		scope.FileDeny[grant.DocumentName] |= grant.DenyMask
 	}
 	return scope, nil
+}
+
+// ResolveVisibleDocumentIDs translates one scope into the server-side
+// retrieval restriction: nil when retrieval is unrestricted, otherwise the
+// document ids of every existing document whose read bit survives the merge
+// (an empty non-nil slice means nothing is visible and retrieval returns no
+// evidence at all).
+func (s *Service) ResolveVisibleDocumentIDs(ctx context.Context, namespace string, scope ScopeSet) ([]string, error) {
+	if !scope.Restricted() {
+		return nil, nil
+	}
+	documents, err := s.documents.List(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(documents))
+	seen := make(map[string]struct{}, len(documents))
+	for _, document := range documents {
+		if !scope.CanReadDocument(document.Name) {
+			continue
+		}
+		if document.DocumentID == "" {
+			continue
+		}
+		if _, duplicate := seen[document.DocumentID]; duplicate {
+			continue
+		}
+		seen[document.DocumentID] = struct{}{}
+		ids = append(ids, document.DocumentID)
+	}
+	return ids, nil
 }
 
 // CanShareKnowledgeBase reports whether the account may create invitations and

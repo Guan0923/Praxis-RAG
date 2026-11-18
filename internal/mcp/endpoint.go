@@ -206,13 +206,9 @@ func (e *Endpoint) toolHandler(namespace string, entry toolEntry) sdk.ToolHandle
 		if err != nil {
 			return toolError(err.Error()), nil
 		}
-		// Document write tools require the per-document write grant; a scope
-		// limited to other files must not be able to modify this one.
-		if document, isDocument := validated.(documentRequest); isDocument {
-			if scope, hasScope := scopeFor(ctx); hasScope && !scope.CanWriteDocument(document.name) {
-				return toolError(messageDocumentWriteRequired), nil
-			}
-		}
+		// Document tools carry their own per-operation permission checks in
+		// tools.go (create/update/delete differ); the shared check here only
+		// covers read-oriented payloads.
 		payload, err := entry.execute(ctx, namespace, validated)
 		if err != nil {
 			return toolError(err.Error()), nil

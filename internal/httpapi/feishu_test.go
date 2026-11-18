@@ -212,7 +212,7 @@ func TestFeishuImportIsolatesReadFailures(t *testing.T) {
 
 func TestFeishuImportRequiresWriteScope(t *testing.T) {
 	readOnly := access.NewScopeSet()
-	readOnly.WholeRead = true
+	readOnly.WholeAllow = uint16(access.OpRead)
 	runtime := newFakeDocRuntime()
 	service := &fakeFeishuService{enabled: true, docs: map[string]string{"doc-1": "正文"}}
 	server := newFeishuTestServer(t, service, runtime, readOnly)

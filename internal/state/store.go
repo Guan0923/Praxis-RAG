@@ -484,7 +484,56 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	if err := s.migrateMembershipBaseline(ctx); err != nil {
 		return err
 	}
+	if err := s.migratePermissionMasks(ctx); err != nil {
+		return err
+	}
 	return s.migrateContentStore(ctx)
+}
+
+// migratePermissionMasks adds the operation-bit mask columns to kb_permissions
+// and kb_invitations and backfills the historical rows.
+//
+// The added columns are nullable on an existing database, and NULL is the
+// explicit "not yet migrated" marker: the backfill only touches rows whose
+// mask column is still NULL, so re-running the migration never overwrites a
+// mask the user deliberately cleared to 0. New tables are created with NOT
+// NULL DEFAULT 0 columns (fresh rows always carry explicit masks) and the
+// backfill then matches nothing.
+//
+// Historical permission levels map onto allow masks exactly like the REST
+// compatibility layer: read -> 1, a whole-library write -> 15, a file-scoped
+// write -> 13; deny masks start at zero because historical rules never denied.
+func (s *Stores) migratePermissionMasks(ctx context.Context) error {
+	if err := s.migrateAddColumns(ctx, map[string][]columnAddition{
+		"kb_permissions": {
+			{name: "allow_mask", definition: "INT UNSIGNED NULL"},
+			{name: "deny_mask", definition: "INT UNSIGNED NULL"},
+		},
+		"kb_invitations": {
+			{name: "allow_mask", definition: "INT UNSIGNED NULL"},
+		},
+	}); err != nil {
+		return err
+	}
+	// The UPDATE ... WHERE mask IS NULL form is idempotent and safe under
+	// concurrent startup: both processes compute the same values from the
+	// untouched permission column, and the second run matches nothing.
+	if _, err := s.DB.ExecContext(ctx,
+		"UPDATE kb_permissions SET "+
+			"allow_mask = CASE WHEN permission = 'write' AND document_name = '' THEN 15 "+
+			"WHEN permission = 'write' THEN 13 ELSE 1 END, "+
+			"deny_mask = 0 "+
+			"WHERE allow_mask IS NULL"); err != nil {
+		return err
+	}
+	if _, err := s.DB.ExecContext(ctx,
+		"UPDATE kb_invitations SET "+
+			"allow_mask = CASE WHEN permission = 'write' AND scope = 'all' THEN 15 "+
+			"WHEN permission = 'write' THEN 13 ELSE 1 END "+
+			"WHERE allow_mask IS NULL"); err != nil {
+		return err
+	}
+	return nil
 }
 
 // migrateModelProfileOwners turns the shared model-configuration registry into a

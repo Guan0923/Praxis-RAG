@@ -1200,6 +1200,24 @@ h3 {
 .permissions-table .ant-table {
   background: transparent;
 }
+/* 规则三态编辑器：每个操作（阅读/新增/修改/删除）一个未设置/允许/拒绝选择 */
+.rule-mask-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.rule-mask-title {
+  font-weight: 600;
+}
+.rule-mask-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.rule-mask-op {
+  color: var(--muted);
+  white-space: nowrap;
+}
 .section-heading-spaced {
   margin-top: 32px;
 }

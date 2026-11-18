@@ -18,6 +18,8 @@ func (s *Server) registerAccessRoutes() {
 	s.router.add("POST", "/v1/knowledge-bases", authSession, s.handleCreateKnowledgeBaseForUser)
 	s.router.add("GET", "/v1/knowledge-bases/{namespace}/access", authSession, s.handleKnowledgeBaseAccess)
 	s.router.add("GET", "/v1/knowledge-bases/{namespace}/permissions", authSession, s.handleListKnowledgeBasePermissions)
+	s.router.add("PUT", "/v1/knowledge-bases/{namespace}/permissions/{user_id}", authSession, s.handleSetKnowledgeBasePermission)
+	s.router.add("POST", "/v1/knowledge-bases/{namespace}/permissions/{user_id}/clear-deny", authSession, s.handleClearKnowledgeBaseDeny)
 	s.router.add("DELETE", "/v1/knowledge-bases/{namespace}/permissions/{user_id}", authSession, s.handleRevokeKnowledgeBasePermission)
 	s.router.add("GET", "/v1/knowledge-bases/{namespace}/invitations", authSession, s.handleListKnowledgeBaseInvitations)
 	s.router.add("POST", "/v1/knowledge-bases/{namespace}/invitations", authSession, s.handleCreateKnowledgeBaseInvitation)
@@ -248,13 +250,133 @@ func (s *Server) handleListKnowledgeBasePermissions(w http.ResponseWriter, r *ht
 	writeJSON(w, http.StatusOK, map[string]any{"permissions": grants})
 }
 
-// handleRevokeKnowledgeBasePermission removes every grant of one account.
+// setKnowledgeBasePermissionBody is the rule-management payload. The masks
+// are optional; the legacy permission field is still accepted.
+type setKnowledgeBasePermissionBody struct {
+	DocumentName string  `json:"document_name"`
+	Permission   *string `json:"permission"`
+	AllowMask    *int    `json:"allow_mask"`
+	DenyMask     *int    `json:"deny_mask"`
+}
+
+// handleSetKnowledgeBasePermission writes one rule (account × whole library
+// or one document). Setting a deny takes effect immediately: no invitation
+// acceptance is involved. Only the knowledge-base manager (owner or
+// administrator) may call it.
+func (s *Server) handleSetKnowledgeBasePermission(w http.ResponseWriter, r *http.Request) {
+	session, ok := requestSessionUserContext(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireAccess(w) {
+		return
+	}
+	var body setKnowledgeBasePermissionBody
+	if details := decodeJSONBody(r, &body); details != nil {
+		writeValidation(w, http.StatusUnprocessableEntity, details)
+		return
+	}
+	if body.Permission == nil && body.AllowMask == nil {
+		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
+			Type: "missing", Loc: []any{"body"}, Msg: "permission 或 allow_mask 至少提供一个",
+		}})
+		return
+	}
+	setter, ok := s.access.(interface {
+		SetRule(ctx context.Context, user state.User, namespace string, request access.RuleRequest) (access.GrantView, error)
+	})
+	if !ok {
+		writeDetail(w, http.StatusServiceUnavailable, "知识库权限服务未启用")
+		return
+	}
+	rule := access.RuleRequest{
+		GranteeUserID: pathParam(r, "user_id"),
+		DocumentName:  body.DocumentName,
+	}
+	if body.Permission != nil {
+		rule.Permission = *body.Permission
+	}
+	if body.AllowMask != nil {
+		rule.AllowMask = body.AllowMask
+	}
+	if body.DenyMask != nil {
+		rule.DenyMask = body.DenyMask
+	}
+	grant, err := setter.SetRule(r.Context(), session.User, pathParam(r, "namespace"), rule)
+	if err != nil {
+		writeAccessError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"permission": grant})
+}
+
+// clearDenyBody names the rule whose denies are cleared.
+type clearDenyBody struct {
+	DocumentName string `json:"document_name"`
+}
+
+// handleClearKnowledgeBaseDeny removes every deny of one rule while keeping
+// its allow: the explicit "清除拒绝" operation.
+func (s *Server) handleClearKnowledgeBaseDeny(w http.ResponseWriter, r *http.Request) {
+	session, ok := requestSessionUserContext(w, r)
+	if !ok {
+		return
+	}
+	if !s.requireAccess(w) {
+		return
+	}
+	var body clearDenyBody
+	if details := decodeJSONBody(r, &body); details != nil {
+		writeValidation(w, http.StatusUnprocessableEntity, details)
+		return
+	}
+	clearer, ok := s.access.(interface {
+		ClearDeny(ctx context.Context, user state.User, namespace, granteeUserID, documentName string) (access.GrantView, error)
+	})
+	if !ok {
+		writeDetail(w, http.StatusServiceUnavailable, "知识库权限服务未启用")
+		return
+	}
+	grant, err := clearer.ClearDeny(r.Context(), session.User, pathParam(r, "namespace"),
+		pathParam(r, "user_id"), body.DocumentName)
+	if err != nil {
+		writeAccessError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"permission": grant})
+}
+
+// handleRevokeKnowledgeBasePermission removes the allows of one account (the
+// legacy revoke surface): deny rules survive, so revoking an allow never lifts
+// an explicit deny. An optional document_name query limits the revoke to that
+// one file rule; without it every allow of the account inside the knowledge
+// base is cleared.
 func (s *Server) handleRevokeKnowledgeBasePermission(w http.ResponseWriter, r *http.Request) {
 	session, ok := requestSessionUserContext(w, r)
 	if !ok {
 		return
 	}
 	if !s.requireAccess(w) {
+		return
+	}
+	if documentName := r.URL.Query().Get("document_name"); documentName != "" {
+		clearer, supports := s.access.(interface {
+			SetRule(ctx context.Context, user state.User, namespace string, request access.RuleRequest) (access.GrantView, error)
+		})
+		if !supports {
+			writeDetail(w, http.StatusServiceUnavailable, "知识库权限服务未启用")
+			return
+		}
+		zero := 0
+		if _, err := clearer.SetRule(r.Context(), session.User, pathParam(r, "namespace"), access.RuleRequest{
+			GranteeUserID: pathParam(r, "user_id"),
+			DocumentName:  documentName,
+			AllowMask:     &zero,
+		}); err != nil {
+			writeAccessError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if err := s.access.RevokeGrant(r.Context(), session.User,
@@ -290,6 +412,7 @@ func (s *Server) handleListKnowledgeBaseInvitations(w http.ResponseWriter, r *ht
 type createKnowledgeBaseInvitationBody struct {
 	Username      string   `json:"username"`
 	Permission    string   `json:"permission"`
+	AllowMask     *int     `json:"allow_mask"`
 	Scope         string   `json:"scope"`
 	DocumentNames []string `json:"document_names"`
 }
@@ -313,6 +436,7 @@ func (s *Server) handleCreateKnowledgeBaseInvitation(w http.ResponseWriter, r *h
 		Namespace:     pathParam(r, "namespace"),
 		Username:      body.Username,
 		Permission:    body.Permission,
+		AllowMask:     body.AllowMask,
 		Scope:         body.Scope,
 		DocumentNames: body.DocumentNames,
 	})

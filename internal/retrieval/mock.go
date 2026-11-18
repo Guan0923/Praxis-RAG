@@ -204,6 +204,9 @@ func sortedTerms(terms map[string]struct{}) []string {
 }
 
 // mockMatchesFilters compares filter values with Python equality semantics.
+// mockMatchesFilters compares filter values with Python equality semantics. A
+// []string document_id condition (the server-side visibility allow-list)
+// accepts any listed document, mirroring the Qdrant match-any behaviour.
 func mockMatchesFilters(chunk KnowledgeChunk, filters map[string]any) bool {
 	values := map[string]any{
 		"document_id": chunk.DocumentID,
@@ -211,6 +214,22 @@ func mockMatchesFilters(chunk KnowledgeChunk, filters map[string]any) bool {
 		"title":       chunk.Title,
 	}
 	for key, want := range filters {
+		if list, isList := want.([]string); isList {
+			if key != "document_id" {
+				return false
+			}
+			matched := false
+			for _, allowed := range list {
+				if allowed == chunk.DocumentID {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return false
+			}
+			continue
+		}
 		if !pythonEqual(values[key], want) {
 			return false
 		}

@@ -28,6 +28,7 @@ import {
   invitationStatus,
   invitationStatusColors,
   invitationStatusLabels,
+  maskToText,
   permissionLabels,
   previewInvitation,
   type InvitationView,
@@ -39,6 +40,18 @@ export function invitationStatusTag(invitation: InvitationView) {
   return (
     <Tag color={invitationStatusColors[status] || "default"}>
       {invitationStatusLabels[status] || status}
+    </Tag>
+  );
+}
+
+// InvitationAllowTag 渲染一条邀请允许的具体操作：掩码翻译成中文标签（例如
+// 「阅读、修改」）；旧邀请没有掩码时回退到只读/读写投影。
+export function InvitationAllowTag({ invitation }: { invitation: InvitationView }) {
+  if (invitation.allow_mask !== undefined)
+    return <Tag color={invitation.allow_mask ? "blue" : "default"}>{maskToText(invitation.allow_mask)}</Tag>;
+  return (
+    <Tag color={invitation.permission === "write" ? "blue" : "default"}>
+      {permissionLabels[invitation.permission] || invitation.permission}
     </Tag>
   );
 }
@@ -106,12 +119,10 @@ export function InvitationsPage({ onOpenInvite }: {
       render: (value: string) => <span className="break-text">{value}</span>,
     },
     {
-      title: "权限",
-      dataIndex: "permission",
-      width: 90,
-      render: (value: InvitationView["permission"]) => (
-        <Tag color={value === "write" ? "blue" : "default"}>{permissionLabels[value] || value}</Tag>
-      ),
+      title: "允许的操作",
+      key: "allow_mask",
+      width: 170,
+      render: (_, invitation) => <InvitationAllowTag invitation={invitation} />,
     },
     {
       title: "范围",
@@ -281,7 +292,7 @@ export function InvitePage({
   const described = invitation ? [
     { key: "namespace", label: "知识库", children: <span className="break-text">{invitation.namespace}</span> },
     { key: "inviter", label: "邀请人", children: <span className="break-text">{invitation.inviter_username}</span> },
-    { key: "permission", label: "权限", children: <Tag color={invitation.permission === "write" ? "blue" : "default"}>{permissionLabels[invitation.permission] || invitation.permission}</Tag> },
+    { key: "permission", label: "允许的操作", children: <InvitationAllowTag invitation={invitation} /> },
     {
       key: "scope",
       label: "范围",

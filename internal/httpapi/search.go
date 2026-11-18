@@ -124,19 +124,40 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeRuntimeError(w, err, true)
 		return
 	}
-	// A file-level grantee only retrieves the documents they may read: the
+	// A restricted grantee only retrieves the documents they may read: the
 	// runtime filters results and snapshots by these ids (nil = unrestricted,
 	// empty slice = nothing visible).
 	if hasScope && scope.Restricted() {
+		// The SAG event-entity mode expands a dynamic hyperedge whose
+		// expansion cannot be bounded to the readable set before recall; a
+		// restricted account is refused explicitly instead of silently
+		// leaking evidence.
+		if request.Retrieval == contracts.RetrievalSAG {
+			writeDetail(w, http.StatusForbidden, "该检索模式暂不支持受限账号调用：sag")
+			return
+		}
 		request.DocumentIDs = []string{}
 		if s.access != nil {
-			ids, resolveErr := s.access.ResolveDocumentIDs(r.Context(), namespace, scope.ReadDocumentNames())
-			if resolveErr != nil {
-				writeAccessError(w, resolveErr)
-				return
-			}
-			if ids != nil {
-				request.DocumentIDs = ids
+			if resolver, ok := s.access.(interface {
+				ResolveVisibleDocumentIDs(ctx context.Context, namespace string, scope access.ScopeSet) ([]string, error)
+			}); ok {
+				ids, resolveErr := resolver.ResolveVisibleDocumentIDs(r.Context(), namespace, scope)
+				if resolveErr != nil {
+					writeAccessError(w, resolveErr)
+					return
+				}
+				if ids != nil {
+					request.DocumentIDs = ids
+				}
+			} else {
+				ids, resolveErr := s.access.ResolveDocumentIDs(r.Context(), namespace, scope.ReadDocumentNames())
+				if resolveErr != nil {
+					writeAccessError(w, resolveErr)
+					return
+				}
+				if ids != nil {
+					request.DocumentIDs = ids
+				}
 			}
 		}
 	}
@@ -146,6 +167,61 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+// requireScopeArtifactRead enforces read visibility on one artifact: the
+// artifact's owning document must be within the caller's visible set. When
+// the artifact carries no trustworthy owning document (or the resolution
+// fails), a scope-restricted request is refused; management credentials keep
+// the historical unrestricted behaviour.
+func (s *Server) requireScopeArtifactRead(w http.ResponseWriter, r *http.Request, namespace, artifactID string) bool {
+	if _, ok := s.requireScopeRead(w, r); !ok {
+		return false
+	}
+	scope, hasScope := access.ScopeFromContext(r.Context())
+	if !hasScope || !scope.Restricted() {
+		return true
+	}
+	// Resolve the artifact's owning document id and check it against the
+	// caller's visible document set.
+	artifact, err := s.runtime.GetArtifact(r.Context(), namespace, artifactID, 0, 1)
+	if err != nil || artifact == nil {
+		// An unreadable or missing artifact cannot prove a trusted owner:
+		// fail closed for the restricted caller.
+		writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
+		return false
+	}
+	documentID, _ := artifact["document_id"].(string)
+	if documentID == "" {
+		writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
+		return false
+	}
+	ids, resolveErr := s.resolveVisibleDocumentIDs(r, namespace, scope)
+	if resolveErr != nil {
+		writeAccessError(w, resolveErr)
+		return false
+	}
+	for _, visible := range ids {
+		if visible == documentID {
+			return true
+		}
+	}
+	writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
+	return false
+}
+
+// resolveVisibleDocumentIDs resolves one scope's visible document ids through
+// the wired access service (the mask-aware resolver when available).
+func (s *Server) resolveVisibleDocumentIDs(r *http.Request, namespace string, scope access.ScopeSet) ([]string, error) {
+	if s.access == nil {
+		return nil, nil
+	}
+	if resolver, ok := s.access.(interface {
+		ResolveVisibleDocumentIDs(ctx context.Context, namespace string, scope access.ScopeSet) ([]string, error)
+	}); ok {
+		return resolver.ResolveVisibleDocumentIDs(r.Context(), namespace, scope)
+	}
+	return s.access.ResolveDocumentIDs(r.Context(), namespace, scope.ReadDocumentNames())
 }
 
 func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request) {
@@ -158,6 +234,9 @@ func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if _, ok := s.requireScopeRead(w, r); !ok {
+		return
+	}
+	if !s.requireScopeArtifactRead(w, r, namespace, pathParam(r, "artifact_id")) {
 		return
 	}
 	artifactID, err := contracts.ValidateUUID(pathParam(r, "artifact_id"))
@@ -223,6 +302,9 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if _, ok := s.requireScopeRead(w, r); !ok {
+		return
+	}
+	if !s.requireScopeArtifactRead(w, r, namespace, pathParam(r, "artifact_id")) {
 		return
 	}
 	artifactID, err := contracts.ValidateUUID(pathParam(r, "artifact_id"))

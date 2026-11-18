@@ -35,6 +35,8 @@ import {
   fetchWorkspaceEntitlements,
   formatBytes,
   formatQuota,
+  hasMask,
+  PERM_UPDATE,
   type AccessView,
   type Connection,
   type DocumentInfo,
@@ -60,7 +62,10 @@ import {
 } from "./uploadBatches";
 import { FeishuImportModal } from "./FeishuImportModal";
 import {
+  canCreateDocument,
+  canDeleteDocument,
   canReplaceDocument,
+  effectiveDocumentMask,
   replaceAcceptAttribute,
   replaceDocument,
   replaceFileError,
@@ -474,16 +479,16 @@ export function DocumentsPage({
     </div>
   );
 
-  // Whole-knowledge-base writers get upload/delete/Feishu import; a file-level
-  // write grant still permits replacing that one document, so the replace action
-  // is decided per row instead of by the whole-knowledge-base rule.
-  const wholeWrite = !authEnabled || !access || access.scope.whole_write;
+  // 有效权限来自 GET access 的 scope 掩码（客户端按公式合并：
+  // allow = default|whole|file，deny 同理，deny 压过 allow）。上传（新增）看
+  // create 位；每行替换看 update 位、删除看 delete 位。旧后端没有掩码字段
+  // 时退回 legacy 只读/读写投影，保持乐观行为，服务端仍会兜底校验。
+  const canCreate = canCreateDocument(access, authEnabled);
   const anyWrite = !authEnabled || !access || access.can_write
-    || access.scope.whole_write || access.scope.write_documents.length > 0;
-  const fileWriteOnly = Boolean(
-    authEnabled && access && !access.scope.whole_write
-      && access.scope.write_documents.length > 0,
-  );
+    || access.scope.whole_write || access.scope.write_documents.length > 0
+    || (access.scope.effective_library !== undefined && access.scope.effective_library > 0);
+  const anyFileUpdate = !authEnabled || !access || documents.some((doc) =>
+    hasMask(effectiveDocumentMask(access, doc.name), PERM_UPDATE));
   const documentColumns: TableColumnsType<DocumentInfo> = [
     {
       title: "文档",
@@ -531,14 +536,15 @@ export function DocumentsPage({
       ),
     },
   ];
-  if (wholeWrite || fileWriteOnly) {
+  if (anyFileUpdate || anyWrite) {
     documentColumns.push({
       title: "操作",
       key: "actions",
       width: 92,
       render: (_, doc) => {
         const replaceable = canReplaceDocument(access, authEnabled, doc.name);
-        if (!replaceable && !wholeWrite) return null;
+        const deletable = canDeleteDocument(access, authEnabled, doc.name);
+        if (!replaceable && !deletable) return null;
         return (
           <div className="document-actions">
             {replaceable && (
@@ -553,7 +559,7 @@ export function DocumentsPage({
                 />
               </Tooltip>
             )}
-            {wholeWrite && (
+            {deletable && (
               <Tooltip title="删除文档">
                 <Button
                   type="text"
@@ -578,7 +584,7 @@ export function DocumentsPage({
         <div className="page-heading-title">
           <h1>知识文档</h1>
           {!anyWrite && <Tag color="orange">只读</Tag>}
-          {fileWriteOnly && <Tag color="blue">文件级写入</Tag>}
+          {authEnabled && access && !anyWrite && anyFileUpdate && <Tag color="blue">文件级写入</Tag>}
         </div>
         <div className="toolbar">
           <Tooltip title="刷新文档">
@@ -589,7 +595,7 @@ export function DocumentsPage({
               onClick={() => void loadDocuments()}
             />
           </Tooltip>
-          {wholeWrite && authEnabled && (
+          {canCreate && authEnabled && (
             <Button
               aria-label="从飞书导入"
               icon={<CloudDownloadOutlined />}
@@ -599,7 +605,7 @@ export function DocumentsPage({
               从飞书导入
             </Button>
           )}
-          {wholeWrite && (summary ? (
+          {canCreate && (summary ? (
             <Popover
               trigger="click"
               placement="bottomRight"
@@ -677,22 +683,22 @@ export function DocumentsPage({
           )}
         </div>
       )}
-      {!anyWrite && (
+      {!anyWrite && !anyFileUpdate && (
         <Alert
           className="page-alert"
           type="info"
           showIcon
           title="只读知识库"
-          description="你对该知识库没有写入权限，上传、替换与删除入口已隐藏；文件列表由服务端按授权范围过滤。"
+          description="你对该知识库没有可用的操作权限，上传、替换与删除入口已隐藏；文件列表由服务端按授权范围过滤。"
         />
       )}
-      {fileWriteOnly && (
+      {authEnabled && access && !anyWrite && anyFileUpdate && (
         <Alert
           className="page-alert"
           type="info"
           showIcon
-          title="文件级写入"
-          description="你只被授权修改部分文档：可对相应文档执行「替换文件」；上传、删除与飞书导入需要全库写权限。"
+          title="文件级权限"
+          description="你被授权操作部分文档：可对相应文档执行「替换文件」或「删除文档」；上传与飞书导入需要知识库级的新增权限。"
         />
       )}
       {entitlements?.files && !entitlements.files.can_add && (
@@ -917,7 +923,7 @@ export function DocumentsPage({
         open={feishuOpen}
         connection={connection}
         knowledgeBase={knowledgeBase}
-        canWrite={Boolean(access?.scope.whole_write)}
+        canWrite={canCreate}
         onClose={() => setFeishuOpen(false)}
         onImported={() => {
           void loadDocuments();
