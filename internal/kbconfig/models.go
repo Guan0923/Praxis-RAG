@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/Guan0923/xinghe_rag/internal/modelapi"
+	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
 )
 
 // ModelLister is the minimal provider model-listing transport seam.

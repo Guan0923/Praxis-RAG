@@ -18,7 +18,6 @@ examples
 docs
 pyproject.toml
 uv.lock
-PROGRESS.md
 VALIDATION.md
 
 # Local caches, virtualenvs and generated data

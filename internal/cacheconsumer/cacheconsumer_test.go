@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/mq"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/mq"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // fakeRefresher records the keys it was asked to refresh and can fail.

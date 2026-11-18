@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/config"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 var canonicalUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)

@@ -4,8 +4,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/chunking"
 )
 
 // WithMCPHandler mounts the MCP Streamable HTTP handler on /mcp. The handler is

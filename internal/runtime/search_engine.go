@@ -8,15 +8,15 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/config"
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
-	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
-	"github.com/Guan0923/xinghe_rag/internal/modelapi"
-	"github.com/Guan0923/xinghe_rag/internal/qdrant"
-	"github.com/Guan0923/xinghe_rag/internal/searchrefs"
-	"github.com/Guan0923/xinghe_rag/internal/sparse"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
+	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
+	"github.com/Guan0923/Praxis-RAG/internal/qdrant"
+	"github.com/Guan0923/Praxis-RAG/internal/searchrefs"
+	"github.com/Guan0923/Praxis-RAG/internal/sparse"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // SearchEngine owns the retrieval half of the service runtime: the per-namespace

@@ -5,10 +5,10 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/Guan0923/xinghe_rag/internal/access"
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/auth"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/access"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/auth"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // AccessControl resolves what one Console account may read or modify inside a

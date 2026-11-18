@@ -5,8 +5,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/Guan0923/xinghe_rag/internal/modelapi"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // Model-profile field limits, also enforced by the HTTP request validation so a

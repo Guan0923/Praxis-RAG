@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 )
 
 // Document limits mirror service_knowledge constants.

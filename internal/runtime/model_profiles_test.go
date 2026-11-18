@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 var modelProfileIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)

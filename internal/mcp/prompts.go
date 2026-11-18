@@ -8,7 +8,7 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/Guan0923/xinghe_rag/internal/catalog"
+	"github.com/Guan0923/Praxis-RAG/internal/catalog"
 )
 
 // loadCatalog reads one namespace's catalog document. Read failures become the

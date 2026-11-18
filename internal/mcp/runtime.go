@@ -13,8 +13,8 @@ import (
 	"errors"
 	"log/slog"
 
-	"github.com/Guan0923/xinghe_rag/internal/catalog"
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/catalog"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 )
 
 const (

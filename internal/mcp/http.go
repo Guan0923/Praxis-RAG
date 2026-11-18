@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/access"
-	"github.com/Guan0923/xinghe_rag/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/access"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
 )
 
 // modernProtocolVersion is the first protocol era the SDK only serves over a

@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 )
 
 func writeBadRuntime(w http.ResponseWriter, err error) {

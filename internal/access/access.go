@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // ErrorKind classifies a sharing failure for the HTTP/MCP layers.

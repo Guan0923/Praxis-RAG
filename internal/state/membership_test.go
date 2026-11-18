@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/plans"
+	"github.com/Guan0923/Praxis-RAG/internal/plans"
 )
 
 // membershipTestNow is one fixed instant inside a Shanghai natural month so the

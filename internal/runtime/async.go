@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // asyncUploadConflictMessage mirrors rag_mcp.mcp_http.mutate_document's safe

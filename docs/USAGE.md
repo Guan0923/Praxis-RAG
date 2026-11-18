@@ -46,6 +46,8 @@ RAG 只返回证据，不生成最终回答。后端为 Go 实现：PDF 默认�
 | Docling 解析微服务 | 可选（默认 compose 启动） | `.docx`、`.html`/`.htm` 解析（`python-workers/docling-service`，容器端口 8092，健康检查 `/healthz`）；配置后 `.doc` 先由 LibreOffice 转成 `.docx` 再交给它。未配置 `RAG_DOCLING_SERVICE_URL` 时 Docling 不启用：`.docx`/`.doc` 仍走进程内 OOXML，`.html`/`.htm` 不可导入 |
 | LibreOffice | 可选 | 仅 DOC 转换需要外部程序；PDF（go 引擎）/DOCX/HTML 解析不直接依赖它（DOCX/HTML 由 Docling 服务解析） |
 
+Go module 路径为 `github.com/Guan0923/Praxis-RAG`，与 GitHub 仓库地址一致。
+
 ### 构建命令
 
 ```powershell

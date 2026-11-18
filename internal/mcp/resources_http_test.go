@@ -14,7 +14,7 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/Guan0923/xinghe_rag/internal/resources"
+	"github.com/Guan0923/Praxis-RAG/internal/resources"
 )
 
 // documentPagesText produces exactly two paragraph pages under

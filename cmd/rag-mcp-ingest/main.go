@@ -20,12 +20,12 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/Guan0923/xinghe_rag/internal/config"
-	"github.com/Guan0923/xinghe_rag/internal/document"
-	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
-	"github.com/Guan0923/xinghe_rag/internal/redisstate"
-	"github.com/Guan0923/xinghe_rag/internal/runtime"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
+	"github.com/Guan0923/Praxis-RAG/internal/redisstate"
+	"github.com/Guan0923/Praxis-RAG/internal/runtime"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // Exit codes: 0 success, 1 runtime/ingest failure (Python main returns 1 when

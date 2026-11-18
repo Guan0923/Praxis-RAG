@@ -11,9 +11,9 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/Guan0923/xinghe_rag/internal/catalog"
-	"github.com/Guan0923/xinghe_rag/internal/logging"
-	"github.com/Guan0923/xinghe_rag/internal/version"
+	"github.com/Guan0923/Praxis-RAG/internal/catalog"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/version"
 )
 
 // namespacePattern is the shared namespace identifier format (catalog.NAME_PATTERN).

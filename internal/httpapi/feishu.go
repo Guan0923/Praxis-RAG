@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/feishu"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/feishu"
 )
 
 // feishuImportReadConcurrency bounds the number of simultaneous document reads

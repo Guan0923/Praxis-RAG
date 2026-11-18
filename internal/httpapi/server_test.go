@@ -13,11 +13,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/apikeys"
-	"github.com/Guan0923/xinghe_rag/internal/catalog"
-	"github.com/Guan0923/xinghe_rag/internal/config"
-	"github.com/Guan0923/xinghe_rag/internal/state"
-	"github.com/Guan0923/xinghe_rag/internal/statetest"
+	"github.com/Guan0923/Praxis-RAG/internal/apikeys"
+	"github.com/Guan0923/Praxis-RAG/internal/catalog"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/statetest"
 )
 
 type fakeNotifier struct{ namespaces []string }

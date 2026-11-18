@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/modelapi"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // validModelDraft is a minimal accepted draft used by the validation table.

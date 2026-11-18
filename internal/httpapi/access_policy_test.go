@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/access"
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/auth"
-	"github.com/Guan0923/xinghe_rag/internal/config"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/access"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/auth"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // fakeAccessControl is an in-memory AccessControl for handler tests.

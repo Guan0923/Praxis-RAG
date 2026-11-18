@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/connect"
-	"github.com/Guan0923/xinghe_rag/internal/k8sops"
+	"github.com/Guan0923/Praxis-RAG/internal/connect"
+	"github.com/Guan0923/Praxis-RAG/internal/k8sops"
 )
 
 // MonitorActionsRuntime performs the operator actions the Console monitor page

@@ -11,7 +11,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // exclusiveResource is the namespace-wide lease field (state.UploadNamespaceResource).

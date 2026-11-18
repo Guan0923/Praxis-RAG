@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
 )
 
 // newTestClient starts one fake Feishu origin serving both the OAuth and Open

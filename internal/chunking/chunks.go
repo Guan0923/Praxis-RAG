@@ -13,7 +13,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/Guan0923/xinghe_rag/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
 )
 
 // Chunk is a stable, storage-neutral unit produced from one source document,

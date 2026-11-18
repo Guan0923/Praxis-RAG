@@ -29,9 +29,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/chunking"
-	"github.com/Guan0923/xinghe_rag/internal/document"
-	"github.com/Guan0923/xinghe_rag/internal/document/pdfcontent"
+	"github.com/Guan0923/Praxis-RAG/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/document/pdfcontent"
 )
 
 const defaultTokenizerModel = "BAAI/bge-m3"

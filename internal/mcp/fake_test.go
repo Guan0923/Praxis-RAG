@@ -8,8 +8,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/catalog"
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/catalog"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 )
 
 // newTestEndpoint builds an Endpoint with in-memory catalog storage and a

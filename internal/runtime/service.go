@@ -18,13 +18,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/chunking"
-	"github.com/Guan0923/xinghe_rag/internal/config"
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
-	"github.com/Guan0923/xinghe_rag/internal/document"
-	"github.com/Guan0923/xinghe_rag/internal/state"
-	"github.com/Guan0923/xinghe_rag/internal/version"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/version"
 )
 
 // windowsReserved mirrors service_knowledge._WINDOWS_RESERVED.

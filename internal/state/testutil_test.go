@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/statetest"
+	"github.com/Guan0923/Praxis-RAG/internal/statetest"
 )
 
 // stateEnvKeys are the environment variables the state layer reads.

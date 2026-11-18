@@ -3,7 +3,7 @@ package catalog
 import (
 	"context"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // StateStore adapts the shared-database CatalogRepository to the catalog.Store

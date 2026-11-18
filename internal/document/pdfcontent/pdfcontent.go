@@ -16,8 +16,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/Guan0923/xinghe_rag/internal/chunking"
-	"github.com/Guan0923/xinghe_rag/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
 )
 
 // PageCharacters mirrors resources.PAGE_CHARACTERS.

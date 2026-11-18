@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Guan0923/xinghe_rag/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
 )
 
 // ViewLoader loads one read-model value using only the supplied querier, which

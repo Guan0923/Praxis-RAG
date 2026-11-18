@@ -181,4 +181,5 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 | `python-workers/pdf-service/README.md` | PDF 视觉解析微服务的构建、视觉模型配置与接口 |
 | `docs/cdc-migration.md` | 事务 outbox → Debezium 表级采集的迁移契约：分布式 Kafka Connect、双连接器、事件、调度版本、缓存消费者、存量切换、监控替换 |
 | `VALIDATION.md` | 已执行的验证记录（按日期） |
-| `PROGRESS.md` | 早期开发阶段记录（历史，不作当前功能清单） |
+| [docs/PROGRESS.md](../PROGRESS.md) | 早期开发阶段记录（历史，不作当前功能清单） |
+| [docs/事务-1057.md](../事务-1057.md) | 事务与一致性审计记录（历史） |

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // Defaults mirror the shared Kafka queue contract (RAG_KAFKA_* + the queue

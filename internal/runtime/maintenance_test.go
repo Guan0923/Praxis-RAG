@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/chunking"
-	"github.com/Guan0923/xinghe_rag/internal/sparse"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/sparse"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // newMaintenanceService builds a runtime without a background loop so tests can

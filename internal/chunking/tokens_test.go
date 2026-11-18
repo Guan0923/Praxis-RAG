@@ -62,7 +62,7 @@ func TestDefaultCounterDeterministicApproximation(t *testing.T) {
 		{"中文句子", 4},
 		{"hello world", 4}, // two 5-rune words -> 4 subword pieces
 		{"a b c", 3},       // whitespace is not counted
-		{"星河 X7", 3},       // 2 CJK runes + one 2-rune word piece
+		{"终端 X7", 3},       // 2 CJK runes + one 2-rune word piece
 		{"。！？", 3},         // punctuation runes are separate tokens
 		{"\n\n\t ", 0},     // whitespace only
 	}
@@ -83,7 +83,7 @@ func TestDefaultCounterOffsetsInvariants(t *testing.T) {
 	if !ok {
 		t.Fatalf("DefaultCounter does not implement TokenOffsetter")
 	}
-	text := "星河 X7 故障 code"
+	text := "终端 X7 故障 code"
 	offsets := offsetter.TokenStartOffsets(text)
 	if len(offsets) != DefaultCounter.Count(text) {
 		t.Fatalf("offsets = %d, count = %d", len(offsets), DefaultCounter.Count(text))
@@ -150,7 +150,7 @@ func TestTokenBudgetModelLimitError(t *testing.T) {
 }
 
 func TestScannedOffsetsMatchOffsetter(t *testing.T) {
-	text := "星河设备工作正常。温度超过上限时"
+	text := "测试设备工作正常。温度超过上限时"
 	expected := runeCounter{}.TokenStartOffsets(text)
 	for _, counter := range []TokenCounter{runeCounter{}, plainRuneCounter{}, DefaultCounter} {
 		if got := scannedTokenOffsets(counter, text); !reflect.DeepEqual(got, expected) {

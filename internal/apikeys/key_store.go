@@ -8,7 +8,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // Error is a safe, user-facing credential error.

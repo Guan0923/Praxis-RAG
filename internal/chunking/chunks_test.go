@@ -10,7 +10,7 @@ import (
 	"testing"
 	"unicode"
 
-	"github.com/Guan0923/xinghe_rag/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
 )
 
 const testWordNamespaces = `xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"` +
@@ -133,7 +133,7 @@ func checkTokenChunks(t *testing.T, path string, chunks []Chunk, counter TokenCo
 
 func TestTokenStrategyLimitsAndSourceCoverage(t *testing.T) {
 	texts := map[string]string{
-		"chinese": strings.Repeat("星河设备工作正常。温度超过上限时应先断电！请检查传感器连接？\n\n", 45),
+		"chinese": strings.Repeat("测试设备工作正常。温度超过上限时应先断电！请检查传感器连接？\n\n", 45),
 		"english": strings.Repeat("Dr. Smith checked version 3.14. It works! Another sentence?\n\n", 40),
 		"mixed":   strings.Repeat("Mixed中文 English café 👩🏽‍💻。下一句话有内容！\n\n", 40),
 		"nopunct": strings.Repeat("无标点非常长的连续文字", 200),

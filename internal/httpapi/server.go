@@ -16,10 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/catalog"
-	"github.com/Guan0923/xinghe_rag/internal/chunking"
-	"github.com/Guan0923/xinghe_rag/internal/config"
-	"github.com/Guan0923/xinghe_rag/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/catalog"
+	"github.com/Guan0923/Praxis-RAG/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
 )
 
 // StatusProvider renders the secret-free service health payload.

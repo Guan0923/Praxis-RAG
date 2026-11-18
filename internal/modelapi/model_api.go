@@ -21,7 +21,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 )
 
 // DefaultTimeout is the model service request timeout in seconds.

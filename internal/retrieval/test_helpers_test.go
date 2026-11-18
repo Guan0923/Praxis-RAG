@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/qdrant"
+	"github.com/Guan0923/Praxis-RAG/internal/qdrant"
 )
 
 // Test helpers: a minimal fake Qdrant REST server shared by the retriever and

@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/Guan0923/xinghe_rag/internal/catalog"
+	"github.com/Guan0923/Praxis-RAG/internal/catalog"
 )
 
 // promptBody mirrors catalog.PromptDefinition as accepted by the admin API.

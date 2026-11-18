@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 
-	"github.com/Guan0923/xinghe_rag/internal/connect"
-	"github.com/Guan0923/xinghe_rag/internal/httpapi"
-	"github.com/Guan0923/xinghe_rag/internal/k8sops"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/connect"
+	"github.com/Guan0923/Praxis-RAG/internal/httpapi"
+	"github.com/Guan0923/Praxis-RAG/internal/k8sops"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // monitorOps is the concrete httpapi.MonitorActionsRuntime wired in

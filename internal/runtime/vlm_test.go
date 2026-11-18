@@ -3,8 +3,8 @@ package runtime
 import (
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
-	"github.com/Guan0923/xinghe_rag/internal/modelapi"
+	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
+	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
 )
 
 // TestUploadVLMUsesKnowledgeBaseProvider verifies the Console settings win over

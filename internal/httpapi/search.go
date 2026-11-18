@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/access"
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/access"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 )
 
 // SearchRuntime runs one synchronous retrieval action.

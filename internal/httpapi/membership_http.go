@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/membership"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/membership"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // MembershipRuntime is the Console membership/order surface. The concrete

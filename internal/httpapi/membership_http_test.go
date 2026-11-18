@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/config"
-	"github.com/Guan0923/xinghe_rag/internal/membership"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/membership"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // fakeMembership implements MembershipRuntime for transport-only tests.

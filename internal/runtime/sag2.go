@@ -8,11 +8,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
-	"github.com/Guan0923/xinghe_rag/internal/modelapi"
-	"github.com/Guan0923/xinghe_rag/internal/qdrant"
-	"github.com/Guan0923/xinghe_rag/internal/retrieval"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
+	"github.com/Guan0923/Praxis-RAG/internal/qdrant"
+	"github.com/Guan0923/Praxis-RAG/internal/retrieval"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // This file wires the sag2 retrieval mode into the service runtime. sag2 is

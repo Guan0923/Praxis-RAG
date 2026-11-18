@@ -19,12 +19,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/connect"
-	"github.com/Guan0923/xinghe_rag/internal/logging"
-	"github.com/Guan0923/xinghe_rag/internal/qdrant"
-	"github.com/Guan0923/xinghe_rag/internal/state"
-	"github.com/Guan0923/xinghe_rag/internal/sysinfo"
-	"github.com/Guan0923/xinghe_rag/internal/version"
+	"github.com/Guan0923/Praxis-RAG/internal/connect"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/qdrant"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/sysinfo"
+	"github.com/Guan0923/Praxis-RAG/internal/version"
 )
 
 const (

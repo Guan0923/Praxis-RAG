@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/auth"
-	"github.com/Guan0923/xinghe_rag/internal/k8sops"
+	"github.com/Guan0923/Praxis-RAG/internal/auth"
+	"github.com/Guan0923/Praxis-RAG/internal/k8sops"
 )
 
 // fakeKubernetesRuntime records the calls the transport layer makes and returns

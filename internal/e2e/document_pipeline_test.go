@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // TestDocumentPipelineEndToEnd drives the asynchronous upload path through the

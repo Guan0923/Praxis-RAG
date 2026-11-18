@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/modelapi"
+	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
 )
 
 func TestModelsForUsesDraftConnection(t *testing.T) {

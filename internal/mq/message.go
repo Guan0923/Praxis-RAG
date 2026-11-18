@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // lookupEnv is a test seam for environment reads.

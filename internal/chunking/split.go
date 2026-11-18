@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/Guan0923/xinghe_rag/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
 )
 
 // Range is one half-open [Start, End) span measured in runes, matching Python

@@ -18,11 +18,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/access"
-	"github.com/Guan0923/xinghe_rag/internal/apikeys"
-	"github.com/Guan0923/xinghe_rag/internal/auth"
-	"github.com/Guan0923/xinghe_rag/internal/state"
-	"github.com/Guan0923/xinghe_rag/internal/statetest"
+	"github.com/Guan0923/Praxis-RAG/internal/access"
+	"github.com/Guan0923/Praxis-RAG/internal/apikeys"
+	"github.com/Guan0923/Praxis-RAG/internal/auth"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/statetest"
 )
 
 // createdAPIKeyDetail is the 403 detail frozen for a normal account attempting

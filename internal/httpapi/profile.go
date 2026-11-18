@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/auth"
-	"github.com/Guan0923/xinghe_rag/internal/mail"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/auth"
+	"github.com/Guan0923/Praxis-RAG/internal/mail"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // AccountProfile is the personal-profile facade behind the Console profile

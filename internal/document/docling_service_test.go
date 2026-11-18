@@ -21,12 +21,12 @@ func doclingServiceManifestFixture(version string) WordManifest {
 	return WordManifest{
 		Version: version,
 		Blocks: []WordManifestBlock{
-			{Ref: "#/texts/0", Order: 0, Kind: KindHeading, Text: "Galaxy X7 系统手册",
-				Location: WordLocation{Part: "body", Paragraph: 1, Headings: []string{"Galaxy X7 系统手册"}, Scope: "body", Section: 1}},
+			{Ref: "#/texts/0", Order: 0, Kind: KindHeading, Text: "X7 系统手册",
+				Location: WordLocation{Part: "body", Paragraph: 1, Headings: []string{"X7 系统手册"}, Scope: "body", Section: 1}},
 			{Ref: "#/tables/0", Order: 1, Kind: "table", AssetID: "table-1",
-				Location: WordLocation{Part: "body", Paragraph: 2, Headings: []string{"Galaxy X7 系统手册"}, Scope: "body", Section: 1}},
+				Location: WordLocation{Part: "body", Paragraph: 2, Headings: []string{"X7 系统手册"}, Scope: "body", Section: 1}},
 			{Ref: "#/pictures/0", Order: 2, Kind: KindPicture, AssetID: "picture-1",
-				Location: WordLocation{Part: "body", Paragraph: 3, Headings: []string{"Galaxy X7 系统手册"}, Scope: "body", Section: 1}},
+				Location: WordLocation{Part: "body", Paragraph: 3, Headings: []string{"X7 系统手册"}, Scope: "body", Section: 1}},
 		},
 		Assets: []*WordManifestAsset{
 			{AssetID: "table-1", Kind: "table", Caption: "表 1 硬件参数表", CaptionSource: "document",

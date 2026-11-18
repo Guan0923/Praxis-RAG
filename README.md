@@ -4,9 +4,9 @@
 
 [快速开始](#快速开始) · [系统架构](#系统架构) · [REST / MCP](docs/USAGE.md#5-rest-api-示例) · [版本发布](https://github.com/Guan0923/Praxis-RAG/releases)
 
-![Praxis-RAG Console 检索调试页面，展示星河 X7 手册的 E03 温度保护处理步骤和来源章节](docs/images/console-search.png)
+![Praxis-RAG Console 检索调试页面，展示X7 智能终端手册的 E03 温度保护处理步骤和来源章节](docs/images/console-search.png)
 
-*Console 界面演示使用仓库内的[星河 X7 维护手册](examples/knowledge/galaxy-x7-large-manual.md)和本地示例响应。*
+*Console 界面演示使用仓库内的[X7 智能终端维护手册](examples/knowledge/x7-maintenance-manual.md)和本地示例响应。*
 
 ## 能做什么
 
@@ -63,7 +63,7 @@ pwsh -File scripts/build-go.ps1
 pwsh -File scripts/start-stack.ps1
 ```
 
-启动后打开本机 Console，注册账号并配置 Embedding 模型。创建知识库，上传星河 X7 维护手册。等索引成功后，在「检索调试」输入「星河 X7 出现 E03 温度保护后怎么处理？」即可查看来源片段。[打开 Console](http://127.0.0.1:8011/console) · [下载样例手册](examples/knowledge/galaxy-x7-large-manual.md) · [启动与冒烟说明](docs/USAGE.md#4-启动与冒烟)
+启动后打开本机 Console，注册账号并配置 Embedding 模型。创建知识库，上传X7 智能终端维护手册。等索引成功后，在「检索调试」输入「X7 终端出现 E03 温度保护后怎么处理？」即可查看来源片段。[打开 Console](http://127.0.0.1:8011/console) · [下载样例手册](examples/knowledge/x7-maintenance-manual.md) · [启动与冒烟说明](docs/USAGE.md#4-启动与冒烟)
 
 | 接入方式 | 入口 |
 | --- | --- |

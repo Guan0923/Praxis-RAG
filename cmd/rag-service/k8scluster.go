@@ -4,7 +4,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/Guan0923/xinghe_rag/internal/k8sops"
+	"github.com/Guan0923/Praxis-RAG/internal/k8sops"
 )
 
 // kubernetesMonitorBuild resolves the Console Kubernetes monitor backend: the

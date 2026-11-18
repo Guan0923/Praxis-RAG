@@ -7,11 +7,11 @@ package wire
 import (
 	"context"
 
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
-	"github.com/Guan0923/xinghe_rag/internal/httpapi"
-	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
-	"github.com/Guan0923/xinghe_rag/internal/mcp"
-	"github.com/Guan0923/xinghe_rag/internal/runtime"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/httpapi"
+	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
+	"github.com/Guan0923/Praxis-RAG/internal/mcp"
+	"github.com/Guan0923/Praxis-RAG/internal/runtime"
 )
 
 // HTTPRuntime adapts *runtime.Service to httpapi.Runtime.

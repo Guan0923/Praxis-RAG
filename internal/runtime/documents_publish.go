@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/Guan0923/xinghe_rag/internal/logging"
-	"github.com/Guan0923/xinghe_rag/internal/qdrant"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/qdrant"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // documentIndexStore adapts one Qdrant store to the upload coordinator's

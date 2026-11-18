@@ -13,7 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Guan0923/xinghe_rag/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
 )
 
 // The Docling HTTP service exposes one fixed contract:

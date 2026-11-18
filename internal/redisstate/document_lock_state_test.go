@@ -7,8 +7,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
-	"github.com/Guan0923/xinghe_rag/internal/statetest"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/statetest"
 )
 
 // TestDocumentLockTwoInstances drives the real journal against one real MySQL

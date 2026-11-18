@@ -22,7 +22,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // Option customizes a Client, primarily for tests that inject a client backed by

@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
 )
 
 const testWordNamespaces = `xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"` +

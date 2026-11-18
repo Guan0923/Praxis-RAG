@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/connect"
-	"github.com/Guan0923/xinghe_rag/internal/k8sops"
+	"github.com/Guan0923/Praxis-RAG/internal/connect"
+	"github.com/Guan0923/Praxis-RAG/internal/k8sops"
 )
 
 // fakeMonitorActions records the transport contract and returns scripted

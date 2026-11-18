@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 )
 
 // TestRestrictedSearchRequestWidensInternalBounds pins the internal pool: a

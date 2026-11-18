@@ -3,7 +3,7 @@ package runtime
 import (
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/qdrant"
+	"github.com/Guan0923/Praxis-RAG/internal/qdrant"
 )
 
 func TestSag2CorpusRevisionChangesWithEveryMutation(t *testing.T) {

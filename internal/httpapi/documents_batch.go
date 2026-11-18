@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/Guan0923/xinghe_rag/internal/access"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/access"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // documentBatchListLimit bounds the active-batch restore query.

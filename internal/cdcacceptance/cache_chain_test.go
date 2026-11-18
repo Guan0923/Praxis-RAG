@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/cacheconsumer"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/cacheconsumer"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // cacheTestDocumentsSQL inserts a documents row directly into MySQL, bypassing

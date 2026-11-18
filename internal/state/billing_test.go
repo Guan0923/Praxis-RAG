@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/plans"
+	"github.com/Guan0923/Praxis-RAG/internal/plans"
 )
 
 // billingTestOrder builds one purchase order input at now.

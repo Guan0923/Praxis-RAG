@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
 )
 
 // contentReadLimit is the raw-content response budget: the plain text limit plus

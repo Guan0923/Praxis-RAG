@@ -17,10 +17,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/logging"
-	"github.com/Guan0923/xinghe_rag/internal/mq"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/mq"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // Payload is the validated, identifier-complete input of one document job. It

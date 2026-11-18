@@ -7,9 +7,9 @@ import (
 	"reflect"
 	"strconv"
 
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
-	"github.com/Guan0923/xinghe_rag/internal/logging"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // assetFetcher is the Qdrant asset lookup seam consumed by the projector. It is

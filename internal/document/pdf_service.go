@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
 )
 
 // The remote vision PDF parse microservice exposes one fixed HTTP contract:

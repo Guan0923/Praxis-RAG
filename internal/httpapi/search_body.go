@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 )
 
 // searchBody mirrors http_service.SearchBody. Unknown fields are ignored like

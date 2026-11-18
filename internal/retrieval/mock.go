@@ -6,8 +6,8 @@ import (
 	"regexp"
 	"sort"
 
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
-	"github.com/Guan0923/xinghe_rag/internal/sparse"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/sparse"
 )
 
 // KnowledgeChunk is one entry of the deterministic Phase-1 knowledge fixture.

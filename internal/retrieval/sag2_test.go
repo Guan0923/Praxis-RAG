@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
-	"github.com/Guan0923/xinghe_rag/internal/modelapi"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
 )
 
 // fakeJevScorer is a deterministic, offline stand-in for the hosted decision

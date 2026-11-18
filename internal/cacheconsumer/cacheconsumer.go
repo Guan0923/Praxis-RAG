@@ -21,9 +21,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/logging"
-	"github.com/Guan0923/xinghe_rag/internal/mq"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/mq"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // DefaultRecoveryInterval is the cadence of the dirty-key compensation pass.

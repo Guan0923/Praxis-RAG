@@ -187,7 +187,7 @@ Points: 3（两个用户 namespace，共两个源文档）
 Legacy collection: mini_agent_phase2_demo（保留，未删除）
 ```
 
-同一个问题“星河 X7 出现 E03 应该怎么处理？”的真实检索结果：
+同一个问题“X7 终端出现 E03 应该怎么处理？”的真实检索结果：
 
 ```text
 BM25: 2 results; top score=4.034924; E03=True
@@ -437,7 +437,7 @@ Responsive visual check: six metrics and three compare columns fit without horiz
 
 本轮将 RAG MCP 模组整理为可直接克隆和安装的独立仓库：
 
-- [x] Git 安装地址切换为 `Guan0923/xinghe_rag`，不再依赖 Mini-Agent 仓库的 `subdirectory`。
+- [x] Git 安装入口切换到独立仓库，不再依赖 Mini-Agent 仓库的 `subdirectory`。
 - [x] 包元数据补充 README、Repository 和 Issues 地址。
 - [x] 增加 `.gitignore`，排除 Python 缓存、构建产物、本地环境、模型缓存和 Qdrant 数据。
 - [x] 从版本控制中移除误加入的 `__pycache__`、`.pyc` 和 `egg-info` 生成文件。

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
 )
 
 func rangeTexts(text string, ranges []Range) []string {

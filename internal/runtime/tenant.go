@@ -7,12 +7,12 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
-	"github.com/Guan0923/xinghe_rag/internal/kbconfig"
-	"github.com/Guan0923/xinghe_rag/internal/modelapi"
-	"github.com/Guan0923/xinghe_rag/internal/qdrant"
-	"github.com/Guan0923/xinghe_rag/internal/retrieval"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
+	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
+	"github.com/Guan0923/Praxis-RAG/internal/qdrant"
+	"github.com/Guan0923/Praxis-RAG/internal/retrieval"
 )
 
 // runtimeImplementation is the debug implementation string of the service

@@ -170,7 +170,7 @@ python deploy/k8s/tests/verify_manifests.py   # checks=546 failures=0
 
 ## 当前验证范围：搜索同步化（MCP/REST 一次调用直返证据）— 2026-11-13
 
-工作树 `dsh-07b26c03-826a`（Windows 11，Go 1.27.3）。本轮验证目标是**搜索同步化改造**：MCP `search` 与 REST `POST /v1/search` 一次调用返回证据；删除搜索任务、结果快照、轮询、SQL 任务逻辑、搜索队列/worker/DLQ 与 Debezium 搜索采集；artifact 独立读取与缓存同步链路保留。代码/文档/Console 变更范围见 [PROGRESS.md](PROGRESS.md) 最后一轮。
+工作树 `dsh-07b26c03-826a`（Windows 11，Go 1.27.3）。本轮验证目标是**搜索同步化改造**：MCP `search` 与 REST `POST /v1/search` 一次调用返回证据；删除搜索任务、结果快照、轮询、SQL 任务逻辑、搜索队列/worker/DLQ 与 Debezium 搜索采集；artifact 独立读取与缓存同步链路保留。代码/文档/Console 变更范围见 [docs/PROGRESS.md](docs/PROGRESS.md) 最后一轮。
 
 ### 已验证（可复核）
 
@@ -214,7 +214,7 @@ go test -p 1 -count=1 ./internal/cacheconsumer                           # 12/12
 > PENDING 记录 / `capture_progress` 的验证记录，验证的是**已下线的旧链路**，仅作历史
 > 保留；当前投递为两个 Debezium 连接器直接从 MySQL 表级采集，契约见
 > [docs/cdc-migration.md](docs/cdc-migration.md)。本轮改造的代码/文档/Console 变更范围
-> 见 [PROGRESS.md](PROGRESS.md) 与 [GO_MIGRATION.md](docs/GO_MIGRATION.md) 最后一轮。
+> 见 [docs/PROGRESS.md](docs/PROGRESS.md) 与 [GO_MIGRATION.md](docs/GO_MIGRATION.md) 最后一轮。
 
 工作树 `dsh-b0dc9fd1-4cde`（Windows 11，Go 1.27.3）。本轮验证目标是**文档、Console
 监控页、存量切换 CLI 与旧表退役 CLI**；Go worker/监控后端由并行任务实现并各自定向测试，
@@ -245,7 +245,7 @@ go run ./cmd/rag-cdc-cutover --record-position    # 缺 --file/--pos → 2
   `internal/migrate` 的 `RetireOutbox`/`OutboxTablesPresent`。对方报告
   `go test -count=1 ./internal/state/ ./internal/migrate/` 全绿；本轮 CLI 只调用这些
   已测试入口，不重复实现 DDL/重排逻辑。
-- 文档一致性：在 `README.md`、`AGENTS.md`、`docs/**`、`PROGRESS.md` 中检索
+- 文档一致性：在 `README.md`、`AGENTS.md`、`docs/**`、`docs/PROGRESS.md` 中检索
   `document_job_outbox`/`search_task_outbox`/`cache_outbox`/`outbox_bridge`/
   `RAG_OUTBOX_BRIDGE`/`进程内 relay`，剩余命中均为明确标注「已下线 / 历史实现」或
   契约对比表；`docs/GO_PARITY_AUDIT.md` 与历史审计记录按要求保留原文。
@@ -702,7 +702,7 @@ concurrent DSH session on the same machine was running its own Go tests against
 the shared `praxis_gotest` schema (leftover `state.test.exe` processes), which
 caused DDL races in unrelated schema tests — see the note at the end.
 
-Go verification (cwd worktree):
+Go verification (cwd worktree; package paths in the output below are relative to the module root):
 
 ```
 $ go build ./...
@@ -712,20 +712,20 @@ $ go vet ./internal/...
 exit 0, no output
 
 $ go test ./internal/kbconfig ./internal/httpapi -count=1 -timeout 600s
-ok   github.com/Guan0923/xinghe_rag/internal/kbconfig   0.343s
-ok   github.com/Guan0923/xinghe_rag/internal/httpapi    11.340s
+ok   internal/kbconfig   0.343s
+ok   internal/httpapi    11.340s
 
 $ go test ./internal/state -run 'TestModelProfile' -count=1 -timeout 600s
-ok   github.com/Guan0923/xinghe_rag/internal/state      35.485s
+ok   internal/state      35.485s
 
 $ go test ./internal/runtime -run 'TestModelProfile' -count=1 -timeout 600s
-ok   github.com/Guan0923/xinghe_rag/internal/runtime    79.162s
+ok   internal/runtime    79.162s
 
 $ go test ./internal/e2e -count=1 -timeout 1200s
-ok   github.com/Guan0923/xinghe_rag/internal/e2e        306.471s
+ok   internal/e2e        306.471s
 
 $ go test ./internal/state -count=1 -timeout 1800s        # full package, isolated schema
-ok   github.com/Guan0923/xinghe_rag/internal/state      426.978s
+ok   internal/state      426.978s
 ```
 
 Console verification (cwd frontend, NODE_OPTIONS shim set):
@@ -2064,7 +2064,7 @@ go test -p 1 -count=1 ./internal/migrate                                        
 
 ## Console 逐文件上传进度（SSE）与每文件保存结果 — 2026-11-14
 
-范围：`GET /v1/document-batches/upload-events/{upload_id}` SSE 端点、`POST /v1/document-batches` 的可选 `X-Upload-ID` 头、Console 逐文件进度条与每文件保存结果，以及 README / `docs/USAGE.md` / `docs/agents/features.md` / `PROGRESS.md` 的同步。工作目录 `D:\Project\Praxis-RAG\.agents\worktrees\dsh-074b99dd-e98a`（Windows + MSYS bash，Go 1.27.3，Node v26.13.0，vitest 5.1.0）。
+范围：`GET /v1/document-batches/upload-events/{upload_id}` SSE 端点、`POST /v1/document-batches` 的可选 `X-Upload-ID` 头、Console 逐文件进度条与每文件保存结果，以及 README / `docs/USAGE.md` / `docs/agents/features.md` / `docs/PROGRESS.md` 的同步。工作目录 `D:\Project\Praxis-RAG\.agents\worktrees\dsh-074b99dd-e98a`（Windows + MSYS bash，Go 1.27.3，Node v26.13.0，vitest 5.1.0）。
 
 后端：
 
@@ -2139,7 +2139,7 @@ cd frontend && npm run typecheck                  # exit 0
   没有单一聚合点数）。
 - `cmd/rag-service/main.go`：注入 `IndexedCollections: stores.MonitorIndexedCollections`。
 - 文档：`docs/USAGE.md`（`RAG_COLLECTION` 说明、监控语义、`points` 兼容字段）、
-  `docs/agents/features.md`、`PROGRESS.md`。
+  `docs/agents/features.md`、`docs/PROGRESS.md`。
 
 **验证**
 

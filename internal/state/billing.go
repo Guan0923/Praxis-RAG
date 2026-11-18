@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/plans"
+	"github.com/Guan0923/Praxis-RAG/internal/plans"
 )
 
 // Billing order statuses. Only pending orders are payable; paid orders may be

@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // Admission leaves the committed document_jobs row for Debezium; the

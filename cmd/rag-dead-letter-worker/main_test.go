@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/mq"
+	"github.com/Guan0923/Praxis-RAG/internal/mq"
 )
 
 func testKafkaSettings() mq.Settings {

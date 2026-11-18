@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/Guan0923/xinghe_rag/internal/catalog"
+	"github.com/Guan0923/Praxis-RAG/internal/catalog"
 )
 
 // ToolRegistry exposes the registered MCP tools and their built-in defaults.

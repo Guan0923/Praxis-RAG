@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/version"
+	"github.com/Guan0923/Praxis-RAG/internal/version"
 )
 
 // openAPIRoute is one documented REST operation. Routes are generated from this

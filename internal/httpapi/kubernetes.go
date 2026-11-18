@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/k8sops"
+	"github.com/Guan0923/Praxis-RAG/internal/k8sops"
 )
 
 // KubernetesRuntime is the Console Kubernetes monitor backend: read-only

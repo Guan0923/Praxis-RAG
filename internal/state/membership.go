@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/plans"
+	"github.com/Guan0923/Praxis-RAG/internal/plans"
 )
 
 // Membership, quota and order state is always read from MySQL. Redis is a

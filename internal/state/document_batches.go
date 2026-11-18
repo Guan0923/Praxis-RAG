@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
 )
 
 // Document batch lifecycle. Only two statuses are stored: "saving" while the

@@ -3,7 +3,7 @@ package runtime
 import (
 	"context"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 )
 
 // UploadOperations returns the display-only recent upload operations.

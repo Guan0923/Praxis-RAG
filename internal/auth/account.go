@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/mail"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/mail"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // Verification-code lifecycle. A code is six digits, valid for ten minutes,

@@ -14,8 +14,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/chunking"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // MaxFilesPerBatch mirrors service_knowledge.MAX_FILES_PER_BATCH.

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/chunking"
-	"github.com/Guan0923/xinghe_rag/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
 )
 
 // fakeDoclingParser implements DoclingParser without HTTP. It mirrors the real
@@ -66,18 +66,18 @@ func doclingFakeManifest(version string) document.WordManifest {
 	return document.WordManifest{
 		Version: version,
 		Blocks: []document.WordManifestBlock{
-			{Ref: "#/texts/0", Order: 0, Kind: document.KindHeading, Text: "Galaxy X7 系统手册",
-				Location: location(1, 1, "Galaxy X7 系统手册")},
+			{Ref: "#/texts/0", Order: 0, Kind: document.KindHeading, Text: "X7 系统手册",
+				Location: location(1, 1, "X7 系统手册")},
 			{Ref: "#/texts/1", Order: 1, Kind: document.KindParagraph, Text: "本文档描述安装流程。",
-				Location: location(2, 1, "Galaxy X7 系统手册")},
+				Location: location(2, 1, "X7 系统手册")},
 			{Ref: "#/texts/2", Order: 2, Kind: document.KindParagraph, Text: "表 1 硬件参数表",
-				Location: location(3, 1, "Galaxy X7 系统手册")},
+				Location: location(3, 1, "X7 系统手册")},
 			{Ref: "#/tables/0", Order: 3, Kind: "table", AssetID: "table-1",
-				Location: location(4, 1, "Galaxy X7 系统手册")},
+				Location: location(4, 1, "X7 系统手册")},
 			{Ref: "#/texts/3", Order: 4, Kind: document.KindParagraph, Text: "图 1 系统架构图",
-				Location: location(5, 1, "Galaxy X7 系统手册")},
+				Location: location(5, 1, "X7 系统手册")},
 			{Ref: "#/pictures/0", Order: 5, Kind: document.KindPicture, AssetID: "picture-1",
-				Location: location(6, 1, "Galaxy X7 系统手册")},
+				Location: location(6, 1, "X7 系统手册")},
 		},
 		Assets: []*document.WordManifestAsset{
 			{AssetID: "table-1", Kind: "table",
@@ -87,9 +87,9 @@ func doclingFakeManifest(version string) document.WordManifest {
 					HeaderRows: [][]string{{"部件", "规格"}},
 					Headers:    []string{"部件", "规格"},
 				},
-				Location: location(4, 1, "Galaxy X7 系统手册")},
+				Location: location(4, 1, "X7 系统手册")},
 			{AssetID: "picture-1", Kind: "picture", ImageFile: &imageFile,
-				Location: location(6, 1, "Galaxy X7 系统手册")},
+				Location: location(6, 1, "X7 系统手册")},
 		},
 		Diagnostics: []document.Diagnostic{},
 	}

@@ -33,10 +33,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/connect"
-	"github.com/Guan0923/xinghe_rag/internal/logging"
-	"github.com/Guan0923/xinghe_rag/internal/mq"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/connect"
+	"github.com/Guan0923/Praxis-RAG/internal/logging"
+	"github.com/Guan0923/Praxis-RAG/internal/mq"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // Exit codes follow the repository convention: 0 success, 1 runtime failure,

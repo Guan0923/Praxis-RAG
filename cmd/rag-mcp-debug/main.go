@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/Guan0923/xinghe_rag/internal/retrieval"
+	"github.com/Guan0923/Praxis-RAG/internal/retrieval"
 )
 
 func main() { os.Exit(run()) }

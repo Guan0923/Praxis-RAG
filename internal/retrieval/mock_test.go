@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 )
 
 func TestMockRetrieverMatchesRRFQuery(t *testing.T) {

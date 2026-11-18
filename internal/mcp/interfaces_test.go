@@ -1,7 +1,7 @@
 package mcp
 
 import (
-	"github.com/Guan0923/xinghe_rag/internal/httpapi"
+	"github.com/Guan0923/Praxis-RAG/internal/httpapi"
 )
 
 // Compile-time proof that the MCP facade satisfies the HTTP API layer's

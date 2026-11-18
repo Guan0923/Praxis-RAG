@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/chunking"
-	"github.com/Guan0923/xinghe_rag/internal/modelapi"
+	"github.com/Guan0923/Praxis-RAG/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
 )
 
 // testEncryptionKey is a deterministic base64-encoded 32-byte AES key.

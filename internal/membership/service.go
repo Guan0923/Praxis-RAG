@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/payment"
-	"github.com/Guan0923/xinghe_rag/internal/plans"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/payment"
+	"github.com/Guan0923/Praxis-RAG/internal/plans"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // Error codes map to HTTP status in the API layer.

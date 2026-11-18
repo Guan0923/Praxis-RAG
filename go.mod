@@ -1,4 +1,4 @@
-module github.com/Guan0923/xinghe_rag
+module github.com/Guan0923/Praxis-RAG
 
 go 1.27
 

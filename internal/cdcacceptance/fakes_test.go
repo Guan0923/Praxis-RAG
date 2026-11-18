@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/Guan0923/xinghe_rag/internal/documentworker"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/documentworker"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // cloneJSONValue detaches a value through JSON, matching what a serializing

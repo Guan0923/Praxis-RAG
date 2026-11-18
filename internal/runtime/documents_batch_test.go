@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // TestSubmitDocumentBatchRejectsHTMLWithoutDocling pins the per-item config

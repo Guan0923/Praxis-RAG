@@ -10,9 +10,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Guan0923/xinghe_rag/internal/access"
-	"github.com/Guan0923/xinghe_rag/internal/auth"
-	"github.com/Guan0923/xinghe_rag/internal/feishu"
+	"github.com/Guan0923/Praxis-RAG/internal/access"
+	"github.com/Guan0923/Praxis-RAG/internal/auth"
+	"github.com/Guan0923/Praxis-RAG/internal/feishu"
 )
 
 // fakeFeishuService is an in-memory FeishuService for handler tests.

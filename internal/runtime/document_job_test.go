@@ -12,15 +12,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/apierrors"
-	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
 
-	"github.com/Guan0923/xinghe_rag/internal/chunking"
-	"github.com/Guan0923/xinghe_rag/internal/document"
-	"github.com/Guan0923/xinghe_rag/internal/documentworker"
-	"github.com/Guan0923/xinghe_rag/internal/ingest"
-	"github.com/Guan0923/xinghe_rag/internal/sparse"
-	"github.com/Guan0923/xinghe_rag/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/document"
+	"github.com/Guan0923/Praxis-RAG/internal/documentworker"
+	"github.com/Guan0923/Praxis-RAG/internal/ingest"
+	"github.com/Guan0923/Praxis-RAG/internal/sparse"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // newDocumentJobService reuses the upload harness: a committed knowledge-base

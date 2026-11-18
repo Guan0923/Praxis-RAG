@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
 )
 
 // StateSettings is the configuration of the authoritative state database. It

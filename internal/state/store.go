@@ -19,7 +19,7 @@ import (
 
 	mysql "github.com/go-sql-driver/mysql"
 
-	"github.com/Guan0923/xinghe_rag/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/config"
 )
 
 // isUniqueViolation reports a constraint failure that Python surfaces as

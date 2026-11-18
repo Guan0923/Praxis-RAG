@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Guan0923/xinghe_rag/internal/monitor"
+	"github.com/Guan0923/Praxis-RAG/internal/monitor"
 )
 
 // MonitorRuntime renders the read-only Console monitoring snapshot and the log

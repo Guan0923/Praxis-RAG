@@ -30,7 +30,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/Guan0923/xinghe_rag/internal/sparse"
+	"github.com/Guan0923/Praxis-RAG/internal/sparse"
 )
 
 const (

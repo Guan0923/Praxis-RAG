@@ -133,7 +133,7 @@ func relationshipXML(id, kind, target string) string {
 }
 
 func TestDOCXParagraphsHeadingsAndTables(t *testing.T) {
-	body := headingParagraph("星河 X7 故障手册", 1) +
+	body := headingParagraph("X7 终端故障手册", 1) +
 		paragraphXML("E03 表示温度传感器异常。") +
 		tableXML([]string{"错误码", "处理方法"}, []string{"E03", "检查传感器连接"})
 	path := buildDOCX(t, basePackage(body, stylesXML())...)
@@ -142,7 +142,7 @@ func TestDOCXParagraphsHeadingsAndTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadText() error = %v", err)
 	}
-	want := "星河 X7 故障手册\n\nE03 表示温度传感器异常。\n\n错误码 | 处理方法\nE03 | 检查传感器连接"
+	want := "X7 终端故障手册\n\nE03 表示温度传感器异常。\n\n错误码 | 处理方法\nE03 | 检查传感器连接"
 	if text != want {
 		t.Fatalf("ReadText() = %q, want %q", text, want)
 	}
@@ -161,7 +161,7 @@ func TestDOCXParagraphsHeadingsAndTables(t *testing.T) {
 		if content.Spans[index].Block.Table != 1 {
 			t.Fatalf("span %d table = %d", index, content.Spans[index].Block.Table)
 		}
-		if strings.Join(content.Spans[index].Block.Headings, "\x00") != "星河 X7 故障手册" {
+		if strings.Join(content.Spans[index].Block.Headings, "\x00") != "X7 终端故障手册" {
 			t.Fatalf("span %d headings = %v", index, content.Spans[index].Block.Headings)
 		}
 	}
