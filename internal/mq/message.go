@@ -76,7 +76,6 @@ var cacheChangeLocators = map[string][]cacheLocator{
 	"knowledge_bases":   {{column: "namespace"}, {column: "version"}},
 	"documents":         {{column: "namespace"}, {column: "name"}, {column: "document_id"}, {column: "del_flag"}},
 	"mcp_catalogs":      {{column: "namespace"}},
-	"api_keys":          {{column: "id"}, {column: "owner_user_id", nullable: true}, {column: "enabled"}},
 	"document_heads":    {{column: "namespace"}, {column: "document_id"}, {column: "version"}},
 	"document_leases":   {{column: "namespace"}, {column: "resource"}, {column: "owner"}, {column: "operation_id", nullable: true}},
 	"upload_operations": {{column: "id"}, {column: "namespace"}, {column: "name"}, {column: "status"}},

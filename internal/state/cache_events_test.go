@@ -82,28 +82,6 @@ func requireNoCacheOutbox(t *testing.T, stores *Stores) {
 	}
 }
 
-func TestAPIKeyCreateBumpsRevisionOnly(t *testing.T) {
-	stores := newTestStores(t)
-	ctx := context.Background()
-	if _, err := stores.APIKeys.Create(ctx, "app", []string{"alpha"}); err != nil {
-		t.Fatalf("Create() error = %v", err)
-	}
-	row := readCacheRevision(t, stores, "api_keys", "")
-	if row.Revision != 1 {
-		t.Fatalf("api_keys revision = %d, want 1", row.Revision)
-	}
-	if row.RefreshedRevision != 0 || row.Attempts != 0 {
-		t.Fatalf("api_keys refreshed/attempts = %d/%d, want 0/0", row.RefreshedRevision, row.Attempts)
-	}
-	if row.LastError.Valid {
-		t.Fatalf("api_keys last_error = %q, want NULL", row.LastError.String)
-	}
-	if row.UpdatedAt <= 0 {
-		t.Fatalf("api_keys updated_at = %v, want a positive epoch timestamp", row.UpdatedAt)
-	}
-	requireNoCacheOutbox(t, stores)
-}
-
 func TestKnowledgeAndDocumentTouchesBumpEveryScope(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()

@@ -239,8 +239,6 @@ func keysForRow(table string, row map[string]any) []state.CacheKey {
 	namespace, _ := textValue(row, "namespace")
 	keys := make([]state.CacheKey, 0, 4)
 	switch table {
-	case "api_keys":
-		keys = append(keys, state.CacheKey{Kind: "api_keys", Scope: ""})
 	case "knowledge_bases":
 		if namespace == "" {
 			return nil

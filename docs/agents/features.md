@@ -187,7 +187,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 ## 12. 异步队列、死信与缓存
 
 - Kafka 只在配置 `RAG_KAFKA_BOOTSTRAP_SERVERS` 时启用；空值 = brokerless（通知无法投递、文档任务保持 `queued`、缓存刷新不生效）。搜索为同步执行，不受 Kafka 是否配置影响。
-- **两个 Kafka Connect 采集连接器**：`praxis-document-cdc` 只采集 `document_jobs`（仅 INSERT 与 `schedule_version` 变化，`skipped.operations=d`）；`praxis-cache-cdc` 采集 `knowledge_bases`/`documents`/`mcp_catalogs`/`api_keys`/`document_heads`/`document_leases`/`upload_operations`/`upload_steps`（全部 c/u/d）。二者运行在同一分布式 Connect 集群，位点保存在 Kafka 内部 topic；应用不再写任何事务 outbox。
+- **两个 Kafka Connect 采集连接器**：`praxis-document-cdc` 只采集 `document_jobs`（仅 INSERT 与 `schedule_version` 变化，`skipped.operations=d`）；`praxis-cache-cdc` 采集 `knowledge_bases`/`documents`/`mcp_catalogs`/`document_heads`/`document_leases`/`upload_operations`/`upload_steps`（全部 c/u/d）。二者运行在同一分布式 Connect 集群，位点保存在 Kafka 内部 topic；应用不再写任何事务 outbox。
 - 重发只发生在 MySQL 事务内：可重试失败先写 `retry_at`，到期由 `Sweep` 递增 `schedule_version`；租约过期也由 `Sweep` 递增版本重排。普通 `queued` 等待不递增版本、不消耗执行次数。消费者只处理与数据库当前版本相等的通知，旧版本/终态/有效租约/未到期重试安全跳过并 ACK。任务表初始快照的 `op=r` 事件用于切换补投。
 - topic：`praxis_document_ingest`、`praxis_state_cache_refresh`；DLQ 是显式 topic `praxis_document_ingest_dead_letters` / `praxis_state_cache_refresh_dead_letters`（不是 `%DLQ%` 约定），由 `rag-dead-letter-worker --kind document|cache` 消费。原搜索 topic/消费组/DLQ 已下线。
 - 缓存消费者按 `cache_revisions` 的 revision 水位刷新：读取事件 → 事务内 `revision+1` → 重建脱敏视图 → 提交后写 Redis；失败记录 `attempts/last_error` 并照常 ACK，由周期 `RefreshDirty` 补偿，Redis 写失败不丢收敛、不会造成 DLQ 风暴。

@@ -217,6 +217,17 @@ func (c *CacheSynchronizer) RefreshKey(ctx context.Context, kind, scope string) 
 	return true, nil
 }
 
+func activeCacheKindFilter() (string, []any) {
+	kinds := knownCacheKinds()
+	placeholders := make([]string, len(kinds))
+	arguments := make([]any, 0, len(kinds))
+	for index, kind := range kinds {
+		placeholders[index] = "?"
+		arguments = append(arguments, kind)
+	}
+	return "kind IN (" + strings.Join(placeholders, ", ") + ")", arguments
+}
+
 // DirtyKeys returns up to limit keys whose published revision lags the committed
 // revision or whose last refresh failed. Rows are ordered deterministically so
 // concurrent sweeps make progress on the same head of the backlog. Revision rows
@@ -226,17 +237,11 @@ func (c *CacheSynchronizer) DirtyKeys(ctx context.Context, limit int) ([]CacheKe
 	if limit <= 0 {
 		limit = defaultCacheDirtyLimit
 	}
-	kinds := knownCacheKinds()
-	placeholders := make([]string, len(kinds))
-	arguments := make([]any, 0, len(kinds)+1)
-	for index, kind := range kinds {
-		placeholders[index] = "?"
-		arguments = append(arguments, kind)
-	}
+	filter, arguments := activeCacheKindFilter()
 	arguments = append(arguments, limit)
 	query := "SELECT kind, scope FROM cache_revisions " +
 		"WHERE (refreshed_revision < revision OR last_error IS NOT NULL) " +
-		"AND kind IN (" + strings.Join(placeholders, ", ") + ") " +
+		"AND " + filter + " " +
 		"ORDER BY kind, scope LIMIT ?"
 	rows, err := c.stores.DB.QueryContext(ctx, query, arguments...)
 	if err != nil {
@@ -283,7 +288,6 @@ func (c *CacheSynchronizer) RefreshDirty(ctx context.Context, limit int) error {
 func (c *CacheSynchronizer) MarkAllDirty(ctx context.Context) (int, error) {
 	keys := []CacheKey{
 		{Kind: "kb_list", Scope: ""},
-		{Kind: "api_keys", Scope: ""},
 	}
 	namespaceMappings := []struct {
 		query string

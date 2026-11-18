@@ -61,11 +61,7 @@ func newAPIKeyRepository(db *sql.DB, encryptionKey string, cacheSync *CacheSynch
 	return &APIKeyRepository{db: db, encryptionKey: encryptionKey, cacheSync: cacheSync}
 }
 
-const apiKeySelectColumns = "id, name, prefix, namespaces, enabled, created_at, protected_key"
-
 // apiKeyOwnerSelectColumns projects one key together with its owning account.
-// The base column list above is kept for the read-model cache loader, which
-// serialises the whole api_keys table without joins.
 const apiKeyOwnerSelectColumns = "k.id, k.name, k.prefix, k.namespaces, k.enabled, " +
 	"k.created_at, k.protected_key, k.owner_user_id, u.username"
 
@@ -74,22 +70,6 @@ const apiKeyOwnerFrom = " FROM api_keys k LEFT JOIN users u ON u.id = k.owner_us
 
 type rowScanner interface {
 	Scan(dest ...any) error
-}
-
-func scanAPIKey(scanner rowScanner) (APIKey, error) {
-	var key APIKey
-	var namespaces string
-	var protected sql.NullString
-	if err := scanner.Scan(&key.ID, &key.Name, &key.Prefix, &namespaces, &key.Enabled, &key.CreatedAt, &protected); err != nil {
-		return APIKey{}, err
-	}
-	list, err := decodeStringList(namespaces)
-	if err != nil {
-		return APIKey{}, err
-	}
-	key.Namespaces = list
-	key.Exportable = protected.Valid && protected.String != ""
-	return key, nil
 }
 
 // scanAPIKeyWithOwner scans apiKeyOwnerSelectColumns (key columns + owner id +
@@ -225,9 +205,7 @@ func (r *APIKeyRepository) create(ctx context.Context, name string, namespaces [
 		return CreatedAPIKey{}, newStateError("API Key 无法保存")
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, apiKeyKeys()...); err != nil {
-		return CreatedAPIKey{}, newStateError("API Key 无法保存")
-	}
+
 	_, err = database.ExecContext(ctx,
 		"INSERT INTO api_keys (id, name, prefix, digest, namespaces, enabled, created_at, updated_at, protected_key, owner_user_id) "+
 			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -255,9 +233,7 @@ func (r *APIKeyRepository) Update(ctx context.Context, keyID, name string, names
 		return nil, newStateError("API Key 无法更新")
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, apiKeyKeys()...); err != nil {
-		return nil, newStateError("API Key 无法更新")
-	}
+
 	result, err := database.ExecContext(ctx,
 		"UPDATE api_keys SET name = ?, namespaces = ?, enabled = ?, updated_at = ? WHERE id = ?",
 		name, encodedNamespaces, enabled, nowISO(), keyID)
@@ -290,9 +266,7 @@ func (r *APIKeyRepository) Delete(ctx context.Context, keyID string) (bool, erro
 		return false, err
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, apiKeyKeys()...); err != nil {
-		return false, err
-	}
+
 	result, err := database.ExecContext(ctx, "DELETE FROM api_keys WHERE id = ?", keyID)
 	if err != nil {
 		return false, err
@@ -308,8 +282,7 @@ func (r *APIKeyRepository) Delete(ctx context.Context, keyID string) (bool, erro
 }
 
 // DeleteMany removes a batch of credentials in one transaction: one SELECT
-// classifies the requested ids, one multi-row DELETE removes them, and one
-// read-model revision bump covers the whole batch. A non-empty ownerUserID
+// classifies the requested ids and one multi-row DELETE removes them. A non-empty ownerUserID
 // applies Delete's ownership rule to every id, and ids owned by another account
 // are reported as missing (the 404 semantics of the single-key endpoint).
 func (r *APIKeyRepository) DeleteMany(ctx context.Context, keyIDs []string, ownerUserID string) ([]string, []string, error) {
@@ -392,9 +365,7 @@ func (r *APIKeyRepository) DeleteMany(ctx context.Context, keyIDs []string, owne
 		if int(changed) != len(existing) {
 			return nil, nil, newStateError("API Key 批量删除冲突，请重试")
 		}
-		if _, err := touch(ctx, database, apiKeyKeys()...); err != nil {
-			return nil, nil, err
-		}
+
 	}
 	if err := database.Commit(); err != nil {
 		return nil, nil, err
@@ -474,9 +445,7 @@ func (r *APIKeyRepository) ImportRow(ctx context.Context, row APIKeyImport) erro
 		return err
 	}
 	defer func() { _ = database.Rollback() }()
-	if _, err := touch(ctx, database, apiKeyKeys()...); err != nil {
-		return err
-	}
+
 	var existing string
 	err = database.QueryRowContext(ctx, "SELECT id FROM api_keys WHERE id = ?", row.ID).Scan(&existing)
 	switch {

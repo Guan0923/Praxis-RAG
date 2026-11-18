@@ -285,14 +285,14 @@ func TestInvalidateAndRefreshKeyEdges(t *testing.T) {
 		t.Fatalf("RefreshKey(retired) = %v, %v; want false, nil", refreshed, err)
 	}
 	// Revalidate de-duplicates (one bump) and publishes each key once.
-	if err := stores.CacheSync.Revalidate(ctx, []CacheKey{{Kind: "api_keys", Scope: ""}, {Kind: "api_keys", Scope: ""}}); err != nil {
+	if err := stores.CacheSync.Revalidate(ctx, []CacheKey{{Kind: "kb_list", Scope: ""}, {Kind: "kb_list", Scope: ""}}); err != nil {
 		t.Fatalf("Revalidate() error = %v", err)
 	}
-	if value := readCacheRevision(t, stores, "api_keys", "").Revision; value != 1 {
-		t.Fatalf("api_keys revision = %d, want 1 (deduplicated)", value)
+	if value := readCacheRevision(t, stores, "kb_list", "").Revision; value != 1 {
+		t.Fatalf("kb_list revision = %d, want 1 (deduplicated)", value)
 	}
-	if hit, _, err := cache.Get(ctx, "api_keys", ""); err != nil || !hit {
-		t.Fatalf("api_keys cache hit = %v, %v; want a published empty list", hit, err)
+	if hit, _, err := cache.Get(ctx, "kb_list", ""); err != nil || !hit {
+		t.Fatalf("kb_list cache hit = %v, %v; want a published empty list", hit, err)
 	}
 }
 
@@ -414,7 +414,6 @@ func TestMarkAllDirtyCoversEveryKnownScope(t *testing.T) {
 	}
 	expected := []CacheKey{
 		{Kind: "kb_list", Scope: ""},
-		{Kind: "api_keys", Scope: ""},
 		{Kind: "kb_public", Scope: "alpha"},
 		{Kind: "documents", Scope: "alpha"},
 		{Kind: "catalog", Scope: "alpha"},
@@ -475,14 +474,12 @@ func TestMarkAllDirtyOnEmptyDatabase(t *testing.T) {
 	stores, _ := newCacheTestStores(t)
 	ctx := context.Background()
 	count, err := stores.CacheSync.MarkAllDirty(ctx)
-	if err != nil || count != 2 {
-		t.Fatalf("MarkAllDirty() on an empty database = %d, %v; want the two global keys", count, err)
+	if err != nil || count != 1 {
+		t.Fatalf("MarkAllDirty() on an empty database = %d, %v; want the global knowledge-base list", count, err)
 	}
-	for _, kind := range []string{"kb_list", "api_keys"} {
-		row := readCacheRevision(t, stores, kind, "")
-		if row.Revision != 1 || row.RefreshedRevision != 0 {
-			t.Fatalf("%s revision/refreshed = %d/%d, want 1/0", kind, row.Revision, row.RefreshedRevision)
-		}
+	row := readCacheRevision(t, stores, "kb_list", "")
+	if row.Revision != 1 || row.RefreshedRevision != 0 {
+		t.Fatalf("kb_list revision/refreshed = %d/%d, want 1/0", row.Revision, row.RefreshedRevision)
 	}
 }
 

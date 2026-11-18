@@ -16,7 +16,7 @@ carries identifiers only; Redis holds display caches (and, when
 `RAG_DOCUMENT_LOCK_MODE=redis`, the document long-held leases), and is not part
 of the task-state or delivery path. **Since 2026-11-13**
 two Debezium connectors read MySQL tables directly (task connector:
-`document_jobs`; cache connector: eight read-model tables); the
+`document_jobs`; cache connector: seven read-model tables); the
 retired transactional outboxes are no longer written or polled.
 
 ## What is stored where
@@ -239,7 +239,7 @@ index and publish.
 
 Kafka 通知统一由两个 Debezium 连接器从 MySQL 表级采集投递。API 只在 MySQL 单事务中提交
 文档任务；任务连接器只读取 `document_jobs` 的 binlog 并发送到 `RAG_DOCUMENT_TOPIC`，
-缓存连接器读取 8 张业务表并发送到 `RAG_CACHE_TOPIC`。搜索为同步执行，不产生通知，
+缓存连接器读取 7 张业务表并发送到 `RAG_CACHE_TOPIC`。搜索为同步执行，不产生通知，
 也没有搜索 topic/消费组（原 `search_tasks` 采集已删除）。
 应用没有 outbox 轮询发布器或投递模式开关（该机制已于 2026-11-13 下线）。
 连接器配置见 [deploy/kafka-connect/README.md](../deploy/kafka-connect/README.md) 与 [CDC 迁移契约](cdc-migration.md)。
@@ -537,7 +537,7 @@ Cluster/Sentinel topologies and `-race` stress runs are not verified yet.
 
 ## Redis 状态读模型
 
-第一批缓存公开知识库配置、MCP catalog、文档列表及知识库列表/统计。第二批缓存 API Key 管理状态、发布指针、租约和事务/步骤/回滚的展示投影；实际鉴权、检索版本与日志恢复仍直接读取 MySQL，上传事务租约的**执行权默认也由 MySQL `document_leases` 承担**。设 `RAG_DOCUMENT_LOCK_MODE=redis` 时，上传/覆盖/删除/恢复/清理与知识库独占操作的长租约改由 Redis 持有，但持有者登记、单调递增的 `fencing_epoch` 以及提交/回滚前的持有者校验仍以 MySQL 为准；展示缓存开关（`RAG_REDIS_ENABLED`）不控制文档锁，锁键也不进入任何读模型。cache_revisions 与状态修改在 MySQL 同事务提交，随后由 Debezium 缓存连接器投递、`rag-cache-worker` 按 revision 水位刷新；Redis 故障时读模型回源，脏 key 由 `RefreshDirty` 重试。**异步文档任务状态与文件字节不经 Redis**：`document_jobs` 是权威，Redis 只承担展示缓存（启用文档锁 Redis 后端时另含锁键）；搜索为同步执行，不写 Redis。完整配置、启动和故障语义见 [状态缓存](state-cache.md)，锁后端切换见 [部署指南](DEPLOYMENT.md) §13。
+第一批缓存公开知识库配置、MCP catalog、文档列表及知识库列表/统计。API Key 管理列表直接读取 MySQL。第二批缓存发布指针、租约和事务/步骤/回滚的展示投影；实际鉴权、检索版本与日志恢复仍直接读取 MySQL，上传事务租约的**执行权默认也由 MySQL `document_leases` 承担**。设 `RAG_DOCUMENT_LOCK_MODE=redis` 时，上传/覆盖/删除/恢复/清理与知识库独占操作的长租约改由 Redis 持有，但持有者登记、单调递增的 `fencing_epoch` 以及提交/回滚前的持有者校验仍以 MySQL 为准；展示缓存开关（`RAG_REDIS_ENABLED`）不控制文档锁，锁键也不进入任何读模型。cache_revisions 与状态修改在 MySQL 同事务提交，随后由 Debezium 缓存连接器投递、`rag-cache-worker` 按 revision 水位刷新；Redis 故障时读模型回源，脏 key 由 `RefreshDirty` 重试。**异步文档任务状态与文件字节不经 Redis**：`document_jobs` 是权威，Redis 只承担展示缓存（启用文档锁 Redis 后端时另含锁键）；搜索为同步执行，不写 Redis。完整配置、启动和故障语义见 [状态缓存](state-cache.md)，锁后端切换见 [部署指南](DEPLOYMENT.md) §13。
 
 ## UUID 结果与逻辑删除
 

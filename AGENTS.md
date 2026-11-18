@@ -17,7 +17,7 @@ Praxis-RAG：面向 AI 助手与业务应用的**独立知识库与检索服务*
 1. **契约稳定**：MCP 工具名与 schema、REST 路径与响应、环境变量名、`enc:v1:` 凭据格式、MySQL 表结构、PDF 清单版本（`go-native-v1` / `docling-service-v1`；后者只是证据格式契约，与是否使用 Docling 无关）。改契约必须同时做迁移并更新文档。
 2. **不要重新引入**：Python 主后端、SQLite、RocketMQ、Qdrant 本地文件模式（`QDRANT_PATH`）。当前是 Kafka + MySQL。
 3. **Go 不依赖 Python**：`go build ./...` 与 `go test ./...` 不涉及 Python；PDF 版面/OCR/表格/公式/图片描述能力由 pdf-service 调用远端视觉模型（或纯 Go 实现）提供，本地不加载模型，也没有 `RAG_PDF_MODELS_PATH` / 模型卷。`python-workers/` 下只有受控微服务（pdf-service、docling-service、lightrag-service），通过 HTTP 契约与 Go 交互，Go 侧用 fake server 测试契约。
-4. **MySQL 是事实来源**：Kafka 只传通知，由两个 Debezium 连接器从 MySQL 表级采集投递（任务连接器 `document_jobs`，缓存连接器 8 张读模型表），应用不写事务 outbox（旧 outbox 已于 2026-11-13 下线）。通知只携带定位标识与 `schedule_version`，参数回 MySQL 读取；上传默认**异步受理**（`document_jobs` 单事务），`artifact_id` 不代表已索引，只有状态 `succeeded` 才可检索。MCP/REST 搜索为**同步执行**，一次调用直接返回证据；`search_tasks`/`search_result_snapshots` 为历史表、保留数据但不再读写，artifact（`artifact_snapshots`）按 ID 独立读取。
+4. **MySQL 是事实来源**：Kafka 只传通知，由两个 Debezium 连接器从 MySQL 表级采集投递（任务连接器 `document_jobs`，缓存连接器 7 张读模型表），应用不写事务 outbox（旧 outbox 已于 2026-11-13 下线）。通知只携带定位标识与 `schedule_version`，参数回 MySQL 读取；上传默认**异步受理**（`document_jobs` 单事务），`artifact_id` 不代表已索引，只有状态 `succeeded` 才可检索。MCP/REST 搜索为**同步执行**，一次调用直接返回证据；`search_tasks`/`search_result_snapshots` 为历史表、保留数据但不再读写，artifact（`artifact_snapshots`）按 ID 独立读取。
 5. **测试必须串行**：`RAG_TEST_MYSQL_URL` 指向库名含 `test` 的一次性 MySQL，并用 `go test -p 1 -count=1 -timeout 25m ./...`；并行会抢同一 schema 的 advisory lock。
 6. **不提交生成物**：`dist/`、`build/`、`frontend/node_modules/`、`.test-tmp/`、`.env*`（除 `.env.example`）、模型/向量数据、根目录 worker 二进制。
 7. **安全默认**：默认只监听 loopback；非 loopback 必须 `RAG_SERVICE_TOKEN` + MCP Host/Origin 白名单；`/v1/admin/*` 仅本机直连或管理员会话；日志不记录查询、正文与凭据。

@@ -17,8 +17,7 @@ func batchContains(values []string, want string) bool {
 
 // TestAPIKeyRepositoryDeleteManyBatchesTransactionally covers the atomic batch
 // delete: one SELECT classifies the requested ids, one multi-row DELETE removes
-// the existing rows, and the read-model revision plus outbox event are written
-// once for the whole batch instead of once per key.
+// the existing rows.
 func TestAPIKeyRepositoryDeleteManyBatchesTransactionally(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
@@ -36,7 +35,6 @@ func TestAPIKeyRepositoryDeleteManyBatchesTransactionally(t *testing.T) {
 		t.Fatalf("Create(batch-third) error = %v", err)
 	}
 
-	revisionBefore := revision(t, stores, "api_keys", "")
 
 	deleted, missing, err := stores.APIKeys.DeleteMany(ctx,
 		[]string{first.ID, "batch-missing-id", second.ID, second.ID, ""}, "")
@@ -48,9 +46,6 @@ func TestAPIKeyRepositoryDeleteManyBatchesTransactionally(t *testing.T) {
 	}
 	if len(missing) != 1 || missing[0] != "batch-missing-id" {
 		t.Fatalf("missing = %v, want [batch-missing-id]", missing)
-	}
-	if got := revision(t, stores, "api_keys", ""); got != revisionBefore+1 {
-		t.Fatalf("revision = %d, want %d (one bump for the whole batch)", got, revisionBefore+1)
 	}
 	for _, keyID := range []string{first.ID, second.ID} {
 		key, err := stores.APIKeys.Get(ctx, keyID)
@@ -66,9 +61,7 @@ func TestAPIKeyRepositoryDeleteManyBatchesTransactionally(t *testing.T) {
 		t.Fatalf("Get(batch-third) = %+v, %v; want the unsubmitted key to survive", survivor, err)
 	}
 
-	// A second batch of already-deleted ids reports them as missing and writes
-	// no revision row.
-	revisionAfter := revision(t, stores, "api_keys", "")
+	// A second batch of already-deleted ids reports them as missing.
 	deletedAgain, missingAgain, err := stores.APIKeys.DeleteMany(ctx, []string{first.ID, second.ID}, "")
 	if err != nil {
 		t.Fatalf("DeleteMany(again) error = %v", err)
@@ -78,9 +71,6 @@ func TestAPIKeyRepositoryDeleteManyBatchesTransactionally(t *testing.T) {
 	}
 	if !batchContains(missingAgain, first.ID) || !batchContains(missingAgain, second.ID) {
 		t.Fatalf("missing again = %v", missingAgain)
-	}
-	if got := revision(t, stores, "api_keys", ""); got != revisionAfter {
-		t.Fatalf("revision after empty batch = %d, want %d", got, revisionAfter)
 	}
 }
 

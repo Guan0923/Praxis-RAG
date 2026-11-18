@@ -25,7 +25,6 @@ Redis 主要承担**持久数据展示缓存**；另有可选的**文档长租�
 
 | 缓存 kind | scope | 内容 |
 | --- | --- | --- |
-| `api_keys` | 管理端全局空 scope | Key 名称、前缀、授权 namespace、enabled、exportable；无 key/digest/密文 |
 | `heads` | namespace | 已发布 document_id → version 的展示快照 |
 | `leases` | namespace | 资源、holder_id、operation_id、expires_at；读取时重新计算 expired |
 | `upload_list` | namespace | 最近 100 条操作状态摘要，不用于恢复扫描 |
@@ -33,7 +32,7 @@ Redis 主要承担**持久数据展示缓存**；另有可选的**文档长租�
 
 **严格边界**：真实 API Key 鉴权、密钥导出、检索可见版本与提交/回滚校验仍直接访问 MySQL；文档租约默认也在 MySQL（`document_leases` 行承担申请/续期/认领）。设 `RAG_DOCUMENT_LOCK_MODE=redis` 时，长租约的申请/续期/认领改在 Redis 原子完成，但 **fencing、持有者登记与提交/回滚校验仍以 MySQL 为准**，锁键不进入任何读模型，缓存中的 enabled、版本、owner 展示值均不能授予执行权。即使缓存故意置旧，也不能导致已停用 Key 被放行或过期节点成功提交。
 
-租约 owner 原始所有权 token 不放 Redis；holder_id 是 token 的短哈希，仅用于区分执行者。操作详情不缓存 idempotency_key、workspace、fingerprint、result 原文、步骤输入 details、文件内容或密钥。upload_status 的返回值再次验证 namespace，UUID 不授予访问权。API Key 列表按账号可见（管理员/本机管理为全部，普通账号仅本人；见 [权限管理](PERMISSIONS.md) §9）。
+租约 owner 原始所有权 token 不放 Redis；holder_id 是 token 的短哈希，仅用于区分执行者。操作详情不缓存 idempotency_key、workspace、fingerprint、result 原文、步骤输入 details、文件内容或密钥。upload_status 的返回值再次验证 namespace，UUID 不授予访问权。API Key 列表直接读取 MySQL，按账号可见（管理员/本机管理为全部，普通账号仅本人；见 [权限管理](PERMISSIONS.md) §9）。
 
 上述**展示读模型**不缓存原始文件、图片、解析产物、查询/重排结果或模型密钥。搜索响应不写入 Redis：检索结果在请求内同步返回，artifact 事实在 MySQL（见 [产物引用](result-references.md)）；文档原本文件不写入 Redis，只保留在 MySQL 的 `document_jobs` 与 `blobs` 中。事务/步骤的展示投影可缓存，MySQL 原始 UploadJournal 始终是恢复依据；不迁移发布/恢复日志或租约的最终判定权威到 Redis（启用文档锁 Redis 后端时只有租约本身在 Redis，fencing 与提交校验仍在 MySQL）。文档列表中的 operation_id 也仅为展示元数据。
 
@@ -77,14 +76,14 @@ Redis 主要承担**持久数据展示缓存**；另有可选的**文档长租�
 - Redis 不可读时直接回源 MySQL。Redis 可读但刷新失败时可能暂时返回旧值，补偿/TTL 后收敛；这是最终一致性，不是跨库原子提交。
 - 新增/更新/删除知识库刷新公开配置、文档展示及全局列表；文档发布/删除刷新文档与全局列表；MCP 修改刷新 catalog。
 - 上传未发布时，公开文档和发布指针保持旧版本，但 RUNNING/FAILED/ROLLING_BACK 等进度缓存照常提交。最终发布的 heads 和 COMMITTED/步骤状态事件，与业务记录在同一 MySQL 事务中提交；发布回滚不会留下这些未提交事件。补偿完成则另行提交 ROLLED_BACK 的状态事件。
-- API Key 创建、修改、删除/导入刷新管理列表。续租只刷新 leases，不制造无关步骤状态；租约过期是时间事件，展示端每次用 `expires_at`（`redis` 模式下按锁后端实时 TTL）重新计算 `expired`，不必等待缓存 TTL。
+- 续租只刷新 leases，不制造无关步骤状态；租约过期是时间事件，展示端每次用 `expires_at`（`redis` 模式下按锁后端实时 TTL）重新计算 `expired`，不必等待缓存 TTL。
 - 提交/删除等由外部事务持有的 journal 方法只递增 revision，不在事务内访问 Redis/Kafka；由调用方提交后刷新。真实状态查询、恢复扫描和 fencing 不追加缓存事件。直接用 SQL 修改业务表（含删除与同名重建）也会产生 CDC 事件并被同一条映射收敛。
 
 ## 第二批状态查询接口
 
 全部使用现有鉴权和 namespace 检查，不增加 MCP 工具，也不改变 UUID 搜索结果协议：
 
-- `GET /v1/admin/api-keys`：已有管理列表，现在使用缓存。
+- `GET /v1/admin/api-keys`：管理列表从 MySQL 直接读取。
 - `GET /v1/uploads`：当前 namespace 最近 100 条操作摘要。
 - `GET /v1/uploads/{operation_id}`：当前 namespace 的操作/步骤/回滚状态；跨 namespace 或不存在返回 404。
 - `GET /v1/admin/published-versions`：namespace 的已发布版本展示，额外要求本机直连管理权限。
