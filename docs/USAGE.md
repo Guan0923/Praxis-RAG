@@ -350,6 +350,16 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_REDIS_LOCK_TTL_SECONDS` | `120`（未显式设置时跟随 `RAG_UPLOAD_LEASE_SECONDS`） | 文档长租约时长；心跳按 1/3 周期续租 |
 | `RAG_REDIS_LOCK_TIMEOUT_SECONDS` | `1` | 单次 Redis 命令超时 |
 | `RAG_REDIS_LOCK_WAIT_SECONDS` | `2` | 后端暂时不可用时等待/重试的窗口，超时返回可重试错误；锁冲突不等待 |
+| `RAG_UPLOAD_BLOOM_MODE` | `off` | 上传操作详情查询布隆过滤器：`off`（默认，行为不变）/ `register`（只登记新 ID，读不判）/ `on`（登记 + 读取侧否定判断）。部署级分阶段开关，创建上传的进程必须同值（见下方说明） |
+| `RAG_UPLOAD_BLOOM_URL` | 空（回退 `RAG_REDIS_URL`） | 布隆 Redis 地址；非 `off` 模式解析不出 URL 时启动报错 |
+| `RAG_UPLOAD_BLOOM_PREFIX` | `rag:uploadbloom:v1` | 布隆键前缀：`meta`/`building`/`disabled` + 每代 `g{N}:{shard}` 位图 |
+| `RAG_UPLOAD_BLOOM_FALSE_POSITIVE` | `0.01` | 规划容量处的目标误判率（1%） |
+| `RAG_UPLOAD_BLOOM_GROWTH` / `RAG_UPLOAD_BLOOM_MIN_CAPACITY` | `2.0` / `10000` | 规划容量 = max(历史+1, MIN) × GROWTH；历史超容量即触发下一代重建 |
+| `RAG_UPLOAD_BLOOM_SHARDS` | `16` | 位图分片（Redis string 键）数量 |
+| `RAG_UPLOAD_BLOOM_TIMEOUT_SECONDS` | `0.3` | 单次 Redis 命令超时 |
+| `RAG_UPLOAD_BLOOM_BATCH` / `RAG_UPLOAD_BLOOM_LOCK_TTL_SECONDS` | `500` / `600` | 构建代时的 MySQL 扫描批大小与构建租约 TTL（确认轮内续租） |
+| `RAG_UPLOAD_BLOOM_CHECK_SECONDS` | `300` | 维护间隔：启动构建 + 周期性扩容/修复检查 |
+| `RAG_UPLOAD_BLOOM_REBUILD` | `0` | 一次性强制重建（先停用否定判断再重扫；用后自清除）：数据库恢复/直接导入/Redis 旧备份恢复后设置 |
 | `RAG_RESULT_TTL_SECONDS` | `3600` | **artifact 保留期**（变量名保留，语义已更正；不再用于搜索结果快照） |
 | `RAG_RESULT_MAX_BYTES` | `16777216` | 单次搜索 artifact 累计字节上限 |
 | `RAG_ARTIFACT_MAX_BYTES` | `67108864` | 单 artifact 上限 |
@@ -358,6 +368,10 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 Redis 不可用时，持久读模型会回源状态库；搜索为同步直返，响应不写 Redis，artifact 以 MySQL `artifact_snapshots` 为事实来源并按 ID 独立读取，**清空 Redis 不影响搜索结果或已签发 artifact**。`RAG_RESULT_TTL_SECONDS` 到期后 MySQL artifact 被有界清理，再读取返回 410。
 
 **文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，`RAG_DOCUMENT_LOCK_MODE=redis` 时文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。默认 `mysql` 模式行为不变（`document_leases` 行 + 心跳续写 `expires_at`）；`redis` 模式只把长租约搬到 Redis，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询，展示读取可回源 MySQL。切换与回退见[部署指南](DEPLOYMENT.md) §13。
+
+**上传操作详情查询布隆过滤器**（`RAG_UPLOAD_BLOOM_MODE`，默认 `off` 行为不变）：只作用于 `GET /v1/uploads/{operation_id}` 的**读路径加速**——Redis bitmap 分片（`RAG_UPLOAD_BLOOM_SHARDS` 个 string 键，键前缀 `RAG_UPLOAD_BLOOM_PREFIX`）记录 MySQL `upload_operations.id`，按历史条数与预计增量（`RAG_UPLOAD_BLOOM_GROWTH`、`RAG_UPLOAD_BLOOM_MIN_CAPACITY`）规划容量、以 `RAG_UPLOAD_BLOOM_FALSE_POSITIVE`（默认 1%）为目标。查询顺序：先读展示缓存（含已缓存的空结果），未命中再问布隆；「一定不存在」直接返回原有 404，不执行上传状态 SQL；「可能存在」继续原有 MySQL 查询、namespace 校验与缓存回填。**MySQL 始终是事实来源**：过滤器未就绪、全局停用开关、分片丢失或 Redis 读取失败一律走原查询路径；布隆误判只多付一次 MySQL 查询；知识库访问权限仍由原 `namespace` 校验决定，跨知识库查询继续返回 404。可能按 MySQL 排序规则等价的 ID 写法（非全小写）一律绕过过滤器，保持历史查询行为。
+
+**分阶段启用与失败语义**：`register`（只登记不判读）→ 全部创建上传的进程升级后 → `on`（登记 + 读取侧否定判断），`rag-service`/`rag-document-worker`/`rag-mcp-ingest` 必须同值。新建上传（MySQL 锁与 Redis 锁两条路径）先登记再提交事务：事务回滚只留下一次无害的误报查询；登记失败时，除非能确认全局停用开关对所有实例可见（该次创建照常提交，后续维护重建），否则该次创建返回**可重试**错误——成功创建的操作不会被误报为不存在。扩容重建并行维护新旧两代（登记同时写两代），全量扫描加确认轮补齐构建期新增后原子切换（单一 meta SET）；删除操作记录**不清位**（位可能被其他 ID 共用，保留即可，误报率仅由容量规划控制）。数据库恢复、绕过应用直接导入记录或 Redis 从旧备份恢复后：设一次 `RAG_UPLOAD_BLOOM_REBUILD=1`（维护过程先停用否定判断、重扫 MySQL、重建并重新启用，开关自清除）。构建期间沿用原查询流程，新一代激活前读取侧不过滤。
 
 ### Kafka 与队列
 

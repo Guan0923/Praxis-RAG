@@ -173,6 +173,26 @@ func run(args []string, stdout, stderr *os.File) int {
 			return exitError
 		}
 	}
+	// Ingestion writes documents through the shared journal, so it must also
+	// register new upload IDs into the deployment's bloom filter before the
+	// read gate (RAG_UPLOAD_BLOOM_MODE=on) may be enabled fleet-wide.
+	bloomSettings, err := state.UploadBloomSettingsFromEnv()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return exitError
+	}
+	if bloomSettings.Mode != state.UploadBloomModeOff {
+		bloomBackend, bloomErr := redisstate.NewUploadBloomBackend(bloomSettings)
+		if bloomErr != nil {
+			fmt.Fprintln(stderr, bloomErr)
+			return exitError
+		}
+		defer func() { _ = bloomBackend.Close() }()
+		if attachErr := stores.AttachUploadBloom(state.NewUploadBloomFilterWith(stores, bloomSettings, bloomBackend)); attachErr != nil {
+			fmt.Fprintln(stderr, attachErr)
+			return exitError
+		}
+	}
 	service, err := runtime.New(ragConfig, stores, serviceSettings.DataRoot)
 	if err != nil {
 		fmt.Fprintln(stderr, err)

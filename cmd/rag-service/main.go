@@ -124,6 +124,32 @@ func run() error {
 	}
 	logger.Info("Document lease backend configured",
 		"mode", lockSettings.Mode, "ttl_seconds", lockSettings.TTLSeconds)
+	// The upload bloom filter tracks which upload operation IDs exist so
+	// GET /v1/uploads/{operation_id} can fast-fail random IDs. Rollout is
+	// fleet-wide and staged (register before on); MySQL stays authoritative
+	// for every "possibly present" answer.
+	bloomSettings, err := state.UploadBloomSettingsFromEnv()
+	if err != nil {
+		return err
+	}
+	if bloomSettings.Mode != state.UploadBloomModeOff {
+		bloomBackend, err := redisstate.NewUploadBloomBackend(bloomSettings)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = bloomBackend.Close() }()
+		if err := stores.AttachUploadBloom(state.NewUploadBloomFilterWith(stores, bloomSettings, bloomBackend)); err != nil {
+			return err
+		}
+		// Build/refresh the generation in the background: the first build
+		// serves no reads until it is complete, and every later build keeps
+		// the previous generation active until the atomic switch.
+		bloomContext, stopBloom := context.WithCancel(context.Background())
+		defer stopBloom()
+		go stores.UploadBloom.RunMaintenance(bloomContext, logger)
+	}
+	logger.Info("Upload bloom filter configured",
+		"mode", bloomSettings.Mode, "prefix", bloomSettings.Prefix)
 	var redisProbe monitor.RedisProbe = cache
 	if !cache.Enabled() && documentLock != nil {
 		// The Console dependency row reports the lease backend when the display

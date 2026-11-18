@@ -46,6 +46,8 @@ flowchart LR
 
 [完整部署拓扑](docs/DEPLOYMENT.md#1-进程拓扑) · [REST API](docs/USAGE.md#5-rest-api-示例) · [MCP 接入](docs/USAGE.md#6-mcp-使用)
 
+上传操作详情查询（`GET /v1/uploads/{operation_id}`）可选启用 Redis bitmap 布隆过滤器（`RAG_UPLOAD_BLOOM_MODE`，默认关闭）：对随机 ID 直接返回原有 404、不执行上传状态 SQL；MySQL 始终是事实来源，权限校验不变。分阶段启用与失败语义见[使用指南](docs/USAGE.md#redis-文档锁与-artifact)。
+
 ## 指标
 
 | 指标 | 默认值 | 请求上限 |

@@ -156,6 +156,26 @@ func run() error {
 	}
 	logger.Info("Document lease backend configured",
 		"mode", lockSettings.Mode, "ttl_seconds", lockSettings.TTLSeconds)
+	// The worker publishes documents through the same journal, so it must also
+	// register new upload IDs into the deployment's bloom filter before the
+	// read gate (RAG_UPLOAD_BLOOM_MODE=on) may be enabled fleet-wide.
+	bloomSettings, err := state.UploadBloomSettingsFromEnv()
+	if err != nil {
+		return configError(err)
+	}
+	if bloomSettings.Mode != state.UploadBloomModeOff {
+		bloomBackend, bloomErr := redisstate.NewUploadBloomBackend(bloomSettings)
+		if bloomErr != nil {
+			return configError(bloomErr)
+		}
+		defer func() { _ = bloomBackend.Close() }()
+		if attachErr := stores.AttachUploadBloom(state.NewUploadBloomFilterWith(stores, bloomSettings, bloomBackend)); attachErr != nil {
+			return attachErr
+		}
+		// The service instance owns build/refresh; this writer only registers.
+	}
+	logger.Info("Upload bloom filter configured",
+		"mode", bloomSettings.Mode, "prefix", bloomSettings.Prefix)
 	stores.CacheSync.Start()
 
 	service, err := runtime.New(ragConfig, stores, serviceSettings.DataRoot)

@@ -82,11 +82,30 @@ func (c *CacheSynchronizer) Loader(kind string) (ViewLoader, bool) {
 // GetOrLoad implements the read-through cache-miss path: a hit returns directly;
 // a miss/unavailable cache takes a revision-latched consistent snapshot.
 func (c *CacheSynchronizer) GetOrLoad(ctx context.Context, kind, scope string) (any, error) {
+	return c.GetOrLoadGuarded(ctx, kind, scope, nil)
+}
+
+// cacheMissGuard answers one question for a cache miss: may the loader consult
+// MySQL? It returns false only when the scope is provably absent without the
+// database (the upload bloom filter's "definitely absent" answer). Every error
+// or uncertainty inside the guard must resolve to true so the original query
+// path is preserved.
+type cacheMissGuard func(ctx context.Context) bool
+
+// GetOrLoadGuarded is GetOrLoad with an optional miss guard: after a cache
+// miss (or an unavailable cache backend) and before the MySQL snapshot, the
+// guard can decline the load. A declined load returns (nil, nil) without
+// writing the cache, so the answer stays per-request and MySQL remains the
+// authority.
+func (c *CacheSynchronizer) GetOrLoadGuarded(ctx context.Context, kind, scope string, guard cacheMissGuard) (any, error) {
 	loader, ok := c.loaders[kind]
 	if !ok {
 		return nil, fmt.Errorf("Unknown state cache kind %q", kind)
 	}
 	if !c.Enabled() {
+		if guard != nil && !guard(ctx) {
+			return nil, nil
+		}
 		return loader(ctx, c.stores.DB, scope)
 	}
 	hit, cached, err := c.Backend.Get(ctx, kind, scope)
@@ -98,6 +117,9 @@ func (c *CacheSynchronizer) GetOrLoad(ctx context.Context, kind, scope string) (
 		if !errors.As(err, &unavailable) {
 			return nil, err
 		}
+	}
+	if guard != nil && !guard(ctx) {
+		return nil, nil
 	}
 	revision, value, err := c.snapshot(ctx, kind, scope, loader)
 	if err != nil {

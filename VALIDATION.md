@@ -16,6 +16,59 @@
 > `search_result_snapshots` 表保留数据但不再读写。当前搜索验证以同步检索、超时/取消与
 > artifact 独立读取为准（见 [产物引用](docs/result-references.md)）。
 
+## 上传操作详情查询布隆过滤器（`GET /v1/uploads/{operation_id}`）— 2026-11-18
+
+`RAG_UPLOAD_BLOOM_MODE` 三档部署级开关（`off` 默认 / `register` 只登记 / `on` 读取侧过滤），
+Redis bitmap 分片存储，MySQL 仍是事实来源；只加速该详情查询，权限校验仍由原 `namespace`
+校验决定。
+
+### 已验证（可复核，`RAG_TEST_MYSQL_URL` 指向一次性 MySQL）
+
+- **`go build ./...` / `go vet ./...` 通过。**
+- **定向测试**：`go test -p 1 -count=1 -run 'TestUploadBloom' ./internal/state/ ./internal/redisstate/` 全部通过。
+  - `internal/state`（策略 + 端到端，真实 MySQL 上的真实 journal/读视图）：
+    - `TestUploadBloomParametersKeepTarget`：容量数学按 1% 目标（1 万/25 万/100 万容量，
+      实测误判率 ≤ 2×目标，含容量 1 的公式下界）。
+    - `TestUploadBloomDefinitelyAbsentFallbacks`：register 模式不判读；无代不判；登记过的
+      ID 不误报；未登记的随机 ID 判「不存在」；非全小写 ID 绕过过滤器（MySQL 排序规则
+      等价性不受影响）；停用开关、分片丢失、State/Probe 失败全部回退 MySQL。
+    - `TestUploadBloomEnsureBuildsAndSwitches`：初始代构建与激活、确认轮收尾、历史超容量
+      触发第二代（扩容重建）并保留全部 ID 可查。
+    - `TestUploadBloomRegisterCoversActiveAndBuilding`：重建窗口内登记同时写活动代与
+      构建代。
+    - `TestUploadBloomRegistrationFailureProtocol`：登记失败且停用开关无法确认 → 该次
+      创建返回可重试错误；停用开关确认 → 允许提交；无代（首次构建未完成）与已停用两种
+      情况不阻塞创建。
+    - `TestUploadBloomForcedRebuildDisablesFirst`：`RAG_UPLOAD_BLOOM_REBUILD=1` 先停用
+      否定判断、重建后重新启用。
+    - `TestUploadBloomSettingsValidation`：13 项配置契约（含 off 模式无 URL 合法、
+      register/on 无 URL 报错）。
+    - `TestUploadBloomBeginRegistersOnBothLockPaths`：MySQL 锁路径与 Redis 锁路径的真实
+      `journal.Begin` 都在提交前登记；新建操作可查询、不误报；登记失败（停用开关
+      无法确认）时 Begin 以可重试错误中止且不留 INTENT 行；跨知识库查询继续 404。
+    - `TestUploadBloomReadViewDetailQueryNoSQL`：过滤器明确排除的随机 ID **不执行
+      上传状态 SQL**（loader 计数为 0）；可能存在 ID 执行恰好一次并回填缓存；缓存命中
+      （含缓存后过滤器故障）不再走 SQL 也不走过滤器。
+  - `internal/redisstate`（miniredis 真实 Redis 语义）：
+    - `TestUploadBloomBackendRoundTrip`：构建租约仲裁（二次获取失败）、位登记与探测、
+      激活原子切换（meta SET + 清停用开关）、构建租约释放、**分片丢失返回
+      shardMissing 而非误判不存在**（修复了「GetBit 0 == 缺失分片 == 不存在」的歧义）、
+      停用开关可验证、过期代 TTL 退役。
+    - `TestUploadBloomBackendUnavailable`：后端不可达时所有操作返回
+      `*state.BloomUnavailable`（调用方回退 MySQL）。
+    - `TestUploadBloomBackendDisabledMode`：off 模式后端不拨号、全部返回
+      `*state.BloomUnavailable`。
+- **语义不变面**：`GET /v1/uploads/{operation_id}` 响应体、状态码、`Cache-Control`、
+  `/v1/uploads` 列表端点、`upload_status` 缓存 kind 与展示缓存键空间全部未改；
+  布隆否定只省略 upload-status SQL，不改变任何响应。
+
+### 未验证（缺外部依赖）
+
+- 真实多实例 Redis Cluster 下的分片行为（miniredis 单实例验证了分片键与丢失语义；
+  Cluster hash-tag 布局同 `KeyPair` 模式但未跑真实集群）。
+- 生产规模（百万级 ID）的构建耗时与内存占用（构建算法为分批 keyset 扫描 + 确认轮，
+  算法已由测试覆盖；大规模性能未实测）。
+
 ## 当前验证范围：LightRAG 知识图谱检索（侧车 + `retrieval=graph`）— 2026-11-18
 
 ### 已验证（可复核）

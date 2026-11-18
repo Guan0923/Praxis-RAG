@@ -421,6 +421,12 @@ func (j *UploadJournal) beginRegister(
 		}
 		return nil, false, err
 	}
+	// Same bloom registration contract as the legacy path: register before the
+	// commit, abort retryably when neither registration nor a confirmed global
+	// stop succeeds.
+	if err := j.registerOperationID(ctx, row.ID); err != nil {
+		return nil, false, err
+	}
 	if options.OnBegin != nil {
 		if err := options.OnBegin(ctx, transaction, row); err != nil {
 			return nil, false, err

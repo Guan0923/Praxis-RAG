@@ -617,6 +617,14 @@ func (j *UploadJournal) beginLegacy(ctx context.Context, namespace, name, docume
 		}
 		return nil, err
 	}
+	// Register the new ID in the bloom filter before committing: a rolled-back
+	// transaction only leaves a harmless false positive, but a committed
+	// operation must never be reported as absent. A failed registration aborts
+	// the creation retryably unless the filter's negative judgment is confirmed
+	// globally stopped.
+	if err := j.registerOperationID(ctx, row.ID); err != nil {
+		return nil, err
+	}
 	if options.OnBegin != nil {
 		if err := options.OnBegin(ctx, transaction, row); err != nil {
 			return nil, err
