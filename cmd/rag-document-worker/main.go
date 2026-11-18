@@ -139,23 +139,23 @@ func run() error {
 		return err
 	}
 	// The worker publishes documents through the same journal, so it must use
-	// the deployment's document lease backend (RAG_DOCUMENT_LOCK_MODE).
+	// the deployment's document lease backend: Redis is required, resolved from
+	// RAG_REDIS_LOCK_URL (falling back to RAG_REDIS_URL) and shared with
+	// rag-service and rag-mcp-ingest.
 	lockSettings, err := state.DocumentLockSettingsFromEnv()
 	if err != nil {
 		return configError(err)
 	}
-	if lockSettings.RedisMode() {
-		documentLock, lockErr := redisstate.NewDocumentLock(lockSettings)
-		if lockErr != nil {
-			return configError(lockErr)
-		}
-		defer func() { _ = documentLock.Close() }()
-		if attachErr := stores.AttachDocumentLocker(documentLock); attachErr != nil {
-			return attachErr
-		}
+	documentLock, lockErr := redisstate.NewDocumentLock(lockSettings)
+	if lockErr != nil {
+		return configError(lockErr)
+	}
+	defer func() { _ = documentLock.Close() }()
+	if attachErr := stores.AttachDocumentLocker(documentLock); attachErr != nil {
+		return attachErr
 	}
 	logger.Info("Document lease backend configured",
-		"mode", lockSettings.Mode, "ttl_seconds", lockSettings.TTLSeconds)
+		"mode", "redis", "ttl_seconds", lockSettings.TTLSeconds)
 	// The worker publishes documents through the same journal, so it must also
 	// register new upload IDs into the deployment's bloom filter before the
 	// read gate (RAG_UPLOAD_BLOOM_MODE=on) may be enabled fleet-wide.

@@ -54,11 +54,10 @@ func redisIntegrationURL(t *testing.T) string {
 	return raw
 }
 
-// lockSettings returns valid Redis-mode settings pointing at rawURL.
+// lockSettings returns valid settings pointing at rawURL.
 func lockSettings(t *testing.T, rawURL string) state.DocumentLockSettings {
 	t.Helper()
 	settings := state.DefaultDocumentLockSettings()
-	settings.Mode = state.DocumentLockModeRedis
 	settings.URL = rawURL
 	settings.Prefix = lockTestPrefix
 	settings.TimeoutSeconds = 2
@@ -158,17 +157,6 @@ func expectLeaseLost(t *testing.T, err error) {
 		if strings.Contains(err.Error(), token) {
 			t.Fatalf("lease lost error leaks the owner token: %v", err)
 		}
-	}
-}
-
-func expectUnavailable(t *testing.T, err error) {
-	t.Helper()
-	var unavailable *state.LockUnavailable
-	if !errors.As(err, &unavailable) {
-		t.Fatalf("want *state.LockUnavailable, got %v", err)
-	}
-	if message := unavailable.Error(); message != "document lock backend is unavailable" {
-		t.Fatalf("unavailable message = %q", message)
 	}
 }
 
@@ -491,60 +479,23 @@ func testDocumentLockReleaseSemantics(t *testing.T) {
 // validates settings, never dials, and every operation reports a typed
 // unavailable error when no backend is attached.
 func TestDocumentLockSettingsValidation(t *testing.T) {
-	ctx := context.Background()
-
 	// The Lua scripts hardcode the exclusive field name; keep it aligned with the
 	// contract constant every caller uses.
 	if exclusiveResource != state.UploadNamespaceResource {
 		t.Fatalf("exclusiveResource = %q, want %q", exclusiveResource, state.UploadNamespaceResource)
 	}
 
-	// Mode=mysql needs no URL (Validate only requires it for Mode=redis), so the
-	// backend constructs without dialing and reports its fixed unavailable error.
-	mysqlSettings := state.DefaultDocumentLockSettings()
-	if mysqlSettings.Mode != state.DocumentLockModeMySQL || mysqlSettings.URL != "" {
-		t.Fatalf("default settings = %+v", mysqlSettings)
-	}
-	lock, err := NewDocumentLock(mysqlSettings)
-	if err != nil {
-		t.Fatalf("mysql settings must construct: %v", err)
-	}
-	expectUnavailable(t, lock.Acquire(ctx, "ns", []string{"document:x"}, lockOwnerA, time.Second))
-	expectUnavailable(t, lock.Acquire(ctx, "ns", []string{"document:x"}, lockOwnerA, 0))
-	expectUnavailable(t, lock.Renew(ctx, "ns", []string{"document:x"}, lockOwnerA, time.Second))
-	expectUnavailable(t, lock.Release(ctx, "ns", []string{"document:x"}, lockOwnerA))
-	expectUnavailable(t, lock.Ping(ctx))
-	if _, err := lock.Inspect(ctx, "ns", "document:x"); err == nil {
-		t.Fatalf("Inspect without a backend must fail")
-	} else {
-		expectUnavailable(t, err)
-	}
-	if err := lock.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if err := lock.Close(); err != nil {
-		t.Fatalf("Close must be idempotent: %v", err)
-	}
-	expectUnavailable(t, lock.Acquire(ctx, "ns", []string{"document:x"}, lockOwnerA, time.Second))
-
-	// Mode=redis requires a URL.
-	redisWithoutURL := state.DefaultDocumentLockSettings()
-	redisWithoutURL.Mode = state.DocumentLockModeRedis
-	if _, err := NewDocumentLock(redisWithoutURL); err == nil {
-		t.Fatalf("redis mode without a URL must be rejected")
+	// A settings value without a URL is rejected: Redis is the required document
+	// lock backend, so a missing address is a configuration error instead of a
+	// silent no-op.
+	noURL := state.DefaultDocumentLockSettings()
+	if _, err := NewDocumentLock(noURL); err == nil {
+		t.Fatalf("settings without a URL must be rejected")
 	}
 
-	// An unknown mode is rejected instead of silently disabling exclusion.
-	unknownMode := state.DefaultDocumentLockSettings()
-	unknownMode.Mode = "postgres"
-	if _, err := NewDocumentLock(unknownMode); err == nil {
-		t.Fatalf("unknown mode must be rejected")
-	}
-
-	// Invalid Redis-mode knobs are rejected, and the message never contains the
+	// Invalid knobs are rejected, and the message never contains the
 	// configured URL.
 	invalidTTL := state.DefaultDocumentLockSettings()
-	invalidTTL.Mode = state.DocumentLockModeRedis
 	invalidTTL.URL = "redis://127.0.0.1:1/0"
 	invalidTTL.TTLSeconds = 0
 	if _, err := NewDocumentLock(invalidTTL); err == nil {
@@ -554,7 +505,6 @@ func TestDocumentLockSettingsValidation(t *testing.T) {
 	}
 
 	emptyPrefix := state.DefaultDocumentLockSettings()
-	emptyPrefix.Mode = state.DocumentLockModeRedis
 	emptyPrefix.URL = "redis://127.0.0.1:1/0"
 	emptyPrefix.Prefix = ""
 	if _, err := NewDocumentLock(emptyPrefix); err == nil {
@@ -564,7 +514,6 @@ func TestDocumentLockSettingsValidation(t *testing.T) {
 	// A valid configuration constructs lazily: an address nothing listens on must
 	// not fail construction, and closing a never-used backend is clean.
 	lazy := state.DefaultDocumentLockSettings()
-	lazy.Mode = state.DocumentLockModeRedis
 	lazy.URL = "redis://127.0.0.1:1/0"
 	lazy.TimeoutSeconds = 0.05
 	unused, err := NewDocumentLock(lazy)

@@ -349,8 +349,7 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_REDIS_BREAKER_THRESHOLD` | `5` | 展示缓存熔断阈值：连续 `N` 次 Redis **可用性故障**（连接错误/超时）后熔断 |
 | `RAG_REDIS_BREAKER_COOLDOWN_SECONDS` | `10` | 熔断冷却时长；到期后每个实例只放一个请求探测 Redis，探测成功（含“key 不存在”）即恢复 |
 | `RAG_CACHE_FALLBACK_CONCURRENCY` | `4` | 单实例展示查询回源 MySQL 的并发上限；等待相同结果的请求不占名额 |
-| `RAG_DOCUMENT_LOCK_MODE` | `mysql` | 文档长租约后端：`mysql`（默认，行为不变）或 `redis`。部署级开关，`rag-service`/`rag-document-worker`/`rag-mcp-ingest` 必须同值 |
-| `RAG_REDIS_LOCK_URL` | 空（回退 `RAG_REDIS_URL`） | 文档锁 Redis 地址；`redis` 模式解析不出 URL 时启动报错 |
+| `RAG_REDIS_LOCK_URL` | 空（回退 `RAG_REDIS_URL`） | 文档锁 Redis 地址；**Redis 是文档锁的唯一后端**，解析不出 URL 时启动报配置错误（旧变量 `RAG_DOCUMENT_LOCK_MODE` 已移除，残留值被忽略） |
 | `RAG_REDIS_LOCK_PREFIX` | `rag:lock:v1` | 锁键前缀；每个 namespace 一个 Hash：`<prefix>:{<sha256(namespace) 前 32 位>}:leases`，单键内多 field，兼容 Redis Cluster |
 | `RAG_REDIS_LOCK_TTL_SECONDS` | `120`（未显式设置时跟随 `RAG_UPLOAD_LEASE_SECONDS`） | 文档长租约时长；心跳按 1/3 周期续租 |
 | `RAG_REDIS_LOCK_TIMEOUT_SECONDS` | `1` | 单次 Redis 命令超时 |
@@ -376,7 +375,7 @@ Redis 不可用时，持久读模型会回源状态库；搜索为同步直返�
 
 回源 MySQL 前，请求先按完整的 `kind + scope`（例如“文档列表 + 某知识库”）合并：同一实例内并发查询同一知识库文档列表的请求共用一次数据库查询，等待者不占用额外名额；只有真正执行查询的请求才获取 `RAG_CACHE_FALLBACK_CONCURRENCY` 的一个名额——拿到名额才开启 MySQL 事务，额度已满时**立即**返回 503「服务繁忙，请稍后重试」（REST 沿用现有 `{"detail": ...}` 错误结构；MCP 走现有工具错误通道），不再排队、也不会在 runtime 再查一次。名额在查库结束时释放，不等 Redis 回填。正常缓存未命中与故障回源共用这道保护，多个列表集中过期时同样有效；Redis 命中则无需名额。名额按**实例**生效：多副本部署的总回源并发约为各实例额度之和，设置时请为上传、发布等写操作保留数据库余量。此约束只作用于前台展示读取；后台 `rag-cache-worker` 的失败补偿（`RefreshDirty`）是独立路径，不占用也不受此额度约束。Console 在刷新收到 503 时保留当前知识库上一次成功加载的列表并提示「刷新失败，当前显示上次加载的数据」；首次加载（或刚切换知识库）失败则显示错误与重试入口，不会把故障显示成「暂无文档」。
 
-**文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，`RAG_DOCUMENT_LOCK_MODE=redis` 时文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。默认 `mysql` 模式行为不变（`document_leases` 行 + 心跳续写 `expires_at`）；`redis` 模式只把长租约搬到 Redis，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询，展示读取可回源 MySQL。切换与回退见[部署指南](DEPLOYMENT.md) §13。
+**文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。Redis 是文档长租约的**唯一后端**（`RAG_DOCUMENT_LOCK_MODE` 已移除）：长租约的申请/续期/接管在 Redis 原子完成，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者；`RAG_REDIS_LOCK_URL`（为空回退 `RAG_REDIS_URL`）必须能解析，否则启动报配置错误。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询，展示读取可回源 MySQL。升级与代码回退见[部署指南](DEPLOYMENT.md) §13。
 
 **上传操作详情查询布隆过滤器**（`RAG_UPLOAD_BLOOM_MODE`，默认 `off` 行为不变）：只作用于 `GET /v1/uploads/{operation_id}` 的**读路径加速**——Redis bitmap 分片（`RAG_UPLOAD_BLOOM_SHARDS` 个 string 键，键前缀 `RAG_UPLOAD_BLOOM_PREFIX`）记录 MySQL `upload_operations.id`，按历史条数与预计增量（`RAG_UPLOAD_BLOOM_GROWTH`、`RAG_UPLOAD_BLOOM_MIN_CAPACITY`）规划容量、以 `RAG_UPLOAD_BLOOM_FALSE_POSITIVE`（默认 1%）为目标。查询顺序：先读展示缓存（含已缓存的空结果），未命中再问布隆；「一定不存在」直接返回原有 404，不执行上传状态 SQL；「可能存在」继续原有 MySQL 查询、namespace 校验与缓存回填。**MySQL 始终是事实来源**：过滤器未就绪、全局停用开关、分片丢失或 Redis 读取失败一律走原查询路径；布隆误判只多付一次 MySQL 查询；知识库访问权限仍由原 `namespace` 校验决定，跨知识库查询继续返回 404。可能按 MySQL 排序规则等价的 ID 写法（非全小写）一律绕过过滤器，保持历史查询行为。
 
@@ -1357,7 +1356,7 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 - `scripts/build-go.ps1` 本机构建 + 冒烟：`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200。POSIX 的 `scripts/build-go.sh`/`make check` 未在当前 Windows 验证环境执行。
 - 四个 worker 二进制与切换/迁移 CLI 的 `--help`、缺少 Kafka、错误 backend、非法 `--kind` 的退出码行为。
 - Go 端 REST/MCP/检索/文档/资产投影/`document.md` 预览/上传事务的单元与集成测试（真实 MySQL + fake Qdrant/model）。
-- 文档长租约后端（`RAG_DOCUMENT_LOCK_MODE=redis`）：`internal/state` 覆盖冲突矩阵、迟到登记、接管围栏、Redis 丢失/不可用/释放失败与租约展示；`internal/runtime`、`internal/documentworker` 回归；`internal/redisstate` 用两个独立客户端对真实 Redis 验证 Lua、续租与 TTL。
+- 文档长租约后端（Redis 唯一后端，旧 `RAG_DOCUMENT_LOCK_MODE` 已移除）：`internal/state` 覆盖冲突矩阵、迟到登记、接管围栏、Redis 丢失/不可用/释放失败与租约展示；`internal/runtime`、`internal/documentworker` 回归；`internal/redisstate` 用两个独立客户端对真实 Redis 验证 Lua、续租与 TTL。
 - Console 角色/知识库归属/邀请共享的**全栈 HTTP E2E**（真实登录会话与 CSRF、真实 access 服务、真实 MySQL）：`internal/e2e/permissions_http_test.go` 覆盖角色变更、归属可见性、邀请创建→收件箱→预览→接受、只读/读写闸门、模板建库、撤销授权。异步上传发布后读模型刷新的回归也由 `internal/e2e` 覆盖。
 
 **未验证**（不要据此宣称生产就绪）：

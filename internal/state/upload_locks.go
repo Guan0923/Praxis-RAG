@@ -22,12 +22,9 @@ var errLeaseEpochChanged = errors.New("document lease generation changed")
 // Redis lease was taken. A missing resource is generation zero.
 type leaseEpoch map[string]int64
 
-// redisLeaseMode reports whether long-lived leases live in Redis.
-func (j *UploadJournal) redisLeaseMode() bool { return j.documentLock.RedisMode() }
-
-// documentLocker returns the attached backend, or a retryable error. A
-// redis-mode journal without a backend must never fall back to MySQL leases:
-// a mixed fleet would hold two incompatible locks.
+// documentLocker returns the attached backend, or a retryable error. A journal
+// without a backend must never fall back to MySQL leases: a mixed fleet would
+// hold two incompatible locks.
 func (j *UploadJournal) documentLocker() (DocumentLocker, error) {
 	j.lockerMutex.RLock()
 	locker := j.locker
@@ -38,10 +35,9 @@ func (j *UploadJournal) documentLocker() (DocumentLocker, error) {
 	return locker, nil
 }
 
-// SetDocumentLocker attaches the cross-instance lease backend and switches the
-// journal to redis mode. It must be called before the process starts serving
-// document writes; later calls are rejected so a running operation never
-// changes backends underneath itself.
+// SetDocumentLocker attaches the cross-instance lease backend. It must be
+// called before the process starts serving document writes; later calls are
+// rejected so a running operation never changes backends underneath itself.
 func (j *UploadJournal) SetDocumentLocker(locker DocumentLocker) error {
 	if locker == nil {
 		return newValueError("document locker is required")
@@ -52,7 +48,6 @@ func (j *UploadJournal) SetDocumentLocker(locker DocumentLocker) error {
 		return newValueError("document locker is already configured")
 	}
 	j.locker = locker
-	j.documentLock.Mode = DocumentLockModeRedis
 	return nil
 }
 
@@ -101,7 +96,7 @@ func (j *UploadJournal) releaseLease(ctx context.Context, locker DocumentLocker,
 // called after the publishing transaction committed; a failure only delays
 // reuse until the lease TTL and must never re-run the committed work.
 func (j *UploadJournal) ReleaseOperation(ctx context.Context, operation *UploadOperation) error {
-	if !j.redisLeaseMode() || operation == nil {
+	if operation == nil {
 		return nil
 	}
 	locker, err := j.documentLocker()
@@ -115,9 +110,6 @@ func (j *UploadJournal) ReleaseOperation(ctx context.Context, operation *UploadO
 // extends it. It runs before a new side effect starts, so a lost lease stops
 // the pipeline before the next external write instead of at the next heartbeat.
 func (j *UploadJournal) assertRedisLease(ctx context.Context, operation *UploadOperation) error {
-	if !j.redisLeaseMode() {
-		return nil
-	}
 	locker, err := j.documentLocker()
 	if err != nil {
 		return err

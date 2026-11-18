@@ -154,24 +154,23 @@ func run(args []string, stdout, stderr *os.File) int {
 	}
 	defer func() { _ = stores.Close() }()
 	// Ingestion writes documents through the shared journal, so it must join the
-	// deployment's document lease backend instead of holding a second, MySQL-only
-	// lock that the other processes cannot see.
+	// deployment's document lease backend: Redis is required, resolved from
+	// RAG_REDIS_LOCK_URL (falling back to RAG_REDIS_URL) and shared with
+	// rag-service and rag-document-worker.
 	lockSettings, err := state.DocumentLockSettingsFromEnv()
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return exitError
 	}
-	if lockSettings.RedisMode() {
-		documentLock, lockErr := redisstate.NewDocumentLock(lockSettings)
-		if lockErr != nil {
-			fmt.Fprintln(stderr, lockErr)
-			return exitError
-		}
-		defer func() { _ = documentLock.Close() }()
-		if attachErr := stores.AttachDocumentLocker(documentLock); attachErr != nil {
-			fmt.Fprintln(stderr, attachErr)
-			return exitError
-		}
+	documentLock, lockErr := redisstate.NewDocumentLock(lockSettings)
+	if lockErr != nil {
+		fmt.Fprintln(stderr, lockErr)
+		return exitError
+	}
+	defer func() { _ = documentLock.Close() }()
+	if attachErr := stores.AttachDocumentLocker(documentLock); attachErr != nil {
+		fmt.Fprintln(stderr, attachErr)
+		return exitError
 	}
 	// Ingestion writes documents through the shared journal, so it must also
 	// register new upload IDs into the deployment's bloom filter before the

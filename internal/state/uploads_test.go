@@ -53,16 +53,17 @@ func commitTestUpload(t *testing.T, stores *Stores, journal *UploadJournal, oper
 	if err := transaction.Commit(); err != nil {
 		t.Fatalf("tx.Commit() error = %v", err)
 	}
+	// The publishing transaction is durable; the runtime releases the Redis
+	// lease right after commit (documents_publish.go publishDocument).
+	if err := journal.ReleaseOperation(context.Background(), committed); err != nil {
+		t.Fatalf("ReleaseOperation() error = %v", err)
+	}
 	return committed
 }
 
 func expireUploadLeases(t *testing.T, stores *Stores, operationID string) {
 	t.Helper()
-	ctx := context.Background()
-	if _, err := stores.DB.ExecContext(ctx,
-		"UPDATE document_leases SET expires_at = 0 WHERE operation_id = ?", operationID); err != nil {
-		t.Fatalf("lease expiry update error = %v", err)
-	}
+	testLocker(t, stores).expireAll()
 }
 
 func stringPtr(value string) *string { return &value }
@@ -621,12 +622,18 @@ func TestUploadDurableRestartAndIdempotency(t *testing.T) {
 		}
 	}
 	settings := stores.Settings
+	locker := stores.DocumentLocks
 	if err := stores.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
 	restartedStores, err := New(settings, true)
 	if err != nil {
 		t.Fatalf("New(restarted) error = %v", err)
+	}
+	if locker != nil {
+		if err := restartedStores.AttachDocumentLocker(locker); err != nil {
+			t.Fatalf("AttachDocumentLocker(restarted) error = %v", err)
+		}
 	}
 	defer func() { _ = restartedStores.Close() }()
 	restarted := newTestJournal(t, restartedStores)

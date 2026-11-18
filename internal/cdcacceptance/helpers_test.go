@@ -23,6 +23,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/documentworker"
 	"github.com/Guan0923/Praxis-RAG/internal/mq"
 	"github.com/Guan0923/Praxis-RAG/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/statelocktest"
 	"github.com/Guan0923/Praxis-RAG/internal/statetest"
 )
 
@@ -86,6 +87,12 @@ func newStores(t *testing.T) *state.Stores {
 	}, true)
 	if err != nil {
 		t.Fatalf("state.New() error = %v", err)
+	}
+	// Document writes need the Redis lease backend; tests use the
+	// deterministic in-memory fake.
+	if err := stores.AttachDocumentLocker(statelocktest.NewFakeDocumentLocker()); err != nil {
+		_ = stores.Close()
+		t.Fatalf("AttachDocumentLocker() error = %v", err)
 	}
 	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })

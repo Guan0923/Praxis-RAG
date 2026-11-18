@@ -114,7 +114,7 @@ docker run -d --name praxis-rag-service \
 - Word/HTML 解析：设置 `RAG_DOCLING_SERVICE_URL` 指向 docling-service（同一 compose 网络用 `http://docling-service:8092`；单独 `docker run` 时用从容器内可达的地址）；单次调用超时用 `RAG_DOCLING_SERVICE_TIMEOUT`（默认 300 秒，1..7200）。**该变量必配**：为空时 Word/HTML 上传在受理阶段被拒绝（进程内 Word 解析已删除）；已配置但服务不可用或超时会让该次文档任务失败并按既有重试策略处理（没有进程内回退）。详见 §3.6。
 - 远端 OpenAI 兼容视觉模型：优先在 Console 的知识库设置页配置（URL/Key/模型），也可用 `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`（可选 `RAG_VLM_TIMEOUT`/`RAG_VLM_CONCURRENCY`）作为未配置知识库时的环境回退。图片内容会离开本机到该端点，选型时确认合规。该端点用于 vision 引擎的 PDF 版面/OCR/表格/公式/图片描述；vision 引擎要求知识库配置 VLM（Console「模型配置」页添加并在知识库表单选择），否则 PDF 上传会在受理阶段被拒绝并提示配置。Word/HTML 解析产物的图片与图注以 docling-service 返回的清单为准（见 §3.6）。
 - 数据目录卷保存上传恢复工作区与 artifact 工作区；不要用匿名卷。
-- 文档长租约默认由 MySQL `document_leases` 承担；设置 `RAG_DOCUMENT_LOCK_MODE=redis` 时，必须让 `rag-service`、`rag-document-worker` 与 `rag-mcp-ingest` 使用同一组 `RAG_REDIS_LOCK_*` 配置，切换/回退见 §13。
+- **Redis 是文档长租约的唯一后端**：`rag-service`、`rag-document-worker` 与 `rag-mcp-ingest` 必须使用同一组 `RAG_REDIS_LOCK_*` 配置（`RAG_REDIS_LOCK_URL` 为空时回退 `RAG_REDIS_URL`），缺失锁地址时这些进程启动即报配置错误；旧环境变量 `RAG_DOCUMENT_LOCK_MODE` 已移除（即使残留也被忽略）。升级步骤见 §13。
 
 ### 3.3 Compose：app profile
 
@@ -126,7 +126,7 @@ docker compose --profile app up -d --build
 docker compose up -d mysql qdrant redis kafka
 ```
 
-`app` 服务从 `.env` 读取 `RAG_SERVICE_TOKEN`（容器 0.0.0.0 绑定，必填）、`RAG_MYSQL_*`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_APP_QDRANT_URL`、`RAG_APP_PORT`、`RAG_APP_KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`RAG_AUTH_*`（Console 登录，见下）、`RAG_FEISHU_*`（可选飞书导入，见下）、`RAG_PDF_ENGINE`（默认 `vision`）、`RAG_PDF_SERVICE_URL`（compose 内默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120）、`RAG_DOCLING_SERVICE_URL`（compose 内默认 `http://docling-service:8092`；留空会禁用 Word/HTML 导入：这些格式的上传在受理阶段被拒绝）、`RAG_DOCLING_SERVICE_TIMEOUT`（默认 300）、`RAG_DOCUMENT_LOCK_MODE`/`RAG_REDIS_LOCK_*`（文档锁，见 §13）等；默认依赖 MySQL healthy + Qdrant started + Kafka healthy + pdf-parser started + docling-service started。`pdf-parser` 与 `docling-service` 都没有 profile，默认 `docker compose up -d` 即启动；前者只在 `vision` 引擎下被调用，后者在配置了 `RAG_DOCLING_SERVICE_URL` 时被调用。详细的环境变量见 §3.5、§3.6。
+`app` 服务从 `.env` 读取 `RAG_SERVICE_TOKEN`（容器 0.0.0.0 绑定，必填）、`RAG_MYSQL_*`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_APP_QDRANT_URL`、`RAG_APP_PORT`、`RAG_APP_KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`RAG_AUTH_*`（Console 登录，见下）、`RAG_FEISHU_*`（可选飞书导入，见下）、`RAG_PDF_ENGINE`（默认 `vision`）、`RAG_PDF_SERVICE_URL`（compose 内默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120）、`RAG_DOCLING_SERVICE_URL`（compose 内默认 `http://docling-service:8092`；留空会禁用 Word/HTML 导入：这些格式的上传在受理阶段被拒绝）、`RAG_DOCLING_SERVICE_TIMEOUT`（默认 300）、`RAG_REDIS_LOCK_*`（文档锁，Redis 是必需后端，见 §13）等；默认依赖 MySQL healthy + Qdrant started + Kafka healthy + pdf-parser started + docling-service started。`pdf-parser` 与 `docling-service` 都没有 profile，默认 `docker compose up -d` 即启动；前者只在 `vision` 引擎下被调用，后者在配置了 `RAG_DOCLING_SERVICE_URL` 时被调用。详细的环境变量见 §3.5、§3.6。
 
 ### 3.4 Compose：worker 示例（需自行保存为 override 文件）
 
@@ -404,14 +404,14 @@ RAG_STATE_ENCRYPTION_KEY=base64:CHANGE_ME
 RAG_BACKEND=qdrant
 QDRANT_URL=http://127.0.0.1:6333
 RAG_REDIS_URL=redis://127.0.0.1:6379/0
-# 文档长租约后端（默认 mysql）：切 redis 时所有 app 进程必须同值，
-# 且 RAG_REDIS_LOCK_URL/前缀/TTL 一致；展示缓存开关不控制文档锁。切换见 §13。
-# RAG_DOCUMENT_LOCK_MODE=mysql
-# RAG_REDIS_LOCK_URL=redis://127.0.0.1:6379/0
-# RAG_REDIS_LOCK_PREFIX=rag:lock:v1
-# RAG_REDIS_LOCK_TTL_SECONDS=120
-# RAG_REDIS_LOCK_TIMEOUT_SECONDS=1
-# RAG_REDIS_LOCK_WAIT_SECONDS=2
+# 文档长租约后端：Redis 是唯一后端（RAG_REDIS_LOCK_URL 为空时回退 RAG_REDIS_URL），
+# 所有 app 进程必须使用同一 URL/前缀/TTL；展示缓存开关不控制文档锁。
+# 旧的 RAG_DOCUMENT_LOCK_MODE 已移除（残留值被忽略）。升级步骤见 §13。
+RAG_REDIS_LOCK_URL=redis://127.0.0.1:6379/0
+RAG_REDIS_LOCK_PREFIX=rag:lock:v1
+RAG_REDIS_LOCK_TTL_SECONDS=120
+RAG_REDIS_LOCK_TIMEOUT_SECONDS=1
+RAG_REDIS_LOCK_WAIT_SECONDS=2
 RAG_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
 # 外部 Kafka 可追加 RAG_KAFKA_SECURITY_PROTOCOL / RAG_KAFKA_SASL_* / RAG_KAFKA_TLS_*
 # 上传默认异步受理：由独立的 rag-document-worker 消费 Kafka 文档通知
@@ -598,7 +598,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 
 停止顺序相反：先停 worker/死信（让在途任务完成或回到可重试状态），再停服务。
 
-所有 app 进程（`rag-service`、`rag-document-worker`、`rag-mcp-ingest`）必须使用相同的文档锁配置（`RAG_DOCUMENT_LOCK_MODE`、`RAG_REDIS_LOCK_URL`/前缀/TTL）。从 `mysql` 切到 `redis` 或回退都**不能热切**：先停写并处理在途操作，见 §13。
+所有 app 进程（`rag-service`、`rag-document-worker`、`rag-mcp-ingest`）必须使用相同的文档锁配置（`RAG_REDIS_LOCK_URL`（为空时回退 `RAG_REDIS_URL`）、`RAG_REDIS_LOCK_PREFIX`、TTL）：Redis 是文档锁的唯一后端。若需回退代码，旧版本显式设置 `RAG_DOCUMENT_LOCK_MODE=redis` 即可，整个回退过程保持同一套锁（见 §13）。
 
 ## 5. 重启策略
 
@@ -727,7 +727,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 - `pdf-parser` 是无认证的内部服务：compose 只把 8091 发布到 `127.0.0.1`，不要改成 `0.0.0.0` 或挂到公网反向代理；只允许 Go 服务所在的容器/主机访问。VLM 端点凭据同样只通过环境变量/密钥注入，且要确认 PDF 图片/公式会被发送到该外部端点。
 - `docling-service` 同样是无认证的内部服务：compose 只把 8092 发布到 `127.0.0.1`，不要改成 `0.0.0.0` 或挂到公网反向代理；只允许 Go 服务所在的容器/主机访问。上传的 `.docx`/HTML（含 `.doc` 的转换结果）会发送到该服务，跨主机部署时须保证链路可信并限制来源。
 - 运行用户非 root，数据目录 0700；env 文件 0600；日志不要输出查询/文件内容（Go 实现只记录任务 ID 与错误类别）。
-- 定期备份 MySQL；上传恢复工作区同样需要备份。Redis 默认只保存可丢失的展示缓存；启用 `RAG_DOCUMENT_LOCK_MODE=redis` 时它还保存文档长租约（只是互斥凭据，可由 TTL 过期后由恢复流程补偿，不是业务数据真相，建议开启 AOF 或接受“重启后最多等一个 TTL”的短暂写不可用）。
+- 定期备份 MySQL；上传恢复工作区同样需要备份。Redis 保存读模型展示缓存与文档长租约（长租约只是互斥凭据，可由 TTL 过期后由恢复流程补偿，不是业务数据真相，建议开启 AOF 或接受“重启后最多等一个 TTL”的短暂写不可用）。Redis 故障影响分两类：展示缓存异常时列表可回源 MySQL；锁后端异常时，需要取得或续租文档锁的写操作必须等待重试（返回可重试错误），检索与状态查询不受影响。
 
 ## 10. 验证与已知未验证项
 
@@ -792,34 +792,38 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 - 回滚不涉及 artifact：`artifact_snapshots` 与 TTL 语义前后一致，已签发 artifact 继续可读。
 - 回滚后务必再次核对监控页 `pipeline.kafka.groups` 是否恢复三组（旧版本）或保持两组（新版本），避免混跑。
 
-## 13. 文档锁迁移到 Redis（升级必读）
+## 13. 文档锁迁移：Redis 成为唯一后端（升级必读）
 
-本节只覆盖**文档长租约后端**：默认 `mysql` 行为不变（`document_leases` 行持有租约，心跳用 SQL 续写 `expires_at`）；改为 `redis` 后长租约在 Redis，MySQL 只保存持有者登记与单调递增的 `fencing_epoch`，所有破坏性事务（`document_heads` 更新、删除、回滚、清理、知识库配置写入）提交前按当前持有者校验。入库任务领取、任务心跳、重试、终态与 Kafka 去重仍在 MySQL（`document_jobs`），两种模式都一样；`RAG_REDIS_ENABLED` 只控制读模型展示缓存，不影响本节。
+本节覆盖**文档长租约后端**：Redis 现在是唯一后端——长租约在 Redis，MySQL 只保存持有者登记与单调递增的 `fencing_epoch`，所有破坏性事务（`document_heads` 更新、删除、回滚、清理、知识库配置写入）提交前按当前持有者校验。入库任务领取、任务心跳、重试、终态与 Kafka 去重仍在 MySQL（`document_jobs`）；`RAG_REDIS_ENABLED` 只控制读模型展示缓存，不影响本节。旧的 `RAG_DOCUMENT_LOCK_MODE` 变量已移除：旧环境即使残留该值也被直接忽略，程序一律使用 Redis 锁。
 
 ### 13.1 前置与 Redis 要求
 
-- **全进程一致**：`rag-service`、`rag-document-worker`、`rag-mcp-ingest` 必须使用相同的 `RAG_DOCUMENT_LOCK_MODE`、`RAG_REDIS_LOCK_URL`（为空时回退 `RAG_REDIS_URL`）、`RAG_REDIS_LOCK_PREFIX` 与 TTL。混跑两种后端等于没有互斥。
+- **Redis 是必需依赖**：`RAG_REDIS_LOCK_URL`（为空时回退 `RAG_REDIS_URL`）必须可解析，否则 `rag-service`、`rag-document-worker`、`rag-mcp-ingest` 启动即报配置错误（`rag-document-worker` 退出码 `2`，`rag-service`/`rag-mcp-ingest` 为 `1`）。仅配置 Redis 地址、省略旧锁模式即使用 Redis 文档锁；关闭展示缓存（`RAG_REDIS_ENABLED=false`）时文档锁仍使用 Redis。
+- **全进程一致**：`rag-service`、`rag-document-worker`、`rag-mcp-ingest` 必须使用相同的 `RAG_REDIS_LOCK_URL`、`RAG_REDIS_LOCK_PREFIX` 与 TTL，且指向**同一 Redis 实例与逻辑库**。两个进程即使都能连上 Redis，只要锁前缀不同，就可能同时锁住同一份文档。
 - **Redis 部署**：建议开启 AOF；也可以接受“重启后最多等一个租约 TTL”的短暂写不可用——租约丢失只让旧实例在下一个步骤边界停止推进，恢复流程接管，不会出现两个发布者。锁键是每个 namespace 一个 Hash（`<prefix>:{<sha256(namespace) 前 32 位>}:leases`），单键内多个 field，天然兼容 Redis Cluster；Redis 需允许 `EVALSHA`/`EVAL`。
-- **表结构**：`document_leases.fencing_epoch BIGINT NOT NULL DEFAULT 0` 追加在列尾。开启自动 schema（默认 `RAG_STATE_AUTO_SCHEMA=true`）时启动会幂等执行 `ALTER TABLE ... ADD COLUMN`，旧库升级前只需备份；关闭自动 schema 的部署按 §6 用有 DDL 权限的账号执行 `rag-state-migrate --apply`。
+- **表结构**：`document_leases.fencing_epoch BIGINT NOT NULL DEFAULT 0` 追加在列尾。开启自动 schema（默认 `RAG_STATE_AUTO_SCHEMA=true`）时启动会幂等执行 `ALTER TABLE ... ADD COLUMN`，旧库升级前只需备份；关闭自动 schema 的部署按 §6 用有 DDL 权限的账号执行 `rag-state-migrate --apply`。本次迁移不删除任何表、列或历史行：已有上传日志、文档版本与恢复记录全部保留。
 - **键空间隔离**：`RAG_REDIS_PREFIX`（读模型）与 `RAG_REDIS_LOCK_PREFIX`（锁）是两套键空间，不要指向同一前缀。
-- **回退无损**：`fencing_epoch` 列回退后仍保留（MySQL 模式不读它）；已有操作日志、已发布版本与租约行都不删除。
+- **故障影响区分**：展示缓存异常时，列表可以回源 MySQL；锁后端异常时，需要取得或续租文档锁的写操作必须等待重试（返回可重试错误，写入不会越过锁校验；Redis 恢复后可重新申请）。
 
-### 13.2 切换步骤（建议停机窗口）
+### 13.2 从 MySQL 长租约版本升级（建议停机窗口）
+
+旧版本（长租约在 MySQL `document_leases`，心跳用 SQL 续写 `expires_at`）升级到本版本时：
 
 1. **暂停新文档写入**：停掉上传/删除/知识库修改入口，或在网关摘流，避免切换窗口内产生新的 INTENT。
 2. **停止 `rag-document-worker` 与维护恢复循环**：停 worker（Compose 部署移除对应服务；`rag-service` 的维护循环每 10 秒扫描上传恢复，建议在停写窗口一并停掉 `rag-service`）。
-3. **排空/明确接管在途操作**：等待运行中的上传/删除完成，或让其租约过期后由恢复流程补偿；确认没有 `INTENT`/`RUNNING`/`FAILED`/`ROLLING_BACK`/`ROLLBACK_FAILED` 残留，或在切换记录中写明如何补偿。
-4. **统一改配置并重启**：所有 app 进程改为 `RAG_DOCUMENT_LOCK_MODE=redis`（同一 URL/前缀/TTL），重启。
+3. **排空/明确接管在途操作**：等待运行中的上传/删除完成，或明确由哪个恢复流程接管；确认没有 `INTENT`/`RUNNING`/`FAILED`/`ROLLING_BACK`/`ROLLBACK_FAILED` 残留，或在切换记录中写明如何补偿。新版本能按已有上传日志接管或恢复这些操作，最终发布状态一致。
+4. **停止所有仍使用 MySQL 锁的写入进程**，用现有版本统一切到 Redis 锁并验证：统一 `RAG_REDIS_LOCK_URL`（为空时回退 `RAG_REDIS_URL`）/前缀/TTL 并重启。升级前已有未完成的上传操作，由新版本按已有日志接管或恢复。
 5. **恢复 worker 与写入入口**。
 6. **观察**：`GET /v1/admin/upload-leases` 的持有者/过期时间正常，日志出现 `Document lease backend configured mode=redis`；做一次上传冒烟。
+7. **上线删除旧分支的新版本**（本版本已删除 MySQL 长租约申请/续租/接管的旧实现）。
 
-### 13.3 回退
+### 13.3 回退代码
 
-同样先停写并处理在途操作，再把所有进程统一改回 `RAG_DOCUMENT_LOCK_MODE=mysql` 并重启。**禁止新旧进程分别拿两种锁**：一部分进程用 Redis、一部分用 MySQL 时两者互不可见。回退后 `document_leases` 行重新由 SQL 心跳续写 `expires_at`，`fencing_epoch` 保留但不参与判定；已发布版本与操作日志不变。
+若需回退代码到旧版本：旧版本显式设置 `RAG_DOCUMENT_LOCK_MODE=redis` 并保持**同一套锁配置**（同 URL/前缀/TTL），整个回退过程保持同一套锁，不存在“新旧进程各拿一种锁”的窗口。回退前的停写与在途操作处理同 §13.2。旧版本在 `redis` 模式下的行为与本版本一致（`fencing_epoch` 保留并参与判定）。
 
 ### 13.4 就绪检查与监控
 
-- 启动校验：`redis` 模式必须能解析出锁 URL，否则进程启动即失败并报配置错误（`rag-document-worker` 退出码 `2`，`rag-service`/`rag-mcp-ingest` 为 `1`）；正常启动会记录 `Document lease backend configured mode=...`。`GET /health` 只表示服务进程已就绪，不探测锁后端；锁后端的观测点是监控页与 `upload-leases`。
-- Console「系统监控 → 概览」：读模型缓存启用时 `Redis` 依赖行探测展示缓存；`RAG_REDIS_ENABLED=false` 且启用文档锁时，该行改报**文档锁后端**的连接状态（只显示连接是否正常，不暴露键与 token）。
-- `GET /v1/admin/upload-leases`：`redis` 模式下 `expires_at`/`expired` 用锁后端实时 TTL 计算（长任务不再被误判过期），Redis 不可用时回退 MySQL 登记值；接口不返回原始 owner token，`holder_id` 是短哈希。
-- 失败语义：Redis 冲突仍是 409 冲突；Redis 不可用返回可重试错误（异步受理 5xx），单实例不会回退 MySQL 锁；提交成功但释放锁失败时不重复执行已提交操作，最多等到租约 TTL 过期。
+- 启动校验：必须能解析出锁 URL（`RAG_REDIS_LOCK_URL` 或 `RAG_REDIS_URL`），否则进程启动即失败并报配置错误（`rag-document-worker` 退出码 `2`，`rag-service`/`rag-mcp-ingest` 为 `1`）；正常启动会记录 `Document lease backend configured mode=redis`。`GET /health` 只表示服务进程已就绪，不探测锁后端；锁后端的观测点是监控页与 `upload-leases`。
+- Console「系统监控 → 概览」：读模型缓存启用时 `Redis` 依赖行探测展示缓存；`RAG_REDIS_ENABLED=false` 时，该行改报**文档锁后端**的连接状态（只显示连接是否正常，不暴露键与 token）。
+- `GET /v1/admin/upload-leases`：`expires_at`/`expired` 用锁后端实时 TTL 计算（长任务不再被误判过期），Redis 不可用时回退 MySQL 登记值；接口不返回原始 owner token，`holder_id` 是短哈希。
+- 失败语义：Redis 冲突仍是 409 冲突（同一份文档被其他 worker 锁定）；Redis 不可用返回可重试错误（异步受理 5xx），单实例不会回退 MySQL 锁；提交成功但释放锁失败时不重复执行已提交操作，最多等到租约 TTL 过期。

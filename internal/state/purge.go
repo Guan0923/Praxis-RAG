@@ -33,8 +33,8 @@ type KnowledgeBasePurgeReport struct {
 // operations or namespaces are involved, so a batch-delete request costs one
 // round-trip set instead of one per document.
 //
-// In redis mode a namespace is only purged after its exclusive lease was taken
-// in Redis and fenced in MySQL; a live document write rejects the purge with the
+// A namespace is only purged after its exclusive lease was taken in Redis and
+// fenced in MySQL; a live document write rejects the purge with the
 // pre-migration "busy" outcome. The MySQL expires_at alone never proves that a
 // running upload is gone.
 func (r *KnowledgeBaseRepository) Purge(ctx context.Context, namespaces []string) (KnowledgeBasePurgeReport, error) {
@@ -49,26 +49,27 @@ func (r *KnowledgeBaseRepository) Purge(ctx context.Context, namespaces []string
 		return report, nil
 	}
 	journal := r.purgeJournal()
-	held := map[string]*LockToken{}
-	if journal != nil && journal.redisLeaseMode() {
-		for _, namespace := range names {
-			token, err := journal.AcquireLock(ctx, namespace, nil)
-			if err != nil {
-				var conflict *UploadConflict
-				if errors.As(err, &conflict) {
-					report.Busy[namespace] = true
-					continue
-				}
-				releasePurgeLocks(journal, held)
-				return report, err
-			}
-			held[namespace] = token
-		}
-		if len(held) == 0 {
-			return report, nil
-		}
-		defer releasePurgeLocks(journal, held)
+	if journal == nil {
+		return report, newValueError("document lease backend is not available")
 	}
+	held := map[string]*LockToken{}
+	for _, namespace := range names {
+		token, err := journal.AcquireLock(ctx, namespace, nil)
+		if err != nil {
+			var conflict *UploadConflict
+			if errors.As(err, &conflict) {
+				report.Busy[namespace] = true
+				continue
+			}
+			releasePurgeLocks(journal, held)
+			return report, err
+		}
+		held[namespace] = token
+	}
+	if len(held) == 0 {
+		return report, nil
+	}
+	defer releasePurgeLocks(journal, held)
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return report, err
@@ -76,20 +77,13 @@ func (r *KnowledgeBaseRepository) Purge(ctx context.Context, namespaces []string
 	defer func() { _ = tx.Rollback() }()
 
 	var active []string
-	if journal != nil && journal.redisLeaseMode() {
-		active = make([]string, 0, len(held))
-		for _, namespace := range names {
-			if token, ok := held[namespace]; ok {
-				if err := journal.AssertLockTx(ctx, tx, token); err != nil {
-					return report, err
-				}
-				active = append(active, namespace)
+	active = make([]string, 0, len(held))
+	for _, namespace := range names {
+		if token, ok := held[namespace]; ok {
+			if err := journal.AssertLockTx(ctx, tx, token); err != nil {
+				return report, err
 			}
-		}
-	} else {
-		active, err = r.purgeBusyNamespaces(ctx, tx, names, report.Busy)
-		if err != nil {
-			return report, err
+			active = append(active, namespace)
 		}
 	}
 	if len(active) == 0 {
@@ -193,37 +187,6 @@ func releasePurgeLocks(journal *UploadJournal, held map[string]*LockToken) {
 	for _, token := range held {
 		_ = journal.ReleaseLock(ctx, token)
 	}
-}
-
-// purgeBusyNamespaces returns the namespaces that no active upload lease holds.
-// FOR UPDATE blocks a concurrent heartbeat until this transaction commits.
-func (r *KnowledgeBaseRepository) purgeBusyNamespaces(ctx context.Context, tx *sql.Tx, names []string, busy map[string]bool) ([]string, error) {
-	arguments := stringArguments(names)
-	rows, err := tx.QueryContext(ctx,
-		"SELECT namespace FROM document_leases WHERE namespace IN ("+
-			inPlaceholders(len(names))+") AND expires_at > ? FOR UPDATE",
-		append(arguments, unixSeconds())...)
-	if err != nil {
-		return nil, err
-	}
-	for rows.Next() {
-		var namespace string
-		if err := rows.Scan(&namespace); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		busy[namespace] = true
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	active := make([]string, 0, len(names))
-	for _, namespace := range names {
-		if !busy[namespace] {
-			active = append(active, namespace)
-		}
-	}
-	return active, nil
 }
 
 // purgeNamespaceRows deletes every non-configuration row that belongs to the
