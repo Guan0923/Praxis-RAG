@@ -109,10 +109,18 @@ type Stores struct {
 	FeishuConnections *FeishuConnectionRepository
 	FeishuOAuthStates *FeishuOAuthStateRepository
 
+	// LightRAGDocuments is the knowledge-graph mirror ledger: which documents
+	// the LightRAG sidecar currently holds and under which workspace
+	// fingerprint. It is a derived-index register, never a source of truth.
+	LightRAGDocuments *LightRAGDocumentRepository
+
 	// Activity and Heartbeats are the Go-only monitoring data sources: hourly
 	// activity counters (every retrieval execution) and Worker liveness rows.
 	Activity   *ActivityCounters
 	Heartbeats *RuntimeHeartbeats
+
+	// SagIndex is the offline event-entity index of the SAG retrieval mode.
+	SagIndex *SagRepository
 
 	closeOnce  sync.Once
 	closeError error
@@ -212,6 +220,7 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.Catalogs = newCatalogRepository(database, cacheSync)
 	stores.Membership = newMembershipRepository(database)
 	stores.Billing = newBillingRepository(database)
+	stores.SagIndex = newSagRepository(database)
 	stores.Blobs = newBlobStore(database)
 	uploads, err := NewUploadJournal(stores)
 	if err != nil {
@@ -231,6 +240,7 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.DocumentBatches = NewDocumentBatches(stores)
 	stores.FeishuConnections = NewFeishuConnectionRepository(stores, settings.EncryptionKey)
 	stores.FeishuOAuthStates = NewFeishuOAuthStateRepository(stores)
+	stores.LightRAGDocuments = NewLightRAGDocumentRepository(stores)
 	if _, err := DocumentQueueSettingsFromEnv(); err != nil {
 		uploads.Close()
 		_ = cacheSync.Close()

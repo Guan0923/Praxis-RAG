@@ -37,6 +37,23 @@ function vlmProfile(overrides: Partial<ModelProfile> = {}): ModelProfile {
   };
 }
 
+// graphProfile 是知识图谱（LightRAG）抽取模型配置：知识库只能在开关开启时选用。
+function graphProfile(overrides: Partial<ModelProfile> = {}): ModelProfile {
+  return {
+    id: "mp-graph",
+    kind: "graph",
+    name: "图谱抽取",
+    base_url: "https://graph.example.com/v1",
+    model: "graph-model",
+    api_key_set: true,
+    vector_size: null,
+    owner_user_id: "user-self",
+    owner_username: "alice",
+    mine: true,
+    ...overrides,
+  };
+}
+
 // connection 是创建页的 Namespace 头：切分策略目录是租户级接口。
 const connection: Connection = { namespace: "team-kb", token: "" };
 
@@ -233,7 +250,7 @@ describe("optional model settings in the knowledge-base form", () => {
     renderForm({ initial: initialKb });
     await waitForDefaults();
 
-    for (const name of ["启用 Reranker", "启用 VLM"]) {
+    for (const name of ["启用 Reranker", "启用 VLM", "启用知识图谱"]) {
       expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("false");
     }
   });
@@ -274,6 +291,9 @@ describe("optional model settings in the knowledge-base form", () => {
     for (const name of ["启用 Reranker", "启用 VLM"]) {
       expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("true");
     }
+    // 知识图谱是可选项：创建页默认关闭。
+    expect(screen.getByRole("switch", { name: "启用知识图谱" }).getAttribute("aria-checked"))
+      .toBe("false");
   });
 
   it("restores explicitly disabled models from the create draft", async () => {
@@ -466,5 +486,69 @@ describe("optional model settings in the knowledge-base form", () => {
     expect(screen.getByLabelText("VLM 模型")).toBeTruthy();
     expect(screen.getByLabelText("知识库标识（Namespace）")).toBeTruthy();
     expect(screen.getByLabelText("切分方式")).toBeTruthy();
+    // 知识图谱开关对每个角色都可用，默认关闭时没有模型选择。
+    expect(screen.getByRole("switch", { name: "启用知识图谱" })).toBeTruthy();
+    expect(screen.queryByLabelText("知识图谱 模型")).toBeNull();
+  });
+
+  it("submits graph_enabled=false without a graph model while the switch stays off", async () => {
+    const initialKb = editInitial();
+    mockApi([profile({ api_key_set: false })], initialKb);
+    const { onSaved } = renderForm({ initial: initialKb });
+    await waitForDefaults();
+
+    // 开关关闭时不展示图谱模型选择，也不会因为缺少图谱模型而校验失败。
+    expect(screen.getByRole("switch", { name: "启用知识图谱" }).getAttribute("aria-checked"))
+      .toBe("false");
+    expect(screen.queryByLabelText("知识图谱 模型")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /保存配置/ }));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    const body = requestBody("/v1/admin/knowledge-bases/team-kb", "PATCH");
+    expect(body).toMatchObject({
+      graph_enabled: false,
+      graph_model: "",
+      graph: { base_url: "", apikey: "" },
+      reembed: false,
+    });
+    // 没有任何图谱配置被解析，因此也不会读取任何模型配置的 Key。
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/key"))).toBe(false);
+  });
+
+  it("enables the knowledge graph and PATCHes the selected graph connection", async () => {
+    const initialKb = editInitial();
+    mockApi([profile({ api_key_set: false }), graphProfile()], initialKb);
+    const { onSaved } = renderForm({ initial: initialKb });
+    await waitForDefaults();
+
+    expect(screen.queryByLabelText("知识图谱 模型")).toBeNull();
+    fireEvent.click(screen.getByRole("switch", { name: "启用知识图谱" }));
+    // 开启开关后才出现图谱模型选择，并与其它可选模型一样必选。
+    await selectProfile("知识图谱 模型", /图谱抽取 · graph-model/);
+    fireEvent.click(screen.getByRole("button", { name: /保存配置/ }));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
+    expect(requestBody("/v1/admin/knowledge-bases/team-kb", "PATCH")).toMatchObject({
+      graph_enabled: true,
+      graph: { base_url: "https://graph.example.com/v1", apikey: "sk-revealed" },
+      graph_model: "graph-model",
+      reembed: false,
+    });
+  });
+
+  it("backfills an enabled knowledge graph on the edit form", async () => {
+    const initialKb = editInitial({
+      graph: { base_url: "https://graph.example.com/v1", api_key_set: false },
+      graph_model: "graph-model",
+      graph_enabled: true,
+    });
+    mockApi([profile({ api_key_set: false }), graphProfile({ api_key_set: false })], initialKb);
+    renderForm({ initial: initialKb });
+    await waitForDefaults();
+
+    // 编辑已有图谱的知识库：开关为开启，并预选与保存连接一致的图谱模型配置。
+    expect(screen.getByRole("switch", { name: "启用知识图谱" }).getAttribute("aria-checked"))
+      .toBe("true");
+    expect(await screen.findByText(/图谱抽取 · graph-model/)).toBeTruthy();
   });
 });

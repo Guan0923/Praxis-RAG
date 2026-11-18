@@ -1,0 +1,20 @@
+# Runtime dependencies for the Praxis-RAG LightRAG sidecar.
+#
+# HTTP layer only; the graph engine is imported lazily by app/lightrag_engine.py.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+httpx>=0.28.1
+numpy>=1.24
+
+# Graph + retrieval engine.
+#
+# Pinned to an exact release: the sidecar maps LightRAG internals (custom-chunk
+# ids, aquery_data payload shape, role LLM configuration, deletion result codes)
+# and the contract tests were written against exactly this version. Upgrading
+# requires re-checking the assumptions listed in README.md.
+#
+# This line is meant for the production image (Dockerfile) only. The pytest
+# suite deliberately does NOT install it: tests inject a fake GraphEngine, so
+# `pip install -r requirements-dev.txt` is enough to run them.
+lightrag-hku==1.5.7

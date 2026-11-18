@@ -341,6 +341,48 @@ services:
       # wider than pdf-parser's on purpose.
       start_period: 60s
 
+  # Knowledge-graph sidecar. Optional capability, so it sits behind the
+  # `lightrag` profile: `docker compose up -d` keeps the current stack
+  # unchanged, and enabling it is an explicit
+  #   docker compose --profile lightrag up -d
+  # The Go service only reaches it when RAG_LIGHTRAG_SERVICE_URL is set; the
+  # container has to bind 0.0.0.0 to be reachable from the app container, which
+  # makes the bearer token mandatory (the sidecar refuses to start without one).
+  # The named volume holds the graph, the extraction cache and the block
+  # registry: it is the index itself, not scratch space.
+  lightrag-service:
+    build:
+      context: ./python-workers/lightrag-service
+      args:
+        BASE_IMAGE: ${RAG_LIGHTRAG_BASE_IMAGE:-python:3.11-slim}
+        PIP_INDEX_URL: ${RAG_LIGHTRAG_PIP_INDEX_URL:-https://pypi.org/simple}
+    image: ${RAG_LIGHTRAG_IMAGE:-praxis-rag-lightrag-service:local}
+    container_name: praxis-rag-lightrag-service
+    restart: unless-stopped
+    profiles: ["lightrag"]
+    environment:
+      RAG_LIGHTRAG_SERVICE_HOST: "0.0.0.0"
+      RAG_LIGHTRAG_SERVICE_PORT: "8093"
+      RAG_LIGHTRAG_SERVICE_WORKING_DIR: /data
+      # Extraction runs one LLM call per chunk, so concurrency is also a
+      # spend dial. Keep the default low and raise it with the upstream
+      # rate limit in mind.
+      RAG_LIGHTRAG_SERVICE_CONCURRENCY: ${RAG_LIGHTRAG_SERVICE_CONCURRENCY:-2}
+      RAG_LIGHTRAG_SERVICE_TOKEN: ${RAG_LIGHTRAG_SERVICE_TOKEN:-}
+      RAG_LIGHTRAG_SERVICE_LOG_LEVEL: ${RAG_LIGHTRAG_SERVICE_LOG_LEVEL:-info}
+      RAG_LIGHTRAG_SERVICE_LOG_FORMAT: ${RAG_LIGHTRAG_SERVICE_LOG_FORMAT:-text}
+    ports:
+      # Same rule as the other sidecars: loopback only on the host.
+      - "127.0.0.1:${RAG_LIGHTRAG_SERVICE_PORT:-8093}:8093"
+    volumes:
+      - lightrag_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8093/healthz').read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
   # Go backend service. Kept out of the default (infra-only) profile:
   #   docker compose --profile app up -d --build
   # The image builds the Console and every cmd/* entrypoint from this repo.
@@ -507,6 +549,7 @@ services:
       RAG_CACHE_DLQ_GROUP: ${RAG_CACHE_DLQ_GROUP:-praxis_state_cache_refresh_dead_letters}
 volumes:
   kafka_data:
+  lightrag_data:
   mysql_data:
   praxis_app_data:
   qdrant_data:

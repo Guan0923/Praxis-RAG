@@ -30,3 +30,38 @@ func (s *Store) ScrollActiveChunks(ctx context.Context, visit func([]Point) erro
 		return visit(chunks)
 	})
 }
+
+// HydrateChunks returns the active chunk points whose chunk_id is in the
+// given set. The lookup scrolls the active corpus once and keeps the first
+// match per id; it is the evidence-text source for candidates produced
+// outside the vector recall (e.g. the SAG hyperedge expansion), which must
+// still return the original chunk text as their evidence boundary.
+func (s *Store) HydrateChunks(ctx context.Context, chunkIDs []string) ([]Point, error) {
+	if len(chunkIDs) == 0 {
+		return []Point{}, nil
+	}
+	wanted := make(map[string]struct{}, len(chunkIDs))
+	for _, chunkID := range chunkIDs {
+		wanted[chunkID] = struct{}{}
+	}
+	matches := make([]Point, 0, len(chunkIDs))
+	err := s.ScrollActiveChunks(ctx, func(points []Point) error {
+		for _, point := range points {
+			payload := point.Payload
+			if payload == nil {
+				continue
+			}
+			chunkID, _ := payload["chunk_id"].(string)
+			if _, ok := wanted[chunkID]; !ok {
+				continue
+			}
+			delete(wanted, chunkID)
+			matches = append(matches, point)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return matches, nil
+}

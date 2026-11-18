@@ -121,12 +121,41 @@ func (e *SearchEngine) buildTenant(namespace string, settings map[string]any) (*
 		e.sag2ScorerResolver(),
 		retrieval.Sag2Options{},
 	)
+	// Graph retrieval is a deployment-level capability: when the LightRAG
+	// sidecar is not configured the mode stays registered but reports an
+	// explicit operational error, so a caller gets an actionable message
+	// instead of "unsupported retrieval mode".
+	var graph retrieval.Retriever = retrieval.NewUnavailableRetriever(
+		"retrieval graph requires RAG_LIGHTRAG_SERVICE_URL and a running LightRAG sidecar",
+	)
+	if e.lightrag != nil {
+		graph = retrieval.NewGraphRetriever(e.lightrag, namespace, retrieval.GraphOptions{
+			IncludeEntities: true,
+		})
+	}
+	// sag consumes the MySQL event-entity index written by the extraction
+	// stage; without one it degrades to hybrid recall, so it always registers.
+	var sagRetriever retrieval.Retriever = retrieval.NewUnavailableRetriever(
+		"retrieval sag requires the SAG event-entity index",
+	)
+	if e.stores.SagIndex != nil {
+		sagRetriever = retrieval.NewSagRetriever(
+			namespace,
+			newSagIndexAdapter(e.stores.SagIndex),
+			embedder,
+			encoder,
+			&sagStoreAdapter{store: store},
+			retrieval.SagOptions{},
+		)
+	}
 	orchestrator := retrieval.NewOrchestrator(
 		map[contracts.RetrievalMode]retrieval.Retriever{
 			contracts.RetrievalBM25:      retrieval.NewBm25Retriever(encoder, store),
 			contracts.RetrievalEmbedding: retrieval.NewDenseRetriever(embedder, store),
 			contracts.RetrievalHybrid:    retrieval.NewHybridRetriever(embedder, encoder, store),
 			contracts.RetrievalSAG2:       sag2,
+			contracts.RetrievalGraph:      graph,
+			contracts.RetrievalSAG:        sagRetriever,
 		},
 		map[contracts.RerankMode]retrieval.Reranker{
 			contracts.RerankCrossEncoder: reranker,

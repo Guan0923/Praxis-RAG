@@ -60,6 +60,22 @@ const vlmProfile: ModelProfile = {
   updated_at: "2026-11-09T10:00:00Z",
 };
 
+// graphProfile 是知识图谱（LightRAG）抽取模型：与其它 kind 一样只保存连接与
+// 模型名，列表里只显示 Key 是否已保存。
+const graphProfile: ModelProfile = {
+  id: "mp-graph",
+  kind: "graph",
+  name: "图谱抽取",
+  base_url: "https://graph.example.com/v1",
+  model: "graph-model",
+  api_key_set: true,
+  vector_size: null,
+  owner_user_id: "user-self",
+  owner_username: "alice",
+  mine: true,
+  updated_at: "2026-11-09T10:00:00Z",
+};
+
 // otherAccountProfile 模拟管理员在只读总览里看到的、别人拥有的配置。
 const otherAccountProfile: ModelProfile = {
   id: "mp-bob",
@@ -151,12 +167,66 @@ describe("ModelProfilesPage", () => {
     expect(await screen.findByText("默认 Reranker")).toBeTruthy();
   });
 
+  it("exposes the knowledge-graph tab and switches to its rows", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ model_profiles: [embeddingProfile, graphProfile] }));
+    renderPage();
+    await screen.findByText("默认 Embedding");
+
+    // 「知识图谱」是与其它凭据类 kind 同级的分页签，标签带计数。
+    const tab = screen.getByRole("tab", { name: "知识图谱（1）" });
+    expect(tab).toBeTruthy();
+    fireEvent.click(tab);
+
+    expect(await screen.findByText("图谱抽取")).toBeTruthy();
+    expect(screen.getByText("https://graph.example.com/v1")).toBeTruthy();
+    expect(screen.getByText("graph-model")).toBeTruthy();
+    // Key 只写不读：列表只显示「已保存」，页面不会去读取 Key。
+    expect(screen.getByText("已保存")).toBeTruthy();
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/key"))).toBe(false);
+    // 只渲染当前 kind 的行。
+    expect(screen.queryByText("默认 Embedding")).toBeNull();
+  });
+
+  it("creates a knowledge-graph profile from its own tab", async () => {
+    fetchMock.mockImplementation(async (path: string, options: RequestInit = {}) => {
+      if (path === "/v1/model-profiles" && options.method === "POST")
+        return jsonResponse({ profile: { ...graphProfile, id: "mp-graph-new", name: "图谱抽取（生产）" } }, 201);
+      return jsonResponse({ model_profiles: [] });
+    });
+    const { onChanged } = renderPage();
+    await screen.findByText(/还没有模型配置/);
+
+    // 先切到「知识图谱」页签，新增的配置就带上该 kind。
+    fireEvent.click(screen.getByRole("tab", { name: "知识图谱（0）" }));
+    fireEvent.click(screen.getAllByRole("button", { name: /添加模型/ })[0]);
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("配置名称"), { target: { value: "图谱抽取（生产）" } });
+    fireEvent.change(within(dialog).getByLabelText("服务地址"), {
+      target: { value: "https://graph.example.com/v1" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("模型名称"), { target: { value: "graph-model" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    const post = fetchMock.mock.calls.find(
+      ([path, options]) => path === "/v1/model-profiles" && (options as RequestInit | undefined)?.method === "POST",
+    );
+    expect(post).toBeTruthy();
+    expect(JSON.parse(String((post![1] as RequestInit).body))).toEqual({
+      kind: "graph",
+      name: "图谱抽取（生产）",
+      base_url: "https://graph.example.com/v1",
+      model: "graph-model",
+      apikey: "",
+    });
+  });
+
   it("shows the informative empty state when no profile exists", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ model_profiles: [] }));
     renderPage();
 
     expect(
-      await screen.findByText("还没有模型配置，请先添加 Embedding / Reranker / VLM / JEV 模型；创建知识库时只能从其中的 Embedding / Reranker / VLM 选择"),
+      await screen.findByText("还没有模型配置，请先添加 Embedding / Reranker / VLM / 知识图谱 / JEV 模型；创建知识库时只能从其中的 Embedding / Reranker / VLM / 知识图谱 选择"),
     ).toBeTruthy();
     expect(screen.getAllByRole("button", { name: /添加模型/ })[0]).toBeTruthy();
   });

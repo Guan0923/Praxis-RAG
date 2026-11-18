@@ -952,7 +952,7 @@ h3 {
 .knowledge-base-form {
   max-width: 720px;
 }
-/* 创建知识库页面：横向多列布局（模型配置 2×2、文本切分三列、基础信息两列），
+/* 创建知识库页面：横向多列布局（模型配置四列、文本切分三列、基础信息两列），
    窄屏逐级降为一列。编辑知识库的抽屉仍用上面的 720px 纵向布局。 */
 .knowledge-base-form-wide {
   max-width: 1080px;
@@ -971,8 +971,8 @@ h3 {
 }
 .knowledge-provider-grid {
   display: grid;
-  /* Embedding / Reranker / VLM 三张卡片，宽屏一行三列，窄屏逐级降为一列。 */
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Embedding / Reranker / VLM / 知识图谱 四张卡片，宽屏一行四列，窄屏逐级降为两列或一列。 */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0 24px;
   border-top: 1px solid var(--line);
   padding: 20px 0 4px;

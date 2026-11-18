@@ -1,3 +1,7 @@
+// This file defines the create/update validation of knowledge-base settings:
+// the stored embedding/reranker/VLM/graph provider connections, the
+// graph_enabled switch and the settings readers used by the runtime.
+
 package kbconfig
 
 import (
@@ -117,6 +121,14 @@ type CreateInput struct {
 	// (RAG_VLM_*) apply.
 	VLMModel  string
 	VLMValues map[string]any
+	// GraphModel/GraphValues are the optional LightRAG graph-extraction model
+	// used for both entity/relation extraction and keyword extraction. Both
+	// empty leaves graph extraction unconfigured.
+	GraphModel  string
+	GraphValues map[string]any
+	// GraphEnabled turns knowledge-graph retrieval on for the new knowledge
+	// base. It defaults to false and is stored as graph_enabled.
+	GraphEnabled bool
 	// EmbeddingBillingSource marks who pays the embedding provider for
 	// document ingestion: "platform" (default) or "customer". Only an
 	// administrator may set "customer"; plain request fields never bypass
@@ -201,6 +213,14 @@ func CreateSettings(ctx context.Context, input CreateInput, prober Prober) (map[
 	if err != nil {
 		return nil, err
 	}
+	graphConnection, err := graphConnectionFor(modelapi.ModelConnection{}, input.GraphValues, input.GraphModel)
+	if err != nil {
+		return nil, err
+	}
+	storedGraph, err := StoredConnectionWithKey(graphConnection, input.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
 	collection := input.Collection
 	if collection == "" {
 		collection, err = NewCollectionName()
@@ -230,6 +250,9 @@ func CreateSettings(ctx context.Context, input CreateInput, prober Prober) (map[
 		"reranker":                 storedReranker,
 		"vlm":                      storedVLM,
 		"vlm_model":                vlmConnection.Model,
+		"graph":                    storedGraph,
+		"graph_model":              graphConnection.Model,
+		"graph_enabled":            input.GraphEnabled,
 		"collection":               collection,
 		"tokenizer":                tokenizer,
 		"strategy":                 input.Chunking.Strategy,
@@ -241,8 +264,10 @@ func CreateSettings(ctx context.Context, input CreateInput, prober Prober) (map[
 
 // UpdateInput is the validated, client-supplied draft for one update.
 type UpdateInput struct {
-	// Values may contain embedding_model, reranker_model, vlm_model, embedding,
-	// reranker and vlm provider drafts. Absent keys keep the current values.
+	// Values may contain embedding_model, reranker_model, vlm_model,
+	// graph_model, graph_enabled, embedding, reranker, vlm and graph provider
+	// drafts. Absent keys keep the current values; graph_enabled is written
+	// only when the request carries it so legacy rows keep their shape.
 	Values map[string]any
 	// Reembed confirms that a changed embedding URL/model/dimension may proceed
 	// by reindexing into a staging collection.
@@ -382,6 +407,30 @@ func UpdateSettings(
 	if err != nil {
 		return UpdateResult{}, err
 	}
+	oldGraph, err := ModelConnectionForKey(current, "graph", input.EncryptionKey)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	graphValues, err := providerValues(input.Values, "graph")
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	graphModel, err := optionalString(input.Values, "graph_model", oldGraph.Model)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	graph, err := graphConnectionFor(oldGraph, graphValues, graphModel)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	storedGraph, err := StoredConnectionWithKey(graph, input.EncryptionKey)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+	graphEnabled, hasGraphEnabled, err := optionalBool(input.Values, "graph_enabled")
+	if err != nil {
+		return UpdateResult{}, err
+	}
 	updatedAt := input.UpdatedAt
 	if updatedAt.IsZero() {
 		updatedAt = time.Now()
@@ -396,6 +445,14 @@ func UpdateSettings(
 	updated["reranker"] = storedReranker
 	updated["vlm"] = storedVLM
 	updated["vlm_model"] = vlm.Model
+	updated["graph"] = storedGraph
+	updated["graph_model"] = graph.Model
+	// graph_enabled is written only when the request carries it: rows created
+	// before the knowledge-graph switch existed keep their exact settings shape
+	// and read as disabled through GraphEnabled until an administrator opts in.
+	if hasGraphEnabled {
+		updated["graph_enabled"] = graphEnabled
+	}
 	updated["embedding_model"] = embedding.Model
 	updated["reranker_model"] = reranker.Model
 	updated["vector_size"] = vectorSize
@@ -423,6 +480,23 @@ func UpdateSettings(
 		Embedding:         embedding,
 		Reranker:          reranker,
 	}, nil
+}
+
+// GraphEnabled reports whether knowledge-graph retrieval (retrieval=graph) is
+// enabled for one knowledge base. settings is the stored settings map; rows
+// written before the graph switch existed have no graph_enabled key and read as
+// false instead of being reported as corrupt settings. A present non-boolean
+// value is rejected with MessageGraphEnabledInvalid.
+func GraphEnabled(settings map[string]any) (bool, error) {
+	raw, ok := settings["graph_enabled"]
+	if !ok || raw == nil {
+		return false, nil
+	}
+	enabled, ok := raw.(bool)
+	if !ok {
+		return false, NewValidationError(MessageGraphEnabledInvalid)
+	}
+	return enabled, nil
 }
 
 // ActivateReembed applies a successfully published staging collection to the
@@ -477,6 +551,22 @@ func optionalString(values map[string]any, key, fallback string) (string, error)
 		return "", NewValidationError("模型名称必须是字符串")
 	}
 	return text, nil
+}
+
+// optionalBool reads one optional boolean value (graph_enabled is currently the
+// only one). It reports whether the key was present so callers can preserve the
+// stored settings shape, and rejects a present non-boolean value instead of
+// coercing it.
+func optionalBool(values map[string]any, key string) (value, present bool, err error) {
+	raw, ok := values[key]
+	if !ok {
+		return false, false, nil
+	}
+	enabled, ok := raw.(bool)
+	if !ok {
+		return false, true, NewValidationError(MessageGraphEnabledInvalid)
+	}
+	return enabled, true, nil
 }
 
 func copySettings(settings map[string]any) map[string]any {

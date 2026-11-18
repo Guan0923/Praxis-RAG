@@ -24,6 +24,7 @@
 | 缓存/CDC | `RAG_CACHE_TOPIC`/`RAG_CACHE_GROUP`、`RAG_CACHE_DLQ_TOPIC`/`RAG_CACHE_DLQ_GROUP`；`cache_revisions` 的 revision/refreshed_revision/attempts/last_error/updated_at；任务表 `schedule_version`；`rag-cdc-cutover` 切换工具 |
 | PDF | `RAG_PDF_ENGINE`（`vision`/`go`；旧值 `docling` 是 `vision` 的兼容别名）、`RAG_PDF_SERVICE_URL`、`RAG_PDF_SERVICE_TIMEOUT`（900，Go 调用与 pdf-parser 请求总预算）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（120，真正开始解析后的单次上限，排队等待不计入，须小于总预算）；`RAG_PDF_MODELS_PATH` 已废弃（本地无模型） |
 | Word/HTML | `RAG_DOCLING_SERVICE_URL`（必配：Word `.docx`/`.doc` 与 `.html`/`.htm` 只由 Docling 服务解析，进程内 OOXML 解析已删除；未配置时这些格式上传在受理阶段被拒绝）、`RAG_DOCLING_SERVICE_TIMEOUT`（300，1..7200，Go 调用与 docling-service 请求预算）、`RAG_WORD_CONVERTER_PATH` 与 `RAG_WORD_CONVERT_TIMEOUT`（120，`.doc` 先经 LibreOffice 转成 `.docx` 再上传给服务，服务只接收 `.docx`/HTML）；服务自身变量：`RAG_DOCLING_SERVICE_HOST`、`PORT`（默认 8092）、`RAG_DOCLING_SERVICE_TIMEOUT`、`RAG_DOCLING_SERVICE_PARSE_TIMEOUT`、`RAG_DOCLING_SERVICE_CONCURRENCY`、`RAG_DOCLING_SERVICE_WORKERS`、`RAG_DOCLING_SERVICE_MAX_BYTES`、`RAG_DOCLING_SERVICE_LOG_LEVEL`/`RAG_DOCLING_SERVICE_LOG_FORMAT`；容器端口 8092 |
+| 知识图谱（可选） | `RAG_LIGHTRAG_SERVICE_URL`（空=禁用 `retrieval=graph`）、`RAG_LIGHTRAG_SERVICE_TOKEN`（侧车 Bearer token；侧车绑定非 loopback 时必填）、`RAG_LIGHTRAG_SERVICE_TIMEOUT`（60，1..600，单次侧车调用预算）；侧车自身变量前缀 `RAG_LIGHTRAG_SERVICE_`（HOST 默认 `127.0.0.1`、PORT 默认 8093、WORKING_DIR、CONCURRENCY、LOG_LEVEL/LOG_FORMAT），上游 `lightrag-hku` 版本 pin 在该目录 `requirements.txt` |
 | 日志 | `RAG_LOG_LEVEL`（`info`）、`RAG_LOG_FORMAT`（`text`/`json`）、`RAG_DEBUG_TRACE`（兼容旧调试开关；未设级别时为 `debug`）、`RAG_LOG_FILE`（可选，所有 Go 进程追加同一个 JSON Lines 文件供监控页文件日志源读取；打开失败 fail fast）、`RAG_LOG_BUFFER_SIZE`（`1000`，范围 `100..20000`，进程内环形缓冲）、`RAG_PDF_SERVICE_LOG_LEVEL`/`RAG_PDF_SERVICE_LOG_FORMAT` |
 | VLM | `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`、`RAG_VLM_TIMEOUT`、`RAG_VLM_CONCURRENCY`（Console 知识库配置优先，环境变量是回退） |
 | 默认知识库模板 | `RAG_DEFAULT_KB_TEMPLATE`（默认 `default`，VIP/普通用户建库时克隆其模型配置） |
@@ -146,6 +147,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 - 上传默认异步，必须存在文档消费者：配置 Kafka + 分布式 Kafka Connect 的两个 Debezium 连接器并运行独立的 `rag-document-worker`；没有内嵌/进程内选项，未部署时任务会一直 `queued`。
 - 受限账号可在同步检索中正常工作：服务端按 scope 追加 `document_ids` 过滤，不再有“排队模式下拒绝受限账号”的限制。
 - 管理凭证（Service Token / API Key）在请求时不做知识库归属校验，只受 API Key 命名空间白名单约束。
+- `sag` 检索的事件-实体抽取每文档上限 512 chunk、实体不做全局消歧（casefold 归一化即 join key）；抽取阶段失败不重试（文档发布不受影响，缺口留给 `rag-sag-backfill` CLI）；`SagRepository` 的 MySQL round-trip 测试需要 `RAG_TEST_MYSQL_URL`（未设则跳过，与包内其他 MySQL 测试一致）。
 
 ## 7. 未验证项（不要据此宣称生产就绪）
 

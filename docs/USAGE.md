@@ -28,7 +28,7 @@ MCP search / REST /v1/search（同步）-> runtime.Service.Search -> 检索 + �
 Kafka 死信（显式 DLQ topic）-> rag-dead-letter-worker --kind document|cache
 ```
 
-RAG 只返回证据，不生成最终回答。后端为 Go 实现：PDF 默认交给独立的 PDF 视觉解析微服务（`python-workers/pdf-service`，HTTP + zip 清单，本地只做 PDF 读取/渲染/裁图，版面/OCR/表格/公式/图片描述统一调用远端 OpenAI 兼容视觉模型；可用 `RAG_PDF_ENGINE=go` 切回内置纯文本引擎）；Word（`.docx`）与 HTML（`.html`/`.htm`）一律交给独立的 Docling 解析微服务（`python-workers/docling-service`，HTTP + zip 清单，容器端口 8092）：`.docx` 与 `.doc`（先由 LibreOffice 转成 `.docx`）以及 HTML 都走它，必须配置 `RAG_DOCLING_SERVICE_URL`，未配置时这些格式的上传会被拒绝（进程内 Word 解析已删除）。VLM 配置由 Console「模型配置」与知识库设置按知识库下发，缺失时 PDF 上传会在受理阶段提示先去配置。Go 服务本身不依赖 Python，只有 pdf-parser 与 docling-service 两个微服务使用 Python。
+RAG 只返回证据，不生成最终回答。后端为 Go 实现：PDF 默认交给独立的 PDF 视觉解析微服务（`python-workers/pdf-service`，HTTP + zip 清单，本地只做 PDF 读取/渲染/裁图，版面/OCR/表格/公式/图片描述统一调用远端 OpenAI 兼容视觉模型；可用 `RAG_PDF_ENGINE=go` 切回内置纯文本引擎）；Word（`.docx`）与 HTML（`.html`/`.htm`）一律交给独立的 Docling 解析微服务（`python-workers/docling-service`，HTTP + zip 清单，容器端口 8092）：`.docx` 与 `.doc`（先由 LibreOffice 转成 `.docx`）以及 HTML 都走它，必须配置 `RAG_DOCLING_SERVICE_URL`，未配置时这些格式的上传会被拒绝（进程内 Word 解析已删除）。VLM 配置由 Console「模型配置」与知识库设置按知识库下发，缺失时 PDF 上传会在受理阶段提示先去配置。Go 服务本身不依赖 Python，只有 pdf-parser、docling-service 与 lightrag-service 三个微服务使用 Python。
 
 ## 1. 安装与构建
 
@@ -268,6 +268,10 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_DOCLING_SERVICE_URL` | 空（未配置） | Docling 文档解析服务地址（绝对 `http(s)` URL，不带 query/fragment，尾部 `/` 会被去掉）。Word（`.docx`/`.doc`）与 HTML 解析必需；为空时这些格式的上传在受理阶段被拒绝（进程内 Word 解析已删除）；compose `app` 容器由 compose 注入 `http://docling-service:8092`，宿主机进程一般用 `http://127.0.0.1:8092` |
 | `RAG_DOCLING_SERVICE_TIMEOUT` | `300` 秒（1..7200） | Go 调用 Docling 服务的单次 HTTP 超时（秒）；服务端读取同名变量作为请求预算，两侧同时生效 |
 | `RAG_DOCLING_IMAGE` | `praxis-rag-docling-service:local`（仅 compose） | docling-service 镜像名 |
+| `RAG_LIGHTRAG_SERVICE_URL` | 空（未配置） | LightRAG 图谱侧车地址（绝对 `http(s)` URL，不带 query/fragment，尾部 `/` 会被去掉）。为空表示 `retrieval=graph` 不可用：调用返回可解释的操作错误，其他四种检索模式不受影响；compose 内用 `http://lightrag-service:8093`，宿主机进程一般用 `http://127.0.0.1:8093` |
+| `RAG_LIGHTRAG_SERVICE_TOKEN` | 空 | 调用侧车时发送的 `Authorization: Bearer` 令牌。侧车绑定非 loopback 地址时**必须**两端一致配置；仅 loopback 时可留空 |
+| `RAG_LIGHTRAG_SERVICE_TIMEOUT` | `60` 秒（1..600） | Go 调用侧车查询的单次超时（秒）；图谱查询含关键词抽取，明显慢于纯向量检索，必要时调大 |
+| `RAG_LIGHTRAG_SERVICE_PORT` | `8093`（仅 compose） | lightrag-service 的宿主发布端口；容器内端口固定 `8093` |
 | `RAG_VLM_BASE_URL` | 空 | 远端 OpenAI 兼容视觉模型端点的**环境回退值**，用于 vision 引擎的 PDF 版面/OCR/表格/公式/图片描述；Console 知识库设置优先 |
 | `RAG_VLM_API_KEY` | 空 | VLM 端点密钥，作为 `Authorization: Bearer` 发送 |
 | `RAG_VLM_MODEL` | 空 | 端点上的模型名，如 `qwen2.5-vl-7b`（环境回退值） |
@@ -850,7 +854,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys/batch-delete `
 
 ### 模型配置（模型列表）
 
-管理员在 Console 侧边栏「模型配置」（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM / JEV 列表，不再在创建知识库时手工填写服务地址、Key 和模型名。页面按模型类型分页签，表格展示 名称 / 模型 / 服务地址 / Key / 向量维度（仅 Embedding）/ 更新时间 / 操作，支持「添加模型」抽屉、编辑和删除。API Key 只在服务端用 `RAG_STATE_ENCRYPTION_KEY` 加密保存，列表与详情只返回 `api_key_set`；编辑时留空表示沿用已保存的 Key，显式提交空字符串会清除。`(kind, name)` 唯一，重名返回 409。VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 的版面/OCR/表格/公式/图片描述统一由它完成；OCR 不再作为独立模型类型。
+管理员在 Console 侧边栏「模型配置」（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM / JEV / 知识图谱 列表，不再在创建知识库时手工填写服务地址、Key 和模型名。页面按模型类型分页签，表格展示 名称 / 模型 / 服务地址 / Key / 向量维度（仅 Embedding）/ 更新时间 / 操作，支持「添加模型」抽屉、编辑和删除。API Key 只在服务端用 `RAG_STATE_ENCRYPTION_KEY` 加密保存，列表与详情只返回 `api_key_set`；编辑时留空表示沿用已保存的 Key，显式提交空字符串会清除。`(kind, name)` 唯一，重名返回 409。VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 的版面/OCR/表格/公式/图片描述统一由它完成；OCR 不再作为独立模型类型。知识图谱模型（`kind=graph`）供 LightRAG 侧车做实体关系抽取与查询关键词抽取——两个角色共用同一连接，选择非思考型快模型可显著降低索引成本。
 
 JEV 条目（TypeSafe System One 决策模型）保存名称、服务地址、模型标识和加密 Key；创建与修改都不探测 provider，`/{id}/models` 对 JEV 直接返回空数组。JEV 不是知识库模型，创建/编辑知识库时不会出现该选项，当前仅保存配置，尚未接入检索或决策调用。常见取值：TypeSafe 服务地址 `https://api.typesafe.ai/v1`（模型 `jev-latest` / `jev-preview` / `jev-1.13.0`），OpenRouter 服务地址 `https://openrouter.ai/api/alpha`（模型 `typesafe/jev-1.13`）。
 
@@ -860,10 +864,13 @@ JEV 条目（TypeSafe System One 决策模型）保存名称、服务地址、�
 - Reranker：执行一次有界的 rerank 调用，只验证服务可达与鉴权。
 - VLM：不做探测，因此半配置的 VLM 端点也可以先保存。
 - JEV：不做探测，直接保存配置（只保存连接，供后续决策能力使用）。
+- 知识图谱：不做探测；该连接只被 LightRAG 侧车使用，知识库启用图谱后才会真正发起抽取调用。
 
 `PATCH` 只在服务地址、模型或 Key 实际变化时重新探测；只改名称或原样保存不会调用 provider，已记录的 Embedding 维度保持不变。修改服务地址但未提交新 Key 时保存的 Key 会被清除（与知识库连接表单的 `DraftConnection` 语义一致）。
 
-管理员的创建知识库表单现在只从该列表选择模型（Embedding 必填；Reranker、VLM 通过开关启用，**创建页两个开关默认全部开启**，可按需关闭），编辑知识库的抽屉（知识库列表 → 配置）同样选择模型：保存时 Console 读取所选条目的 Key，并把该配置的服务地址、模型名和 Key 复制进原有的知识库请求；**切换 Embedding 到不同连接仍要求「重新向量化并保存」确认**。知识库已有连接不在列表中时，编辑抽屉保留「当前配置」选项，保存时沿用原连接、不触发重新向量化。删除或编辑模型配置不会修改已保存到知识库里的连接。知识库 REST 契约不变（仍接受内联 `embedding`/`reranker`/`vlm` 连接），模型列表只服务于 Console 管理员表单。
+管理员的创建知识库表单现在只从该列表选择模型（Embedding 必填；Reranker、VLM、知识图谱通过开关启用，**创建页默认全部开启**，可按需关闭），编辑知识库的抽屉（知识库列表 → 配置）同样选择模型：保存时 Console 读取所选条目的 Key，并把该配置的服务地址、模型名和 Key 复制进原有的知识库请求；**切换 Embedding 到不同连接仍要求「重新向量化并保存」确认**。知识库已有连接不在列表中时，编辑抽屉保留「当前配置」选项，保存时沿用原连接、不触发重新向量化。删除或编辑模型配置不会修改已保存到知识库里的连接。知识库 REST 契约不变（仍接受内联 `embedding`/`reranker`/`vlm`/`graph` 连接与 `graph_enabled` 开关），模型列表只服务于 Console 管理员表单。
+
+> 知识库打开 `graph_enabled` 后，该库每次上传都会在发布成功后把块异步镜像进图谱；此时若知识库没有可用的知识图谱模型，或部署未配置 `RAG_LIGHTRAG_SERVICE_URL`，上传会在**受理阶段**被拒绝并提示去「模型配置」补齐，而不是先入库再静默缺图。
 
 以下接口都属于 `/v1/admin/*`，仅本机直连或管理员会话可访问：
 
@@ -871,7 +878,7 @@ JEV 条目（TypeSafe System One 决策模型）保存名称、服务地址、�
 # 列表（按 kind、名称排序；每个条目含 id/kind/name/base_url/model/api_key_set/vector_size/created_at/updated_at，不含 Key 明文）
 curl.exe http://127.0.0.1:8011/v1/admin/model-profiles
 
-# 新建：kind 为 embedding / reranker / vlm / jev；Embedding 会真实探测并记录向量维度
+# 新建：kind 为 embedding / reranker / vlm / jev / graph；Embedding 会真实探测并记录向量维度
 curl.exe -X POST http://127.0.0.1:8011/v1/admin/model-profiles `
   -H "Content-Type: application/json" `
   -d '{"kind":"embedding","name":"生产 Embedding","base_url":"http://127.0.0.1:8032/v1","apikey":"<provider-key>","model":"bge-m3"}'
@@ -1039,6 +1046,47 @@ curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>/content" -H $headers
 curl.exe -X POST http://127.0.0.1:8011/v1/search `
   -H $headers `
   -d '{"query":"E03 怎么处理？","retrieval":"sag2","rerank":"none","candidate_k":100,"top_k":5,"filters":{}}'
+```
+
+#### 知识图谱检索（`retrieval: graph`）
+
+第五种模式，把知识库文本块索引成实体关系图谱后做双层召回（局部实体、全局关系、原文块）。它面向**跨文档关联**问题：某条义务散落在六份文件、十一个条款里时，`hybrid` 只会返回语义最相近的几段，图谱能把它们连起来并给出每条命中的来源与原页码。
+
+使用要求与成本：
+
+- 部署侧需配置 `RAG_LIGHTRAG_SERVICE_URL`（及 token）并运行 `python-workers/lightrag-service`；未配置时该模式返回明确的操作错误，其他模式与上传链路不受影响。
+- 响应与四种既有模式完全一致：`results[]` 带 `title`/`source`/`text`/`score`/`metadata`（`metadata` 额外含 `graph_mode`、`page`、`heading`，命中实体/关系时含 `entities`/`relations`），`evidence_status` 与 `answer_guidance` 语义不变。
+- **不返回生成答案**：侧车在 LLM 生成前停止，只回上下文。
+- 可与 `cross_encoder` 叠加（先图谱召回再重排）；`candidate_k` 传给侧车作为 `top_k` 上限。
+- 索引成本按块计：每块一次实体关系抽取调用，大库首次入库明显慢于纯向量入库；查询本身需一次关键词抽取调用，延迟高于 `hybrid`，必要时调大 `RAG_LIGHTRAG_SERVICE_TIMEOUT`。
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8011/v1/search `
+  -H $headers `
+  -d '{"query":"所有涉及用户画像的条款之间是什么关系？","retrieval":"graph","rerank":"none","candidate_k":10,"top_k":5,"filters":{}}'
+```
+
+#### SAG 事件-实体检索（`retrieval: sag`）
+
+第五种模式 `sag` 是 [Zleap-AI/SAG](https://github.com/Zleap-AI/SAG) 架构的事件-实体检索：**离线**为每个 chunk 抽取一个事件（chunk 的完整语义单元）和若干规范化实体，写入 MySQL（`sag_events` / `sag_entities` / `sag_event_entities` 三张表）；**查询时**先用 hybrid 召回种子 chunk，映射到事件与实体，再用 SQL join 沿共享实体扩展到未被向量召回命中的关联事件——即查询期动态超边，不需要图数据库，也不预建全局图。证据边界仍是原始 chunk（超边命中的 chunk 会从 Qdrant 补水原文）。
+
+使用要求与行为：
+
+- 管理员先在 Console「模型配置」添加 `kind=extraction` 条目（任意 OpenAI 兼容 chat 端点，建议低价快速模型如 qwen-flash / deepseek-chat；存在多条时取**最近更新**的一条）。添加后，**新上传**的文档在发布完成后自动抽取（非致命阶段，失败只记日志不影响文档状态）；存量文档用 `rag-sag-backfill` CLI 补建。
+- 未配置抽取模型或文档未建索引时，`sag` 自动**降级为 hybrid 召回**（不报错、不静默无结果）。
+- 可以搭配任意 `rerank`（`none` 或 `cross_encoder`）：排序是种子分与超边共享实体数的融合分，cross-encoder 二段精排合法（区别于 `sag2`）。
+- 每文档抽取上限 512 chunk（超出部分留给回填 CLI），实体归一化为 casefold；抽取结果含 `metadata.sag_event`（该 chunk 的事件句），便于核对证据链。
+- 删除文档时事件与关联级联清理，实体行保留（共享数据），不会留下悬空超边。
+
+```powershell
+# 存量文档补建索引（先 dry-run 看清单）
+dist/bin/rag-sag-backfill --namespace default --dry-run
+dist/bin/rag-sag-backfill --namespace default --verbose
+
+# 查询
+curl.exe -X POST http://127.0.0.1:8011/v1/search `
+  -H $headers `
+  -d '{"query":"Atlas 项目的第二个里程碑是谁负责的？","retrieval":"sag","rerank":"none","candidate_k":30,"top_k":5,"filters":{}}'
 ```
 
 ### 上传状态、发布版本与租约

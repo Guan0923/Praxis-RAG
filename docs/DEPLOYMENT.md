@@ -42,6 +42,7 @@ Connect worker 宕机后，peer 接管 task 并从保存位点继续，不依赖
 - **按部署形态选择进程**：`rag-service` 只受理上传、同步搜索与后台维护，不内嵌任何消费者；文档/缓存/死信 worker 全部独立部署。文档解析必须由 `rag-document-worker` 通过 Kafka 消费完成；未部署时上传仍会受理，但文档任务保持 `queued`。缓存变更由 `rag-cache-worker` 消费；未部署时 Redis 读模型最终一致会延后（周期补偿也依赖该进程），但 MySQL 事实不受影响。worker 不监听端口。
 - **PDF 解析引擎可选**：默认 `RAG_PDF_ENGINE=vision` 时，`rag-service`/`rag-document-worker` 通过 `RAG_PDF_SERVICE_URL` 调用独立进程 `pdf-parser`（容器端口 8091，健康检查 `/healthz`）；它不连接状态库/Qdrant，本地只做 PDF 读取/渲染/裁图与结果组装，版面/OCR/表格/公式/图片描述统一调用远端视觉模型，最终把 PDF 转成 zip（`manifest.json` + 图片资产）。`RAG_PDF_ENGINE=go` 时 pdf-parser 不需要运行，PDF 由 Go 内置纯文本引擎处理。旧值 `docling` 作为兼容别名等价于 `vision`。详见 §3.5。
 - **Word/HTML 解析必须接入 Docling 服务**：`rag-service`/`rag-document-worker` 通过 HTTP 调用 `docling-service`（容器端口 8092，健康检查 `/healthz`）解析 `.docx` 与 `.html`/`.htm`；`.doc` 先由 LibreOffice 转成 `.docx` 再交给同一服务。必须配置 `RAG_DOCLING_SERVICE_URL`：该变量为空时 Word/HTML 上传在受理阶段被拒绝（进程内 Word 解析已删除）；`.md`/`.txt`/`.pdf` 不受影响。已配置但服务不可达时任务失败并按既有重试策略处理，没有进程内回退。PDF 解析链路完全不变。详见 §3.6。
+- **知识图谱检索可选接入 LightRAG 侧车**：配置 `RAG_LIGHTRAG_SERVICE_URL` 并把 `RAG_LIGHTRAG_SERVICE_TOKEN` 与侧车对齐后，`retrieval=graph` 由 `python-workers/lightrag-service`（容器端口 8093，健康检查 `/healthz`）提供跨文档实体/关系上下文。侧车只做图谱索引与上下文检索，**不返回生成答案**；每个知识库独立 workspace，数据落在命名卷 `lightrag_data`。该变量为空时 `retrieval=graph` 返回可解释的操作错误，其他四种检索模式完全不受影响。侧车需要能访问知识库配置的抽取模型端点，索引成本按块计（详见 `python-workers/lightrag-service/README.md`）。
 - 所有进程必须共享同一份基础设施配置：`RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`RAG_BACKEND=qdrant`/`QDRANT_URL`、`RAG_STATE_ENCRYPTION_KEY`、Redis 与 Kafka（bootstrap、topic/group、DLQ）设置。配置不一致会造成 401/找不到任务/重复发布等难以排查的问题。
 - 上传默认异步受理：`rag-service + Qdrant + 状态库` 只能受理；完整的解析/索引还需要 Kafka + **分布式 Kafka Connect 集群（含两个 Debezium MySQL 连接器）** + `rag-document-worker`（`scripts/start-stack.ps1` 在开发环境会自动启动）；缓存收敛需要 cache worker。搜索在 `rag-service` 内同步执行，不需要 search worker、搜索 topic 或 Redis。
 
@@ -348,6 +349,44 @@ docker run -d --name praxis-rag-docling-service \
 - **`app` profile 的依赖**：compose 的 `app` 服务 `depends_on` 该服务（`service_started`）；不需要 Word/HTML 导入时可在 `.env` 把 `RAG_DOCLING_SERVICE_URL` 留空（Word/HTML 上传会被受理层拒绝），并用 `docker compose up -d mysql qdrant redis kafka` 之类显式服务列表跳过它。
 - **HTML 限制与预览**：HTML 中的外部/相对图片不会被抓取，只保留文字说明（如替代文本）；Console 只展示解析后的纯文本，不在同源页面渲染上传的 HTML（该页面与 REST API 同源并持有调用方凭据）。
 - **与其他解析路径的关系**：`.doc` 由 Go 服务调用外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）转成 `.docx`，不经过 pdf-parser，转换结果交给本服务。`.md`/`.txt` 直接读取；PDF 完全走 §3.5 的链路。
+
+## 3.7 知识图谱微服务（lightrag-service）
+
+可选能力，默认不启动。它把知识库文本块索引成实体关系图谱，供 `retrieval=graph` 查询；**只返回上下文，不生成答案**。
+
+### 启用
+
+```bash
+# 1) 生成并写入 .env
+RAG_LIGHTRAG_SERVICE_TOKEN=<openssl rand -hex 32 的结果>
+
+# 2) 启动侧车（默认 compose 不含它）
+docker compose --profile lightrag up -d lightrag-service
+
+# 3) 让 Go 服务找到它
+RAG_LIGHTRAG_SERVICE_URL=http://127.0.0.1:8093
+RAG_LIGHTRAG_SERVICE_TOKEN=<同上>
+```
+
+`app` 容器内访问时用 `http://lightrag-service:8093`。**不配置 `RAG_LIGHTRAG_SERVICE_URL` 时该能力完全关闭**：`retrieval=graph` 返回可解释的操作错误，其他四种检索模式、上传与解析链路完全不受影响。
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `RAG_LIGHTRAG_SERVICE_HOST` | `127.0.0.1`（compose 内 `0.0.0.0`） | 监听地址；绑定非 loopback 时没有 token 会**拒绝启动** |
+| `RAG_LIGHTRAG_SERVICE_PORT` | `8093` | 容器内固定 8093，改宿主端口要同步 `RAG_LIGHTRAG_SERVICE_URL` |
+| `RAG_LIGHTRAG_SERVICE_TOKEN` | 空 | Bearer 令牌；容器网络下必填，Go 端同名变量要保持一致 |
+| `RAG_LIGHTRAG_SERVICE_WORKING_DIR` | 容器内 `/data`（compose 挂命名卷 `lightrag_data`） | 图谱、抽取缓存与块登记表的根目录。**这是索引本身**，不要当临时目录删除 |
+| `RAG_LIGHTRAG_SERVICE_CONCURRENCY` | `2`（1..64） | 并发图谱操作数；抽取按块调用一次 LLM，调大等于加大花费与限流压力 |
+| `RAG_LIGHTRAG_SERVICE_MAX_BODY_BYTES` | `33554432`（32 MiB） | 单次请求体上限 |
+| `RAG_LIGHTRAG_SERVICE_LOG_LEVEL` / `_FORMAT` | `info` / `text` | 日志级别与格式；日志不记录查询原文与正文 |
+
+### 版本与数据
+
+- 上游 `lightrag-hku` 版本 pin 在 `python-workers/lightrag-service/requirements.txt`，`GET /healthz` 会报出期望版本与实际可导入版本；两者不一致时优先怀疑镜像版本而不是配置。
+- 每个 Praxis 知识库对应一个独立 workspace 目录，互相隔离；删除知识库或重建索引时由 Go 端调用清空。
+- 索引成本按块计（每块一次抽取调用），大库首次入库明显慢于纯向量入库；先用小库验证再整体开启。
 
 ## 4. systemd 部署
 

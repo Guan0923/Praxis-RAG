@@ -101,7 +101,7 @@ func TestOpenAPIAndDocsRoutes(t *testing.T) {
 	modelProfileProperties, _ := modelProfileBody["properties"].(map[string]any)
 	kind, _ := modelProfileProperties["kind"].(map[string]any)
 	kindEnum, _ := kind["enum"].([]any)
-	if len(kindEnum) != 4 || kindEnum[3] != "jev" {
+	if len(kindEnum) != 6 || kindEnum[3] != "jev" || kindEnum[4] != "graph" || kindEnum[5] != "extraction" {
 		t.Fatalf("CreateModelProfileBody.kind enum = %v", kindEnum)
 	}
 

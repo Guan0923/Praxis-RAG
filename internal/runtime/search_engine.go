@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 	"github.com/Guan0923/Praxis-RAG/internal/config"
 	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
+	"github.com/Guan0923/Praxis-RAG/internal/lightrag"
 	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
 	"github.com/Guan0923/Praxis-RAG/internal/qdrant"
 	"github.com/Guan0923/Praxis-RAG/internal/searchrefs"
@@ -35,6 +37,10 @@ type SearchEngine struct {
 	stores     *state.Stores
 	encoder    *sparse.Encoder
 	httpClient *http.Client
+	// lightrag is the knowledge-graph sidecar client. It is nil when
+	// RAG_LIGHTRAG_SERVICE_URL is unset; graph retrieval then reports an
+	// explicit unavailable error instead of failing an unrelated search.
+	lightrag *lightrag.Client
 
 	mu         sync.Mutex
 	tenants    map[string]*tenantResources
@@ -52,11 +58,24 @@ func NewSearchEngine(cfg config.RagConfig, stores *state.Stores) (*SearchEngine,
 	if stores == nil {
 		return nil, fmt.Errorf("search engine requires the shared state store")
 	}
+	var graphClient *lightrag.Client
+	if strings.TrimSpace(cfg.LightRAGServiceURL) != "" {
+		client, err := lightrag.NewClient(lightrag.Options{
+			BaseURL: cfg.LightRAGServiceURL,
+			Token:   cfg.LightRAGServiceToken,
+			Timeout: cfg.LightRAGServiceTimeout,
+		})
+		if err != nil {
+			return nil, err
+		}
+		graphClient = client
+	}
 	return &SearchEngine{
 		config:     cfg,
 		stores:     stores,
 		encoder:    sparse.NewDefaultEncoder(),
 		httpClient: &http.Client{Timeout: qdrant.DefaultTimeout},
+		lightrag:   graphClient,
 		tenants:    make(map[string]*tenantResources),
 	}, nil
 }

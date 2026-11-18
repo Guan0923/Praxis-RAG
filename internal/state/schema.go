@@ -1024,9 +1024,9 @@ var schemaTables = []*SchemaTable{
 			index("ix_embedding_usage_review", "status", "expires_at"),
 		},
 	},
-	// billing_events is the append-only audit/idempotency log: event_key is
-	// unique so a repeated Alipay notification or refund callback cannot grant
-	// entitlement twice.
+	// billing_events is the append-only audit of membership entitlement
+	// changes. event_key is idempotent so a replayed notification cannot charge
+	// an entitlement twice.
 	{
 		Name: "billing_events",
 		Columns: []SchemaColumn{
@@ -1041,6 +1041,94 @@ var schemaTables = []*SchemaTable{
 		},
 		Uniques: []SchemaUnique{unique("uq_billing_events_key", "event_key")},
 		Indexes: []SchemaIndex{index("ix_billing_events_order", "order_id")},
+	},
+	// lightrag_documents is the mirror ledger of the knowledge-graph sidecar.
+	// It is a derived-index record, not a source of truth: the row says whether
+	// the graph copy of one document is current, so a failed mirror can be
+	// retried and a deleted document can be removed from the graph. Chunk text
+	// never lives here; the sidecar owns the graph itself.
+	{
+		Name: "lightrag_documents",
+		Columns: []SchemaColumn{
+			identifier("namespace", 64).PK(),
+			identifier("document_id", 64).PK(),
+			identifier("document_name", 200),
+			// config_fingerprint is the sidecar workspace fingerprint the row
+			// was indexed under; a different fingerprint means the graph copy
+			// is stale and must be rebuilt before it is trusted.
+			identifier("config_fingerprint", 64),
+			integer("chunk_count"),
+			// status is indexed|failed|deleted.
+			varchar("status", 16),
+			integer("attempts"),
+			text("last_error").Null(),
+			varchar("indexed_at", 40).Null(),
+			varchar("updated_at", 40),
+		},
+		Indexes: []SchemaIndex{
+			index("ix_lightrag_documents_status", "status", "updated_at"),
+		},
+	},
+	// The sag_* tables are the offline index of the SAG retrieval architecture
+	// (Zleap-AI/SAG): every chunk gets one event (its complete semantic unit)
+	// and several normalized entities; the event-entity associations are what
+	// query-time SQL joins turn into dynamic hyperedges. MySQL is the source of
+	// truth for this data; Qdrant only holds the semantic representations of the
+	// same rows (record_type sag_event / sag_entity points) for seed recall.
+	{
+		Name: "sag_events",
+		Columns: []SchemaColumn{
+			identifier("id", 36).PK(),
+			identifier("namespace", 64),
+			identifier("document_id", 36),
+			identifier("chunk_id", 36),
+			// event is the one semantically complete event of the chunk as
+			// produced by the extraction model; it never gets split further.
+			longText("event"),
+			// version is the upload version (operation id) that published the
+			// chunk, so events follow the same visibility authority as Qdrant
+			// points and document heads.
+			identifier("version", 64),
+			identifier("created_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_sag_events_chunk", "namespace", "chunk_id")},
+		Indexes: []SchemaIndex{
+			index("ix_sag_events_document", "namespace", "document_id"),
+			index("ix_sag_events_version", "namespace", "version"),
+		},
+	},
+	{
+		Name: "sag_entities",
+		Columns: []SchemaColumn{
+			identifier("id", 36).PK(),
+			identifier("namespace", 64),
+			// normalized_key is the join key: the casefolded, NFKC form of the
+			// entity name. entity_key is the casefolded source chunk + name so a
+			// repeated mention inside one chunk is stored once.
+			identifier("normalized_key", 190),
+			identifier("entity_key", 128),
+			// display_name is the first-seen original form shown back to
+			// callers; aliases are not merged (SAG does no global resolution).
+			varchar("display_name", 190),
+			bigint("mention_count"),
+			identifier("created_at", 40),
+			identifier("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_sag_entities_key", "namespace", "entity_key")},
+		Indexes: []SchemaIndex{index("ix_sag_entities_normalized", "namespace", "normalized_key")},
+	},
+	{
+		Name: "sag_event_entities",
+		Columns: []SchemaColumn{
+			identifier("event_id", 36).PK(),
+			identifier("entity_id", 36).PK(),
+			identifier("namespace", 64),
+			varchar("created_at", 40),
+		},
+		Indexes: []SchemaIndex{
+			index("ix_sag_event_entities_entity", "namespace", "entity_id"),
+			index("ix_sag_event_entities_event", "namespace", "event_id"),
+		},
 	},
 }
 

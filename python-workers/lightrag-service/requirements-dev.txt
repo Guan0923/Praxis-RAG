@@ -1,0 +1,11 @@
+# Development/test dependencies.
+#
+# lightrag-hku is intentionally absent: the engine layer is an injectable
+# abstract class and the pytest suite uses an in-memory fake, so the service can
+# be developed and tested without the upstream package (and its heavy dependency
+# tree). Install requirements.txt instead when running the real engine.
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.6
+httpx>=0.27
+pytest>=8.0

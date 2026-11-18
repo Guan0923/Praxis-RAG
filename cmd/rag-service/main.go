@@ -249,6 +249,11 @@ func run() error {
 		IndexedCollections:    stores.MonitorIndexedCollections,
 		KafkaBootstrapServers: mqSettings.BootstrapServers,
 		KafkaProbe:            kafkaProbe,
+		// The knowledge-graph sidecar is optional: an empty URL makes the
+		// Console report the capability as disabled instead of degraded.
+		LightRAGServiceURL:     ragConfig.LightRAGServiceURL,
+		LightRAGServiceToken:   ragConfig.LightRAGServiceToken,
+		LightRAGServiceTimeout: ragConfig.LightRAGServiceTimeout,
 		// The two Debezium connectors now run as tasks in the distributed Kafka
 		// Connect cluster. The probe reads connector/task state (including the
 		// worker that owns each task) and the restart supervisor's bookkeeping;

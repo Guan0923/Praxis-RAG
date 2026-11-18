@@ -1,3 +1,7 @@
+// This file tests knowledge-base create/update settings validation, including
+// the stored provider connections (embedding/reranker/vlm/graph) and the
+// graph_enabled knowledge-graph switch.
+
 package kbconfig
 
 import (
