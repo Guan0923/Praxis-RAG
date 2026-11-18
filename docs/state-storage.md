@@ -127,6 +127,7 @@ migration CLI.
 | `app_settings` | `setting_key` | Console-editable settings; the `mail` row holds the SMTP configuration with its password protected as `enc:v1:` |
 | `feishu_connections` | `user_id` | **optional** per-account Feishu OAuth grant: open/union id, display name/avatar, `access_token`/`refresh_token` protected as `enc:v1:`, expiry and granted scope; the Feishu App Secret is never stored here |
 | `feishu_oauth_states` | `state_digest` (SHA-256) | **optional** one-time OAuth callback state bound to a Console account, 10-minute expiry, pruned on the next state creation; only the digest is stored |
+| `lightrag_documents` | `(namespace, document_id)` | **optional** knowledge-graph mirror ledger: which documents the LightRAG sidecar currently holds, under which `config_fingerprint`, with `status` (`indexed`/`failed`/`deleted`), `attempts`, safe `last_error` and `indexed_at`. A derived-index register, not a source of truth: MySQL keeps the document, the sidecar keeps the graph, and a `failed` row is the retry queue. Chunk text and credentials never enter this table |
 
 Identifier columns (`namespace`, document `name`, `digest`, blob `key`) use a
 binary collation in MySQL so `Alpha` and `alpha` do not collapse into one row.

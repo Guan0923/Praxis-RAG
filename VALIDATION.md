@@ -16,6 +16,24 @@
 > `search_result_snapshots` 表保留数据但不再读写。当前搜索验证以同步检索、超时/取消与
 > artifact 独立读取为准（见 [产物引用](docs/result-references.md)）。
 
+## 当前验证范围：LightRAG 知识图谱检索（侧车 + `retrieval=graph`）— 2026-11-18
+
+### 已验证（可复核）
+
+- **侧车测试**：`cd python-workers/lightrag-service && python -m pytest` → `72 passed`（未安装、未导入 `lightrag-hku`；真实引擎由可注入抽象隔离）。覆盖 `/healthz` 契约、workspace 创建/幂等/指纹重建、块灌入与替换、查询只返回上下文（响应无答案字段）、`document_name`/`page`/`heading` 回填、删除与清空、400/401/404/503、请求体上限、并发闸门、Go 载荷形状兼容。
+- **Go 编译**：`go build ./...` 通过。
+- **Go 测试**（`go test -p 1 -count=1`）：`./internal/lightrag/...`（客户端 14 个 httptest 用例：端点、错误分类、响应上限、取消、URL 转义）、`./internal/contracts/...`（`graph` 通过校验、JSON Schema enum 含 graph、默认值不变）、`./internal/config/...`（`RAG_LIGHTRAG_SERVICE_*` 默认值/非法 URL/超时边界）、`./internal/retrieval/...`（图谱候选投影、`document_id` 过滤透传、低分与空文本过滤、侧车故障映射为操作错误、未配置守卫）、`./internal/kbconfig/...`（graph kind、`graph_enabled` 默认关闭、旧库不补写、公开视图不泄露密钥）、`./internal/monitor/...`（未配置不降级、版本漂移降级、不可达不泄露地址）、`./internal/state/` 的 schema 结构用例（新表列/主键/索引）、`./internal/runtime/` 的图谱镜像纯逻辑用例（开关解析、缺 sidecar/缺模型报错、指纹敏感性、块载荷投影）。
+- **并行增量用例**：`./internal/httpapi/` 的 OpenAPI kind 枚举断言（5 项含 graph）通过。
+- **前端**：`npm run typecheck` 通过；`npx vitest run` → `22 files / 319 tests passed`（含新分页签、建库开关、编辑抽屉保存断言）。
+- **契约面**：`retrieval` 新增 `graph`、模型 kind 新增 `graph`、知识库 settings 新增 `graph`/`graph_model`/`graph_enabled`，都是纯增量；MCP 工具描述、REST 透传、Console 下拉与表单自动生效。
+
+### 未验证（缺外部依赖）
+
+- 依赖 MySQL 的测试（`internal/state` 仓储、`internal/runtime` 大部分、`internal/httpapi` 的会话与 API Key 用例）未跑：本机没有一次性测试库，且 Docker 守护进程在本环境不可用。这些包已由 `go build ./...` 证明可编译，新增的纯逻辑用例已单独跑通。
+- 侧车未用真实 `lightrag-hku` 跑端到端。SDK 调用假设（`role_llm_configs`、`ainsert_custom_chunks`、`aquery_data` + `only_need_context`、`custom_chunk_id` 派生、清空依赖删目录）见 [侧车 README](python-workers/lightrag-service/README.md)，升级上游前按该清单复核。
+- 图谱索引质量与成本（每块一次抽取调用）未实测，评估方法见 [M0 评估说明](deploy/lightrag-eval/README.md)。
+- 未跑真实上传→镜像链路（需要 MySQL + Kafka + Qdrant + 侧车 + 抽取模型齐全）；镜像失败重试目前只有台账，没有后台补偿任务。
+
 ## Kubernetes 应用层部署（Kustomize）— 2026-11-17
 
 工作树 `dsh-0a7946b7-479b`（Windows 11，kubectl v1.36.1 / kustomize v5.8.1）。

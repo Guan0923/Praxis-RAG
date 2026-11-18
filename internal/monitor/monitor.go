@@ -134,9 +134,19 @@ type Options struct {
 	PDFEngine     string
 	PDFServiceURL string
 
+	// LightRAGServiceURL is the optional knowledge-graph sidecar base URL
+	// (RAG_LIGHTRAG_SERVICE_URL). Empty means graph retrieval is not deployed
+	// in this configuration: the dependency row reports "disabled" and the
+	// overall verdict stays untouched. The token and timeout are the client
+	// options internal/lightrag uses for retrieval; the probe never prints
+	// either the token or the URL.
+	LightRAGServiceURL     string
+	LightRAGServiceToken   string
+	LightRAGServiceTimeout time.Duration
+
 	StartedAt time.Time
-	// HTTPClient is shared by the Qdrant and PDF probes; nil uses a client
-	// bounded by probeTimeout.
+	// HTTPClient is shared by the Qdrant, PDF and LightRAG probes; nil uses a
+	// client bounded by probeTimeout.
 	HTTPClient *http.Client
 
 	// System samples host CPU/memory/network/process resources for the Console
@@ -188,6 +198,24 @@ type dependency struct {
 	// deployment indexes into one generated collection per knowledge base, so
 	// there is no single aggregate point count to report.
 	Points *int64 `json:"points,omitempty"`
+	// Upstream is the optional upstream-version report of a dependency backed
+	// by a versioned sidecar. Only the "lightrag" row sets it, so every other
+	// row keeps its exact JSON shape: the field is omitted when nil.
+	Upstream *dependencyUpstream `json:"upstream,omitempty"`
+}
+
+// dependencyUpstream is the additive upstream-version report of a dependency
+// backed by a versioned sidecar. It lets the Console spot an image drift
+// (Expected != Installed) without parsing the Chinese detail text.
+type dependencyUpstream struct {
+	// Package is the upstream distribution name, for example "lightrag-hku".
+	Package string `json:"package"`
+	// Expected is the version the sidecar image is built against (the pin).
+	Expected string `json:"expected"`
+	// Installed is the version the running sidecar actually reported.
+	Installed string `json:"installed"`
+	// Drift reports that both versions are known and differ.
+	Drift bool `json:"drift"`
 }
 
 // dependencyLabels are the display labels of the fixed dependency rows.
@@ -200,6 +228,7 @@ var dependencyLabels = []struct {
 	{"qdrant", "Qdrant"},
 	{"kafka", "Kafka"},
 	{"pdf-service", "PDF 解析服务"},
+	{"lightrag", "知识图谱服务"},
 }
 
 // probeResult is the outcome of one bounded dependency probe.
@@ -207,6 +236,9 @@ type probeResult struct {
 	status    string
 	detail    string
 	latencyMS float64
+	// upstream carries the optional upstream-version report of a sidecar
+	// dependency; nil leaves the "upstream" JSON field out of the row.
+	upstream *dependencyUpstream
 }
 
 // KafkaProgress is one observation of the document consumer group offsets.
@@ -368,6 +400,7 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 		s.probeQdrant,
 		s.probeKafka,
 		s.probePDF,
+		s.probeLightRAG,
 	}
 	results := make([]probeResult, len(probes))
 	var wait sync.WaitGroup
@@ -482,6 +515,7 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 			Status:    result.status,
 			LatencyMS: roundOneDecimal(result.latencyMS),
 			Detail:    result.detail,
+			Upstream:  result.upstream,
 		})
 	}
 
@@ -558,7 +592,7 @@ func (s *Service) MonitorOverview(ctx context.Context) map[string]any {
 		"library":      library,
 		"activity":     activity,
 		"system":       systemView,
-		"actions":     s.actionsView(),
+		"actions":      s.actionsView(),
 		"errors":       errorsList,
 	}
 }
@@ -673,6 +707,8 @@ func overallStatus(statsErr error, dependencies []dependency, pipeline pipelineS
 			}
 		}
 	}
+	// A disabled dependency (no Redis, the in-process PDF engine, no graph
+	// sidecar) is a configuration choice, not a fault: raise ignores it.
 	for _, item := range dependencies {
 		raise(item.Status, true)
 	}

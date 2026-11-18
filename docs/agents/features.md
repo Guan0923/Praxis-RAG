@@ -5,7 +5,7 @@
 
 ## 1. 知识库（namespace）与租户隔离
 
-- 一个知识库 = 一个 namespace，命名规则 `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`；文档、切分配置、Embedding/Reranker/VLM 连接、Qdrant collection 与维度都按知识库保存。
+- 一个知识库 = 一个 namespace，命名规则 `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`；文档、切分配置、Embedding/Reranker/VLM/图谱模型连接、`graph_enabled` 开关、Qdrant collection 与维度都按知识库保存。
 - 所有租户请求（REST `/v1/*`、MCP）必须携带 `X-RAG-Namespace`；Qdrant 查询按 payload 中的 `namespace` 过滤，不同知识库互不可见。
 - 知识库默认归创建者私有；共享通过「权限管理」页的邀请链接完成（见 §10）。个人会员 Free/Plus/Pro 只影响自有库数、每库文件数和平台文档 Embedding 字符额度，不改 `admin/vip/user` 角色；Plus/Pro 可对自己拥有的知识库发邀请。
 - 每个知识库的 Qdrant 集合由知识库配置决定（创建知识库时生成 `knowledge_*` 名称，首次入库时创建）；`RAG_COLLECTION` 只是没有知识库配置时的回退名，系统监控按有效文档实际入库的集合校验，不要求回退集合存在，空知识库没有集合也不算异常；dense 向量维度固定 1024（BGE-M3），其他维度启动即报错。
@@ -73,7 +73,9 @@
 
 ## 5. 检索与重排
 
-- 检索模式：`bm25`（关键词）、`embedding`（语义）、`hybrid`（默认，Qdrant 服务端 RRF 融合 dense + sparse）、`sag2`（词法多跳：BM25 初筛 → JEV 必要证据判定 → 词项扩展再召回 → DPP 终排）。
+- 检索模式：`bm25`（关键词）、`embedding`（语义）、`hybrid`（默认，Qdrant 服务端 RRF 融合 dense + sparse）、`sag2`（词法多跳：BM25 初筛 → JEV 必要证据判定 → 词项扩展再召回 → DPP 终排）、`graph`（知识图谱：LightRAG 侧车的实体/关系上下文，跨文档主题与关联查询）。
+- `graph` 约束：需要部署侧配置 `RAG_LIGHTRAG_SERVICE_URL` 并运行 `python-workers/lightrag-service` 侧车，否则调用返回可解释的操作错误（`retrieval graph requires RAG_LIGHTRAG_SERVICE_URL ...`）；侧车**只返回上下文不返回答案**，结果仍走同一套证据投影与可见性过滤；索引按知识库独立 workspace 隔离，允许与 `cross_encoder` 叠加（先图谱召回再重排）。
+- `graph` 入库：知识库设置 `graph_enabled` 打开后，文档发布成功后把该文档的块异步镜像进图谱（`internal/runtime` 的 detached 运行，预算 30 分钟），镜像结果写 `lightrag_documents` 台账；镜像失败只留一条 `failed` 行并记警告，**不影响文档状态**（向量索引仍可用）。删除文档时同步删除图谱副本。知识库打开图谱却没配 `graph` 模型或部署没配侧车时，上传在**受理阶段**被拒绝并提示去「模型配置」。
 - `sag2` 约束：必须搭配 `rerank: none`（JEV 证据分即最终排序，校验层直接拒绝 `cross_encoder` 组合）；需要管理员在「模型配置」保存 `kind=jev` 条目，否则检索返回可解释的操作错误；语料在进程内按可见版本指纹缓存（发布/覆盖/删除自动失效），首次查询或失效后重建索引需要全量读取活跃 chunk；`candidate_k` 同时是每轮召回预算（SAG2 参考实现 B=100，建议给 50..100），轮数固定 3（1 轮初筛 + 2 轮扩展），扩展词 ≤20、种子 ≤10、终排前 10 名做 DPP；每次查询约 3 轮 JEV 决策调用，延迟与费用显著高于其他模式。
 - 重排模式：`none`、`cross_encoder`（默认）；Cross-Encoder 通过 HTTP 调用：进入重排的候选上限 30、批大小 4、重排文本上限 4000 字符、模型 token 上限 512。
 - 参数：`query` ≤2000 字符；`candidate_k` 1..100（默认 10）；`top_k` 1..10（默认 5）且 ≤`candidate_k`；`filters` 仅允许 `document_id`、`source`、`title`（闭集白名单）。
@@ -175,7 +177,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 
 ## 11. 模型配置（model profiles）
 
-- 管理员在「模型配置」页维护可复用列表：`embedding` / `reranker` / `vlm` / `jev`；`(kind, name)` 唯一。
+- 管理员在「模型配置」页维护可复用列表：`embedding` / `reranker` / `vlm` / `jev` / `graph`；`(kind, name)` 唯一。`graph` 是知识图谱抽取模型（一个 OpenAI 兼容端点，LightRAG 的抽取与关键词两个角色共用它）。
 - Embedding/Reranker/VLM/JEV 保存 `base_url`、`model`、加密后的 API Key；Embedding 保存时会真实探测并记录 `vector_size`，Reranker 做一次有界探测，VLM 与 JEV 不探测。VLM 是唯一的远端视觉模型，PDF 版面/OCR/表格/公式/图片描述都由它完成；`ocr` 类型已删除（升级迁移会删除旧条目）。
 - 知识库保存的是**连接副本**（保存时把 profile 的 URL/模型/Key 复制进知识库配置），之后编辑/删除 profile 不影响已保存的知识库；知识库 REST 契约仍是内联连接对象。
 - 凭据加密格式 `enc:v1:`（AES-GCM，12 字节 nonce，`base64(nonce||ciphertext)`），密钥来自 `RAG_STATE_ENCRYPTION_KEY`（`base64:` 前缀的 32 字节）；旧 `dpapi:`/`private-file:` 记录只读兼容。

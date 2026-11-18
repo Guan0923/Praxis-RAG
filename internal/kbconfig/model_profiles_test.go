@@ -1,3 +1,6 @@
+// This file tests saved model-configuration drafts, the per-kind probe rules
+// and the credential-free public model projection.
+
 package kbconfig
 
 import (
@@ -184,15 +187,19 @@ func TestProbeModelProfile(t *testing.T) {
 		t.Fatalf("reranker probe calls = %d", prober.rerankerCalls)
 	}
 
-	// VLM and JEV configurations are never probed: no provider call may happen.
+	// VLM, JEV and graph configurations are never probed: no provider call may
+	// happen (the graph model is exercised by LightRAG during ingestion).
 	if vectorSize, err := ProbeModelProfile(ctx, connection, "vlm", prober); err != nil || vectorSize != nil {
 		t.Fatalf("vlm probe = %v, %v", vectorSize, err)
 	}
 	if vectorSize, err := ProbeModelProfile(ctx, connection, "jev", prober); err != nil || vectorSize != nil {
 		t.Fatalf("jev probe = %v, %v", vectorSize, err)
 	}
+	if vectorSize, err := ProbeModelProfile(ctx, connection, "graph", prober); err != nil || vectorSize != nil {
+		t.Fatalf("graph probe = %v, %v", vectorSize, err)
+	}
 	if prober.embeddingCalls != 1 || prober.rerankerCalls != 1 {
-		t.Fatalf("vlm/jev probe called the provider: %d/%d", prober.embeddingCalls, prober.rerankerCalls)
+		t.Fatalf("vlm/jev/graph probe called the provider: %d/%d", prober.embeddingCalls, prober.rerankerCalls)
 	}
 
 	if _, err := ProbeModelProfile(ctx, connection, "sql", prober); err == nil {

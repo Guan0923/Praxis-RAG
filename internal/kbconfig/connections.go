@@ -1,3 +1,7 @@
+// This file defines the saved-model kinds and the encrypted provider
+// connections a knowledge base stores (embedding, reranker, VLM and the
+// LightRAG graph extraction model), plus the draft/stored connection helpers.
+
 package kbconfig
 
 import (
@@ -18,13 +22,17 @@ import (
 // table and formula recognition and picture descriptions; it is optional per
 // knowledge base and falls back to the service environment (RAG_VLM_*) when
 // unset. "jev" is the TypeSafe System One decision-model configuration kept for
-// later use by the Console; it is not a knowledge-base model.
-var Kinds = []string{"embedding", "reranker", "vlm", "jev"}
+// later use by the Console; it is not a knowledge-base model. "graph" is the
+// knowledge-base graph-extraction model: LightRAG uses one OpenAI-compatible
+// connection for both entity/relation extraction and keyword extraction, so a
+// single kind covers both LLM roles.
+var Kinds = []string{"embedding", "reranker", "vlm", "jev", "graph"}
 
 // CredentialKinds lists the kinds whose settings are stored as
 // {base_url, protected_key} pairs and replaced by the credential-free public
-// view.
-var CredentialKinds = []string{"embedding", "reranker", "vlm"}
+// view. "graph" joins embedding/reranker/vlm: its API key is encrypted at rest
+// and only reduced to api_key_set by PublicSettings.
+var CredentialKinds = []string{"embedding", "reranker", "vlm", "graph"}
 
 // IsKind reports whether kind is one of Kinds.
 func IsKind(kind string) bool {
@@ -78,10 +86,10 @@ func ModelConnectionForKey(settings map[string]any, kind, encryptionKey string) 
 	}
 	model, err := requiredString(settings, kind+"_model")
 	if err != nil {
-		// Knowledge bases created before the remote VLM settings existed have
-		// no vlm_model; treat that as "not configured" instead of corrupt
-		// settings.
-		if kind != "vlm" {
+		// Knowledge bases created before the remote VLM and graph settings
+		// existed have no vlm_model/graph_model; treat that as "not
+		// configured" instead of corrupt settings.
+		if kind != "vlm" && kind != "graph" {
 			return modelapi.ModelConnection{}, err
 		}
 		model = ""
@@ -278,13 +286,39 @@ func pythonString(value any) string {
 // model name must be configured together; clearing both disables the provider
 // and lets the service environment (RAG_VLM_*) apply again.
 func vlmConnectionFor(current modelapi.ModelConnection, values map[string]any, model string) (modelapi.ModelConnection, error) {
+	return optionalConnectionFor(current, values, model,
+		"VLM 服务配置格式无效", MessageVLMURLRequired, MessageVLMModelRequired)
+}
+
+// graphConnectionFor resolves the optional knowledge-graph extraction model.
+// LightRAG receives one OpenAI-compatible connection and uses it for both
+// entity/relation extraction and keyword extraction, so a single connection
+// covers both LLM roles; URL and model name must be configured together, and
+// clearing both leaves graph extraction unconfigured.
+func graphConnectionFor(current modelapi.ModelConnection, values map[string]any, model string) (modelapi.ModelConnection, error) {
+	return optionalConnectionFor(current, values, model,
+		"图谱模型服务配置格式无效", MessageGraphURLRequired, MessageGraphModelRequired)
+}
+
+// optionalConnectionFor resolves one optional provider whose base URL and model
+// name must be configured together (the remote VLM endpoint and the graph
+// extraction model share this shape).
+//
+// invalidMessage is returned when the client-supplied provider object is
+// malformed; urlMessage/modelMessage when only one half is configured. Clearing
+// both returns a zero connection so the provider stays disabled.
+func optionalConnectionFor(
+	current modelapi.ModelConnection,
+	values map[string]any,
+	model, invalidMessage, urlMessage, modelMessage string,
+) (modelapi.ModelConnection, error) {
 	model = strings.TrimSpace(model)
 	rawURL := current.BaseURL
 	if values != nil {
 		if raw, ok := values["base_url"]; ok {
 			text, ok := raw.(string)
 			if !ok {
-				return modelapi.ModelConnection{}, NewValidationError("VLM 服务配置格式无效")
+				return modelapi.ModelConnection{}, NewValidationError(invalidMessage)
 			}
 			rawURL = text
 		}
@@ -294,10 +328,10 @@ func vlmConnectionFor(current modelapi.ModelConnection, values map[string]any, m
 		return modelapi.ModelConnection{}, nil
 	}
 	if baseURL == "" {
-		return modelapi.ModelConnection{}, NewValidationError(MessageVLMURLRequired)
+		return modelapi.ModelConnection{}, NewValidationError(urlMessage)
 	}
 	if model == "" {
-		return modelapi.ModelConnection{}, NewValidationError(MessageVLMModelRequired)
+		return modelapi.ModelConnection{}, NewValidationError(modelMessage)
 	}
 	connection, err := DraftConnection(current, values)
 	if err != nil {

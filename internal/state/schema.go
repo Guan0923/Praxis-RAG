@@ -1042,6 +1042,33 @@ var schemaTables = []*SchemaTable{
 		Uniques: []SchemaUnique{unique("uq_billing_events_key", "event_key")},
 		Indexes: []SchemaIndex{index("ix_billing_events_order", "order_id")},
 	},
+	// lightrag_documents is the mirror ledger of the knowledge-graph sidecar.
+	// It is a derived-index record, not a source of truth: the row says whether
+	// the graph copy of one document is current, so a failed mirror can be
+	// retried and a deleted document can be removed from the graph. Chunk text
+	// never lives here; the sidecar owns the graph itself.
+	{
+		Name: "lightrag_documents",
+		Columns: []SchemaColumn{
+			identifier("namespace", 64).PK(),
+			identifier("document_id", 64).PK(),
+			identifier("document_name", 200),
+			// config_fingerprint is the sidecar workspace fingerprint the row
+			// was indexed under; a different fingerprint means the graph copy
+			// is stale and must be rebuilt before it is trusted.
+			identifier("config_fingerprint", 64),
+			integer("chunk_count"),
+			// status is indexed|failed|deleted.
+			varchar("status", 16),
+			integer("attempts"),
+			text("last_error").Null(),
+			varchar("indexed_at", 40).Null(),
+			varchar("updated_at", 40),
+		},
+		Indexes: []SchemaIndex{
+			index("ix_lightrag_documents_status", "status", "updated_at"),
+		},
+	},
 }
 
 // SchemaTables returns the schema tables in creation order. The returned slice

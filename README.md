@@ -12,6 +12,7 @@
 
 - **把资料建成知识库。** 在 Console 批量上传 Markdown、TXT、PDF 和 Word，选择切分策略，后台完成解析与索引。启用 Docling 后可上传静态 HTML。
 - **找回能引用的原文。** 在 Console 并排比较 BM25、Embedding 和 Hybrid，也可启用模型重排。检索返回原文片段和来源，解析产物可带页码、表格、图片和公式。
+- **跨文档找关系。** 启用知识图谱后，可用图谱模式回答"这几份文件里的条款彼此是什么关系"这类问题；图谱只提供实体、关系和原文片段作为证据，同样不生成答案。
 - **让助手和业务系统查同一份资料。** Console 用于管理知识库和调试检索，MCP 供 AI 助手调用，REST API 供应用集成。调用方可用返回的证据组织答案。
 
 ## 系统架构
@@ -29,6 +30,8 @@ flowchart LR
 
     API -->|同步检索| Qdrant
     API -->|Embedding / Reranker| Model["模型 API"]
+    API -->|图谱上下文检索| Graph["知识图谱侧车 · LightRAG"]
+    Graph -->|实体关系抽取| Model
     Worker -->|Embedding| Model
     Worker -->|按格式与配置调用| Parsers["PDF 视觉解析 / Word 与 HTML Docling"]
     Parsers -->|PDF 版面与 OCR| Model

@@ -32,7 +32,7 @@ func TestInvalidSearchArgumentsFailAtTheBoundary(t *testing.T) {
 	}{
 		{map[string]any{}, "query"},
 		{map[string]any{"query": "x", "top_k": 6, "candidate_k": 5}, "top_k"},
-		{map[string]any{"query": "x", "retrieval": "sql"}, "retrieval"},
+		{map[string]any{"query": "x", "retrieval": "sql"}, "retrieval must be bm25, embedding, hybrid, sag2, or graph"},
 		{map[string]any{"query": "x", "rerank": "bi_encoder"}, "rerank must be none or cross_encoder"},
 		{map[string]any{"query": "x", "retrieval": "sag2"}, "retrieval sag2 requires rerank none"},
 		{map[string]any{"query": "x", "retrieval": "sag2", "rerank": "cross_encoder"}, "retrieval sag2 requires rerank none"},
@@ -93,15 +93,69 @@ func TestSAG2SearchRequestRequiresRerankNone(t *testing.T) {
 	}
 }
 
-func TestSearchToolSchemaExposesSAG2(t *testing.T) {
+func TestGraphSearchRequestKeepsTheDefaultRerank(t *testing.T) {
+	// graph has no mutual-exclusion rule with rerank: the graph score is the
+	// relevance signal and a cross-encoder pass stays legal.
+	request, err := SearchRequestFromArguments(map[string]any{
+		"query": "谁负责 RRF 融合？", "retrieval": "graph",
+	})
+	if err != nil {
+		t.Fatalf("SearchRequestFromArguments() error = %v", err)
+	}
+	if request.Retrieval != RetrievalGraph || request.Rerank != RerankCrossEncoder {
+		t.Fatalf("request = %+v", request)
+	}
+	if _, err := SearchRequestFromArguments(map[string]any{
+		"query": "谁负责 RRF 融合？", "retrieval": "graph", "rerank": "none",
+	}); err != nil {
+		t.Fatalf("graph with rerank none error = %v", err)
+	}
+}
+
+func TestExistingRetrievalModesStillValidate(t *testing.T) {
+	cases := map[string]RetrievalMode{
+		"bm25":      RetrievalBM25,
+		"embedding": RetrievalEmbedding,
+		"hybrid":    RetrievalHybrid,
+		"sag2":      RetrievalSAG2,
+		"graph":     RetrievalGraph,
+	}
+	for value, want := range cases {
+		request, err := SearchRequestFromArguments(map[string]any{
+			"query": "x", "retrieval": value, "rerank": "none",
+		})
+		if err != nil {
+			t.Fatalf("retrieval %q error = %v", value, err)
+		}
+		if request.Retrieval != want {
+			t.Fatalf("retrieval %q = %q, want %q", value, request.Retrieval, want)
+		}
+	}
+	// The documented default does not move when a mode is added.
+	defaults, err := SearchRequestFromArguments(map[string]any{"query": "x"})
+	if err != nil {
+		t.Fatalf("SearchRequestFromArguments() error = %v", err)
+	}
+	if defaults.Retrieval != RetrievalHybrid || defaults.Rerank != RerankCrossEncoder {
+		t.Fatalf("unexpected defaults: %+v", defaults)
+	}
+}
+
+func TestSearchToolSchemaExposesSAG2AndGraph(t *testing.T) {
 	schema := SearchToolSchema()
 	retrieval, ok := schema["properties"].(map[string]any)["retrieval"].(map[string]any)
 	if !ok {
 		t.Fatalf("schema properties = %#v", schema["properties"])
 	}
 	values, ok := retrieval["enum"].([]string)
-	if !ok || len(values) != 4 || values[3] != "sag2" {
+	if !ok || len(values) != 5 || values[3] != "sag2" || values[4] != "graph" {
 		t.Fatalf("retrieval enum = %v", retrieval["enum"])
+	}
+	// The graph mode is described in the schema so an Agent knows it returns
+	// graph evidence instead of an answer.
+	description, ok := retrieval["description"].(string)
+	if !ok || !strings.Contains(description, "graph") {
+		t.Fatalf("retrieval description = %v", retrieval["description"])
 	}
 }
 func TestValidateUUID(t *testing.T) {

@@ -691,13 +691,15 @@ describe("model-profile API contract", () => {
   };
 
   it("exposes the frozen model-kind vocabulary", () => {
-    // 知识库只能引用前三种；JEV 是 Console 专属的第四种配置类型。
-    expect(knowledgeBaseModelKinds).toEqual(["embedding", "reranker", "vlm"]);
-    expect(modelKinds).toEqual(["embedding", "reranker", "vlm", "jev"]);
+    // 知识库可引用 Embedding / Reranker / VLM / 知识图谱；JEV 仍是 Console 专属的
+    // 第五种配置类型（没有 OpenAI /models 接口）。
+    expect(knowledgeBaseModelKinds).toEqual(["embedding", "reranker", "vlm", "graph"]);
+    expect(modelKinds).toEqual(["embedding", "reranker", "vlm", "graph", "jev"]);
     expect(modelKindLabels).toEqual({
       embedding: "Embedding",
       reranker: "Reranker",
       vlm: "VLM",
+      graph: "知识图谱",
       jev: "JEV",
     });
   });

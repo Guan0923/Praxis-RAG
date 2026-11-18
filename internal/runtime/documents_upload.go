@@ -81,6 +81,11 @@ type uploadResources struct {
 	embedder       *modelapi.HTTPEmbedder
 	encoder        *sparse.Encoder
 	store          *qdrant.Store
+	// graph is the knowledge-graph mirror configuration resolved from the
+	// knowledge-base settings. Nil means graph indexing is switched off for
+	// this knowledge base (or the deployment has no sidecar), which every
+	// caller treats as "do nothing".
+	graph *graphMirror
 }
 
 // resolveUploadResources loads the knowledge-base configuration and builds the
@@ -126,6 +131,14 @@ func (s *Service) resolveUploadResources(ctx context.Context, namespace string) 
 	if err != nil {
 		return nil, &apierrors.KnowledgeError{Message: "Qdrant 索引不可用，请检查 Qdrant 服务配置"}
 	}
+	// A knowledge base that switched graph indexing on must have a usable
+	// graph model and a configured sidecar before any upload is admitted;
+	// otherwise the document would be indexed but silently absent from the
+	// graph.
+	graph, err := s.resolveGraphMirror(settings)
+	if err != nil {
+		return nil, err
+	}
 	return &uploadResources{
 		settings:       settings,
 		chunking:       configuration,
@@ -137,6 +150,7 @@ func (s *Service) resolveUploadResources(ctx context.Context, namespace string) 
 		embedder:       modelapi.NewHTTPEmbedder(embeddingConnection, modelapi.DefaultTimeout),
 		encoder:        sparse.NewDefaultEncoder(),
 		store:          store,
+		graph:          graph,
 	}, nil
 }
 
@@ -460,6 +474,11 @@ func (s *Service) deleteDocumentByName(ctx context.Context, namespace, name stri
 		}
 		return nil, &apierrors.KnowledgeError{Message: "知识文件删除失败"}
 	}
+	// The deletion already committed. Removing the graph copy is best effort:
+	// a sidecar outage must not make a successful delete look failed, and the
+	// ledger row is removed with the graph copy so a stale copy cannot be
+	// mistaken for a current one.
+	s.removeDocumentGraph(ctx, namespace, documentID)
 	documents, err := s.ListDocuments(ctx, namespace)
 	if err != nil {
 		return nil, err
@@ -791,6 +810,10 @@ func (s *Service) storeAndIndex(
 		return s.failDocumentOperation(ctx, journal, coordinator, operation,
 			logging.WrapStage("publishing", err))
 	}
+	// The publication is durable, so the knowledge-graph mirror is scheduled
+	// afterwards and never affects the upload outcome: a sidecar outage leaves
+	// a failed ledger row, not a failed document.
+	s.scheduleGraphMirror(ctx, namespace, name, documentID, resources.graph, indexed.result.Chunks)
 	if _, cleanupErr := coordinator.CleanupWorkspace(ctx, operation); cleanupErr != nil {
 		logUploadWarning(ctx, "Committed workspace cleanup pending", operation.ID, cleanupErr)
 	}

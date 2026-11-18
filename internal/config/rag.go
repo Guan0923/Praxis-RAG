@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // DenseVectorSize is the fixed BGE-M3 dense dimension.
@@ -96,6 +97,18 @@ type RagConfig struct {
 	// DoclingServiceTimeout bounds one Docling parse call in seconds
 	// (RAG_DOCLING_SERVICE_TIMEOUT, default 300).
 	DoclingServiceTimeout int
+	// LightRAGServiceURL is the base URL of the LightRAG sidecar service
+	// (RAG_LIGHTRAG_SERVICE_URL). It has no default: an empty value means graph
+	// retrieval is not enabled for this deployment.
+	LightRAGServiceURL string
+	// LightRAGServiceTimeout bounds one sidecar call
+	// (RAG_LIGHTRAG_SERVICE_TIMEOUT in seconds, default 60, at most 600).
+	LightRAGServiceTimeout time.Duration
+	// LightRAGServiceToken is the bearer token sent to the sidecar
+	// (RAG_LIGHTRAG_SERVICE_TOKEN). The sidecar requires it whenever it binds
+	// to a non-loopback address; an empty value is only valid for a
+	// loopback-bound sidecar.
+	LightRAGServiceToken string
 }
 
 // RagConfigFromEnv loads configuration without connecting to Qdrant or loading
@@ -207,6 +220,15 @@ func RagConfigFromEnv() (RagConfig, error) {
 	if err != nil {
 		return RagConfig{}, err
 	}
+	lightragServiceURL, err := parseLightRAGServiceURL(os.Getenv("RAG_LIGHTRAG_SERVICE_URL"))
+	if err != nil {
+		return RagConfig{}, err
+	}
+	lightragServiceTimeout, err := integerEnv("RAG_LIGHTRAG_SERVICE_TIMEOUT", 60, 1, 600)
+	if err != nil {
+		return RagConfig{}, err
+	}
+	lightragServiceToken := strings.TrimSpace(os.Getenv("RAG_LIGHTRAG_SERVICE_TOKEN"))
 	vlmBaseURL, err := parseVLMBaseURL(os.Getenv("RAG_VLM_BASE_URL"))
 	if err != nil {
 		return RagConfig{}, err
@@ -259,6 +281,12 @@ func RagConfigFromEnv() (RagConfig, error) {
 		PDFServiceTimeout:     pdfServiceTimeout,
 		DoclingServiceURL:     doclingServiceURL,
 		DoclingServiceTimeout: doclingServiceTimeout,
+		LightRAGServiceURL:    lightragServiceURL,
+		// The sidecar timeout is stored as a duration because every client
+		// call takes a context deadline; the environment value stays in
+		// seconds like the other service timeouts.
+		LightRAGServiceTimeout: time.Duration(lightragServiceTimeout) * time.Second,
+		LightRAGServiceToken:   lightragServiceToken,
 	}, nil
 }
 
@@ -311,6 +339,26 @@ func parseDoclingServiceURL(raw string) (string, error) {
 	}
 	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
 		return "", fmt.Errorf("RAG_DOCLING_SERVICE_URL must not include a query or fragment")
+	}
+	return strings.TrimRight(value, "/"), nil
+}
+
+// parseLightRAGServiceURL validates the LightRAG sidecar base URL. It follows
+// parsePDFServiceURL: an absolute http(s) URL without a query or fragment
+// because the client appends fixed paths such as /v1/workspaces. It
+// deliberately has no default, so an empty value keeps graph retrieval
+// disabled instead of pointing at a service that is not deployed.
+func parseLightRAGServiceURL(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("RAG_LIGHTRAG_SERVICE_URL must be an http(s) URL, for example http://127.0.0.1:8093")
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", fmt.Errorf("RAG_LIGHTRAG_SERVICE_URL must not include a query or fragment")
 	}
 	return strings.TrimRight(value, "/"), nil
 }

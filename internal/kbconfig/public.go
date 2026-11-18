@@ -1,10 +1,19 @@
+// This file defines the credential-free public projection of stored
+// knowledge-base settings.
+
 package kbconfig
 
 // PublicSettings returns the credential-free projection of stored settings
 // (rag_mcp.knowledge_bases.public_settings): the protected provider objects are
 // replaced with {base_url, api_key_set} per kind while every other field
-// (namespace, collection, vector_size, model names, tokenizer, strategy, chunk
-// fields, timestamps, version) is preserved exactly.
+// (namespace, collection, vector_size, model names such as vlm_model and
+// graph_model, the graph_enabled flag, tokenizer, strategy, chunk fields,
+// timestamps, version) is preserved exactly.
+//
+// The "graph" provider is projected like the other CredentialKinds: only
+// base_url/api_key_set survive, so a graph API key is never exposed. A legacy
+// row without graph_enabled stays without it here; readers use GraphEnabled for
+// the false default and the stored settings shape is never rewritten.
 //
 // internal/state.CachedReadViews keeps an equivalent copy for cached read
 // models; the two projections must stay in sync.

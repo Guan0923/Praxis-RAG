@@ -40,6 +40,14 @@ const (
 	// MessageVLMModelRequired is raised when a VLM service URL is configured
 	// without a model name.
 	MessageVLMModelRequired = "请填写 VLM 模型名称"
+	// MessageGraphURLRequired is raised when a knowledge-graph extraction model
+	// is configured without a service URL.
+	MessageGraphURLRequired = "请填写图谱抽取模型服务 URL"
+	// MessageGraphModelRequired is raised when a graph extraction service URL
+	// is configured without a model name.
+	MessageGraphModelRequired = "请填写图谱抽取模型名称"
+	// MessageGraphEnabledInvalid is raised when graph_enabled is not a boolean.
+	MessageGraphEnabledInvalid = "知识图谱开关必须是布尔值"
 
 	// MessageModelKindInvalid is raised when a saved model configuration names
 	// an unsupported provider kind.

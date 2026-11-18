@@ -236,6 +236,9 @@ func (a HTTPRuntime) CreateKnowledgeBase(ctx context.Context, input httpapi.Know
 		RerankerValues:         input.RerankerValues,
 		VLMModel:               input.VLMModel,
 		VLMValues:              input.VLMValues,
+		GraphModel:             input.GraphModel,
+		GraphValues:            input.GraphValues,
+		GraphEnabled:           input.GraphEnabled,
 		EmbeddingBillingSource: input.EmbeddingBillingSource,
 		TokenizerModel:         a.Service.Config().ChunkTokenizerModel,
 	})
@@ -259,6 +262,9 @@ func (a HTTPRuntime) CreateKnowledgeBaseForUser(
 		RerankerValues:  input.RerankerValues,
 		VLMModel:        input.VLMModel,
 		VLMValues:       input.VLMValues,
+		GraphModel:      input.GraphModel,
+		GraphValues:     input.GraphValues,
+		GraphEnabled:    input.GraphEnabled,
 		TokenizerModel:  a.Service.Config().ChunkTokenizerModel,
 	})
 }
