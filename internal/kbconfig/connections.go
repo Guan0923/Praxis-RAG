@@ -25,14 +25,15 @@ import (
 // later use by the Console; it is not a knowledge-base model. "graph" is the
 // knowledge-base graph-extraction model: LightRAG uses one OpenAI-compatible
 // connection for both entity/relation extraction and keyword extraction, so a
-// single kind covers both LLM roles.
-var Kinds = []string{"embedding", "reranker", "vlm", "jev", "graph"}
+// single kind covers both LLM roles. "extraction" is the SAG event-entity
+// extraction model, also a Console-only kind.
+var Kinds = []string{"embedding", "reranker", "vlm", "jev", "graph", "extraction"}
 
 // CredentialKinds lists the kinds whose settings are stored as
 // {base_url, protected_key} pairs and replaced by the credential-free public
 // view. "graph" joins embedding/reranker/vlm: its API key is encrypted at rest
 // and only reduced to api_key_set by PublicSettings.
-var CredentialKinds = []string{"embedding", "reranker", "vlm", "graph"}
+var CredentialKinds = []string{"embedding", "reranker", "vlm", "graph", "extraction"}
 
 // IsKind reports whether kind is one of Kinds.
 func IsKind(kind string) bool {

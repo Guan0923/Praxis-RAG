@@ -216,7 +216,7 @@ export type Health = {
   backend?: string;
   collection?: string;
 };
-export type Retrieval = "bm25" | "embedding" | "hybrid" | "sag2" | "graph";
+export type Retrieval = "bm25" | "embedding" | "hybrid" | "sag2" | "graph" | "sag";
 export type Rerank = "none" | "cross_encoder";
 export type Hit = {
   rank: number;
@@ -381,6 +381,7 @@ export const retrievalLabels = {
   hybrid: "Hybrid",
   sag2: "SAG2",
   graph: "图谱",
+  sag: "SAG（事件-实体）",
 };
 export const rerankLabels = {
   none: "不重排",
@@ -1042,11 +1043,12 @@ export async function deleteUser(id: string): Promise<void> {
 // single remote OpenAI-compatible vision model for PDF parsing: it also handles
 // layout, OCR, tables, formulas and picture descriptions in the parsing
 // service. 知识图谱（graph）是 LightRAG 实体关系抽取用的 OpenAI 兼容模型，知识库
-// 可选择启用它来构建图谱索引；JEV (TypeSafe System One decision model) is a
-// Console-only kind: it is configured for later use, is never offered by the
-// knowledge-base forms, and has no OpenAI /models route.
+// 可选择启用它来构建图谱索引；JEV (TypeSafe System One decision model) 与
+// extraction (SAG 事件抽取模型) are Console-only kinds: they are configured for
+// later use, are never offered by the knowledge-base forms, and have no OpenAI
+// /models route.
 export type KnowledgeBaseModelKind = "embedding" | "reranker" | "vlm" | "graph";
-export type ModelKind = KnowledgeBaseModelKind | "jev";
+export type ModelKind = KnowledgeBaseModelKind | "jev" | "extraction";
 export type ModelProfile = {
   id: string;
   kind: ModelKind;
@@ -1073,16 +1075,17 @@ export type ModelProfileInput = {
 };
 // ModelProfileUpdate omits kind: an existing profile cannot change its kind.
 export type ModelProfileUpdate = Partial<Omit<ModelProfileInput, "kind">>;
-// knowledgeBaseModelKinds are the kinds a knowledge base can reference; JEV stays
-// Console-only and is therefore appended to modelKinds instead.
+// knowledgeBaseModelKinds are the kinds a knowledge base can reference; JEV and
+// extraction stay Console-only and are therefore appended to modelKinds instead.
 export const knowledgeBaseModelKinds: KnowledgeBaseModelKind[] = ["embedding", "reranker", "vlm", "graph"];
-export const modelKinds: ModelKind[] = [...knowledgeBaseModelKinds, "jev"];
+export const modelKinds: ModelKind[] = [...knowledgeBaseModelKinds, "jev", "extraction"];
 export const modelKindLabels: Record<ModelKind, string> = {
   embedding: "Embedding",
   reranker: "Reranker",
   vlm: "VLM",
   graph: "知识图谱",
   jev: "JEV",
+  extraction: "抽取（SAG）",
 };
 
 // normalizeModelProfile keeps a nullable vector_size stable for the table and

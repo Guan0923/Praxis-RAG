@@ -66,6 +66,11 @@ var expectedSchema = []struct {
 	// lightrag_documents is the knowledge-graph mirror ledger (Go-only), the
 	// register of which documents the LightRAG sidecar currently holds.
 	{"lightrag_documents", []string{"namespace", "document_id", "document_name", "config_fingerprint", "chunk_count", "status", "attempts", "last_error", "indexed_at", "updated_at"}},
+	// SAG event-entity index (retrieval mode sag): one event per chunk plus
+	// normalized entities and their associations.
+	{"sag_events", []string{"id", "namespace", "document_id", "chunk_id", "event", "version", "created_at"}},
+	{"sag_entities", []string{"id", "namespace", "normalized_key", "entity_key", "display_name", "mention_count", "created_at", "updated_at"}},
+	{"sag_event_entities", []string{"event_id", "entity_id", "namespace", "created_at"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
@@ -108,6 +113,9 @@ var expectedPrimaryKeys = map[string][]string{
 	"embedding_usage":          {"id"},
 	"billing_events":           {"id"},
 	"lightrag_documents":       {"namespace", "document_id"},
+	"sag_events":               {"id"},
+	"sag_entities":             {"id"},
+	"sag_event_entities":       {"event_id", "entity_id"},
 }
 
 var expectedUniques = map[string][]string{
@@ -128,6 +136,8 @@ var expectedUniques = map[string][]string{
 	"embedding_quota_periods": {"uq_embedding_period"},
 	"embedding_usage":         {"uq_embedding_usage_operation"},
 	"billing_events":          {"uq_billing_events_key"},
+	"sag_events":              {"uq_sag_events_chunk"},
+	"sag_entities":            {"uq_sag_entities_key"},
 }
 
 var expectedIndexes = map[string][]string{
@@ -158,6 +168,9 @@ var expectedIndexes = map[string][]string{
 	"embedding_usage":          {"ix_embedding_usage_user", "ix_embedding_usage_review"},
 	"billing_events":           {"ix_billing_events_order"},
 	"lightrag_documents":       {"ix_lightrag_documents_status"},
+	"sag_events":               {"ix_sag_events_document", "ix_sag_events_version"},
+	"sag_entities":             {"ix_sag_entities_normalized"},
+	"sag_event_entities":       {"ix_sag_event_entities_entity", "ix_sag_event_entities_event"},
 }
 
 // expectedTableNames returns the schema table names in Python declaration order.

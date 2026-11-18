@@ -63,6 +63,7 @@ func TestPublicSettingsReplacesProviders(t *testing.T) {
 		"graph":           map[string]any{"base_url": "http://graph:8000/v1", "api_key_set": true},
 		"graph_model":     "graph-llm",
 		"graph_enabled":   true,
+		"extraction":      map[string]any{"base_url": "", "api_key_set": false},
 	}
 	public := PublicSettings(settings)
 	if !reflect.DeepEqual(public, want) {
@@ -81,6 +82,7 @@ func TestPublicSettingsDefaultsMissingProviders(t *testing.T) {
 		"reranker":  map[string]any{"base_url": "", "api_key_set": false},
 		"vlm":       map[string]any{"base_url": "", "api_key_set": false},
 		"graph":     map[string]any{"base_url": "", "api_key_set": false},
+		"extraction": map[string]any{"base_url": "", "api_key_set": false},
 	}
 	if !reflect.DeepEqual(public, want) {
 		t.Fatalf("PublicSettings() = %#v, want %#v", public, want)

@@ -119,6 +119,9 @@ type Stores struct {
 	Activity   *ActivityCounters
 	Heartbeats *RuntimeHeartbeats
 
+	// SagIndex is the offline event-entity index of the SAG retrieval mode.
+	SagIndex *SagRepository
+
 	closeOnce  sync.Once
 	closeError error
 }
@@ -217,6 +220,7 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.Catalogs = newCatalogRepository(database, cacheSync)
 	stores.Membership = newMembershipRepository(database)
 	stores.Billing = newBillingRepository(database)
+	stores.SagIndex = newSagRepository(database)
 	stores.Blobs = newBlobStore(database)
 	uploads, err := NewUploadJournal(stores)
 	if err != nil {

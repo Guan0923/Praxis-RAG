@@ -473,6 +473,31 @@ PDF 总解析容量上限为 `RAG_PDF_SERVICE_WORKERS × RAG_PDF_SERVICE_CONCURR
 
 ## 4. 启动与冒烟
 
+### 用 Console 跑通文档导入与检索
+
+在 Windows 上准备 PowerShell 7、Go 1.27+、Node.js 20.19+ 或 22.12+，以及 Docker Compose。首次启动需要下载依赖和镜像。
+
+1. 在仓库根目录创建配置文件并生成状态库加密密钥。
+
+   ```powershell
+   Copy-Item .env.example .env
+   'base64:' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+   ```
+
+   将密钥输出写入 `.env` 的 `RAG_STATE_ENCRYPTION_KEY`，并填写 `RAG_MYSQL_PASSWORD` 和 `MYSQL_ROOT_PASSWORD`。
+
+2. 构建并启动本机服务。
+
+   ```powershell
+   pwsh -File scripts/build-go.ps1
+   pwsh -File scripts/start-stack.ps1
+   ```
+
+3. 打开 [Console](http://127.0.0.1:8011/console)。首次启动时注册账号，在「模型配置」添加 Embedding 模型，然后创建知识库并选用该模型。
+4. 上传 [X7 智能终端维护手册](../examples/knowledge/x7-maintenance-manual.md)。等文档索引成功后，在「检索调试」选择混合检索，输入「X7 终端出现 E03 温度保护后怎么处理？」。检查命中片段的来源章节，手册第 6.2 节列出了普通用户的处理步骤。[查看示例结果](images/console-search.png)
+
+首次只想查看证据结构时，可以运行 [README 的 5 分钟示例](../README.md#5-分钟快速开始)。
+
 ### 启动 rag-service
 
 ```powershell
@@ -1039,6 +1064,29 @@ curl.exe -X POST http://127.0.0.1:8011/v1/search `
 curl.exe -X POST http://127.0.0.1:8011/v1/search `
   -H $headers `
   -d '{"query":"所有涉及用户画像的条款之间是什么关系？","retrieval":"graph","rerank":"none","candidate_k":10,"top_k":5,"filters":{}}'
+```
+
+#### SAG 事件-实体检索（`retrieval: sag`）
+
+第五种模式 `sag` 是 [Zleap-AI/SAG](https://github.com/Zleap-AI/SAG) 架构的事件-实体检索：**离线**为每个 chunk 抽取一个事件（chunk 的完整语义单元）和若干规范化实体，写入 MySQL（`sag_events` / `sag_entities` / `sag_event_entities` 三张表）；**查询时**先用 hybrid 召回种子 chunk，映射到事件与实体，再用 SQL join 沿共享实体扩展到未被向量召回命中的关联事件——即查询期动态超边，不需要图数据库，也不预建全局图。证据边界仍是原始 chunk（超边命中的 chunk 会从 Qdrant 补水原文）。
+
+使用要求与行为：
+
+- 管理员先在 Console「模型配置」添加 `kind=extraction` 条目（任意 OpenAI 兼容 chat 端点，建议低价快速模型如 qwen-flash / deepseek-chat；存在多条时取**最近更新**的一条）。添加后，**新上传**的文档在发布完成后自动抽取（非致命阶段，失败只记日志不影响文档状态）；存量文档用 `rag-sag-backfill` CLI 补建。
+- 未配置抽取模型或文档未建索引时，`sag` 自动**降级为 hybrid 召回**（不报错、不静默无结果）。
+- 可以搭配任意 `rerank`（`none` 或 `cross_encoder`）：排序是种子分与超边共享实体数的融合分，cross-encoder 二段精排合法（区别于 `sag2`）。
+- 每文档抽取上限 512 chunk（超出部分留给回填 CLI），实体归一化为 casefold；抽取结果含 `metadata.sag_event`（该 chunk 的事件句），便于核对证据链。
+- 删除文档时事件与关联级联清理，实体行保留（共享数据），不会留下悬空超边。
+
+```powershell
+# 存量文档补建索引（先 dry-run 看清单）
+dist/bin/rag-sag-backfill --namespace default --dry-run
+dist/bin/rag-sag-backfill --namespace default --verbose
+
+# 查询
+curl.exe -X POST http://127.0.0.1:8011/v1/search `
+  -H $headers `
+  -d '{"query":"Atlas 项目的第二个里程碑是谁负责的？","retrieval":"sag","rerank":"none","candidate_k":30,"top_k":5,"filters":{}}'
 ```
 
 ### 上传状态、发布版本与租约

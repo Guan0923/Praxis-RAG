@@ -1,91 +1,59 @@
 # Praxis-RAG
 
-**面向 AI 助手和业务应用的自托管知识库，让检索结果可引用、可回查原文。**
+**Praxis-RAG 是面向 AI 助手和业务应用的自托管知识库，通过 Console、REST API 和 MCP 返回可回查原文的检索证据。**
 
-[快速开始](#快速开始) · [系统架构](#系统架构) · [REST / MCP](docs/USAGE.md#5-rest-api-示例) · [版本发布](https://github.com/Guan0923/Praxis-RAG/releases)
+[5 分钟快速开始](#5-分钟快速开始) · [使用指南](docs/USAGE.md) · [部署指南](docs/DEPLOYMENT.md) · [MIT 许可证](LICENSE)
 
-![Praxis-RAG Console 检索调试页面，展示X7 智能终端手册的 E03 温度保护处理步骤和来源章节](docs/images/console-search.png)
+## 演示
 
-*Console 界面演示使用仓库内的[X7 智能终端维护手册](examples/knowledge/x7-maintenance-manual.md)和本地示例响应。*
+![Console 检索 X7 终端的 E03 故障码并显示手册原文与来源章节](docs/images/console-search.gif)
 
-## 能做什么
+Console 使用示例响应展示混合检索。输入 E03 故障问题后，可以看到 [X7 维护手册](examples/knowledge/x7-maintenance-manual.md)中的处理步骤和来源章节。除 BM25 / Embedding / Hybrid 外，配置抽取模型后还可启用 SAG 事件-实体检索，跨 chunk 追溯共享实体的关联证据（见[使用指南](docs/USAGE.md#sag-事件-实体检索retrieval-sag)）。启用知识图谱后还可用图谱模式回答"这几份文件里的条款彼此是什么关系"这类跨文档关联问题，同样只提供证据、不生成答案（见[使用指南](docs/USAGE.md#知识图谱检索retrieval-graph)）。
 
-- **把资料建成知识库。** 在 Console 批量上传 Markdown、TXT、PDF 和 Word，选择切分策略，后台完成解析与索引。启用 Docling 后可上传静态 HTML。
-- **找回能引用的原文。** 在 Console 并排比较 BM25、Embedding 和 Hybrid，也可启用模型重排。检索返回原文片段和来源，解析产物可带页码、表格、图片和公式。
-- **跨文档找关系。** 启用知识图谱后，可用图谱模式回答"这几份文件里的条款彼此是什么关系"这类问题；图谱只提供实体、关系和原文片段作为证据，同样不生成答案。
-- **让助手和业务系统查同一份资料。** Console 用于管理知识库和调试检索，MCP 供 AI 助手调用，REST API 供应用集成。调用方可用返回的证据组织答案。
+## 5 分钟快速开始
 
-## 系统架构
+准备 Git 和 Go 1.27+，运行内置示例检索。只需下载 Go 依赖，无需启动数据库或配置模型 API Key。
+
+```sh
+git clone https://github.com/Guan0923/Praxis-RAG.git
+cd Praxis-RAG
+go run ./cmd/rag-mcp-debug --query "RRF 怎么融合 BM25 和 Dense？" --limit 2
+```
+
+看到 `mode=mock` 和 `results=2` 即可验证示例。第一条结果的 `Text` 是原文片段，`Source` 是来源，`ChunkID` 标识片段。首次下载依赖的时间取决于网络。
+
+[启动完整服务并导入 X7 手册](docs/USAGE.md#用-console-跑通文档导入与检索)
+
+## 架构
 
 ```mermaid
 flowchart LR
-    Client["Console · REST · MCP"] <-->|管理与检索| API["rag-service · Go"]
-
-    API -->|受理上传 · 写入任务| MySQL[("MySQL · 文档与任务")]
-    MySQL -->|表级 CDC| CDC["Debezium · Kafka Connect"]
-    CDC --> Kafka["Kafka · 事件通知"]
-    Kafka -->|文档任务| Worker["文档 Worker · 解析 / 切分 / 索引"]
-    Worker <-->|读取任务 · 发布文档| MySQL
-    Worker -->|发布索引| Qdrant[("Qdrant · 稠密与稀疏索引")]
-
-    API -->|同步检索| Qdrant
-    API -->|Embedding / Reranker| Model["模型 API"]
-    API -->|图谱上下文检索| Graph["知识图谱侧车 · LightRAG"]
-    Graph -->|实体关系抽取| Model
-    Worker -->|Embedding| Model
-    Worker -->|按格式与配置调用| Parsers["PDF 视觉解析 / Word 与 HTML Docling"]
-    Parsers -->|PDF 版面与 OCR| Model
-
-    Kafka -->|读模型变更| Cache["缓存 Worker"]
+    Client["Console · REST API · MCP"] <-->|"上传 · 检索证据"| Service["Go 检索服务"]
+    Service -->|"同步检索"| Qdrant[(Qdrant)]
+    Service -->|"图谱上下文检索"| Graph["知识图谱侧车 · LightRAG"]
+    Graph -->|"实体关系抽取"| Model["模型 API"]
+    Service -->|"受理入库任务"| MySQL[(MySQL)]
+    MySQL -->|"Debezium CDC"| Kafka["Kafka"]
+    Kafka -->|"通知"| Worker["文档 Worker"]
+    Worker -->|"解析 · 切分 · 写入索引"| Qdrant
+    Worker -->|"发布后镜像图谱"| Graph
+    Worker -->|"更新任务状态"| MySQL
+    Service -->|"向量化 · 可选重排"| Model["模型 API"]
+    Worker -->|"文档向量化"| Model
+    Kafka -->|"读模型变更"| Cache["缓存 Worker"]
     Cache --> Redis[("Redis · 可选")]
 ```
 
-上传在 MySQL 保存任务后立即返回。文档 Worker 通过 Kafka 收到通知，异步完成索引。搜索在一次请求内返回命中片段和证据引用。[部署拓扑与进程清单](docs/DEPLOYMENT.md#1-进程拓扑)
+[完整部署拓扑](docs/DEPLOYMENT.md#1-进程拓扑) · [REST API](docs/USAGE.md#5-rest-api-示例) · [MCP 接入](docs/USAGE.md#6-mcp-使用)
 
-## 运行指标与限制
+## 指标
 
-| 指标 | 上限或默认值 | 口径 |
+| 指标 | 默认值 | 请求上限 |
 | --- | --- | --- |
-| 批量上传 | **10 个文件/批**，**10 MiB/文件** | REST 批次上传与 Console |
-| 单次搜索 | **100 个候选**，**10 条结果** | `candidate_k`、`top_k` 的请求上限 |
-| 搜索超时预算 | **120 秒** | 默认值，可通过 `RAG_SEARCH_TIMEOUT_SECONDS` 调整 |
-| 证据产物保留期 | **1 小时** | 默认值，可通过 `RAG_RESULT_TTL_SECONDS` 调整 |
+| 批量上传 | — | 10 个文件/批，10 MiB/文件 |
+| 检索候选数 `candidate_k` | 10 | 100 |
+| 单次返回数 `top_k` | 5 | 10 |
+| 搜索超时预算 | 120 秒 | — |
+| 证据产物保留期 | 1 小时 | — |
 
-这些数字来自请求校验与默认配置。部署验证和测试环境见[验证记录](VALIDATION.md)。
-
-## 快速开始
-
-在 Windows 上准备 PowerShell 7、Go 1.27+、Node.js 20.19+ 或 22.12+，以及 Docker Compose。首次在仓库目录启动时执行以下命令。
-
-```powershell
-Copy-Item .env.example .env
-# 生成加密密钥，将输出填入 .env 的 RAG_STATE_ENCRYPTION_KEY
-'base64:' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
-# 在 .env 中填写 RAG_MYSQL_PASSWORD 和 MYSQL_ROOT_PASSWORD
-pwsh -File scripts/build-go.ps1
-pwsh -File scripts/start-stack.ps1
-```
-
-启动后打开本机 Console，注册账号并配置 Embedding 模型。创建知识库，上传X7 智能终端维护手册。等索引成功后，在「检索调试」输入「X7 终端出现 E03 温度保护后怎么处理？」即可查看来源片段。[打开 Console](http://127.0.0.1:8011/console) · [下载样例手册](examples/knowledge/x7-maintenance-manual.md) · [启动与冒烟说明](docs/USAGE.md#4-启动与冒烟)
-
-| 接入方式 | 入口 |
-| --- | --- |
-| Web Console | `/console` |
-| REST API | `POST /v1/search`，在线接口文档位于 `/docs` |
-| MCP（Streamable HTTP） | `/mcp`，使用 `search` 查询证据 |
-
-## 项目文档
-
-| 文档 | 内容 |
-| --- | --- |
-| [使用指南](docs/USAGE.md) | 本地构建、管理员初始化、模型配置、REST 和 MCP 示例 |
-| [部署指南](docs/DEPLOYMENT.md) | Compose、systemd、Kafka Connect、运行监控和升级 |
-| [Kubernetes 部署](deploy/k8s/README.md) | Kustomize 清单、依赖配置和启动顺序 |
-| [知识库权限](docs/PERMISSIONS.md) | 知识库归属、文档范围和邀请共享 |
-| [证据产物与引用](docs/result-references.md) | Artifact 读取方式与保留策略 |
-| [开发与测试](docs/USAGE.md#11-开发与测试) | Go 与 Console 的验证方式 |
-| [Go 迁移记录](docs/GO_MIGRATION.md) | 历史契约、已完成的迁移和兼容性说明 |
-
-## 许可证
-
-[MIT](LICENSE)
+[配置与运行说明](docs/USAGE.md) · [证据引用与保留策略](docs/result-references.md) · [验证记录](VALIDATION.md)

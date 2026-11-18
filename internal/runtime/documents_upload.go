@@ -817,6 +817,9 @@ func (s *Service) storeAndIndex(
 	if _, cleanupErr := coordinator.CleanupWorkspace(ctx, operation); cleanupErr != nil {
 		logUploadWarning(ctx, "Committed workspace cleanup pending", operation.ID, cleanupErr)
 	}
+	// The publication is durable: run the non-fatal SAG extraction stage. Its
+	// failures are logged inside and never change the publication outcome.
+	s.extractSagIndex(ctx, namespace, indexed.document.DocumentID, operation.ID, indexed.qdrantChunks)
 	return metadata, nil
 }
 

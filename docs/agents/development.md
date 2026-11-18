@@ -147,6 +147,7 @@ CI 见 `.github/workflows/test.yml`：`go vet + go build + go test -p 1`（MySQL
 - 上传默认异步，必须存在文档消费者：配置 Kafka + 分布式 Kafka Connect 的两个 Debezium 连接器并运行独立的 `rag-document-worker`；没有内嵌/进程内选项，未部署时任务会一直 `queued`。
 - 受限账号可在同步检索中正常工作：服务端按 scope 追加 `document_ids` 过滤，不再有“排队模式下拒绝受限账号”的限制。
 - 管理凭证（Service Token / API Key）在请求时不做知识库归属校验，只受 API Key 命名空间白名单约束。
+- `sag` 检索的事件-实体抽取每文档上限 512 chunk、实体不做全局消歧（casefold 归一化即 join key）；抽取阶段失败不重试（文档发布不受影响，缺口留给 `rag-sag-backfill` CLI）；`SagRepository` 的 MySQL round-trip 测试需要 `RAG_TEST_MYSQL_URL`（未设则跳过，与包内其他 MySQL 测试一致）。
 
 ## 7. 未验证项（不要据此宣称生产就绪）
 

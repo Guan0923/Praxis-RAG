@@ -32,7 +32,7 @@ func TestInvalidSearchArgumentsFailAtTheBoundary(t *testing.T) {
 	}{
 		{map[string]any{}, "query"},
 		{map[string]any{"query": "x", "top_k": 6, "candidate_k": 5}, "top_k"},
-		{map[string]any{"query": "x", "retrieval": "sql"}, "retrieval must be bm25, embedding, hybrid, sag2, or graph"},
+		{map[string]any{"query": "x", "retrieval": "sql"}, "retrieval must be bm25, embedding, hybrid, sag2, graph, or sag"},
 		{map[string]any{"query": "x", "rerank": "bi_encoder"}, "rerank must be none or cross_encoder"},
 		{map[string]any{"query": "x", "retrieval": "sag2"}, "retrieval sag2 requires rerank none"},
 		{map[string]any{"query": "x", "retrieval": "sag2", "rerank": "cross_encoder"}, "retrieval sag2 requires rerank none"},
@@ -148,7 +148,7 @@ func TestSearchToolSchemaExposesSAG2AndGraph(t *testing.T) {
 		t.Fatalf("schema properties = %#v", schema["properties"])
 	}
 	values, ok := retrieval["enum"].([]string)
-	if !ok || len(values) != 5 || values[3] != "sag2" || values[4] != "graph" {
+	if !ok || len(values) != 6 || values[3] != "sag2" || values[4] != "graph" || values[5] != "sag" {
 		t.Fatalf("retrieval enum = %v", retrieval["enum"])
 	}
 	// The graph mode is described in the schema so an Agent knows it returns
@@ -156,6 +156,37 @@ func TestSearchToolSchemaExposesSAG2AndGraph(t *testing.T) {
 	description, ok := retrieval["description"].(string)
 	if !ok || !strings.Contains(description, "graph") {
 		t.Fatalf("retrieval description = %v", retrieval["description"])
+	}
+}
+
+func TestSAGSearchRequestAcceptedWithAnyRerank(t *testing.T) {
+	// sag's ordering is a fusion score, so the cross-encoder second stage is
+	// legal (unlike sag2, whose JEV score is the final ordering).
+	for _, rerank := range []string{"none", "cross_encoder"} {
+		request, err := SearchRequestFromArguments(map[string]any{
+			"query": "多跳问题", "retrieval": "sag", "rerank": rerank,
+		})
+		if err != nil {
+			t.Fatalf("SearchRequestFromArguments(rerank=%s) error = %v", rerank, err)
+		}
+		if request.Retrieval != RetrievalSAG {
+			t.Fatalf("request.Retrieval = %v, want sag", request.Retrieval)
+		}
+	}
+}
+
+func TestSAGSearchRequestWithoutIndexDegradesGracefully(t *testing.T) {
+	// A sag request is structurally valid even when no extraction index
+	// exists: validation must accept it (the runtime degrades to hybrid
+	// recall instead of failing at the boundary).
+	request, err := SearchRequestFromArguments(map[string]any{
+		"query": "多跳问题", "retrieval": "sag",
+	})
+	if err != nil {
+		t.Fatalf("SearchRequestFromArguments() error = %v", err)
+	}
+	if request.Retrieval != RetrievalSAG || request.Rerank != RerankCrossEncoder {
+		t.Fatalf("request = %+v", request)
 	}
 }
 func TestValidateUUID(t *testing.T) {

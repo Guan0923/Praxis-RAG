@@ -205,19 +205,20 @@ func TestDraftConnectionRejectsInvalidCurrentURL(t *testing.T) {
 }
 
 func TestIsKind(t *testing.T) {
-	if !IsKind("embedding") || !IsKind("reranker") || !IsKind("vlm") || !IsKind("jev") || !IsKind("graph") {
-		t.Errorf("expected embedding/reranker/vlm/jev/graph kinds")
+	if !IsKind("embedding") || !IsKind("reranker") || !IsKind("vlm") || !IsKind("jev") ||
+		!IsKind("graph") || !IsKind("extraction") {
+		t.Errorf("expected embedding/reranker/vlm/jev/graph/extraction kinds")
 	}
 	if IsKind("") || IsKind("Embedding") || IsKind("bm25") || IsKind("ocr") {
 		t.Errorf("unexpected kind accepted")
 	}
-	if !reflect.DeepEqual(Kinds, []string{"embedding", "reranker", "vlm", "jev", "graph"}) {
+	if !reflect.DeepEqual(Kinds, []string{"embedding", "reranker", "vlm", "jev", "graph", "extraction"}) {
 		t.Errorf("Kinds = %v", Kinds)
 	}
 	// The public projection only replaces the kinds that own a knowledge-base
-	// provider connection; JEV is a Console-only configuration, while graph owns
-	// a per-knowledge-base extraction endpoint and therefore redacts its key.
-	if !reflect.DeepEqual(CredentialKinds, []string{"embedding", "reranker", "vlm", "graph"}) {
+	// provider connection; JEV is a Console-only configuration, while graph and
+	// extraction own a per-knowledge-base endpoint and therefore redact the key.
+	if !reflect.DeepEqual(CredentialKinds, []string{"embedding", "reranker", "vlm", "graph", "extraction"}) {
 		t.Errorf("CredentialKinds = %v", CredentialKinds)
 	}
 }
