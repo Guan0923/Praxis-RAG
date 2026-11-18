@@ -2,10 +2,12 @@
 // cache interface: a read-through display cache (StateCache) for the document,
 // knowledge-base and catalog read models.
 //
-// It is a port of rag_mcp/state/cache.py. MySQL remains authoritative; every
-// cache failure is reported as *state.CacheUnavailable so callers fall back to
-// the database instead of failing a request. Search results are synchronous and
-// are not cached or stored here.
+// It is a port of rag_mcp/state/cache.py. MySQL remains authoritative; cache
+// failures are reported as sanitized *state.CacheUnavailable errors. The state
+// layer's read-through path (GetOrLoad) treats them as retryable while the cache
+// is enabled: it no longer silently falls back to MySQL, because the per-key
+// backfill lock makes lock ownership unverifiable during an outage. Search
+// results are synchronous and are not cached or stored here.
 package redisstate
 
 import (
@@ -308,7 +310,9 @@ func canonicalRevision(value string) bool {
 
 // Put atomically publishes a snapshot unless a newer revision already exists.
 // Equal revisions can refill expired payloads but cannot undo a deletion; the
-// deletion value is discarded. It mirrors RedisStateCache.put.
+// deletion value is discarded. It mirrors RedisStateCache.put. The payload TTL
+// is randomized per write in [T-floor(T/5), T] (48~60s by default) so
+// synchronized expiries stagger, while the revision watermark never expires.
 func (c *Client) Put(ctx context.Context, kind, scope string, revision int64, value any, deleted bool) (bool, error) {
 	if !c.enabled {
 		return false, nil
@@ -334,7 +338,7 @@ func (c *Client) Put(ctx context.Context, kind, scope string, revision int64, va
 		deletedMarker = "1"
 	}
 	payloadKey, revisionKey := KeyPair(c.settings.Prefix, kind, scope)
-	ttl := time.Duration(c.settings.TTLSeconds) * time.Second
+	ttl := time.Duration(state.RandomTTLSeconds(c.settings.TTLSeconds)) * time.Second
 	for range 32 {
 		skip := false
 		watchErr := connection.Watch(ctx, func(transaction *redis.Tx) error {
@@ -394,6 +398,127 @@ func parseWatermark(value string) (revision string, deleted bool, ok bool) {
 	default:
 		return "", false, false
 	}
+}
+
+// renewBackfillLockScript and releaseBackfillLockScript keep the token check
+// and the write in one atomic operation, mirroring the lease scripts' contract
+// that a caller must never extend or delete a lock it no longer owns.
+const renewBackfillLockScriptSource = `
+local current = redis.call('GET', KEYS[1])
+if not current or current ~= ARGV[1] then
+  return 0
+end
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+return 1
+`
+
+const releaseBackfillLockScriptSource = `
+local current = redis.call('GET', KEYS[1])
+if current and current == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+`
+
+var (
+	renewBackfillLockScript   = redis.NewScript(renewBackfillLockScriptSource)
+	releaseBackfillLockScript = redis.NewScript(releaseBackfillLockScriptSource)
+)
+
+// backfillLockKey returns the per-key backfill lock key. It reuses the
+// identityDigest hash tag so payload, watermark and lock share one Redis
+// Cluster hash slot.
+func backfillLockKey(prefix, kind, scope string) string {
+	return prefix + ":{" + identityDigest(kind, scope) + "}:lock"
+}
+
+// BackfillLockKey returns the backfill lock key used by this client
+// (tests/diagnostics).
+func (c *Client) BackfillLockKey(kind, scope string) string {
+	return backfillLockKey(c.settings.Prefix, kind, scope)
+}
+
+// backfillTTL converts the lease duration to the millisecond string the Lua
+// renew script compares/persists.
+func backfillTTL(ttl time.Duration) string {
+	return strconv.FormatInt(ttl.Milliseconds(), 10)
+}
+
+// AcquireBackfillLock takes the kind+scope backfill lock for token with one
+// SET NX PX: it either wins atomically or observes that another instance holds
+// the lock (false, nil). A backend failure returns *state.CacheUnavailable,
+// which leaves ownership unknown; callers must not treat that as a free lock.
+func (c *Client) AcquireBackfillLock(ctx context.Context, kind, scope, token string, ttl time.Duration) (bool, error) {
+	if token == "" {
+		return false, &state.ValueError{Message: "State cache backfill lock token must not be empty"}
+	}
+	if ttl <= 0 {
+		return false, &state.ValueError{Message: "State cache backfill lock TTL must be positive"}
+	}
+	if !c.enabled {
+		// A disabled cache has no payload to guard, so there is nothing to
+		// serialize: report the lock as taken by this caller.
+		return true, nil
+	}
+	connection, err := c.connection()
+	if err != nil {
+		return false, err
+	}
+	acquired, err := connection.SetNX(ctx, backfillLockKey(c.settings.Prefix, kind, scope), token, ttl).Result()
+	if err != nil {
+		return false, &state.CacheUnavailable{Message: "State cache backfill lock unavailable"}
+	}
+	return acquired, nil
+}
+
+// RenewBackfillLock extends the lock only when token still owns it. A false
+// result with a nil error means the lease was lost (expired or taken over);
+// a backend error returns *state.CacheUnavailable and leaves ownership
+// unverifiable.
+func (c *Client) RenewBackfillLock(ctx context.Context, kind, scope, token string, ttl time.Duration) (bool, error) {
+	if token == "" {
+		return false, &state.ValueError{Message: "State cache backfill lock token must not be empty"}
+	}
+	if ttl <= 0 {
+		return false, &state.ValueError{Message: "State cache backfill lock TTL must be positive"}
+	}
+	if !c.enabled {
+		return true, nil
+	}
+	connection, err := c.connection()
+	if err != nil {
+		return false, err
+	}
+	renewed, err := renewBackfillLockScript.Run(ctx, connection,
+		[]string{backfillLockKey(c.settings.Prefix, kind, scope)},
+		token, backfillTTL(ttl)).Int64()
+	if err != nil {
+		return false, &state.CacheUnavailable{Message: "State cache backfill lock unavailable"}
+	}
+	return renewed == 1, nil
+}
+
+// ReleaseBackfillLock deletes the lock only when token still owns it; it is
+// idempotent. A backend error is reported, but the holder must already have
+// given up filling when that happens, so the error only feeds diagnostics.
+func (c *Client) ReleaseBackfillLock(ctx context.Context, kind, scope, token string) error {
+	if token == "" {
+		return &state.ValueError{Message: "State cache backfill lock token must not be empty"}
+	}
+	if !c.enabled {
+		return nil
+	}
+	connection, err := c.connection()
+	if err != nil {
+		return err
+	}
+	if _, err := releaseBackfillLockScript.Run(ctx, connection,
+		[]string{backfillLockKey(c.settings.Prefix, kind, scope)},
+		token).Int64(); err != nil {
+		return &state.CacheUnavailable{Message: "State cache backfill lock unavailable"}
+	}
+	return nil
 }
 
 func cacheText(value any) (string, bool) {

@@ -81,6 +81,12 @@ func (v *CachedReadViews) getOrLoad(ctx context.Context, kind, scope string) (an
 		if errors.As(err, &stateErr) {
 			return nil, err
 		}
+		var retryable *CacheRetryable
+		if errors.As(err, &retryable) {
+			// Retryable read-through failures (backfill wait timeout, lost or
+			// unverifiable lock ownership) must stay retryable for the caller.
+			return nil, err
+		}
 		return nil, newStateError("Cached read view cannot be loaded")
 	}
 	return value, nil

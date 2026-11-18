@@ -4,13 +4,18 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// CacheUnavailable is a sanitized cache failure; callers must fall back to the
-// authoritative database. It mirrors rag_mcp.state.cache.CacheUnavailable.
+// CacheUnavailable is a sanitized backend failure. Callers fall back to the
+// authoritative database only when the cache is disabled; while the cache is
+// enabled the synchronizer maps an unavailable backend to *CacheRetryable
+// instead (see CacheSynchronizer.GetOrLoad). It mirrors
+// rag_mcp.state.cache.CacheUnavailable.
 type CacheUnavailable struct{ Message string }
 
 // Error implements error.
@@ -20,14 +25,48 @@ func newCacheUnavailable(message string) *CacheUnavailable {
 	return &CacheUnavailable{Message: message}
 }
 
+// CacheRetryable is a sanitized, retryable read-through cache failure: the
+// caller should retry the read later. The synchronizer returns it for a
+// backfill wait timeout, a lost backfill lease, or a backend outage that
+// leaves lock ownership unverifiable while the cache is enabled. It
+// deliberately replaces the legacy behavior of falling back to MySQL on a
+// Redis outage.
+type CacheRetryable struct{ Message string }
+
+// Error implements error.
+func (e *CacheRetryable) Error() string { return e.Message }
+
+func newCacheRetryable(message string) *CacheRetryable {
+	return &CacheRetryable{Message: message}
+}
+
+// Sanitized, stable messages for retryable read-through failures. They never
+// carry backend details, tokens or credentials.
+const (
+	cacheReadRetryableMessage  = "State cache read is unavailable; retry later"
+	cacheLockRetryableMessage  = "State cache backfill lock is unavailable; retry later"
+	cacheWaitRetryableMessage  = "State cache backfill wait timed out; retry later"
+	cacheLeaseRetryableMessage = "State cache backfill lease was lost; retry later"
+)
+
 // StateCache is the read-through snapshot backend. In production this is the
 // Redis implementation of rag_mcp.state.cache.RedisStateCache; the Go port keeps
 // it behind this interface so the state layer compiles and is testable without a
 // Redis dependency. Values must be JSON-marshalable.
+//
+// The backfill lock methods serialize MySQL backfill across instances for one
+// cache key: AcquireBackfillLock is a SET NX PX with a caller-supplied token,
+// RenewBackfillLock extends the lease only for that token, and
+// ReleaseBackfillLock deletes the lock only when the token still owns it.
+// A backend outage is reported as *CacheUnavailable and leaves ownership
+// unknown to the caller.
 type StateCache interface {
 	Enabled() bool
 	Get(ctx context.Context, kind, scope string) (bool, any, error)
 	Put(ctx context.Context, kind, scope string, revision int64, value any, deleted bool) (bool, error)
+	AcquireBackfillLock(ctx context.Context, kind, scope, token string, ttl time.Duration) (bool, error)
+	RenewBackfillLock(ctx context.Context, kind, scope, token string, ttl time.Duration) (bool, error)
+	ReleaseBackfillLock(ctx context.Context, kind, scope, token string) error
 	Close() error
 }
 
@@ -47,6 +86,21 @@ func (DisabledStateCache) Put(context.Context, string, string, int64, any, bool)
 	return false, nil
 }
 
+// AcquireBackfillLock reports a free lock (there is no cache to guard).
+func (DisabledStateCache) AcquireBackfillLock(context.Context, string, string, string, time.Duration) (bool, error) {
+	return true, nil
+}
+
+// RenewBackfillLock reports a held lock.
+func (DisabledStateCache) RenewBackfillLock(context.Context, string, string, string, time.Duration) (bool, error) {
+	return true, nil
+}
+
+// ReleaseBackfillLock is a no-op.
+func (DisabledStateCache) ReleaseBackfillLock(context.Context, string, string, string) error {
+	return nil
+}
+
 // Close is a no-op.
 func (DisabledStateCache) Close() error { return nil }
 
@@ -63,6 +117,22 @@ type CacheSettings struct {
 // DefaultCacheSettings returns the dataclass defaults.
 func DefaultCacheSettings() CacheSettings {
 	return CacheSettings{Prefix: "rag:state:v1", TTLSeconds: 60, TimeoutSeconds: 0.3}
+}
+
+// RandomTTLSeconds draws the randomized payload TTL for one display-cache
+// write: an integer number of seconds drawn uniformly from
+// [T-floor(T/5), T], where T is the RAG_REDIS_TTL_SECONDS upper bound.
+// With the default T=60 the range is 48~60 seconds. Randomizing the expiry
+// staggers concurrent revalidations of one key so synchronized expiry no
+// longer turns one miss into a thundering herd of MySQL backfills. The
+// revision watermark stays un-expiring, so an older refill can never
+// resurrect deleted data after the payload lapses.
+func RandomTTLSeconds(ttlSeconds int) int {
+	if ttlSeconds <= 0 {
+		return ttlSeconds
+	}
+	minimum := ttlSeconds - ttlSeconds/5
+	return minimum + rand.IntN(ttlSeconds-minimum+1)
 }
 
 // CacheSettingsFromEnv mirrors StateCacheSettings.from_env, including its

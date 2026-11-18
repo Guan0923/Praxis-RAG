@@ -342,7 +342,7 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_REDIS_ENABLED` | 未设置 = 按 URL 自动启用 | `false/0/off` 显式禁用；禁用时只影响读模型展示缓存（读取回源 MySQL），不影响文档锁后端 |
 | `RAG_REDIS_URL` | 空 | 例如 `redis://127.0.0.1:6379/0` |
 | `RAG_REDIS_PREFIX` | `rag:state:v1` | 读模型缓存键前缀 |
-| `RAG_REDIS_TTL_SECONDS` | `60` | 读模型展示缓存 TTL（与文档锁 TTL 无关） |
+| `RAG_REDIS_TTL_SECONDS` | `60` | 读模型展示缓存 TTL **上限**（与文档锁 TTL 无关）：每次写入随机取 `[T-floor(T/5), T]` 内整秒，默认 48～60 秒，错开同步过期 |
 | `RAG_REDIS_TIMEOUT_SECONDS` | `0.3` | Redis 连接/命令超时 |
 | `RAG_DOCUMENT_LOCK_MODE` | `mysql` | 文档长租约后端：`mysql`（默认，行为不变）或 `redis`。部署级开关，`rag-service`/`rag-document-worker`/`rag-mcp-ingest` 必须同值 |
 | `RAG_REDIS_LOCK_URL` | 空（回退 `RAG_REDIS_URL`） | 文档锁 Redis 地址；`redis` 模式解析不出 URL 时启动报错 |
@@ -355,9 +355,9 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_ARTIFACT_MAX_BYTES` | `67108864` | 单 artifact 上限 |
 | `RAG_RESULT_MAX_ARTIFACTS` | `100` | 每次搜索最多 artifact 数 |
 
-Redis 不可用时，持久读模型会回源状态库；搜索为同步直返，响应不写 Redis，artifact 以 MySQL `artifact_snapshots` 为事实来源并按 ID 独立读取，**清空 Redis 不影响搜索结果或已签发 artifact**。`RAG_RESULT_TTL_SECONDS` 到期后 MySQL artifact 被有界清理，再读取返回 410。
+持久读模型展示缓存启用时，读取先查 Redis，未命中按 `kind+scope` 争 Redis 回源锁（`SET NX PX` + 唯一 token，同一知识库的文档列表共用一把锁、不同知识库并行），拿到锁后复读 Redis、仍未命中才查 MySQL 并回填；等待者短暂退避并每次醒来先复读 Redis，等待超时/租约丢失/后端不可用返回**可重试**错误。**Redis 故障导致锁归属无法确认时不再直接回源 MySQL**；显式禁用缓存（`RAG_REDIS_ENABLED=false`）时读取仍直接回源 MySQL。搜索为同步直返，响应不写 Redis，artifact 以 MySQL `artifact_snapshots` 为事实来源并按 ID 独立读取，**清空 Redis 不影响搜索结果或已签发 artifact**。`RAG_RESULT_TTL_SECONDS` 到期后 MySQL artifact 被有界清理，再读取返回 410。
 
-**文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，`RAG_DOCUMENT_LOCK_MODE=redis` 时文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。默认 `mysql` 模式行为不变（`document_leases` 行 + 心跳续写 `expires_at`）；`redis` 模式只把长租约搬到 Redis，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询，展示读取可回源 MySQL。切换与回退见[部署指南](DEPLOYMENT.md) §13。
+**文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，`RAG_DOCUMENT_LOCK_MODE=redis` 时文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。默认 `mysql` 模式行为不变（`document_leases` 行 + 心跳续写 `expires_at`）；`redis` 模式只把长租约搬到 Redis，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询。切换与回退见[部署指南](DEPLOYMENT.md) §13。
 
 ### Kafka 与队列
 

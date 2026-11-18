@@ -87,8 +87,9 @@ func TestKeyPairAndCacheRoundTrip(t *testing.T) {
 	if keys := server.Keys(); len(keys) != 2 {
 		t.Fatalf("redis keys = %v", keys)
 	}
-	if ttl := server.TTL(payloadKey); ttl != 60*time.Second {
-		t.Fatalf("payload TTL = %v, want 60s", ttl)
+	// The payload TTL is randomized per write in [48, 60] seconds by default.
+	if ttl := server.TTL(payloadKey); ttl < 48*time.Second || ttl > 60*time.Second {
+		t.Fatalf("payload TTL = %v, want within 48~60s", ttl)
 	}
 	if ttl := server.TTL(revisionKey); ttl != 0 {
 		t.Fatalf("watermark must not expire, TTL = %v", ttl)

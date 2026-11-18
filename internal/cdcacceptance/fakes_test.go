@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/Guan0923/Praxis-RAG/internal/documentworker"
 	"github.com/Guan0923/Praxis-RAG/internal/state"
@@ -39,6 +40,7 @@ type fakeStateCache struct {
 	enabled   bool
 	values    map[string]any
 	revisions map[string]int64
+	locks     map[string]string
 	failPuts  int
 	puts      int
 }
@@ -48,6 +50,7 @@ func newFakeStateCache() *fakeStateCache {
 		enabled:   true,
 		values:    map[string]any{},
 		revisions: map[string]int64{},
+		locks:     map[string]string{},
 	}
 }
 
@@ -94,6 +97,41 @@ func (f *fakeStateCache) Put(_ context.Context, kind, scope string, revision int
 	return true, nil
 }
 
+// AcquireBackfillLock mirrors the production SET NX PX semantics.
+func (f *fakeStateCache) AcquireBackfillLock(_ context.Context, kind, scope, token string, _ time.Duration) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.enabled {
+		return true, nil
+	}
+	key := transientKey(kind, scope)
+	if holder, ok := f.locks[key]; ok && holder != token {
+		return false, nil
+	}
+	f.locks[key] = token
+	return true, nil
+}
+
+func (f *fakeStateCache) RenewBackfillLock(_ context.Context, kind, scope, token string, _ time.Duration) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.enabled {
+		return true, nil
+	}
+	holder, ok := f.locks[transientKey(kind, scope)]
+	return ok && holder == token, nil
+}
+
+func (f *fakeStateCache) ReleaseBackfillLock(_ context.Context, kind, scope, token string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := transientKey(kind, scope)
+	if holder, ok := f.locks[key]; ok && holder == token {
+		delete(f.locks, key)
+	}
+	return nil
+}
+
 func (f *fakeStateCache) Close() error { return nil }
 
 // value returns the cached snapshot for one kind/scope.
@@ -123,6 +161,7 @@ func (f *fakeStateCache) clear() {
 	defer f.mu.Unlock()
 	f.values = map[string]any{}
 	f.revisions = map[string]int64{}
+	f.locks = map[string]string{}
 }
 
 // ---------------------------------------------------------------------------

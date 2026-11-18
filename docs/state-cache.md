@@ -10,7 +10,7 @@
 Redis 主要承担**持久数据展示缓存**；另有可选的**文档长租约后端**（`RAG_DOCUMENT_LOCK_MODE=redis`，默认关闭），两者共用同一 Redis 实例，但键空间、开关与 TTL 完全独立：
 
 - **异步文档入库的任务状态与文件字节保存在 MySQL**（`document_jobs`、`blobs`）：没有 Redis TTL，不会因 Redis 丢失、过期或不可用而失效；进度只由 Debezium 任务连接器 → `rag-document-worker` 推进。
-- **持久数据展示缓存**：MySQL 继续保存异步文档任务、已发布文档/源文件/解析产物、KB/API Key/catalog、artifact 快照和 UploadJournal 操作/租约；Qdrant 继续检索。下面第一、二批读模型仍可在 Redis 故障时回源 MySQL；缓存刷新由 Debezium 表级事件驱动 revision 水位，`cache_outbox` 已于 2026-11-13 下线（下文的 outbox 描述仅作历史）。
+- **持久数据展示缓存**：MySQL 继续保存异步文档任务、已发布文档/源文件/解析产物、KB/API Key/catalog、artifact 快照和 UploadJournal 操作/租约；Qdrant 继续检索。下面第一、二批读模型在 Redis 故障时按「持久读模型的读写与可靠同步」的故障行为返回可重试错误（不再直接回源 MySQL）；缓存刷新由 Debezium 表级事件驱动 revision 水位，`cache_outbox` 已于 2026-11-13 下线（下文的 outbox 描述仅作历史）。
 
 第一批缓存四种读模型（MCP 工具和提示词共用一份 catalog）：
 
@@ -59,21 +59,27 @@ Redis 主要承担**持久数据展示缓存**；另有可选的**文档长租�
 ## 持久读模型的读写与可靠同步
 
 ```text
-读取：Redis 命中 → 返回；未命中 → MySQL 一致快照 → 带修订号回填
+读取：Redis 命中 → 返回；未命中 → 按 kind+scope 争 Redis 回源锁（SET NX PX + 唯一 token）
+      → 拿到锁先复读 Redis（命中即返回）→ 仍未命中查 MySQL 一致快照 → 带修订号回填 → 释放锁
+      → 未拿到锁的请求短暂退避，每次醒来先复读 Redis；命中直接返回，仍不命中再争锁
 写入：MySQL 同事务更新业务数据 + cache_revisions（revision+1、updated_at）
       → Debezium 缓存连接器采集 binlog 投递 Kafka（只含定位列）
-      → rag-cache-worker 事务内 revision+1、重读脱敏视图、提交后写 Redis
+      → rag-cache-worker 与读取共用同一把回源锁，事务内 revision+1、重读脱敏视图、提交后写 Redis
       → 失败记录 attempts/last_error 并 ACK；周期 RefreshDirty 继续重试
 ```
 
 - 数据和版本用一个 Redis Lua 原子写入；版本使用十进制字符串比较，避免 BIGINT 超出 Lua 浮点精度。
 - 每种 kind/scope 独立递增修订号；旧消息和旧回填不能覆盖新值。
+- **Redis payload TTL 随机化**：每次写入在 `[T - floor(T/5), T]` 内随机取整秒（`RAG_REDIS_TTL_SECONDS` 为上限 T，默认 60 → **48～60 秒**），错开同一 key 的同步过期，配合回源锁抑制惊群；`revision` 水位 key 保持无过期时间，防止 payload 过期后旧回填复活已删除数据。相同修订号不能覆盖删除标记。
+- **按缓存键加 Redis 回源锁**：锁粒度为 `kind + scope`（同一知识库的文档列表共用一把锁，不同知识库可并行回源），`SET NX PX` 原子加锁；每次持锁使用唯一随机 token，续租与释放都校验 token，旧持有者无法管理新持有者的锁。持有者查询期间按 TTL/2 续租；失去租约（过期或被接管）即取消查询并放弃回填。
+- **读取流程**：请求先读 Redis，未命中才争锁；拿到锁后**再次读 Redis**（双重检查），仍未命中才查 MySQL，随后按现有版本规则回填并释放锁。未拿到锁的请求短暂退避（默认 25ms）并总先复读 Redis；等待有界（默认合计一个 TTL，5 秒），超时返回**可重试**错误，绝不绕过锁直接读 MySQL。
+- **故障行为（缓存启用时）**：Redis 故障导致锁归属无法确认时，请求返回可重试错误（等待超时、租约丢失、后端不可用三类），**取代了此前“Redis 不可读时直接回源 MySQL”的行为**；Redis Put 失败仍不失败读取（读取已从 MySQL 返回，发布由脏键扫描补偿）。缓存禁用（`RAG_REDIS_ENABLED=false`）时行为不变：读取直接回源 MySQL。
+- **后台刷新共用回源锁**：`RefreshKey` 与 `GetOrLoad` 使用同一把 `kind + scope` 锁。后台按目标 `revision` 判断刷新是否完成：锁被占用且目标版本尚未发布时，保留待刷新状态（`refreshed_revision` 仍落后），由 `RefreshDirty` 补偿完成目标版本发布。
 - MySQL 修订行是快照锁：写方先获取修订行再改业务数据；缓存未命中和消息刷新读取同一提交快照的数据与修订号。
-- Redis payload 默认 TTL 60 秒；另一个持久水位 key 保存版本/删除标记，防止 payload 过期后旧回填复活已删除数据。相同修订号不能覆盖删除标记。
 - 同步消息是 at-least-once，重复、乱序消息允许；消费者读最新数据库快照，不回放消息中的陈旧数据。
 - Redis、Kafka 都故障或进程中断时，脏状态仍保留在 MySQL `cache_revisions`（revision/refreshed_revision/last_error）；`rag-cache-worker` 周期 `RefreshDirty` 会继续重试直到成功。缓存失败不进入 DLQ，也不会回滚已提交的业务写入；需监控 dirty/failures 直到归零。
 - 同一 kind/scope 的积压刷新会合并到最新修订；成功刷新后 `refreshed_revision = revision`、`last_error = NULL`。
-- Redis 不可读时直接回源 MySQL。Redis 可读但刷新失败时可能暂时返回旧值，补偿/TTL 后收敛；这是最终一致性，不是跨库原子提交。
+- **一致性边界**：Redis 可读但刷新失败时可能暂时返回旧值，补偿/TTL 后收敛；这是最终一致性，不是跨库原子提交。回源锁防止的是“同一 key 的重复 MySQL 回填与旧持有者回填”，不是跨库原子提交。
 - 新增/更新/删除知识库刷新公开配置、文档展示及全局列表；文档发布/删除刷新文档与全局列表；MCP 修改刷新 catalog。
 - 上传未发布时，公开文档和发布指针保持旧版本，但 RUNNING/FAILED/ROLLING_BACK 等进度缓存照常提交。最终发布的 heads 和 COMMITTED/步骤状态事件，与业务记录在同一 MySQL 事务中提交；发布回滚不会留下这些未提交事件。补偿完成则另行提交 ROLLED_BACK 的状态事件。
 - 续租只刷新 leases，不制造无关步骤状态；租约过期是时间事件，展示端每次用 `expires_at`（`redis` 模式下按锁后端实时 TTL）重新计算 `expired`，不必等待缓存 TTL。
@@ -101,6 +107,7 @@ Redis 主要承担**持久数据展示缓存**；另有可选的**文档长租�
 RAG_REDIS_URL=redis://127.0.0.1:6379/0
 RAG_REDIS_ENABLED=true
 RAG_REDIS_PREFIX=rag:state:v1
+# 随机 TTL 上限 T：每次写入取 [T-floor(T/5), T] 内随机整秒（默认 60 → 48~60 秒）
 RAG_REDIS_TTL_SECONDS=60
 RAG_REDIS_TIMEOUT_SECONDS=0.3
 RAG_KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
@@ -124,7 +131,7 @@ RAG_CONNECT_DOCUMENT_CONNECTOR=praxis-document-cdc
 RAG_CONNECT_CACHE_CONNECTOR=praxis-cache-cdc
 ```
 
-`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存；artifact 保留期用 `RAG_RESULT_TTL_SECONDS=3600`（变量名保留，语义已更正为 artifact TTL）。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis：**搜索同步直返、artifact 按 ID 从 MySQL 读取，均不依赖 Redis**；被禁用的只是读模型展示缓存（读取回源 MySQL）。**文档锁与展示缓存解耦**：`RAG_DOCUMENT_LOCK_MODE` 默认 `mysql`，设 `redis` 时需要能解析出 `RAG_REDIS_LOCK_URL`（为空回退 `RAG_REDIS_URL`），且所有参与文档写入/恢复/清理的进程必须同值；`RAG_REDIS_ENABLED=false` 不影响文档锁。文档异步新增不依赖 Redis：禁用后仍可提交、查询状态并完成 MySQL 持久发布（Kafka 部署需 Debezium 完成通知投递，但不影响受理与状态查询）。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；持久数据展示读取可回源 MySQL。多实例共享相同 Redis、前缀、MySQL 和各自的 cache/document topic/group（以及两个显式 DLQ topic）。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；Kafka SASL/TLS 凭据仅从 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*` 读取。
+`RAG_REDIS_TTL_SECONDS=60` 只用于展示缓存，且为**随机 TTL 的上限**：每次写入取 `[T - floor(T/5), T]`（默认 48～60 秒）内的随机整秒，错开同步过期；artifact 保留期用 `RAG_RESULT_TTL_SECONDS=3600`（变量名保留，语义已更正为 artifact TTL）。不设置 Redis URL 或显式 `RAG_REDIS_ENABLED=false` 可禁用 Redis：**搜索同步直返、artifact 按 ID 从 MySQL 读取，均不依赖 Redis**；被禁用的只是读模型展示缓存（读取回源 MySQL，不涉及回源锁）。**文档锁与展示缓存解耦**：`RAG_DOCUMENT_LOCK_MODE` 默认 `mysql`，设 `redis` 时需要能解析出 `RAG_REDIS_LOCK_URL`（为空回退 `RAG_REDIS_URL`），且所有参与文档写入/恢复/清理的进程必须同值；`RAG_REDIS_ENABLED=false` 不影响文档锁。文档异步新增不依赖 Redis：禁用后仍可提交、查询状态并完成 MySQL 持久发布（Kafka 部署需 Debezium 完成通知投递，但不影响受理与状态查询）。同步 REST 文档上传、更新/删除仍使用 MySQL UploadJournal，不受 Redis 显式禁用影响；缓存启用时持久数据展示读取受回源锁保护，Redis 故障导致锁归属无法确认的请求返回**可重试**错误（见上文「持久读模型的读写与可靠同步」）。多实例共享相同 Redis、前缀、MySQL 和各自的 cache/document topic/group（以及两个显式 DLQ topic）。不同 MySQL 数据库使用不同 Redis 前缀，防止隔离域串数据。Redis 密码可放 URL（勿打印或提交）；Kafka SASL/TLS 凭据仅从 `RAG_KAFKA_SASL_*` / `RAG_KAFKA_TLS_*` 读取。
 
 ## Docker 与启动
 
@@ -158,4 +165,4 @@ docker exec praxis-rag-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server k
 go test -count=1 ./internal/state/ ./internal/redisstate/...
 ```
 
-历史 Python 测试已随 Python 后端删除；当前 Go 状态层的缓存/Redis 测试使用上述命令。2026-11-13 的缓存消费者改造（Debezium 缓存连接器 + revision 水位 + MarkAllDirty/RefreshDirty）以 `internal/state` 与 `internal/cacheconsumer` 单测覆盖；搜索结果快照/搜索任务相关用例已随同步化改造删除。文档锁的 Redis 后端另由 `internal/state`（冲突矩阵、迟到登记、接管围栏、Redis 丢失/不可用/释放失败、租约展示）、`internal/runtime`/`internal/documentworker` 回归与 `internal/redisstate`（两个独立客户端对真实 Redis 的 Lua/续租/TTL 集成测试）覆盖；Redis Cluster/Sentinel 与 `-race` 压测未验证。真实 Redis/SASL/TLS 集群与双连接器实链路未验证，见 [VALIDATION](../VALIDATION.md)。
+历史 Python 测试已随 Python 后端删除；当前 Go 状态层的缓存/Redis 测试使用上述命令。2026-11-13 的缓存消费者改造（Debezium 缓存连接器 + revision 水位 + MarkAllDirty/RefreshDirty）以 `internal/state` 与 `internal/cacheconsumer` 单测覆盖；搜索结果快照/搜索任务相关用例已随同步化改造删除。**2026-11-18 的随机 TTL + 回源锁改造**（随机 TTL 48～60 秒、按 `kind+scope` 加锁、双重检查读取、等待者退避复读/超时可重试、Redis 故障可重试不再回源 MySQL、`RefreshKey` 共用锁并按目标 revision 收敛）由 `internal/state` 的回源锁行为测试与 `internal/redisstate` 的锁/TTL 测试覆盖。文档锁的 Redis 后端另由 `internal/state`（冲突矩阵、迟到登记、接管围栏、Redis 丢失/不可用/释放失败、租约展示）、`internal/runtime`/`internal/documentworker` 回归与 `internal/redisstate`（两个独立客户端对真实 Redis 的 Lua/续租/TTL 集成测试）覆盖；Redis Cluster/Sentinel 与 `-race` 压测未验证。真实 Redis/SASL/TLS 集群与双连接器实链路未验证，见 [VALIDATION](../VALIDATION.md)。

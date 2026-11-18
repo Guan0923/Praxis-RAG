@@ -5,8 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/Guan0923/Praxis-RAG/internal/logging"
 )
@@ -25,6 +28,18 @@ type viewQuerier interface {
 // defaultCacheDirtyLimit bounds one dirty-key retry sweep.
 const defaultCacheDirtyLimit = 100
 
+// Backfill lock timing. The lease (5s) covers one MySQL snapshot plus its
+// publish; the renewer extends it at half the TTL while the query runs, so a
+// dead holder can never block a key for longer than one TTL. Waiters back off
+// for cacheBackfillPoll and re-read the cache on every wakeup; their total wait
+// budget equals one TTL, so after a holder exits (release or lease expiry) a
+// waiter always gets its chance to take over before timing out.
+const (
+	defaultCacheBackfillTTL   = 5 * time.Second
+	defaultCacheBackfillPoll  = 25 * time.Millisecond
+	defaultCacheBackfillWait = defaultCacheBackfillTTL
+)
+
 // CacheSynchronizer owns the MySQL revision water line and the Redis
 // read-model snapshot cache. Writers bump cache_revisions inside their business
 // transaction (touch); the Debezium cache consumer derives the affected keys,
@@ -40,6 +55,12 @@ type CacheSynchronizer struct {
 
 	loaders map[string]ViewLoader
 
+	// Backfill lock timing (see the block comment above). Tests may shrink
+	// these to keep waiters fast.
+	backfillTTL  time.Duration
+	backfillPoll time.Duration
+	backfillWait time.Duration
+
 	closeMu sync.Mutex
 	closed  bool
 }
@@ -53,10 +74,13 @@ func NewDefaultCacheSynchronizer(stores *Stores) (*CacheSynchronizer, error) {
 		return nil, err
 	}
 	return &CacheSynchronizer{
-		stores:   stores,
-		Settings: settings,
-		Backend:  DisabledStateCache{},
-		loaders:  map[string]ViewLoader{},
+		stores:       stores,
+		Settings:     settings,
+		Backend:      DisabledStateCache{},
+		loaders:      map[string]ViewLoader{},
+		backfillTTL:  defaultCacheBackfillTTL,
+		backfillPoll: defaultCacheBackfillPoll,
+		backfillWait: defaultCacheBackfillWait,
 	}, nil
 }
 
@@ -79,8 +103,21 @@ func (c *CacheSynchronizer) Loader(kind string) (ViewLoader, bool) {
 	return loader, ok
 }
 
-// GetOrLoad implements the read-through cache-miss path: a hit returns directly;
-// a miss/unavailable cache takes a revision-latched consistent snapshot.
+// GetOrLoad implements the read-through cache-miss path:
+//
+//  1. read Redis first; a hit returns directly;
+//  2. a miss contends for the per-key backfill lock (SET NX PX, one lock per
+//     kind+scope: one knowledge base's document list, different knowledge
+//     bases stay parallel);
+//  3. the winner re-reads Redis (double-checked locking), queries MySQL at the
+//     revision latch, publishes under the watermark rules, then releases;
+//  4. losers back off briefly and re-read Redis on every wakeup; a hit returns
+//     directly and a continuing miss contends again;
+//  5. a wait timeout, a lost lease, or a backend outage that leaves lock
+//     ownership unverifiable returns *CacheRetryable instead of silently
+//     reading MySQL (the pre-lock behavior).
+//
+// With the cache disabled the loader runs straight against MySQL, unchanged.
 func (c *CacheSynchronizer) GetOrLoad(ctx context.Context, kind, scope string) (any, error) {
 	loader, ok := c.loaders[kind]
 	if !ok {
@@ -89,27 +126,198 @@ func (c *CacheSynchronizer) GetOrLoad(ctx context.Context, kind, scope string) (
 	if !c.Enabled() {
 		return loader(ctx, c.stores.DB, scope)
 	}
-	hit, cached, err := c.Backend.Get(ctx, kind, scope)
-	if err == nil && hit {
+	if hit, cached, err := c.Backend.Get(ctx, kind, scope); err == nil && hit {
 		return cached, nil
 	}
+	value, err := c.getOrFill(ctx, kind, scope, loader)
 	if err != nil {
-		var unavailable *CacheUnavailable
-		if !errors.As(err, &unavailable) {
-			return nil, err
+		return nil, c.readThroughError(err)
+	}
+	return value, nil
+}
+
+// readThroughError keeps retryable failures retryable and keeps other fill
+// failures as their original (state) error types.
+func (c *CacheSynchronizer) readThroughError(err error) error {
+	var retryable *CacheRetryable
+	if errors.As(err, &retryable) {
+		return err
+	}
+	var unavailable *CacheUnavailable
+	if errors.As(err, &unavailable) {
+		return newCacheRetryable(cacheReadRetryableMessage)
+	}
+	return err
+}
+
+// getOrFill fills one cache key under the per-key backfill lock, waiting for a
+// concurrent holder when the lock is busy. The waiter re-reads the cache before
+// every renewed contention attempt and its total wait is bounded by
+// backfillWait.
+func (c *CacheSynchronizer) getOrFill(ctx context.Context, kind, scope string, loader ViewLoader) (any, error) {
+	deadline := time.Now().Add(c.backfillWait)
+	token := newBackfillToken()
+	for {
+		held, err := c.Backend.AcquireBackfillLock(ctx, kind, scope, token, c.backfillTTL)
+		if err != nil {
+			// Ownership cannot be confirmed: never fall back to MySQL here.
+			return nil, newCacheRetryable(cacheLockRetryableMessage)
+		}
+		if held {
+			return c.fillUnderLock(ctx, kind, scope, token, loader)
+		}
+		// Someone else is backfilling this key: brief backoff, then read the
+		// cache again (a hit returns without touching MySQL) and contend once
+		// more while the miss persists.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, newCacheRetryable(cacheWaitRetryableMessage)
+		}
+		pause := c.backfillPoll
+		if remaining < pause {
+			pause = remaining
+		}
+		timer := time.NewTimer(pause)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, newCacheRetryable(cacheWaitRetryableMessage)
+		case <-timer.C:
+		}
+		hit, cached, err := c.Backend.Get(ctx, kind, scope)
+		if err != nil {
+			return nil, newCacheRetryable(cacheReadRetryableMessage)
+		}
+		if hit {
+			return cached, nil
 		}
 	}
-	revision, value, err := c.snapshot(ctx, kind, scope, loader)
+}
+
+// fillUnderLock is the holder path: re-read the cache, then fill from MySQL and
+// publish. The lock is released in every branch before returning.
+func (c *CacheSynchronizer) fillUnderLock(ctx context.Context, kind, scope, token string, loader ViewLoader) (any, error) {
+	// Double-checked locking: another holder may have published between this
+	// caller's miss and its lock acquisition.
+	if hit, cached, err := c.Backend.Get(ctx, kind, scope); err == nil && hit {
+		c.releaseFill(ctx, kind, scope, token)
+		return cached, nil
+	}
+	revision, value, err := c.fillLocked(ctx, &cacheFillGuard{kind: kind, scope: scope, token: token, ttl: c.backfillTTL}, loader)
 	if err != nil {
+		c.releaseFill(ctx, kind, scope, token)
 		return nil, err
 	}
-	if _, err := c.Backend.Put(ctx, kind, scope, revision, value, value == nil); err != nil {
-		var unavailable *CacheUnavailable
-		if !errors.As(err, &unavailable) {
-			return nil, err
+	_, putErr := c.Backend.Put(ctx, kind, scope, revision, value, value == nil)
+	c.releaseFill(ctx, kind, scope, token)
+	if putErr != nil {
+		// A tolerated publish outage: the value was still read from MySQL, so
+		// the read succeeds while the payload stays absent for the next reader
+		// (the dirty-key sweep retries the publish). Other errors surface.
+		if !isCacheUnavailable(putErr) {
+			return nil, putErr
 		}
 	}
 	return value, nil
+}
+
+// cacheFillGuard tracks one acquisition of the per-key backfill lock while its
+// MySQL snapshot runs.
+type cacheFillGuard struct {
+	kind  string
+	scope string
+	token string
+	ttl   time.Duration
+
+	lost atomic.Bool
+}
+
+// fillLocked runs the revision-latched MySQL snapshot for one guarded fill. A
+// renewer goroutine extends the lease while the query is in flight; when the
+// lease is lost or its ownership becomes unverifiable the query is cancelled
+// and marked lost, and this function returns a retryable error so a stale
+// holder can never publish its result.
+func (c *CacheSynchronizer) fillLocked(ctx context.Context, guard *cacheFillGuard, loader ViewLoader) (int64, any, error) {
+	queryCtx, cancelQuery := context.WithCancel(ctx)
+	defer cancelQuery()
+	renewDone := make(chan struct{})
+	go func() {
+		defer close(renewDone)
+		guard.renewLoop(c, queryCtx, cancelQuery)
+	}()
+	revision, value, err := c.snapshot(queryCtx, guard.kind, guard.scope, loader)
+	cancelQuery()
+	<-renewDone
+	if err != nil || guard.lost.Load() {
+		if guard.lost.Load() {
+			// The snapshot may have committed in MySQL, but this holder no
+			// longer provably owns the key: the value must not be published.
+			return 0, nil, newCacheRetryable(cacheLeaseRetryableMessage)
+		}
+		return 0, nil, err
+	}
+	return revision, value, nil
+}
+
+// renewLoop keeps the backfill lease alive for the duration of the MySQL
+// query: it renews at half the TTL and stops (cancelling the query) as soon as
+// a renewal reports the lease lost or fails to confirm ownership.
+func (g *cacheFillGuard) renewLoop(sync *CacheSynchronizer, queryCtx context.Context, cancelQuery context.CancelFunc) {
+	interval := g.ttl / 2
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-queryCtx.Done():
+			return
+		case <-ticker.C:
+		}
+		// Renew with its own deadline, detached from the query's context so a
+		// slow query cannot shorten the renewal window.
+		renewCtx, cancel := context.WithTimeout(context.WithoutCancel(queryCtx), g.ttl)
+		held, err := sync.Backend.RenewBackfillLock(renewCtx, g.kind, g.scope, g.token, g.ttl)
+		cancel()
+		if err != nil || !held {
+			// Lost, or ownership is unverifiable (backend outage): stop the
+			// in-flight query and block this holder from publishing.
+			g.lost.Store(true)
+			cancelQuery()
+			return
+		}
+	}
+}
+
+// releaseFill drops the backfill lock for one token. It is idempotent, never
+// fails the caller, and detaches from the request's cancellation so a timed-out
+// caller still frees the lock instead of leaving it to expire.
+func (c *CacheSynchronizer) releaseFill(ctx context.Context, kind, scope, token string) {
+	if err := c.Backend.ReleaseBackfillLock(context.WithoutCancel(ctx), kind, scope, token); err != nil {
+		logging.FromContext(ctx).Warn("State cache backfill lock release failed",
+			logging.ErrorAttrs(err)...)
+	}
+}
+
+// newBackfillToken mints the unique lock token for one fill attempt. Tokens
+// are random and single-use: renew and release verify them, so a late
+// previous holder can never manage the next holder's lock.
+func newBackfillToken() string {
+	token, err := randomHex(16)
+	if err != nil {
+		// crypto/rand only fails in broken environments; the timestamp keeps
+		// the token unique within this process.
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return token
+}
+
+// isCacheUnavailable reports whether err is the sanitized backend-unavailable
+// failure category.
+func isCacheUnavailable(err error) bool {
+	var unavailable *CacheUnavailable
+	return errors.As(err, &unavailable)
 }
 
 // snapshot locks the revision before the first consistent read. Writers acquire
@@ -189,26 +397,61 @@ func (c *CacheSynchronizer) Revalidate(ctx context.Context, keys []CacheKey) err
 }
 
 // RefreshKey rebuilds one view at its current revision and publishes it to the
-// backend. The loader runs in the same revision-latched transaction as the
-// read-path snapshot, so the value and the watermark always agree. Success
-// records refreshed_revision and clears last_error; an unavailable backend
-// records attempts+1/last_error and returns false, nil so the caller ACKs and a
-// periodic sweep retries later.
+// backend through the same per-key backfill lock as GetOrLoad, so a background
+// refresh and a concurrent read miss serialize on one lock instead of racing.
+//
+// The snapshot's revision is the target: markRefreshed only advances the
+// refreshed watermark to it, so a writer committing a newer revision mid-refresh
+// leaves the key dirty for the next sweep. When the lock is busy and the target
+// revision has not been published yet, the pending-refresh state is kept
+// (false, nil) and the periodic RefreshDirty sweep compensates; a lost or
+// unverifiable lease does the same. Publish failures keep recording
+// attempts/last_error so the sweep retries them.
 func (c *CacheSynchronizer) RefreshKey(ctx context.Context, kind, scope string) (bool, error) {
 	loader, ok := c.loaders[kind]
 	if !ok {
 		return false, nil
 	}
-	revision, value, err := c.snapshot(ctx, kind, scope, loader)
+	if !c.Enabled() {
+		// No cache backend: no lock to share, keep the dirty state draining.
+		revision, _, err := c.snapshot(ctx, kind, scope, loader)
+		if err != nil {
+			return false, err
+		}
+		if err := c.markRefreshed(ctx, kind, scope, revision); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	token := newBackfillToken()
+	held, err := c.Backend.AcquireBackfillLock(ctx, kind, scope, token, c.backfillTTL)
 	if err != nil {
+		// Ownership unverifiable while the cache is enabled: record the
+		// failure like a publish failure and keep the key dirty for the sweep.
+		c.recordRefreshFailure(ctx, kind, scope, err)
+		return false, nil
+	}
+	if !held {
+		// Another holder (reader miss or refresh) is filling this key. Keep
+		// the pending-refresh state: refreshed_revision still lags revision,
+		// so RefreshDirty compensates later.
+		return false, nil
+	}
+	revision, value, err := c.fillLocked(ctx, &cacheFillGuard{kind: kind, scope: scope, token: token, ttl: c.backfillTTL}, loader)
+	if err != nil {
+		c.releaseFill(ctx, kind, scope, token)
+		var retryable *CacheRetryable
+		if errors.As(err, &retryable) || isCacheUnavailable(err) {
+			// The lease was lost or ownership could not be confirmed: nothing
+			// was published and the dirty row keeps the retry state.
+			return false, nil
+		}
 		return false, err
 	}
-	backend := c.Backend
-	if backend == nil || !backend.Enabled() {
-		backend = DisabledStateCache{}
-	}
-	if _, err := backend.Put(ctx, kind, scope, revision, value, value == nil); err != nil {
-		c.recordRefreshFailure(ctx, kind, scope, err)
+	_, putErr := c.Backend.Put(ctx, kind, scope, revision, value, value == nil)
+	c.releaseFill(ctx, kind, scope, token)
+	if putErr != nil {
+		c.recordRefreshFailure(ctx, kind, scope, putErr)
 		return false, nil
 	}
 	if err := c.markRefreshed(ctx, kind, scope, revision); err != nil {
