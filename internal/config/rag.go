@@ -89,9 +89,9 @@ type RagConfig struct {
 	// (RAG_PDF_SERVICE_TIMEOUT, default 900).
 	PDFServiceTimeout int
 	// DoclingServiceURL is the base URL of the Docling document parse service
-	// (RAG_DOCLING_SERVICE_URL). Empty means the service is not configured:
-	// DOC/DOCX keep the in-process OOXML parser and static HTML cannot be
-	// imported.
+	// (RAG_DOCLING_SERVICE_URL), the only Word/HTML parser. Empty means the
+	// service is not configured: DOC/DOCX and static HTML uploads are
+	// rejected at admission (there is no in-process Word parser).
 	DoclingServiceURL string
 	// DoclingServiceTimeout bounds one Docling parse call in seconds
 	// (RAG_DOCLING_SERVICE_TIMEOUT, default 300).

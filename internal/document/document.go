@@ -1,20 +1,20 @@
 // Package document ports supported-document text extraction from
-// rag_mcp.document_readers and the OOXML reader from rag_mcp.word_reader, plus
-// the storage-decoupled asset pipelines of rag_mcp.word_assets /
-// rag_mcp.pdf_assets and the OMML formula conversion used by Word reading.
+// rag_mcp.document_readers, plus the storage-decoupled asset pipelines of
+// rag_mcp.word_assets / rag_mcp.pdf_assets.
 //
-// Markdown/TXT are read in process; DOCX is parsed from the OOXML zip package
-// in process (including full caption/note association and skipped-object
-// diagnostics); PDF text is extracted in process by NativePDFParser, or by
-// PDFServiceParser when a remote vision parse service is configured.
-// Legacy .doc
-// files additionally require an external LibreOffice based converter, see
-// docconvert.go; uncaptioned Word pictures can be described by the remote VLM
-// endpoint through vision.go.
+// Markdown/TXT are read in process; PDF text is extracted in process by
+// NativePDFParser, or by PDFServiceParser when a remote vision parse service
+// is configured. DOCX has no in-process parser any more: Word (and static
+// HTML) is parsed exclusively by the independent Docling HTTP service
+// (docling_service.go); the plain reader rejects .doc/.docx with a
+// configuration error instead of parsing OOXML locally. Legacy .doc files are
+// still converted to .docx by an external LibreOffice based converter (see
+// docconvert.go) before the Docling upload, and uncaptioned Word pictures can
+// be described by the remote VLM endpoint through vision.go.
 //
 // Pipeline API (all storage decoupled; the runtime persists what these return):
-//   - ParseWordPackage -> BuildWordContent: qualified manifest, document.md text
-//     and typed Asset records (bytes, mime, document-relative identity,
+//   - DoclingServiceParser -> BuildWordContent: qualified manifest, document.md
+//     text and typed Asset records (bytes, mime, document-relative identity,
 //     checksum, size, order).
 //   - NativePDFParser -> BuildPDFContent: the same for PDF manifests, plus
 //     RenderContent for the document.md text.
@@ -164,21 +164,17 @@ type Content struct {
 	// Spans locate every non-blank block in Text.
 	Spans []Span
 	// OriginalText is the raw extracted text before block joining: the UTF-8
-	// file text for .md/.txt, the Word block join for .docx, or the joined PDF
-	// page text.
+	// file text for .md/.txt or the joined PDF page text.
 	OriginalText string
 }
 
-// Reader extracts document content. The optional PDF and DOC dependencies keep
-// external parsers injectable; a nil dependency produces the same kind of safe
+// Reader extracts document content. The optional PDF dependency keeps the
+// external parser injectable; a nil dependency produces the same kind of safe
 // read error that a missing Python parser would in practice.
 type Reader struct {
 	// PDF extracts per-page plain text for read_document/chunk_document
 	// parity. When nil, PDF documents report that no PDF parser is configured.
 	PDF PDFPages
-	// DOC converts legacy .doc files to .docx through an external converter.
-	// When nil, .doc files report the LibreOffice requirement.
-	DOC DOCConverter
 }
 
 // ReadDocument extracts block-structured content from one supported document.
@@ -205,6 +201,11 @@ func (r *Reader) ReadDocumentContext(ctx context.Context, path string) (Content,
 		// Static HTML is only parsed by the Docling service; reading it as
 		// plain text would index raw markup.
 		return Content{}, htmlReaderError(name)
+	case SuffixDOC, SuffixDOCX:
+		// Word parsing lives only in the Docling service; the in-process
+		// OOXML reader was removed, so plain reading is a configuration
+		// error instead of a local parse.
+		return Content{}, wordReaderError(name)
 	case SuffixPDF:
 		pages, err := r.pdfPages(ctx, resolved, name)
 		if err != nil {
@@ -217,12 +218,6 @@ func (r *Reader) ReadDocumentContext(ctx context.Context, path string) (Content,
 			}
 		}
 		original := pagesText(pages)
-		return assembleBlocks(blocks, original, name)
-	case SuffixDOC, SuffixDOCX:
-		blocks, original, err := r.docxDocument(ctx, resolved, name, suffix)
-		if err != nil {
-			return Content{}, err
-		}
 		return assembleBlocks(blocks, original, name)
 	case SuffixMD:
 		original, err := readUTF8(resolved, name)
@@ -245,7 +240,8 @@ func (r *Reader) ReadDocumentContext(ctx context.Context, path string) (Content,
 
 // ReadText extracts bounded plain text from one supported document. It mirrors
 // rag_mcp.document_readers.read_document_text: .md/.txt return the raw UTF-8
-// text, PDF returns the joined page text and Word returns the joined block text.
+// text and PDF returns the joined page text; Word/HTML are Docling-only and
+// fail with a configuration error instead of parsing locally.
 func ReadText(path string) (string, error) {
 	return (&Reader{}).ReadText(path)
 }
@@ -277,11 +273,7 @@ func (r *Reader) ReadTextContext(ctx context.Context, path string) (string, erro
 		}
 		return pagesText(pages), nil
 	default: // .doc, .docx
-		_, original, err := r.docxDocument(ctx, resolved, name, suffix)
-		if err != nil {
-			return "", err
-		}
-		return original, nil
+		return "", wordReaderError(name)
 	}
 }
 
@@ -298,6 +290,14 @@ func unsupportedSuffixError(suffix string) *ReadError {
 // table and picture provenance that raw markup cannot provide.
 func htmlReaderError(name string) *ReadError {
 	return readErrf("HTML 文档需要通过 Docling 解析服务导入：%s", name)
+}
+
+// wordReaderError keeps Word documents out of the plain-text reader: the
+// in-process OOXML parser was removed, so .doc/.docx is only parsed by the
+// Docling HTTP service. Reading raw package bytes would index compressed
+// markup instead of document text.
+func wordReaderError(name string) *ReadError {
+	return readErrf("Word 文档需要通过 Docling 解析服务导入：%s", name)
 }
 
 // assembleBlocks joins non-blank blocks with "\n\n" and records rune spans,

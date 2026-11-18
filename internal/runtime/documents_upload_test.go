@@ -796,7 +796,7 @@ func TestIndexConfigurationRecordsPDFParserEngine(t *testing.T) {
 		{config.PDFEngineDocling, document.PDFParserVersionService},
 	} {
 		metadata := indexConfiguration("paper.pdf", cfg, "BAAI/bge-m3", "bge-m3",
-			document.PDFParserVersionForEngine(testCase.engine), false)
+			document.PDFParserVersionForEngine(testCase.engine))
 		if got := metadata["pdf_parser_version"]; got != testCase.want {
 			t.Fatalf("engine %q pdf_parser_version = %v, want %q", testCase.engine, got, testCase.want)
 		}
@@ -807,32 +807,36 @@ func TestIndexConfigurationRecordsPDFParserEngine(t *testing.T) {
 }
 
 // TestIndexConfigurationRecordsDoclingParserVersions pins the stored parser
-// contract: DOC/DOCX record docling-word-v1 only when the Docling service is
-// configured (word-assets-v1 otherwise) and HTML always records
-// docling-html-v1, so ReadDocument and duplicate detection pick the right
-// asset bucket.
+// contract after the Docling-only cutover: DOC/DOCX always record
+// docling-word-v1 (Word parsing no longer exists outside the Docling
+// service) and HTML always records docling-html-v1, so ReadDocument and
+// duplicate detection pick the right asset bucket. Historical
+// word-assets-v1 records stay readable through
+// document.IsSupportedWordParserVersion.
 func TestIndexConfigurationRecordsDoclingParserVersions(t *testing.T) {
 	cfg, err := chunking.NewConfig("character", 700, 100)
 	if err != nil {
 		t.Fatalf("chunking.NewConfig() error = %v", err)
 	}
 	cases := []struct {
-		name    string
-		docling bool
-		key     string
-		want    string
+		name string
+		key  string
+		want string
 	}{
-		{name: "manual.docx", docling: false, key: "word_parser_version", want: document.WordParserVersion},
-		{name: "manual.doc", docling: true, key: "word_parser_version", want: document.DoclingWordParserVersion},
-		{name: "page.html", docling: false, key: "html_parser_version", want: document.HTMLParserVersion},
-		{name: "page.htm", docling: true, key: "html_parser_version", want: document.HTMLParserVersion},
+		{name: "manual.docx", key: "word_parser_version", want: document.DoclingWordParserVersion},
+		{name: "manual.doc", key: "word_parser_version", want: document.DoclingWordParserVersion},
+		{name: "page.html", key: "html_parser_version", want: document.HTMLParserVersion},
+		{name: "page.htm", key: "html_parser_version", want: document.HTMLParserVersion},
 	}
 	for _, testCase := range cases {
 		metadata := indexConfiguration(testCase.name, cfg, "BAAI/bge-m3", "bge-m3",
-			document.PDFParserVersion, testCase.docling)
+			document.PDFParserVersion)
 		if got := metadata[testCase.key]; got != testCase.want {
 			t.Fatalf("%s %s = %v, want %q", testCase.name, testCase.key, got, testCase.want)
 		}
+	}
+	if !document.IsSupportedWordParserVersion(document.WordParserVersion) {
+		t.Fatalf("historical %s records must stay readable", document.WordParserVersion)
 	}
 }
 
@@ -860,35 +864,41 @@ func TestDoclingOptionsSelectsConfiguredService(t *testing.T) {
 	}
 }
 
-// TestValidateDoclingHTMLUploadRequiresService pins the admission-time check:
-// HTML/HTM needs RAG_DOCLING_SERVICE_URL, while DOCX keeps the in-process parser
-// and the other formats are unaffected.
-func TestValidateDoclingHTMLUploadRequiresService(t *testing.T) {
+// TestValidateDoclingDocumentUploadRequiresService pins the admission-time
+// check after the Docling-only cutover: Word (.doc/.docx) and HTML/HTM all
+// need RAG_DOCLING_SERVICE_URL (there is no in-process Word parser any
+// more), while the other formats are unaffected.
+func TestValidateDoclingDocumentUploadRequiresService(t *testing.T) {
 	service := &Service{}
-	for _, name := range []string{"page.html", "page.HTM"} {
-		assertKnowledgeValidation(t, service.validateDoclingHTMLUpload([]UploadFile{uploadFile(name, "<html></html>")}),
+	for _, name := range []string{"page.html", "page.HTM", "manual.docx", "manual.DOC"} {
+		assertKnowledgeValidation(t, service.validateDoclingDocumentUpload([]UploadFile{uploadFile(name, "content")}),
 			doclingServiceRequiredMessage)
 	}
-	for _, name := range []string{"note.md", "note.txt", "manual.pdf", "manual.docx", "manual.doc"} {
-		if err := service.validateDoclingHTMLUpload([]UploadFile{uploadFile(name, "content")}); err != nil {
+	for _, name := range []string{"note.md", "note.txt", "manual.pdf"} {
+		if err := service.validateDoclingDocumentUpload([]UploadFile{uploadFile(name, "content")}); err != nil {
 			t.Fatalf("%s rejected without Docling: %v", name, err)
 		}
 	}
 	configured := &Service{config: config.RagConfig{DoclingServiceURL: "http://127.0.0.1:8092"}}
-	if err := configured.validateDoclingHTMLUpload([]UploadFile{uploadFile("page.html", "<html></html>")}); err != nil {
-		t.Fatalf("configured HTML upload rejected: %v", err)
+	for _, name := range []string{"page.html", "manual.docx", "manual.doc"} {
+		if err := configured.validateDoclingDocumentUpload([]UploadFile{uploadFile(name, "content")}); err != nil {
+			t.Fatalf("configured %s upload rejected: %v", name, err)
+		}
 	}
 }
 
-// TestUploadRejectsHTMLWithoutDocling pins that the rejection happens while the
-// upload is accepted: no journal operation or document is written.
-func TestUploadRejectsHTMLWithoutDocling(t *testing.T) {
+// TestUploadRejectsDoclingOnlyFormatsWithoutService pins that the rejection
+// happens while the upload is accepted: no journal operation or document is
+// written. Word and HTML are both rejected the same way now.
+func TestUploadRejectsDoclingOnlyFormatsWithoutService(t *testing.T) {
 	service, stores, qdrantFake, _ := newUploadService(t)
 	ctx := context.Background()
 
-	_, err := service.uploadDocuments(ctx, "alpha",
-		[]UploadFile{uploadFile("page.html", "<html><body>raw</body></html>")}, "")
-	assertKnowledgeValidation(t, err, doclingServiceRequiredMessage)
+	for _, name := range []string{"page.html", "manual.docx", "legacy.doc"} {
+		_, err := service.uploadDocuments(ctx, "alpha",
+			[]UploadFile{uploadFile(name, "content")}, "")
+		assertKnowledgeValidation(t, err, doclingServiceRequiredMessage)
+	}
 
 	var operations int
 	if err := stores.DB.QueryRowContext(ctx,
@@ -896,16 +906,16 @@ func TestUploadRejectsHTMLWithoutDocling(t *testing.T) {
 		t.Fatalf("count upload_operations error = %v", err)
 	}
 	if operations != 0 {
-		t.Fatalf("upload journal has %d rows after a rejected HTML upload", operations)
+		t.Fatalf("upload journal has %d rows after a rejected upload", operations)
 	}
 	documents, err := stores.Documents.List(ctx, "alpha")
 	if err != nil {
 		t.Fatalf("Documents.List() error = %v", err)
 	}
 	if len(documents) != 0 {
-		t.Fatalf("documents after a rejected HTML upload = %+v", documents)
+		t.Fatalf("documents after a rejected upload = %+v", documents)
 	}
 	if puts := qdrantFake.find("PUT", "/points"); len(puts) != 0 {
-		t.Fatalf("rejected HTML upload wrote %d Qdrant upserts", len(puts))
+		t.Fatalf("rejected upload wrote %d Qdrant upserts", len(puts))
 	}
 }

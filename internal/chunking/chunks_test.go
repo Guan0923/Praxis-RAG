@@ -268,51 +268,105 @@ func TestPDFChunkingSurfacesOCRRequirement(t *testing.T) {
 }
 
 func TestWordSectionsTablesAndLongRows(t *testing.T) {
+	// The in-process Word reader is gone (.docx is Docling-only), so the
+	// structure-aware Word splitting is exercised on the document.Content
+	// block view directly (the Docling manifest projects to the same Block
+	// shape): a heading, body text, a second heading and long table rows.
 	longCell := strings.Repeat("检查传感器然后重启。", 100)
-	body := `<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>设备手册</w:t></w:r></w:p>` +
-		`<w:p><w:r><w:t>正常使用。</w:t></w:r></w:p>` +
-		`<w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>故障处理</w:t></w:r></w:p>` +
-		`<w:tbl><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid>` +
-		`<w:tr><w:tc><w:p><w:r><w:t>代码</w:t></w:r></w:p></w:tc>` +
-		`<w:tc><w:p><w:r><w:t>处理方法</w:t></w:r></w:p></w:tc></w:tr>` +
-		`<w:tr><w:tc><w:p><w:r><w:t>E03</w:t></w:r></w:p></w:tc>` +
-		`<w:tc><w:p><w:r><w:t>` + longCell + `</w:t></w:r></w:p></w:tc></w:tr></w:tbl>` +
-		`<w:p><w:r><w:t>处理结束。</w:t></w:r></w:p>`
-	path := buildDOCXFixture(t, body)
+	rows := [][]string{
+		{"代码", "处理方法"},
+		{"E03", longCell},
+	}
+	tableNumber := 1
+	blocks := []document.Block{
+		{Text: "设备手册", Kind: document.KindHeading, Headings: []string{"设备手册"}},
+		{Text: "正常使用。", Kind: document.KindParagraph, Headings: []string{"设备手册"}},
+		{Text: "故障处理", Kind: document.KindHeading, Headings: []string{"设备手册", "故障处理"}},
+	}
+	for _, row := range rows {
+		cells := make([]string, len(row))
+		for index, cell := range row {
+			cells[index] = strings.ReplaceAll(cell, "|", `\|`)
+		}
+		blocks = append(blocks, document.Block{
+			Text: strings.Join(cells, " | "), Kind: document.KindTableRow,
+			Headings: []string{"设备手册", "故障处理"}, Table: tableNumber,
+		})
+	}
+	blocks = append(blocks, document.Block{
+		Text: "处理结束。", Kind: document.KindParagraph, Headings: []string{"设备手册", "故障处理"},
+	})
+	// Assemble the joined text and spans the way document.Content carries
+	// them for the structure splitter.
+	parts := make([]string, len(blocks))
+	spans := make([]document.Span, 0, len(blocks))
+	offset := 0
+	for index, block := range blocks {
+		if index > 0 {
+			offset += 2
+		}
+		length := len([]rune(block.Text))
+		spans = append(spans, document.Span{
+			Start: offset, End: offset + length, Block: block, Paragraph: len(spans) + 1,
+		})
+		parts[index] = block.Text
+		offset += length
+	}
+	content := document.Content{Text: strings.Join(parts, "\n\n"), Spans: spans}
 
 	config := mustConfig(t, "structure", 64, 12)
-	chunks, err := ChunkDocument(path, ChunkOptions{Config: &config, Counter: runeCounter{}})
+	budget, err := NewTokenBudget(runeCounter{}, config)
 	if err != nil {
-		t.Fatalf("ChunkDocument() error = %v", err)
+		t.Fatalf("NewTokenBudget() error = %v", err)
 	}
-	checkTokenChunks(t, path, chunks, runeCounter{}, 64, nil)
-
+	ranges, err := SplitContent(content, document.SuffixDOCX, config, budget)
+	if err != nil {
+		t.Fatalf("SplitContent() error = %v", err)
+	}
+	if len(ranges) < 3 {
+		t.Fatalf("ranges = %v", ranges)
+	}
+	runes := []rune(content.Text)
 	tableRowLocation := false
 	headingPath := false
-	for _, chunk := range chunks {
-		if chunk.Metadata["document_suffix"] != ".docx" {
-			t.Fatalf("document_suffix = %v", chunk.Metadata["document_suffix"])
+	for _, span := range ranges {
+		start, end := span.Start, span.End
+		for start < end && unicode.IsSpace(runes[start]) {
+			start++
 		}
-		locations, ok := chunk.Metadata["locations"].([]map[string]any)
+		for end > start && unicode.IsSpace(runes[end-1]) {
+			end--
+		}
+		if start >= end {
+			continue
+		}
+		metadata := SourceMetadata(content, start, end)
+		locations, ok := metadata["locations"].([]map[string]any)
 		if !ok {
-			t.Fatalf("locations = %v", chunk.Metadata["locations"])
+			t.Fatalf("locations = %v", metadata["locations"])
 		}
 		for _, location := range locations {
 			if location["kind"] == document.KindTableRow {
 				tableRowLocation = true
 			}
 		}
-		if paths, ok := chunk.Metadata["heading_paths"].([][]string); ok {
+		if paths, ok := metadata["heading_paths"].([][]string); ok {
 			if containsPath(paths, []string{"设备手册", "故障处理"}) {
 				headingPath = true
 			}
 		}
 	}
 	if !tableRowLocation {
-		t.Fatalf("no table_row location in chunks")
+		t.Fatalf("no table_row location in split ranges")
 	}
 	if !headingPath {
 		t.Fatalf("heading path 设备手册/故障处理 missing")
+	}
+	// Long rows are still split into bounded pieces.
+	for _, span := range ranges {
+		if length := span.End - span.Start; length > 64 {
+			t.Fatalf("range length %d over limit", length)
+		}
 	}
 }
 

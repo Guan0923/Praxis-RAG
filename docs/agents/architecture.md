@@ -45,6 +45,7 @@ MCP search / REST /v1/search（同步）→ runtime.Service.Search → SearchEng
 - **搜索永远同步**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，没有任务 ID、`wait_seconds` 或轮询；artifact 按 ID 独立读取（保留期 `RAG_RESULT_TTL_SECONDS`）。
 - **文档解析必须走 Kafka**：`rag-service` 不内嵌文档消费者；未配置 Kafka + Kafka Connect 的两个 Debezium 连接器 + `rag-document-worker` 时，上传仍会受理，但文档任务停留在 `queued`。
 - **PDF 双引擎**：`RAG_PDF_ENGINE=vision`（compose `app` 默认；为空时按是否配置 `RAG_PDF_SERVICE_URL` 决定）走 pdf-parser，由远端 OpenAI 兼容视觉模型完成版面/OCR/表格/公式/图片描述；旧值 `docling` 作为兼容别名等价于 `vision`；`go` 使用 Go 进程内纯文本引擎。pdf-service 本地不加载任何模型权重。
+- **Word/HTML 只走 Docling 服务**：`.docx`/`.doc`（先经 LibreOffice 转换）与静态 HTML 一律由独立的 `docling-service`（`RAG_DOCLING_SERVICE_URL`）解析；进程内 OOXML Word 解析已删除，未配置该 URL 时这些格式的上传在受理阶段被拒绝。
 
 ## 2. 进程与可执行文件
 
@@ -92,7 +93,7 @@ examples/knowledge/         示例知识文档（可直接上传试用）
 | `config` | 环境变量、`~/.praxis-rag/config.toml`、启动校验（含可选飞书应用配置） |
 | `contracts` | 检索/MCP 请求契约、JSON Schema、错误语义 |
 | `feishu` | 可选飞书导入：OAuth state/换 token/刷新、用户信息、文件夹/搜索/正文客户端、逐文档读取与安全文件名 |
-| `document` | PDF 原生解析、PDF 视觉服务客户端、DOCX、DOC 转换、公式、VLM、图片/表格资产 |
+| `document` | PDF 原生解析、PDF 视觉服务客户端、Docling Word/HTML 服务客户端、DOC 转换、VLM、图片/表格资产 |
 | `documentworker` | 文档任务处理器（仅由 Kafka 消费者 `rag-document-worker` 调用） |
 | `httpapi` | REST 路由、认证中间件、OpenAPI、Console 静态资源 |
 | `ingest` | “解析 → 切分 → Embedding → Qdrant 发布”管线 |

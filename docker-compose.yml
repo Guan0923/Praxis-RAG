@@ -286,16 +286,17 @@ services:
 
   # Docling document parsing microservice: one HTTP endpoint (FastAPI on
   # :8092) that turns .docx and .html/.htm uploads into Markdown plus assets.
-  # The Go app calls it over HTTP only when RAG_DOCLING_SERVICE_URL is set.
-  # With an empty URL Docling stays disabled: .docx/.doc keep the in-process
-  # OOXML parser and .html/.htm cannot be imported. The service never receives
-  # .doc directly: the Go app converts it with LibreOffice and uploads the
-  # resulting .docx.
+  # The Go app calls it over HTTP through RAG_DOCLING_SERVICE_URL; it is the
+  # only Word/HTML parser (the in-process OOXML reader was removed), so with
+  # an empty URL those uploads are rejected at admission. The service never
+  # receives .doc directly: the Go app converts it with LibreOffice and
+  # uploads the resulting .docx.
   # The PDF path is unchanged: PDF still goes through pdf-parser above.
   # No profile: `docker compose up -d` starts it together with the
-  # infrastructure, so a deployment that only ingests .md/.txt/.pdf can skip it
-  # with `docker compose up -d mysql qdrant redis kafka` and/or
-  # `docker compose stop docling-service`.
+  # infrastructure, so a deployment that only ingests .md/.txt/.pdf can skip
+  # it with `docker compose up -d mysql qdrant redis kafka` and/or
+  # `docker compose stop docling-service` (Word/HTML uploads then fail
+  # admission with a configuration error).
   # Dependency versions, the image build and the local (non-container) start
   # command live in python-workers/docling-service/README.md.
   docling-service:
@@ -419,14 +420,14 @@ services:
       RAG_PDF_ENGINE: ${RAG_PDF_ENGINE:-vision}
       RAG_PDF_SERVICE_URL: ${RAG_PDF_SERVICE_URL:-http://pdf-parser:8091}
       RAG_PDF_SERVICE_TIMEOUT: ${RAG_PDF_SERVICE_TIMEOUT:-900}
-      # Docling parsing: .docx and .html/.htm uploads are converted by the
-      # docling-service sidecar (zip: Markdown + assets); .doc is converted
-      # locally by LibreOffice and uploaded as .docx. An empty value disables
-      # Docling: .docx/.doc keep the in-process OOXML parser and .html/.htm
-      # cannot be imported (HTML requires the service). PDF parsing is
-      # unaffected and still uses the RAG_PDF_* pair above. The `-` (not `:-`)
-      # fallback keeps an explicit empty .env value empty, which is how this
-      # deployment disables the service.
+      # Docling parsing: .docx/.doc and .html/.htm uploads are all converted
+      # by the docling-service sidecar (zip: Markdown + assets); .doc is
+      # converted locally by LibreOffice and uploaded as .docx. This service
+      # is the only Word/HTML parser (the in-process OOXML reader was
+      # removed): an empty value makes those uploads fail at admission with
+      # a configuration error. PDF parsing is unaffected and still uses the
+      # RAG_PDF_* pair above. The `-` (not `:-`) fallback keeps an explicit
+      # empty .env value empty for deployments that skip Word/HTML ingest.
       RAG_DOCLING_SERVICE_URL: ${RAG_DOCLING_SERVICE_URL-http://docling-service:8092}
       RAG_DOCLING_SERVICE_TIMEOUT: ${RAG_DOCLING_SERVICE_TIMEOUT:-300}
       RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}

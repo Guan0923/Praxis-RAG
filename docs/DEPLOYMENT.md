@@ -41,7 +41,7 @@ Connect worker 宕机后，peer 接管 task 并从保存位点继续，不依赖
 
 - **按部署形态选择进程**：`rag-service` 只受理上传、同步搜索与后台维护，不内嵌任何消费者；文档/缓存/死信 worker 全部独立部署。文档解析必须由 `rag-document-worker` 通过 Kafka 消费完成；未部署时上传仍会受理，但文档任务保持 `queued`。缓存变更由 `rag-cache-worker` 消费；未部署时 Redis 读模型最终一致会延后（周期补偿也依赖该进程），但 MySQL 事实不受影响。worker 不监听端口。
 - **PDF 解析引擎可选**：默认 `RAG_PDF_ENGINE=vision` 时，`rag-service`/`rag-document-worker` 通过 `RAG_PDF_SERVICE_URL` 调用独立进程 `pdf-parser`（容器端口 8091，健康检查 `/healthz`）；它不连接状态库/Qdrant，本地只做 PDF 读取/渲染/裁图与结果组装，版面/OCR/表格/公式/图片描述统一调用远端视觉模型，最终把 PDF 转成 zip（`manifest.json` + 图片资产）。`RAG_PDF_ENGINE=go` 时 pdf-parser 不需要运行，PDF 由 Go 内置纯文本引擎处理。旧值 `docling` 作为兼容别名等价于 `vision`。详见 §3.5。
-- **Word/HTML 解析可选接入 Docling 服务**：配置 `RAG_DOCLING_SERVICE_URL` 后，`rag-service`/`rag-document-worker` 通过 HTTP 调用 `docling-service`（容器端口 8092，健康检查 `/healthz`）解析 `.docx` 与 `.html`/`.htm`；`.doc` 先由 LibreOffice 转成 `.docx` 再交给同一服务。该变量为空时不启用 Docling：`.docx`/`.doc` 仍由 Go 进程内 OOXML 解析（历史行为），`.html`/`.htm` 不可导入；`.md`/`.txt`/`.pdf` 不受影响。已配置但服务不可达时任务失败并按既有重试策略处理，不回退进程内解析。PDF 解析链路完全不变。详见 §3.6。
+- **Word/HTML 解析必须接入 Docling 服务**：`rag-service`/`rag-document-worker` 通过 HTTP 调用 `docling-service`（容器端口 8092，健康检查 `/healthz`）解析 `.docx` 与 `.html`/`.htm`；`.doc` 先由 LibreOffice 转成 `.docx` 再交给同一服务。必须配置 `RAG_DOCLING_SERVICE_URL`：该变量为空时 Word/HTML 上传在受理阶段被拒绝（进程内 Word 解析已删除）；`.md`/`.txt`/`.pdf` 不受影响。已配置但服务不可达时任务失败并按既有重试策略处理，没有进程内回退。PDF 解析链路完全不变。详见 §3.6。
 - 所有进程必须共享同一份基础设施配置：`RAG_CONFIG_FILE`、`RAG_SERVICE_DATA_ROOT`、`RAG_STATE_*`、`RAG_BACKEND=qdrant`/`QDRANT_URL`、`RAG_STATE_ENCRYPTION_KEY`、Redis 与 Kafka（bootstrap、topic/group、DLQ）设置。配置不一致会造成 401/找不到任务/重复发布等难以排查的问题。
 - 上传默认异步受理：`rag-service + Qdrant + 状态库` 只能受理；完整的解析/索引还需要 Kafka + **分布式 Kafka Connect 集群（含两个 Debezium MySQL 连接器）** + `rag-document-worker`（`scripts/start-stack.ps1` 在开发环境会自动启动）；缓存收敛需要 cache worker。搜索在 `rag-service` 内同步执行，不需要 search worker、搜索 topic 或 Redis。
 
@@ -108,9 +108,9 @@ docker run -d --name praxis-rag-service \
 
 - 公开到宿主机时加 TLS 反向代理；不要直接把 8011 暴露到公网。
 - 使用 MySQL 时先执行一次 schema 检查/建表（见 §6）：`docker run --rm --entrypoint /app/bin/rag-state-migrate ... --apply`。
-- 镜像不含 Python 或 LibreOffice：PDF 高保真解析调用独立的 `pdf-parser`（见 §3.5），使用 `RAG_PDF_ENGINE=go` 时不需要它；配置 `RAG_DOCLING_SERVICE_URL` 后 Word（`.docx`，`.doc` 先经 LibreOffice 转换）与 HTML（`.html`/`.htm`）解析调用独立的 `docling-service`（见 §3.6），未配置时 `.docx`/`.doc` 仍走进程内 OOXML、HTML 不可导入；只有 .doc 转换需要把 LibreOffice bind mount 进容器并设置 `RAG_WORD_CONVERTER_PATH`；转换进程的路径必须在容器内可见。
+- 镜像不含 Python 或 LibreOffice：PDF 高保真解析调用独立的 `pdf-parser`（见 §3.5），使用 `RAG_PDF_ENGINE=go` 时不需要它；Word（`.docx`，`.doc` 先经 LibreOffice 转换）与 HTML（`.html`/`.htm`）解析一律调用独立的 `docling-service`（见 §3.6，必须配置 `RAG_DOCLING_SERVICE_URL`，未配置时这些格式被拒绝）；只有 .doc 转换需要把 LibreOffice bind mount 进容器并设置 `RAG_WORD_CONVERTER_PATH`；转换进程的路径必须在容器内可见。
 - PDF 高保真解析：设置 `RAG_PDF_ENGINE=vision` 并把 `RAG_PDF_SERVICE_URL` 指向 pdf-parser（同一 compose 网络用 `http://pdf-parser:8091`；单独 `docker run` 时用从容器内可达的地址，如 `http://host.docker.internal:8091`）；调用总超时用 `RAG_PDF_SERVICE_TIMEOUT`（默认 900 秒），真正开始解析后的单次上限用 `RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120 秒，排队等待不计入）。pdf-parser 不可用时 vision 上传会失败，可切回 `RAG_PDF_ENGINE=go`。
-- Word/HTML 解析：设置 `RAG_DOCLING_SERVICE_URL` 指向 docling-service（同一 compose 网络用 `http://docling-service:8092`；单独 `docker run` 时用从容器内可达的地址）；单次调用超时用 `RAG_DOCLING_SERVICE_TIMEOUT`（默认 300 秒，1..7200）。**该变量为空时不启用 Docling**：`.docx`/`.doc` 仍由 Go 进程内 OOXML 解析，`.html`/`.htm` 不可导入；已配置但服务不可用或超时会让该次文档任务失败并按既有重试策略处理（不回退进程内解析）。详见 §3.6。
+- Word/HTML 解析：设置 `RAG_DOCLING_SERVICE_URL` 指向 docling-service（同一 compose 网络用 `http://docling-service:8092`；单独 `docker run` 时用从容器内可达的地址）；单次调用超时用 `RAG_DOCLING_SERVICE_TIMEOUT`（默认 300 秒，1..7200）。**该变量必配**：为空时 Word/HTML 上传在受理阶段被拒绝（进程内 Word 解析已删除）；已配置但服务不可用或超时会让该次文档任务失败并按既有重试策略处理（没有进程内回退）。详见 §3.6。
 - 远端 OpenAI 兼容视觉模型：优先在 Console 的知识库设置页配置（URL/Key/模型），也可用 `RAG_VLM_BASE_URL`、`RAG_VLM_API_KEY`、`RAG_VLM_MODEL`（可选 `RAG_VLM_TIMEOUT`/`RAG_VLM_CONCURRENCY`）作为未配置知识库时的环境回退。图片内容会离开本机到该端点，选型时确认合规。该端点用于 vision 引擎的 PDF 版面/OCR/表格/公式/图片描述；vision 引擎要求知识库配置 VLM（Console「模型配置」页添加并在知识库表单选择），否则 PDF 上传会在受理阶段被拒绝并提示配置。Word/HTML 解析产物的图片与图注以 docling-service 返回的清单为准（见 §3.6）。
 - 数据目录卷保存上传恢复工作区与 artifact 工作区；不要用匿名卷。
 - 文档长租约默认由 MySQL `document_leases` 承担；设置 `RAG_DOCUMENT_LOCK_MODE=redis` 时，必须让 `rag-service`、`rag-document-worker` 与 `rag-mcp-ingest` 使用同一组 `RAG_REDIS_LOCK_*` 配置，切换/回退见 §13。
@@ -125,7 +125,7 @@ docker compose --profile app up -d --build
 docker compose up -d mysql qdrant redis kafka
 ```
 
-`app` 服务从 `.env` 读取 `RAG_SERVICE_TOKEN`（容器 0.0.0.0 绑定，必填）、`RAG_MYSQL_*`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_APP_QDRANT_URL`、`RAG_APP_PORT`、`RAG_APP_KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`RAG_AUTH_*`（Console 登录，见下）、`RAG_FEISHU_*`（可选飞书导入，见下）、`RAG_PDF_ENGINE`（默认 `vision`）、`RAG_PDF_SERVICE_URL`（compose 内默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120）、`RAG_DOCLING_SERVICE_URL`（compose 内默认 `http://docling-service:8092`，在 `.env` 中显式留空即可禁用 Docling：`.docx`/`.doc` 回退进程内 OOXML、HTML 不可导入）、`RAG_DOCLING_SERVICE_TIMEOUT`（默认 300）、`RAG_DOCUMENT_LOCK_MODE`/`RAG_REDIS_LOCK_*`（文档锁，见 §13）等；默认依赖 MySQL healthy + Qdrant started + Kafka healthy + pdf-parser started + docling-service started。`pdf-parser` 与 `docling-service` 都没有 profile，默认 `docker compose up -d` 即启动；前者只在 `vision` 引擎下被调用，后者在配置了 `RAG_DOCLING_SERVICE_URL` 时被调用。详细的环境变量见 §3.5、§3.6。
+`app` 服务从 `.env` 读取 `RAG_SERVICE_TOKEN`（容器 0.0.0.0 绑定，必填）、`RAG_MYSQL_*`、`RAG_STATE_ENCRYPTION_KEY`、`RAG_APP_QDRANT_URL`、`RAG_APP_PORT`、`RAG_APP_KAFKA_BOOTSTRAP_SERVERS`（默认 `kafka:9092`）、`RAG_AUTH_*`（Console 登录，见下）、`RAG_FEISHU_*`（可选飞书导入，见下）、`RAG_PDF_ENGINE`（默认 `vision`）、`RAG_PDF_SERVICE_URL`（compose 内默认 `http://pdf-parser:8091`）、`RAG_PDF_SERVICE_TIMEOUT`（默认 900）、`RAG_PDF_SERVICE_PARSE_TIMEOUT`（默认 120）、`RAG_DOCLING_SERVICE_URL`（compose 内默认 `http://docling-service:8092`；留空会禁用 Word/HTML 导入：这些格式的上传在受理阶段被拒绝）、`RAG_DOCLING_SERVICE_TIMEOUT`（默认 300）、`RAG_DOCUMENT_LOCK_MODE`/`RAG_REDIS_LOCK_*`（文档锁，见 §13）等；默认依赖 MySQL healthy + Qdrant started + Kafka healthy + pdf-parser started + docling-service started。`pdf-parser` 与 `docling-service` 都没有 profile，默认 `docker compose up -d` 即启动；前者只在 `vision` 引擎下被调用，后者在配置了 `RAG_DOCLING_SERVICE_URL` 时被调用。详细的环境变量见 §3.5、§3.6。
 
 ### 3.4 Compose：worker 示例（需自行保存为 override 文件）
 
@@ -288,7 +288,7 @@ docker run -d --name praxis-rag-pdf-parser \\
 
 与其他解析路径的关系：
 
-- `.doc` 转换仍由 Go 服务调用外部 LibreOffice，不经过 pdf-parser；配置了 Docling 时转换结果作为 `.docx` 交给 docling-service（见 §3.6），未配置时由进程内 OOXML 解析。
+- `.doc` 转换仍由 Go 服务调用外部 LibreOffice，不经过 pdf-parser；转换结果作为 `.docx` 交给 docling-service（见 §3.6，Docling 是唯一的 Word 解析器）。
 - `RAG_PDF_ENGINE=go` 时 PDF 由 Go 纯文本引擎处理（无版面/表格/OCR/公式），此时 Go 服务不调用
   pdf-parser，可以 `docker compose stop pdf-parser` 释放资源；但下次 `docker compose up -d`
   仍会按默认 profile 启动它，可用 `docker compose up -d mysql qdrant redis kafka` 跳过。
@@ -296,9 +296,9 @@ docker run -d --name praxis-rag-pdf-parser \\
 
 ## 3.6 Docling 文档解析微服务（docling-service）
 
-`docling-service` 是独立容器/进程（`python-workers/docling-service`，FastAPI）：只接收 `.docx`、`.html`、`.htm` 三种格式（`.doc` 由 Go 侧先调用 LibreOffice 转成 `.docx` 再上传，服务不直接接收 `.doc`），返回 `application/zip`（版本化清单、序列化的 `DoclingDocument` 与图片资产；`document.md` 预览产物由 Go 生成），供 Go 端安全解压、切分入库。Go 服务只通过 HTTP 调用它，Python 不进入 app 镜像；**PDF 解析仍由 §3.5 的 pdf-parser 负责，本服务不处理 PDF**。配置该服务后 `.docx`/`.doc`/`.html`/`.htm` 都走它；未配置时 `.docx`/`.doc` 保持 Go 进程内 OOXML 解析，HTML 不可导入。
+`docling-service` 是独立容器/进程（`python-workers/docling-service`，FastAPI）：只接收 `.docx`、`.html`、`.htm` 三种格式（`.doc` 由 Go 侧先调用 LibreOffice 转成 `.docx` 再上传，服务不直接接收 `.doc`），返回 `application/zip`（版本化清单、序列化的 `DoclingDocument` 与图片资产；`document.md` 预览产物由 Go 生成），供 Go 端安全解压、切分入库。Go 服务只通过 HTTP 调用它，Python 不进入 app 镜像；**PDF 解析仍由 §3.5 的 pdf-parser 负责，本服务不处理 PDF**。`.docx`/`.doc`/`.html`/`.htm` 一律走它（该服务是唯一的 Word/HTML 解析器）；未配置时这些格式的上传在受理阶段被拒绝。
 
-接口固定：`GET /healthz`、`POST /v1/parse`（multipart 字段 `file`，成功返回 `application/zip`）。接口不做认证，只应在本机/内网暴露。Go 端通过 `RAG_DOCLING_SERVICE_URL` 找到它；**该变量为空时 Docling 不启用**：`.docx`/`.doc` 仍由 Go 进程内 OOXML 解析，`.html`/`.htm` 不可导入（`.md`/`.txt`/`.pdf` 不受影响）。已配置但服务不可达时任务失败并按既有重试策略处理，不会静默回退到进程内解析。
+接口固定：`GET /healthz`、`POST /v1/parse`（multipart 字段 `file`，成功返回 `application/zip`）。接口不做认证，只应在本机/内网暴露。Go 端通过 `RAG_DOCLING_SERVICE_URL` 找到它；**该变量必配**：为空时 Word/HTML 上传在受理阶段被拒绝并提示配置（`.md`/`.txt`/`.pdf` 不受影响）。已配置但服务不可达时任务失败并按既有重试策略处理，没有进程内解析可回退。
 
 Compose 部署（`docling-service` 没有 profile，默认 `docker compose up -d` 就会启动）：
 
@@ -345,9 +345,9 @@ docker run -d --name praxis-rag-docling-service \
 - **依赖版本**：Docling `2.150.1`（`docling-slim[convert-core,format-docx,format-html]`）、服务契约 `docling-service-v1`、清单版本 `docling-word-v1` / `docling-html-v1`；升级 Docling 必须按该服务 README 重跑测试，本文不重复维护版本号。（以 [python-workers/docling-service/README.md](../python-workers/docling-service/README.md) 为准。）
 - **资源**：解析是 CPU/内存敏感操作，先保持 `RAG_DOCLING_SERVICE_CONCURRENCY=1`，需要吞吐时再与文档 worker 并发、容器资源一起调大。
 - **依赖与本地启动**：Python 依赖版本、镜像构建参数与不经过容器的启动命令以 [python-workers/docling-service/README.md](../python-workers/docling-service/README.md) 为准；镜像构建、容器运行与真实业务文档质量未验证（服务自身测试使用真实 Docling 2.150.1，见 §10）。
-- **`app` profile 的依赖**：compose 的 `app` 服务 `depends_on` 该服务（`service_started`）；不需要 Docling 解析时可在 `.env` 把 `RAG_DOCLING_SERVICE_URL` 留空，并用 `docker compose up -d mysql qdrant redis kafka` 之类显式服务列表跳过它。
+- **`app` profile 的依赖**：compose 的 `app` 服务 `depends_on` 该服务（`service_started`）；不需要 Word/HTML 导入时可在 `.env` 把 `RAG_DOCLING_SERVICE_URL` 留空（Word/HTML 上传会被受理层拒绝），并用 `docker compose up -d mysql qdrant redis kafka` 之类显式服务列表跳过它。
 - **HTML 限制与预览**：HTML 中的外部/相对图片不会被抓取，只保留文字说明（如替代文本）；Console 只展示解析后的纯文本，不在同源页面渲染上传的 HTML（该页面与 REST API 同源并持有调用方凭据）。
-- **与其他解析路径的关系**：配置 Docling 时 `.doc` 仍由 Go 服务调用外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）转成 `.docx`，不经过 pdf-parser，转换结果交给本服务；未配置时由进程内 OOXML 解析。`.md`/`.txt` 直接读取；PDF 完全走 §3.5 的链路。
+- **与其他解析路径的关系**：`.doc` 由 Go 服务调用外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）转成 `.docx`，不经过 pdf-parser，转换结果交给本服务。`.md`/`.txt` 直接读取；PDF 完全走 §3.5 的链路。
 
 ## 4. systemd 部署
 
@@ -414,8 +414,8 @@ RAG_PDF_SERVICE_URL=http://127.0.0.1:8091
 RAG_PDF_SERVICE_TIMEOUT=900
 RAG_PDF_SERVICE_PARSE_TIMEOUT=120
 # Word/HTML 的 Docling 解析服务（服务只接收 .docx/.html/.htm；.doc 由 Go 侧
-# 调 LibreOffice 转成 .docx 后上传）。留空即禁用 Docling：.docx/.doc 回退进程内
-# OOXML 解析、HTML 不可导入。超时默认 300 秒，两侧同值。
+# 调 LibreOffice 转成 .docx 后上传）。该服务是唯一的 Word/HTML 解析器；留空时
+# 这些格式的上传会被受理层拒绝。超时默认 300 秒，两侧同值。
 RAG_DOCLING_SERVICE_URL=http://127.0.0.1:8092
 RAG_DOCLING_SERVICE_TIMEOUT=300
 # RAG_VLM_BASE_URL=https://llm.internal/v1

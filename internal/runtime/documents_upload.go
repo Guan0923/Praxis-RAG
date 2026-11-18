@@ -56,12 +56,12 @@ type documentOperationError struct {
 // work, so users are sent to 模型配置 instead of seeing a parse failure later.
 const remotePDFModelsRequiredMessage = "PDF 解析需要先在「模型配置」页添加视觉模型（VLM），并在知识库配置中选择后再上传。"
 
-// doclingServiceRequiredMessage is the fixed Chinese rejection shown when an
-// HTML/HTM file is uploaded before RAG_DOCLING_SERVICE_URL is configured.
-// Static HTML has no in-process parser (reading it as text would index raw
-// markup), so the upload is rejected at admission instead of failing later in
-// the worker.
-const doclingServiceRequiredMessage = "HTML 文档需要配置 Docling 解析服务（RAG_DOCLING_SERVICE_URL）。"
+// doclingServiceRequiredMessage is the fixed Chinese rejection shown when a
+// Word (.doc/.docx) or HTML/HTM file is uploaded before RAG_DOCLING_SERVICE_URL
+// is configured. Word parsing lives only in the Docling service (the in-process
+// OOXML parser was removed) and static HTML has no text fallback at all, so the
+// upload is rejected at admission instead of failing later in the worker.
+const doclingServiceRequiredMessage = "Word/HTML 文档需要配置 Docling 解析服务（RAG_DOCLING_SERVICE_URL）。"
 
 // Error implements error.
 func (e *documentOperationError) Error() string { return e.Err.Error() }
@@ -219,16 +219,18 @@ func (s *Service) validateRemotePDFAdmission(ctx context.Context, namespace, nam
 }
 
 // doclingEnabled reports whether the Docling HTTP service is configured. It
-// selects the structured parser for DOC/DOCX and is the only way static HTML
-// can be imported at all.
+// selects the structured parser for DOC/DOCX and static HTML: Word parsing is
+// Docling-only (the in-process OOXML parser was removed), so uploads of those
+// formats are rejected at admission when it is off.
 func (s *Service) doclingEnabled() bool {
 	return strings.TrimSpace(s.config.DoclingServiceURL) != ""
 }
 
-// validateDoclingHTMLUpload rejects HTML/HTM uploads before any journal/queue
-// work when the Docling service is not configured. DOCX keeps the in-process
-// parser in that case, so only the HTML family is rejected here.
-func (s *Service) validateDoclingHTMLUpload(files []UploadFile) error {
+// validateDoclingDocumentUpload rejects Word and HTML uploads before any
+// journal/queue work when the Docling service is not configured. Word parsing
+// is Docling-only now, so .doc/.docx is guarded the same way as the HTML
+// family.
+func (s *Service) validateDoclingDocumentUpload(files []UploadFile) error {
 	if s.doclingEnabled() {
 		return nil
 	}
@@ -238,18 +240,20 @@ func (s *Service) validateDoclingHTMLUpload(files []UploadFile) error {
 			continue
 		}
 		switch strings.ToLower(filepath.Ext(name)) {
-		case document.SuffixHTML, document.SuffixHTM:
+		case document.SuffixDOC, document.SuffixDOCX,
+			document.SuffixHTML, document.SuffixHTM:
 			return &apierrors.KnowledgeValidationError{Message: doclingServiceRequiredMessage}
 		}
 	}
 	return nil
 }
 
-// validateDoclingHTMLAdmission is the asynchronous counterpart of
-// validateDoclingHTMLUpload: a queued HTML job is rejected while it is admitted
-// rather than failing later in the worker with a generic parse error.
-func (s *Service) validateDoclingHTMLAdmission(name string) error {
-	return s.validateDoclingHTMLUpload([]UploadFile{{Name: name}})
+// validateDoclingDocumentAdmission is the asynchronous counterpart of
+// validateDoclingDocumentUpload: a queued Word/HTML job is rejected while it
+// is admitted rather than failing later in the worker with a generic parse
+// error.
+func (s *Service) validateDoclingDocumentAdmission(name string) error {
+	return s.validateDoclingDocumentUpload([]UploadFile{{Name: name}})
 }
 
 // uploadDocuments is the real implementation behind Service.Upload: a batch of
@@ -271,7 +275,7 @@ func (s *Service) uploadDocuments(
 	if err := s.validateRemotePDFUpload(files, resources); err != nil {
 		return nil, err
 	}
-	if err := s.validateDoclingHTMLUpload(files); err != nil {
+	if err := s.validateDoclingDocumentUpload(files); err != nil {
 		return nil, err
 	}
 	imported := make([]map[string]any, 0, len(files))
@@ -370,7 +374,7 @@ func (s *Service) writeDocumentContent(
 	if err := s.validateRemotePDFUpload([]UploadFile{{Name: name, Content: content}}, resources); err != nil {
 		return nil, err
 	}
-	if err := s.validateDoclingHTMLUpload([]UploadFile{{Name: name, Content: content}}); err != nil {
+	if err := s.validateDoclingDocumentUpload([]UploadFile{{Name: name, Content: content}}); err != nil {
 		return nil, err
 	}
 	record, err := s.storeAndIndex(ctx, namespace, resources, storeIndexOptions{
@@ -485,21 +489,18 @@ type storeIndexOptions struct {
 // indexConfiguration mirrors _index_configuration + ChunkingConfig.metadata +
 // the embedding model suffix used for deduplication and stored metadata. The
 // PDF parser version comes from the configured engine so stored documents
-// record the parser that actually produced their content; doclingEnabled does
-// the same for DOC/DOCX (Docling service vs in-process OOXML parser). HTML is
-// always parsed by Docling, so it records the HTML parser contract.
-func indexConfiguration(name string, configuration chunking.Config, tokenizerModel, embeddingModel, pdfParserVersion string, doclingEnabled bool) map[string]any {
+// record the parser that actually produced their content. Word/HTML is always
+// parsed by the Docling service now, so DOC/DOCX records docling-word-v1 and
+// HTML records the HTML parser contract; historical word-assets-v1 records
+// stay readable through document.IsSupportedWordParserVersion.
+func indexConfiguration(name string, configuration chunking.Config, tokenizerModel, embeddingModel, pdfParserVersion string) map[string]any {
 	metadata := configuration.Metadata(tokenizerModel)
 	suffix := strings.ToLower(filepath.Ext(name))
 	switch suffix {
 	case document.SuffixPDF:
 		metadata["pdf_parser_version"] = pdfParserVersion
 	case document.SuffixDOC, document.SuffixDOCX:
-		if doclingEnabled {
-			metadata["word_parser_version"] = document.DoclingWordParserVersion
-		} else {
-			metadata["word_parser_version"] = document.WordParserVersion
-		}
+		metadata["word_parser_version"] = document.DoclingWordParserVersion
 	case document.SuffixHTML, document.SuffixHTM:
 		metadata["html_parser_version"] = document.HTMLParserVersion
 	}
@@ -523,7 +524,7 @@ func (s *Service) storeAndIndex(
 		return nil, &apierrors.KnowledgeValidationError{Message: "Invalid idempotency key"}
 	}
 	configuration := indexConfiguration(name, resources.chunking, resources.tokenizerModel,
-		options.EmbeddingModel, document.PDFParserVersionForEngine(s.config.PDFEngine), s.doclingEnabled())
+		options.EmbeddingModel, document.PDFParserVersionForEngine(s.config.PDFEngine))
 	journal := s.stores.Uploads
 	if journal == nil {
 		return nil, &apierrors.KnowledgeError{Message: "上传事务存储不可用"}
@@ -910,9 +911,10 @@ func (s *Service) pdfOptions(resources *uploadResources) ingest.PDFOptions {
 }
 
 // doclingOptions selects the Docling HTTP service for DOC/DOCX and static
-// HTML. An empty RAG_DOCLING_SERVICE_URL keeps ingest.Docling.Parser nil, which
-// leaves DOCX on the in-process OOXML parser and makes HTML import fail with
-// ingest.ErrDoclingNotConfigured (already rejected at admission).
+// HTML. An empty RAG_DOCLING_SERVICE_URL keeps ingest.Docling.Parser nil; the
+// Word/HTML upload paths reject such files at admission with
+// doclingServiceRequiredMessage, so Prepare's ErrDoclingNotConfigured is the
+// worker-side backstop for jobs admitted by an older deployment.
 func (s *Service) doclingOptions() ingest.DoclingOptions {
 	if !s.doclingEnabled() {
 		return ingest.DoclingOptions{}
