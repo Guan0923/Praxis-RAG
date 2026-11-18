@@ -285,7 +285,10 @@ func (s *Service) PreviewInvitation(ctx context.Context, user state.User, token 
 	return s.invitationView(ctx, cache, *invitation), nil
 }
 
-// AcceptInvitation turns one pending invitation into effective grants.
+// AcceptInvitation turns one pending invitation into effective grants. The
+// grants and the accepted status are written by one repository transaction, so
+// a concurrently declined, revoked or superseded invitation never receives
+// grants.
 func (s *Service) AcceptInvitation(ctx context.Context, user state.User, token string) (InvitationView, error) {
 	invitation, err := s.invitationByToken(ctx, user, token)
 	if err != nil {
@@ -341,16 +344,20 @@ func (s *Service) AcceptInvitation(ctx context.Context, user state.User, token s
 			})
 		}
 	}
-	if err := s.permissions.UpsertMany(ctx, grants); err != nil {
-		return InvitationView{}, err
-	}
 	acceptedAt := s.nowISO()
-	if _, err := s.invitations.SetStatus(ctx, invitation.ID, state.InvitationAccepted, acceptedAt); err != nil {
+	final, err := s.invitations.AcceptPending(ctx, invitation.ID, acceptedAt, grants)
+	if err != nil {
 		return InvitationView{}, err
 	}
-	invitation.Status = state.InvitationAccepted
-	invitation.AcceptedAt = &acceptedAt
-	return s.invitationView(ctx, cache, *invitation), nil
+	if final == nil {
+		return InvitationView{}, NewError(KindNotFound, MessageInvitationGone)
+	}
+	if final.Status != state.InvitationAccepted {
+		// A concurrent decline, revoke or supersede won the transition, so
+		// this accept wrote nothing.
+		return InvitationView{}, NewError(KindConflict, MessageInvitationUsed)
+	}
+	return s.invitationView(ctx, cache, *final), nil
 }
 
 // DeclineInvitation marks one pending invitation as declined.
