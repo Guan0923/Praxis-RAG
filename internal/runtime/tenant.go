@@ -121,12 +121,28 @@ func (e *SearchEngine) buildTenant(namespace string, settings map[string]any) (*
 		e.sag2ScorerResolver(),
 		retrieval.Sag2Options{},
 	)
+	// sag consumes the MySQL event-entity index written by the extraction
+	// stage; without one it degrades to hybrid recall, so it always registers.
+	var sagRetriever retrieval.Retriever = retrieval.NewUnavailableRetriever(
+		"retrieval sag requires the SAG event-entity index",
+	)
+	if e.stores.SagIndex != nil {
+		sagRetriever = retrieval.NewSagRetriever(
+			namespace,
+			newSagIndexAdapter(e.stores.SagIndex),
+			embedder,
+			encoder,
+			&sagStoreAdapter{store: store},
+			retrieval.SagOptions{},
+		)
+	}
 	orchestrator := retrieval.NewOrchestrator(
 		map[contracts.RetrievalMode]retrieval.Retriever{
 			contracts.RetrievalBM25:      retrieval.NewBm25Retriever(encoder, store),
 			contracts.RetrievalEmbedding: retrieval.NewDenseRetriever(embedder, store),
 			contracts.RetrievalHybrid:    retrieval.NewHybridRetriever(embedder, encoder, store),
 			contracts.RetrievalSAG2:       sag2,
+			contracts.RetrievalSAG:        sagRetriever,
 		},
 		map[contracts.RerankMode]retrieval.Reranker{
 			contracts.RerankCrossEncoder: reranker,

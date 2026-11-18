@@ -210,7 +210,7 @@ export type Health = {
   backend?: string;
   collection?: string;
 };
-export type Retrieval = "bm25" | "embedding" | "hybrid" | "sag2";
+export type Retrieval = "bm25" | "embedding" | "hybrid" | "sag2" | "sag";
 export type Rerank = "none" | "cross_encoder";
 export type Hit = {
   rank: number;
@@ -374,6 +374,7 @@ export const retrievalLabels = {
   embedding: "Embedding",
   hybrid: "Hybrid",
   sag2: "SAG2",
+  sag: "SAG（事件-实体）",
 };
 export const rerankLabels = {
   none: "不重排",
@@ -1038,7 +1039,7 @@ export async function deleteUser(id: string): Promise<void> {
 // is configured for later use, is never offered by the knowledge-base forms,
 // and has no OpenAI /models route.
 export type KnowledgeBaseModelKind = "embedding" | "reranker" | "vlm";
-export type ModelKind = KnowledgeBaseModelKind | "jev";
+export type ModelKind = KnowledgeBaseModelKind | "jev" | "extraction";
 export type ModelProfile = {
   id: string;
   kind: ModelKind;
@@ -1065,15 +1066,16 @@ export type ModelProfileInput = {
 };
 // ModelProfileUpdate omits kind: an existing profile cannot change its kind.
 export type ModelProfileUpdate = Partial<Omit<ModelProfileInput, "kind">>;
-// knowledgeBaseModelKinds are the kinds a knowledge base can reference; JEV stays
-// Console-only and is therefore appended to modelKinds instead.
+// knowledgeBaseModelKinds are the kinds a knowledge base can reference; JEV and
+// extraction stay Console-only and are therefore appended to modelKinds instead.
 export const knowledgeBaseModelKinds: KnowledgeBaseModelKind[] = ["embedding", "reranker", "vlm"];
-export const modelKinds: ModelKind[] = [...knowledgeBaseModelKinds, "jev"];
+export const modelKinds: ModelKind[] = [...knowledgeBaseModelKinds, "jev", "extraction"];
 export const modelKindLabels: Record<ModelKind, string> = {
   embedding: "Embedding",
   reranker: "Reranker",
   vlm: "VLM",
   jev: "JEV",
+  extraction: "抽取（SAG）",
 };
 
 // normalizeModelProfile keeps a nullable vector_size stable for the table and

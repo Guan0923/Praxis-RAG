@@ -73,8 +73,10 @@
 
 ## 5. 检索与重排
 
-- 检索模式：`bm25`（关键词）、`embedding`（语义）、`hybrid`（默认，Qdrant 服务端 RRF 融合 dense + sparse）、`sag2`（词法多跳：BM25 初筛 → JEV 必要证据判定 → 词项扩展再召回 → DPP 终排）。
+- 检索模式：`bm25`（关键词）、`embedding`（语义）、`hybrid`（默认，Qdrant 服务端 RRF 融合 dense + sparse）、`sag2`（词法多跳：BM25 初筛 → JEV 必要证据判定 → 词项扩展再召回 → DPP 终排）、`sag`（事件-实体多跳：hybrid 种子召回 → chunk 映射事件/实体 → SQL join 沿共享实体扩展关联事件 → 融合排序）。
 - `sag2` 约束：必须搭配 `rerank: none`（JEV 证据分即最终排序，校验层直接拒绝 `cross_encoder` 组合）；需要管理员在「模型配置」保存 `kind=jev` 条目，否则检索返回可解释的操作错误；语料在进程内按可见版本指纹缓存（发布/覆盖/删除自动失效），首次查询或失效后重建索引需要全量读取活跃 chunk；`candidate_k` 同时是每轮召回预算（SAG2 参考实现 B=100，建议给 50..100），轮数固定 3（1 轮初筛 + 2 轮扩展），扩展词 ≤20、种子 ≤10、终排前 10 名做 DPP；每次查询约 3 轮 JEV 决策调用，延迟与费用显著高于其他模式。
+- `sag` 离线索引：管理员在「模型配置」保存 `kind=extraction` 条目（OpenAI 兼容 chat 端点）后，文档发布完成后按 chunk 抽取一个事件（完整语义单元）+ ≤12 个规范化实体，事务写入 MySQL `sag_events`/`sag_entities`/`sag_event_entities`（每文档上限 512 chunk）；抽取是**非致命**阶段（失败仅记日志，文档仍 `succeeded`），未配置模型时整段跳过；存量文档用 `cmd/rag-sag-backfill` CLI 补建（Qdrant 活跃点为 chunk 来源，不复活已删文档）。实体归一化为 casefold join key，不做全局消歧；删除文档级联清理事件与关联（实体行保留）。
+- `sag` 查询行为：种子实体 ≤8、超边事件上限 32；融合分 = 种子召回分×0.5 + 共享实体数×0.5；超边候选从 Qdrant 补水原始 chunk 文本（证据边界不变），补水失败的候选被丢弃；无索引/无事件时**降级为 hybrid 召回**（不报错）。`rerank` 任意（融合分非唯一序，cross-encoder 合法）。结果 `metadata.sag_event` 携带事件句。
 - 重排模式：`none`、`cross_encoder`（默认）；Cross-Encoder 通过 HTTP 调用：进入重排的候选上限 30、批大小 4、重排文本上限 4000 字符、模型 token 上限 512。
 - 参数：`query` ≤2000 字符；`candidate_k` 1..100（默认 10）；`top_k` 1..10（默认 5）且 ≤`candidate_k`；`filters` 仅允许 `document_id`、`source`、`title`（闭集白名单）。
 - 名词解释：`dense` 命名向量（Cosine，1024 维）+ `sparse` 命名向量（BM25，确定性哈希词表，IDF 由 Qdrant 提供）；hybrid 先各自 prefetch，再服务端 RRF。

@@ -19,12 +19,12 @@ import (
 // knowledge base and falls back to the service environment (RAG_VLM_*) when
 // unset. "jev" is the TypeSafe System One decision-model configuration kept for
 // later use by the Console; it is not a knowledge-base model.
-var Kinds = []string{"embedding", "reranker", "vlm", "jev"}
+var Kinds = []string{"embedding", "reranker", "vlm", "jev", "extraction"}
 
 // CredentialKinds lists the kinds whose settings are stored as
 // {base_url, protected_key} pairs and replaced by the credential-free public
 // view.
-var CredentialKinds = []string{"embedding", "reranker", "vlm"}
+var CredentialKinds = []string{"embedding", "reranker", "vlm", "extraction"}
 
 // IsKind reports whether kind is one of Kinds.
 func IsKind(kind string) bool {

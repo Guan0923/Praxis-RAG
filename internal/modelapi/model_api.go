@@ -233,6 +233,16 @@ func safeTransportError(err error) *ModelAPIError {
 	return modelError("无法连接模型服务，请检查地址、端口和服务状态")
 }
 
+// SafeErrorName renders a safe failure category for logs and user-facing
+// summaries without ever including message contents or payloads (the same
+// rule internal/logging and state apply).
+func SafeErrorName(err error) string {
+	if err == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("%T", err)
+}
+
 // Models returns the provider model ids in declaration order without
 // duplicates.
 func (c *ModelHTTPClient) Models(ctx context.Context) ([]string, error) {

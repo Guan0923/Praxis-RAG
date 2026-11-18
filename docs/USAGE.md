@@ -1016,6 +1016,29 @@ curl.exe -X POST http://127.0.0.1:8011/v1/search `
   -d '{"query":"E03 怎么处理？","retrieval":"sag2","rerank":"none","candidate_k":100,"top_k":5,"filters":{}}'
 ```
 
+#### SAG 事件-实体检索（`retrieval: sag`）
+
+第五种模式 `sag` 是 [Zleap-AI/SAG](https://github.com/Zleap-AI/SAG) 架构的事件-实体检索：**离线**为每个 chunk 抽取一个事件（chunk 的完整语义单元）和若干规范化实体，写入 MySQL（`sag_events` / `sag_entities` / `sag_event_entities` 三张表）；**查询时**先用 hybrid 召回种子 chunk，映射到事件与实体，再用 SQL join 沿共享实体扩展到未被向量召回命中的关联事件——即查询期动态超边，不需要图数据库，也不预建全局图。证据边界仍是原始 chunk（超边命中的 chunk 会从 Qdrant 补水原文）。
+
+使用要求与行为：
+
+- 管理员先在 Console「模型配置」添加 `kind=extraction` 条目（任意 OpenAI 兼容 chat 端点，建议低价快速模型如 qwen-flash / deepseek-chat；存在多条时取**最近更新**的一条）。添加后，**新上传**的文档在发布完成后自动抽取（非致命阶段，失败只记日志不影响文档状态）；存量文档用 `rag-sag-backfill` CLI 补建。
+- 未配置抽取模型或文档未建索引时，`sag` 自动**降级为 hybrid 召回**（不报错、不静默无结果）。
+- 可以搭配任意 `rerank`（`none` 或 `cross_encoder`）：排序是种子分与超边共享实体数的融合分，cross-encoder 二段精排合法（区别于 `sag2`）。
+- 每文档抽取上限 512 chunk（超出部分留给回填 CLI），实体归一化为 casefold；抽取结果含 `metadata.sag_event`（该 chunk 的事件句），便于核对证据链。
+- 删除文档时事件与关联级联清理，实体行保留（共享数据），不会留下悬空超边。
+
+```powershell
+# 存量文档补建索引（先 dry-run 看清单）
+dist/bin/rag-sag-backfill --namespace default --dry-run
+dist/bin/rag-sag-backfill --namespace default --verbose
+
+# 查询
+curl.exe -X POST http://127.0.0.1:8011/v1/search `
+  -H $headers `
+  -d '{"query":"Atlas 项目的第二个里程碑是谁负责的？","retrieval":"sag","rerank":"none","candidate_k":30,"top_k":5,"filters":{}}'
+```
+
 ### 上传状态、发布版本与租约
 
 ```powershell
