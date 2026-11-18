@@ -104,7 +104,14 @@ type Stores struct {
 	Blobs     *BlobStore
 	Views     *CachedReadViews
 	Artifacts *ArtifactRegistry
-	Uploads   *UploadJournal
+	// Uploads is the durable upload transaction journal.
+	Uploads *UploadJournal
+
+	// UploadBloom is the optional Redis bitmap bloom filter that tracks which
+	// upload operation IDs exist (MySQL stays the source of truth; it only
+	// fast-fails "definitely absent" IDs on GET /v1/uploads/{operation_id}).
+	// Nil keeps the historical behavior everywhere.
+	UploadBloom *UploadBloomFilter
 
 	DocumentJobs    *DocumentJobs
 	DocumentBatches *DocumentBatches
@@ -306,6 +313,17 @@ func (s *Stores) AttachDocumentLocker(locker DocumentLocker) error {
 	return nil
 }
 
+// AttachUploadBloom enables the upload-operation bloom filter on this store.
+// Every process that creates upload operations must attach it with the same
+// configuration before RAG_UPLOAD_BLOOM_MODE=on is deployed fleet-wide.
+func (s *Stores) AttachUploadBloom(filter *UploadBloomFilter) error {
+	if filter == nil {
+		return newValueError("upload bloom filter is required")
+	}
+	s.UploadBloom = filter
+	return nil
+}
+
 // Ping runs the lightweight connectivity check used by StateStores.ping.
 func (s *Stores) Ping(ctx context.Context) error {
 	var one int
@@ -327,6 +345,11 @@ func (s *Stores) Close() error {
 		}
 		if s.DocumentLocks != nil {
 			if err := s.DocumentLocks.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if s.UploadBloom != nil {
+			if err := s.UploadBloom.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}

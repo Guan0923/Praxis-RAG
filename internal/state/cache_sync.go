@@ -105,11 +105,33 @@ func (c *CacheSynchronizer) Loader(kind string) (ViewLoader, bool) {
 // fault also skips the backfill after its fallback succeeds. A deployment with
 // the cache explicitly disabled keeps the original direct-read mode.
 func (c *CacheSynchronizer) GetOrLoad(ctx context.Context, kind, scope string) (any, error) {
+	return c.GetOrLoadGuarded(ctx, kind, scope, nil)
+}
+
+// cacheMissGate answers one question for a cache miss: may the loader consult
+// MySQL? It returns false only when the scope is provably absent without the
+// database (the upload bloom filter's "definitely absent" answer). Every error
+// or uncertainty inside the gate must resolve to true so the original query
+// path is preserved.
+type cacheMissGate func(ctx context.Context) bool
+
+// GetOrLoadGuarded is GetOrLoad with an optional miss gate: after a cache miss
+// (or an unavailable cache backend) and before the MySQL fallback, the gate can
+// decline the load. A declined load returns (nil, nil) without writing the
+// cache and without joining the single-flight fallback group, so the answer
+// stays per-request and MySQL remains the authority. The gate is consulted
+// while the display-cache breaker may be open; a gate whose own backend is
+// unavailable must answer true (fall back), which the upload bloom filter's
+// DefinitelyAbsent already guarantees.
+func (c *CacheSynchronizer) GetOrLoadGuarded(ctx context.Context, kind, scope string, missGate cacheMissGate) (any, error) {
 	loader, ok := c.loaders[kind]
 	if !ok {
 		return nil, fmt.Errorf("Unknown state cache kind %q", kind)
 	}
 	if !c.Enabled() {
+		if missGate != nil && !missGate(ctx) {
+			return nil, nil
+		}
 		return loader(ctx, c.stores.DB, scope)
 	}
 	breaker, guard := c.displayProtections()
@@ -142,8 +164,14 @@ func (c *CacheSynchronizer) GetOrLoad(ctx context.Context, kind, scope string) (
 		}
 	} else {
 		// Circuit open (or half-open with another probe in flight): skip the
-		// Redis read and the backfill, go straight to the guarded fallback.
+		// Redis read and the backfill, go straight to the gated fallback.
 		backfill = false
+	}
+	// The miss gate runs after the cache miss and before the fallback group:
+	// a scope provably absent (the upload bloom filter) neither joins the
+	// single-flight fallback nor occupies one of its concurrency slots.
+	if missGate != nil && !missGate(ctx) {
+		return nil, nil
 	}
 	var revision int64
 	value, err, executed := guard.execute(ctx, callKey{kind: kind, scope: scope}, func(runCtx context.Context) (any, error) {
