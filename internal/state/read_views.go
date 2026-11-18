@@ -66,7 +66,6 @@ func NewCachedReadViews(stores *Stores) *CachedReadViews {
 		stores.CacheSync.Register("kb_list", views.loadKnowledgeBases)
 		stores.CacheSync.Register("documents", views.loadDocuments)
 		stores.CacheSync.Register("catalog", views.loadCatalog)
-		stores.CacheSync.Register("api_keys", views.loadAPIKeys)
 		stores.CacheSync.Register("heads", views.loadHeads)
 		stores.CacheSync.Register("leases", views.loadLeases)
 		stores.CacheSync.Register("upload_list", views.loadUploadList)
@@ -301,30 +300,6 @@ func (v *CachedReadViews) loadCatalog(ctx context.Context, querier viewQuerier, 
 		return nil, viewLoadError(err)
 	}
 	return data, nil
-}
-
-func (v *CachedReadViews) loadAPIKeys(ctx context.Context, querier viewQuerier, _ string) (any, error) {
-	rows, err := querier.QueryContext(ctx,
-		"SELECT "+apiKeySelectColumns+" FROM api_keys ORDER BY created_at DESC, id DESC")
-	if err != nil {
-		return nil, viewLoadError(err)
-	}
-	keys := make([]APIKey, 0)
-	for rows.Next() {
-		key, err := scanAPIKey(rows)
-		if err != nil {
-			_ = rows.Close()
-			return nil, viewLoadError(err)
-		}
-		keys = append(keys, key)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, viewLoadError(err)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, viewLoadError(err)
-	}
-	return keys, nil
 }
 
 func (v *CachedReadViews) loadHeads(ctx context.Context, querier viewQuerier, namespace string) (any, error) {
@@ -577,22 +552,6 @@ func (v *CachedReadViews) Catalog(ctx context.Context, namespace string) (string
 		return "", false, err
 	}
 	return data, found, nil
-}
-
-// APIKeys is display-only metadata; never use it to authorize.
-func (v *CachedReadViews) APIKeys(ctx context.Context) ([]APIKey, error) {
-	value, err := v.getOrLoad(ctx, "api_keys", "")
-	if err != nil {
-		return nil, err
-	}
-	keys, found, err := decodeCached[[]APIKey](value)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return []APIKey{}, nil
-	}
-	return keys, nil
 }
 
 // PublishedVersions is the display snapshot of document heads.

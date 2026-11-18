@@ -16,7 +16,7 @@ schema history：
 | 实例 | 容器 | 采集表 | 目标 topic | 状态卷 |
 | --- | --- | --- | --- | --- |
 | 任务连接器 | `praxis-rag-debezium` | `document_jobs` | `RAG_DOCUMENT_TOPIC` | `debezium_data` |
-| 缓存连接器 | `praxis-rag-debezium-cache` | 8 张读模型表 | `RAG_CACHE_TOPIC` | `debezium_cache_data` |
+| 缓存连接器 | `praxis-rag-debezium-cache` | 7 张读模型表 | `RAG_CACHE_TOPIC` | `debezium_cache_data` |
 
 旧实例通过 Quarkus `/q/health` 暴露健康状态；新部署已改为 Kafka Connect
 `GET /connectors/{name}/status` 与 task 状态，不再使用 `/q/health`。

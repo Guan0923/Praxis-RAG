@@ -65,11 +65,6 @@ func TestKeysForChangeMapsCachedTables(t *testing.T) {
 			want:   []state.CacheKey{{Kind: "catalog", Scope: "manuals"}},
 		},
 		{
-			name:   "api key delete",
-			change: change("api_keys", "d", map[string]any{"id": "k1", "owner_user_id": "u1"}, nil),
-			want:   []state.CacheKey{{Kind: "api_keys", Scope: ""}},
-		},
-		{
 			name:   "document head update also refreshes the documents view",
 			change: change("document_heads", "u", nil, map[string]any{"namespace": "manuals", "document_id": "d1"}),
 			want: []state.CacheKey{
@@ -167,7 +162,7 @@ func TestHandleNacksWhenStateLayerFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	if processor.Handle(context.Background(), change("api_keys", "u", nil, map[string]any{"id": "k1"})) {
+	if processor.Handle(context.Background(), change("mcp_catalogs", "u", nil, map[string]any{"namespace": "manuals"})) {
 		t.Fatal("Handle() = true, want false on state failure")
 	}
 }
@@ -317,7 +312,7 @@ func requireCacheKeys(t *testing.T, got, want []state.CacheKey) {
 }
 
 // TestKeysForChangeDeleteCoversEveryCapturedTable pins the delete (op=d) mapping
-// for all eight read-model tables captured by the cache connector. Every one of
+// for all seven read-model tables captured by the cache connector. Every one of
 // them must invalidate at least one cache key, otherwise a direct DELETE in MySQL
 // (the scenario the connector exists for) could never converge the Redis view.
 func TestKeysForChangeDeleteCoversEveryCapturedTable(t *testing.T) {
@@ -350,11 +345,6 @@ func TestKeysForChangeDeleteCoversEveryCapturedTable(t *testing.T) {
 			name:   "mcp_catalogs",
 			change: change("mcp_catalogs", "d", map[string]any{"namespace": "manuals"}, nil),
 			want:   []state.CacheKey{{Kind: "catalog", Scope: "manuals"}},
-		},
-		{
-			name:   "api_keys",
-			change: change("api_keys", "d", map[string]any{"id": "k1", "owner_user_id": "u1", "enabled": true}, nil),
-			want:   []state.CacheKey{{Kind: "api_keys", Scope: ""}},
 		},
 		{
 			name:   "document_heads",

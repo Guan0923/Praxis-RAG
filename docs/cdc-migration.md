@@ -15,8 +15,8 @@ document_jobs ──────┤ praxis-document-cdc（只采集 INSERT / sch
                     │   skipped.operations=d；column.include.list 只含定位列；                          │
                     │   skip.messages.without.change=true；ByLogicalTableRouter）                       │
                     │                                                                                  │
-knowledge_bases ────┤ praxis-cache-cdc（采集 8 张读模型表，全量 c/u/d；                              ├─► praxis_state_cache_refresh
-documents / mcp_catalogs / api_keys / document_heads / document_leases / upload_operations / upload_steps ┘
+knowledge_bases ────┤ praxis-cache-cdc（采集 7 张读模型表，全量 c/u/d；                              ├─► praxis_state_cache_refresh
+documents / mcp_catalogs / document_heads / document_leases / upload_operations / upload_steps ┘
                     └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -191,7 +191,6 @@ Redis 写入失败、缓存刷新失败不是 nack 理由：缓存有独立的�
 | `knowledge_bases` | `kb_list("")`、`kb_public(ns)`、`documents(ns)` |
 | `documents` | `kb_list("")`、`documents(ns)` |
 | `mcp_catalogs` | `catalog(ns)` |
-| `api_keys` | `api_keys("")` |
 | `document_heads` | `heads(ns)`、`documents(ns)`（docs 视图 join heads 版本） |
 | `document_leases` | `leases(ns)` |
 | `upload_operations` | `upload_list(ns)`、`upload_status(id)` |

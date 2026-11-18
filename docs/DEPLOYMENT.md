@@ -672,7 +672,7 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 | 连接器 | 采集范围 | 投递 | 配置 |
 | --- | --- | --- | --- |
 | `praxis-document-cdc` | 只采集 `document_jobs`；`column.include.list` 只含定位列，`skip.messages.without.change=true`，`skipped.operations=d` | `RAG_DOCUMENT_TOPIC` | `deploy/kafka-connect/connectors/document-cdc.json` |
-| `praxis-cache-cdc` | `knowledge_bases`、`documents`、`mcp_catalogs`、`api_keys`、`document_heads`、`document_leases`、`upload_operations`、`upload_steps`；所有 c/u/d | `RAG_CACHE_TOPIC` | `deploy/kafka-connect/connectors/cache-cdc.json` |
+| `praxis-cache-cdc` | `knowledge_bases`、`documents`、`mcp_catalogs`、`document_heads`、`document_leases`、`upload_operations`、`upload_steps`；所有 c/u/d | `RAG_CACHE_TOPIC` | `deploy/kafka-connect/connectors/cache-cdc.json` |
 
 - 两个连接器运行在**同一个分布式 Connect 集群**的两个 worker 上，共享
   `praxis_connect_configs` / `praxis_connect_offsets` / `praxis_connect_status`

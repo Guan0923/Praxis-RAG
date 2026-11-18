@@ -297,9 +297,7 @@ func (r *UserRepository) Delete(ctx context.Context, id string) (bool, error) {
 	if _, err := transaction.ExecContext(ctx, "DELETE FROM user_sessions WHERE user_id = ?", id); err != nil {
 		return false, newStateError("用户无法删除")
 	}
-	if _, err := touch(ctx, transaction, apiKeyKeys()...); err != nil {
-		return false, newStateError("用户无法删除")
-	}
+
 	if _, err := transaction.ExecContext(ctx, "DELETE FROM api_keys WHERE owner_user_id = ?", id); err != nil {
 		return false, newStateError("用户无法删除")
 	}

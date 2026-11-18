@@ -29,3 +29,6 @@ func (e *CacheUnavailable) ErrorCategory() string { return "cache_unavailable" }
 
 // ErrorCategory labels an unavailable stored artifact.
 func (e *ArtifactUnavailable) ErrorCategory() string { return "artifact_unavailable" }
+
+// ErrorCategory labels an artifact read denied by document-level permissions.
+func (e *ArtifactForbidden) ErrorCategory() string { return "artifact_forbidden" }

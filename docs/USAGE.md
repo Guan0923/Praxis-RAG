@@ -848,9 +848,9 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys/batch-delete `
   -d '{"ids":["<id-a>","<id-b>","<id-missing>"]}'
 ```
 
-`batch-delete` 在一个事务里完成整批删除：1 条 `SELECT ... WHERE id IN (...)` 分类（不存在或无权访问的 id 进入 `not_found`，与单条删除同语义、不视为错误），1 条 `DELETE ... WHERE id IN (...)` 删除，整批只提交 1 次、缓存修订与事件也只写 1 次。返回 `{"deleted":["<id>"],"not_found":["<id>"],"failed":[],"deleted_count":N}`：`failed` 恒为空数组（保留字段以兼容旧客户端）；整批数据库错误返回 500 `API Key 删除失败` 并整批回滚，可重试。请求体校验失败（缺失、空数组、空字符串、超过 100 项、未知字段）返回 FastAPI 形状的 422。
+`batch-delete` 在一个事务里完成整批删除：1 条 `SELECT ... WHERE id IN (...)` 分类（不存在或无权访问的 id 进入 `not_found`，与单条删除同语义、不视为错误），1 条 `DELETE ... WHERE id IN (...)` 删除，整批只提交 1 次。返回 `{"deleted":["<id>"],"not_found":["<id>"],"failed":[],"deleted_count":N}`：`failed` 恒为空数组（保留字段以兼容旧客户端）；整批数据库错误返回 500 `API Key 删除失败` 并整批回滚，可重试。请求体校验失败（缺失、空数组、空字符串、超过 100 项、未知字段）返回 FastAPI 形状的 422。
 
-本机直连可以看到并管理全部密钥（含历史无主密钥）。改用登录会话（Cookie + 写操作 `X-CSRF-Token`）调用时按账号过滤：管理员看到全部密钥，响应条目带 `owner_user_id` / `owner_username`（历史密钥不带这两个字段，Console 显示「—（未绑定）」）；VIP / 普通用户只看到自己创建的密钥，查看/修改/删除/导出别人的密钥返回 404 `API Key 不存在`。非管理员创建或修改密钥时只能绑定自己拥有的知识库，否则返回 403 `只能为本人创建的知识库创建 API Key`。
+API Key 管理列表直接读取 MySQL。本机直连可以看到并管理全部密钥（含历史无主密钥）。改用登录会话（Cookie + 写操作 `X-CSRF-Token`）调用时按账号过滤：管理员看到全部密钥，响应条目带 `owner_user_id` / `owner_username`（历史密钥不带这两个字段，Console 显示「—（未绑定）」）；VIP / 普通用户只看到自己创建的密钥，查看/修改/删除/导出别人的密钥返回 404 `API Key 不存在`。非管理员创建或修改密钥时只能绑定自己拥有的知识库，否则返回 403 `只能为本人创建的知识库创建 API Key`。
 
 `mcp-config` 返回 `{"url":"http://<host>/mcp","headers":{"Authorization":"Bearer <key>","X-RAG-Namespace":"default"}}`，可直接粘贴到 MCP 客户端配置。
 
@@ -1028,6 +1028,8 @@ curl.exe -X POST http://127.0.0.1:8011/v1/search `
 # artifact（源文件/图片/表格 JSON）
 curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>" -H $headers
 curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>/content" -H $headers
+# 文件级（受限）授权只能读取自己可读文档的附件：权限按附件所属文档在同一事务内校验，
+# 无权限返回 403，父文档已删除同样拒绝（fail closed）；详见 docs/PERMISSIONS.md。
 ```
 
 搜索**同步执行**：一次请求完成检索 + 重排并直接返回 `retrieval`、`rerank`、`evidence_status`、`results`、`debug`、`snapshot_context`、`artifacts`；资产命中带 `asset`（图片 base64 或表格结构）。响应**不含** `result_id`/`created_at`/`expires_at`/`snapshot_available`/`snapshot_error`，`GET /v1/search-results/{result_id}` 已删除。分页/偏移参数越界返回 400；超过 `RAG_SEARCH_TIMEOUT_SECONDS` 返回搜索错误，重试等于重新检索。
@@ -1403,7 +1405,7 @@ PDF 默认由独立的 `pdf-parser` 微服务解析（本地 PyMuPDF 读取/渲�
 - **Qdrant**：仅支持 HTTP 模式；`QDRANT_PATH` 会在启动时被拒绝。
 - **Tokenizer**：见 §10；token 预算切分位置可能与 Python 不同。
 - **解析器**：PDF 默认走独立 `pdf-parser` 微服务（本地只做 PDF 读取/渲染/裁图，版面/OCR/表格/公式 LaTeX/图片描述统一由知识库配置的远端视觉模型完成；需要该服务与可用视觉端点，服务或模型不可用时 vision 上传会失败，`docling` 是 `vision` 的兼容别名）。`RAG_PDF_ENGINE=go` 时使用 Go 内置纯文本引擎（文字型 PDF；扫描件、PDF 表格/公式/图片资产不支持，需要时请先 OCR 或用其他工具预处理）。`.docx`/`.doc`/`.html`/`.htm` 一律由独立 `docling-service` 解析（必须配置 `RAG_DOCLING_SERVICE_URL`，未配置时这些格式被拒绝；进程内 Word 解析已删除）；`.doc` 先由外部 LibreOffice 转成 `.docx` 再交给同一服务。HTML 只支持静态上传：外部/相对图片不抓取、只保留文字说明，仍不支持网页抓取。
-- **异步投递**：Kafka 通知由运行在分布式 Kafka Connect 上的两个 Debezium 连接器从 MySQL 表级采集后写入 Kafka（`praxis-document-cdc` 只采集 `document_jobs` 的 INSERT 与 `schedule_version` 变化；`praxis-cache-cdc` 采集 8 张业务表全部 c/u/d）；必须配置 Kafka + Kafka Connect + 两个连接器并运行 `rag-document-worker`/`rag-cache-worker`，否则文档任务保持 `queued`、缓存刷新不生效。worker 故障由 Connect peer 接管并从 Kafka 保存位点恢复；FAILED task 由 `rag-service` supervisor 自动重启。
+- **异步投递**：Kafka 通知由运行在分布式 Kafka Connect 上的两个 Debezium 连接器从 MySQL 表级采集后写入 Kafka（`praxis-document-cdc` 只采集 `document_jobs` 的 INSERT 与 `schedule_version` 变化；`praxis-cache-cdc` 采集 7 张业务表全部 c/u/d）；必须配置 Kafka + Kafka Connect + 两个连接器并运行 `rag-document-worker`/`rag-cache-worker`，否则文档任务保持 `queued`、缓存刷新不生效。worker 故障由 Connect peer 接管并从 Kafka 保存位点恢复；FAILED task 由 `rag-service` supervisor 自动重启。
 - **同步搜索**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，无任务 ID/轮询/结果快照；总预算 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120 秒）。`search_tasks`/`search_result_snapshots` 为历史表、保留数据但不再读写，搜索 topic/消费组/DLQ 与 `rag-search-worker` 已下线；迁移与回滚见 [部署指南](DEPLOYMENT.md) §12。
 - **文档锁**：默认 `mysql`（MySQL `document_leases` 行），可整体切到 `redis`；两种模式不能混跑，同一部署内所有参与文档写入/恢复/清理的进程必须同值。切换/回退必须先停写并排空在途操作，见 [部署指南](DEPLOYMENT.md) §13。
 - **上传受理**：REST/Console 统一使用 `POST /v1/document-batches` 异步受理，通过批次或文档任务状态接口观察进度。`rag-service` 只受理，文档解析只由消费 Kafka 通知的 `rag-document-worker` 完成；未部署时任务保持 `queued`。MCP `update_document`/`delete_document` 仍同步执行，通过同名检查和发布事务内的 `ValidatePublication` 与在途文档任务互斥。

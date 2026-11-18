@@ -9,6 +9,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/access"
 	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 	"github.com/Guan0923/Praxis-RAG/internal/contracts"
+	"github.com/Guan0923/Praxis-RAG/internal/runtime"
 )
 
 // SearchRuntime runs one synchronous retrieval action.
@@ -62,6 +63,10 @@ func runtimeErrorStatus(err error) (int, string) {
 	var unavailable *apierrors.SnapshotUnavailable
 	if errors.As(err, &unavailable) {
 		return http.StatusGone, unavailable.Message
+	}
+	var forbidden *apierrors.ArtifactForbiddenError
+	if errors.As(err, &forbidden) {
+		return http.StatusForbidden, forbidden.Message
 	}
 	var knowledge *apierrors.KnowledgeError
 	if errors.As(err, &knowledge) {
@@ -148,6 +153,19 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, payload)
 }
 
+// artifactDocumentGate builds the document-level read gate for the two artifact
+// entries from the caller's resolved scope. It is nil for management
+// credentials and whole-knowledge-base readers (historical unrestricted
+// behaviour); a restricted scope may only read artifacts of documents it may
+// read.
+func artifactDocumentGate(r *http.Request) func(string) bool {
+	scope, ok := access.ScopeFromContext(r.Context())
+	if !ok || !scope.Restricted() {
+		return nil
+	}
+	return scope.CanReadDocument
+}
+
 func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request) {
 	namespace, ok := s.tenantNamespace(w, r)
 	if !ok {
@@ -179,7 +197,8 @@ func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request
 		writeDetail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	payload, err := s.runtime.GetArtifact(r.Context(), namespace, artifactID, offset, length)
+	ctx := runtime.WithDocumentReadGate(r.Context(), artifactDocumentGate(r))
+	payload, err := s.runtime.GetArtifact(ctx, namespace, artifactID, offset, length)
 	if err != nil {
 		writeRuntimeError(w, err, true)
 		return
@@ -230,7 +249,8 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 		writeDetail(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	content, mimeType, name, err := s.runtime.DownloadArtifact(r.Context(), namespace, artifactID)
+	ctx := runtime.WithDocumentReadGate(r.Context(), artifactDocumentGate(r))
+	content, mimeType, name, err := s.runtime.DownloadArtifact(ctx, namespace, artifactID)
 	if err != nil {
 		writeRuntimeError(w, err, true)
 		return
