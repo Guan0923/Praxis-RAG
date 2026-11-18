@@ -199,7 +199,9 @@ RAG_WORD_CONVERT_TIMEOUT = "120"
 | `RAG_INVITATION_TTL_HOURS` | `168` | 知识库邀请链接有效期（小时，1..8760） |
 | `RAG_DEFAULT_KB_TEMPLATE` | `default` | 管理员自建知识库未提交模型连接时克隆模板；普通账号必须从本人「模型配置」选择连接 |
 
-角色分管理员（`admin`）、VIP（`vip`）和普通用户（`user`），只有管理员可以改角色。知识库默认归创建者私有，共享通过邀请链接完成：管理员、VIP 以及当前 Plus/Pro 会员可邀请（管理员可邀请任意知识库，其余只能邀请自己创建的知识库），权限分「可读 / 可修改」、范围分「单文件 / 多文件 / 全库」；被邀请人登录后接受邀请才生效。会员到期后已有共享保留并可撤销，但停止新发付费邀请。完整流程见 [权限管理](PERMISSIONS.md)。
+角色分管理员（`admin`）、VIP（`vip`）和普通用户（`user`），只有管理员可以改角色。知识库默认归创建者私有，共享通过邀请链接完成：管理员、VIP 以及当前 Plus/Pro 会员可邀请（管理员可邀请任意知识库，其余只能邀请自己创建的知识库）。权限按四项操作（阅读 `read` / 新建 `create` / 更新 `update` / 删除 `delete`）分别授予，范围分「单文件 / 多文件 / 全库」；每项操作三态——未设置、允许（allow）、拒绝（deny），**同一操作上任何 deny 都优先于 allow**：全库拒绝可以压过单文件允许，单文件拒绝也可以限制全库允许；合并后没有获得允许的操作默认拒绝。账号上的拒绝只约束**该账号的登录会话**：独立 API Key 仍按自身绑定的知识库范围授权，不套用账号 ACL；服务令牌与本机直连凭据语义不变。SAG（事件-实体）检索对受限账号（任何非全库可读账号）会被明确拒绝，其余检索模式按可读文档过滤。会员到期后已有共享保留并可撤销，但停止新发付费邀请。完整流程见 [权限管理](PERMISSIONS.md)。
+
+**用户组**：`vip` 和 `admin` 可以在 Console 的「用户组」页面创建组并邀请成员（普通账号可以查看自己的邀请、接受或退出组）。组创建者可以在「权限管理」页把自己拥有的知识库授权给某个组：权限位为「阅读 1 / 新增 2 / 修改 4 / 删除 8」，范围分全库或指定文件（「新增」仅全库）。成员的最终权限是其个人授权与所有当前有效组授权的按位并集（个人显式拒绝仍优先生效）；移除成员、退出组、撤销组授权或解散组后，下一个请求立即失去对应权限。邀请人降级为 `user` 后不能再发新邀请（接受旧邀请时服务端会重新校验），但已有成员和授权继续有效。组规则、组邀请链接与权限来源说明见 [权限管理](PERMISSIONS.md)。
 
 ### 个人会员、额度与支付宝
 
@@ -209,7 +211,7 @@ Console 侧边栏和账号菜单提供「会员与用量」。Free / Plus / Pro 
 
 ### 飞书文档导入
 
-Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账号且对当前知识库有整体写权限时显示）。点击后先连接用户自己的飞书账号，再按文件夹浏览或按标题搜索该账号有权限访问的飞书文档，勾选后一次导入当前知识库，单次最多 10 篇。该功能依赖 Console 登录会话（`RAG_AUTH_ENABLED=true`）；纯 API Key / Service Token 模式没有“用户本人”的飞书身份，因此不显示入口，直接调用接口会返回未登录。
+Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账号且对当前知识库具备有效 `create` 时显示）。点击后先连接用户自己的飞书账号，再按文件夹浏览或按标题搜索该账号有权限访问的飞书文档，勾选后一次导入当前知识库，单次最多 10 篇。该功能依赖 Console 登录会话（`RAG_AUTH_ENABLED=true`）；纯 API Key / Service Token 模式没有“用户本人”的飞书身份，因此不显示入口，直接调用接口会返回未登录。
 
 - **使用用户自己的权限**：浏览、搜索、读取正文都用当前 Console 账号的飞书 `user_access_token`；服务端不会用应用身份越权读取。`App ID` / `App Secret` 由部署方配置，普通用户只需点击授权。
 - **复用现有入库规则**：只取新版飞书文档（docx）的纯文本，复用普通上传的知识库写权限校验、SHA-256 去重、同名跳过和异步索引。`document_id` 只用于本次选择和读取，不建立长期映射。
@@ -344,20 +346,40 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_REDIS_PREFIX` | `rag:state:v1` | 读模型缓存键前缀 |
 | `RAG_REDIS_TTL_SECONDS` | `60` | 读模型展示缓存 TTL **上限**（与文档锁 TTL 无关）：每次写入随机取 `[T-floor(T/5), T]` 内整秒，默认 48～60 秒，错开同步过期 |
 | `RAG_REDIS_TIMEOUT_SECONDS` | `0.3` | Redis 连接/命令超时 |
-| `RAG_DOCUMENT_LOCK_MODE` | `mysql` | 文档长租约后端：`mysql`（默认，行为不变）或 `redis`。部署级开关，`rag-service`/`rag-document-worker`/`rag-mcp-ingest` 必须同值 |
-| `RAG_REDIS_LOCK_URL` | 空（回退 `RAG_REDIS_URL`） | 文档锁 Redis 地址；`redis` 模式解析不出 URL 时启动报错 |
+| `RAG_REDIS_BREAKER_THRESHOLD` | `5` | 展示缓存熔断阈值：连续 `N` 次 Redis **可用性故障**（连接错误/超时）后熔断 |
+| `RAG_REDIS_BREAKER_COOLDOWN_SECONDS` | `10` | 熔断冷却时长；到期后每个实例只放一个请求探测 Redis，探测成功（含“key 不存在”）即恢复 |
+| `RAG_CACHE_FALLBACK_CONCURRENCY` | `4` | 单实例展示查询回源 MySQL 的并发上限；等待相同结果的请求不占名额 |
+| `RAG_REDIS_LOCK_URL` | 空（回退 `RAG_REDIS_URL`） | 文档锁 Redis 地址；**Redis 是文档锁的唯一后端**，解析不出 URL 时启动报配置错误（旧变量 `RAG_DOCUMENT_LOCK_MODE` 已移除，残留值被忽略） |
 | `RAG_REDIS_LOCK_PREFIX` | `rag:lock:v1` | 锁键前缀；每个 namespace 一个 Hash：`<prefix>:{<sha256(namespace) 前 32 位>}:leases`，单键内多 field，兼容 Redis Cluster |
 | `RAG_REDIS_LOCK_TTL_SECONDS` | `120`（未显式设置时跟随 `RAG_UPLOAD_LEASE_SECONDS`） | 文档长租约时长；心跳按 1/3 周期续租 |
 | `RAG_REDIS_LOCK_TIMEOUT_SECONDS` | `1` | 单次 Redis 命令超时 |
 | `RAG_REDIS_LOCK_WAIT_SECONDS` | `2` | 后端暂时不可用时等待/重试的窗口，超时返回可重试错误；锁冲突不等待 |
+| `RAG_UPLOAD_BLOOM_MODE` | `off` | 上传操作详情查询布隆过滤器：`off`（默认，行为不变）/ `register`（只登记新 ID，读不判）/ `on`（登记 + 读取侧否定判断）。部署级分阶段开关，创建上传的进程必须同值（见下方说明） |
+| `RAG_UPLOAD_BLOOM_URL` | 空（回退 `RAG_REDIS_URL`） | 布隆 Redis 地址；非 `off` 模式解析不出 URL 时启动报错 |
+| `RAG_UPLOAD_BLOOM_PREFIX` | `rag:uploadbloom:v1` | 布隆键前缀：`meta`/`building`/`disabled` + 每代 `g{N}:{shard}` 位图 |
+| `RAG_UPLOAD_BLOOM_FALSE_POSITIVE` | `0.01` | 规划容量处的目标误判率（1%） |
+| `RAG_UPLOAD_BLOOM_GROWTH` / `RAG_UPLOAD_BLOOM_MIN_CAPACITY` | `2.0` / `10000` | 规划容量 = max(历史+1, MIN) × GROWTH；历史超容量即触发下一代重建 |
+| `RAG_UPLOAD_BLOOM_SHARDS` | `16` | 位图分片（Redis string 键）数量 |
+| `RAG_UPLOAD_BLOOM_TIMEOUT_SECONDS` | `0.3` | 单次 Redis 命令超时 |
+| `RAG_UPLOAD_BLOOM_BATCH` / `RAG_UPLOAD_BLOOM_LOCK_TTL_SECONDS` | `500` / `600` | 构建代时的 MySQL 扫描批大小与构建租约 TTL（确认轮内续租） |
+| `RAG_UPLOAD_BLOOM_CHECK_SECONDS` | `300` | 维护间隔：启动构建 + 周期性扩容/修复检查 |
+| `RAG_UPLOAD_BLOOM_REBUILD` | `0` | 一次性强制重建（先停用否定判断再重扫；用后自清除）：数据库恢复/直接导入/Redis 旧备份恢复后设置 |
 | `RAG_RESULT_TTL_SECONDS` | `3600` | **artifact 保留期**（变量名保留，语义已更正；不再用于搜索结果快照） |
 | `RAG_RESULT_MAX_BYTES` | `16777216` | 单次搜索 artifact 累计字节上限 |
 | `RAG_ARTIFACT_MAX_BYTES` | `67108864` | 单 artifact 上限 |
 | `RAG_RESULT_MAX_ARTIFACTS` | `100` | 每次搜索最多 artifact 数 |
 
-持久读模型展示缓存启用时，读取先查 Redis，未命中按 `kind+scope` 争 Redis 回源锁（`SET NX PX` + 唯一 token，同一知识库的文档列表共用一把锁、不同知识库并行），拿到锁后复读 Redis、仍未命中才查 MySQL 并回填；等待者短暂退避并每次醒来先复读 Redis，等待超时/租约丢失/后端不可用返回**可重试**错误。**Redis 故障导致锁归属无法确认时不再直接回源 MySQL**；显式禁用缓存（`RAG_REDIS_ENABLED=false`）时读取仍直接回源 MySQL。搜索为同步直返，响应不写 Redis，artifact 以 MySQL `artifact_snapshots` 为事实来源并按 ID 独立读取，**清空 Redis 不影响搜索结果或已签发 artifact**。`RAG_RESULT_TTL_SECONDS` 到期后 MySQL artifact 被有界清理，再读取返回 410。
+持久读模型展示缓存启用时，读取先查 Redis，未命中按 `kind+scope` 争 Redis 回源锁（`SET NX PX` + 唯一 token，同一知识库的文档列表共用一把锁、不同知识库并行），拿到锁后复读 Redis、仍未命中才查 MySQL 并回填；等待者短暂退避并每次醒来先复读 Redis。**Redis 故障（含锁后端故障）按熔断与回源限流的既有语义直接回源 MySQL**；等待超时/租约丢失返回**可重试**错误。显式禁用缓存（`RAG_REDIS_ENABLED=false`）时读取仍直接回源 MySQL。搜索为同步直返，响应不写 Redis，artifact 以 MySQL `artifact_snapshots` 为事实来源并按 ID 独立读取，**清空 Redis 不影响搜索结果或已签发 artifact**。`RAG_RESULT_TTL_SECONDS` 到期后 MySQL artifact 被有界清理，再读取返回 410。
 
-**文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，`RAG_DOCUMENT_LOCK_MODE=redis` 时文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。默认 `mysql` 模式行为不变（`document_leases` 行 + 心跳续写 `expires_at`）；`redis` 模式只把长租约搬到 Redis，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询。切换与回退见[部署指南](DEPLOYMENT.md) §13。
+**展示缓存熔断与回源限流**：Redis 持续超时/连接失败时，展示读取（文档列表、知识库列表、上传列表等读模型视图）按 `RAG_REDIS_BREAKER_THRESHOLD` 计数，达到阈值后熔断——后续展示请求**跳过 Redis 读写**、直接回源 MySQL，不再为每个请求支付一次 0.3 秒超时；一次读取已因可用性故障失败时，回源成功后也不回填这个故障后端。冷却（`RAG_REDIS_BREAKER_COOLDOWN_SECONDS`）到期后，每个实例只放**一个**请求探测 Redis（其他请求继续回源）：探测成功——包括 Redis 正常回答“key 不存在”——即恢复正常缓存；探测失败则重新冷却。熔断只统计可用性故障：单条缓存内容损坏只影响该条（由该请求回源修复）、调用方主动取消不计为 Redis 故障，均不触发熔断。`RAG_REDIS_ENABLED=false` 的部署继续沿用直读 MySQL 模式，不经过熔断器。
+
+回源 MySQL 前，请求先按完整的 `kind + scope`（例如“文档列表 + 某知识库”）合并：同一实例内并发查询同一知识库文档列表的请求共用一次数据库查询，等待者不占用额外名额；只有真正执行查询的请求才获取 `RAG_CACHE_FALLBACK_CONCURRENCY` 的一个名额——拿到名额才开启 MySQL 事务，额度已满时**立即**返回 503「服务繁忙，请稍后重试」（REST 沿用现有 `{"detail": ...}` 错误结构；MCP 走现有工具错误通道），不再排队、也不会在 runtime 再查一次。合并后的这一次回源同时受**跨实例回源锁**保护：SET NX 拿锁的实例执行查询并回填，其它实例的同类请求退避复读、复用先到的结果，跨实例也只有一次列表查询。名额在查库结束时释放，不等 Redis 回填。正常缓存未命中与故障回源共用这道保护，多个列表集中过期时同样有效（随机 TTL 进一步错开过期）；Redis 命中则无需名额。名额按**实例**生效：多副本部署的总回源并发约为各实例额度之和，设置时请为上传、发布等写操作保留数据库余量。此约束只作用于前台展示读取；后台 `rag-cache-worker` 的失败补偿（`RefreshDirty`）是独立路径，不占用也不受此额度约束。Console 在刷新收到 503 时保留当前知识库上一次成功加载的列表并提示「刷新失败，当前显示上次加载的数据」；首次加载（或刚切换知识库）失败则显示错误与重试入口，不会把故障显示成「暂无文档」。
+
+**文档锁启用条件与失败语义**：文档锁与展示缓存**解耦**——`RAG_REDIS_ENABLED=false` 只关闭读模型展示缓存，文档锁仍用 Redis；`RAG_REDIS_TTL_SECONDS`（展示缓存）与 `RAG_REDIS_LOCK_TTL_SECONDS`（锁）是两套配置。Redis 是文档长租约的**唯一后端**（`RAG_DOCUMENT_LOCK_MODE` 已移除）：长租约的申请/续期/接管在 Redis 原子完成，MySQL 仍保存持有者登记与单调递增的 `fencing_epoch`，每个破坏性事务提交时校验当前持有者；`RAG_REDIS_LOCK_URL`（为空回退 `RAG_REDIS_URL`）必须能解析，否则启动报配置错误。Redis 冲突保持原有 409「资源被占用」；Redis 暂时不可用（超时/连接失败/未配置后端）返回**可重试**错误（REST 文案「文档锁暂不可用，请稍后使用相同的幂等键重试」，异步受理为 5xx），**不会**让单个实例回退到 MySQL 锁；已受理的任务仍可查询，展示读取可回源 MySQL。升级与代码回退见[部署指南](DEPLOYMENT.md) §13。
+
+**上传操作详情查询布隆过滤器**（`RAG_UPLOAD_BLOOM_MODE`，默认 `off` 行为不变）：只作用于 `GET /v1/uploads/{operation_id}` 的**读路径加速**——Redis bitmap 分片（`RAG_UPLOAD_BLOOM_SHARDS` 个 string 键，键前缀 `RAG_UPLOAD_BLOOM_PREFIX`）记录 MySQL `upload_operations.id`，按历史条数与预计增量（`RAG_UPLOAD_BLOOM_GROWTH`、`RAG_UPLOAD_BLOOM_MIN_CAPACITY`）规划容量、以 `RAG_UPLOAD_BLOOM_FALSE_POSITIVE`（默认 1%）为目标。查询顺序：先读展示缓存（含已缓存的空结果），未命中再问布隆；「一定不存在」直接返回原有 404，不执行上传状态 SQL；「可能存在」继续原有 MySQL 查询、namespace 校验与缓存回填。**MySQL 始终是事实来源**：过滤器未就绪、全局停用开关、分片丢失或 Redis 读取失败一律走原查询路径；布隆误判只多付一次 MySQL 查询；知识库访问权限仍由原 `namespace` 校验决定，跨知识库查询继续返回 404。可能按 MySQL 排序规则等价的 ID 写法（非全小写）一律绕过过滤器，保持历史查询行为。
+
+**分阶段启用与失败语义**：`register`（只登记不判读）→ 全部创建上传的进程升级后 → `on`（登记 + 读取侧否定判断），`rag-service`/`rag-document-worker`/`rag-mcp-ingest` 必须同值。新建上传（MySQL 锁与 Redis 锁两条路径）先登记再提交事务：事务回滚只留下一次无害的误报查询；登记失败时，除非能确认全局停用开关对所有实例可见（该次创建照常提交，后续维护重建），否则该次创建返回**可重试**错误——成功创建的操作不会被误报为不存在。扩容重建并行维护新旧两代（登记同时写两代），全量扫描加确认轮补齐构建期新增后原子切换（单一 meta SET）；删除操作记录**不清位**（位可能被其他 ID 共用，保留即可，误报率仅由容量规划控制）。数据库恢复、绕过应用直接导入记录或 Redis 从旧备份恢复后：设一次 `RAG_UPLOAD_BLOOM_REBUILD=1`（维护过程先停用否定判断、重扫 MySQL、重建并重新启用，开关自清除）。构建期间沿用原查询流程，新一代激活前读取侧不过滤。
 
 ### Kafka 与队列
 
@@ -536,7 +558,7 @@ Console 默认启用账号登录（`RAG_AUTH_ENABLED=true`）：
 1. 打开 `/console` 会进入登录页；切到"注册"创建账号，**第一个注册的账号自动成为管理员**。用户名不区分大小写（统一按小写保存）。
 2. 管理员在侧边栏"用户管理"页可以：把账号设为管理员 / VIP / 普通用户、启用/禁用、删除。系统始终保留至少一名启用状态的管理员（最后一个管理员不能被降级、禁用或删除）。
 3. 普通用户只能使用自己创建的知识库以及被邀请授权的知识库；管理员可以使用全部知识库并管理知识库配置、全部 API Key 和用户；VIP 额外可以邀请他人共享自己创建的知识库。所有登录角色都能打开「API Key」页管理自己的密钥，但非管理员只能绑定本人创建的知识库（详见[权限管理](PERMISSIONS.md) §9）。
-4. 共享入口在侧边栏「权限管理」（管理员与 VIP 可见）：选择知识库 → 邀请用户（权限：可读/可修改；范围：全库 / 若干文件）→ 复制邀请链接发给对方。被邀请人会在控制台通知铃铛看到待处理邀请，登录后打开链接即可接受；接受后权限立即生效。详见 [权限管理](PERMISSIONS.md)。
+4. 共享入口在侧边栏「权限管理」（管理员与 VIP 可见）：选择知识库 → 邀请用户（按操作授予：阅读/新建/更新/删除；范围：全库 / 若干文件）→ 复制邀请链接发给对方。被邀请人会在控制台通知铃铛看到待处理邀请，登录后打开链接即可接受；接受后授权立即生效。详见 [权限管理](PERMISSIONS.md)。
 5. 知识库与 API Key 页面支持批量删除：勾选行首复选框，或按住鼠标左键在表格上拖出框选。框选只增不减：拖动或缩小框选区域、开始新一轮框选、上下滚动页面都不会取消已选中的行；要取消某一行请点它的行首复选框（Esc 只取消本次拖动并恢复拖动前的选中）。工具栏「批量删除」按钮会显示已选数量。知识库批量删除会删除所选知识库的全部文档并移除配置记录，**删除后无法恢复**；只要有一个文档删除失败，该知识库就保留并列出失败原因，可重试。API Key 批量删除对已不存在的 id 视为已删除，失败项保留选中。
 
 会话使用 HttpOnly Cookie（`rag_session`）保存，默认有效期 7 天（`RAG_AUTH_SESSION_TTL_HOURS`），所有写操作要求 `X-CSRF-Token`（Console 自动带上）。判定规则：
@@ -580,7 +602,7 @@ worker 必须与 `rag-service` 使用**同一** `RAG_CONFIG_FILE`、`RAG_SERVICE
 3. REST `/v1/documents` 需要认证，未认证返回 401。
 4. MCP 初始化成功，`tools/list` 返回 5 个工具。
 5. 异步链路：默认异步上传与 MCP `add_document` 得到 `artifact_id`；配置 Kafka/Debezium 并启动 document worker 后，轮询 `get_document_status` 至 `succeeded`；未运行 worker 时任务保持 `queued`。
-6. 同步搜索：MCP `search` 与 `POST /v1/search` 一次调用直接返回 `results`/`artifacts`/`evidence_status`；响应无 `result_id`，`GET /v1/search-results/<uuid>` 返回 404；受限账号检索按 scope 过滤。
+6. 同步搜索：MCP `search` 与 `POST /v1/search` 一次调用直接返回 `results`/`artifacts`/`evidence_status`；响应无 `result_id`，`GET /v1/search-results/<uuid>` 返回 404；受限账号检索按有效 `read` 过滤（SAG 模式对受限账号明确拒绝，见 [权限管理](PERMISSIONS.md) §11）。
 7. 缓存收敛：直接 `UPDATE`/`DELETE` 一张缓存相关业务表，等待 `rag-cache-worker` 消费后 Redis 读模型与 MySQL 一致；监控页缓存 dirty/failures 归零。
 8. PDF 解析（vision 引擎）：`curl.exe http://127.0.0.1:8091/healthz` 返回 200 且 `status=ok`，在 Console 为测试知识库选择 VLM 后上传一个 PDF，任务 `succeeded` 且该文档的 PDF 清单版本为 `docling-service-v1`；`RAG_PDF_ENGINE=go` 时清单版本为 `go-native-v1`。
 9. Word/HTML 解析：`curl.exe http://127.0.0.1:8092/healthz` 返回 200 且 `config_error` 为 `null`（该接口始终 200），上传一个 `.docx` 与一个 `.html`（`RAG_DOCLING_SERVICE_URL` 已配置），任务 `succeeded` 后确认 HTML 预览显示为纯文本而不是渲染后的页面。
@@ -659,7 +681,7 @@ curl.exe -X POST "http://127.0.0.1:8011/v1/documents/%E4%BD%BF%E7%94%A8%E6%89%8B
 ```
 
 - `{name}` 是目标文档的现有名称（URL 编码），multipart 字段固定为 `file`，一次只接受一个文件。
-- 需要目标文档的写权限：全库写权限，或该文档的单文件写权限；只被授权其他文件时返回 403。
+- 需要对目标文档的有效 `update`（全库授权，或该文档的单文件授权）；没有 `update` 时返回 403。
 - 新文件类型必须与目标文档一致（400）；目标文档不存在返回 404；非法/超限文件返回 400。
 - 响应与 MCP `update_document` 同步语义一致：`status`（通常为 `updated`，内容与切分配置都未变化时为 `unchanged`）、`document` 和 `documents`（替换后的文档列表）。替换失败不会发布部分索引，原文档仍可预览与检索。
 
@@ -978,13 +1000,13 @@ curl.exe http://127.0.0.1:8011/v1/invitations
 curl.exe -X POST http://127.0.0.1:8011/v1/invitations/preview -H "Content-Type: application/json" -d '{"token":"<link-token>"}'
 curl.exe -X POST http://127.0.0.1:8011/v1/invitations/accept  -H "Content-Type: application/json" -d '{"token":"<link-token>"}'
 
-# 管理已有授权与未接受的邀请
+# 管理已有授权与未接受的邀请（旧撤销授权只清除 allow，不移除拒绝规则）
 curl.exe http://127.0.0.1:8011/v1/knowledge-bases/team-kb/permissions
 curl.exe -X DELETE http://127.0.0.1:8011/v1/knowledge-bases/team-kb/permissions/<user_id>
 curl.exe -X DELETE http://127.0.0.1:8011/v1/invitations/<invitation_id>
 ```
 
-邀请链接形如 `http://127.0.0.1:8011/console#/invite?token=<一次性token>`；数据库只保存 token 的 SHA-256 摘要，链接只在创建响应中出现一次。邀请只能由被邀请的账号接受。
+邀请链接形如 `http://127.0.0.1:8011/console#/invite?token=<一次性token>`；数据库只保存 token 的 SHA-256 摘要，链接只在创建响应中出现一次。邀请只能由被邀请的账号接受。旧的 `permission: "read"|"write"` 请求字段继续接受并转换为位掩码，精确的 allow/deny 掩码通过新增字段表达；除邀请外，也可以按「账号 + 全库或单文件」直接设置规则——设置 deny 立即生效，无需对方接受邀请。字段级 schema 见服务端契约，行为语义见 [权限管理](PERMISSIONS.md)。
 
 ### 文档管理
 
@@ -1079,6 +1101,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/search `
 - 可以搭配任意 `rerank`（`none` 或 `cross_encoder`）：排序是种子分与超边共享实体数的融合分，cross-encoder 二段精排合法（区别于 `sag2`）。
 - 每文档抽取上限 512 chunk（超出部分留给回填 CLI），实体归一化为 casefold；抽取结果含 `metadata.sag_event`（该 chunk 的事件句），便于核对证据链。
 - 删除文档时事件与关联级联清理，实体行保留（共享数据），不会留下悬空超边。
+- 受限账号（任何非全库可读账号，含全库 `read` + 文件级 deny）调用 `sag` 会被**明确拒绝**：该模式的动态超边扩展无法在召回前可靠限定文档范围，这是明确的拒绝而非静默泄露；其余检索模式按可读文档过滤（见 [权限管理](PERMISSIONS.md) §11）。
 
 ```powershell
 # 存量文档补建索引（先 dry-run 看清单）
@@ -1333,7 +1356,7 @@ $env:RAG_MCP_ALLOWED_ORIGINS = "https://app.example.com"
 - `scripts/build-go.ps1` 本机构建 + 冒烟：`/health 200 status=ok`、`/console` 返回构建后的 Console、`/` 200。POSIX 的 `scripts/build-go.sh`/`make check` 未在当前 Windows 验证环境执行。
 - 四个 worker 二进制与切换/迁移 CLI 的 `--help`、缺少 Kafka、错误 backend、非法 `--kind` 的退出码行为。
 - Go 端 REST/MCP/检索/文档/资产投影/`document.md` 预览/上传事务的单元与集成测试（真实 MySQL + fake Qdrant/model）。
-- 文档长租约后端（`RAG_DOCUMENT_LOCK_MODE=redis`）：`internal/state` 覆盖冲突矩阵、迟到登记、接管围栏、Redis 丢失/不可用/释放失败与租约展示；`internal/runtime`、`internal/documentworker` 回归；`internal/redisstate` 用两个独立客户端对真实 Redis 验证 Lua、续租与 TTL。
+- 文档长租约后端（Redis 唯一后端，旧 `RAG_DOCUMENT_LOCK_MODE` 已移除）：`internal/state` 覆盖冲突矩阵、迟到登记、接管围栏、Redis 丢失/不可用/释放失败与租约展示；`internal/runtime`、`internal/documentworker` 回归；`internal/redisstate` 用两个独立客户端对真实 Redis 验证 Lua、续租与 TTL。
 - Console 角色/知识库归属/邀请共享的**全栈 HTTP E2E**（真实登录会话与 CSRF、真实 access 服务、真实 MySQL）：`internal/e2e/permissions_http_test.go` 覆盖角色变更、归属可见性、邀请创建→收件箱→预览→接受、只读/读写闸门、模板建库、撤销授权。异步上传发布后读模型刷新的回归也由 `internal/e2e` 覆盖。
 
 **未验证**（不要据此宣称生产就绪）：
@@ -1407,7 +1430,7 @@ PDF 默认由独立的 `pdf-parser` 微服务解析（本地 PyMuPDF 读取/渲�
 - **同步搜索**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，无任务 ID/轮询/结果快照；总预算 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120 秒）。`search_tasks`/`search_result_snapshots` 为历史表、保留数据但不再读写，搜索 topic/消费组/DLQ 与 `rag-search-worker` 已下线；迁移与回滚见 [部署指南](DEPLOYMENT.md) §12。
 - **文档锁**：默认 `mysql`（MySQL `document_leases` 行），可整体切到 `redis`；两种模式不能混跑，同一部署内所有参与文档写入/恢复/清理的进程必须同值。切换/回退必须先停写并排空在途操作，见 [部署指南](DEPLOYMENT.md) §13。
 - **上传受理**：REST/Console 统一使用 `POST /v1/document-batches` 异步受理，通过批次或文档任务状态接口观察进度。`rag-service` 只受理，文档解析只由消费 Kafka 通知的 `rag-document-worker` 完成；未部署时任务保持 `queued`。MCP `update_document`/`delete_document` 仍同步执行，通过同名检查和发布事务内的 `ValidatePublication` 与在途文档任务互斥。
-- **权限与共享**：账号分为管理员 / VIP / 普通用户；知识库默认归创建者私有，共享靠邀请链接完成（权限：可读/可修改；范围：单文件/多文件/全库），只有 VIP 与管理员可发起邀请。邀请消息目前是站内通知（控制台铃铛），不发送邮件/IM；链接只展示一次，库内只存摘要。文件级写授权只能替换已授权的同名文档，不能上传新文件；历史无创建者的知识库仅管理员可用/可授权；受限账号在同步检索中按文档 scope 过滤，不再被拒绝。详见 [权限管理](PERMISSIONS.md)。
+- **权限与共享**：账号分为管理员 / VIP / 普通用户；知识库默认归创建者私有，共享靠邀请链接完成（按操作授予：`read`/`create`/`update`/`delete`；范围：单文件/多文件/全库），只有 VIP 与管理员可发起邀请；每项操作三态（未设置/允许/拒绝），同一操作上 deny 优先于 allow，合并后未获允许的操作默认拒绝。邀请消息目前是站内通知（控制台铃铛），不发送邮件/IM；链接只展示一次，库内只存摘要。只有 `create` 的账号能上传新文件但不能覆盖已有文件（覆盖需要 `update`），只有 `update` 的账号能替换授权文件但不能删除；历史无创建者的知识库仅管理员可用/可授权；受限账号在同步检索中按有效 `read` 过滤，SAG 模式对受限账号明确拒绝。详见 [权限管理](PERMISSIONS.md)。
 - **管理边界**：`/v1/admin/*` 仅本机直连或管理员会话；**例外**是 `/v1/admin/api-keys` 的五条管理路由——任意登录角色的会话都可管理自己的 API Key（管理员管理全部，非管理员只能绑定本人拥有的知识库）。API Key 按创建账号归属隔离，历史无主密钥仅管理员/本机管理可见；管理凭证（Service Token / API Key）在请求时仍不做知识库归属校验，API Key 的 namespace 白名单仍然生效。详见 [权限管理](PERMISSIONS.md) §9。
 - **数据**：状态表用 `rag-state-migrate`；旧知识源 `rag-service-migrate --apply` 不重建向量，需重新上传。旧任务/旧结果快照不迁移也不读取；artifact 以 MySQL `artifact_snapshots` 为事实来源（保留期 `RAG_RESULT_TTL_SECONDS`），`search_tasks`/`search_result_snapshots` 保留历史数据、不再读写，物理删除另行安排。
 - 具体契约差异（cached read views、静态目录列表等剩余的 P1/P2）见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)。

@@ -19,6 +19,8 @@ type GrantView struct {
 	Username          string `json:"username"`
 	DocumentName      string `json:"document_name"`
 	Permission        string `json:"permission"`
+	AllowMask         int    `json:"allow_mask"`
+	DenyMask          int    `json:"deny_mask"`
 	GrantedBy         string `json:"granted_by"`
 	GrantedByUsername string `json:"granted_by_username"`
 	CreatedAt         string `json:"created_at"`
@@ -34,6 +36,7 @@ type InvitationView struct {
 	InviteeUserID   string   `json:"invitee_user_id"`
 	InviteeUsername string   `json:"invitee_username"`
 	Permission      string   `json:"permission"`
+	AllowMask       int      `json:"allow_mask"`
 	Scope           string   `json:"scope"`
 	DocumentNames   []string `json:"document_names"`
 	Status          string   `json:"status"`
@@ -49,12 +52,23 @@ type UserView struct {
 	Role     string `json:"role"`
 }
 
-// ScopeView renders one effective scope as JSON.
+// ScopeView renders one effective scope as JSON. The legacy boolean/list
+// fields stay for old readers; the mask fields expose the raw rule state so
+// the Console can compute per-document effective operations itself.
 type ScopeView struct {
-	WholeRead      bool     `json:"whole_read"`
-	WholeWrite     bool     `json:"whole_write"`
-	ReadDocuments  []string `json:"read_documents"`
-	WriteDocuments []string `json:"write_documents"`
+	WholeRead      bool              `json:"whole_read"`
+	WholeWrite     bool              `json:"whole_write"`
+	ReadDocuments  []string          `json:"read_documents"`
+	WriteDocuments []string          `json:"write_documents"`
+	DefaultAllow   int               `json:"default_allow"`
+	DefaultDeny    int               `json:"default_deny"`
+	WholeAllow     int               `json:"whole_allow"`
+	WholeDeny      int               `json:"whole_deny"`
+	FileAllow      map[string]int    `json:"file_allow"`
+	FileDeny       map[string]int    `json:"file_deny"`
+	// EffectiveLibrary is the effective operation mask at knowledge-base
+	// level (the create bit lives here).
+	EffectiveLibrary int `json:"effective_library"`
 }
 
 // AccessView is the effective access of the current account in one knowledge
@@ -75,8 +89,20 @@ type CreateInvitationRequest struct {
 	Namespace     string
 	Username      string
 	Permission    string
+	AllowMask     *int
 	Scope         string
 	DocumentNames []string
+}
+
+// RuleRequest sets one rule (account × whole library or one document). Masks
+// are optional: a nil mask leaves that side unchanged so the legacy
+// permission-only payload only rewrites the allow side.
+type RuleRequest struct {
+	GranteeUserID string
+	DocumentName  string
+	Permission    string
+	AllowMask     *int
+	DenyMask      *int
 }
 
 // Describe returns the caller's effective access view for one knowledge base.
@@ -97,6 +123,14 @@ func (s *Service) Describe(ctx context.Context, user state.User, namespace strin
 	if err != nil {
 		return AccessView{}, err
 	}
+	fileAllow := map[string]int{}
+	for name, mask := range scope.FileAllow {
+		fileAllow[name] = int(mask)
+	}
+	fileDeny := map[string]int{}
+	for name, mask := range scope.FileDeny {
+		fileDeny[name] = int(mask)
+	}
 	return AccessView{
 		Namespace: namespace,
 		Owner:     owner != "" && owner == user.ID,
@@ -110,6 +144,13 @@ func (s *Service) Describe(ctx context.Context, user state.User, namespace strin
 			WholeWrite:     scope.WritesWhole(),
 			ReadDocuments:  scope.ReadDocumentNames(),
 			WriteDocuments: scope.WriteDocumentNames(),
+			DefaultAllow:   int(scope.DefaultAllow),
+			DefaultDeny:    int(scope.DefaultDeny),
+			WholeAllow:     int(scope.WholeAllow),
+			WholeDeny:      int(scope.WholeDeny),
+			FileAllow:      fileAllow,
+			FileDeny:       fileDeny,
+			EffectiveLibrary: int(scope.EffectiveLibrary()),
 		},
 	}, nil
 }
@@ -132,6 +173,8 @@ func (s *Service) ListGrants(ctx context.Context, user state.User, namespace str
 			Username:          s.username(ctx, cache, row.GranteeUserID),
 			DocumentName:      row.DocumentName,
 			Permission:        row.Permission,
+			AllowMask:         int(row.AllowMask),
+			DenyMask:         int(row.DenyMask),
 			GrantedBy:         row.GrantedBy,
 			GrantedByUsername: s.username(ctx, cache, row.GrantedBy),
 			CreatedAt:         row.CreatedAt,
@@ -141,7 +184,138 @@ func (s *Service) ListGrants(ctx context.Context, user state.User, namespace str
 	return views, nil
 }
 
-// RevokeGrant removes every grant of one account inside one knowledge base.
+// SetRule writes one rule (account × whole library or one document) directly.
+// A non-nil allow/deny mask overwrites that side; the other side keeps its
+// stored value, so "revoke allow" and "clear deny" are expressed as targeted
+// zero masks rather than deleting the row. Denies take effect immediately:
+// no invitation acceptance is involved. The rule document must exist when a
+// document name is supplied.
+func (s *Service) SetRule(ctx context.Context, user state.User, namespace string, request RuleRequest) (GrantView, error) {
+	if err := s.RequireManagePermission(ctx, user, namespace); err != nil {
+		return GrantView{}, err
+	}
+	grantee := strings.TrimSpace(request.GranteeUserID)
+	if grantee == "" {
+		return GrantView{}, NewError(KindValidation, MessageUserMissing)
+	}
+	if _, err := s.users.ByID(ctx, grantee); err != nil {
+		return GrantView{}, err
+	}
+	documentName := strings.TrimSpace(request.DocumentName)
+	if documentName != "" && !IsDocumentNameValid(documentName) {
+		return GrantView{}, NewError(KindValidation, MessageDocumentsBad+documentName)
+	}
+	// Read the stored rule first so an unchanged side survives untouched.
+	existing, err := s.permissions.ListFor(ctx, namespace, grantee)
+	if err != nil {
+		return GrantView{}, err
+	}
+	storedAllow := PermissionMask(0)
+	storedDeny := PermissionMask(0)
+	grantedBy := user.ID
+	for _, row := range existing {
+		if row.DocumentName == documentName {
+			storedAllow = row.AllowMask
+			storedDeny = row.DenyMask
+			if row.GrantedBy != "" {
+				grantedBy = row.GrantedBy
+			}
+		}
+	}
+	rule := state.Permission{
+		Namespace:     namespace,
+		GranteeUserID: grantee,
+		DocumentName:  documentName,
+		AllowMask:     storedAllow,
+		DenyMask:      storedDeny,
+		GrantedBy:     grantedBy,
+	}
+	switch {
+	case request.Permission != "":
+		if !state.IsPermission(request.Permission) {
+			return GrantView{}, NewError(KindValidation, MessagePermissionBad)
+		}
+		rule.Permission = request.Permission
+		rule.AllowMask = LegacyMask(request.Permission, documentName == "")
+	case request.AllowMask != nil:
+		mask, maskErr := ParseMask(int64(*request.AllowMask))
+		if maskErr != nil {
+			return GrantView{}, maskErr
+		}
+		if documentName != "" && !MaskAllowsFileScope(mask) {
+			return GrantView{}, NewError(KindValidation, MessageMaskCreateFile)
+		}
+		rule.Permission = LegacyPermission(mask)
+		rule.AllowMask = mask
+	default:
+		return GrantView{}, NewError(KindValidation, MessagePermissionBad)
+	}
+	if request.DenyMask != nil {
+		mask, maskErr := ParseMask(int64(*request.DenyMask))
+		if maskErr != nil {
+			return GrantView{}, maskErr
+		}
+		if documentName != "" && !MaskAllowsFileScope(mask) {
+			return GrantView{}, NewError(KindValidation, MessageMaskCreateFile)
+		}
+		rule.DenyMask = mask
+	}
+	if err := s.permissions.Upsert(ctx, rule); err != nil {
+		return GrantView{}, err
+	}
+	return s.grantView(ctx, namespace, grantee, documentName)
+}
+
+// ClearDeny removes every deny of one rule while keeping its allow: the
+// explicit "清除拒绝" operation. It reports the stored rule afterwards.
+func (s *Service) ClearDeny(ctx context.Context, user state.User, namespace, granteeUserID, documentName string) (GrantView, error) {
+	if err := s.RequireManagePermission(ctx, user, namespace); err != nil {
+		return GrantView{}, err
+	}
+	grantee := strings.TrimSpace(granteeUserID)
+	if grantee == "" {
+		return GrantView{}, NewError(KindValidation, MessageUserMissing)
+	}
+	documentName = strings.TrimSpace(documentName)
+	changed, err := s.permissions.ClearDeny(ctx, namespace, grantee, documentName)
+	if err != nil {
+		return GrantView{}, err
+	}
+	if !changed {
+		return GrantView{}, NewError(KindNotFound, MessageRuleMissing)
+	}
+	return s.grantView(ctx, namespace, grantee, documentName)
+}
+
+// grantView renders one freshly written rule row.
+func (s *Service) grantView(ctx context.Context, namespace, granteeUserID, documentName string) (GrantView, error) {
+	rows, err := s.permissions.ListFor(ctx, namespace, granteeUserID)
+	if err != nil {
+		return GrantView{}, err
+	}
+	cache := map[string]string{}
+	for _, row := range rows {
+		if row.DocumentName == documentName {
+			return GrantView{
+				UserID:            row.GranteeUserID,
+				Username:          s.username(ctx, cache, row.GranteeUserID),
+				DocumentName:      row.DocumentName,
+				Permission:        row.Permission,
+				AllowMask:         int(row.AllowMask),
+				DenyMask:          int(row.DenyMask),
+				GrantedBy:         row.GrantedBy,
+				GrantedByUsername: s.username(ctx, cache, row.GrantedBy),
+				CreatedAt:         row.CreatedAt,
+				UpdatedAt:         row.UpdatedAt,
+			}, nil
+		}
+	}
+	return GrantView{}, NewError(KindNotFound, MessageRuleMissing)
+}
+
+// RevokeGrant removes the allows of one account inside one knowledge base
+// (the legacy revoke surface). Deny rules survive: clearing an allow never
+// lifts an explicit deny.
 func (s *Service) RevokeGrant(ctx context.Context, user state.User, namespace, granteeUserID string) error {
 	if err := s.RequireManagePermission(ctx, user, namespace); err != nil {
 		return err
@@ -149,12 +323,21 @@ func (s *Service) RevokeGrant(ctx context.Context, user state.User, namespace, g
 	if strings.TrimSpace(granteeUserID) == "" {
 		return NewError(KindValidation, MessageUserMissing)
 	}
-	removed, err := s.permissions.Delete(ctx, namespace, granteeUserID)
+	rows, err := s.permissions.ListFor(ctx, namespace, granteeUserID)
 	if err != nil {
 		return err
 	}
-	if removed == 0 {
+	if len(rows) == 0 {
 		return NewError(KindNotFound, "授权不存在")
+	}
+	removed, err := s.permissions.ClearAllAllow(ctx, namespace, granteeUserID)
+	if err != nil {
+		return err
+	}
+	if removed == 0 && len(rows) > 0 {
+		// Only deny rules existed: they stay, but the operation still reports
+		// success because nothing allowed remains.
+		return nil
 	}
 	return nil
 }
@@ -191,8 +374,21 @@ func (s *Service) CreateInvitation(
 	if !canShare {
 		return InvitationView{}, "", NewError(KindForbidden, MessageForbidden)
 	}
+	allowMask := PermissionMask(0)
+	hasMask := false
+	if request.AllowMask != nil {
+		mask, maskErr := ParseMask(int64(*request.AllowMask))
+		if maskErr != nil {
+			return InvitationView{}, "", maskErr
+		}
+		allowMask = mask
+		hasMask = true
+	}
 	permission := strings.TrimSpace(request.Permission)
-	if !state.IsPermission(permission) {
+	if allowMask == 0 && permission == "" {
+		return InvitationView{}, "", NewError(KindValidation, MessagePermissionBad)
+	}
+	if permission != "" && !state.IsPermission(permission) {
 		return InvitationView{}, "", NewError(KindValidation, MessagePermissionBad)
 	}
 	scope := strings.TrimSpace(request.Scope)
@@ -202,6 +398,13 @@ func (s *Service) CreateInvitation(
 	documents, err := normalizeDocumentNames(scope, request.DocumentNames)
 	if err != nil {
 		return InvitationView{}, "", err
+	}
+	// The create bit is library-level: a file-scoped invitation cannot carry it.
+	if scope == state.InvitationScopeFiles && !MaskAllowsFileScope(allowMask) {
+		return InvitationView{}, "", NewError(KindValidation, MessageMaskCreateFile)
+	}
+	if !hasMask && permission != "" {
+		allowMask = LegacyMask(permission, scope == state.InvitationScopeAll)
 	}
 	namespace := strings.TrimSpace(request.Namespace)
 	if namespace == "" {
@@ -247,7 +450,8 @@ func (s *Service) CreateInvitation(
 		Namespace:     namespace,
 		InviterUserID: inviter.ID,
 		InviteeUserID: invitee.ID,
-		Permission:    permission,
+		Permission:    LegacyPermission(allowMask),
+		AllowMask:     allowMask,
 		Scope:         scope,
 		DocumentNames: documents,
 		TokenDigest:   digest,
@@ -325,12 +529,15 @@ func (s *Service) AcceptInvitation(ctx context.Context, user state.User, token s
 		return InvitationView{}, NewError(KindConflict, MessageInviterExpired)
 	}
 	grants := make([]state.Permission, 0, len(invitation.DocumentNames)+1)
+	allow := invitation.InvitationAllowMask()
+	permission := LegacyPermission(allow)
 	if invitation.Scope == state.InvitationScopeAll || len(invitation.DocumentNames) == 0 {
 		grants = append(grants, state.Permission{
 			Namespace:     invitation.Namespace,
 			GranteeUserID: user.ID,
 			DocumentName:  "",
-			Permission:    invitation.Permission,
+			Permission:    permission,
+			AllowMask:     allow,
 			GrantedBy:     invitation.InviterUserID,
 		})
 	} else {
@@ -339,7 +546,8 @@ func (s *Service) AcceptInvitation(ctx context.Context, user state.User, token s
 				Namespace:     invitation.Namespace,
 				GranteeUserID: user.ID,
 				DocumentName:  name,
-				Permission:    invitation.Permission,
+				Permission:    permission,
+				AllowMask:     allow,
 				GrantedBy:     invitation.InviterUserID,
 			})
 		}
@@ -476,6 +684,7 @@ func (s *Service) invitationView(ctx context.Context, cache map[string]string, i
 		InviteeUserID:   invitation.InviteeUserID,
 		InviteeUsername: s.username(ctx, cache, invitation.InviteeUserID),
 		Permission:      invitation.Permission,
+		AllowMask:       int(invitation.InvitationAllowMask()),
 		Scope:           invitation.Scope,
 		DocumentNames:   documents,
 		Status:          status,

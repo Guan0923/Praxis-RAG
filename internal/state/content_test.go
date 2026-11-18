@@ -382,8 +382,8 @@ func TestKnowledgeBasePurgeBatchDeletesNamespaceRows(t *testing.T) {
 	}
 }
 
-// TestKnowledgeBasePurgeSkipsBusyNamespace verifies that an active upload lease
-// blocks a purge instead of deleting the namespace underneath the upload.
+// TestKnowledgeBasePurgeSkipsBusyNamespace verifies that an active document
+// lease blocks a purge instead of deleting the namespace underneath the upload.
 func TestKnowledgeBasePurgeSkipsBusyNamespace(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
@@ -392,10 +392,11 @@ func TestKnowledgeBasePurgeSkipsBusyNamespace(t *testing.T) {
 		"busy", "collection-busy", `{}`, 1, nowISO(), nowISO()); err != nil {
 		t.Fatalf("inserting knowledge base: %v", err)
 	}
-	if _, err := stores.DB.ExecContext(ctx,
-		"INSERT INTO document_leases (namespace, resource, owner, operation_id, expires_at) VALUES (?, ?, ?, NULL, ?)",
-		"busy", UploadNamespaceResource, "owner", unixSeconds()+60); err != nil {
-		t.Fatalf("inserting lease: %v", err)
+	// A live lease in the backend is what makes the namespace busy: the SQL
+	// registration alone never authorizes or blocks anything.
+	if err := testLocker(t, stores).Acquire(ctx, "busy",
+		[]string{UploadNamespaceResource}, "owner", 60*time.Second); err != nil {
+		t.Fatalf("fake acquire error = %v", err)
 	}
 	report, err := stores.KnowledgeBases.Purge(ctx, []string{"busy"})
 	if err != nil {

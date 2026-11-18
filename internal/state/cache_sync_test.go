@@ -20,6 +20,7 @@ type memoryCache struct {
 	enabled       bool
 	down          bool
 	closed        bool
+	puts          int
 	lockedDown    bool
 	entries       map[CacheKey]any
 	watermarks    map[CacheKey]int64
@@ -33,6 +34,13 @@ func newMemoryCache() *memoryCache {
 		watermarks:    map[CacheKey]int64{},
 		backfillLocks: map[CacheKey]string{},
 	}
+}
+
+// putCount reports how many Put calls were attempted.
+func (m *memoryCache) putCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.puts
 }
 
 func (m *memoryCache) Enabled() bool { return m.enabled }
@@ -58,6 +66,7 @@ func (m *memoryCache) Get(_ context.Context, kind, scope string) (bool, any, err
 func (m *memoryCache) Put(_ context.Context, kind, scope string, revision int64, value any, _ bool) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.puts++
 	if m.down {
 		return false, newCacheUnavailable("unreachable")
 	}
@@ -143,13 +152,18 @@ func newCacheTestStores(t *testing.T) (*Stores, *memoryCache) {
 }
 
 // newFastCacheTestStores shortens the backfill lock timing so waiter tests
-// stay fast: a small TTL/poll/wait still exercises the same protocol.
+// stay fast: a small TTL/poll/wait still exercises the same protocol. The
+// breaker stays closed and the fallback budget stays effectively unbounded so
+// the lock protocol is the only protection under test.
 func newFastCacheTestStores(t *testing.T) (*Stores, *memoryCache) {
 	t.Helper()
 	stores, cache := newCacheTestStores(t)
 	stores.CacheSync.backfillTTL = 150 * time.Millisecond
 	stores.CacheSync.backfillPoll = 5 * time.Millisecond
 	stores.CacheSync.backfillWait = 150 * time.Millisecond
+	stores.CacheSync.Settings.BreakerThreshold = 1000
+	stores.CacheSync.Settings.BreakerCooldownSeconds = 1000
+	stores.CacheSync.Settings.FallbackConcurrency = 1000
 	return stores, cache
 }
 
@@ -685,12 +699,12 @@ func TestGetOrLoadBackfillsOnceForConcurrentMisses(t *testing.T) {
 	if queries != 1 {
 		t.Fatalf("backfill list queries = %d, want exactly 1", queries)
 	}
-	// Both callers return the same JSON-detached shape the backend hands back
-	// (a []any of records after the round trip).
+	// Both callers return the same value: the leader's loader result is reused
+	// by the guard waiter, so the shapes agree without a second query.
 	if fmt.Sprint(results[0]) != fmt.Sprint(results[1]) {
 		t.Fatalf("results differ between caller slots: %#v vs %#v", results[0], results[1])
 	}
-	if list, ok := results[0].([]any); !ok || len(list) != 0 {
+	if list, ok := results[0].([]map[string]any); !ok || len(list) != 0 {
 		t.Fatalf("first result = %#v, want the shared empty list", results[0])
 	}
 	if hit, _, err := cache.Get(ctx, "documents", "ns"); err != nil || !hit {
@@ -715,6 +729,9 @@ func TestGetOrLoadParallelScopesBackfillIndependently(t *testing.T) {
 	stores.CacheSync.backfillTTL = 150 * time.Millisecond
 	stores.CacheSync.backfillPoll = 5 * time.Millisecond
 	stores.CacheSync.backfillWait = 150 * time.Millisecond
+	stores.CacheSync.Settings.BreakerThreshold = 1000
+	stores.CacheSync.Settings.BreakerCooldownSeconds = 1000
+	stores.CacheSync.Settings.FallbackConcurrency = 1000
 	ctx := context.Background()
 	base := uniqueCacheNamespace(t, "parallel")
 	scopes := []string{base + "-a", base + "-b"}
@@ -888,10 +905,11 @@ func (h heldOnlyCache) ReleaseBackfillLock(context.Context, string, string, stri
 
 func (h heldOnlyCache) Close() error { return nil }
 
-// TestGetOrLoadRedisOutageIsRetryableNotFallback pins the replaced failure
-// semantics: with the cache enabled, an outage during the miss path (lock
-// acquire) must return a retryable error instead of silently reading MySQL.
-func TestGetOrLoadRedisOutageIsRetryableNotFallback(t *testing.T) {
+// TestGetOrLoadLockOutageStillFallsBack pins the merged failure semantics: a
+// Redis (lock backend) outage keeps the documented outage contract — the
+// request falls back to MySQL and succeeds — while no publish is attempted
+// against the down backend.
+func TestGetOrLoadLockOutageStillFallsBack(t *testing.T) {
 	stores, cache := newFastCacheTestStores(t)
 	ctx := context.Background()
 	if err := stores.KnowledgeBases.Create(ctx, cacheTestKnowledgeBase("c")); err != nil {
@@ -908,16 +926,18 @@ func TestGetOrLoadRedisOutageIsRetryableNotFallback(t *testing.T) {
 		return loader(loaderCtx, querier, scope)
 	}
 
-	_, err := stores.CacheSync.GetOrLoad(ctx, "documents", "ns")
-	if err == nil {
-		t.Fatal("GetOrLoad must surface the outage as a retryable error")
+	value, err := stores.CacheSync.GetOrLoad(ctx, "documents", "ns")
+	if err != nil {
+		t.Fatalf("GetOrLoad during a lock backend outage = %v, want the MySQL fallback to answer", err)
 	}
-	var retryable *CacheRetryable
-	if !errors.As(err, &retryable) {
-		t.Fatalf("GetOrLoad error = %v (%T), want *CacheRetryable", err, err)
+	if !fallback {
+		t.Fatal("GetOrLoad did not fall back to MySQL during the lock backend outage")
 	}
-	if fallback {
-		t.Fatal("GetOrLoad fell back to MySQL during a Redis outage; the lock ownership could not be confirmed")
+	if documents, ok := value.([]map[string]any); !ok || len(documents) != 0 {
+		t.Fatalf("fallback value = %#v, want the documents list", value)
+	}
+	if puts := cache.putCount(); puts != 0 {
+		t.Fatalf("publish attempts against the down backend = %d, want 0", puts)
 	}
 }
 
@@ -1011,8 +1031,9 @@ func TestRefreshKeySharesTheBackfillLockWithGetOrLoad(t *testing.T) {
 
 // TestGetOrLoadLostLeaseBlocksStaleRefill covers the fencing row: a holder
 // whose lease expires mid-query (renewal fails) must have its query cancelled
-// and must not publish its snapshot; the next reader re-runs the backfill and
-// returns a live value.
+// and must not publish its snapshot; the request still answers through the
+// MySQL fallback (the merged outage contract) and the next reader re-runs the
+// backfill against a healthy backend.
 func TestGetOrLoadLostLeaseBlocksStaleRefill(t *testing.T) {
 	stores, cache := newFastCacheTestStores(t)
 	ctx := context.Background()
@@ -1041,21 +1062,22 @@ func TestGetOrLoadLostLeaseBlocksStaleRefill(t *testing.T) {
 	stolen := newBackfillToken()
 	stores.CacheSync.Backend = leaseStealingCache{inner: cache, owner: stolen}
 
-	_, err := stores.CacheSync.GetOrLoad(ctx, "documents", "ns")
-	if err == nil {
-		t.Fatal("the lease-lost read must fail retryably instead of publishing a stale snapshot")
+	value, err := stores.CacheSync.GetOrLoad(ctx, "documents", "ns")
+	if err != nil {
+		t.Fatalf("the lease-lost read must still answer through the MySQL fallback: %v", err)
 	}
-	var retryable *CacheRetryable
-	if !errors.As(err, &retryable) {
-		t.Fatalf("GetOrLoad error = %v (%T), want *CacheRetryable", err, err)
+	if _, ok := value.([]map[string]any); !ok {
+		t.Fatalf("fallback value = %#v, want the documents list", value)
 	}
 	select {
 	case <-cancels:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the in-flight query was not cancelled after the lease was lost")
 	}
-	if _, cached, err := cache.Get(ctx, "documents", "ns"); err != nil || cached != nil {
-		t.Fatalf("the lease-lost snapshot was published: hit=%v value=%v err=%v", true, cached, err)
+	// The lease-lost snapshot was never published: the cache still misses and
+	// nothing stale leaked in.
+	if hit, cached, err := cache.Get(ctx, "documents", "ns"); err != nil || hit {
+		t.Fatalf("the lease-lost snapshot was published: hit=%v value=%v err=%v", hit, cached, err)
 	}
 
 	// The next reader takes over and succeeds.

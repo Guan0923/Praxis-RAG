@@ -4,6 +4,7 @@
 > **2026-11-13 更新（事务 outbox 已下线）**：`document_job_outbox`、`search_task_outbox`、`cache_outbox`、`document_task_outbox` 已从活跃路径移除，改由两个 Debezium 连接器直接采集 `document_jobs` 与缓存相关业务表（见 [CDC 迁移契约](cdc-migration.md)）。本文中所有以 outbox 为中介的投递描述仅作历史记录；任务表新增 `schedule_version`，`cache_revisions` 扩展为 revision 水位。
 > **2026-11-13 二次更新（搜索同步化）**：排队搜索与结果快照已下线；`search_tasks`、`search_result_snapshots` 保留历史数据、不再读写（`retired; no longer read or written`），不 DROP、不清数据。搜索为同步执行，artifact 以 `artifact_snapshots` 为事实来源，保留期沿用 `RAG_RESULT_TTL_SECONDS=3600`。见 [产物引用](result-references.md)。
 > **2026-11-17 更新（文档锁双模式）**：长租约默认仍由 MySQL `document_leases` 持有；设 `RAG_DOCUMENT_LOCK_MODE=redis` 后长租约移到 Redis，MySQL 只保留持有者登记与单调递增的 `fencing_epoch`，所有破坏性事务在提交时校验当前持有者。入库任务领取/心跳/重试/终态仍在 `document_jobs`，不受影响；切换与回退见 [部署指南](DEPLOYMENT.md) §13。
+> **2026-11-18 更新（Redis 成为唯一锁后端）**：`RAG_DOCUMENT_LOCK_MODE` 已移除（残留值被忽略）；Redis 是文档长租约的唯一后端——申请/续期/接管在 Redis 原子完成，MySQL 只保留持有者登记与 `fencing_epoch` 提交围栏。升级与代码回退见 [部署指南](DEPLOYMENT.md) §13。
 
 
 Praxis-RAG keeps the retrieval index in Qdrant and permanent published data in
@@ -12,8 +13,9 @@ no SQLite file fallback for development, tests or production. MySQL is the
 single source of truth for asynchronous document ingestion and queued search:
 the complete document job (file bytes included), its status/`schedule_version`,
 the queued-search task and the search result snapshot all live in MySQL. Kafka
-carries identifiers only; Redis holds display caches (and, when
-`RAG_DOCUMENT_LOCK_MODE=redis`, the document long-held leases), and is not part
+carries identifiers only; Redis holds display caches and the document
+long-held leases (the required lease backend; `RAG_REDIS_LOCK_URL`, falling
+back to `RAG_REDIS_URL`), and is not part
 of the task-state or delivery path. **Since 2026-11-13**
 two Debezium connectors read MySQL tables directly (task connector:
 `document_jobs`; cache connector: seven read-model tables); the
@@ -35,7 +37,7 @@ retired transactional outboxes are no longer written or polled.
 | MCP search (current) | Fully synchronous: one `tools/call` runs retrieval + rerank and returns evidence; no task row, no notification, no polling. |
 | ~~Search result snapshots~~ | **retired 2026-11-13**: the queue, schema-3 notification, worker and snapshot read path were removed. `search_result_snapshots` rows are retained as history and are no longer read or written. Artifacts (`artifact_snapshots`) remain the durable reference, TTL `RAG_RESULT_TTL_SECONDS=3600`. |
 | Issued version-bound artifact snapshots | MySQL `artifact_snapshots` (bytes and expiry) |
-| Upload publication/recovery operations and business leases | MySQL UploadJournal tables (see below); the live long-held lease is the Redis field when `RAG_DOCUMENT_LOCK_MODE=redis` (default `mysql`) |
+| Upload publication/recovery operations and business leases | MySQL UploadJournal tables (see below); the live long-held lease is the Redis field (Redis is the only lease backend) |
 | Persistent read-model refresh revisions | MySQL `cache_revisions` (`revision`, `refreshed_revision`, `attempts`, `last_error`, `updated_at`); Debezium cache connector → separate cache Kafka topic. `cache_outbox` is retired |
 | Consumer retries and dead-letter publishing | Kafka consumer in the worker processes (in-process retry; explicit RAG_*_DLQ_TOPIC; not SQL task scheduling) |
 | Retired outbox tables (2026-11-13) | `document_job_outbox`, `search_task_outbox`, `cache_outbox`, `document_task_outbox`; dropped by `rag-service-migrate --retire-outbox`. `document_tasks` is legacy and inactive |
@@ -256,8 +258,8 @@ in the request and returns evidence directly, so there is no task row, schema-3
 notification or worker. `search_tasks`/`search_result_snapshots` are retained as
 history and are no longer read or written. For documents, Kafka is not on the
 acceptance path; only MySQL availability (plus a running consumer, to make
-progress) is required. With `RAG_DOCUMENT_LOCK_MODE=redis` the document
-long-held lease does sit on the write path, so a temporary Redis outage returns a
+progress) is required. The document long-held lease does sit on the write path
+(Redis is the required lease backend), so a temporary Redis outage returns a
 retryable error instead of admitting the write (see *Recovery and limits*). Logs
 contain only task/operation IDs and safe error categories, never query text,
 file/message content or secrets.
@@ -397,20 +399,18 @@ Deduplicated requests commit a replayable no-op without switching the head.
 ### Recovery and limits
 
 At service startup and every 10 seconds the recovery worker scans durable
-records. Lease ownership depends on the configured backend
-(`RAG_DOCUMENT_LOCK_MODE`, default `mysql`). In `mysql` mode the
-`document_leases` row holds the lease and every heartbeat renews `expires_at`
-over SQL; `RAG_UPLOAD_LEASE_SECONDS` (default 120) controls expiry. In `redis`
-mode the Redis lease is the only liveness proof: the heartbeat renews it in
-Redis, the MySQL row keeps the holder registration and a monotonically
-increasing `fencing_epoch`, and `expires_at` is only the registration/display
-fallback (it is no longer rewritten on a timer). Acquisition reads each
-resource's generation, takes the Redis lease atomically, then registers the
-holder in a short transaction that compares the generation (a changed epoch
-releases this attempt's own lease and retries, at most three times), so a
-request that resumes after a takeover is rejected. In `redis` mode a takeover
-(`ClaimRecovery`) is authorized only after the Redis lease proves the previous
-holder is gone; a live MySQL `expires_at` alone never steals a running upload.
+records. Redis is the only lease backend (the legacy `RAG_DOCUMENT_LOCK_MODE`
+switch is ignored). The Redis lease is the only liveness proof: the heartbeat
+renews it in Redis, the MySQL row keeps the holder registration and a
+monotonically increasing `fencing_epoch`, and `expires_at` is only the
+registration/display fallback (it is no longer rewritten on a timer).
+Acquisition reads each resource's generation, takes the Redis lease
+atomically, then registers the holder in a short transaction that compares
+the generation (a changed epoch releases this attempt's own lease and
+retries, at most three times), so a request that resumes after a takeover is
+rejected. A takeover (`ClaimRecovery`) is authorized only after the Redis
+lease proves the previous holder is gone; a live MySQL `expires_at` alone
+never steals a running upload.
 Every publish/step/object write checks the recorded holder in its transaction,
 so an expired worker cannot publish after another worker claims recovery (the
 fencing generation is what the short registration transaction and the takeover
@@ -504,10 +504,11 @@ outside the publication transaction.
   deliver notifications.
 - Document/name leases coordinate uploads and conflict with document deletion.
   Knowledge-base edits/reembedding take an exclusive namespace lease. Their live
-  owner is the `document_leases` row in `mysql` mode or the Redis lock field in
-  `redis` mode (`RAG_DOCUMENT_LOCK_MODE`); every process that writes, recovers or
-  cleans document state must use the same backend, because leases held in one
-  backend are invisible to the other.
+  owner is the Redis lock field (Redis is the only lease backend; the legacy
+  `RAG_DOCUMENT_LOCK_MODE` switch is ignored); every process that writes,
+  recovers or cleans document state must use the same Redis instance, logical
+  database and lock prefix, because leases held under one prefix are invisible
+  to a process using another.
 - API keys are read on every request. Knowledge-base snapshots include their
   version so other instances refresh tenant caches on the next operation.
 - MCP notification delivery remains process-local; this change does not provide
@@ -528,7 +529,8 @@ Python live suites (including `RAG_TEST_MYSQL_URL`/`RAG_TEST_QDRANT_URL` runs) w
 removed with the Python backend; current Kafka/MySQL/Debezium live verification is
 recorded in [GO_MIGRATION](GO_MIGRATION.md) and [VALIDATION](../VALIDATION.md).
 
-The redis document-lease backend (`RAG_DOCUMENT_LOCK_MODE=redis`) is covered by
+The redis document-lease backend (the only backend; the legacy
+`RAG_DOCUMENT_LOCK_MODE` switch is ignored) is covered by
 `internal/state` (conflict matrix, late registration, takeover fencing, Redis
 loss/unavailable, release failure, lease display), `internal/runtime` and
 `internal/documentworker` regressions, and `internal/redisstate` Lua/renew/TTL
@@ -537,7 +539,7 @@ Cluster/Sentinel topologies and `-race` stress runs are not verified yet.
 
 ## Redis 状态读模型
 
-第一批缓存公开知识库配置、MCP catalog、文档列表及知识库列表/统计。API Key 管理列表直接读取 MySQL。第二批缓存发布指针、租约和事务/步骤/回滚的展示投影；实际鉴权、检索版本与日志恢复仍直接读取 MySQL，上传事务租约的**执行权默认也由 MySQL `document_leases` 承担**。设 `RAG_DOCUMENT_LOCK_MODE=redis` 时，上传/覆盖/删除/恢复/清理与知识库独占操作的长租约改由 Redis 持有，但持有者登记、单调递增的 `fencing_epoch` 以及提交/回滚前的持有者校验仍以 MySQL 为准；展示缓存开关（`RAG_REDIS_ENABLED`）不控制文档锁，锁键也不进入任何读模型。cache_revisions 与状态修改在 MySQL 同事务提交，随后由 Debezium 缓存连接器投递、`rag-cache-worker` 按 revision 水位刷新；Redis 故障时读模型回源，脏 key 由 `RefreshDirty` 重试。**异步文档任务状态与文件字节不经 Redis**：`document_jobs` 是权威，Redis 只承担展示缓存（启用文档锁 Redis 后端时另含锁键）；搜索为同步执行，不写 Redis。完整配置、启动和故障语义见 [状态缓存](state-cache.md)，锁后端切换见 [部署指南](DEPLOYMENT.md) §13。
+第一批缓存公开知识库配置、MCP catalog、文档列表及知识库列表/统计。API Key 管理列表直接读取 MySQL。第二批缓存发布指针、租约和事务/步骤/回滚的展示投影；实际鉴权、检索版本与日志恢复仍直接读取 MySQL，上传事务租约的**执行权由 Redis 长租约承担（唯一后端）**：上传/覆盖/删除/恢复/清理与知识库独占操作的长租约由 Redis 持有，但持有者登记、单调递增的 `fencing_epoch` 以及提交/回滚前的持有者校验仍以 MySQL 为准；展示缓存开关（`RAG_REDIS_ENABLED`）不控制文档锁，锁键也不进入任何读模型。cache_revisions 与状态修改在 MySQL 同事务提交，随后由 Debezium 缓存连接器投递、`rag-cache-worker` 按 revision 水位刷新；Redis 故障时读模型回源，脏 key 由 `RefreshDirty` 重试。**异步文档任务状态与文件字节不经 Redis**：`document_jobs` 是权威，Redis 只承担展示缓存与文档锁键；搜索为同步执行，不写 Redis。完整配置、启动和故障语义见 [状态缓存](state-cache.md)，锁后端升级见 [部署指南](DEPLOYMENT.md) §13。
 
 ## UUID 结果与逻辑删除
 

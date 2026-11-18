@@ -105,8 +105,8 @@ func newFixture(t *testing.T) *fixture {
 
 func TestScopeSetDocumentRules(t *testing.T) {
 	scope := NewScopeSet()
-	scope.ReadDocuments["a.md"] = struct{}{}
-	scope.WriteDocuments["b.md"] = struct{}{}
+	scope.FileAllow["a.md"] = uint16(OpRead)
+	scope.FileAllow["b.md"] = uint16(OpRead | OpUpdate)
 	if !scope.AllowsAnyRead() || !scope.HasAnyWrite() || scope.ReadsWhole() || scope.WritesWhole() {
 		t.Fatalf("partial scope flags = %+v", scope)
 	}
@@ -126,7 +126,8 @@ func TestScopeSetDocumentRules(t *testing.T) {
 		t.Fatalf("WriteDocumentNames = %v", names)
 	}
 
-	full := fullScope()
+	full := NewScopeSet()
+	full.DefaultAllow = 15
 	if !full.AllowsAnyRead() || !full.HasAnyWrite() || !full.ReadsWhole() || full.Restricted() {
 		t.Fatalf("full scope flags = %+v", full)
 	}
@@ -146,7 +147,7 @@ func TestScopeContextRoundTrip(t *testing.T) {
 		t.Fatal("plain context must not carry a scope")
 	}
 	scope := NewScopeSet()
-	scope.WholeRead = true
+	scope.WholeAllow = uint16(OpRead)
 	ctx = ContextWithScope(ctx, scope)
 	loaded, ok := ScopeFromContext(ctx)
 	if !ok || !loaded.ReadsWhole() {

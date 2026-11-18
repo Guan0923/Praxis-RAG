@@ -154,21 +154,40 @@ func run(args []string, stdout, stderr *os.File) int {
 	}
 	defer func() { _ = stores.Close() }()
 	// Ingestion writes documents through the shared journal, so it must join the
-	// deployment's document lease backend instead of holding a second, MySQL-only
-	// lock that the other processes cannot see.
+	// deployment's document lease backend: Redis is required, resolved from
+	// RAG_REDIS_LOCK_URL (falling back to RAG_REDIS_URL) and shared with
+	// rag-service and rag-document-worker.
 	lockSettings, err := state.DocumentLockSettingsFromEnv()
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return exitError
 	}
-	if lockSettings.RedisMode() {
-		documentLock, lockErr := redisstate.NewDocumentLock(lockSettings)
-		if lockErr != nil {
-			fmt.Fprintln(stderr, lockErr)
+	documentLock, lockErr := redisstate.NewDocumentLock(lockSettings)
+	if lockErr != nil {
+		fmt.Fprintln(stderr, lockErr)
+		return exitError
+	}
+	defer func() { _ = documentLock.Close() }()
+	if attachErr := stores.AttachDocumentLocker(documentLock); attachErr != nil {
+		fmt.Fprintln(stderr, attachErr)
+		return exitError
+	}
+	// Ingestion writes documents through the shared journal, so it must also
+	// register new upload IDs into the deployment's bloom filter before the
+	// read gate (RAG_UPLOAD_BLOOM_MODE=on) may be enabled fleet-wide.
+	bloomSettings, err := state.UploadBloomSettingsFromEnv()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return exitError
+	}
+	if bloomSettings.Mode != state.UploadBloomModeOff {
+		bloomBackend, bloomErr := redisstate.NewUploadBloomBackend(bloomSettings)
+		if bloomErr != nil {
+			fmt.Fprintln(stderr, bloomErr)
 			return exitError
 		}
-		defer func() { _ = documentLock.Close() }()
-		if attachErr := stores.AttachDocumentLocker(documentLock); attachErr != nil {
+		defer func() { _ = bloomBackend.Close() }()
+		if attachErr := stores.AttachUploadBloom(state.NewUploadBloomFilterWith(stores, bloomSettings, bloomBackend)); attachErr != nil {
 			fmt.Fprintln(stderr, attachErr)
 			return exitError
 		}

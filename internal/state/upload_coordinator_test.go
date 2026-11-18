@@ -653,7 +653,10 @@ func TestCoordinatorRestartUsesPersistedJournal(t *testing.T) {
 		t.Fatalf("Intent() error = %v", err)
 	}
 	expireUploadLeases(t, stores, operation.ID)
+	// The lease expiry also releases the backend's lease so the restart recovery
+	// can take over.
 	settings := stores.Settings
+	locker := stores.DocumentLocks
 	workspaceRoot := coordinator.WorkspaceRoot
 	if err := stores.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -661,6 +664,11 @@ func TestCoordinatorRestartUsesPersistedJournal(t *testing.T) {
 	restartedStores, err := New(settings, true)
 	if err != nil {
 		t.Fatalf("New(restarted) error = %v", err)
+	}
+	if locker != nil {
+		if err := restartedStores.AttachDocumentLocker(locker); err != nil {
+			t.Fatalf("AttachDocumentLocker(restarted) error = %v", err)
+		}
 	}
 	defer func() { _ = restartedStores.Close() }()
 	restarted := newTestCoordinator(t, restartedStores, workspaceRoot)

@@ -20,6 +20,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
 	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
 	"github.com/Guan0923/Praxis-RAG/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/statelocktest"
 )
 
 var knowledgeCollectionPattern = regexp.MustCompile(`^knowledge_[0-9a-f]{32}$`)
@@ -775,10 +776,15 @@ func TestPurgeKnowledgeBaseKeepsConfigurationWhenUploadLeaseIsActive(t *testing.
 	}
 	// A live upload lease blocks the purge: the namespace is reported as failed
 	// and the configuration row is kept for a retry once the upload finishes.
-	if _, err := stores.DB.ExecContext(ctx,
-		"INSERT INTO document_leases (namespace, resource, owner, operation_id, expires_at) VALUES (?, ?, ?, NULL, ?)",
-		"alpha", state.UploadNamespaceResource, "owner", float64(time.Now().Unix()+60)); err != nil {
-		t.Fatalf("inserting lease: %v", err)
+	// The lease is live in the backend (Redis in production, the fake here);
+	// the SQL registration alone never blocks anything.
+	fakeLock, ok := stores.DocumentLocks.(*statelocktest.FakeDocumentLocker)
+	if !ok || fakeLock == nil {
+		t.Fatalf("test store has no fake document locker (got %T)", stores.DocumentLocks)
+	}
+	if err := fakeLock.Acquire(ctx, "alpha",
+		[]string{state.UploadNamespaceResource}, "owner", 60*time.Second); err != nil {
+		t.Fatalf("fake acquire error = %v", err)
 	}
 
 	result, err := service.PurgeKnowledgeBase(ctx, "alpha")

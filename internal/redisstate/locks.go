@@ -207,6 +207,9 @@ var _ state.DocumentLocker = (*DocumentLock)(nil)
 // unreachable while the service starts, and every method then reports
 // *state.LockUnavailable instead of blocking startup. WithRedisClient injects an
 // already-configured client (tests); the injected client is closed by Close.
+// A settings value without a URL is rejected here: Redis is the required
+// document lock backend, and a missing address is a configuration error the
+// caller must surface at startup.
 func NewDocumentLock(settings state.DocumentLockSettings, options ...Option) (*DocumentLock, error) {
 	if err := settings.Validate(); err != nil {
 		return nil, err

@@ -41,10 +41,18 @@ flowchart LR
     Service -->|"向量化 · 可选重排"| Model["模型 API"]
     Worker -->|"文档向量化"| Model
     Kafka -->|"读模型变更"| Cache["缓存 Worker"]
-    Cache --> Redis[("Redis · 可选")]
+    Cache --> Redis[("Redis · 展示缓存（可选）+ 文档分布式锁（必需）")]
 ```
 
 [完整部署拓扑](docs/DEPLOYMENT.md#1-进程拓扑) · [REST API](docs/USAGE.md#5-rest-api-示例) · [MCP 接入](docs/USAGE.md#6-mcp-使用)
+
+> 状态与发布事实保存在 MySQL；Redis 承担读模型展示缓存（可选，故障时回源 MySQL）与**文档分布式锁（必需，`RAG_REDIS_LOCK_URL`，空则回退 `RAG_REDIS_URL`）**——所有执行文档写入、恢复或清理的进程必须使用同一 Redis 实例、逻辑库与锁前缀。锁后端异常时相关写操作等待重试；检索与状态查询不受影响。
+
+## 权限与共享
+
+知识库默认归创建者私有。共享按四项操作（阅读 / 新建 / 更新 / 删除）分别授予，每项操作三态（未设置 / 允许 / 拒绝）；**同一操作上任何拒绝都优先于允许**——全库拒绝可以压过单文件允许。独立 API Key 按自身绑定的知识库范围授权，不套用账号 ACL；SAG 事件-实体检索对受限账号（任何非全库可读账号）会被明确拒绝。详见 [权限管理](docs/PERMISSIONS.md)。
+
+上传操作详情查询（`GET /v1/uploads/{operation_id}`）可选启用 Redis bitmap 布隆过滤器（`RAG_UPLOAD_BLOOM_MODE`，默认关闭）：对随机 ID 直接返回原有 404、不执行上传状态 SQL；MySQL 始终是事实来源，权限校验不变。分阶段启用与失败语义见[使用指南](docs/USAGE.md#redis-文档锁与-artifact)。
 
 ## 指标
 
@@ -56,4 +64,4 @@ flowchart LR
 | 搜索超时预算 | 120 秒 | — |
 | 证据产物保留期 | 1 小时 | — |
 
-[配置与运行说明](docs/USAGE.md) · [证据引用与保留策略](docs/result-references.md) · [验证记录](VALIDATION.md)
+[配置与运行说明](docs/USAGE.md) · [权限管理](docs/PERMISSIONS.md) · [证据引用与保留策略](docs/result-references.md) · [验证记录](VALIDATION.md)

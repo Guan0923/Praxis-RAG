@@ -361,15 +361,17 @@ func (s *Server) handleFeishuImport(w http.ResponseWriter, r *http.Request) {
 		seen[document.DocumentID] = struct{}{}
 		unique[index] = true
 	}
-	// Apply the ordinary knowledge-base write check before reading any content,
-	// so a read-only caller learns about it immediately and consistently.
+	// Apply the ordinary knowledge-base admission check before reading any
+	// content, so a caller without the required operations learns about it
+	// immediately and consistently: new names need the library create bit,
+	// names that already exist need that document's update bit.
 	candidates := make([]UploadFile, 0, len(documents))
 	for index, isUnique := range unique {
 		if isUnique {
 			candidates = append(candidates, UploadFile{Name: names[index]})
 		}
 	}
-	if !s.requireScopeWriteBatch(w, r, candidates) {
+	if blocked, _ := s.scopeUploadBatchBlocked(w, r, namespace, candidates); blocked {
 		return
 	}
 	contents := make([]string, len(documents))

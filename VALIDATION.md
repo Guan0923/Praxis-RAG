@@ -1,5 +1,23 @@
 # Historical UUID results/artifacts and logical deletion — 2026-10-23
 
+## 当前验证范围：用户组（组创建/邀请/成员/组授权/权限合并）— 2026-11-18
+
+### 已验证（可复核）
+
+- **Go 编译与静态检查**：`go build ./...`、`go vet ./internal/state ./internal/access ./internal/httpapi ./internal/mcp` 通过。
+- **Go 测试**（`go test -p 1 -count=1 -timeout 25m`，`RAG_TEST_MYSQL_URL` 指向一次性 MySQL 测试库）：
+  - `./internal/state/`（全量，含新增组仓库用例）：`user_groups`/`user_group_members`/`user_group_invitations`/`kb_group_permissions` 四表的 schema 结构断言（列/主键/唯一键/索引）；组-成员-授权的 MySQL 往返；解散级联清成员/撤销待接受邀请/清组授权；账号删除级联清组；知识库清库同步删组授权；`AcceptPending` 的并发语义（先撤销/先拒绝后接受均返回类型化冲突且不写成员）、幂等重试不把已退出/被移除成员加回、过期链接拒绝并落库 revoked、事务内组有效性与邀请人角色重查。
+  - `./internal/access/`（全量）：`TestGroupCreateRoleRules`（vip/admin 可建组，user/禁用账号被拒）；`TestGroupInvitationFlow`（仅目标账号可接受、邀请人降级后不能发新邀请）；`TestGroupInvitationAcceptRechecksInviterRole`（降级后旧邀请不再添加成员、已有成员和授权继续生效）；`TestGroupPermissionMerge`（个人 0100+组 0110 合并为全位，组 0110 单独保留）；`TestGroupMultipleGroupsUnion`（两组 0001/0100 并集为 0101）；`TestGroupFileLevelGrant`（文件级组授权只覆盖指定文件、create 位拒绝在文件级）；`TestGroupMembershipRemovalKillsAccess`（移除成员/撤销组授权/解散组后新请求失去对应位、个人来源保留）；`TestGroupInvitationIdempotentRetry`（旧链接重试幂等且不重加成员）；`TestGroupGrantOwnership`（他人的组/他人的库被拒）；`TestGroupVisibleNamespaces`（组授权决定命名空间可见性）；`TestGroupPermissionSources`（来源说明含组名与位）；以及原有个人共享/邀请全部用例不回归。
+  - `./internal/httpapi/`（全量，含一处陈旧断言修正：`TestSearchEndpoint` 的 `retrieval` 校验文案与 `internal/contracts` 的 SAG/graph 枚举对齐）：`TestGroupRoutesRequireSessionAndCsrf`（无会话 401、缺 CSRF 403、no-store）；`TestGroupTransportRoundTrip`（组列表/详情/创建/邀请 invite_path 形如 `/console#/group-invite?token=…`、移除成员/退出/解散/撤销邀请/组授权 PUT-DELETE/权限来源查询的 JSON 契约与参数透传）；`TestGroupRoutesRefusePlainUserByService`（普通账号建组 403）；OpenAPI 路径与 `SetGroupGrantBody.allow_mask` schema 断言。
+  - `./internal/mcp/`（全量）：`TestScopeHeaderRoundTripGroupMasks`（内部作用域头携带 whole update/delete 与文件级 update/delete 集合并完整往返；全库 update 不泄漏为 delete）；原有 scope 往返与工具用例不回归。
+- **前端**：`npm run typecheck` 通过；`npx vitest run` → `23 files / 326 tests passed`（新增 `GroupsPage.test.tsx` 5 例：组列表渲染/成员详情与解散入口/普通账号禁用创建/粘贴邀请链接解析 token/邀请过期态计算；`navigation.test.ts` 增加用户组页面可见性与 `#/group-invite` 路由往返断言）。
+- **契约面**：新增 `/v1/groups*`、`/v1/group-invitations*`、`/v1/knowledge-bases/{ns}/group-permissions*`、`/v1/knowledge-bases/{ns}/permission-sources` 共 17 条路由，全部走 `authSession`（登录会话 + CSRF 写校验 + `Cache-Control: no-store`）；OpenAPI 表与 `/docs` 同步；既有共享接口不变。
+- **数据面**：四张新表由现有 `ensureSchema` 建表迁移自动创建（`CREATE TABLE` + 索引，容忍并发启动）；`users.Delete` 与知识库 purge 级联清理组数据；无 `ALTER` 迁移。
+
+### 未验证（缺外部依赖）
+
+- 未在真实多副本部署上验证组权限合并的跨请求一致性（单元/集成测试以单进程 MySQL 事务覆盖）。
+
 > **Transport note (2026-11-09):** The dated records in this file were produced
 > while the repository still used RocketMQ. The current transport is Kafka
 > (`RAG_KAFKA_*`, explicit `RAG_*_DLQ_TOPIC`); the Kafka/MySQL/Debezium live check
@@ -15,6 +33,59 @@
 > `verify-kafka-search.py` 的记录均为历史存档，不代表当前实现；`search_tasks`/
 > `search_result_snapshots` 表保留数据但不再读写。当前搜索验证以同步检索、超时/取消与
 > artifact 独立读取为准（见 [产物引用](docs/result-references.md)）。
+
+## 上传操作详情查询布隆过滤器（`GET /v1/uploads/{operation_id}`）— 2026-11-18
+
+`RAG_UPLOAD_BLOOM_MODE` 三档部署级开关（`off` 默认 / `register` 只登记 / `on` 读取侧过滤），
+Redis bitmap 分片存储，MySQL 仍是事实来源；只加速该详情查询，权限校验仍由原 `namespace`
+校验决定。
+
+### 已验证（可复核，`RAG_TEST_MYSQL_URL` 指向一次性 MySQL）
+
+- **`go build ./...` / `go vet ./...` 通过。**
+- **定向测试**：`go test -p 1 -count=1 -run 'TestUploadBloom' ./internal/state/ ./internal/redisstate/` 全部通过。
+  - `internal/state`（策略 + 端到端，真实 MySQL 上的真实 journal/读视图）：
+    - `TestUploadBloomParametersKeepTarget`：容量数学按 1% 目标（1 万/25 万/100 万容量，
+      实测误判率 ≤ 2×目标，含容量 1 的公式下界）。
+    - `TestUploadBloomDefinitelyAbsentFallbacks`：register 模式不判读；无代不判；登记过的
+      ID 不误报；未登记的随机 ID 判「不存在」；非全小写 ID 绕过过滤器（MySQL 排序规则
+      等价性不受影响）；停用开关、分片丢失、State/Probe 失败全部回退 MySQL。
+    - `TestUploadBloomEnsureBuildsAndSwitches`：初始代构建与激活、确认轮收尾、历史超容量
+      触发第二代（扩容重建）并保留全部 ID 可查。
+    - `TestUploadBloomRegisterCoversActiveAndBuilding`：重建窗口内登记同时写活动代与
+      构建代。
+    - `TestUploadBloomRegistrationFailureProtocol`：登记失败且停用开关无法确认 → 该次
+      创建返回可重试错误；停用开关确认 → 允许提交；无代（首次构建未完成）与已停用两种
+      情况不阻塞创建。
+    - `TestUploadBloomForcedRebuildDisablesFirst`：`RAG_UPLOAD_BLOOM_REBUILD=1` 先停用
+      否定判断、重建后重新启用。
+    - `TestUploadBloomSettingsValidation`：13 项配置契约（含 off 模式无 URL 合法、
+      register/on 无 URL 报错）。
+    - `TestUploadBloomBeginRegistersOnBothLockPaths`：MySQL 锁路径与 Redis 锁路径的真实
+      `journal.Begin` 都在提交前登记；新建操作可查询、不误报；登记失败（停用开关
+      无法确认）时 Begin 以可重试错误中止且不留 INTENT 行；跨知识库查询继续 404。
+    - `TestUploadBloomReadViewDetailQueryNoSQL`：过滤器明确排除的随机 ID **不执行
+      上传状态 SQL**（loader 计数为 0）；可能存在 ID 执行恰好一次并回填缓存；缓存命中
+      （含缓存后过滤器故障）不再走 SQL 也不走过滤器。
+  - `internal/redisstate`（miniredis 真实 Redis 语义）：
+    - `TestUploadBloomBackendRoundTrip`：构建租约仲裁（二次获取失败）、位登记与探测、
+      激活原子切换（meta SET + 清停用开关）、构建租约释放、**分片丢失返回
+      shardMissing 而非误判不存在**（修复了「GetBit 0 == 缺失分片 == 不存在」的歧义）、
+      停用开关可验证、过期代 TTL 退役。
+    - `TestUploadBloomBackendUnavailable`：后端不可达时所有操作返回
+      `*state.BloomUnavailable`（调用方回退 MySQL）。
+    - `TestUploadBloomBackendDisabledMode`：off 模式后端不拨号、全部返回
+      `*state.BloomUnavailable`。
+- **语义不变面**：`GET /v1/uploads/{operation_id}` 响应体、状态码、`Cache-Control`、
+  `/v1/uploads` 列表端点、`upload_status` 缓存 kind 与展示缓存键空间全部未改；
+  布隆否定只省略 upload-status SQL，不改变任何响应。
+
+### 未验证（缺外部依赖）
+
+- 真实多实例 Redis Cluster 下的分片行为（miniredis 单实例验证了分片键与丢失语义；
+  Cluster hash-tag 布局同 `KeyPair` 模式但未跑真实集群）。
+- 生产规模（百万级 ID）的构建耗时与内存占用（构建算法为分批 keyset 扫描 + 确认轮，
+  算法已由测试覆盖；大规模性能未实测）。
 
 ## 当前验证范围：LightRAG 知识图谱检索（侧车 + `retrieval=graph`）— 2026-11-18
 

@@ -30,22 +30,19 @@ const (
 
 // testWholeScope is the owner/administrator scope: everything, read and write.
 func testWholeScope() access.ScopeSet {
-	return access.ScopeSet{
-		WholeRead:      true,
-		WholeWrite:     true,
-		ReadDocuments:  map[string]struct{}{},
-		WriteDocuments: map[string]struct{}{},
-	}
+	scope := access.NewScopeSet()
+	scope.WholeAllow = 15
+	return scope
 }
 
 // testFileScope is a file-level grant: only the named documents.
 func testFileScope(read, write []string) access.ScopeSet {
 	scope := access.NewScopeSet()
 	for _, name := range read {
-		scope.ReadDocuments[name] = struct{}{}
+		scope.FileAllow[name] |= uint16(access.OpRead)
 	}
 	for _, name := range write {
-		scope.WriteDocuments[name] = struct{}{}
+		scope.FileAllow[name] |= uint16(access.OpRead | access.OpUpdate | access.OpDelete)
 	}
 	return scope
 }
@@ -149,6 +146,7 @@ func TestScopeSearchRestrictsDocumentIDs(t *testing.T) {
 			map[string]any{"rank": 1, "document_id": "doc:a.md", "chunk_id": "c1", "text": "A"},
 		},
 	}
+	runtime.listDocuments = []DocumentRecord{{"name": "a.md"}, {"name": "b.md"}}
 	scopes := map[string]access.ScopeSet{
 		"full":  testWholeScope(),
 		"files": testFileScope([]string{"a.md"}, []string{"a.md"}),
@@ -179,9 +177,6 @@ func TestScopeSearchRestrictsDocumentIDs(t *testing.T) {
 	if got := runtime.searchCalls[0].DocumentIDs; !reflect.DeepEqual(got, []string{"doc:a.md"}) {
 		t.Fatalf("restricted DocumentIDs = %#v, want [doc:a.md]", got)
 	}
-	if got := runtime.resolveCalls[0]; !reflect.DeepEqual(got, []string{"a.md"}) {
-		t.Fatalf("resolved names = %#v, want [a.md]", got)
-	}
 
 	callToolScoped(t, rpc, "full", searchToolName, map[string]any{"query": "hello"})
 	if got := runtime.searchCalls[1].DocumentIDs; got != nil {
@@ -202,6 +197,7 @@ func TestScopeSearchRestrictsDocumentIDs(t *testing.T) {
 
 func TestScopeSearchCannotBeForgedByClientHeader(t *testing.T) {
 	runtime := newFakeRuntime()
+	runtime.listDocuments = []DocumentRecord{{"name": "a.md"}, {"name": "b.md"}}
 	scopes := map[string]access.ScopeSet{
 		"files": testFileScope([]string{"a.md"}, nil),
 	}
@@ -354,6 +350,7 @@ func TestScopeDocumentWritesRequirePerFileGrant(t *testing.T) {
 
 func TestScopeModernStatelessSearch(t *testing.T) {
 	runtime := newFakeRuntime()
+	runtime.listDocuments = []DocumentRecord{{"name": "a.md"}, {"name": "b.md"}}
 	scopes := map[string]access.ScopeSet{
 		"files": testFileScope([]string{"a.md"}, nil),
 	}
@@ -513,7 +510,7 @@ func TestScopeResourcesOverHTTP(t *testing.T) {
 // degrades into an unrestricted search.
 func TestScopeResolveFailureIsToolError(t *testing.T) {
 	runtime := newFakeRuntime()
-	runtime.resolveErr = context.DeadlineExceeded
+	runtime.listErr = context.DeadlineExceeded
 	endpoint := newTestEndpoint(t, runtime, Options{})
 	entry := entryByName(t, endpoint, searchToolName)
 
@@ -556,5 +553,42 @@ func TestScopeHeaderRoundTrip(t *testing.T) {
 	}
 	if tampered, present := decodeScopeHeader("!!!not-base64!!!"); !present || tampered.AllowsAnyRead() || tampered.HasAnyWrite() {
 		t.Fatalf("tampered header must deny everything: %#v present=%v", tampered, present)
+	}
+}
+
+// TestScopeHeaderRoundTripGroupMasks pins the group-contribution fields of the
+// internal wire form: whole update/delete and the per-file update/delete sets
+// all survive the round trip.
+func TestScopeHeaderRoundTripGroupMasks(t *testing.T) {
+	scope := access.NewScopeSet()
+	scope.WholeAllow = uint16(access.OpRead | access.OpUpdate)
+	scope.GroupAllow["spec.md"] = uint16(access.OpUpdate)
+	scope.GroupAllow["old.md"] = uint16(access.OpDelete)
+	decoded, present := decodeScopeHeader(encodeScopeHeader(scope))
+	if !present {
+		t.Fatalf("scope header must report a present scope")
+	}
+	if !decoded.ReadsWhole() {
+		t.Fatalf("decoded lost whole read: %#v", decoded)
+	}
+	if !decoded.CanUpdateDocument("anything.md") {
+		t.Fatalf("whole update did not survive: %#v", decoded)
+	}
+	// WholeUpdate alone only covers update, not delete.
+	if decoded.CanDeleteDocument("anything.md") {
+		t.Fatalf("whole update leaked into delete: %#v", decoded)
+	}
+	if !decoded.CanUpdateDocument("spec.md") {
+		t.Fatalf("file-level update lost: %#v", decoded)
+	}
+	if !decoded.CanDeleteDocument("old.md") {
+		t.Fatalf("file-level delete lost: %#v", decoded)
+	}
+	// WholeUpdate covers update everywhere; delete stays per-file.
+	if !decoded.CanUpdateDocument("other.md") {
+		t.Fatalf("whole update must cover every document: %#v", decoded)
+	}
+	if decoded.CanDeleteDocument("spec.md") {
+		t.Fatalf("decoded scope grants delete without a delete rule: %#v", decoded)
 	}
 }

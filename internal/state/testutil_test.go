@@ -34,6 +34,9 @@ var stateEnvKeys = []string{
 	"RAG_REDIS_TTL_SECONDS",
 	"RAG_REDIS_TIMEOUT_SECONDS",
 	"RAG_REDIS_ENABLED",
+	"RAG_REDIS_BREAKER_THRESHOLD",
+	"RAG_REDIS_BREAKER_COOLDOWN_SECONDS",
+	"RAG_CACHE_FALLBACK_CONCURRENCY",
 	"RAG_DOCUMENT_LOCK_MODE",
 	"RAG_REDIS_LOCK_URL",
 	"RAG_REDIS_LOCK_PREFIX",
@@ -101,7 +104,11 @@ func useTestEncryptionKey(t *testing.T) {
 }
 
 // newTestStores opens the shared MySQL test schema with portable encryption
-// enabled, truncating it first. It replaces the SQLite temp-file fixture.
+// enabled, truncating it first. It replaces the SQLite temp-file fixture. The
+// document lock backend is the deterministic in-memory fake: Redis is the only
+// production backend, and the fake keeps the lease contract (atomic
+// multi-resource acquire, owner-checked renew/release, TTL expiry) observable
+// without a live server.
 func newTestStores(t *testing.T) *Stores {
 	t.Helper()
 	isolateStateEnv(t)
@@ -120,21 +127,42 @@ func newTestStores(t *testing.T) *Stores {
 	if err != nil {
 		t.Fatalf("New(MySQL) error = %v", err)
 	}
+	if err := stores.AttachDocumentLocker(newFakeDocumentLocker()); err != nil {
+		_ = stores.Close()
+		t.Fatalf("AttachDocumentLocker() error = %v", err)
+	}
 	statetest.Prepare(t, stores.DB)
 	t.Cleanup(func() { _ = stores.Close() })
 	return stores
 }
 
-// reopenStores opens a second store over the same database file.
+// testLocker returns the fake document locker attached to the test store.
+func testLocker(t *testing.T, stores *Stores) *fakeDocumentLocker {
+	t.Helper()
+	locker, ok := stores.DocumentLocks.(*fakeDocumentLocker)
+	if !ok || locker == nil {
+		t.Fatalf("test store has no fake document locker (got %T)", stores.DocumentLocks)
+	}
+	return locker
+}
+
+// reopenStores opens a second store over the same database file, preserving the
+// document lock backend (a restarted process must join the same lease backend).
 func reopenStores(t *testing.T, stores *Stores) *Stores {
 	t.Helper()
 	settings := stores.Settings
+	locker := stores.DocumentLocks
 	if err := stores.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
 	reopened, err := New(settings, true)
 	if err != nil {
 		t.Fatalf("New(reopen) error = %v", err)
+	}
+	if locker != nil {
+		if err := reopened.AttachDocumentLocker(locker); err != nil {
+			t.Fatalf("AttachDocumentLocker(reopen) error = %v", err)
+		}
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
 	return reopened

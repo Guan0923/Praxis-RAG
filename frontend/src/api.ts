@@ -49,12 +49,23 @@ export type PermissionLevel = "read" | "write";
 export type ShareScope = "all" | "files";
 // "expired" is computed by the server from expires_at; it is never persisted.
 export type InvitationStatus = "pending" | "accepted" | "declined" | "revoked" | "expired";
-// ScopeView is one effective permission set inside a knowledge base.
+// ScopeView is one effective permission set inside a knowledge base. The
+// bitmask fields are the source of truth (0-15 per mask); the legacy
+// read/write projection stays alongside for older readers.
 export type ScopeView = {
   whole_read: boolean;
   whole_write: boolean;
   read_documents: string[];
   write_documents: string[];
+  // 掩码模型字段：默认（未设置时的 allow/deny）、全库、单文件三层掩码与
+  // 全库有效掩码。字段由新后端保证存在；读取处统一按 0 兜底以兼容旧投影。
+  default_allow?: number;
+  default_deny?: number;
+  whole_allow?: number;
+  whole_deny?: number;
+  file_allow?: Record<string, number>;
+  file_deny?: Record<string, number>;
+  effective_library?: number;
 };
 // AccessView is the caller's effective access in one knowledge base.
 export type AccessView = {
@@ -71,7 +82,12 @@ export type GrantView = {
   user_id: string;
   username: string;
   document_name: string;
-  permission: PermissionLevel;
+  // permission 是旧的只读/读写保守投影：混合掩码无法表达时后端可能返回 ""。
+  permission: PermissionLevel | "";
+  // allow_mask 与 deny_mask 是该规则的三态位掩码（0-15）：两个掩码都未置位
+  // ＝未设置；allow 置位＝允许；deny 置位＝拒绝。旧后端可能不带这两个字段。
+  allow_mask?: number;
+  deny_mask?: number;
   granted_by: string;
   granted_by_username: string;
   created_at: string;
@@ -85,6 +101,8 @@ export type InvitationView = {
   invitee_user_id: string;
   invitee_username: string;
   permission: PermissionLevel;
+  // allow_mask 是该邀请授予的允许位掩码（0-15）；旧邀请可能不带该字段。
+  allow_mask?: number;
   scope: ShareScope;
   document_names: string[];
   status: InvitationStatus;
@@ -96,7 +114,10 @@ export type InvitationView = {
 export type InviteUser = { id: string; username: string; role: Role };
 export type CreateInvitationInput = {
   username: string;
-  permission: PermissionLevel;
+  // allow_mask 是新契约的授权位掩码（scope=files 时不允许带 create 位）；
+  // 旧字段 permission 仍被服务端接受并映射，二选一提交即可。
+  allow_mask?: number;
+  permission?: PermissionLevel;
   scope: ShareScope;
   document_names: string[];
 };
@@ -105,10 +126,148 @@ export type CreateInvitationResult = {
   invite_path: string;
 };
 
+// ---- 用户组（user groups）----
+export type GroupStatus = "active" | "dissolved";
+export type GroupView = {
+  id: string;
+  name: string;
+  owner_user_id: string;
+  owner_username: string;
+  status: GroupStatus;
+  member_count: number;
+  created_at: string;
+  updated_at: string;
+  dissolved_at: string | null;
+};
+export type GroupMemberView = {
+  user_id: string;
+  username: string;
+  role: Role;
+  enabled: boolean;
+  joined_at: string;
+};
+export type GroupInvitationView = {
+  id: string;
+  group_id: string;
+  group_name: string;
+  inviter_user_id: string;
+  inviter_username: string;
+  invitee_user_id: string;
+  invitee_username: string;
+  status: InvitationStatus;
+  created_at: string;
+  expires_at: string;
+  accepted_at: string | null;
+};
+export type GroupGrantView = {
+  group_id: string;
+  group_name: string;
+  namespace: string;
+  document_name: string;
+  allow_mask: number;
+  granted_by: string;
+  granted_by_username: string;
+  created_at: string;
+  updated_at: string;
+};
+export type PermissionSourceView = {
+  bit: number;
+  bit_name: string;
+  kind: "role" | "personal" | "group";
+  origin: string;
+  document_name: string;
+};
+export type SetGroupGrantInput = {
+  document_names: string[];
+  allow_mask: number;
+};
+
+export const groupStatusLabels: Record<GroupStatus, string> = {
+  active: "使用中",
+  dissolved: "已解散",
+};
+// permissionBits maps the four document permission bits (read=1, create=2,
+// update=4, delete=8) to their Chinese labels.
+export const permissionBits: { bit: number; value: number; name: string; key: string; label: string }[] = [
+  { bit: 1, value: 1, name: "read", key: "read", label: "阅读" },
+  { bit: 2, value: 2, name: "create", key: "create", label: "新增" },
+  { bit: 4, value: 4, name: "update", key: "update", label: "修改" },
+  { bit: 8, value: 8, name: "delete", key: "delete", label: "删除" },
+];
+export const permissionSourceKindLabels: Record<PermissionSourceView["kind"], string> = {
+  role: "角色",
+  personal: "个人授权",
+  group: "用户组",
+};
+
+export function groupInvitationLink(invitePath: string) {
+  return `${location.origin}${invitePath}`;
+}
+
 export const permissionLabels: Record<PermissionLevel, string> = {
   read: "只读",
   write: "读写",
 };
+
+// --- 文档权限位掩码（4 个操作位） ------------------------------------------
+// read=1(0001)、create=2(0010)、update=4(0100)、delete=8(1000)。每条规则用
+// allow_mask 与 deny_mask 两个 0-15 的掩码表达三态：两个掩码都没置该位＝未
+// 设置；allow 置位＝允许；deny 置位＝拒绝（deny 永远压过 allow）。
+export const PERM_READ = 1;
+export const PERM_CREATE = 2;
+export const PERM_UPDATE = 4;
+export const PERM_DELETE = 8;
+export const PERM_FULL = 15;
+
+
+export const permissionBitLabels: Record<number, string> = {
+  [PERM_READ]: "阅读",
+  [PERM_CREATE]: "新增",
+  [PERM_UPDATE]: "修改",
+  [PERM_DELETE]: "删除",
+};
+
+// mergeMasks 合并三层掩码：deny 位清除对应的 allow 位（Go 的 &^ 语义）。
+export function mergeMasks(allow: number, deny: number) {
+  return (allow | 0) & ~(deny | 0);
+}
+
+// effectiveScopeMask 按契约计算单个文档的有效掩码：
+// (default_allow | whole_allow | file_allow) &^ (default_deny | whole_deny | file_deny)。
+export function effectiveScopeMask(scope: ScopeView, documentName?: string) {
+  const allow = (scope.default_allow || 0) | (scope.whole_allow || 0)
+    | ((scope.file_allow || {})[documentName || ""] || 0);
+  const deny = (scope.default_deny || 0) | (scope.whole_deny || 0)
+    | ((scope.file_deny || {})[documentName || ""] || 0);
+  return mergeMasks(allow, deny);
+}
+
+// hasMask 判断掩码是否包含某个操作位。
+export function hasMask(mask: number | undefined, bit: number) {
+  return ((mask || 0) & bit) !== 0;
+}
+
+// maskToLabels 把掩码翻译成中文标签列表（按 read/update/delete、create 的
+// 展示顺序），空掩码返回空数组。
+export function maskToLabels(mask: number | undefined) {
+  const value = mask || 0;
+  return [PERM_READ, PERM_UPDATE, PERM_DELETE, PERM_CREATE]
+    .filter((bit) => (value & bit) !== 0)
+    .map((bit) => permissionBitLabels[bit]);
+}
+
+// maskToText 把掩码翻译成逗号连接的中文标签；空掩码显示占位文案。
+export function maskToText(mask: number | undefined, fallback = "未设置") {
+  const labels = maskToLabels(mask);
+  return labels.length ? labels.join("、") : fallback;
+}
+
+// normalizeMask 把任意输入收拢到合法的 0-15 掩码。
+export function normalizeMask(mask: number | undefined) {
+  const value = typeof mask === "number" && Number.isFinite(mask) ? Math.trunc(mask) : 0;
+  return value & PERM_FULL;
+}
+
 export const scopeLabels: Record<ShareScope, string> = {
   all: "全库",
   files: "指定文件",
@@ -126,6 +285,11 @@ export const invitationStatusColors: Record<string, string> = {
   declined: "default",
   revoked: "default",
   expired: "error",
+};
+// groupInvitationStatusLabels shares the invitation status wording; group
+// invitations use the same pending/accepted/declined/revoked/expired states.
+export const groupInvitationStatusLabels: Record<string, string> = {
+  ...invitationStatusLabels,
 };
 // invitationStatus renders the display status: a pending invitation whose
 // expires_at already passed is expired for the invitee even before the server
@@ -1818,9 +1982,58 @@ export async function fetchGrants(namespace: string, connection: Connection): Pr
   return payload.permissions || [];
 }
 
-export async function revokeGrant(namespace: string, userId: string, connection: Connection): Promise<void> {
-  await apiResponse(
+// SetKnowledgeBasePermissionInput 是管理端设置一条规则（全库 document_name
+// 传 ""）的请求体；allow_mask 与 deny_mask 同时提交，立即生效，无需邀请确认。
+export type SetKnowledgeBasePermissionInput = {
+  document_name: string;
+  allow_mask: number;
+  deny_mask: number;
+};
+
+// setKnowledgeBasePermission 写入一条账号 × 知识库 × 文件（""＝全库）规则。
+// 文件级规则带 create 位会被后端 422 拒绝，界面层已负责不让 create 出现。
+export async function setKnowledgeBasePermission(
+  namespace: string,
+  userId: string,
+  input: SetKnowledgeBasePermissionInput,
+  connection: Connection,
+): Promise<GrantView> {
+  const payload = await api<{ permission: GrantView }>(
     `/v1/knowledge-bases/${encodeURIComponent(namespace)}/permissions/${encodeURIComponent(userId)}`,
+    { ...connection, namespace },
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+  return payload.permission;
+}
+
+// clearKnowledgeBaseDeny 清除一条规则上的全部 deny 位（document_name 为 ""
+// 时清除全库规则的拒绝位，传具体文件名则只清该文件）。204 无响应体。
+export async function clearKnowledgeBaseDeny(
+  namespace: string,
+  userId: string,
+  documentName: string,
+  connection: Connection,
+): Promise<void> {
+  await apiResponse(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/permissions/${encodeURIComponent(userId)}/clear-deny`,
+    { ...connection, namespace },
+    { method: "POST", body: JSON.stringify({ document_name: documentName }) },
+  );
+}
+
+// revokeGrant 只撤销 allow：DELETE 语义已改为清除 allow_mask、保留 deny_mask
+// （documentName 缺省撤销该用户全部 allow；传具体文件名只撤该文件的 allow）。
+export async function revokeGrant(
+  namespace: string,
+  userId: string,
+  connection: Connection,
+  documentName?: string,
+): Promise<void> {
+  const query = documentName !== undefined && documentName !== ""
+    ? `?document_name=${encodeURIComponent(documentName)}`
+    : "";
+  await apiResponse(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/permissions/${encodeURIComponent(userId)}${query}`,
     { ...connection, namespace },
     { method: "DELETE" },
   );
@@ -1846,16 +2059,26 @@ export async function createInvitation(
   const result = await api<CreateInvitationResult>(
     `/v1/knowledge-bases/${encodeURIComponent(namespace)}/invitations`,
     { ...connection, namespace },
-    { method: "POST", body: JSON.stringify(input) },
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ...input,
+        // 始终提交归一化后的 allow_mask（0-15）；permission 保留原样供旧后端
+        // 兼容映射，服务端以 allow_mask 为准。
+        allow_mask: normalizeMask(input.allow_mask),
+      }),
+    },
   );
   return { ...result, invitation: normalizeInvitation(result.invitation) };
 }
 
-// normalizeInvitation tolerates a null document_names slice in JSON.
+// normalizeInvitation tolerates a null document_names slice in JSON and clamps
+// the optional allow_mask into the valid 0-15 range.
 function normalizeInvitation(invitation: InvitationView): InvitationView {
   return {
     ...invitation,
     document_names: Array.isArray(invitation.document_names) ? invitation.document_names : [],
+    allow_mask: normalizeMask(invitation.allow_mask),
   };
 }
 
@@ -1906,6 +2129,156 @@ export async function revokeInvitation(invitationId: string): Promise<void> {
 export async function fetchInvitableUsers(): Promise<InviteUser[]> {
   const payload = await api<{ users: InviteUser[] }>("/v1/users", undefined, { cache: "no-store" });
   return payload.users || [];
+}
+
+// ---- 用户组 API ----
+
+// fetchGroups lists the groups the current account created or joined.
+export async function fetchGroups(): Promise<{ owned: GroupView[]; joined: GroupView[] }> {
+  const payload = await api<{ owned_groups: GroupView[]; joined_groups: GroupView[] }>(
+    "/v1/groups", undefined, { cache: "no-store" });
+  return {
+    owned: (payload.owned_groups || []).map(normalizeGroup),
+    joined: (payload.joined_groups || []).map(normalizeGroup),
+  };
+}
+
+// normalizeGroup tolerates a null member_count in JSON.
+function normalizeGroup(group: GroupView): GroupView {
+  return { ...group, member_count: group.member_count ?? 0 };
+}
+
+// createGroup creates one user group owned by the current account (vip/admin).
+export async function createGroup(name: string): Promise<GroupView> {
+  const payload = await api<{ group: GroupView }>("/v1/groups", undefined, {
+    method: "POST", body: JSON.stringify({ name }),
+  });
+  return normalizeGroup(payload.group);
+}
+
+// fetchGroupDetail returns one group with members and invitations.
+export async function fetchGroupDetail(
+  groupId: string,
+): Promise<{ group: GroupView; members: GroupMemberView[]; invitations: GroupInvitationView[] }> {
+  const payload = await api<{ group: GroupView; members: GroupMemberView[]; invitations: GroupInvitationView[] }>(
+    `/v1/groups/${encodeURIComponent(groupId)}`, undefined, { cache: "no-store" });
+  return {
+    group: normalizeGroup(payload.group),
+    members: payload.members || [],
+    invitations: payload.invitations || [],
+  };
+}
+
+// dissolveGroup deactivates one group and clears members/invitations/grants.
+export async function dissolveGroup(groupId: string): Promise<void> {
+  await apiResponse(`/v1/groups/${encodeURIComponent(groupId)}`, undefined, { method: "DELETE" });
+}
+
+// createGroupInvitation issues one membership invitation link (group owner,
+// still vip/admin). The raw token appears only in this response.
+export async function createGroupInvitation(
+  groupId: string, username: string,
+): Promise<{ invitation: GroupInvitationView; invite_path: string }> {
+  return await api<{ invitation: GroupInvitationView; invite_path: string }>(
+    `/v1/groups/${encodeURIComponent(groupId)}/invitations`, undefined,
+    { method: "POST", body: JSON.stringify({ username }) });
+}
+
+// removeGroupMember removes one member from the owner's group.
+export async function removeGroupMember(groupId: string, userId: string): Promise<void> {
+  await apiResponse(`/v1/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(userId)}`, undefined, {
+    method: "DELETE",
+  });
+}
+
+// leaveGroup removes the current account's own membership.
+export async function leaveGroup(groupId: string): Promise<void> {
+  await apiResponse(`/v1/groups/${encodeURIComponent(groupId)}/membership`, undefined, { method: "DELETE" });
+}
+
+// fetchGroupInvitationInbox lists the group invitations addressed to the
+// current account, pending first.
+export async function fetchGroupInvitationInbox(
+  options: { signal?: AbortSignal } = {},
+): Promise<GroupInvitationView[]> {
+  const payload = await api<{ invitations: GroupInvitationView[] }>(
+    "/v1/group-invitations", undefined, { cache: "no-store", signal: options.signal });
+  return payload.invitations || [];
+}
+
+// previewGroupInvitation resolves one group invitation link for its invitee.
+export async function previewGroupInvitation(token: string): Promise<GroupInvitationView> {
+  const payload = await api<{ invitation: GroupInvitationView }>("/v1/group-invitations/preview", undefined, {
+    method: "POST", body: JSON.stringify({ token }),
+  });
+  return payload.invitation;
+}
+
+// acceptGroupInvitation turns one pending membership invitation into a
+// membership. Idempotent retries never re-add a member that left.
+export async function acceptGroupInvitation(token: string): Promise<GroupInvitationView> {
+  const payload = await api<{ invitation: GroupInvitationView }>("/v1/group-invitations/accept", undefined, {
+    method: "POST", body: JSON.stringify({ token }),
+  });
+  return payload.invitation;
+}
+
+// declineGroupInvitation declines one pending membership invitation.
+export async function declineGroupInvitation(token: string): Promise<GroupInvitationView> {
+  const payload = await api<{ invitation: GroupInvitationView }>("/v1/group-invitations/decline", undefined, {
+    method: "POST", body: JSON.stringify({ token }),
+  });
+  return payload.invitation;
+}
+
+// revokeGroupInvitation withdraws one pending group invitation (group owner).
+export async function revokeGroupInvitation(invitationId: string): Promise<void> {
+  await apiResponse(`/v1/group-invitations/${encodeURIComponent(invitationId)}`, undefined, { method: "DELETE" });
+}
+
+// fetchGroupGrants lists the user-group grants of one knowledge base.
+export async function fetchGroupGrants(
+  namespace: string, connection: Connection,
+): Promise<GroupGrantView[]> {
+  const payload = await api<{ group_permissions: GroupGrantView[] }>(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/group-permissions`,
+    { ...connection, namespace }, { cache: "no-store" });
+  return payload.group_permissions || [];
+}
+
+// setGroupGrant writes one whole-library or per-file group grant.
+export async function setGroupGrant(
+  namespace: string, groupId: string, input: SetGroupGrantInput, connection: Connection,
+): Promise<void> {
+  await apiResponse(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/group-permissions/${encodeURIComponent(groupId)}`,
+    { ...connection, namespace },
+    { method: "PUT", body: JSON.stringify(input) },
+  );
+}
+
+// revokeGroupGrant removes every group grant of one group inside one
+// knowledge base.
+export async function revokeGroupGrant(
+  namespace: string, groupId: string, connection: Connection,
+): Promise<void> {
+  await apiResponse(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/group-permissions/${encodeURIComponent(groupId)}`,
+    { ...connection, namespace },
+    { method: "DELETE" },
+  );
+}
+
+// fetchPermissionSources explains the origins of the current account's
+// effective permissions for one namespace (all documents, or one document).
+export async function fetchPermissionSources(
+  namespace: string, connection: Connection, documentName = "",
+): Promise<PermissionSourceView[]> {
+  const query = documentName ? `?document_name=${encodeURIComponent(documentName)}` : "";
+  const payload = await api<{ sources: PermissionSourceView[] }>(
+    `/v1/knowledge-bases/${encodeURIComponent(namespace)}/permission-sources${query}`,
+    { ...connection, namespace }, { cache: "no-store" });
+  return payload.sources || [];
 }
 
 // invitationLink makes the shareable absolute URL from the invite_path returned

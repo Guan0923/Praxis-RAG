@@ -91,7 +91,8 @@ Get-Content ".env" | ForEach-Object {
 
 if (-not $env:RAG_REDIS_URL) { $env:RAG_REDIS_URL = "redis://127.0.0.1:6379/0" }
 # The document lock is independent of the display cache but defaults to the same
-# local Redis; the backend switch itself stays opt-in (RAG_DOCUMENT_LOCK_MODE).
+# local Redis. Redis is the required lease backend: a missing lock address is a
+# startup configuration error for every document-writing process.
 if (-not $env:RAG_REDIS_LOCK_URL) { $env:RAG_REDIS_LOCK_URL = "redis://127.0.0.1:6379/0" }
 # Host processes connect through the published listener; containers use kafka:9092.
 if (-not $env:RAG_KAFKA_BOOTSTRAP_SERVERS) { $env:RAG_KAFKA_BOOTSTRAP_SERVERS = "127.0.0.1:9092" }

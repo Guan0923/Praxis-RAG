@@ -77,6 +77,17 @@ type Stores struct {
 	AppSettings    *AppSettingsRepository
 	Permissions    *PermissionRepository
 	Invitations    *InvitationRepository
+
+	// UserGroups / UserGroupMembers / GroupInvitations / GroupPermissions back
+	// the user-group feature: a vip/admin account creates groups, invites
+	// members through digest-only link tokens and grants allow bits on its own
+	// knowledge bases. Membership and grants are inputs of the permission
+	// merge resolved by internal/access.
+	UserGroups        *UserGroupRepository
+	UserGroupMembers  *UserGroupMemberRepository
+	GroupInvitations  *GroupInvitationRepository
+	GroupPermissions  *KBGroupPermissionRepository
+
 	ModelProfiles  *ModelProfileRepository
 	KnowledgeBases *KnowledgeBaseRepository
 	Documents      *DocumentRepository
@@ -93,7 +104,14 @@ type Stores struct {
 	Blobs     *BlobStore
 	Views     *CachedReadViews
 	Artifacts *ArtifactRegistry
-	Uploads   *UploadJournal
+	// Uploads is the durable upload transaction journal.
+	Uploads *UploadJournal
+
+	// UploadBloom is the optional Redis bitmap bloom filter that tracks which
+	// upload operation IDs exist (MySQL stays the source of truth; it only
+	// fast-fails "definitely absent" IDs on GET /v1/uploads/{operation_id}).
+	// Nil keeps the historical behavior everywhere.
+	UploadBloom *UploadBloomFilter
 
 	DocumentJobs    *DocumentJobs
 	DocumentBatches *DocumentBatches
@@ -214,6 +232,10 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	stores.AppSettings = newAppSettingsRepository(database)
 	stores.Permissions = newPermissionRepository(database)
 	stores.Invitations = newInvitationRepository(database)
+	stores.UserGroups = newUserGroupRepository(database)
+	stores.UserGroupMembers = newUserGroupMemberRepository(database)
+	stores.GroupInvitations = newGroupInvitationRepository(database)
+	stores.GroupPermissions = newKBGroupPermissionRepository(database)
 	stores.ModelProfiles = newModelProfileRepository(database)
 	stores.KnowledgeBases = newKnowledgeBaseRepository(database, cacheSync)
 	stores.Documents = newDocumentRepository(database, cacheSync)
@@ -291,6 +313,17 @@ func (s *Stores) AttachDocumentLocker(locker DocumentLocker) error {
 	return nil
 }
 
+// AttachUploadBloom enables the upload-operation bloom filter on this store.
+// Every process that creates upload operations must attach it with the same
+// configuration before RAG_UPLOAD_BLOOM_MODE=on is deployed fleet-wide.
+func (s *Stores) AttachUploadBloom(filter *UploadBloomFilter) error {
+	if filter == nil {
+		return newValueError("upload bloom filter is required")
+	}
+	s.UploadBloom = filter
+	return nil
+}
+
 // Ping runs the lightweight connectivity check used by StateStores.ping.
 func (s *Stores) Ping(ctx context.Context) error {
 	var one int
@@ -312,6 +345,11 @@ func (s *Stores) Close() error {
 		}
 		if s.DocumentLocks != nil {
 			if err := s.DocumentLocks.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if s.UploadBloom != nil {
+			if err := s.UploadBloom.Close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
@@ -484,7 +522,56 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	if err := s.migrateMembershipBaseline(ctx); err != nil {
 		return err
 	}
+	if err := s.migratePermissionMasks(ctx); err != nil {
+		return err
+	}
 	return s.migrateContentStore(ctx)
+}
+
+// migratePermissionMasks adds the operation-bit mask columns to kb_permissions
+// and kb_invitations and backfills the historical rows.
+//
+// The added columns are nullable on an existing database, and NULL is the
+// explicit "not yet migrated" marker: the backfill only touches rows whose
+// mask column is still NULL, so re-running the migration never overwrites a
+// mask the user deliberately cleared to 0. New tables are created with NOT
+// NULL DEFAULT 0 columns (fresh rows always carry explicit masks) and the
+// backfill then matches nothing.
+//
+// Historical permission levels map onto allow masks exactly like the REST
+// compatibility layer: read -> 1, a whole-library write -> 15, a file-scoped
+// write -> 13; deny masks start at zero because historical rules never denied.
+func (s *Stores) migratePermissionMasks(ctx context.Context) error {
+	if err := s.migrateAddColumns(ctx, map[string][]columnAddition{
+		"kb_permissions": {
+			{name: "allow_mask", definition: "INT UNSIGNED NULL"},
+			{name: "deny_mask", definition: "INT UNSIGNED NULL"},
+		},
+		"kb_invitations": {
+			{name: "allow_mask", definition: "INT UNSIGNED NULL"},
+		},
+	}); err != nil {
+		return err
+	}
+	// The UPDATE ... WHERE mask IS NULL form is idempotent and safe under
+	// concurrent startup: both processes compute the same values from the
+	// untouched permission column, and the second run matches nothing.
+	if _, err := s.DB.ExecContext(ctx,
+		"UPDATE kb_permissions SET "+
+			"allow_mask = CASE WHEN permission = 'write' AND document_name = '' THEN 15 "+
+			"WHEN permission = 'write' THEN 13 ELSE 1 END, "+
+			"deny_mask = 0 "+
+			"WHERE allow_mask IS NULL"); err != nil {
+		return err
+	}
+	if _, err := s.DB.ExecContext(ctx,
+		"UPDATE kb_invitations SET "+
+			"allow_mask = CASE WHEN permission = 'write' AND scope = 'all' THEN 15 "+
+			"WHEN permission = 'write' THEN 13 ELSE 1 END "+
+			"WHERE allow_mask IS NULL"); err != nil {
+		return err
+	}
+	return nil
 }
 
 // migrateModelProfileOwners turns the shared model-configuration registry into a

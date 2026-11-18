@@ -10,26 +10,16 @@ import (
 	"time"
 )
 
-// Document lock modes. The mode is a deployment-wide switch: every process that
-// writes, recovers or cleans document state must use the same mode, because a
-// fleet that mixes both backends has no mutual exclusion at all.
-const (
-	// DocumentLockModeMySQL is the legacy backend: document_leases rows hold the
-	// long-lived lease and every heartbeat renews expires_at over SQL.
-	DocumentLockModeMySQL = "mysql"
-	// DocumentLockModeRedis moves the long-lived lease to Redis. MySQL keeps the
-	// holder registration and a monotonically increasing fencing epoch, which is
-	// what every destructive SQL transaction verifies.
-	DocumentLockModeRedis = "redis"
-)
-
 // DocumentLockSettings configures the cross-instance document lease backend.
+// Redis is the only backend: the long-lived lease lives in Redis while MySQL
+// keeps the holder registration and a monotonically increasing fencing epoch,
+// which is what every destructive SQL transaction verifies.
 //
 // The display cache (RAG_REDIS_*) and the document lock are independent:
 // disabling the cache must not disable the lock, and the two TTLs are separate.
+// The legacy RAG_DOCUMENT_LOCK_MODE switch is ignored: even when an old
+// environment still exports it, the program always uses the Redis backend.
 type DocumentLockSettings struct {
-	// Mode is RAG_DOCUMENT_LOCK_MODE: "mysql" (default) or "redis".
-	Mode string
 	// URL is RAG_REDIS_LOCK_URL, falling back to RAG_REDIS_URL.
 	URL string
 	// Prefix is the lock key namespace (RAG_REDIS_LOCK_PREFIX).
@@ -44,10 +34,12 @@ type DocumentLockSettings struct {
 	WaitSeconds float64
 }
 
-// DefaultDocumentLockSettings returns the documented defaults.
+// DefaultDocumentLockSettings returns the documented defaults. URL stays empty
+// until the environment (or an explicit option) resolves it; a journal without
+// a URL and without an injected backend reports *LockUnavailable on every
+// write path that needs the lease instead of falling back to MySQL leases.
 func DefaultDocumentLockSettings() DocumentLockSettings {
 	return DocumentLockSettings{
-		Mode:           DocumentLockModeMySQL,
 		Prefix:         "rag:lock:v1",
 		TTLSeconds:     120,
 		TimeoutSeconds: 1,
@@ -55,17 +47,26 @@ func DefaultDocumentLockSettings() DocumentLockSettings {
 	}
 }
 
-// DocumentLockSettingsFromEnv reads the RAG_DOCUMENT_LOCK_*/RAG_REDIS_LOCK_*
-// contract. It mirrors CacheSettingsFromEnv style: trimmed values, explicit
+// documentLockURLFromEnv resolves RAG_REDIS_LOCK_URL, falling back to
+// RAG_REDIS_URL. An empty result means the deployment has no lock address.
+func documentLockURLFromEnv() string {
+	url := strings.TrimSpace(os.Getenv("RAG_REDIS_LOCK_URL"))
+	if url == "" {
+		url = strings.TrimSpace(os.Getenv("RAG_REDIS_URL"))
+	}
+	return url
+}
+
+// DocumentLockSettingsFromEnv reads the RAG_REDIS_LOCK_* contract. Redis is the
+// required document lock backend, so a missing address is a configuration
+// error: the process must fail to start rather than silently lose mutual
+// exclusion. It mirrors CacheSettingsFromEnv style: trimmed values, explicit
 // validation and no dialing.
 func DocumentLockSettingsFromEnv() (DocumentLockSettings, error) {
 	settings := DefaultDocumentLockSettings()
-	if raw := strings.ToLower(strings.TrimSpace(os.Getenv("RAG_DOCUMENT_LOCK_MODE"))); raw != "" {
-		settings.Mode = raw
-	}
-	settings.URL = strings.TrimSpace(os.Getenv("RAG_REDIS_LOCK_URL"))
+	settings.URL = documentLockURLFromEnv()
 	if settings.URL == "" {
-		settings.URL = strings.TrimSpace(os.Getenv("RAG_REDIS_URL"))
+		return DocumentLockSettings{}, fmt.Errorf("RAG_REDIS_LOCK_URL or RAG_REDIS_URL is required: Redis is the document lock backend")
 	}
 	settings.Prefix = strings.TrimSpace(envOrDefault("RAG_REDIS_LOCK_PREFIX", settings.Prefix))
 	ttl, err := parseFloatSetting("RAG_REDIS_LOCK_TTL_SECONDS", "120")
@@ -109,28 +110,20 @@ func parseFloatSetting(name, fallback string) (float64, error) {
 
 // Validate rejects configurations that would silently disable mutual exclusion.
 func (s DocumentLockSettings) Validate() error {
-	switch s.Mode {
-	case DocumentLockModeMySQL:
-	case DocumentLockModeRedis:
-		if s.URL == "" {
-			return fmt.Errorf("RAG_DOCUMENT_LOCK_MODE=redis requires RAG_REDIS_LOCK_URL or RAG_REDIS_URL")
-		}
-	default:
-		return fmt.Errorf("RAG_DOCUMENT_LOCK_MODE must be %q or %q", DocumentLockModeMySQL, DocumentLockModeRedis)
+	if s.URL == "" {
+		return fmt.Errorf("RAG_REDIS_LOCK_URL or RAG_REDIS_URL is required: Redis is the document lock backend")
 	}
-	if s.Mode == DocumentLockModeRedis {
-		if math.IsNaN(s.TTLSeconds) || math.IsInf(s.TTLSeconds, 0) || s.TTLSeconds <= 0 {
-			return fmt.Errorf("RAG_REDIS_LOCK_TTL_SECONDS must be a positive finite number")
-		}
-		if math.IsNaN(s.TimeoutSeconds) || math.IsInf(s.TimeoutSeconds, 0) || s.TimeoutSeconds <= 0 {
-			return fmt.Errorf("RAG_REDIS_LOCK_TIMEOUT_SECONDS must be a positive finite number")
-		}
-		if math.IsNaN(s.WaitSeconds) || math.IsInf(s.WaitSeconds, 0) || s.WaitSeconds < 0 {
-			return fmt.Errorf("RAG_REDIS_LOCK_WAIT_SECONDS must be a finite nonnegative number")
-		}
-		if s.Prefix == "" {
-			return fmt.Errorf("RAG_REDIS_LOCK_PREFIX must not be empty")
-		}
+	if math.IsNaN(s.TTLSeconds) || math.IsInf(s.TTLSeconds, 0) || s.TTLSeconds <= 0 {
+		return fmt.Errorf("RAG_REDIS_LOCK_TTL_SECONDS must be a positive finite number")
+	}
+	if math.IsNaN(s.TimeoutSeconds) || math.IsInf(s.TimeoutSeconds, 0) || s.TimeoutSeconds <= 0 {
+		return fmt.Errorf("RAG_REDIS_LOCK_TIMEOUT_SECONDS must be a positive finite number")
+	}
+	if math.IsNaN(s.WaitSeconds) || math.IsInf(s.WaitSeconds, 0) || s.WaitSeconds < 0 {
+		return fmt.Errorf("RAG_REDIS_LOCK_WAIT_SECONDS must be a finite nonnegative number")
+	}
+	if s.Prefix == "" {
+		return fmt.Errorf("RAG_REDIS_LOCK_PREFIX must not be empty")
 	}
 	return nil
 }
@@ -139,9 +132,6 @@ func (s DocumentLockSettings) Validate() error {
 func (s DocumentLockSettings) TTL() time.Duration {
 	return time.Duration(s.TTLSeconds * float64(time.Second))
 }
-
-// RedisMode reports whether the long-lived document lease lives in Redis.
-func (s DocumentLockSettings) RedisMode() bool { return s.Mode == DocumentLockModeRedis }
 
 // LockBusy reports that another live holder owns at least one requested
 // resource. It keeps the pre-migration conflict contract (callers map it to

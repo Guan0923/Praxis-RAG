@@ -217,15 +217,17 @@ func (f *fakeDocumentLocker) acquireCount() int {
 	return f.acquires
 }
 
-// newRedisTestJournal builds a journal in redis mode with short, test-friendly
-// settings (no acquisition wait) over the shared test store.
+// newRedisTestJournal builds a journal with short, test-friendly settings (no
+// acquisition wait) over the shared test store. The store's already-attached
+// backend keeps serving; this only rebinds the journal's settings.
 func newRedisTestJournal(t *testing.T, stores *Stores, locker DocumentLocker, options ...JournalOption) *UploadJournal {
 	t.Helper()
-	if err := stores.AttachDocumentLocker(locker); err != nil {
-		t.Fatalf("AttachDocumentLocker() error = %v", err)
+	if stores.DocumentLocks != locker {
+		if err := stores.AttachDocumentLocker(locker); err != nil {
+			t.Fatalf("AttachDocumentLocker() error = %v", err)
+		}
 	}
 	settings := DocumentLockSettings{
-		Mode:           DocumentLockModeRedis,
 		Prefix:         "test:lease",
 		TTLSeconds:     60,
 		TimeoutSeconds: 1,
@@ -258,7 +260,7 @@ func unfinishedOperationCount(t *testing.T, stores *Stores, namespace string) in
 // directions, and unaffected parallelism for different documents.
 func TestDocumentLockRedisConflictMatrix(t *testing.T) {
 	stores := newTestStores(t)
-	locker := newFakeDocumentLocker()
+	locker := testLocker(t, stores)
 	journal := newRedisTestJournal(t, stores, locker)
 	ctx := context.Background()
 	operation := beginTestUpload(t, journal, "ns", "file.txt", "doc", "collection", BeginOptions{})
@@ -323,7 +325,7 @@ func TestDocumentLockRedisConflictMatrix(t *testing.T) {
 // resumes. A must not become a second holder.
 func TestDocumentLockRedisPausedRegistrationRejected(t *testing.T) {
 	stores := newTestStores(t)
-	locker := newFakeDocumentLocker()
+	locker := testLocker(t, stores)
 	journalA := newRedisTestJournal(t, stores, locker)
 	journalB := newRedisTestJournal(t, stores, locker)
 	ctx := context.Background()
@@ -374,7 +376,7 @@ func TestDocumentLockRedisPausedRegistrationRejected(t *testing.T) {
 // after the earlier holder committed and released its lease.
 func TestDocumentLockRedisStaleEpochRegistration(t *testing.T) {
 	stores := newTestStores(t)
-	locker := newFakeDocumentLocker()
+	locker := testLocker(t, stores)
 	journalA := newRedisTestJournal(t, stores, locker)
 	journalB := newRedisTestJournal(t, stores, locker)
 	ctx := context.Background()
@@ -414,7 +416,7 @@ func TestDocumentLockRedisStaleEpochRegistration(t *testing.T) {
 // the old worker: it cannot renew, release, publish, or run compensation.
 func TestDocumentLockRedisTakeoverFencesOldWorker(t *testing.T) {
 	stores := newTestStores(t)
-	locker := newFakeDocumentLocker()
+	locker := testLocker(t, stores)
 	journalA := newRedisTestJournal(t, stores, locker)
 	journalB := newRedisTestJournal(t, stores, locker)
 	ctx := context.Background()
@@ -497,7 +499,7 @@ func TestDocumentLockRedisTakeoverFencesOldWorker(t *testing.T) {
 // can still finish the operation afterwards.
 func TestDocumentLockRedisLostLeaseStopsNextStep(t *testing.T) {
 	stores := newTestStores(t)
-	locker := newFakeDocumentLocker()
+	locker := testLocker(t, stores)
 	journal := newRedisTestJournal(t, stores, locker)
 	ctx := context.Background()
 	operation := beginTestUpload(t, journal, "ns", "file.txt", "doc", "collection", BeginOptions{})
@@ -530,7 +532,7 @@ func TestDocumentLockRedisLostLeaseStopsNextStep(t *testing.T) {
 // retryable error, never a silent fallback to MySQL leases.
 func TestDocumentLockRedisUnavailableIsRetryable(t *testing.T) {
 	stores := newTestStores(t)
-	locker := newFakeDocumentLocker()
+	locker := testLocker(t, stores)
 	journal := newRedisTestJournal(t, stores, locker)
 	ctx := context.Background()
 	locker.setUnavailable(true)
@@ -559,7 +561,7 @@ func TestDocumentLockRedisUnavailableIsRetryable(t *testing.T) {
 // failure never re-runs committed work and only delays reuse.
 func TestDocumentLockRedisReleaseFailureAfterCommit(t *testing.T) {
 	stores := newTestStores(t)
-	locker := newFakeDocumentLocker()
+	locker := testLocker(t, stores)
 	journal := newRedisTestJournal(t, stores, locker)
 	ctx := context.Background()
 	idempotencyKey := "same-key"
@@ -605,7 +607,7 @@ func TestDocumentLockRedisReleaseFailureAfterCommit(t *testing.T) {
 // registration timestamp) without exposing the owner token.
 func TestDocumentLockRedisLeaseDisplayUsesLiveTTL(t *testing.T) {
 	stores := newTestStores(t)
-	locker := newFakeDocumentLocker()
+	locker := testLocker(t, stores)
 	journal := newRedisTestJournal(t, stores, locker)
 	ctx := context.Background()
 	operation := beginTestUpload(t, journal, "ns", "file.txt", "doc", "collection", BeginOptions{})
@@ -643,7 +645,7 @@ func TestDocumentLockRedisLeaseDisplayUsesLiveTTL(t *testing.T) {
 // new work blindly.
 func TestDocumentLockRedisHeartbeatCancelsInFlightWork(t *testing.T) {
 	stores := newTestStores(t)
-	locker := newFakeDocumentLocker()
+	locker := testLocker(t, stores)
 	journal := newRedisTestJournal(t, stores, locker, WithLeaseSeconds(0.06))
 	ctx := context.Background()
 	operation := beginTestUpload(t, journal, "ns", "file.txt", "doc", "collection", BeginOptions{})

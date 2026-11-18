@@ -62,7 +62,7 @@ var observedKeys = []string{
 	"RAG_RESULT_TTL_SECONDS", "RAG_ARTIFACT_MAX_BYTES", "RAG_RESULT_MAX_ARTIFACTS",
 	"RAG_REDIS_ENABLED", "RAG_REDIS_URL", "RAG_REDIS_PREFIX", "RAG_REDIS_TTL_SECONDS",
 	"RAG_REDIS_TIMEOUT_SECONDS",
-	"RAG_DOCUMENT_LOCK_MODE", "RAG_REDIS_LOCK_URL", "RAG_REDIS_LOCK_PREFIX",
+	"RAG_REDIS_LOCK_URL", "RAG_REDIS_LOCK_PREFIX",
 	"RAG_REDIS_LOCK_TTL_SECONDS", "RAG_REDIS_LOCK_TIMEOUT_SECONDS",
 	"RAG_REDIS_LOCK_WAIT_SECONDS",
 	"RAG_KAFKA_BOOTSTRAP_SERVERS", "RAG_KAFKA_CLIENT_ID", "RAG_KAFKA_SECURITY_PROTOCOL",
@@ -87,6 +87,10 @@ var observedKeys = []string{
 
 // ignoredDocumentKeys are legacy settings still accepted but never applied.
 var ignoredDocumentKeys = map[string]struct{}{
+	// RAG_DOCUMENT_LOCK_MODE selected the document lease backend before Redis
+	// became the only backend. Old environments may still export it; it is
+	// accepted and ignored so an upgraded config.toml keeps loading.
+	"RAG_DOCUMENT_LOCK_MODE":                  {},
 	"RAG_DOCUMENT_MAX_ATTEMPTS":               {},
 	"RAG_DOCUMENT_LEASE_SECONDS":              {},
 	"RAG_DOCUMENT_RETRY_SECONDS":              {},

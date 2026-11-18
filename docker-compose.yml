@@ -474,12 +474,12 @@ services:
       RAG_DOCLING_SERVICE_TIMEOUT: ${RAG_DOCLING_SERVICE_TIMEOUT:-300}
       RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
       RAG_CACHE_GROUP: ${RAG_CACHE_GROUP:-praxis_state_cache_refresh_workers}
-      # Document lease backend. mysql (default) keeps the pre-migration SQL lease
-      # rows; redis moves long-lived document leases to Redis with a durable MySQL
-      # fencing generation. The switch is deployment-wide: flip it for rag-service
-      # and every rag-document-worker together while document writes are stopped
-      # (docs/DEPLOYMENT.md §13). The display cache stays independent.
-      RAG_DOCUMENT_LOCK_MODE: ${RAG_DOCUMENT_LOCK_MODE:-mysql}
+      # Document lease backend. Redis is the required backend for document
+      # long-lived leases: every process that writes, recovers or cleans
+      # document state must resolve the same RAG_REDIS_LOCK_* configuration
+      # (rag-service, rag-document-worker, rag-mcp-ingest). MySQL keeps the
+      # holder registration and the fencing epoch only. The display cache
+      # stays independent. A legacy RAG_DOCUMENT_LOCK_MODE value is ignored.
       RAG_REDIS_LOCK_URL: ${RAG_APP_REDIS_LOCK_URL:-redis://redis:6379/0}
       RAG_REDIS_LOCK_PREFIX: ${RAG_REDIS_LOCK_PREFIX:-rag:lock:v1}
       RAG_REDIS_LOCK_TTL_SECONDS: ${RAG_REDIS_LOCK_TTL_SECONDS:-120}

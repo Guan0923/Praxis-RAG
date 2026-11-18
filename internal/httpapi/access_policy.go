@@ -39,6 +39,29 @@ type AccessControl interface {
 	ListInvitableUsers(ctx context.Context, inviter state.User) ([]access.UserView, error)
 }
 
+// GroupControl is the user-group management surface. The concrete
+// implementation is *access.Service; the interface keeps the httpapi layer
+// compilable against the sharing fakes that predate the feature. Servers
+// without a group-capable access service answer 503 on these routes.
+type GroupControl interface {
+	CreateGroup(ctx context.Context, user state.User, request access.CreateGroupRequest) (access.GroupView, error)
+	ListGroups(ctx context.Context, user state.User) (owned []access.GroupView, joined []access.GroupView, err error)
+	GroupDetail(ctx context.Context, user state.User, groupID string) (access.GroupView, []access.GroupMemberView, []access.GroupInvitationView, error)
+	CreateGroupInvitation(ctx context.Context, inviter state.User, request access.CreateGroupInvitationRequest) (access.GroupInvitationView, string, error)
+	GroupInvitationInbox(ctx context.Context, user state.User) ([]access.GroupInvitationView, error)
+	PreviewGroupInvitation(ctx context.Context, user state.User, token string) (access.GroupInvitationView, error)
+	AcceptGroupInvitation(ctx context.Context, user state.User, token string) (access.GroupInvitationView, error)
+	DeclineGroupInvitation(ctx context.Context, user state.User, token string) (access.GroupInvitationView, error)
+	RevokeGroupInvitation(ctx context.Context, user state.User, invitationID string) error
+	RemoveGroupMember(ctx context.Context, user state.User, groupID, memberUserID string) error
+	LeaveGroup(ctx context.Context, user state.User, groupID string) error
+	DissolveGroup(ctx context.Context, user state.User, groupID string) error
+	ListGroupGrants(ctx context.Context, user state.User, namespace string) ([]access.GroupGrantView, error)
+	SetGroupGrant(ctx context.Context, user state.User, request access.SetGroupGrantRequest) error
+	RevokeGroupGrant(ctx context.Context, user state.User, namespace, groupID string) error
+	DescribePermissionSources(ctx context.Context, user state.User, namespace, documentName string) ([]access.PermissionSourceView, error)
+}
+
 // KnowledgeBaseSelfCreateRuntime clones the default knowledge-base template for
 // one owning account. The admin route keeps the full provider configuration;
 // this surface only accepts namespace/chunking fields.
@@ -135,6 +158,46 @@ func (s *Server) withAccessScope(w http.ResponseWriter, r *http.Request, user st
 	return r.WithContext(access.ContextWithScope(r.Context(), scope))
 }
 
+// scopeReadCheck reports whether the request's scope grants one operation on
+// one target document. Without a scope (management credentials, ownership
+// enforcement disabled) the historical unrestricted behaviour applies.
+func scopeReadCheck(r *http.Request, required access.Operation, name string) bool {
+	scope, ok := access.ScopeFromContext(r.Context())
+	if !ok {
+		return true
+	}
+	effective := scope.EffectiveDocumentOrDefault(name)
+	return required != 0 && access.Operation(effective)&required == required
+}
+
+// scopeLibraryCheck reports whether the request's scope grants one operation at
+// knowledge-base level (the create bit).
+func scopeLibraryCheck(r *http.Request, required access.Operation) bool {
+	scope, ok := access.ScopeFromContext(r.Context())
+	if !ok {
+		return true
+	}
+	effective := scope.EffectiveLibrary()
+	return required != 0 && access.Operation(effective)&required == required
+}
+
+// scopeAnyCheck reports whether any document satisfies one operation bit.
+func scopeAnyCheck(r *http.Request, required access.Operation) bool {
+	scope, ok := access.ScopeFromContext(r.Context())
+	if !ok {
+		return true
+	}
+	if access.Operation(scope.EffectiveLibrary())&required != 0 {
+		return true
+	}
+	for name, allow := range scope.FileAllow {
+		if access.Operation(allow)&required != 0 && access.Operation(scope.EffectiveDocumentOrDefault(name))&required != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // requireScopeRead enforces read visibility on one tenant read endpoint. When no
 // scope was resolved (no session, or ownership enforcement disabled) the request
 // keeps the historical unrestricted behaviour.
@@ -152,35 +215,38 @@ func (s *Server) requireScopeRead(w http.ResponseWriter, r *http.Request) (acces
 
 // requireScopeReadDocument checks one document-level read grant.
 func (s *Server) requireScopeReadDocument(w http.ResponseWriter, r *http.Request, name string) bool {
-	scope, ok := access.ScopeFromContext(r.Context())
-	if !ok || scope.CanReadDocument(name) {
-		return true
+	if !scopeReadCheck(r, access.OpRead, name) {
+		writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
+		return false
 	}
-	writeDetail(w, http.StatusForbidden, access.MessageKnowledgeAccess)
-	return false
+	return true
 }
 
-// requireScopeWriteDocument checks one document-level write grant.
-func (s *Server) requireScopeWriteDocument(w http.ResponseWriter, r *http.Request, name string) bool {
-	scope, ok := access.ScopeFromContext(r.Context())
-	if !ok || scope.CanWriteDocument(name) {
-		return true
+// requireScopeUpdateDocument checks one document-level update grant (the
+// replace entry point).
+func (s *Server) requireScopeUpdateDocument(w http.ResponseWriter, r *http.Request, name string) bool {
+	if !scopeReadCheck(r, access.OpUpdate, name) {
+		writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
+		return false
 	}
-	writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
-	return false
+	return true
 }
 
-// requireScopeWriteBatch checks every file name of one upload batch.
-func (s *Server) requireScopeWriteBatch(w http.ResponseWriter, r *http.Request, files []UploadFile) bool {
-	scope, ok := access.ScopeFromContext(r.Context())
-	if !ok {
-		return true
+// requireScopeDeleteDocument checks one document-level delete grant.
+func (s *Server) requireScopeDeleteDocument(w http.ResponseWriter, r *http.Request, name string) bool {
+	if !scopeReadCheck(r, access.OpDelete, name) {
+		writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
+		return false
 	}
-	for _, file := range files {
-		if !scope.CanWriteDocument(file.Name) {
-			writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
-			return false
-		}
+	return true
+}
+
+// requireScopeCreate checks the library-level create grant used by every
+// new-document entry point.
+func (s *Server) requireScopeCreate(w http.ResponseWriter, r *http.Request) bool {
+	if !scopeLibraryCheck(r, access.OpCreate) {
+		writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
+		return false
 	}
 	return true
 }
@@ -195,7 +261,7 @@ func scopedDocuments(r *http.Request, documents []map[string]any) []map[string]a
 	filtered := make([]map[string]any, 0, len(documents))
 	for _, document := range documents {
 		name, _ := document["name"].(string)
-		if name != "" && scope.CanReadDocument(name) {
+		if name != "" && scopeReadCheck(r, access.OpRead, name) {
 			filtered = append(filtered, document)
 		}
 	}

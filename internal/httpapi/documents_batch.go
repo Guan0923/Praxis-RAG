@@ -82,8 +82,11 @@ func (s *Server) handleCreateDocumentBatch(w http.ResponseWriter, r *http.Reques
 		writeUploadProblem(w, uploadProblem)
 		return
 	}
-	if !s.requireScopeWriteBatch(w, r, files) {
+	if blocked, name := s.scopeUploadBatchBlocked(w, r, namespace, files); blocked {
 		detail := access.MessageWriteRequired
+		if name != "" {
+			detail = access.MessageWriteRequired + "：" + name
+		}
 		publishDone(nil, &detail)
 		return
 	}
@@ -100,6 +103,46 @@ func (s *Server) handleCreateDocumentBatch(w http.ResponseWriter, r *http.Reques
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusAccepted, payload)
+}
+
+// scopeUploadBatchBlocked applies the admission checks of one upload batch
+// before the runtime accepts any file: every new file name needs the
+// library-level create bit, and every name that already exists needs that
+// document's update bit (an account with only create cannot overwrite an
+// existing file). It writes the rejection response itself and reports whether
+// the batch is blocked; the blocked name is returned for the SSE frame.
+func (s *Server) scopeUploadBatchBlocked(w http.ResponseWriter, r *http.Request, namespace string, files []UploadFile) (bool, string) {
+	scope, hasScope := access.ScopeFromContext(r.Context())
+	if !hasScope {
+		// Management credentials and servers without ownership enforcement
+		// keep the historical unrestricted behaviour.
+		return false, ""
+	}
+	documents, err := s.runtime.ListDocuments(r.Context(), namespace)
+	if err != nil {
+		// Without the existence set the create/update split cannot be
+		// decided: fail closed rather than admit an unchecked overwrite.
+		writeDetail(w, http.StatusInternalServerError, "知识库权限服务异常")
+		return true, ""
+	}
+	existing := make(map[string]bool, len(documents))
+	for _, document := range documents {
+		if name, _ := document["name"].(string); name != "" {
+			existing[name] = true
+		}
+	}
+	for _, file := range files {
+		if existing[file.Name] {
+			if access.Operation(scope.EffectiveDocumentOrDefault(file.Name))&access.OpUpdate == access.OpUpdate {
+				continue
+			}
+		} else if access.Operation(scope.EffectiveLibrary())&access.OpCreate == access.OpCreate {
+			continue
+		}
+		writeDetail(w, http.StatusForbidden, access.MessageWriteRequired)
+		return true, file.Name
+	}
+	return false, ""
 }
 
 // writeUploadProblem mirrors the FastAPI-shaped rejection already returned by

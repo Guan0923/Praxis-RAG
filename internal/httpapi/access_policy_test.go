@@ -225,15 +225,14 @@ func sessionHeaders(token, namespace string) map[string]string {
 
 func fullTestScope() access.ScopeSet {
 	scope := access.NewScopeSet()
-	scope.WholeRead = true
-	scope.WholeWrite = true
+	scope.WholeAllow = 15
 	return scope
 }
 
 func readFilesScope(names ...string) access.ScopeSet {
 	scope := access.NewScopeSet()
 	for _, name := range names {
-		scope.ReadDocuments[name] = struct{}{}
+		scope.FileAllow[name] = uint16(access.OpRead)
 	}
 	return scope
 }
@@ -241,7 +240,7 @@ func readFilesScope(names ...string) access.ScopeSet {
 func writeFilesScope(names ...string) access.ScopeSet {
 	scope := access.NewScopeSet()
 	for _, name := range names {
-		scope.WriteDocuments[name] = struct{}{}
+		scope.FileAllow[name] = uint16(access.OpUpdate | access.OpDelete)
 	}
 	return scope
 }
@@ -361,7 +360,7 @@ func TestKnowledgeBaseAccessEndpoint(t *testing.T) {
 	control := &fakeAccessControl{describe: access.AccessView{
 		Namespace: "kb1", Owner: false, CanManage: false, CanShare: false, Role: state.RoleUser,
 		CanRead: true, CanWrite: true,
-		Scope: access.ScopeView{ReadDocuments: []string{"a.md"}, WriteDocuments: []string{"a.md"}},
+		Scope: access.ScopeView{ReadDocuments: []string{"a.md"}, WriteDocuments: []string{"a.md"}, FileAllow: map[string]int{}, FileDeny: map[string]int{}},
 	}}
 	handler := newAccessTestServer(t, users, control, nil).Handler()
 

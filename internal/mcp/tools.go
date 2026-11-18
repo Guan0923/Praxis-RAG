@@ -13,6 +13,7 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/Guan0923/Praxis-RAG/internal/access"
 	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 	"github.com/Guan0923/Praxis-RAG/internal/resources"
 )
@@ -82,6 +83,13 @@ func (e *Endpoint) buildToolEntries() []toolEntry {
 		execute: func(ctx context.Context, namespace string, input any) (map[string]any, error) {
 			request := input.(contracts.SearchRequest)
 			if scope, restricted := restrictedScope(ctx); restricted {
+				// The SAG event-entity mode expands a dynamic hyperedge whose
+				// expansion cannot be bounded to the readable set before
+				// recall; a restricted account is refused explicitly instead
+				// of silently leaking evidence.
+				if request.Retrieval == contracts.RetrievalSAG {
+					return nil, fmt.Errorf("%s：%s", messageRetrievalRestricted, contracts.RetrievalSAG)
+				}
 				documentIDs, err := e.resolvedDocumentIDs(ctx, namespace, scope)
 				if err != nil {
 					return nil, err
@@ -213,9 +221,33 @@ func (e *Endpoint) documentEntry(name, description string) toolEntry {
 
 // executeDocumentOperation ports McpHttpEndpoint.mutate_document for the
 // synchronous document operations (add/status go straight to the runtime).
+// Every operation applies its own permission check first: add needs the
+// library-level create bit (and the update bit when the name already exists
+// so a create-only account cannot overwrite), update needs the target's
+// update bit, delete needs the delete bit.
 func (e *Endpoint) executeDocumentOperation(ctx context.Context, namespace, operation string, request documentRequest) (map[string]any, error) {
 	switch operation {
 	case addDocumentToolName:
+		if scope, hasScope := scopeFor(ctx); hasScope {
+			existing, err := e.opts.Runtime.ListDocuments(ctx, namespace)
+			if err != nil {
+				return nil, err
+			}
+			exists := false
+			for _, document := range existing {
+				if document.Name() == request.name {
+					exists = true
+					break
+				}
+			}
+			if exists {
+				if access.Operation(scope.EffectiveDocumentOrDefault(request.name))&access.OpUpdate != access.OpUpdate {
+					return nil, fmt.Errorf("%s", messageDocumentWriteRequired)
+				}
+			} else if access.Operation(scope.EffectiveLibrary())&access.OpCreate != access.OpCreate {
+				return nil, fmt.Errorf("%s", messageCreateRequired)
+			}
+		}
 		payload, err := e.opts.Runtime.AddDocument(ctx, namespace, request.name, request.content, request.idempotencyKey)
 		if err != nil {
 			if errors.Is(err, ErrUploadConflict) {
@@ -226,6 +258,10 @@ func (e *Endpoint) executeDocumentOperation(ctx context.Context, namespace, oper
 		return payload, nil
 
 	case deleteDocumentToolName:
+		if scope, hasScope := scopeFor(ctx); hasScope &&
+			access.Operation(scope.EffectiveDocumentOrDefault(request.name))&access.OpDelete != access.OpDelete {
+			return nil, fmt.Errorf("%s", messageDocumentWriteRequired)
+		}
 		before, err := e.opts.Runtime.ListDocuments(ctx, namespace)
 		if err != nil {
 			return nil, err
@@ -264,6 +300,10 @@ func (e *Endpoint) executeDocumentOperation(ctx context.Context, namespace, oper
 		return payload, nil
 
 	case updateDocumentToolName:
+		if scope, hasScope := scopeFor(ctx); hasScope &&
+			access.Operation(scope.EffectiveDocumentOrDefault(request.name))&access.OpUpdate != access.OpUpdate {
+			return nil, fmt.Errorf("%s", messageDocumentWriteRequired)
+		}
 		before, err := e.opts.Runtime.ListDocuments(ctx, namespace)
 		if err != nil {
 			return nil, err

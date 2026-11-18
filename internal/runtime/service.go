@@ -201,12 +201,18 @@ func (s *Service) PublicKnowledgeBase(ctx context.Context, namespace string) (ma
 // (Python state.views.documents), so repeated reads share the same snapshot and
 // event ordering as the other view endpoints. The view already overlays the
 // knowledge-base collection/embedding_model; when views are unavailable or fail
-// the authoritative repository is used as a fallback.
+// the authoritative repository is used as a fallback — except when the display
+// fallback budget is exhausted: that *state.ViewBackpressureError was raised
+// precisely to protect MySQL, so re-reading the repository would bypass the
+// limit and it propagates to REST/MCP unchanged.
 func (s *Service) ListDocuments(ctx context.Context, namespace string) ([]map[string]any, error) {
 	if s.views != nil {
 		documents, err := s.views.Documents(ctx, namespace)
 		if err == nil {
 			return documents, nil
+		}
+		if state.IsViewBackpressure(err) {
+			return nil, err
 		}
 	}
 	return s.authoritativeDocuments(ctx, namespace)

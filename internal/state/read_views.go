@@ -77,6 +77,14 @@ func NewCachedReadViews(stores *Stores) *CachedReadViews {
 func (v *CachedReadViews) getOrLoad(ctx context.Context, kind, scope string) (any, error) {
 	value, err := v.stores.CacheSync.GetOrLoad(ctx, kind, scope)
 	if err != nil {
+		// The display-query fallback budget being exhausted must stay
+		// recognizable all the way to REST/MCP: retrying it against MySQL
+		// elsewhere is exactly what the guard refuses to allow. Every other
+		// error keeps its existing sanitized business semantics.
+		var backpressure *ViewBackpressureError
+		if errors.As(err, &backpressure) {
+			return nil, err
+		}
 		var stateErr *StateError
 		if errors.As(err, &stateErr) {
 			return nil, err
@@ -650,8 +658,16 @@ func (v *CachedReadViews) UploadOperations(ctx context.Context, namespace string
 
 // UploadOperation returns one operation's display detail; UUIDs never grant
 // cross-namespace access.
+//
+// Read order: the display cache first (a cached empty result is a hit and
+// still returns "not found"), then the upload bloom filter on a miss. When
+// the filter is ready and proves "definitely absent", the upload-status SQL
+// never runs; every other filter outcome (not ready, kill switch, lost shard,
+// backend failure, non-canonical ID) keeps the original MySQL query and
+// namespace check. The gate never affects the list endpoint.
 func (v *CachedReadViews) UploadOperation(ctx context.Context, namespace, operationID string) (map[string]any, error) {
-	value, err := v.getOrLoad(ctx, "upload_status", operationID)
+	value, err := v.stores.CacheSync.GetOrLoadGuarded(ctx, "upload_status", operationID,
+		v.uploadBloomGate(operationID))
 	if err != nil {
 		return nil, err
 	}
@@ -663,4 +679,17 @@ func (v *CachedReadViews) UploadOperation(ctx context.Context, namespace, operat
 		return nil, nil
 	}
 	return result, nil
+}
+
+// uploadBloomGate builds the cache-miss guard for one operation ID. A nil
+// guard (no filter, or reads not gated in this process) keeps the historical
+// behavior.
+func (v *CachedReadViews) uploadBloomGate(operationID string) cacheMissGate {
+	filter := v.stores.UploadBloom
+	if filter == nil || !filter.Settings().GatesReads() {
+		return nil
+	}
+	return func(ctx context.Context) bool {
+		return !filter.DefinitelyAbsent(ctx, operationID)
+	}
 }

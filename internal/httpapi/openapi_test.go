@@ -123,6 +123,31 @@ func TestOpenAPIAndDocsRoutes(t *testing.T) {
 			t.Fatalf("paths missing %s", path)
 		}
 	}
+	// User-group management surface documented from the same table.
+	for _, path := range []string{
+		"/v1/groups",
+		"/v1/groups/{group_id}",
+		"/v1/groups/{group_id}/invitations",
+		"/v1/groups/{group_id}/members/{user_id}",
+		"/v1/groups/{group_id}/membership",
+		"/v1/group-invitations",
+		"/v1/group-invitations/preview",
+		"/v1/group-invitations/accept",
+		"/v1/group-invitations/decline",
+		"/v1/group-invitations/{invitation_id}",
+		"/v1/knowledge-bases/{namespace}/group-permissions",
+		"/v1/knowledge-bases/{namespace}/group-permissions/{group_id}",
+		"/v1/knowledge-bases/{namespace}/permission-sources",
+	} {
+		if _, present := paths[path]; !present {
+			t.Fatalf("paths missing %s", path)
+		}
+	}
+	setGroupGrantBody, _ := schemas["SetGroupGrantBody"].(map[string]any)
+	groupGrantProperties, _ := setGroupGrantBody["properties"].(map[string]any)
+	if _, present := groupGrantProperties["allow_mask"]; !present {
+		t.Fatalf("SetGroupGrantBody.properties missing allow_mask: %v", groupGrantProperties)
+	}
 	// Console batch delete: one literal batch path per resource plus the
 	// single-knowledge-base purge route.
 	for _, path := range []string{
