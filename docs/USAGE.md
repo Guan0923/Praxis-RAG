@@ -28,7 +28,7 @@ MCP search / REST /v1/search（同步）-> runtime.Service.Search -> 检索 + �
 Kafka 死信（显式 DLQ topic）-> rag-dead-letter-worker --kind document|cache
 ```
 
-RAG 只返回证据，不生成最终回答。后端为 Go 实现：PDF 默认交给独立的 PDF 视觉解析微服务（`python-workers/pdf-service`，HTTP + zip 清单，本地只做 PDF 读取/渲染/裁图，版面/OCR/表格/公式/图片描述统一调用远端 OpenAI 兼容视觉模型；可用 `RAG_PDF_ENGINE=go` 切回内置纯文本引擎）；Word（`.docx`）与 HTML（`.html`/`.htm`）可选地交给独立的 Docling 解析微服务（`python-workers/docling-service`，HTTP + zip 清单，容器端口 8092）：配置 `RAG_DOCLING_SERVICE_URL` 后 `.docx` 与 `.doc`（先由 LibreOffice 转成 `.docx`）以及 HTML 都走它，未配置时 `.docx`/`.doc` 仍由 Go 进程内 OOXML 解析、HTML 不可导入。VLM 配置由 Console「模型配置」与知识库设置按知识库下发，缺失时 PDF 上传会在受理阶段提示先去配置。Go 服务本身不依赖 Python，只有 pdf-parser 与 docling-service 两个微服务使用 Python。
+RAG 只返回证据，不生成最终回答。后端为 Go 实现：PDF 默认交给独立的 PDF 视觉解析微服务（`python-workers/pdf-service`，HTTP + zip 清单，本地只做 PDF 读取/渲染/裁图，版面/OCR/表格/公式/图片描述统一调用远端 OpenAI 兼容视觉模型；可用 `RAG_PDF_ENGINE=go` 切回内置纯文本引擎）；Word（`.docx`）与 HTML（`.html`/`.htm`）一律交给独立的 Docling 解析微服务（`python-workers/docling-service`，HTTP + zip 清单，容器端口 8092）：`.docx` 与 `.doc`（先由 LibreOffice 转成 `.docx`）以及 HTML 都走它，必须配置 `RAG_DOCLING_SERVICE_URL`，未配置时这些格式的上传会被拒绝（进程内 Word 解析已删除）。VLM 配置由 Console「模型配置」与知识库设置按知识库下发，缺失时 PDF 上传会在受理阶段提示先去配置。Go 服务本身不依赖 Python，只有 pdf-parser、docling-service 与 lightrag-service 三个微服务使用 Python。
 
 ## 1. 安装与构建
 
@@ -43,7 +43,7 @@ RAG 只返回证据，不生成最终回答。后端为 Go 实现：PDF 默认�
 | Redis | 可选，7.x | 读模型展示缓存；搜索为同步直返，artifact 事实在 MySQL，Redis 丢失不影响读取 |
 | Kafka | 文档入库与缓存刷新必需，单节点 KRaft（Compose `kafka`）或外部集群 | 两类通知：文档任务、缓存变更（均只含定位标识）；可用 SASL/TLS 环境变量连接外部集群，Compose 本身只提供 PLAINTEXT。需分布式 Kafka Connect + 两个 Debezium MySQL 连接器 |
 | PDF 视觉解析微服务 | 可选（默认 compose 启动） | PDF 版面/OCR/表格/公式/图片描述统一由远端视觉模型完成（`python-workers/pdf-service`，容器端口 8091，本地只做读取/渲染/裁图）；`RAG_PDF_ENGINE=go` 时不需要。vision 引擎还需要在 Console 为知识库配置 VLM 模型 |
-| Docling 解析微服务 | 可选（默认 compose 启动） | `.docx`、`.html`/`.htm` 解析（`python-workers/docling-service`，容器端口 8092，健康检查 `/healthz`）；配置后 `.doc` 先由 LibreOffice 转成 `.docx` 再交给它。未配置 `RAG_DOCLING_SERVICE_URL` 时 Docling 不启用：`.docx`/`.doc` 仍走进程内 OOXML，`.html`/`.htm` 不可导入 |
+| Docling 解析微服务 | 必需（默认 compose 启动） | `.docx`、`.doc`、`.html`/`.htm` 解析（`python-workers/docling-service`，容器端口 8092，健康检查 `/healthz`）；`.doc` 先由 LibreOffice 转成 `.docx` 再交给它。必须配置 `RAG_DOCLING_SERVICE_URL`：未配置时这些格式的上传在受理阶段被拒绝（进程内 Word 解析已删除） |
 | LibreOffice | 可选 | 仅 DOC 转换需要外部程序；PDF（go 引擎）/DOCX/HTML 解析不直接依赖它（DOCX/HTML 由 Docling 服务解析） |
 
 Go module 路径为 `github.com/Guan0923/Praxis-RAG`，与 GitHub 仓库地址一致。
@@ -129,7 +129,7 @@ MySQL 默认映射 `127.0.0.1:3307`（避免与本地 3306 冲突），Qdrant �
 
 pdf-parser 首次构建只安装 Python/PyMuPDF 依赖，镜像很小，也无需预置任何模型。知识库需要在 Console「模型配置」页添加 VLM（服务地址 + 模型名 + 可选 API Key）并在知识库表单中选择，也可以配置 `RAG_VLM_BASE_URL` + `RAG_VLM_MODEL` 作为服务级回退；两者都没有时 `/v1/parse` 返回 503。宿主机直接运行的 Go 服务默认通过 `http://127.0.0.1:8091` 访问它；compose `app` 容器由 compose 注入 `http://pdf-parser:8091`。vision 引擎要求每个知识库在 Console 选中 VLM，缺失时 PDF 上传会在受理阶段返回中文提示（不进入队列）。
 
-docling-service 负责 `.docx` 与 `.html`/`.htm`（仅在配置 `RAG_DOCLING_SERVICE_URL` 后启用；`.doc` 先由 Go 服务调用外部 LibreOffice 转成 `.docx` 再上传给它）。宿主机直接运行 Go 服务时用 `RAG_DOCLING_SERVICE_URL=http://127.0.0.1:8092`（默认超时 300 秒，可设 `RAG_DOCLING_SERVICE_TIMEOUT`）；compose `app` 容器由 compose 注入 `http://docling-service:8092`。该值为空时 Docling 不启用：`.docx`/`.doc` 继续用进程内 OOXML 解析，`.html`/`.htm` 不可导入（`.md`/`.txt`/`.pdf` 不受影响）。服务自身配置见 §3「Word/HTML 解析（Docling 服务）」，依赖版本与本地启动方式以 [python-workers/docling-service/README.md](../python-workers/docling-service/README.md) 为准。
+docling-service 负责 `.docx`、`.doc` 与 `.html`/`.htm` 的全部解析（必须配置 `RAG_DOCLING_SERVICE_URL`；`.doc` 先由 Go 服务调用外部 LibreOffice 转成 `.docx` 再上传给它）。宿主机直接运行 Go 服务时用 `RAG_DOCLING_SERVICE_URL=http://127.0.0.1:8092`（默认超时 300 秒，可设 `RAG_DOCLING_SERVICE_TIMEOUT`）；compose `app` 容器由 compose 注入 `http://docling-service:8092`。该值为空时 Word/HTML 上传会在受理阶段被拒绝（进程内 OOXML 解析已删除；`.md`/`.txt`/`.pdf` 不受影响）。服务自身配置见 §3「Word/HTML 解析（Docling 服务）」，依赖版本与本地启动方式以 [python-workers/docling-service/README.md](../python-workers/docling-service/README.md) 为准。
 
 > Kafka 默认自动创建 topic（4 partitions、副本 1）；`scripts/start-stack.ps1` 仍会显式创建 document/cache 与两个 DLQ topic、等待 Kafka healthy、执行 `rag-state-migrate --apply`（可选导入 legacy 知识源），然后启动 `dist/bin/rag-service.exe`、`dist/bin/rag-document-worker.exe` 与 `dist/bin/rag-cache-worker.exe`（收到 Ctrl+C 时一并停止）；默认同时启动分布式 Kafka Connect 的两个 worker，等待 REST 就绪后用 `rag-connect register` 按固定名称注册文档/缓存连接器，并等待 connector 与 task 都 `RUNNING`。用 `-MigrateOnly` 可只准备依赖与数据库。该脚本执行默认 `docker compose up -d`，因此也会启动 pdf-parser 与 docling-service，并把 `.env` 中的变量加载进宿主进程；只用 Go 引擎时请在 `.env` 设 `RAG_PDF_ENGINE=go` 并自行停掉 pdf-parser。需要用 Word/HTML 导入时，确认 `.env` 里有 `RAG_DOCLING_SERVICE_URL=http://127.0.0.1:8092`（宿主机上的 Go 服务通过本机发布端口访问容器内的 docling-service）。不配置 Kafka 时服务仍可启动（仅记录告警）并受理上传，但没有文档消费者，任务保持 `queued`；完整异步链路必须配置 Kafka + Kafka Connect 的 Debezium 连接器并运行 `rag-document-worker`。
 
@@ -265,9 +265,13 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_PDF_MODELS_PATH` | 空 | **已废弃**：本地不再有模型，pdf-parser 不再读取该变量 |
 | `RAG_PDF_SERVICE_WORKERS` | `1` | PDF 容器内启动的 Uvicorn 服务进程数（正整数）。由 `python -m app.main` 读取，同一端口接收请求；每个进程有独立的解析并发名额 |
 | `RAG_PDF_SERVICE_CONCURRENCY` | `1`（仅 pdf-parser） | 每个 PDF 服务进程的并发解析数；PDF 总解析容量上限为 `RAG_PDF_SERVICE_WORKERS × 本值`。应与文档 worker 总任务并发一起调整，超出解析容量的请求会排队，但不消耗单次解析上限；调大前先核对容器 CPU/内存 |
-| `RAG_DOCLING_SERVICE_URL` | 空（未配置） | Docling 文档解析服务地址（绝对 `http(s)` URL，不带 query/fragment，尾部 `/` 会被去掉）。为空表示 Docling 不启用：`.docx`/`.doc` 仍由 Go 进程内 OOXML 解析，`.html`/`.htm` 不可导入；compose `app` 容器由 compose 注入 `http://docling-service:8092`，宿主机进程一般用 `http://127.0.0.1:8092` |
+| `RAG_DOCLING_SERVICE_URL` | 空（未配置） | Docling 文档解析服务地址（绝对 `http(s)` URL，不带 query/fragment，尾部 `/` 会被去掉）。Word（`.docx`/`.doc`）与 HTML 解析必需；为空时这些格式的上传在受理阶段被拒绝（进程内 Word 解析已删除）；compose `app` 容器由 compose 注入 `http://docling-service:8092`，宿主机进程一般用 `http://127.0.0.1:8092` |
 | `RAG_DOCLING_SERVICE_TIMEOUT` | `300` 秒（1..7200） | Go 调用 Docling 服务的单次 HTTP 超时（秒）；服务端读取同名变量作为请求预算，两侧同时生效 |
 | `RAG_DOCLING_IMAGE` | `praxis-rag-docling-service:local`（仅 compose） | docling-service 镜像名 |
+| `RAG_LIGHTRAG_SERVICE_URL` | 空（未配置） | LightRAG 图谱侧车地址（绝对 `http(s)` URL，不带 query/fragment，尾部 `/` 会被去掉）。为空表示 `retrieval=graph` 不可用：调用返回可解释的操作错误，其他四种检索模式不受影响；compose 内用 `http://lightrag-service:8093`，宿主机进程一般用 `http://127.0.0.1:8093` |
+| `RAG_LIGHTRAG_SERVICE_TOKEN` | 空 | 调用侧车时发送的 `Authorization: Bearer` 令牌。侧车绑定非 loopback 地址时**必须**两端一致配置；仅 loopback 时可留空 |
+| `RAG_LIGHTRAG_SERVICE_TIMEOUT` | `60` 秒（1..600） | Go 调用侧车查询的单次超时（秒）；图谱查询含关键词抽取，明显慢于纯向量检索，必要时调大 |
+| `RAG_LIGHTRAG_SERVICE_PORT` | `8093`（仅 compose） | lightrag-service 的宿主发布端口；容器内端口固定 `8093` |
 | `RAG_VLM_BASE_URL` | 空 | 远端 OpenAI 兼容视觉模型端点的**环境回退值**，用于 vision 引擎的 PDF 版面/OCR/表格/公式/图片描述；Console 知识库设置优先 |
 | `RAG_VLM_API_KEY` | 空 | VLM 端点密钥，作为 `Authorization: Bearer` 发送 |
 | `RAG_VLM_MODEL` | 空 | 端点上的模型名，如 `qwen2.5-vl-7b`（环境回退值） |
@@ -303,8 +307,8 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 
 配置与行为：
 
-- **启用条件与未配置时的行为**：`RAG_DOCLING_SERVICE_URL` 非空即启用 Docling，`.docx`/`.doc` 与 `.html`/`.htm` 都交给它；为空时不启用——`.docx`/`.doc` 仍由 Go 进程内 OOXML 解析（历史行为），`.html`/`.htm` 不可导入（上传会被拒绝或任务报「HTML 文档需要配置 Docling 解析服务」），`.md`/`.txt`/`.pdf` 不受影响。服务地址必须是绝对 `http(s)` URL，不能带 query/fragment。
-- **服务不可达**：已配置 URL 但连接失败或超时时，该次文档任务失败并按既有重试策略处理，**不会静默回退**到进程内解析；只返回安全错误，不泄露文档正文。
+- **启用条件与未配置时的行为**：`RAG_DOCLING_SERVICE_URL` 非空即启用 Docling，`.docx`/`.doc` 与 `.html`/`.htm` 都交给它（进程内 Word 解析已删除，该服务是唯一 Word/HTML 解析器）；为空时这些格式的上传在受理阶段被拒绝并提示「Word/HTML 文档需要配置 Docling 解析服务（RAG_DOCLING_SERVICE_URL）」（`.md`/`.txt`/`.pdf` 不受影响）。服务地址必须是绝对 `http(s)` URL，不能带 query/fragment。
+- **服务不可达**：已配置 URL 但连接失败或超时时，该次文档任务失败并按既有重试策略处理，**不会静默回退**（也没有进程内 Word 解析可回退）；只返回安全错误，不泄露文档正文。
 - **超时**：`RAG_DOCLING_SERVICE_TIMEOUT` 默认 300 秒（范围 1..7200），同时作为服务端请求预算。
 - **端口与健康检查**：容器内固定 `0.0.0.0:8092`（镜像内 `PORT=8092`），compose 只发布 `127.0.0.1:8092`；健康检查 `GET /healthz`，`POST /v1/parse` 不做认证，因此**不要暴露到公网**。宿主机直接运行 Go 服务时用 `http://127.0.0.1:8092`。
 - **HTML 限制**：HTML 中的外部/相对图片不会被抓取，只保留文字说明（如替代文本）；Console 预览以解析后的**纯文本**展示，不在同源页面渲染或执行上传的 HTML（Console 与 REST API 同源且持有调用方凭据）。
@@ -850,7 +854,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/api-keys/batch-delete `
 
 ### 模型配置（模型列表）
 
-管理员在 Console 侧边栏「模型配置」（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM / JEV 列表，不再在创建知识库时手工填写服务地址、Key 和模型名。页面按模型类型分页签，表格展示 名称 / 模型 / 服务地址 / Key / 向量维度（仅 Embedding）/ 更新时间 / 操作，支持「添加模型」抽屉、编辑和删除。API Key 只在服务端用 `RAG_STATE_ENCRYPTION_KEY` 加密保存，列表与详情只返回 `api_key_set`；编辑时留空表示沿用已保存的 Key，显式提交空字符串会清除。`(kind, name)` 唯一，重名返回 409。VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 的版面/OCR/表格/公式/图片描述统一由它完成；OCR 不再作为独立模型类型。
+管理员在 Console 侧边栏「模型配置」（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM / JEV / 知识图谱 列表，不再在创建知识库时手工填写服务地址、Key 和模型名。页面按模型类型分页签，表格展示 名称 / 模型 / 服务地址 / Key / 向量维度（仅 Embedding）/ 更新时间 / 操作，支持「添加模型」抽屉、编辑和删除。API Key 只在服务端用 `RAG_STATE_ENCRYPTION_KEY` 加密保存，列表与详情只返回 `api_key_set`；编辑时留空表示沿用已保存的 Key，显式提交空字符串会清除。`(kind, name)` 唯一，重名返回 409。VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 的版面/OCR/表格/公式/图片描述统一由它完成；OCR 不再作为独立模型类型。知识图谱模型（`kind=graph`）供 LightRAG 侧车做实体关系抽取与查询关键词抽取——两个角色共用同一连接，选择非思考型快模型可显著降低索引成本。
 
 JEV 条目（TypeSafe System One 决策模型）保存名称、服务地址、模型标识和加密 Key；创建与修改都不探测 provider，`/{id}/models` 对 JEV 直接返回空数组。JEV 不是知识库模型，创建/编辑知识库时不会出现该选项，当前仅保存配置，尚未接入检索或决策调用。常见取值：TypeSafe 服务地址 `https://api.typesafe.ai/v1`（模型 `jev-latest` / `jev-preview` / `jev-1.13.0`），OpenRouter 服务地址 `https://openrouter.ai/api/alpha`（模型 `typesafe/jev-1.13`）。
 
@@ -860,10 +864,13 @@ JEV 条目（TypeSafe System One 决策模型）保存名称、服务地址、�
 - Reranker：执行一次有界的 rerank 调用，只验证服务可达与鉴权。
 - VLM：不做探测，因此半配置的 VLM 端点也可以先保存。
 - JEV：不做探测，直接保存配置（只保存连接，供后续决策能力使用）。
+- 知识图谱：不做探测；该连接只被 LightRAG 侧车使用，知识库启用图谱后才会真正发起抽取调用。
 
 `PATCH` 只在服务地址、模型或 Key 实际变化时重新探测；只改名称或原样保存不会调用 provider，已记录的 Embedding 维度保持不变。修改服务地址但未提交新 Key 时保存的 Key 会被清除（与知识库连接表单的 `DraftConnection` 语义一致）。
 
-管理员的创建知识库表单现在只从该列表选择模型（Embedding 必填；Reranker、VLM 通过开关启用，**创建页两个开关默认全部开启**，可按需关闭），编辑知识库的抽屉（知识库列表 → 配置）同样选择模型：保存时 Console 读取所选条目的 Key，并把该配置的服务地址、模型名和 Key 复制进原有的知识库请求；**切换 Embedding 到不同连接仍要求「重新向量化并保存」确认**。知识库已有连接不在列表中时，编辑抽屉保留「当前配置」选项，保存时沿用原连接、不触发重新向量化。删除或编辑模型配置不会修改已保存到知识库里的连接。知识库 REST 契约不变（仍接受内联 `embedding`/`reranker`/`vlm` 连接），模型列表只服务于 Console 管理员表单。
+管理员的创建知识库表单现在只从该列表选择模型（Embedding 必填；Reranker、VLM、知识图谱通过开关启用，**创建页默认全部开启**，可按需关闭），编辑知识库的抽屉（知识库列表 → 配置）同样选择模型：保存时 Console 读取所选条目的 Key，并把该配置的服务地址、模型名和 Key 复制进原有的知识库请求；**切换 Embedding 到不同连接仍要求「重新向量化并保存」确认**。知识库已有连接不在列表中时，编辑抽屉保留「当前配置」选项，保存时沿用原连接、不触发重新向量化。删除或编辑模型配置不会修改已保存到知识库里的连接。知识库 REST 契约不变（仍接受内联 `embedding`/`reranker`/`vlm`/`graph` 连接与 `graph_enabled` 开关），模型列表只服务于 Console 管理员表单。
+
+> 知识库打开 `graph_enabled` 后，该库每次上传都会在发布成功后把块异步镜像进图谱；此时若知识库没有可用的知识图谱模型，或部署未配置 `RAG_LIGHTRAG_SERVICE_URL`，上传会在**受理阶段**被拒绝并提示去「模型配置」补齐，而不是先入库再静默缺图。
 
 以下接口都属于 `/v1/admin/*`，仅本机直连或管理员会话可访问：
 
@@ -871,7 +878,7 @@ JEV 条目（TypeSafe System One 决策模型）保存名称、服务地址、�
 # 列表（按 kind、名称排序；每个条目含 id/kind/name/base_url/model/api_key_set/vector_size/created_at/updated_at，不含 Key 明文）
 curl.exe http://127.0.0.1:8011/v1/admin/model-profiles
 
-# 新建：kind 为 embedding / reranker / vlm / jev；Embedding 会真实探测并记录向量维度
+# 新建：kind 为 embedding / reranker / vlm / jev / graph；Embedding 会真实探测并记录向量维度
 curl.exe -X POST http://127.0.0.1:8011/v1/admin/model-profiles `
   -H "Content-Type: application/json" `
   -d '{"kind":"embedding","name":"生产 Embedding","base_url":"http://127.0.0.1:8032/v1","apikey":"<provider-key>","model":"bge-m3"}'
@@ -1043,6 +1050,24 @@ curl.exe -X POST http://127.0.0.1:8011/v1/search `
   -d '{"query":"E03 怎么处理？","retrieval":"sag2","rerank":"none","candidate_k":100,"top_k":5,"filters":{}}'
 ```
 
+#### 知识图谱检索（`retrieval: graph`）
+
+第五种模式，把知识库文本块索引成实体关系图谱后做双层召回（局部实体、全局关系、原文块）。它面向**跨文档关联**问题：某条义务散落在六份文件、十一个条款里时，`hybrid` 只会返回语义最相近的几段，图谱能把它们连起来并给出每条命中的来源与原页码。
+
+使用要求与成本：
+
+- 部署侧需配置 `RAG_LIGHTRAG_SERVICE_URL`（及 token）并运行 `python-workers/lightrag-service`；未配置时该模式返回明确的操作错误，其他模式与上传链路不受影响。
+- 响应与四种既有模式完全一致：`results[]` 带 `title`/`source`/`text`/`score`/`metadata`（`metadata` 额外含 `graph_mode`、`page`、`heading`，命中实体/关系时含 `entities`/`relations`），`evidence_status` 与 `answer_guidance` 语义不变。
+- **不返回生成答案**：侧车在 LLM 生成前停止，只回上下文。
+- 可与 `cross_encoder` 叠加（先图谱召回再重排）；`candidate_k` 传给侧车作为 `top_k` 上限。
+- 索引成本按块计：每块一次实体关系抽取调用，大库首次入库明显慢于纯向量入库；查询本身需一次关键词抽取调用，延迟高于 `hybrid`，必要时调大 `RAG_LIGHTRAG_SERVICE_TIMEOUT`。
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8011/v1/search `
+  -H $headers `
+  -d '{"query":"所有涉及用户画像的条款之间是什么关系？","retrieval":"graph","rerank":"none","candidate_k":10,"top_k":5,"filters":{}}'
+```
+
 #### SAG 事件-实体检索（`retrieval: sag`）
 
 第五种模式 `sag` 是 [Zleap-AI/SAG](https://github.com/Zleap-AI/SAG) 架构的事件-实体检索：**离线**为每个 chunk 抽取一个事件（chunk 的完整语义单元）和若干规范化实体，写入 MySQL（`sag_events` / `sag_entities` / `sag_event_entities` 三张表）；**查询时**先用 hybrid 召回种子 chunk，映射到事件与实体，再用 SQL join 沿共享实体扩展到未被向量召回命中的关联事件——即查询期动态超边，不需要图数据库，也不预建全局图。证据边界仍是原始 chunk（超边命中的 chunk 会从 Qdrant 补水原文）。
@@ -1211,7 +1236,7 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 - 目录内文档按相对 POSIX 路径命名（与 Python 一致）；单文件按 basename。
 - 同名已存在文档默认覆盖；内容未变时输出 `SKIP ... unchanged content`，不重复 embedding（Python 会无条件重跑）。
 - 退出码：`0` 全部成功；`1` 至少一个文档失败或运行时不可用；`2` 参数/配置错误（缺 `RAG_BACKEND=qdrant`、`QDRANT_PATH`、namespace 或知识库不存在）。
-- PDF 与 Word/HTML 使用与 HTTP 上传相同的解析配置：PDF 由 Go 内置纯文本引擎或 pdf-parser 解析；配置了 `RAG_DOCLING_SERVICE_URL` 时 `.docx`/`.doc`（先经 LibreOffice 转换）与 `.html`/`.htm` 走 Docling，未配置时 `.docx`/`.doc` 走进程内 OOXML、HTML 不可用；解析器不可用时按上传同规则失败。`--dry-run` 不打开运行时/状态库。
+- PDF 与 Word/HTML 使用与 HTTP 上传相同的解析配置：PDF 由 Go 内置纯文本引擎或 pdf-parser 解析；`.docx`/`.doc`（先经 LibreOffice 转换）与 `.html`/`.htm` 一律走 Docling（必须配置 `RAG_DOCLING_SERVICE_URL`，未配置时这些格式被拒绝）；解析器不可用时按上传同规则失败。`--dry-run` 不打开运行时/状态库。
 - 兼容性说明：该命令在本仓库验证环境中未连接真实 Qdrant/模型 API 实跑，上线前先用 `--dry-run` 和一个小目录验证。
 
 `rag-mcp-debug`：无 Qdrant/模型的 mock 检索调试：
@@ -1371,13 +1396,13 @@ npm run build            # tsc + vite build
 
 `.github/workflows/test.yml` 提供两条流水线：`go vet + go build + go test -p 1`（GitHub Actions 的 MySQL 8 service，库名 `praxis_unit_test`）和前端 `typecheck + npm test + build`。CI 与本地命令一致，唯一区别是 Linux 上不需要 `-p 1` 以外的额外处理。
 
-PDF 默认由独立的 `pdf-parser` 微服务解析（本地 PyMuPDF 读取/渲染/裁图，版面/OCR/表格/公式/图片描述调用远端 OpenAI 兼容视觉模型，HTTP + zip 清单，不进入 Go 构建/镜像）；`RAG_PDF_ENGINE=go` 时使用内置纯 Go 阅读器。Word（`.docx`）与 HTML（`.html`/`.htm`）可选地由独立的 `docling-service` 微服务解析（HTTP + zip 清单，容器端口 8092）：配置 `RAG_DOCLING_SERVICE_URL` 后 `.docx`/`.doc`（先经 LibreOffice 转换）与 HTML 都走它，未配置时 `.docx`/`.doc` 仍用进程内 OOXML、HTML 不可导入；只有 .doc 转换需要外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）。
+PDF 默认由独立的 `pdf-parser` 微服务解析（本地 PyMuPDF 读取/渲染/裁图，版面/OCR/表格/公式/图片描述调用远端 OpenAI 兼容视觉模型，HTTP + zip 清单，不进入 Go 构建/镜像）；`RAG_PDF_ENGINE=go` 时使用内置纯 Go 阅读器。Word（`.docx`）与 HTML（`.html`/`.htm`）一律由独立的 `docling-service` 微服务解析（HTTP + zip 清单，容器端口 8092）：`.docx`/`.doc`（先经 LibreOffice 转换）与 HTML 都走它，必须配置 `RAG_DOCLING_SERVICE_URL`，未配置时这些格式被拒绝（进程内 Word 解析已删除）；只有 .doc 转换需要外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）。
 
 ## 12. 当前限制
 
 - **Qdrant**：仅支持 HTTP 模式；`QDRANT_PATH` 会在启动时被拒绝。
 - **Tokenizer**：见 §10；token 预算切分位置可能与 Python 不同。
-- **解析器**：PDF 默认走独立 `pdf-parser` 微服务（本地只做 PDF 读取/渲染/裁图，版面/OCR/表格/公式 LaTeX/图片描述统一由知识库配置的远端视觉模型完成；需要该服务与可用视觉端点，服务或模型不可用时 vision 上传会失败，`docling` 是 `vision` 的兼容别名）。`RAG_PDF_ENGINE=go` 时使用 Go 内置纯文本引擎（文字型 PDF；扫描件、PDF 表格/公式/图片资产不支持，需要时请先 OCR 或用其他工具预处理）。`.docx`/`.html`/`.htm` 在配置 `RAG_DOCLING_SERVICE_URL` 后由独立 `docling-service` 解析，未配置时 `.docx`/`.doc` 仍走进程内 OOXML、HTML 不可导入；`.doc` 先由外部 LibreOffice 转成 `.docx` 再交给同一服务（配置时）。HTML 只支持静态上传：外部/相对图片不抓取、只保留文字说明，仍不支持网页抓取。
+- **解析器**：PDF 默认走独立 `pdf-parser` 微服务（本地只做 PDF 读取/渲染/裁图，版面/OCR/表格/公式 LaTeX/图片描述统一由知识库配置的远端视觉模型完成；需要该服务与可用视觉端点，服务或模型不可用时 vision 上传会失败，`docling` 是 `vision` 的兼容别名）。`RAG_PDF_ENGINE=go` 时使用 Go 内置纯文本引擎（文字型 PDF；扫描件、PDF 表格/公式/图片资产不支持，需要时请先 OCR 或用其他工具预处理）。`.docx`/`.doc`/`.html`/`.htm` 一律由独立 `docling-service` 解析（必须配置 `RAG_DOCLING_SERVICE_URL`，未配置时这些格式被拒绝；进程内 Word 解析已删除）；`.doc` 先由外部 LibreOffice 转成 `.docx` 再交给同一服务。HTML 只支持静态上传：外部/相对图片不抓取、只保留文字说明，仍不支持网页抓取。
 - **异步投递**：Kafka 通知由运行在分布式 Kafka Connect 上的两个 Debezium 连接器从 MySQL 表级采集后写入 Kafka（`praxis-document-cdc` 只采集 `document_jobs` 的 INSERT 与 `schedule_version` 变化；`praxis-cache-cdc` 采集 8 张业务表全部 c/u/d）；必须配置 Kafka + Kafka Connect + 两个连接器并运行 `rag-document-worker`/`rag-cache-worker`，否则文档任务保持 `queued`、缓存刷新不生效。worker 故障由 Connect peer 接管并从 Kafka 保存位点恢复；FAILED task 由 `rag-service` supervisor 自动重启。
 - **同步搜索**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，无任务 ID/轮询/结果快照；总预算 `RAG_SEARCH_TIMEOUT_SECONDS`（默认 120 秒）。`search_tasks`/`search_result_snapshots` 为历史表、保留数据但不再读写，搜索 topic/消费组/DLQ 与 `rag-search-worker` 已下线；迁移与回滚见 [部署指南](DEPLOYMENT.md) §12。
 - **文档锁**：默认 `mysql`（MySQL `document_leases` 行），可整体切到 `redis`；两种模式不能混跑，同一部署内所有参与文档写入/恢复/清理的进程必须同值。切换/回退必须先停写并排空在途操作，见 [部署指南](DEPLOYMENT.md) §13。

@@ -212,6 +212,7 @@ func healthyOptions(t *testing.T) Options {
 	t.Helper()
 	qdrant := qdrantServer(t, "alpha", "knowledge")
 	pdf := pdfServer(t, http.StatusOK)
+	lightragService := lightragHealthyServer(t)
 	return Options{
 		Stats:                 &fakeStatsProvider{stats: sampleStats()},
 		MySQL:                 fakeMySQLPinger{},
@@ -237,11 +238,14 @@ func healthyOptions(t *testing.T) Options {
 		WorkerHeartbeat: func(context.Context) (*WorkerHeartbeat, error) {
 			return &WorkerHeartbeat{UpdatedAt: time.Now().Add(-2 * time.Second), Instances: 1}, nil
 		},
-		Delivery:      "debezium",
-		UploadMode:    "async",
-		PDFEngine:     pdfEngineVision,
-		PDFServiceURL: pdf.URL,
-		StartedAt:     time.Now().Add(-90 * time.Second),
+		Delivery:               "debezium",
+		UploadMode:             "async",
+		PDFEngine:              pdfEngineVision,
+		PDFServiceURL:          pdf.URL,
+		LightRAGServiceURL:     lightragService.URL,
+		LightRAGServiceToken:   "test-lightrag-token",
+		LightRAGServiceTimeout: 5 * time.Second,
+		StartedAt:              time.Now().Add(-90 * time.Second),
 	}
 }
 
@@ -366,7 +370,7 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 		t.Fatalf("uptime_seconds = %v", service["uptime_seconds"])
 	}
 
-	for _, name := range []string{"mysql", "redis", "qdrant", "kafka", "pdf-service"} {
+	for _, name := range []string{"mysql", "redis", "qdrant", "kafka", "pdf-service", "lightrag"} {
 		item := dependencyByName(t, overview, name)
 		if item.Status != statusOK {
 			t.Fatalf("dependency %q status = %q detail = %q", name, item.Status, item.Detail)
@@ -395,6 +399,14 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 	pdfDependency := dependencyByName(t, overview, "pdf-service")
 	if !strings.Contains(pdfDependency.Detail, "转换器 vision") {
 		t.Fatalf("pdf detail = %q", pdfDependency.Detail)
+	}
+	// The graph sidecar reports its workspace count, build version and the
+	// upstream package version pair that detects an image drift.
+	lightragDependency := dependencyByName(t, overview, "lightrag")
+	if !strings.Contains(lightragDependency.Detail, "工作区 2 个") ||
+		!strings.Contains(lightragDependency.Detail, "lightrag-hku 1.5.7（与 pin 一致）") ||
+		lightragDependency.Upstream == nil || lightragDependency.Upstream.Drift {
+		t.Fatalf("lightrag = %+v", lightragDependency)
 	}
 
 	queues, ok := overview["queues"].(map[string]any)

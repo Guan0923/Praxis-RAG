@@ -286,16 +286,17 @@ services:
 
   # Docling document parsing microservice: one HTTP endpoint (FastAPI on
   # :8092) that turns .docx and .html/.htm uploads into Markdown plus assets.
-  # The Go app calls it over HTTP only when RAG_DOCLING_SERVICE_URL is set.
-  # With an empty URL Docling stays disabled: .docx/.doc keep the in-process
-  # OOXML parser and .html/.htm cannot be imported. The service never receives
-  # .doc directly: the Go app converts it with LibreOffice and uploads the
-  # resulting .docx.
+  # The Go app calls it over HTTP through RAG_DOCLING_SERVICE_URL; it is the
+  # only Word/HTML parser (the in-process OOXML reader was removed), so with
+  # an empty URL those uploads are rejected at admission. The service never
+  # receives .doc directly: the Go app converts it with LibreOffice and
+  # uploads the resulting .docx.
   # The PDF path is unchanged: PDF still goes through pdf-parser above.
   # No profile: `docker compose up -d` starts it together with the
-  # infrastructure, so a deployment that only ingests .md/.txt/.pdf can skip it
-  # with `docker compose up -d mysql qdrant redis kafka` and/or
-  # `docker compose stop docling-service`.
+  # infrastructure, so a deployment that only ingests .md/.txt/.pdf can skip
+  # it with `docker compose up -d mysql qdrant redis kafka` and/or
+  # `docker compose stop docling-service` (Word/HTML uploads then fail
+  # admission with a configuration error).
   # Dependency versions, the image build and the local (non-container) start
   # command live in python-workers/docling-service/README.md.
   docling-service:
@@ -339,6 +340,48 @@ services:
       # Parser library imports can be slow on first start; the grace window is
       # wider than pdf-parser's on purpose.
       start_period: 60s
+
+  # Knowledge-graph sidecar. Optional capability, so it sits behind the
+  # `lightrag` profile: `docker compose up -d` keeps the current stack
+  # unchanged, and enabling it is an explicit
+  #   docker compose --profile lightrag up -d
+  # The Go service only reaches it when RAG_LIGHTRAG_SERVICE_URL is set; the
+  # container has to bind 0.0.0.0 to be reachable from the app container, which
+  # makes the bearer token mandatory (the sidecar refuses to start without one).
+  # The named volume holds the graph, the extraction cache and the block
+  # registry: it is the index itself, not scratch space.
+  lightrag-service:
+    build:
+      context: ./python-workers/lightrag-service
+      args:
+        BASE_IMAGE: ${RAG_LIGHTRAG_BASE_IMAGE:-python:3.11-slim}
+        PIP_INDEX_URL: ${RAG_LIGHTRAG_PIP_INDEX_URL:-https://pypi.org/simple}
+    image: ${RAG_LIGHTRAG_IMAGE:-praxis-rag-lightrag-service:local}
+    container_name: praxis-rag-lightrag-service
+    restart: unless-stopped
+    profiles: ["lightrag"]
+    environment:
+      RAG_LIGHTRAG_SERVICE_HOST: "0.0.0.0"
+      RAG_LIGHTRAG_SERVICE_PORT: "8093"
+      RAG_LIGHTRAG_SERVICE_WORKING_DIR: /data
+      # Extraction runs one LLM call per chunk, so concurrency is also a
+      # spend dial. Keep the default low and raise it with the upstream
+      # rate limit in mind.
+      RAG_LIGHTRAG_SERVICE_CONCURRENCY: ${RAG_LIGHTRAG_SERVICE_CONCURRENCY:-2}
+      RAG_LIGHTRAG_SERVICE_TOKEN: ${RAG_LIGHTRAG_SERVICE_TOKEN:-}
+      RAG_LIGHTRAG_SERVICE_LOG_LEVEL: ${RAG_LIGHTRAG_SERVICE_LOG_LEVEL:-info}
+      RAG_LIGHTRAG_SERVICE_LOG_FORMAT: ${RAG_LIGHTRAG_SERVICE_LOG_FORMAT:-text}
+    ports:
+      # Same rule as the other sidecars: loopback only on the host.
+      - "127.0.0.1:${RAG_LIGHTRAG_SERVICE_PORT:-8093}:8093"
+    volumes:
+      - lightrag_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8093/healthz').read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
 
   # Go backend service. Kept out of the default (infra-only) profile:
   #   docker compose --profile app up -d --build
@@ -419,14 +462,14 @@ services:
       RAG_PDF_ENGINE: ${RAG_PDF_ENGINE:-vision}
       RAG_PDF_SERVICE_URL: ${RAG_PDF_SERVICE_URL:-http://pdf-parser:8091}
       RAG_PDF_SERVICE_TIMEOUT: ${RAG_PDF_SERVICE_TIMEOUT:-900}
-      # Docling parsing: .docx and .html/.htm uploads are converted by the
-      # docling-service sidecar (zip: Markdown + assets); .doc is converted
-      # locally by LibreOffice and uploaded as .docx. An empty value disables
-      # Docling: .docx/.doc keep the in-process OOXML parser and .html/.htm
-      # cannot be imported (HTML requires the service). PDF parsing is
-      # unaffected and still uses the RAG_PDF_* pair above. The `-` (not `:-`)
-      # fallback keeps an explicit empty .env value empty, which is how this
-      # deployment disables the service.
+      # Docling parsing: .docx/.doc and .html/.htm uploads are all converted
+      # by the docling-service sidecar (zip: Markdown + assets); .doc is
+      # converted locally by LibreOffice and uploaded as .docx. This service
+      # is the only Word/HTML parser (the in-process OOXML reader was
+      # removed): an empty value makes those uploads fail at admission with
+      # a configuration error. PDF parsing is unaffected and still uses the
+      # RAG_PDF_* pair above. The `-` (not `:-`) fallback keeps an explicit
+      # empty .env value empty for deployments that skip Word/HTML ingest.
       RAG_DOCLING_SERVICE_URL: ${RAG_DOCLING_SERVICE_URL-http://docling-service:8092}
       RAG_DOCLING_SERVICE_TIMEOUT: ${RAG_DOCLING_SERVICE_TIMEOUT:-300}
       RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
@@ -506,6 +549,7 @@ services:
       RAG_CACHE_DLQ_GROUP: ${RAG_CACHE_DLQ_GROUP:-praxis_state_cache_refresh_dead_letters}
 volumes:
   kafka_data:
+  lightrag_data:
   mysql_data:
   praxis_app_data:
   qdrant_data:

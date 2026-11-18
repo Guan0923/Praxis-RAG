@@ -159,6 +159,10 @@ export type KnowledgeBase = Chunking & {
   embedding: ProviderSettings;
   reranker: ProviderSettings;
   vlm: ProviderSettings;
+  // graph 是可选的知识图谱（LightRAG）抽取连接：公开视图同样只返回服务地址与
+  // 「Key 已保存」，绝不带密钥；graph_enabled 决定入库时是否构建实体关系索引，
+  // graph_model 是选用的图谱抽取模型。
+  graph?: ProviderSettings;
   updated_at?: string;
   reembedded_at?: string;
   namespace: string;
@@ -166,6 +170,8 @@ export type KnowledgeBase = Chunking & {
   embedding_model: string;
   reranker_model: string;
   vlm_model?: string;
+  graph_model?: string;
+  graph_enabled?: boolean;
   // Who pays the Embedding provider for document ingestion. Existing rows
   // without the key are platform-provided by default.
   embedding_billing_source?: "platform" | "customer";
@@ -210,7 +216,7 @@ export type Health = {
   backend?: string;
   collection?: string;
 };
-export type Retrieval = "bm25" | "embedding" | "hybrid" | "sag2" | "sag";
+export type Retrieval = "bm25" | "embedding" | "hybrid" | "sag2" | "graph" | "sag";
 export type Rerank = "none" | "cross_encoder";
 export type Hit = {
   rank: number;
@@ -374,6 +380,7 @@ export const retrievalLabels = {
   embedding: "Embedding",
   hybrid: "Hybrid",
   sag2: "SAG2",
+  graph: "图谱",
   sag: "SAG（事件-实体）",
 };
 export const rerankLabels = {
@@ -1027,18 +1034,20 @@ export async function deleteUser(id: string): Promise<void> {
 }
 
 // --- Model profiles (模型配置) ----------------------------------------------
-// A model profile is a reusable Embedding / Reranker / VLM / JEV connection
-// owned by exactly one account (模型配置按账号严格隔离); knowledge bases
-// reference one profile per knowledge-base-selectable kind instead of carrying
-// their own base URL, key and model id. The /v1/model-profiles routes are
-// session-scoped: every signed-in account manages its own list, while an
+// A model profile is a reusable Embedding / Reranker / VLM / 知识图谱 / JEV
+// connection owned by exactly one account (模型配置按账号严格隔离); knowledge
+// bases reference one profile per knowledge-base-selectable kind instead of
+// carrying their own base URL, key and model id. The /v1/model-profiles routes
+// are session-scoped: every signed-in account manages its own list, while an
 // administrator additionally sees every account's rows read-only. VLM is the
 // single remote OpenAI-compatible vision model for PDF parsing: it also handles
 // layout, OCR, tables, formulas and picture descriptions in the parsing
-// service. JEV (TypeSafe System One decision model) is a Console-only kind: it
-// is configured for later use, is never offered by the knowledge-base forms,
-// and has no OpenAI /models route.
-export type KnowledgeBaseModelKind = "embedding" | "reranker" | "vlm";
+// service. 知识图谱（graph）是 LightRAG 实体关系抽取用的 OpenAI 兼容模型，知识库
+// 可选择启用它来构建图谱索引；JEV (TypeSafe System One decision model) 与
+// extraction (SAG 事件抽取模型) are Console-only kinds: they are configured for
+// later use, are never offered by the knowledge-base forms, and have no OpenAI
+// /models route.
+export type KnowledgeBaseModelKind = "embedding" | "reranker" | "vlm" | "graph";
 export type ModelKind = KnowledgeBaseModelKind | "jev" | "extraction";
 export type ModelProfile = {
   id: string;
@@ -1068,12 +1077,13 @@ export type ModelProfileInput = {
 export type ModelProfileUpdate = Partial<Omit<ModelProfileInput, "kind">>;
 // knowledgeBaseModelKinds are the kinds a knowledge base can reference; JEV and
 // extraction stay Console-only and are therefore appended to modelKinds instead.
-export const knowledgeBaseModelKinds: KnowledgeBaseModelKind[] = ["embedding", "reranker", "vlm"];
+export const knowledgeBaseModelKinds: KnowledgeBaseModelKind[] = ["embedding", "reranker", "vlm", "graph"];
 export const modelKinds: ModelKind[] = [...knowledgeBaseModelKinds, "jev", "extraction"];
 export const modelKindLabels: Record<ModelKind, string> = {
   embedding: "Embedding",
   reranker: "Reranker",
   vlm: "VLM",
+  graph: "知识图谱",
   jev: "JEV",
   extraction: "抽取（SAG）",
 };

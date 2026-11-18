@@ -122,11 +122,18 @@ func TestPrepareSourceNameFallback(t *testing.T) {
 }
 
 func TestPrepareDOCXAssetsArtifactsAndMetadata(t *testing.T) {
-	body := headingParagraphXML("设备手册", 1) + paragraphXML("正常使用。") +
-		tableXML([]string{"错误码", "处理方法"}, []string{"E03", "检查传感器连接"}) +
-		pictureParagraph("图 1") + paragraphXML("图 1: 状态灯")
-	path := pictureDocxPackage(t, body, true)
-	result, err := Prepare(t.Context(), path, Options{SourceName: "manual.docx"})
+	manifest := newManifestBuilder().
+		heading("#/texts/0", "设备手册", []string{"设备手册"}).
+		paragraph("#/texts/1", "正常使用。", "设备手册").
+		table("#/tables/0", "table-1", [][]string{{"错误码", "处理方法"}, {"E03", "检查传感器连接"}}, "设备手册").
+		picture("#/pictures/0", "picture-1", "图 1: 状态灯", "设备手册").
+		build()
+	source := plainDocxPackage(t, paragraphXML("正文"), false)
+	staging := t.TempDir()
+	options := wordPrepareOptions(t, source, staging, manifest, func(o *Options) {
+		o.SourceName = "manual.docx"
+	})
+	result, err := Prepare(t.Context(), source, options)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -137,11 +144,11 @@ func TestPrepareDOCXAssetsArtifactsAndMetadata(t *testing.T) {
 		t.Fatalf("title = %q", result.Title)
 	}
 	if result.Metadata["document_suffix"] != ".docx" ||
-		result.Metadata["parser_version"] != document.WordParserVersion {
+		result.Metadata["parser_version"] != document.DoclingWordParserVersion {
 		t.Fatalf("result metadata = %v", result.Metadata)
 	}
 	chunkingMetadata := result.Metadata["chunking"].(map[string]any)
-	if chunkingMetadata["word_parser_version"] != document.WordParserVersion {
+	if chunkingMetadata["word_parser_version"] != document.DoclingWordParserVersion {
 		t.Fatalf("chunking metadata = %v", chunkingMetadata)
 	}
 	if result.Metadata["skipped_object_count"] != 0 {
@@ -162,7 +169,7 @@ func TestPrepareDOCXAssetsArtifactsAndMetadata(t *testing.T) {
 			tableAsset = candidate
 		}
 	}
-	if asset.Kind != "picture" || asset.MIMEType != "image/jpeg" || len(asset.Data) == 0 || asset.SHA256 == "" {
+	if asset.Kind != "picture" || len(asset.Data) == 0 || asset.SHA256 == "" {
 		t.Fatalf("picture asset = %+v", asset)
 	}
 	if tableAsset.Kind != "table" || tableAsset.Table == nil {
@@ -178,18 +185,18 @@ func TestPrepareDOCXAssetsArtifactsAndMetadata(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(result.StagingDir) })
 	manifestPath := filepath.Join(result.StagingDir, "manifest.json")
-	manifest, err := document.ReadWordManifestFile(manifestPath)
+	stored, err := document.ReadWordManifestFile(manifestPath)
 	if err != nil {
 		t.Fatalf("manifest artifact = %v", err)
 	}
 	qualifiedPicture := false
-	for _, candidate := range manifest.Assets {
+	for _, candidate := range stored.Assets {
 		if candidate.AssetID == asset.ID {
 			qualifiedPicture = true
 		}
 	}
-	if len(manifest.Assets) != 2 || !qualifiedPicture {
-		t.Fatalf("qualified manifest artifact = %+v", manifest.Assets)
+	if len(stored.Assets) != 2 || !qualifiedPicture {
+		t.Fatalf("qualified manifest artifact = %+v", stored.Assets)
 	}
 	markdown, err := os.ReadFile(filepath.Join(result.StagingDir, "document.md"))
 	if err != nil || !strings.Contains(string(markdown), "设备手册") {
@@ -198,13 +205,18 @@ func TestPrepareDOCXAssetsArtifactsAndMetadata(t *testing.T) {
 }
 
 func TestPrepareLegacyDOCConversion(t *testing.T) {
-	docxPath := pictureDocxPackage(t, paragraphXML("legacy body text"), false)
+	manifest := newManifestBuilder().
+		paragraph("#/texts/0", "legacy body text").
+		build()
+	docxPath := plainDocxPackage(t, paragraphXML("converted"), false)
 	converter := &fakeDOCConverter{target: docxPath}
 	docPath := writeText(t, "legacy.doc", "dummy legacy bytes")
-	result, err := Prepare(t.Context(), docPath, Options{
-		SourceName: "legacy.doc",
-		Word:       WordOptions{Converter: converter},
+	staging := t.TempDir()
+	options := wordPrepareOptions(t, docPath, staging, manifest, func(o *Options) {
+		o.SourceName = "legacy.doc"
+		o.Word = WordOptions{Converter: converter}
 	})
+	result, err := Prepare(t.Context(), docPath, options)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -365,9 +377,12 @@ func TestPreparePDFEmptyVersionMismatchAndParserError(t *testing.T) {
 }
 
 func TestPrepareWordVisionIntegration(t *testing.T) {
-	body := pictureParagraph("") + paragraphXML("Body text")
-	path := pictureDocxPackage(t, body, false)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	manifest := newManifestBuilder().
+		picture("#/pictures/0", "picture-1", "").
+		paragraph("#/texts/0", "Body text").
+		build()
+	source := plainDocxPackage(t, paragraphXML("body"), false)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{{"message": map[string]any{
@@ -380,10 +395,12 @@ func TestPrepareWordVisionIntegration(t *testing.T) {
 		BaseURL: server.URL + "/v1",
 		Model:   "test-vlm",
 	}}
-	result, err := Prepare(t.Context(), path, Options{
-		SourceName: "vision.docx",
-		Word:       WordOptions{Vision: worker},
+	staging := t.TempDir()
+	options := wordPrepareOptions(t, source, staging, manifest, func(o *Options) {
+		o.SourceName = "vision.docx"
+		o.Word = WordOptions{Vision: worker}
 	})
+	result, err := Prepare(t.Context(), source, options)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -396,11 +413,11 @@ func TestPrepareWordVisionIntegration(t *testing.T) {
 		result.Assets[0].GeneratedDescription != "A green pressure indicator on the pump panel." {
 		t.Fatalf("assets = %+v", result.Assets)
 	}
-	manifest, err := document.ReadWordManifestFile(filepath.Join(result.StagingDir, "manifest.json"))
+	stored, err := document.ReadWordManifestFile(filepath.Join(result.StagingDir, "manifest.json"))
 	if err != nil {
 		t.Fatalf("manifest artifact = %v", err)
 	}
-	if manifest.Assets[0].GeneratedDescription == "" {
+	if stored.Assets[0].GeneratedDescription == "" {
 		t.Fatalf("manifest artifact lost the description")
 	}
 }

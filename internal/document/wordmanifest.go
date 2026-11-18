@@ -4,8 +4,10 @@ import (
 	"strings"
 )
 
-// WordParserVersion mirrors word_reader.WORD_PARSER_VERSION. Parsed Word content
-// is only reusable while the manifest reports this version.
+// WordParserVersion is the historical parser version of the removed in-process
+// OOXML reader. It stays declared because documents indexed before the
+// Docling-only cutover recorded it and remain readable; new content always
+// records DoclingWordParserVersion.
 const WordParserVersion = "word-assets-v1"
 
 // DoclingWordParserVersion is the parser version recorded for DOC/DOCX content
@@ -151,9 +153,9 @@ func (l WordLocation) Payload() map[string]any {
 	}
 }
 
-// WordManifest is the ordered OOXML extraction result. Its JSON shape matches
-// word_reader.parse_docx so runtime artifacts and the external vision worker
-// stay compatible.
+// WordManifest is the ordered extraction result shared by the Docling service
+// contract. Its JSON shape matches word_reader.parse_docx so runtime
+// artifacts and the external vision worker stay compatible.
 type WordManifest struct {
 	Version            string               `json:"version"`
 	Blocks             []WordManifestBlock  `json:"blocks"`
@@ -162,59 +164,18 @@ type WordManifest struct {
 	SkippedObjectCount int                  `json:"skipped_object_count"`
 }
 
-// WordPackage is a parsed Word document: the manifest plus image bytes keyed by
-// manifest asset id. It is the storage-decoupled output of ParseWordPackage.
+// WordPackage is a parsed Word/HTML document: the manifest plus image bytes
+// keyed by manifest asset id. It is the storage-decoupled output of the
+// Docling HTTP service client.
 type WordPackage struct {
 	Manifest WordManifest
 	Images   map[string][]byte
 }
 
-// DocumentBlocks projects the manifest the way document_readers._docx_blocks
-// does: table assets expand to one row block each, picture assets become
-// "[Image: <asset_id>]" and empty text blocks are dropped.
-func (m WordManifest) DocumentBlocks() []Block {
-	assets := make(map[string]*WordManifestAsset, len(m.Assets))
-	assetIndex := make(map[string]int, len(m.Assets))
-	for index, asset := range m.Assets {
-		assets[asset.AssetID] = asset
-		assetIndex[asset.AssetID] = index
-	}
-	result := make([]Block, 0, len(m.Blocks))
-	for _, block := range m.Blocks {
-		if block.AssetID != "" {
-			asset, ok := assets[block.AssetID]
-			if !ok {
-				continue
-			}
-			if asset.Kind == "table" && asset.Table != nil {
-				tableNumber := assetIndex[block.AssetID] + 1
-				for _, row := range asset.Table.Rows {
-					result = append(result, Block{
-						Text:     tableRowText(row),
-						Kind:     KindTableRow,
-						Headings: cloneStrings(block.Location.Headings),
-						Table:    tableNumber,
-					})
-				}
-				continue
-			}
-			result = append(result, Block{
-				Text:     "[Image: " + asset.AssetID + "]",
-				Kind:     KindPicture,
-				Headings: cloneStrings(block.Location.Headings),
-			})
-			continue
-		}
-		if block.Text != "" {
-			result = append(result, Block{
-				Text:     block.Text,
-				Kind:     block.Kind,
-				Headings: cloneStrings(block.Location.Headings),
-			})
-		}
-	}
-	return result
-}
+// DocumentBlocks removed: the projected reader view (table rows expanded to
+// one row block each, pictures as "[Image: <id>]") belonged to the deleted
+// in-process OOXML reader. Word chunking now runs on the manifest through
+// ingest.buildWordChunks.
 
 // Render ports word_reader.render_word: ordered plain text for the document.md
 // artifact, using table rows and picture placeholders and skipping in-cell
@@ -255,22 +216,4 @@ func tableRowText(row []string) string {
 		cells[index] = cell
 	}
 	return strings.Join(cells, " | ")
-}
-
-// joinDOCX mirrors document_readers._join_docx over projected blocks.
-func joinDOCX(blocks []Block) string {
-	parts := make([]string, 0, len(blocks))
-	previousTable := 0
-	for _, block := range blocks {
-		if len(parts) > 0 {
-			if block.Table != 0 && block.Table == previousTable {
-				parts = append(parts, "\n")
-			} else {
-				parts = append(parts, "\n\n")
-			}
-		}
-		parts = append(parts, block.Text)
-		previousTable = block.Table
-	}
-	return strings.Join(parts, "")
 }

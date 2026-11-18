@@ -126,6 +126,9 @@ type selfCreateKnowledgeBaseBody struct {
 	RerankerModel  string            `json:"reranker_model"`
 	VLM            *providerSettings `json:"vlm"`
 	VLMModel       string            `json:"vlm_model"`
+	Graph          *providerSettings `json:"graph"`
+	GraphModel     string            `json:"graph_model"`
+	GraphEnabled   bool              `json:"graph_enabled"`
 }
 
 // withProviderSettings copies the administrator-only provider fields into the
@@ -144,6 +147,11 @@ func (body selfCreateKnowledgeBaseBody) withProviderSettings(input KnowledgeBase
 	input.VLMModel = body.VLMModel
 	if body.VLM != nil {
 		input.VLMValues = body.VLM.values()
+	}
+	input.GraphModel = body.GraphModel
+	input.GraphEnabled = body.GraphEnabled
+	if body.Graph != nil {
+		input.GraphValues = body.Graph.values()
 	}
 	return input, true
 }

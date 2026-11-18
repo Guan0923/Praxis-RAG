@@ -154,7 +154,7 @@ func (s *Service) admitDocumentBatchFile(
 		result.Error = batchFailureText(err)
 		return result
 	}
-	if err := s.validateDoclingHTMLAdmission(file.Name); err != nil {
+	if err := s.validateDoclingDocumentAdmission(file.Name); err != nil {
 		result.Status = state.DocumentBatchItemFailed
 		result.Reason = state.DocumentBatchReasonConfig
 		result.Error = batchFailureText(err)

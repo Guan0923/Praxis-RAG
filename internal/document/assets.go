@@ -330,15 +330,6 @@ func (c *PDFContent) WriteDocumentMarkdown(dir string) error {
 	return nil
 }
 
-// ValidateWordParserVersion mirrors word_assets.read_word_content's parser
-// version guard.
-func ValidateWordParserVersion(version string) error {
-	if version != WordParserVersion {
-		return fmt.Errorf("Word parser changed; reimport this document")
-	}
-	return nil
-}
-
 // ValidatePDFParserVersion mirrors pdf_assets.read_pdf_content's parser version
 // guard. Manifests from either supported engine (and historical remote
 // artifacts) pass; foreign version strings are rejected.

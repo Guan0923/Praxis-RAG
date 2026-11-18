@@ -19,12 +19,13 @@ import { namespacePattern } from "./navigation";
 
 type Kind = KnowledgeBaseModelKind;
 type ProviderValues = { base_url: string; apikey?: string };
-type ProfileField = "embedding_profile" | "reranker_profile" | "vlm_profile";
+type ProfileField = "embedding_profile" | "reranker_profile" | "vlm_profile" | "graph_profile";
 type Values = Chunking & {
   namespace: string;
   embedding_profile: string;
   reranker_profile?: string;
   vlm_profile?: string;
+  graph_profile?: string;
   embedding_billing_source?: "platform" | "customer";
 };
 type Defaults = { default: string; strategies: Strategy[] };
@@ -37,8 +38,10 @@ type Draft = {
   embedding_profile?: string;
   reranker_profile?: string;
   vlm_profile?: string;
+  graph_profile?: string;
   reranker_enabled?: boolean;
   vlm_enabled?: boolean;
+  graph_enabled?: boolean;
   // 旧版草稿没有版本号：其开关状态来自「默认关闭」时代，恢复时忽略，
   // 统一按当前的默认开启处理。
   draft_version?: number;
@@ -51,6 +54,7 @@ const profileField: Record<Kind, ProfileField> = {
   embedding: "embedding_profile",
   reranker: "reranker_profile",
   vlm: "vlm_profile",
+  graph: "graph_profile",
 };
 const cleanUrl = (value: string) => value.trim().replace(/\/+$/, "");
 
@@ -88,7 +92,7 @@ const draftVersion = 2;
 
 // CreateKnowledgeBase 保持表单在首次访问后挂载，切换页面不会丢失已填内容。
 // 所有登录角色使用同一套交互：从自己的「模型配置」中选择 Embedding / Reranker /
-// VLM，再提交这些配置对应的 provider 字段（模型配置按账号严格隔离）。
+// VLM / 知识图谱，再提交这些配置对应的 provider 字段（模型配置按账号严格隔离）。
 export function CreateKnowledgeBase({ active, disabled, onCreated, connection, onOpenModelProfiles }: {
   active: boolean; disabled: boolean; onCreated: (namespace: string) => void;
   connection: Connection; onOpenModelProfiles?: () => void;
@@ -129,6 +133,8 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
   // 逐个选择）；编辑页沿用知识库当前是否配置了该类模型。
   const [rerankerEnabled, setRerankerEnabled] = useState(initial ? Boolean(initial.reranker_model) : true);
   const [vlmEnabled, setVlmEnabled] = useState(initial ? Boolean(initial.vlm_model) : true);
+  // 知识图谱是可选能力：创建页默认关闭，编辑页沿用知识库保存的 graph_enabled。
+  const [graphEnabled, setGraphEnabled] = useState(initial ? Boolean(initial.graph_enabled) : false);
   const lifetime = useRef(new AbortController());
   const profilesRequest = useRef<AbortController | null>(null);
   const running = useRef(false);
@@ -151,14 +157,16 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
     if (!initial) return "";
     if (kind === "embedding") return initial.embedding.base_url;
     if (kind === "reranker") return initial.reranker.base_url;
-    return initial.vlm?.base_url || "";
+    if (kind === "vlm") return initial.vlm?.base_url || "";
+    return initial.graph?.base_url || "";
   }
 
   function currentModel(kind: Kind) {
     if (!initial) return "";
     if (kind === "embedding") return initial.embedding_model;
     if (kind === "reranker") return initial.reranker_model;
-    return initial.vlm_model || "";
+    if (kind === "vlm") return initial.vlm_model || "";
+    return initial.graph_model || "";
   }
 
   // matchedProfile 找出与知识库当前连接（服务地址 + 模型）完全一致的配置。
@@ -233,10 +241,13 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         embedding_profile: draft.embedding_profile,
         reranker_profile: draft.reranker_profile,
         vlm_profile: draft.vlm_profile,
+        graph_profile: draft.graph_profile,
       });
       if (draft.draft_version === draftVersion) {
         if (draft.reranker_enabled !== undefined) setRerankerEnabled(draft.reranker_enabled);
         if (draft.vlm_enabled !== undefined) setVlmEnabled(draft.vlm_enabled);
+        // 知识图谱默认关闭：旧草稿没有该字段时保持关闭。
+        if (draft.graph_enabled !== undefined) setGraphEnabled(draft.graph_enabled);
       }
     } catch {
       // An unreadable draft must never block the form.
@@ -273,8 +284,10 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         embedding_profile: values.embedding_profile,
         reranker_profile: values.reranker_profile,
         vlm_profile: values.vlm_profile,
+        graph_profile: values.graph_profile,
         reranker_enabled: rerankerEnabled,
         vlm_enabled: vlmEnabled,
+        graph_enabled: graphEnabled,
         draft_version: draftVersion,
         ...overrides,
       };
@@ -311,11 +324,12 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
     setError("");
     const blank: ResolvedProvider = { provider: { base_url: "", apikey: "" }, model: "" };
     try {
-      // 三个模型配置的 Key 并行解析后再一次性提交。
-      const [embedding, reranker, vlm] = await Promise.all([
+      // 四个模型配置的 Key 并行解析后再一次性提交。
+      const [embedding, reranker, vlm, graph] = await Promise.all([
         resolveSelection("embedding", values.embedding_profile),
         rerankerEnabled ? resolveSelection("reranker", values.reranker_profile) : Promise.resolve(blank),
         vlmEnabled ? resolveSelection("vlm", values.vlm_profile) : Promise.resolve(blank),
+        graphEnabled ? resolveSelection("graph", values.graph_profile) : Promise.resolve(blank),
       ]);
       const body = {
         embedding: embedding.provider,
@@ -324,6 +338,11 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         reranker_model: rerankerEnabled ? reranker.model : "",
         vlm: vlmEnabled ? vlm.provider : { base_url: "", apikey: "" },
         vlm_model: vlmEnabled ? vlm.model : "",
+        // 知识图谱是可选项：关闭时一并提交空连接与 graph_enabled=false，
+        // 服务端据此停用该知识库的图谱索引。
+        graph: graphEnabled ? graph.provider : { base_url: "", apikey: "" },
+        graph_model: graphEnabled ? graph.model : "",
+        graph_enabled: graphEnabled,
         embedding_billing_source: values.embedding_billing_source
           ?? initial?.embedding_billing_source ?? "platform",
       };
@@ -348,9 +367,10 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         if (!initial) {
           try { sessionStorage.removeItem(draftKey); } catch { /* Draft cleanup is best effort. */ }
           form.resetFields();
-          // 创建成功后回到「全部模型默认开启」的初始状态。
+          // 创建成功后回到「全部模型默认开启」的初始状态（知识图谱默认关闭）。
           setRerankerEnabled(true);
           setVlmEnabled(true);
+          setGraphEnabled(false);
           void loadDefaults();
         }
         onSaved(result);
@@ -372,15 +392,23 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
     } else if (kind === "vlm") {
       setVlmEnabled(enabled);
       persistDraft({ vlm_enabled: enabled });
+    } else if (kind === "graph") {
+      setGraphEnabled(enabled);
+      persistDraft({ graph_enabled: enabled });
     }
   }
 
-  // 创建知识库页面把 Embedding / Reranker / VLM 三张卡片排成自适应网格（宽屏
-  // 一行三列，窄屏逐级降为一列），文本切分排成一行；编辑知识库的抽屉仍保持纵向布局。
+  // 创建知识库页面把 Embedding / Reranker / VLM / 知识图谱 四张卡片排成自适应
+  // 网格（宽屏一行四列，窄屏逐级降为两列或一列），文本切分排成一行；编辑知识库
+  // 的抽屉仍保持纵向布局。
   const providerSections = kinds.map((kind) => {
     const title = modelKindLabels[kind];
-    const enabled = kind === "embedding"
-      || (kind === "reranker" ? rerankerEnabled : vlmEnabled);
+    // Embedding 必选；Reranker / VLM 默认开启；知识图谱默认关闭，由开关决定是否
+    // 提交图谱连接与模型。
+    const enabled = kind === "embedding" ? true
+      : kind === "reranker" ? rerankerEnabled
+        : kind === "vlm" ? vlmEnabled
+          : graphEnabled;
     const field = profileField[kind];
     const kindProfiles = ownProfiles.filter((profile) => profile.kind === kind);
     const options = kindProfiles.map((profile) => ({
@@ -401,13 +429,18 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         label: <span className="break-text">{currentLabel}</span>,
       });
     }
+    // 知识图谱是可选能力：关闭开关时整块隐藏模型选择，既不展示也不参与校验。
+    const showSelect = kind !== "graph" || enabled;
     return <section className="knowledge-provider" aria-label={title + " 配置"} key={kind}>
       <div className="section-heading"><h2>{title}</h2>{kind === "reranker" &&
         <Switch aria-label="启用 Reranker" checked={rerankerEnabled} disabled={locked}
           onChange={(checked) => toggleKind("reranker", checked)} />}
         {kind === "vlm" &&
         <Switch aria-label="启用 VLM" checked={vlmEnabled} disabled={locked}
-          onChange={(checked) => toggleKind("vlm", checked)} />}</div>
+          onChange={(checked) => toggleKind("vlm", checked)} />}
+        {kind === "graph" &&
+        <Switch aria-label="启用知识图谱" checked={graphEnabled} disabled={locked}
+          onChange={(checked) => toggleKind("graph", checked)} />}</div>
       {enabled && kindProfiles.length === 0 && !profilesLoading && !profilesError &&
         <Alert className="page-alert" type="warning" showIcon title={`暂无 ${title} 模型`}
           description={initial
@@ -418,7 +451,10 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
           action={!initial && onOpenModelProfiles
             ? <Button type="link" size="small" onClick={onOpenModelProfiles}>前往模型配置</Button>
             : undefined} />}
-      <Form.Item name={field} label={title + " 模型"}
+      {showSelect && <Form.Item name={field} label={title + " 模型"}
+        extra={kind === "graph"
+          ? "开启后入库时为该知识库构建实体关系索引（LightRAG），检索时可选择「图谱」模式。"
+          : undefined}
         rules={enabled ? [{ required: true, message: `请选择 ${title} 模型` }] : []}>
         <Select
           virtual={false}
@@ -430,7 +466,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
               : kindProfiles.length === 0 ? `暂无可用 ${title} 模型` : `请选择 ${title} 模型`}
           options={options}
         />
-      </Form.Item>
+      </Form.Item>}
     </section>;
   });
 
@@ -449,6 +485,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         embedding_profile: initial ? currentProfile : undefined,
         reranker_profile: initial && initial.reranker_model ? currentProfile : undefined,
         vlm_profile: initial && initial.vlm_model ? currentProfile : undefined,
+        graph_profile: initial && initial.graph_model ? currentProfile : undefined,
         embedding_billing_source: initial?.embedding_billing_source || "platform",
         strategy: initial?.strategy, chunk_size: initial?.chunk_size, chunk_overlap: initial?.chunk_overlap }}
       onValuesChange={() => {

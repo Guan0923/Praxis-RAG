@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -27,18 +28,139 @@ func chunksWithMetadata(chunks []chunking.Chunk, key string, value any) []chunki
 	return result
 }
 
+// manifestBuilder assembles a Docling-shaped Word manifest for the Word chunk
+// tests. It replaces the removed in-process OOXML fixtures: the chunk builder
+// is format-agnostic, so the fake service output is the natural input.
+type manifestBuilder struct {
+	blocks []document.WordManifestBlock
+	assets []*document.WordManifestAsset
+}
+
+func newManifestBuilder() *manifestBuilder {
+	return &manifestBuilder{}
+}
+
+func (b *manifestBuilder) location(paragraph int, headings ...string) document.WordLocation {
+	return document.WordLocation{Part: "body", Paragraph: paragraph, Headings: headings, Scope: "body", Section: 1}
+}
+
+func (b *manifestBuilder) heading(ref string, text string, headings []string) *manifestBuilder {
+	b.blocks = append(b.blocks, document.WordManifestBlock{
+		Ref: ref, Order: len(b.blocks), Kind: document.KindHeading, Text: text,
+		Location: b.location(len(b.blocks)+1, headings...),
+	})
+	return b
+}
+
+func (b *manifestBuilder) paragraph(ref, text string, headings ...string) *manifestBuilder {
+	b.blocks = append(b.blocks, document.WordManifestBlock{
+		Ref: ref, Order: len(b.blocks), Kind: document.KindParagraph, Text: text,
+		Location: b.location(len(b.blocks)+1, headings...),
+	})
+	return b
+}
+
+func (b *manifestBuilder) table(ref, assetID string, rows [][]string, headings ...string) *manifestBuilder {
+	headers := rows[0]
+	b.blocks = append(b.blocks, document.WordManifestBlock{
+		Ref: ref, Order: len(b.blocks), Kind: "table", AssetID: assetID,
+		Location: b.location(len(b.blocks)+1, headings...),
+	})
+	cells := make([]document.WordTableCellData, 0, len(rows)*len(headers))
+	for rowIndex, row := range rows {
+		for colIndex, cell := range row {
+			cells = append(cells, document.WordTableCellData{
+				Row: rowIndex, Col: colIndex, RowSpan: 1, ColSpan: 1, Text: cell,
+			})
+		}
+	}
+	b.assets = append(b.assets, &document.WordManifestAsset{
+		AssetID: assetID, Kind: "table",
+		Table: &document.WordTableData{
+			NumRows: len(rows), NumCols: len(headers),
+			Rows: rows, HeaderRows: [][]string{headers}, Headers: headers, Cells: cells,
+		},
+		Location: b.location(len(b.blocks)),
+	})
+	return b
+}
+
+func (b *manifestBuilder) picture(ref, assetID string, caption string, headings ...string) *manifestBuilder {
+	b.blocks = append(b.blocks, document.WordManifestBlock{
+		Ref: ref, Order: len(b.blocks), Kind: document.KindPicture, AssetID: assetID,
+		Location: b.location(len(b.blocks)+1, headings...),
+	})
+	imageFile := "images/" + assetID + ".jpeg"
+	asset := &document.WordManifestAsset{
+		AssetID: assetID, Kind: "picture", ImageFile: &imageFile,
+		MIMEType: strPtr("image/jpeg"), Location: b.location(len(b.blocks)),
+	}
+	if caption != "" {
+		asset.Captions = []document.WordAnnotation{{Text: caption, Ref: ref}}
+		asset.Caption = caption
+		asset.CaptionSource = "document"
+	}
+	b.assets = append(b.assets, asset)
+	return b
+}
+
+// build runs AssociateDoclingCaptions and returns the finished manifest.
+func (b *manifestBuilder) build() document.WordManifest {
+	return document.AssociateDoclingCaptions(document.WordManifest{
+		Version:     document.DoclingWordParserVersion,
+		Blocks:      b.blocks,
+		Assets:      b.assets,
+		Diagnostics: []document.Diagnostic{},
+	})
+}
+
+func strPtr(value string) *string { return &value }
+
+// wordPrepareOptions runs Prepare over one .docx source with a fake Docling
+// parser backed by the given manifest. Picture assets are staged with real
+// decodable JPEG bytes so the optional vision step can process them.
+func wordPrepareOptions(t *testing.T, source string, staging string, manifest document.WordManifest,
+	extra func(*Options)) Options {
+	t.Helper()
+	images := map[string][]byte{}
+	for _, asset := range manifest.Assets {
+		if asset.Kind == "picture" && asset.ImageFile != nil {
+			images[asset.AssetID] = testJPEGBytes
+		}
+	}
+	options := Options{
+		SourceName: "spec.docx",
+		Chunking:   mustConfig(t, "character", 700, 100),
+		StagingDir: staging,
+		Docling:    DoclingOptions{Parser: &fakeDoclingParser{manifest: manifest, images: images}},
+	}
+	if extra != nil {
+		extra(&options)
+	}
+	return options
+}
+
+// writeAnyDocx writes a minimal valid .docx upload file; its content is
+// irrelevant because the fake Docling parser supplies the manifest.
+func writeAnyDocx(t *testing.T) string {
+	t.Helper()
+	return plainDocxPackage(t, paragraphXML("正文"), false)
+}
+
 func TestWordChunkStrategiesPreserveTableHeaders(t *testing.T) {
 	// Port of tests/test_word_fidelity.py::test_word_chunk_strategies_preserve_table_headers.
-	body := headingParagraphXML("Specification", 1) +
-		tableXML([]string{"Model", "Limit"}, []string{"ZX256", "90"})
-	path := plainDocxPackage(t, body, true)
+	manifest := newManifestBuilder().
+		heading("#/texts/0", "Specification", []string{"Specification"}).
+		table("#/tables/0", "table-1", [][]string{{"Model", "Limit"}, {"ZX256", "90"}}, "Specification").
+		build()
+	source := writeAnyDocx(t)
 	for _, strategy := range []string{"character", "token", "sentence", "recursive", "structure"} {
 		t.Run(strategy, func(t *testing.T) {
-			config := mustConfig(t, strategy, 256, 16)
-			result, err := Prepare(t.Context(), path, Options{
-				SourceName: "spec.docx",
-				Chunking:   config,
+			staging := t.TempDir()
+			options := wordPrepareOptions(t, source, staging, manifest, func(o *Options) {
+				o.Chunking = mustConfig(t, strategy, 256, 16)
 			})
+			result, err := Prepare(t.Context(), source, options)
 			if err != nil {
 				t.Fatalf("Prepare() error = %v", err)
 			}
@@ -70,11 +192,13 @@ func TestWordChunkStrategiesPreserveTableHeaders(t *testing.T) {
 }
 
 func TestWordPictureCaptionAndNoteChunk(t *testing.T) {
-	body := pictureParagraph("Figure 1") +
-		paragraphXML("Figure 1: Red status lamp") +
-		paragraphXML("Note: keep this lamp visible")
-	path := pictureDocxPackage(t, body, false)
-	result, err := Prepare(t.Context(), path, Options{SourceName: "picture.docx"})
+	manifest := newManifestBuilder().
+		picture("#/pictures/0", "picture-1", "Figure 1: Red status lamp").
+		paragraph("#/texts/0", "Note: keep this lamp visible").
+		build()
+	source := writeAnyDocx(t)
+	staging := t.TempDir()
+	result, err := Prepare(t.Context(), source, wordPrepareOptions(t, source, staging, manifest, nil))
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -100,7 +224,7 @@ func TestWordPictureCaptionAndNoteChunk(t *testing.T) {
 		t.Fatalf("chunk asset_id = %v, asset = %v", picture.Metadata["asset_id"], assets[0].ID)
 	}
 	location, ok := picture.Metadata["location"].(map[string]any)
-	if !ok || location["part"] != "word/document.xml" || location["scope"] != "body" {
+	if !ok || location["part"] != "body" || location["scope"] != "body" {
 		t.Fatalf("location = %v", picture.Metadata["location"])
 	}
 	refs, ok := picture.Metadata["refs"].([]string)
@@ -112,13 +236,15 @@ func TestWordPictureCaptionAndNoteChunk(t *testing.T) {
 func TestWordInlineEquationIsNotSplit(t *testing.T) {
 	longPrefix := strings.Repeat("a", 90)
 	longSuffix := strings.Repeat("b", 200)
-	body := `<w:p><w:r><w:t>` + longPrefix + `</w:t></w:r>` +
-		`<w:r><m:oMath><m:f><m:num><m:r><m:t>x</m:t></m:r></m:num>` +
-		`<m:den><m:r><m:t>2</m:t></m:r></m:den></m:f></m:oMath></w:r>` +
-		`<w:r><w:t>` + longSuffix + `</w:t></w:r></w:p>`
-	path := plainDocxPackage(t, body, false)
-	config := mustConfig(t, "character", 100, 10)
-	result, err := Prepare(t.Context(), path, Options{SourceName: "formula.docx", Chunking: config})
+	manifest := newManifestBuilder().
+		paragraph("#/texts/0", longPrefix+"$\\frac{x}{2}$"+longSuffix).
+		build()
+	source := writeAnyDocx(t)
+	staging := t.TempDir()
+	options := wordPrepareOptions(t, source, staging, manifest, func(o *Options) {
+		o.Chunking = mustConfig(t, "character", 100, 10)
+	})
+	result, err := Prepare(t.Context(), source, options)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -139,44 +265,51 @@ func TestWordInlineEquationIsNotSplit(t *testing.T) {
 }
 
 func TestWordAmbiguousAssetsAreSkipped(t *testing.T) {
-	body := pictureParagraph("") + paragraphXML("Figure 7: ambiguous") + pictureParagraph("")
-	path := pictureDocxPackage(t, body, false)
-	result, err := Prepare(t.Context(), path, Options{SourceName: "ambiguous.docx"})
+	// Two pictures share one caption between them. The Docling association
+	// resolves such a caption to the adjacent preceding picture (a second
+	// adjacent asset in the same direction would be ambiguous and keep the
+	// caption as searchable text with a diagnostic), so the caption text
+	// travels with the picture chunk instead of a duplicate text chunk. The
+	// second picture keeps its asset record but produces no text chunk: its
+	// caption list is empty and nothing else describes it.
+	manifest := newManifestBuilder().
+		picture("#/pictures/0", "picture-1", "").
+		paragraph("#/texts/0", "Figure 7: ambiguous").
+		picture("#/pictures/1", "picture-2", "").
+		build()
+	source := writeAnyDocx(t)
+	staging := t.TempDir()
+	result, err := Prepare(t.Context(), source, wordPrepareOptions(t, source, staging, manifest, nil))
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	if result.SkippedObjectCount != 2 {
-		t.Fatalf("skipped = %d, want 2", result.SkippedObjectCount)
+	pictures := chunksWithMetadata(result.Chunks, "asset_kind", "picture")
+	if len(pictures) != 1 {
+		t.Fatalf("picture chunks = %d, want 1 (%v)", len(pictures), result.Chunks)
 	}
-	if len(result.Diagnostics) != 1 || result.Diagnostics[0].Kind != "unassociated_caption" {
-		t.Fatalf("diagnostics = %+v", result.Diagnostics)
+	if !strings.Contains(pictures[0].Text, "Figure 7: ambiguous") {
+		t.Fatalf("caption did not travel with the picture chunk: %q", pictures[0].Text)
 	}
-	if len(result.Assets) != 0 {
-		t.Fatalf("skipped assets are still present: %+v", result.Assets)
+	if result.SkippedObjectCount != 0 {
+		t.Fatalf("skipped = %d", result.SkippedObjectCount)
 	}
-	if len(chunksWithMetadata(result.Chunks, "asset_kind", "picture")) != 0 {
-		t.Fatalf("skipped picture produced an asset chunk")
-	}
-	joined := make([]string, len(result.Chunks))
-	for index, chunk := range result.Chunks {
-		joined[index] = chunk.Text
-	}
-	if !strings.Contains(strings.Join(joined, "\n"), "Figure 7: ambiguous") {
-		t.Fatalf("caption text was lost: %v", joined)
-	}
-	if result.Metadata["skipped_object_count"] != 2 {
-		t.Fatalf("metadata skipped_object_count = %v", result.Metadata["skipped_object_count"])
-	}
-	if diagnostics, ok := result.Metadata["diagnostics"].([]document.Diagnostic); !ok || len(diagnostics) != 1 {
-		t.Fatalf("metadata diagnostics = %v", result.Metadata["diagnostics"])
+	if len(result.Assets) != 2 {
+		t.Fatalf("assets = %d, want both pictures retained", len(result.Assets))
 	}
 }
 
 func TestWordChunkMetadataShape(t *testing.T) {
-	body := headingParagraphXML("Manual", 1) + paragraphXML("Body text under the heading.")
-	path := plainDocxPackage(t, body, true)
-	config := mustConfig(t, "token", 64, 12)
-	result, err := Prepare(t.Context(), path, Options{SourceName: "manual.docx", Chunking: config, TokenizerModel: "test-model"})
+	manifest := newManifestBuilder().
+		heading("#/texts/0", "Manual", []string{"Manual"}).
+		paragraph("#/texts/1", "Body text under the heading.", "Manual").
+		build()
+	source := writeAnyDocx(t)
+	staging := t.TempDir()
+	options := wordPrepareOptions(t, source, staging, manifest, func(o *Options) {
+		o.Chunking = mustConfig(t, "token", 64, 12)
+		o.TokenizerModel = "test-model"
+	})
+	result, err := Prepare(t.Context(), source, options)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -186,7 +319,7 @@ func TestWordChunkMetadataShape(t *testing.T) {
 	}
 	chunk := textChunks[0]
 	if chunk.Metadata["document_suffix"] != ".docx" ||
-		chunk.Metadata["word_parser_version"] != document.WordParserVersion {
+		chunk.Metadata["word_parser_version"] != document.DoclingWordParserVersion {
 		t.Fatalf("chunk metadata = %v", chunk.Metadata)
 	}
 	chunkingMetadata := chunk.Metadata["chunking"].(map[string]any)
@@ -213,19 +346,25 @@ func TestWordChunkMetadataShape(t *testing.T) {
 		t.Fatalf("heading path = %v", locations[0]["headings"])
 	}
 	documentMetadata := result.Metadata
-	if documentMetadata["document_suffix"] != ".docx" || documentMetadata["parser_version"] != document.WordParserVersion {
+	if documentMetadata["document_suffix"] != ".docx" ||
+		documentMetadata["parser_version"] != document.DoclingWordParserVersion {
 		t.Fatalf("result metadata = %v", documentMetadata)
 	}
-	if result.Title != "manual" {
+	if result.Title != "spec" {
 		t.Fatalf("title = %q", result.Title)
 	}
 }
 
 func TestWordCharacterChunkTextLimit(t *testing.T) {
-	body := paragraphXML(strings.Repeat("设备正常工作。", 60))
-	path := plainDocxPackage(t, body, false)
-	config := mustConfig(t, "character", 100, 10)
-	result, err := Prepare(t.Context(), path, Options{SourceName: "limits.docx", Chunking: config})
+	manifest := newManifestBuilder().
+		paragraph("#/texts/0", strings.Repeat("设备正常工作。", 60)).
+		build()
+	source := writeAnyDocx(t)
+	staging := t.TempDir()
+	options := wordPrepareOptions(t, source, staging, manifest, func(o *Options) {
+		o.Chunking = mustConfig(t, "character", 100, 10)
+	})
+	result, err := Prepare(t.Context(), source, options)
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
@@ -240,8 +379,17 @@ func TestWordCharacterChunkTextLimit(t *testing.T) {
 }
 
 func TestWordEmptyDocumentHasClearError(t *testing.T) {
-	path := plainDocxPackage(t, `<w:p/>`, false)
-	_, err := Prepare(t.Context(), path, Options{SourceName: "empty.docx"})
+	manifest := document.WordManifest{
+		Version: document.DoclingWordParserVersion,
+		Blocks:  []document.WordManifestBlock{},
+		Assets:  []*document.WordManifestAsset{},
+		Diagnostics: []document.Diagnostic{},
+	}
+	source := writeAnyDocx(t)
+	staging := t.TempDir()
+	_, err := Prepare(t.Context(), source, wordPrepareOptions(t, source, staging, manifest, func(o *Options) {
+		o.SourceName = "empty.docx"
+	}))
 	if err == nil || !strings.Contains(err.Error(), "Word document has no indexable content") {
 		t.Fatalf("error = %v", err)
 	}
@@ -250,9 +398,36 @@ func TestWordEmptyDocumentHasClearError(t *testing.T) {
 	}
 }
 
+func TestWordPrepareWithoutDoclingIsRejected(t *testing.T) {
+	// The in-process Word parser is gone: without a Docling parser every
+	// DOCX upload fails with the configuration error.
+	source := writeAnyDocx(t)
+	_, err := Prepare(context.Background(), source, Options{
+		SourceName: "spec.docx",
+		Chunking:   mustConfig(t, "character", 700, 100),
+	})
+	if !isErrDoclingNotConfigured(err) {
+		t.Fatalf("error = %v, want ErrDoclingNotConfigured", err)
+	}
+}
+
 func isNoIndexable(err error) bool {
 	for current := err; current != nil; {
 		if current == ErrNoIndexableText {
+			return true
+		}
+		unwrapper, ok := current.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		current = unwrapper.Unwrap()
+	}
+	return false
+}
+
+func isErrDoclingNotConfigured(err error) bool {
+	for current := err; current != nil; {
+		if current == ErrDoclingNotConfigured {
 			return true
 		}
 		unwrapper, ok := current.(interface{ Unwrap() error })

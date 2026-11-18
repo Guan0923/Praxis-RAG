@@ -63,6 +63,9 @@ var expectedSchema = []struct {
 	{"embedding_quota_periods", []string{"id", "user_id", "source", "period_start", "period_end", "plan", "allowance_chars", "used_chars", "reserved_chars", "created_at", "updated_at"}},
 	{"embedding_usage", []string{"id", "operation_id", "user_id", "quota_period_id", "namespace", "document_name", "document_version", "model", "purpose", "reserved_chars", "used_chars", "status", "expires_at", "created_at", "updated_at"}},
 	{"billing_events", []string{"id", "order_id", "event_key", "event_type", "alipay_trade_no", "amount_cents", "detail", "created_at"}},
+	// lightrag_documents is the knowledge-graph mirror ledger (Go-only), the
+	// register of which documents the LightRAG sidecar currently holds.
+	{"lightrag_documents", []string{"namespace", "document_id", "document_name", "config_fingerprint", "chunk_count", "status", "attempts", "last_error", "indexed_at", "updated_at"}},
 	// SAG event-entity index (retrieval mode sag): one event per chunk plus
 	// normalized entities and their associations.
 	{"sag_events", []string{"id", "namespace", "document_id", "chunk_id", "event", "version", "created_at"}},
@@ -109,6 +112,7 @@ var expectedPrimaryKeys = map[string][]string{
 	"embedding_quota_periods":  {"id"},
 	"embedding_usage":          {"id"},
 	"billing_events":           {"id"},
+	"lightrag_documents":       {"namespace", "document_id"},
 	"sag_events":               {"id"},
 	"sag_entities":             {"id"},
 	"sag_event_entities":       {"event_id", "entity_id"},
@@ -163,6 +167,7 @@ var expectedIndexes = map[string][]string{
 	"embedding_quota_periods":  {"ix_embedding_period_user"},
 	"embedding_usage":          {"ix_embedding_usage_user", "ix_embedding_usage_review"},
 	"billing_events":           {"ix_billing_events_order"},
+	"lightrag_documents":       {"ix_lightrag_documents_status"},
 	"sag_events":               {"ix_sag_events_document", "ix_sag_events_version"},
 	"sag_entities":             {"ix_sag_entities_normalized"},
 	"sag_event_entities":       {"ix_sag_event_entities_entity", "ix_sag_event_entities_event"},

@@ -183,6 +183,9 @@ func BuildDefaultOrchestrator(cfg config.RagConfig) (*Orchestrator, error) {
 			contracts.RetrievalSAG2: NewUnavailableRetriever(
 				"retrieval sag2 requires the Qdrant backend with a configured JEV decision model",
 			),
+			contracts.RetrievalGraph: NewUnavailableRetriever(
+				"retrieval graph requires the service runtime with a configured LightRAG sidecar",
+			),
 			contracts.RetrievalSAG: NewUnavailableRetriever(
 				"retrieval sag requires the service runtime with the SAG event-entity index",
 			),
@@ -277,6 +280,11 @@ func BuildQdrantOrchestrator(
 			// here; the service runtime registers the real implementations.
 			contracts.RetrievalSAG2: NewUnavailableRetriever(
 				"retrieval sag2 requires the service runtime with a configured JEV decision model",
+			),
+			// The debug CLI stack has no knowledge-base row to bind a graph
+			// workspace to, so graph retrieval stays explicitly unavailable.
+			contracts.RetrievalGraph: NewUnavailableRetriever(
+				"retrieval graph requires the service runtime with a configured LightRAG sidecar",
 			),
 			contracts.RetrievalSAG: NewUnavailableRetriever(
 				"retrieval sag requires the service runtime with the SAG event-entity index",

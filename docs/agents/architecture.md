@@ -44,7 +44,9 @@ MCP search / REST /v1/search（同步）→ runtime.Service.Search → SearchEng
 - **上传默认异步受理**：HTTP 提交点是 `document_jobs` 任务事务提交（不再有发件箱），而不是解析完成；`add_document` 返回 `artifact_id` 不代表已可检索，只有 `succeeded` 才算发布完成。
 - **搜索永远同步**：MCP `search` 与 REST `POST /v1/search` 一次调用完成检索 + 重排并直接返回证据，没有任务 ID、`wait_seconds` 或轮询；artifact 按 ID 独立读取（保留期 `RAG_RESULT_TTL_SECONDS`）。
 - **文档解析必须走 Kafka**：`rag-service` 不内嵌文档消费者；未配置 Kafka + Kafka Connect 的两个 Debezium 连接器 + `rag-document-worker` 时，上传仍会受理，但文档任务停留在 `queued`。
+- **图谱检索是可选能力**：配置 `RAG_LIGHTRAG_SERVICE_URL` 后，`rag-service` 用 `retrieval=graph` 同步调用 `lightrag-service`（HTTP :8093）取实体/关系上下文；侧车只做图谱索引与上下文检索，**不生成答案**，结果仍走同一证据投影与可见性过滤。未配置时该模式注册为不可用，调用返回可解释的操作错误，不影响其他四种模式。
 - **PDF 双引擎**：`RAG_PDF_ENGINE=vision`（compose `app` 默认；为空时按是否配置 `RAG_PDF_SERVICE_URL` 决定）走 pdf-parser，由远端 OpenAI 兼容视觉模型完成版面/OCR/表格/公式/图片描述；旧值 `docling` 作为兼容别名等价于 `vision`；`go` 使用 Go 进程内纯文本引擎。pdf-service 本地不加载任何模型权重。
+- **Word/HTML 只走 Docling 服务**：`.docx`/`.doc`（先经 LibreOffice 转换）与静态 HTML 一律由独立的 `docling-service`（`RAG_DOCLING_SERVICE_URL`）解析；进程内 OOXML Word 解析已删除，未配置该 URL 时这些格式的上传在受理阶段被拒绝。
 
 ## 2. 进程与可执行文件
 
@@ -61,6 +63,7 @@ MCP search / REST /v1/search（同步）→ runtime.Service.Search → SearchEng
 | `rag-mcp-ingest` | 本地文件/目录批量导入（走运行时上传管线） | `cmd/rag-mcp-ingest/main.go` |
 | `rag-mcp-debug` | 无 Qdrant/模型的 mock 检索调试 | `cmd/rag-mcp-debug/main.go` |
 | `pdf-parser`（容器） | PDF 视觉解析微服务：本地 PyMuPDF 读取/渲染/裁图，远端视觉模型完成版面/OCR/表格/公式/图片描述，`POST /v1/parse` 返回 zip（`manifest.json` + 图片资产） | `python-workers/pdf-service/app/main.py` |
+| `lightrag-service`（容器） | 知识图谱侧车：接收 Go 端已切好的块构建图谱，`POST /v1/workspaces/{namespace}/query` 只返回上下文；按 namespace 独立 workspace；仅配置 `RAG_LIGHTRAG_SERVICE_URL` 时被调用 | `python-workers/lightrag-service/app/main.py` |
 
 退出码约定：`0` 正常停止 / `1` 运行时失败 / `2` 配置或用法错误。
 
@@ -71,6 +74,7 @@ cmd/                        各可执行入口（见上表）
 internal/                   Go 业务实现（按包见下表）
 frontend/                   Console（React + Vite，测试与源文件同目录）
 python-workers/pdf-service/  PDF 视觉解析微服务（独立镜像，本地无模型，不在 Go 构建内）
+python-workers/lightrag-service/ 知识图谱侧车（独立镜像，pin lightrag-hku，不在 Go 构建内）
 deploy/                     compose 用容器配置、Kafka Connect 连接器模板、旧 Debezium 回滚配置、MySQL 初始化脚本
 scripts/                    build-go.ps1/.sh、start-stack、stop-stack、verify-*.py
 docs/                       使用、部署、权限、迁移、状态存储、缓存等文档
@@ -92,11 +96,12 @@ examples/knowledge/         示例知识文档（可直接上传试用）
 | `config` | 环境变量、`~/.praxis-rag/config.toml`、启动校验（含可选飞书应用配置） |
 | `contracts` | 检索/MCP 请求契约、JSON Schema、错误语义 |
 | `feishu` | 可选飞书导入：OAuth state/换 token/刷新、用户信息、文件夹/搜索/正文客户端、逐文档读取与安全文件名 |
-| `document` | PDF 原生解析、PDF 视觉服务客户端、DOCX、DOC 转换、公式、VLM、图片/表格资产 |
+| `document` | PDF 原生解析、PDF 视觉服务客户端、Docling Word/HTML 服务客户端、DOC 转换、VLM、图片/表格资产 |
 | `documentworker` | 文档任务处理器（仅由 Kafka 消费者 `rag-document-worker` 调用） |
 | `httpapi` | REST 路由、认证中间件、OpenAPI、Console 静态资源 |
 | `ingest` | “解析 → 切分 → Embedding → Qdrant 发布”管线 |
 | `kbconfig` | 知识库模型连接、模型配置（profiles；kind 为 embedding/reranker/vlm/jev，无 ocr） |
+| `lightrag` | LightRAG 侧车 HTTP 客户端：workspace 生命周期、已切块灌入、只取上下文查询、健康探测；错误按 unavailable/unauthorized/invalid 分类，响应体上限与取消向下传递 |
 | `mcp` | MCP 端点、工具、资源、提示词、权限 scope |
 | `migrate` | 旧知识源导入与状态迁移 |
 | `modelapi` | Embedding / Reranker HTTP 客户端 |

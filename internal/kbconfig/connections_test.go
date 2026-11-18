@@ -1,3 +1,6 @@
+// This file tests the saved-model kind list and the provider connection
+// helpers (stored/draft/decrypted connections), including the graph kind.
+
 package kbconfig
 
 import (
@@ -202,18 +205,38 @@ func TestDraftConnectionRejectsInvalidCurrentURL(t *testing.T) {
 }
 
 func TestIsKind(t *testing.T) {
-	if !IsKind("embedding") || !IsKind("reranker") || !IsKind("vlm") || !IsKind("jev") {
-		t.Errorf("expected embedding/reranker/vlm/jev kinds")
+	if !IsKind("embedding") || !IsKind("reranker") || !IsKind("vlm") || !IsKind("jev") ||
+		!IsKind("graph") || !IsKind("extraction") {
+		t.Errorf("expected embedding/reranker/vlm/jev/graph/extraction kinds")
 	}
 	if IsKind("") || IsKind("Embedding") || IsKind("bm25") || IsKind("ocr") {
 		t.Errorf("unexpected kind accepted")
 	}
-	if !reflect.DeepEqual(Kinds, []string{"embedding", "reranker", "vlm", "jev"}) {
+	if !reflect.DeepEqual(Kinds, []string{"embedding", "reranker", "vlm", "jev", "graph", "extraction"}) {
 		t.Errorf("Kinds = %v", Kinds)
 	}
 	// The public projection only replaces the kinds that own a knowledge-base
-	// provider connection; JEV is a Console-only configuration.
-	if !reflect.DeepEqual(CredentialKinds, []string{"embedding", "reranker", "vlm"}) {
+	// provider connection; JEV is a Console-only configuration, while graph and
+	// extraction own a per-knowledge-base endpoint and therefore redact the key.
+	if !reflect.DeepEqual(CredentialKinds, []string{"embedding", "reranker", "vlm", "graph", "extraction"}) {
 		t.Errorf("CredentialKinds = %v", CredentialKinds)
+	}
+}
+
+// TestModelConnectionForLegacyGraph checks that a knowledge base written before
+// the graph extraction model existed reads as an unconfigured connection instead
+// of reporting corrupt settings.
+func TestModelConnectionForLegacyGraph(t *testing.T) {
+	settings := map[string]any{"namespace": "alpha"}
+	connection, err := ModelConnectionForKey(settings, "graph", testEncryptionKey)
+	if err != nil {
+		t.Fatalf("ModelConnectionForKey(graph) error: %v", err)
+	}
+	if connection.Configured() {
+		t.Fatalf("legacy graph connection = %+v, want unconfigured", connection)
+	}
+	// The vlm special case must keep working unchanged.
+	if _, err := ModelConnectionForKey(settings, "vlm", testEncryptionKey); err != nil {
+		t.Fatalf("ModelConnectionForKey(vlm) error: %v", err)
 	}
 }

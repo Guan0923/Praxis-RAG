@@ -12,7 +12,7 @@ import (
 // CredentialKinds are the provider settings replaced by redacted public views
 // (the provider half of model_settings.KINDS in Python): each one owns a
 // base_url/protected_key pair.
-var CredentialKinds = []string{"embedding", "reranker", "vlm"}
+var CredentialKinds = []string{"embedding", "reranker", "vlm", "graph"}
 
 // PublicSettings mirrors rag_mcp.knowledge_bases.public_settings: provider
 // credentials are replaced with base_url/api_key_set so cached values can never

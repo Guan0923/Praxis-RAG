@@ -45,9 +45,10 @@ func (s *Service) admitDocument(
 	if err := s.validateRemotePDFAdmission(ctx, namespace, name); err != nil {
 		return state.DocumentAdmission{}, err
 	}
-	// Static HTML has no in-process parser: reject the job at admission when
-	// the Docling service is not configured.
-	if err := s.validateDoclingHTMLAdmission(name); err != nil {
+	// Word (.doc/.docx) and static HTML are both parsed only by the Docling
+	// service: reject the job at admission when the service is not
+	// configured.
+	if err := s.validateDoclingDocumentAdmission(name); err != nil {
 		return state.DocumentAdmission{}, err
 	}
 	var key *string

@@ -34,6 +34,18 @@ type KnowledgeBase = {
   embedding?: { base_url: string; api_key_set: boolean };
   reranker_model?: string;
   reranker?: { base_url: string; api_key_set: boolean };
+  // 配置抽屉里知识库表单还会读取切分参数、VLM / 知识图谱的可选配置。
+  vlm?: { base_url: string; api_key_set: boolean };
+  vlm_model?: string;
+  graph?: { base_url: string; api_key_set: boolean };
+  graph_model?: string;
+  graph_enabled?: boolean;
+  strategy?: string;
+  chunk_size?: number;
+  chunk_overlap?: number;
+  collection?: string;
+  tokenizer?: string;
+  created_at?: string;
   vector_size?: number;
 };
 
@@ -330,5 +342,61 @@ describe("KnowledgeBasesPage batch delete", () => {
     await waitFor(() => expect(batchButton().textContent).toContain("2"));
     expect(batchButton().disabled).toBe(false);
     await waitFor(() => expect(document.querySelector(".drag-band")).toBeNull());
+  });
+});
+
+// 配置抽屉复用知识库表单：这里只验证「启用知识图谱」开关与保存请求体。
+describe("KnowledgeBasesPage configuration drawer", () => {
+  it("saves graph_enabled=false without requiring a graph model while the switch is off", async () => {
+    const detail: KnowledgeBase = {
+      ...knowledgeBase("kb-a"),
+      embedding: { base_url: "https://embed.example.com/v1", api_key_set: false },
+      reranker: { base_url: "", api_key_set: false },
+      strategy: "recursive",
+      chunk_size: 512,
+      chunk_overlap: 64,
+      collection: "kb_a",
+      tokenizer: "bge",
+      created_at: "2026-11-09T10:00:00Z",
+    };
+    fetchMock.mockImplementation(async (path: string, init: RequestInit = {}) => {
+      const method = (init.method ?? "GET").toUpperCase();
+      if (path === "/v1/admin/knowledge-bases" && method === "GET")
+        return jsonResponse({ knowledge_bases: [detail] });
+      if (path === "/v1/admin/knowledge-bases/defaults")
+        return jsonResponse({
+          default: "recursive",
+          strategies: [
+            { id: "recursive", label: "递归切分", unit: "tokens", chunk_size: 512, chunk_overlap: 64 },
+          ],
+        });
+      if (path === "/v1/admin/knowledge-bases/kb-a" && method === "GET") return jsonResponse(detail);
+      if (path === "/v1/admin/knowledge-bases/kb-a" && method === "PATCH") return jsonResponse(detail);
+      if (path === "/v1/model-profiles") return jsonResponse({ model_profiles: [] });
+      return jsonResponse({ detail: "not found" }, 404);
+    });
+    const { onChanged } = renderPage();
+    await screen.findByText("kb-a");
+
+    fireEvent.click(screen.getByRole("button", { name: "配置 kb-a" }));
+    const dialog = await screen.findByRole("dialog");
+    // 编辑抽屉里新增「启用知识图谱」开关：默认关闭，且不展示图谱模型选择。
+    const toggle = await within(dialog).findByRole("switch", { name: "启用知识图谱" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(within(dialog).queryByLabelText("知识图谱 模型")).toBeNull();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /保存配置/ }));
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    const patch = fetchMock.mock.calls.find(
+      ([path, options]) =>
+        path === "/v1/admin/knowledge-bases/kb-a"
+        && (((options as RequestInit | undefined)?.method) ?? "GET") === "PATCH",
+    );
+    expect(patch).toBeTruthy();
+    expect(JSON.parse(String((patch![1] as RequestInit).body))).toMatchObject({
+      graph_enabled: false,
+      graph_model: "",
+      graph: { base_url: "", apikey: "" },
+    });
   });
 });

@@ -1,3 +1,7 @@
+// This file defines the saved model-configuration drafts and probes for every
+// kind (embedding, reranker, VLM, JEV and the graph extraction model) plus
+// their credential-free public projection.
+
 package kbconfig
 
 import (
@@ -103,9 +107,10 @@ func DraftModelProfile(
 
 // ProbeModelProfile validates a saved model configuration against its provider
 // before it is persisted. An embedding probe records the produced dense
-// dimension; a reranker probe only checks accessibility; VLM and JEV endpoints
-// have no cheap probe (JEV is stored for Console configuration only), so both
-// are stored as entered. A nil prober uses HTTPProber.
+// dimension; a reranker probe only checks accessibility; VLM, JEV and graph
+// endpoints have no cheap probe (JEV is stored for Console configuration only
+// and the graph model is exercised by LightRAG during ingestion), so all are
+// stored as entered. A nil prober uses HTTPProber.
 func ProbeModelProfile(
 	ctx context.Context,
 	connection modelapi.ModelConnection,
@@ -127,7 +132,7 @@ func ProbeModelProfile(
 			return nil, err
 		}
 		return nil, nil
-	case "vlm", "jev", "extraction":
+	case "vlm", "jev", "graph", "extraction":
 		return nil, nil
 	default:
 		return nil, NewValidationError(MessageModelKindInvalid)

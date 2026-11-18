@@ -8,7 +8,7 @@
 
 ![Console 检索 X7 终端的 E03 故障码并显示手册原文与来源章节](docs/images/console-search.gif)
 
-Console 使用示例响应展示混合检索。输入 E03 故障问题后，可以看到 [X7 维护手册](examples/knowledge/x7-maintenance-manual.md)中的处理步骤和来源章节。除 BM25 / Embedding / Hybrid 外，配置抽取模型后还可启用 SAG 事件-实体检索，跨 chunk 追溯共享实体的关联证据（见[使用指南](docs/USAGE.md#sag-事件-实体检索retrieval-sag)）。
+Console 使用示例响应展示混合检索。输入 E03 故障问题后，可以看到 [X7 维护手册](examples/knowledge/x7-maintenance-manual.md)中的处理步骤和来源章节。除 BM25 / Embedding / Hybrid 外，配置抽取模型后还可启用 SAG 事件-实体检索，跨 chunk 追溯共享实体的关联证据（见[使用指南](docs/USAGE.md#sag-事件-实体检索retrieval-sag)）。启用知识图谱后还可用图谱模式回答"这几份文件里的条款彼此是什么关系"这类跨文档关联问题，同样只提供证据、不生成答案（见[使用指南](docs/USAGE.md#知识图谱检索retrieval-graph)）。
 
 ## 5 分钟快速开始
 
@@ -30,13 +30,18 @@ go run ./cmd/rag-mcp-debug --query "RRF 怎么融合 BM25 和 Dense？" --limit 
 flowchart LR
     Client["Console · REST API · MCP"] <-->|"上传 · 检索证据"| Service["Go 检索服务"]
     Service -->|"同步检索"| Qdrant[(Qdrant)]
+    Service -->|"图谱上下文检索"| Graph["知识图谱侧车 · LightRAG"]
+    Graph -->|"实体关系抽取"| Model["模型 API"]
     Service -->|"受理入库任务"| MySQL[(MySQL)]
     MySQL -->|"Debezium CDC"| Kafka["Kafka"]
     Kafka -->|"通知"| Worker["文档 Worker"]
     Worker -->|"解析 · 切分 · 写入索引"| Qdrant
+    Worker -->|"发布后镜像图谱"| Graph
     Worker -->|"更新任务状态"| MySQL
     Service -->|"向量化 · 可选重排"| Model["模型 API"]
     Worker -->|"文档向量化"| Model
+    Kafka -->|"读模型变更"| Cache["缓存 Worker"]
+    Cache --> Redis[("Redis · 可选")]
 ```
 
 [完整部署拓扑](docs/DEPLOYMENT.md#1-进程拓扑) · [REST API](docs/USAGE.md#5-rest-api-示例) · [MCP 接入](docs/USAGE.md#6-mcp-使用)

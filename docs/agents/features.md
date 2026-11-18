@@ -5,14 +5,14 @@
 
 ## 1. 知识库（namespace）与租户隔离
 
-- 一个知识库 = 一个 namespace，命名规则 `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`；文档、切分配置、Embedding/Reranker/VLM 连接、Qdrant collection 与维度都按知识库保存。
+- 一个知识库 = 一个 namespace，命名规则 `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`；文档、切分配置、Embedding/Reranker/VLM/图谱模型连接、`graph_enabled` 开关、Qdrant collection 与维度都按知识库保存。
 - 所有租户请求（REST `/v1/*`、MCP）必须携带 `X-RAG-Namespace`；Qdrant 查询按 payload 中的 `namespace` 过滤，不同知识库互不可见。
 - 知识库默认归创建者私有；共享通过「权限管理」页的邀请链接完成（见 §10）。个人会员 Free/Plus/Pro 只影响自有库数、每库文件数和平台文档 Embedding 字符额度，不改 `admin/vip/user` 角色；Plus/Pro 可对自己拥有的知识库发邀请。
 - 每个知识库的 Qdrant 集合由知识库配置决定（创建知识库时生成 `knowledge_*` 名称，首次入库时创建）；`RAG_COLLECTION` 只是没有知识库配置时的回退名，系统监控按有效文档实际入库的集合校验，不要求回退集合存在，空知识库没有集合也不算异常；dense 向量维度固定 1024（BGE-M3），其他维度启动即报错。
 
 ## 2. 文档导入与异步任务
 
-- 支持格式：`.md`、`.txt`、`.pdf`、`.docx`、`.doc`、`.html`、`.htm`；每批最多 10 个文件，单文件最大 10 MiB。配置 `RAG_DOCLING_SERVICE_URL` 后 `.docx`/`.doc`（先经 LibreOffice 转 `.docx`）与 `.html`/`.htm` 由独立的 Docling 解析服务解析；未配置时 `.docx`/`.doc` 仍走 Go 进程内 OOXML，`.html`/`.htm` 不可导入。
+- 支持格式：`.md`、`.txt`、`.pdf`、`.docx`、`.doc`、`.html`、`.htm`；每批最多 10 个文件，单文件最大 10 MiB。`.docx`/`.doc`（先经 LibreOffice 转 `.docx`）与 `.html`/`.htm` 一律由独立的 Docling 解析服务解析（配置 `RAG_DOCLING_SERVICE_URL`）；未配置时 Word/HTML 上传在受理阶段被拒绝（进程内 Word 解析已删除）。
 - **异步受理**：`POST /v1/document-batches` 为每个文件在一个事务内写入 `document_jobs`（含文件字节、sha256、配置版本、`schedule_version=1`），以 `202` 返回批次和逐文件结果；解析/切分/Embedding/发布在 worker 后台完成。任务表由 Kafka Connect 的 `praxis-document-cdc` 连接器采集，不再写事务 outbox。上传 POST 可携带可选的 `X-Upload-ID`，与 `GET /v1/document-batches/upload-events/{upload_id}`（SSE）配对实时推送逐文件字节进度与保存结果；缺省该头时行为与响应完全不变。
 - 上传前可用 `POST /v1/documents/check` 做同名/SHA-256 预检；`Idempotency-Key` 支持重试复用原批次及其文件任务。
 - **批次上传（Console 使用）**：`POST /v1/document-batches` 先提交 `document_batches` + `document_batch_items`（每项 `saving`），再按输入顺序逐项受理每个文件（每项仍有独立的文件名锁与事务），最后把每项结果与计数写回并返回 `202`。顺序裁决保证最后一个文件/知识库名额归属确定，已受理项仍在后台异步运行。`GET /v1/document-batches/{batch_id}` 同时给出保存结果（`accepted`/`skipped`/`failed` + 原因）与已受理文件的 `job.status/stage`；`GET /v1/document-batches?limit=20` 只返回仍有未完成工作的批次，供 Console 刷新后恢复进度气泡。批次只是进度元数据，不保存文件字节，7 天后清理。Console 上传面板为每个文件一行独立进度条并先订阅 SSE（`ready` 后发 POST）：`progress.received` 是请求体累计接收的内容字节数（前端按本地 `File.size` 换算百分比），每文件 `result`（`saved`/`skipped`/`failed`）落地即结束该行；面板在保存结果处结束，不再展示或轮询解析阶段（解析阶段仍由批次状态接口的 `items[].job.status/stage` 暴露）。
@@ -44,15 +44,15 @@
 | --- | --- | --- |
 | PDF（vision，默认） | 独立 `pdf-parser` 微服务 + 远端视觉模型 | 本地 PyMuPDF 读取/渲染/裁图，版面分析、表格结构（行列/表头/合并单元格）、OCR、公式 LaTeX、图片描述统一由知识库配置的远端 OpenAI 兼容视觉模型完成；返回 zip：根 `manifest.json`（版本 `docling-service-v1`，证据格式契约）+ 图片资产 |
 | PDF（`RAG_PDF_ENGINE=go`） | Go 进程内纯文本引擎 | 按页抽正文、按基线分行、合并上标、去页眉页脚/页码、修复连字符换行；清单版本 `go-native-v1`；不支持版面/表格/OCR/公式/图片资产，扫描件会明确报“没有可索引的内容” |
-| DOCX | 配置 `RAG_DOCLING_SERVICE_URL` 时走独立 `docling-service`（`POST /v1/parse`，multipart 字段 `file`，返回 zip：版本化清单 + 序列化 `DoclingDocument` + 图片资产；`document.md` 由 Go 生成）；未配置时用 Go 进程内 OOXML 读取 | 解析在服务内完成时，Go 端只校验状态码/content-type、安全解压后切分；未配置 Docling 时保持历史进程内解析 |
-| DOC | 外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）转成 `.docx`；配置了 Docling 时转给 `docling-service`，否则由进程内 OOXML 解析 | 超时 `RAG_WORD_CONVERT_TIMEOUT`（默认 120s）；服务只接收 `.docx`/HTML，不直接接收 `.doc` |
+| DOCX | 独立 `docling-service`（`POST /v1/parse`，multipart 字段 `file`，返回 zip：版本化清单 + 序列化 `DoclingDocument` + 图片资产；`document.md` 由 Go 生成）；**必须配置 `RAG_DOCLING_SERVICE_URL`**，未配置时上传在受理阶段被拒绝 | Go 端只校验状态码/content-type、安全解压后切分；本地仍执行 zip 边界校验（条目数/加密/解压大小）后上传；进程内 OOXML 解析已删除 |
+| DOC | 外部 LibreOffice（`RAG_WORD_CONVERTER_PATH`）转成 `.docx` 后交给 `docling-service`（同样要求已配置 Docling） | 超时 `RAG_WORD_CONVERT_TIMEOUT`（默认 120s）；服务只接收 `.docx`/HTML，不直接接收 `.doc` |
 | HTML / HTM | 必须配置 `docling-service`（未配置时上传被拒绝/任务报 `ErrDoclingNotConfigured`） | 静态 HTML 上传；外部/相对图片不抓取、只保留文字说明（如替代文本）；Console 预览只展示解析后的纯文本，不在同源页面渲染或执行上传的 HTML；不支持网页抓取 |
 | Markdown/TXT | 直接读取 | 直接进入切分 |
 
 - **vision 引擎的强约束**：知识库必须已在 Console「模型配置」中添加并选中 VLM，否则 PDF 上传会在**受理阶段**被拒绝并提示配置，不进入队列；VLM 有 `RAG_VLM_*` 环境回退。同一个视觉模型承担 PDF 版面/OCR/表格/公式/图片描述。OCR 已并入视觉模型，不再有独立 OCR 模型类型；升级迁移会删除旧 `kind='ocr'` 配置并清除知识库中的 `ocr`/`ocr_model` 设置。旧值 `RAG_PDF_ENGINE=docling` 等价于 `vision`。
 - 解析上限：单文档最多 1000 页、解压后 50 MiB、最多 10000 个 zip 成员、500 万字符；pdf-parser 请求体默认上限 100 MiB。
 - 安全拒绝：非 `%PDF-` 文件、明显加密的 PDF、空抽取结果都会返回明确错误，不会静默入库垃圾文本。
-- **Docling 服务**：配置 `RAG_DOCLING_SERVICE_URL` 后，`.docx`/`.doc`（先经 LibreOffice 转 `.docx`）与 `.html`/`.htm` 通过该独立服务解析，单次调用超时 `RAG_DOCLING_SERVICE_TIMEOUT`（默认 300 秒，1..7200）；该 URL 为空时不启用 Docling：`.docx`/`.doc` 仍走进程内 OOXML，`.html`/`.htm` 不可导入（`.md`/`.txt`/`.pdf` 不受影响）。已配置但服务不可达时任务失败并按既有重试处理，不回退进程内解析。服务自身环境变量：`RAG_DOCLING_SERVICE_HOST`、`PORT`（默认 8092）、`RAG_DOCLING_SERVICE_TIMEOUT`、`RAG_DOCLING_SERVICE_PARSE_TIMEOUT`、`RAG_DOCLING_SERVICE_CONCURRENCY`、`RAG_DOCLING_SERVICE_WORKERS`、`RAG_DOCLING_SERVICE_MAX_BYTES`、`RAG_DOCLING_SERVICE_LOG_LEVEL`、`RAG_DOCLING_SERVICE_LOG_FORMAT`；容器端口 8092，健康检查 `/healthz`；依赖版本与启动方式见 `python-workers/docling-service/README.md`。
+- **Docling 服务**：`.docx`/`.doc`（先经 LibreOffice 转 `.docx`）与 `.html`/`.htm` 一律通过该独立服务解析（配置 `RAG_DOCLING_SERVICE_URL`），单次调用超时 `RAG_DOCLING_SERVICE_TIMEOUT`（默认 300 秒，1..7200）；该 URL 为空时 Word/HTML 上传在受理阶段被拒绝并提示配置（进程内 Word 解析已删除，`.md`/`.txt`/`.pdf` 不受影响）。已配置但服务不可达时任务失败并按既有重试处理，不回退进程内解析。服务自身环境变量：`RAG_DOCLING_SERVICE_HOST`、`PORT`（默认 8092）、`RAG_DOCLING_SERVICE_TIMEOUT`、`RAG_DOCLING_SERVICE_PARSE_TIMEOUT`、`RAG_DOCLING_SERVICE_CONCURRENCY`、`RAG_DOCLING_SERVICE_WORKERS`、`RAG_DOCLING_SERVICE_MAX_BYTES`、`RAG_DOCLING_SERVICE_LOG_LEVEL`、`RAG_DOCLING_SERVICE_LOG_FORMAT`；容器端口 8092，健康检查 `/healthz`；依赖版本与启动方式见 `python-workers/docling-service/README.md`。
 - **HTML 预览安全**：Console 以 React 文本节点渲染解析后的纯文本，不使用 `dangerouslySetInnerHTML`，上传的 HTML/JS 不会在 Console 同源页面执行。
 - 解析产物（`manifest.json`、`document.md`、图片、表格、图注/脚注）保存在共享状态库；检索命中时返回图片 Base64、表格行列/表头/合并信息与页码/版面或 Word 章节位置。
 - 图片/表格可经 `/v1/artifacts/{artifact_id}`、`/v1/artifacts/{artifact_id}/content` 读取。
@@ -73,7 +73,9 @@
 
 ## 5. 检索与重排
 
-- 检索模式：`bm25`（关键词）、`embedding`（语义）、`hybrid`（默认，Qdrant 服务端 RRF 融合 dense + sparse）、`sag2`（词法多跳：BM25 初筛 → JEV 必要证据判定 → 词项扩展再召回 → DPP 终排）、`sag`（事件-实体多跳：hybrid 种子召回 → chunk 映射事件/实体 → SQL join 沿共享实体扩展关联事件 → 融合排序）。
+- 检索模式：`bm25`（关键词）、`embedding`（语义）、`hybrid`（默认，Qdrant 服务端 RRF 融合 dense + sparse）、`sag2`（词法多跳：BM25 初筛 → JEV 必要证据判定 → 词项扩展再召回 → DPP 终排）、`graph`（知识图谱：LightRAG 侧车的实体/关系上下文，跨文档主题与关联查询）、`sag`（事件-实体多跳：hybrid 种子召回 → chunk 映射事件/实体 → SQL join 沿共享实体扩展关联事件 → 融合排序）。
+- `graph` 约束：需要部署侧配置 `RAG_LIGHTRAG_SERVICE_URL` 并运行 `python-workers/lightrag-service` 侧车，否则调用返回可解释的操作错误（`retrieval graph requires RAG_LIGHTRAG_SERVICE_URL ...`）；侧车**只返回上下文不返回答案**，结果仍走同一套证据投影与可见性过滤；索引按知识库独立 workspace 隔离，允许与 `cross_encoder` 叠加（先图谱召回再重排）。
+- `graph` 入库：知识库设置 `graph_enabled` 打开后，文档发布成功后把该文档的块异步镜像进图谱（`internal/runtime` 的 detached 运行，预算 30 分钟），镜像结果写 `lightrag_documents` 台账；镜像失败只留一条 `failed` 行并记警告，**不影响文档状态**（向量索引仍可用）。删除文档时同步删除图谱副本。知识库打开图谱却没配 `graph` 模型或部署没配侧车时，上传在**受理阶段**被拒绝并提示去「模型配置」。
 - `sag2` 约束：必须搭配 `rerank: none`（JEV 证据分即最终排序，校验层直接拒绝 `cross_encoder` 组合）；需要管理员在「模型配置」保存 `kind=jev` 条目，否则检索返回可解释的操作错误；语料在进程内按可见版本指纹缓存（发布/覆盖/删除自动失效），首次查询或失效后重建索引需要全量读取活跃 chunk；`candidate_k` 同时是每轮召回预算（SAG2 参考实现 B=100，建议给 50..100），轮数固定 3（1 轮初筛 + 2 轮扩展），扩展词 ≤20、种子 ≤10、终排前 10 名做 DPP；每次查询约 3 轮 JEV 决策调用，延迟与费用显著高于其他模式。
 - `sag` 离线索引：管理员在「模型配置」保存 `kind=extraction` 条目（OpenAI 兼容 chat 端点）后，文档发布完成后按 chunk 抽取一个事件（完整语义单元）+ ≤12 个规范化实体，事务写入 MySQL `sag_events`/`sag_entities`/`sag_event_entities`（每文档上限 512 chunk）；抽取是**非致命**阶段（失败仅记日志，文档仍 `succeeded`），未配置模型时整段跳过；存量文档用 `cmd/rag-sag-backfill` CLI 补建（Qdrant 活跃点为 chunk 来源，不复活已删文档）。实体归一化为 casefold join key，不做全局消歧；删除文档级联清理事件与关联（实体行保留）。
 - `sag` 查询行为：种子实体 ≤8、超边事件上限 32；融合分 = 种子召回分×0.5 + 共享实体数×0.5；超边候选从 Qdrant 补水原始 chunk 文本（证据边界不变），补水失败的候选被丢弃；无索引/无事件时**降级为 hybrid 召回**（不报错）。`rerank` 任意（融合分非唯一序，cross-encoder 合法）。结果 `metadata.sag_event` 携带事件句。
@@ -177,7 +179,7 @@ Hash 路由（namespace 不在 URL 中，保存在 `localStorage`，默认 `defa
 
 ## 11. 模型配置（model profiles）
 
-- 管理员在「模型配置」页维护可复用列表：`embedding` / `reranker` / `vlm` / `jev`；`(kind, name)` 唯一。
+- 管理员在「模型配置」页维护可复用列表：`embedding` / `reranker` / `vlm` / `jev` / `graph`；`(kind, name)` 唯一。`graph` 是知识图谱抽取模型（一个 OpenAI 兼容端点，LightRAG 的抽取与关键词两个角色共用它）。
 - Embedding/Reranker/VLM/JEV 保存 `base_url`、`model`、加密后的 API Key；Embedding 保存时会真实探测并记录 `vector_size`，Reranker 做一次有界探测，VLM 与 JEV 不探测。VLM 是唯一的远端视觉模型，PDF 版面/OCR/表格/公式/图片描述都由它完成；`ocr` 类型已删除（升级迁移会删除旧条目）。
 - 知识库保存的是**连接副本**（保存时把 profile 的 URL/模型/Key 复制进知识库配置），之后编辑/删除 profile 不影响已保存的知识库；知识库 REST 契约仍是内联连接对象。
 - 凭据加密格式 `enc:v1:`（AES-GCM，12 字节 nonce，`base64(nonce||ciphertext)`），密钥来自 `RAG_STATE_ENCRYPTION_KEY`（`base64:` 前缀的 32 字节）；旧 `dpapi:`/`private-file:` 记录只读兼容。

@@ -43,6 +43,12 @@ func doclingServiceManifestFixture(version string) WordManifest {
 
 func stringPtr(value string) *string { return &value }
 
+// docxSource writes one minimal valid DOCX package as the upload source.
+func docxSource(t *testing.T) string {
+	t.Helper()
+	return writeStagingZipPackage(t, filepath.Join(t.TempDir(), "manual.docx"))
+}
+
 type doclingServiceCall struct {
 	path        string
 	filename    string
@@ -94,7 +100,7 @@ func TestDoclingServiceParserParseInto(t *testing.T) {
 	server, call := newDoclingServiceServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeDoclingServiceZip(w, archive)
 	})
-	source := wordPicturePackage(t, pictureParagraph("rId1", "架构图"))
+	source := writeStagingZipPackage(t, filepath.Join(t.TempDir(), "manual.docx"))
 	staging := t.TempDir()
 	parser := &DoclingServiceParser{BaseURL: server.URL + "/"}
 	pkg, err := parser.ParseInto(context.Background(), source, "manual.docx", staging)
@@ -171,7 +177,7 @@ func TestDoclingServiceParserRejectsMismatchedManifestVersions(t *testing.T) {
 				writeDoclingServiceZip(w, archive)
 			})
 			parser := &DoclingServiceParser{BaseURL: server.URL}
-			_, err := parser.ParseInto(context.Background(), wordPicturePackage(t, pictureParagraph("rId1", "")), "manual.docx", t.TempDir())
+			_, err := parser.ParseInto(context.Background(), docxSource(t), "manual.docx", t.TempDir())
 			var parseErr *DoclingParseError
 			if !errors.As(err, &parseErr) || !strings.Contains(parseErr.Message, testCase.wantDetail) {
 				t.Fatalf("error = %v, want %q", err, testCase.wantDetail)
@@ -187,7 +193,7 @@ func TestDoclingServiceParserRejectsMissingImage(t *testing.T) {
 		writeDoclingServiceZip(w, archive)
 	})
 	parser := &DoclingServiceParser{BaseURL: server.URL}
-	_, err := parser.ParseInto(context.Background(), wordPicturePackage(t, pictureParagraph("rId1", "")), "manual.docx", t.TempDir())
+	_, err := parser.ParseInto(context.Background(), docxSource(t), "manual.docx", t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "缺失的图片文件") {
 		t.Fatalf("error = %v", err)
 	}
@@ -201,7 +207,7 @@ func TestDoclingServiceParserRejectsUnsafeArchivePaths(t *testing.T) {
 		writeDoclingServiceZip(w, archive)
 	})
 	parser := &DoclingServiceParser{BaseURL: server.URL}
-	_, err := parser.ParseInto(context.Background(), wordPicturePackage(t, pictureParagraph("rId1", "")), "manual.docx", t.TempDir())
+	_, err := parser.ParseInto(context.Background(), docxSource(t), "manual.docx", t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "不安全的路径") {
 		t.Fatalf("error = %v", err)
 	}
@@ -213,7 +219,7 @@ func TestDoclingServiceParserHTTPFailures(t *testing.T) {
 			http.Error(w, "boom", http.StatusInternalServerError)
 		})
 		parser := &DoclingServiceParser{BaseURL: server.URL}
-		_, err := parser.ParseInto(context.Background(), wordPicturePackage(t, pictureParagraph("rId1", "")), "manual.docx", t.TempDir())
+		_, err := parser.ParseInto(context.Background(), docxSource(t), "manual.docx", t.TempDir())
 		var parseErr *DoclingParseError
 		if !errors.As(err, &parseErr) || parseErr.StatusCode != http.StatusInternalServerError {
 			t.Fatalf("error = %v", err)
@@ -224,7 +230,7 @@ func TestDoclingServiceParserHTTPFailures(t *testing.T) {
 			http.Error(w, "timeout", http.StatusGatewayTimeout)
 		})
 		parser := &DoclingServiceParser{BaseURL: server.URL}
-		_, err := parser.ParseInto(context.Background(), wordPicturePackage(t, pictureParagraph("rId1", "")), "manual.docx", t.TempDir())
+		_, err := parser.ParseInto(context.Background(), docxSource(t), "manual.docx", t.TempDir())
 		if !errors.Is(err, ErrDoclingParseTimeout) {
 			t.Fatalf("error = %v, want ErrDoclingParseTimeout", err)
 		}
@@ -235,21 +241,21 @@ func TestDoclingServiceParserHTTPFailures(t *testing.T) {
 			_, _ = w.Write([]byte("<html>oops</html>"))
 		})
 		parser := &DoclingServiceParser{BaseURL: server.URL}
-		_, err := parser.ParseInto(context.Background(), wordPicturePackage(t, pictureParagraph("rId1", "")), "manual.docx", t.TempDir())
+		_, err := parser.ParseInto(context.Background(), docxSource(t), "manual.docx", t.TempDir())
 		if err == nil || !strings.Contains(err.Error(), "非 ZIP") {
 			t.Fatalf("error = %v", err)
 		}
 	})
 	t.Run("unreachable", func(t *testing.T) {
 		parser := &DoclingServiceParser{BaseURL: "http://127.0.0.1:1"}
-		_, err := parser.ParseInto(context.Background(), wordPicturePackage(t, pictureParagraph("rId1", "")), "manual.docx", t.TempDir())
+		_, err := parser.ParseInto(context.Background(), docxSource(t), "manual.docx", t.TempDir())
 		if err == nil || !strings.Contains(err.Error(), "不可用") {
 			t.Fatalf("error = %v", err)
 		}
 	})
 	t.Run("missing_base_url", func(t *testing.T) {
 		parser := &DoclingServiceParser{}
-		_, err := parser.ParseInto(context.Background(), wordPicturePackage(t, pictureParagraph("rId1", "")), "manual.docx", t.TempDir())
+		_, err := parser.ParseInto(context.Background(), docxSource(t), "manual.docx", t.TempDir())
 		if err == nil || !strings.Contains(err.Error(), "地址未配置") {
 			t.Fatalf("error = %v", err)
 		}
@@ -296,7 +302,7 @@ func TestDoclingServiceParserRejectsInvalidLocalInput(t *testing.T) {
 				pdfServiceZipMember{name: "images/picture-1.png", data: []byte("PNGDATA")}))
 		})
 		parser := &DoclingServiceParser{BaseURL: server.URL}
-		_, err := parser.ParseInto(ctx, wordPicturePackage(t, pictureParagraph("rId1", "")), "manual.docx", t.TempDir())
+		_, err := parser.ParseInto(ctx, docxSource(t), "manual.docx", t.TempDir())
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("error = %v, want context.Canceled", err)
 		}

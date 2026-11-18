@@ -24,6 +24,12 @@ const (
 	// It requires a configured JEV decision model and pairs with rerank=none:
 	// the JEV evidence score is the final ordering.
 	RetrievalSAG2 RetrievalMode = "sag2"
+	// RetrievalGraph is the LightRAG knowledge-graph mode: it traverses the
+	// workspace graph (entities and relations) plus the text chunks they came
+	// from and returns that evidence, never a generated answer. It requires a
+	// configured LightRAG sidecar and pairs with any rerank mode because the
+	// graph score is the relevance signal, not a generated ordering.
+	RetrievalGraph RetrievalMode = "graph"
 	// RetrievalSAG is the event-entity mode of the SAG architecture
 	// (Zleap-AI/SAG): offline extraction persists one event plus normalized
 	// entities per chunk, and the search joins seed entities into their
@@ -174,8 +180,9 @@ func SearchRequestFromArguments(arguments map[string]any) (SearchRequest, error)
 	if raw, exists := arguments["retrieval"]; exists {
 		value, ok := raw.(string)
 		if !ok || (value != string(RetrievalBM25) && value != string(RetrievalEmbedding) &&
-			value != string(RetrievalHybrid) && value != string(RetrievalSAG2) && value != string(RetrievalSAG)) {
-			return SearchRequest{}, validationError("retrieval must be bm25, embedding, hybrid, sag2, or sag")
+			value != string(RetrievalHybrid) && value != string(RetrievalSAG2) &&
+			value != string(RetrievalGraph) && value != string(RetrievalSAG)) {
+			return SearchRequest{}, validationError("retrieval must be bm25, embedding, hybrid, sag2, graph, or sag")
 		}
 		retrieval = RetrievalMode(value)
 	}
@@ -323,7 +330,9 @@ const SearchToolDescription = "Search user-uploaded/local knowledge for manuals,
 	"not already established in the conversation. Prefer hybrid + cross_encoder initially; use bm25 " +
 	"for exact codes/names and embedding for semantic paraphrases. When the knowledge base has a " +
 	"configured JEV decision model, retrieval sag2 chains multi-hop lexical evidence with " +
-	"necessary-evidence decisions (requires rerank none). When documents were indexed with an " +
+	"necessary-evidence decisions (requires rerank none). When the deployment has a Knowledge Graph " +
+	"index, retrieval graph answers cross-document entity/relationship questions that plain chunk " +
+	"retrieval misses. When documents were indexed with an " +
 	"extraction model, retrieval sag joins event-entity evidence across chunks (multi-hop through " +
 	"shared entities). Cite returned source and chunk_id. " +
 	"If evidence_status is no_evidence, rewrite the query once when useful, otherwise say the knowledge " +
@@ -352,7 +361,14 @@ func SearchToolSchema() map[string]any {
 	properties := map[string]any{
 		"query": map[string]any{"type": "string", "minLength": 1, "maxLength": 2000},
 		"retrieval": map[string]any{
-			"type": "string", "enum": []string{"bm25", "embedding", "hybrid", "sag2", "sag"}, "default": "hybrid",
+			"type":    "string",
+			"enum":    []string{"bm25", "embedding", "hybrid", "sag2", "graph", "sag"},
+			"default": "hybrid",
+			"description": "Candidate generator. bm25 matches exact codes and names, embedding matches " +
+				"semantic paraphrases, hybrid fuses both, sag2 chains multi-hop lexical evidence " +
+				"(requires rerank none). graph traverses the LightRAG knowledge graph and returns " +
+				"the matched entities and relations plus their text-chunk context as evidence, " +
+				"never a generated answer. sag joins event-entity evidence across chunks.",
 		},
 		"rerank": map[string]any{
 			"type": "string", "enum": []string{"none", "cross_encoder"}, "default": "cross_encoder",

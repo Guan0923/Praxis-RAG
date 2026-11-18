@@ -85,6 +85,14 @@ func (r *PermissionRepository) ListFor(ctx context.Context, namespace, granteeUs
 // triple is unique, so re-issuing a permission overwrites the level instead of
 // duplicating rows. An empty ID is generated.
 func (r *PermissionRepository) Upsert(ctx context.Context, permission Permission) error {
+	return upsertPermissionRow(ctx, r.db, permission, nowISO())
+}
+
+// upsertPermissionRow writes one grant through the pool or an open
+// transaction (both satisfy sqlQueryer). An empty ID is generated; the
+// (namespace, grantee, document_name) triple is unique, so re-issuing a
+// permission overwrites the level instead of duplicating rows.
+func upsertPermissionRow(ctx context.Context, db sqlQueryer, permission Permission, timestamp string) error {
 	id := permission.ID
 	if id == "" {
 		generated, err := randomHex(16)
@@ -93,8 +101,7 @@ func (r *PermissionRepository) Upsert(ctx context.Context, permission Permission
 		}
 		id = generated
 	}
-	timestamp := nowISO()
-	if _, err := r.db.ExecContext(ctx,
+	if _, err := db.ExecContext(ctx,
 		"INSERT INTO kb_permissions ("+permissionColumns+") VALUES (?, ?, ?, ?, ?, ?, ?, ?) "+
 			"ON DUPLICATE KEY UPDATE permission = VALUES(permission), granted_by = VALUES(granted_by), "+
 			"updated_at = VALUES(updated_at)",
@@ -119,21 +126,8 @@ func (r *PermissionRepository) UpsertMany(ctx context.Context, permissions []Per
 	defer func() { _ = transaction.Rollback() }()
 	timestamp := nowISO()
 	for _, permission := range permissions {
-		id := permission.ID
-		if id == "" {
-			generated, generateErr := randomHex(16)
-			if generateErr != nil {
-				return newStateError("知识库权限无法保存")
-			}
-			id = generated
-		}
-		if _, err := transaction.ExecContext(ctx,
-			"INSERT INTO kb_permissions ("+permissionColumns+") VALUES (?, ?, ?, ?, ?, ?, ?, ?) "+
-				"ON DUPLICATE KEY UPDATE permission = VALUES(permission), granted_by = VALUES(granted_by), "+
-				"updated_at = VALUES(updated_at)",
-			id, permission.Namespace, permission.GranteeUserID, permission.DocumentName,
-			permission.Permission, permission.GrantedBy, timestamp, timestamp); err != nil {
-			return newStateError("知识库权限无法保存")
+		if err := upsertPermissionRow(ctx, transaction, permission, timestamp); err != nil {
+			return err
 		}
 	}
 	if err := transaction.Commit(); err != nil {

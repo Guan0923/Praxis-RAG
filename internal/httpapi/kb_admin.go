@@ -9,7 +9,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/chunking"
 )
 
-var knowledgeBaseKinds = map[string]struct{}{"embedding": {}, "reranker": {}, "vlm": {}}
+var knowledgeBaseKinds = map[string]struct{}{"embedding": {}, "reranker": {}, "vlm": {}, "graph": {}}
 
 // providerSettings mirrors http_service.ProviderSettingsBody.
 type providerSettings struct {
@@ -30,14 +30,19 @@ func (p providerSettings) values() map[string]any {
 
 // KnowledgeBaseCreateInput is the transport-neutral create request.
 type KnowledgeBaseCreateInput struct {
-	Namespace              string
-	Chunking               chunking.Config
-	EmbeddingModel         string
-	RerankerModel          string
-	EmbeddingValues        map[string]any
-	RerankerValues         map[string]any
-	VLMModel               string
-	VLMValues              map[string]any
+	Namespace       string
+	Chunking        chunking.Config
+	EmbeddingModel  string
+	RerankerModel   string
+	EmbeddingValues map[string]any
+	RerankerValues  map[string]any
+	VLMModel        string
+	VLMValues       map[string]any
+	// GraphModel and GraphValues are the knowledge-graph extraction model of
+	// the knowledge base; GraphEnabled is its per-knowledge-base switch.
+	GraphModel             string
+	GraphValues            map[string]any
+	GraphEnabled           bool
 	EmbeddingBillingSource string
 }
 
@@ -155,6 +160,9 @@ type createKnowledgeBaseBody struct {
 	RerankerModel          string            `json:"reranker_model"`
 	VLM                    *providerSettings `json:"vlm"`
 	VLMModel               string            `json:"vlm_model"`
+	Graph                  *providerSettings `json:"graph"`
+	GraphModel             string            `json:"graph_model"`
+	GraphEnabled           bool              `json:"graph_enabled"`
 	EmbeddingBillingSource string            `json:"embedding_billing_source"`
 	Strategy               string            `json:"strategy"`
 	ChunkSize              *int              `json:"chunk_size"`
@@ -168,6 +176,9 @@ type updateKnowledgeBaseBody struct {
 	RerankerModel          *string           `json:"reranker_model"`
 	VLM                    *providerSettings `json:"vlm"`
 	VLMModel               *string           `json:"vlm_model"`
+	Graph                  *providerSettings `json:"graph"`
+	GraphModel             *string           `json:"graph_model"`
+	GraphEnabled           *bool             `json:"graph_enabled"`
 	EmbeddingBillingSource *string           `json:"embedding_billing_source"`
 	Reembed                bool              `json:"reembed"`
 }
@@ -191,6 +202,15 @@ func (body updateKnowledgeBaseBody) values() map[string]any {
 	}
 	if body.VLMModel != nil {
 		values["vlm_model"] = *body.VLMModel
+	}
+	if body.Graph != nil {
+		values["graph"] = body.Graph.values()
+	}
+	if body.GraphModel != nil {
+		values["graph_model"] = *body.GraphModel
+	}
+	if body.GraphEnabled != nil {
+		values["graph_enabled"] = *body.GraphEnabled
 	}
 	return values
 }
@@ -314,15 +334,23 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 	if body.VLM != nil {
 		vlmValues = body.VLM.values()
 	}
+	graphValues := map[string]any{}
+	if body.Graph != nil {
+		graphValues = body.Graph.values()
+	}
 	payload, err := s.kbAdmin.CreateKnowledgeBase(r.Context(), KnowledgeBaseCreateInput{
 		Namespace:       body.Namespace,
 		Chunking:        configuration,
 		EmbeddingModel:  *body.EmbeddingModel,
 		RerankerModel:   body.RerankerModel,
 		EmbeddingValues: embeddingValues,
-		RerankerValues:         rerankerValues,
-		VLMModel:               body.VLMModel,
-		VLMValues:              vlmValues,
+		RerankerValues:  rerankerValues,
+		VLMModel:        body.VLMModel,
+		VLMValues:       vlmValues,
+		GraphModel:      body.GraphModel,
+		GraphValues:     graphValues,
+		GraphEnabled:    body.GraphEnabled,
+
 		EmbeddingBillingSource: body.EmbeddingBillingSource,
 	})
 	if err != nil {
@@ -368,7 +396,7 @@ func (s *Server) handleKnowledgeBaseKey(w http.ResponseWriter, r *http.Request) 
 	if _, ok := knowledgeBaseKinds[kind]; !ok {
 		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
 			Type: "literal_error", Loc: []any{"path", "kind"},
-			Msg: "Input should be 'embedding', 'reranker', 'vlm'",
+			Msg: "Input should be 'embedding', 'reranker', 'vlm', 'graph'",
 		}})
 		return
 	}
@@ -394,7 +422,7 @@ func (s *Server) handleKnowledgeBaseModels(w http.ResponseWriter, r *http.Reques
 	if _, ok := knowledgeBaseKinds[kind]; !ok {
 		writeValidation(w, http.StatusUnprocessableEntity, []validationDetail{{
 			Type: "literal_error", Loc: []any{"path", "kind"},
-			Msg: "Input should be 'embedding', 'reranker', 'vlm'",
+			Msg: "Input should be 'embedding', 'reranker', 'vlm', 'graph'",
 		}})
 		return
 	}
