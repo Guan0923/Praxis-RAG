@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -228,6 +229,17 @@ func (s *stubDocumentViews) Documents(context.Context, string) ([]map[string]any
 		return nil, s.err
 	}
 	return s.documents, nil
+}
+
+func TestListDocumentsReturnsCacheRetryableWithoutFallback(t *testing.T) {
+	retryable := &state.CacheRetryable{Message: "State cache backfill wait timed out; retry later"}
+	viewErr := fmt.Errorf("document view: %w", retryable)
+	// No repository is needed when the view asks the caller to retry.
+	service := &Service{views: &stubDocumentViews{err: viewErr}}
+	documents, err := service.ListDocuments(context.Background(), "alpha")
+	if documents != nil || err != viewErr {
+		t.Fatalf("ListDocuments() = %+v, %v, want nil and the original view error", documents, err)
+	}
 }
 
 func TestListDocumentsUsesCachedReadViewsAndFallback(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // fakeDocRuntime extends fakeServiceRuntime with document and knowledge-base
@@ -169,6 +170,20 @@ func multipartBody(t *testing.T, fields map[string]string, filename, content str
 		t.Fatalf("close writer: %v", err)
 	}
 	return buffer.String(), writer.FormDataContentType()
+}
+
+func TestListDocumentsReturnsServiceUnavailableOnCacheRetry(t *testing.T) {
+	runtime := newFakeDocRuntime()
+	runtime.listErr = &state.CacheRetryable{Message: "State cache backfill wait timed out; retry later"}
+	handler := newRuntimeServer(t, runtime).Handler()
+
+	response := performRequest(handler, testRequest{method: "GET", target: "/v1/documents", headers: tenantAuth()})
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("list status = %d body = %s", response.Code, response.Body.String())
+	}
+	if detail := decodeBody(t, response)["detail"]; detail != "服务繁忙，请稍后重试" {
+		t.Fatalf("list detail = %v", detail)
+	}
 }
 
 func TestDocumentsEndpoints(t *testing.T) {

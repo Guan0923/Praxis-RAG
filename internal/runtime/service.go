@@ -200,18 +200,17 @@ func (s *Service) PublicKnowledgeBase(ctx context.Context, namespace string) (ma
 // ListDocuments returns the display document list through the cached read view
 // (Python state.views.documents), so repeated reads share the same snapshot and
 // event ordering as the other view endpoints. The view already overlays the
-// knowledge-base collection/embedding_model; when views are unavailable or fail
-// the authoritative repository is used as a fallback — except when the display
-// fallback budget is exhausted: that *state.ViewBackpressureError was raised
-// precisely to protect MySQL, so re-reading the repository would bypass the
-// limit and it propagates to REST/MCP unchanged.
+// knowledge-base collection/embedding_model. Return backpressure and retryable
+// cache errors to the caller so a direct repository read cannot bypass the
+// fallback budget or the cache backfill lock.
 func (s *Service) ListDocuments(ctx context.Context, namespace string) ([]map[string]any, error) {
 	if s.views != nil {
 		documents, err := s.views.Documents(ctx, namespace)
 		if err == nil {
 			return documents, nil
 		}
-		if state.IsViewBackpressure(err) {
+		var retryable *state.CacheRetryable
+		if state.IsViewBackpressure(err) || errors.As(err, &retryable) {
 			return nil, err
 		}
 	}

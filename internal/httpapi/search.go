@@ -84,6 +84,10 @@ func runtimeErrorStatus(err error) (int, string) {
 	if errors.As(err, &backpressure) {
 		return http.StatusServiceUnavailable, backpressure.Message
 	}
+	var retryable *state.CacheRetryable
+	if errors.As(err, &retryable) {
+		return http.StatusServiceUnavailable, state.ViewBackpressureMessage
+	}
 	return http.StatusInternalServerError, "Internal Server Error"
 }
 
