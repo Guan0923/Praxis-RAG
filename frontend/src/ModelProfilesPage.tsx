@@ -43,13 +43,20 @@ const jevModelSuggestions = [
 const jevModelHint =
   "JEV 是 TypeSafe System One 决策模型，没有 /models 接口，可直接输入模型名且仅保存配置供后续使用";
 
-// ModelProfilesPage 维护当前账号自己的 Embedding / Reranker / VLM / JEV 连接：
+// extraction 是 SAG 事件-实体抽取用的 OpenAI 兼容 chat 模型：文档入库时
+// 每个 chunk 调用一次，产出该 chunk 的完整事件句与实体名列表。
+const extractionModelHint =
+  "抽取模型用于 SAG 检索的事件-实体索引：文档入库时按 chunk 调用（建议选用低价快速的 chat 模型，如 qwen-flash / deepseek-chat）";
+
+// ModelProfilesPage 维护当前账号自己的 Embedding / Reranker / VLM / JEV / 抽取 连接：
 // 每个账号只能编辑、删除和读取自己的 Key；管理员额外看到所有人的配置，但别人的
 // 行是只读的（服务端也会以 404 拒绝编辑、删除和读 Key）。创建和修改知识库时只能
 // 从自己的知识库模型类型中选择，页面本身不保存任何明文 Key。
 // VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 版面/OCR/表格/公式/图片描述都由它完成。
 // JEV（TypeSafe System One 决策模型）仅保存 Console 配置供后续使用，不会出现在
 // 知识库表单中，也没有 OpenAI /models 模型列表接口。
+// 抽取（extraction）模型驱动 SAG 检索的事件-实体索引：文档发布后按 chunk 抽取
+// 事件与实体写入 MySQL，未配置时该阶段整体跳过（不影响文档发布）。
 export function ModelProfilesPage({ disabled, onChanged, role }: {
   disabled: boolean;
   onChanged?: () => void;
@@ -110,7 +117,7 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
   }, [load]);
 
   const counts = useMemo(() => {
-    const result: Record<ModelKind, number> = { embedding: 0, reranker: 0, vlm: 0, jev: 0 };
+    const result: Record<ModelKind, number> = { embedding: 0, reranker: 0, vlm: 0, jev: 0, extraction: 0 };
     for (const profile of profiles) {
       if (profile.kind in result) result[profile.kind] += 1;
     }
@@ -203,7 +210,8 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
 
   async function loadModels() {
     const values = form.getFieldsValue();
-    // JEV 没有 OpenAI /models 接口，不做远端探测。
+    // JEV 没有 OpenAI /models 接口，不做远端探测。extraction 是标准
+    // OpenAI 兼容 chat 端点，可以像 embedding 一样探测 /models。
     if (values.kind === "jev") return;
     const baseUrl = cleanUrl(values.base_url || "");
     if (!baseUrl) {
@@ -555,7 +563,7 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
             name="model"
             label="模型名称"
             rules={[{ required: true, whitespace: true, message: "请输入或获取模型名称" }]}
-            extra={formKind === "jev" ? jevModelHint : modelHint || undefined}
+            extra={formKind === "jev" ? jevModelHint : formKind === "extraction" ? extractionModelHint : modelHint || undefined}
           >
             <AutoComplete
               options={formKind === "jev" ? jevModelSuggestions : models.map((value) => ({ value }))}

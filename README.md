@@ -8,7 +8,7 @@
 
 ![Console 检索 X7 终端的 E03 故障码并显示手册原文与来源章节](docs/images/console-search.gif)
 
-Console 使用示例响应展示混合检索。输入 E03 故障问题后，可以看到 [X7 维护手册](examples/knowledge/x7-maintenance-manual.md)中的处理步骤和来源章节。
+Console 使用示例响应展示混合检索。输入 E03 故障问题后，可以看到 [X7 维护手册](examples/knowledge/x7-maintenance-manual.md)中的处理步骤和来源章节。除 BM25 / Embedding / Hybrid 外，配置抽取模型后还可启用 SAG 事件-实体检索，跨 chunk 追溯共享实体的关联证据（见[使用指南](docs/USAGE.md#sag-事件-实体检索retrieval-sag)）。
 
 ## 5 分钟快速开始
 

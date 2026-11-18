@@ -127,7 +127,7 @@ func ProbeModelProfile(
 			return nil, err
 		}
 		return nil, nil
-	case "vlm", "jev":
+	case "vlm", "jev", "extraction":
 		return nil, nil
 	default:
 		return nil, NewValidationError(MessageModelKindInvalid)
