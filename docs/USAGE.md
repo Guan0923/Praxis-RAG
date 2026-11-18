@@ -469,6 +469,31 @@ PDF 总解析容量上限为 `RAG_PDF_SERVICE_WORKERS × RAG_PDF_SERVICE_CONCURR
 
 ## 4. 启动与冒烟
 
+### 用 Console 跑通文档导入与检索
+
+在 Windows 上准备 PowerShell 7、Go 1.27+、Node.js 20.19+ 或 22.12+，以及 Docker Compose。首次启动需要下载依赖和镜像。
+
+1. 在仓库根目录创建配置文件并生成状态库加密密钥。
+
+   ```powershell
+   Copy-Item .env.example .env
+   'base64:' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+   ```
+
+   将密钥输出写入 `.env` 的 `RAG_STATE_ENCRYPTION_KEY`，并填写 `RAG_MYSQL_PASSWORD` 和 `MYSQL_ROOT_PASSWORD`。
+
+2. 构建并启动本机服务。
+
+   ```powershell
+   pwsh -File scripts/build-go.ps1
+   pwsh -File scripts/start-stack.ps1
+   ```
+
+3. 打开 [Console](http://127.0.0.1:8011/console)。首次启动时注册账号，在「模型配置」添加 Embedding 模型，然后创建知识库并选用该模型。
+4. 上传 [X7 智能终端维护手册](../examples/knowledge/x7-maintenance-manual.md)。等文档索引成功后，在「检索调试」选择混合检索，输入「X7 终端出现 E03 温度保护后怎么处理？」。检查命中片段的来源章节，手册第 6.2 节列出了普通用户的处理步骤。[查看示例结果](images/console-search.png)
+
+首次只想查看证据结构时，可以运行 [README 的 5 分钟示例](../README.md#5-分钟快速开始)。
+
 ### 启动 rag-service
 
 ```powershell
