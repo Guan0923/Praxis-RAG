@@ -16,6 +16,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 	"github.com/Guan0923/Praxis-RAG/internal/logging"
 	"github.com/Guan0923/Praxis-RAG/internal/resources"
+	"github.com/Guan0923/Praxis-RAG/internal/runtime"
 )
 
 // Resource behavior ported from rag_mcp/mcp_http.py (NamespaceEndpoint):
@@ -101,18 +102,15 @@ func (e *Endpoint) readResource(ctx context.Context, namespace string, params *s
 		if parseErr != nil {
 			return nil, invalidParams(parseErr.Error())
 		}
+		if hasScope && scope.Restricted() {
+			// REST and MCP enforce the same document-level artifact visibility:
+			// the runtime resolves the artifact's parent document and applies
+			// the caller's file-level grants in one transaction.
+			ctx = runtime.WithDocumentReadGate(ctx, scope.CanReadDocument)
+		}
 		payload, runtimeErr := e.opts.Runtime.GetArtifact(ctx, namespace, artifactID, offset, length)
 		if runtimeErr != nil {
 			return nil, invalidParams(runtimeErr.Error())
-		}
-		// Artifacts embed the source document name; a file-level grant may only
-		// read artifacts of readable documents. The generic message avoids
-		// revealing whether the UUID exists at all.
-		if hasScope && scope.Restricted() {
-			name, _ := payload["name"].(string)
-			if name == "" || !scope.CanReadDocument(name) {
-				return nil, invalidParams(access.MessageKnowledgeAccess)
-			}
 		}
 		// Copy before decorating so the runtime's payload is never mutated.
 		public := make(map[string]any, len(payload)+1)

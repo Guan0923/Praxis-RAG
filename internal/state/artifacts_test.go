@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -302,6 +303,106 @@ func TestArtifactSurvivesDocumentAndBlobDeletion(t *testing.T) {
 	_, stored, err := registry.Read(ctx, "alpha", artifact.ArtifactID)
 	if err != nil || string(stored) != string(content) {
 		t.Fatalf("Read() after cleanup = %q, %v", stored, err)
+	}
+}
+
+// insertArtifactDocument stores one visible parent document row for the
+// authorized artifact read tests.
+func insertArtifactDocument(t *testing.T, stores *Stores, namespace, name, documentID string) {
+	t.Helper()
+	if err := stores.Documents.Upsert(context.Background(), namespace, DocumentRecord{
+		Name: name, DocumentID: documentID, Size: 1, Collection: "c",
+		ModifiedAt: "2026-11-08T10:00:00.000000+00:00",
+		IndexedAt:  "2026-11-08T10:00:00.000000+00:00",
+	}); err != nil {
+		t.Fatalf("Documents.Upsert() error = %v", err)
+	}
+}
+
+func requireArtifactForbidden(t *testing.T, err error) {
+	t.Helper()
+	var forbidden *ArtifactForbidden
+	if !errors.As(err, &forbidden) {
+		t.Fatalf("error = %v, want *ArtifactForbidden", err)
+	}
+	if forbidden.Message != messageArtifactDocumentAccess {
+		t.Fatalf("message = %q, want %q", forbidden.Message, messageArtifactDocumentAccess)
+	}
+}
+
+func TestArtifactAuthorizedReadEnforcesDocumentGrant(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+	insertArtifactDocument(t, stores, "alpha", "report.pdf", "doc-a")
+	insertArtifactDocument(t, stores, "alpha", "other.md", "doc-b")
+	registry := newTestArtifactRegistry(t, stores, DefaultArtifactTTLSeconds, fixedClock(100), nil)
+	// A markdown side-car artifact: its name is an asset label, so the gate
+	// must consult the parent document, not the artifact name.
+	options := defaultArtifactOptions()
+	options.kind = "markdown"
+	options.name = "document.md"
+	artifact, err := registerArtifact(t, registry, options)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	granted := map[string]bool{"report.pdf": true}
+	gate := func(name string) bool { return granted[name] }
+
+	// The parent document is readable: bytes and metadata come back.
+	read, content, err := registry.ReadAuthorized(ctx, "alpha", artifact.ArtifactID, gate)
+	if err != nil || string(content) != string(options.content) || read.ArtifactID != artifact.ArtifactID {
+		t.Fatalf("ReadAuthorized(granted) = %+v, %q, %v", read, content, err)
+	}
+	chunk, err := registry.ChunkAuthorized(ctx, "alpha", artifact.ArtifactID, 0, 1024, gate)
+	if err != nil || chunk.Name != "document.md" || chunk.TotalBytes != len(options.content) {
+		t.Fatalf("ChunkAuthorized(granted) = %+v, %v", chunk, err)
+	}
+
+	// Only another document is granted: the read is denied without content.
+	_, _, err = registry.ReadAuthorized(ctx, "alpha", artifact.ArtifactID, func(string) bool { return false })
+	requireArtifactForbidden(t, err)
+	_, err = registry.ChunkAuthorized(ctx, "alpha", artifact.ArtifactID, 0, 1024, func(string) bool { return false })
+	requireArtifactForbidden(t, err)
+
+	// A nil gate keeps the unrestricted historical behaviour.
+	_, content, err = registry.ReadAuthorized(ctx, "alpha", artifact.ArtifactID, nil)
+	if err != nil || string(content) != string(options.content) {
+		t.Fatalf("ReadAuthorized(nil gate) = %q, %v", content, err)
+	}
+
+	// A different namespace never leaks through the gated path.
+	_, _, err = registry.ReadAuthorized(ctx, "beta", artifact.ArtifactID, gate)
+	var unavailable *ArtifactUnavailable
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("cross-namespace error = %v, want *ArtifactUnavailable", err)
+	}
+}
+
+func TestArtifactAuthorizedReadFailsClosedWithoutParentDocument(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+	insertArtifactDocument(t, stores, "alpha", "report.pdf", "doc-a")
+	registry := newTestArtifactRegistry(t, stores, DefaultArtifactTTLSeconds, nil, nil)
+	options := defaultArtifactOptions()
+	artifact, err := registerArtifact(t, registry, options)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// The parent document is deleted: no document-level grant can cover it
+	// anymore, so the gated read fails closed even for a permissive gate.
+	if _, err := stores.Documents.Delete(ctx, "alpha", "report.pdf"); err != nil {
+		t.Fatalf("Documents.Delete() error = %v", err)
+	}
+	_, _, err = registry.ReadAuthorized(ctx, "alpha", artifact.ArtifactID, func(string) bool { return true })
+	requireArtifactForbidden(t, err)
+
+	// The unrestricted read keeps its historical behaviour: artifacts survive
+	// document deletion.
+	_, content, err := registry.Read(ctx, "alpha", artifact.ArtifactID)
+	if err != nil || string(content) != string(options.content) {
+		t.Fatalf("Read() after deletion = %q, %v", content, err)
 	}
 }
 

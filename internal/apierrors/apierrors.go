@@ -24,6 +24,14 @@ type SnapshotUnavailable struct{ Message string }
 // Error implements error.
 func (e *SnapshotUnavailable) Error() string { return e.Message }
 
+// ArtifactForbidden marks an artifact read denied by the caller's document-level
+// read grant (HTTP 403). It is distinct from SnapshotUnavailable so a permission
+// denial never surfaces as a missing snapshot.
+type ArtifactForbiddenError struct{ Message string }
+
+// Error implements error.
+func (e *ArtifactForbiddenError) Error() string { return e.Message }
+
 // UploadConflict marks a colliding document name, queued upload or reused
 // idempotency key (HTTP 409).
 type UploadConflict struct{ Message string }
@@ -51,6 +59,10 @@ func (e *KnowledgeValidationError) ErrorCategory() string { return "validation_e
 // ErrorCategory implements the optional interface internal/logging uses to
 // classify a failure without importing this package.
 func (e *SnapshotUnavailable) ErrorCategory() string { return "snapshot_unavailable" }
+
+// ErrorCategory implements the optional interface internal/logging uses to
+// classify a failure without importing this package.
+func (e *ArtifactForbiddenError) ErrorCategory() string { return "artifact_forbidden" }
 
 // ErrorCategory implements the optional interface internal/logging uses to
 // classify a failure without importing this package.

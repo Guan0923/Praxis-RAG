@@ -23,6 +23,25 @@ func newArtifactUnavailable(message string) *ArtifactUnavailable {
 	return &ArtifactUnavailable{Message: message}
 }
 
+// messageArtifactDocumentAccess is the frozen user-facing denial for an
+// artifact whose parent document the caller may not read. It mirrors the
+// access-layer wording of a document read denial (access.MessageKnowledgeAccess)
+// and must stay identical so REST and MCP keep their replies stable.
+const messageArtifactDocumentAccess = "无权访问该知识库"
+
+// ArtifactForbidden reports an artifact whose parent document is outside the
+// caller's document-level read grants. It is distinct from ArtifactUnavailable
+// so the HTTP/MCP layers answer a permission denial instead of reporting a
+// missing snapshot.
+type ArtifactForbidden struct{ Message string }
+
+// Error implements error.
+func (e *ArtifactForbidden) Error() string { return e.Message }
+
+func newArtifactForbidden(message string) *ArtifactForbidden {
+	return &ArtifactForbidden{Message: message}
+}
+
 // DefaultArtifactTTLSeconds and DefaultArtifactMaxBytes are the Python defaults.
 const (
 	DefaultArtifactTTLSeconds = 3600.0
@@ -264,18 +283,106 @@ func (r *ArtifactRegistry) Read(ctx context.Context, namespace, artifactID strin
 	return publicArtifact(value), content, nil
 }
 
+// ReadAuthorized reads one artifact like Read while enforcing the caller's
+// document-level read grants: mayReadDocument decides whether one document name
+// is readable, and a nil gate keeps Read's unrestricted behaviour.
+//
+// The gated path resolves the artifact's parent document name from the documents
+// table and applies the gate inside one transaction that also reads the
+// artifact bytes; the bytes are released only after the gate grants access, so
+// the permission decision and the content read share one consistent snapshot
+// and one commit. A parent document that is missing or logically deleted fails
+// closed: no grant can reference it anymore.
+func (r *ArtifactRegistry) ReadAuthorized(
+	ctx context.Context, namespace, artifactID string, mayReadDocument func(string) bool,
+) (Artifact, []byte, error) {
+	if mayReadDocument == nil {
+		return r.Read(ctx, namespace, artifactID)
+	}
+	if namespace == "" || len(namespace) > 64 {
+		return Artifact{}, nil, newArtifactUnavailable("Artifact is unavailable")
+	}
+	if !canonicalUUID(artifactID) {
+		return Artifact{}, nil, newArtifactUnavailable("Artifact is unavailable")
+	}
+	now, err := r.now()
+	if err != nil {
+		return Artifact{}, nil, err
+	}
+	transaction, err := r.stores.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return Artifact{}, nil, err
+	}
+	defer func() { _ = transaction.Rollback() }()
+	var content []byte
+	var value rowArtifact
+	if err := transaction.QueryRowContext(ctx,
+		"SELECT id, namespace, document_id, version, kind, name, mime_type, expires_at, content "+
+			"FROM artifact_snapshots WHERE namespace = ? AND id = ? AND expires_at > ?",
+		namespace, artifactID, now).
+		Scan(&value.artifactID, &value.namespace, &value.documentID, &value.version,
+			&value.kind, &value.name, &value.mimeType, &value.expiresAt, &content); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Artifact{}, nil, newArtifactUnavailable("Artifact is unavailable")
+		}
+		return Artifact{}, nil, err
+	}
+	// MySQL PAD SPACE collations can match a namespace with trailing spaces.
+	if value.namespace != namespace {
+		return Artifact{}, nil, newArtifactUnavailable("Artifact is unavailable")
+	}
+	var documentNamespace, documentName string
+	if err := transaction.QueryRowContext(ctx,
+		"SELECT namespace, name FROM documents WHERE namespace = ? AND document_id = ? AND del_flag = 0",
+		namespace, value.documentID).Scan(&documentNamespace, &documentName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Artifact{}, nil, newArtifactForbidden(messageArtifactDocumentAccess)
+		}
+		return Artifact{}, nil, err
+	}
+	if documentNamespace != namespace {
+		return Artifact{}, nil, newArtifactForbidden(messageArtifactDocumentAccess)
+	}
+	if !mayReadDocument(documentName) {
+		return Artifact{}, nil, newArtifactForbidden(messageArtifactDocumentAccess)
+	}
+	if err := transaction.Commit(); err != nil {
+		return Artifact{}, nil, err
+	}
+	return publicArtifact(value), content, nil
+}
+
 // Chunk returns at most 1 MiB as base64; EOF is valid, offsets past EOF are not.
 func (r *ArtifactRegistry) Chunk(ctx context.Context, namespace, artifactID string, offset, length int) (ArtifactChunk, error) {
+	return r.chunk(ctx, namespace, artifactID, offset, length, nil)
+}
+
+// ChunkAuthorized bounds one artifact chunk like Chunk while enforcing the
+// caller's document-level read gate; see ReadAuthorized.
+func (r *ArtifactRegistry) ChunkAuthorized(
+	ctx context.Context, namespace, artifactID string, offset, length int, mayReadDocument func(string) bool,
+) (ArtifactChunk, error) {
+	return r.chunk(ctx, namespace, artifactID, offset, length, mayReadDocument)
+}
+
+func (r *ArtifactRegistry) chunk(
+	ctx context.Context, namespace, artifactID string, offset, length int, mayReadDocument func(string) bool,
+) (ArtifactChunk, error) {
 	if offset < 0 {
 		return ArtifactChunk{}, newValueError("offset must be a nonnegative integer")
 	}
 	if length < 1 || length > 1024*1024 {
 		return ArtifactChunk{}, newValueError("length must be an integer between 1 and 1048576")
 	}
-	artifact, content, err := r.Read(ctx, namespace, artifactID)
+	artifact, content, err := r.ReadAuthorized(ctx, namespace, artifactID, mayReadDocument)
 	if err != nil {
 		return ArtifactChunk{}, err
 	}
+	return chunkFrom(artifact, content, offset, length)
+}
+
+// chunkFrom slices one artifact read into the public chunk envelope.
+func chunkFrom(artifact Artifact, content []byte, offset, length int) (ArtifactChunk, error) {
 	if offset > len(content) {
 		return ArtifactChunk{}, newValueError("offset exceeds the artifact byte length")
 	}
