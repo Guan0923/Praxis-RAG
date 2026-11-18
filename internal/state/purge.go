@@ -276,6 +276,7 @@ func (r *KnowledgeBaseRepository) purgeNamespaceRows(ctx context.Context, tx *sq
 		{"DELETE FROM document_leases WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM kb_permissions WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM kb_invitations WHERE namespace IN (" + inClause + ")", true},
+		{"DELETE FROM kb_group_permissions WHERE namespace IN (" + inClause + ")", true},
 	}
 	for _, delete := range deletes {
 		if delete.withArgs {
