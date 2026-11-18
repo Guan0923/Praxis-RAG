@@ -4,12 +4,16 @@ import (
 	"context"
 
 	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // UploadOperations returns the display-only recent upload operations.
 func (s *Service) UploadOperations(ctx context.Context, namespace string) ([]map[string]any, error) {
 	operations, err := s.stores.Views.UploadOperations(ctx, namespace)
 	if err != nil {
+		if state.IsViewBackpressure(err) {
+			return nil, err
+		}
 		return nil, &apierrors.KnowledgeError{Message: "Upload operations cannot be read."}
 	}
 	return operations, nil
@@ -20,6 +24,9 @@ func (s *Service) UploadOperations(ctx context.Context, namespace string) ([]map
 func (s *Service) UploadOperation(ctx context.Context, namespace, operationID string) (map[string]any, bool, error) {
 	operation, err := s.stores.Views.UploadOperation(ctx, namespace, operationID)
 	if err != nil {
+		if state.IsViewBackpressure(err) {
+			return nil, false, err
+		}
 		return nil, false, &apierrors.KnowledgeError{Message: "Upload operation cannot be read."}
 	}
 	if operation == nil {
@@ -32,6 +39,9 @@ func (s *Service) UploadOperation(ctx context.Context, namespace, operationID st
 func (s *Service) PublishedVersions(ctx context.Context, namespace string) (map[string]string, error) {
 	versions, err := s.stores.Views.PublishedVersions(ctx, namespace)
 	if err != nil {
+		if state.IsViewBackpressure(err) {
+			return nil, err
+		}
 		return nil, &apierrors.KnowledgeError{Message: "Published versions cannot be read."}
 	}
 	return versions, nil
@@ -41,6 +51,9 @@ func (s *Service) PublishedVersions(ctx context.Context, namespace string) (map[
 func (s *Service) UploadLeases(ctx context.Context, namespace string) ([]map[string]any, error) {
 	leases, err := s.stores.Views.Leases(ctx, namespace)
 	if err != nil {
+		if state.IsViewBackpressure(err) {
+			return nil, err
+		}
 		return nil, &apierrors.KnowledgeError{Message: "Upload leases cannot be read."}
 	}
 	return leases, nil

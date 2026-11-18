@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -11,13 +12,96 @@ import (
 
 // CacheUnavailable is a sanitized cache failure; callers must fall back to the
 // authoritative database. It mirrors rag_mcp.state.cache.CacheUnavailable.
-type CacheUnavailable struct{ Message string }
+//
+// Reason keeps the internal cause distinguishable after the Redis client folded
+// network outages and single-entry corruption into one error type: a corrupt
+// list only affects itself, a caller cancellation is not a Redis fault, and only
+// availability failures (connection errors, timeouts) feed the display-cache
+// circuit breaker. The zero Reason keeps the historical "backend unavailable"
+// meaning.
+type CacheUnavailable struct {
+	Message string
+	Reason  CacheFailureReason
+}
+
+// CacheFailureReason classifies one *CacheUnavailable.
+type CacheFailureReason string
+
+const (
+	// CacheFailureNetwork marks connectivity/timeout failures that make the
+	// backend unusable for every key. These are the failures the display-cache
+	// circuit breaker counts.
+	CacheFailureNetwork CacheFailureReason = "network"
+	// CacheFailureCorrupt marks one cached payload that cannot be decoded. The
+	// backend itself answered, so only this entry is affected: it is repaired
+	// by the MySQL fallback of the very request that hit it.
+	CacheFailureCorrupt CacheFailureReason = "corrupt"
+	// CacheFailureCanceled marks a read aborted because the caller canceled the
+	// request. It says nothing about backend health.
+	CacheFailureCanceled CacheFailureReason = "canceled"
+)
 
 // Error implements error.
 func (e *CacheUnavailable) Error() string { return e.Message }
 
+// AvailabilityFailure reports whether this failure is a backend availability
+// fault (network outage, or the legacy unclassified failures) as opposed to a
+// single corrupt entry or a caller cancellation.
+func (e *CacheUnavailable) AvailabilityFailure() bool {
+	return e.Reason == "" || e.Reason == CacheFailureNetwork
+}
+
 func newCacheUnavailable(message string) *CacheUnavailable {
 	return &CacheUnavailable{Message: message}
+}
+
+// NewCacheUnavailableNetwork builds an availability failure (connection error,
+// timeout, closed backend).
+func NewCacheUnavailableNetwork(message string) *CacheUnavailable {
+	return &CacheUnavailable{Message: message, Reason: CacheFailureNetwork}
+}
+
+// NewCacheUnavailableCorrupt builds a single-entry decode failure.
+func NewCacheUnavailableCorrupt(message string) *CacheUnavailable {
+	return &CacheUnavailable{Message: message, Reason: CacheFailureCorrupt}
+}
+
+// NewCacheUnavailableCanceled builds a failure caused by the caller canceling
+// the request.
+func NewCacheUnavailableCanceled(message string) *CacheUnavailable {
+	return &CacheUnavailable{Message: message, Reason: CacheFailureCanceled}
+}
+
+// IsCacheAvailabilityFailure reports whether err is a *CacheUnavailable that
+// makes the backend unusable (network outage or the legacy unclassified kind).
+func IsCacheAvailabilityFailure(err error) bool {
+	var unavailable *CacheUnavailable
+	return errors.As(err, &unavailable) && unavailable.AvailabilityFailure()
+}
+
+// ViewBackpressureMessage is the user-visible "fallback budget exhausted"
+// detail served by REST (503) and MCP tool errors.
+const ViewBackpressureMessage = "服务繁忙，请稍后重试"
+
+// ViewBackpressureError reports that the instance-level MySQL fallback budget
+// for display read views is exhausted. It is the only state-layer error the
+// runtime must not retry against the authoritative repository: the request was
+// rejected precisely to protect that database, so the error travels unchanged
+// through the cached views and the runtime to REST/MCP.
+type ViewBackpressureError struct{ Message string }
+
+// Error implements error.
+func (e *ViewBackpressureError) Error() string { return e.Message }
+
+// NewViewBackpressureError builds the display-query fallback rejection.
+func NewViewBackpressureError() *ViewBackpressureError {
+	return &ViewBackpressureError{Message: ViewBackpressureMessage}
+}
+
+// IsViewBackpressure reports whether err is a *ViewBackpressureError.
+func IsViewBackpressure(err error) bool {
+	var backpressure *ViewBackpressureError
+	return errors.As(err, &backpressure)
 }
 
 // StateCache is the read-through snapshot backend. In production this is the
@@ -58,11 +142,42 @@ type CacheSettings struct {
 	TimeoutSeconds float64
 	// Enabled explicitly overrides the URL-derived default when non-nil.
 	Enabled *bool
+	// BreakerThreshold is the number of consecutive backend availability
+	// failures that trips the display-cache circuit breaker.
+	BreakerThreshold int
+	// BreakerCooldownSeconds is how long a tripped breaker stays open before
+	// one half-open probe request is allowed through.
+	BreakerCooldownSeconds int
+	// FallbackConcurrency bounds the concurrent display-query MySQL fallbacks
+	// (cache misses and outage fallbacks) of one service instance. Waiting for
+	// a shared result does not consume a slot.
+	FallbackConcurrency int
 }
+
+// Display-cache circuit defaults: five consecutive availability failures trip
+// the breaker, it stays open for ten seconds before one probe, and one instance
+// keeps at most four concurrent display fallbacks against MySQL. Multi-replica
+// deployments therefore land at roughly replicas x 4 total fallback queries and
+// must budget for uploads/publications sharing the same database.
+const (
+	defaultBreakerThreshold        = 5
+	defaultBreakerCooldownSeconds  = 10
+	defaultFallbackConcurrency     = 4
+	breakerThresholdEnvName        = "RAG_REDIS_BREAKER_THRESHOLD"
+	breakerCooldownEnvName         = "RAG_REDIS_BREAKER_COOLDOWN_SECONDS"
+	fallbackConcurrencyEnvName     = "RAG_CACHE_FALLBACK_CONCURRENCY"
+)
 
 // DefaultCacheSettings returns the dataclass defaults.
 func DefaultCacheSettings() CacheSettings {
-	return CacheSettings{Prefix: "rag:state:v1", TTLSeconds: 60, TimeoutSeconds: 0.3}
+	return CacheSettings{
+		Prefix:                 "rag:state:v1",
+		TTLSeconds:            60,
+		TimeoutSeconds:         0.3,
+		BreakerThreshold:       defaultBreakerThreshold,
+		BreakerCooldownSeconds: defaultBreakerCooldownSeconds,
+		FallbackConcurrency:    defaultFallbackConcurrency,
+	}
 }
 
 // CacheSettingsFromEnv mirrors StateCacheSettings.from_env, including its
@@ -87,6 +202,21 @@ func CacheSettingsFromEnv() (CacheSettings, error) {
 	if err != nil {
 		return CacheSettings{}, fmt.Errorf("RAG_REDIS_TIMEOUT_SECONDS must be a positive finite number")
 	}
+	settings.BreakerThreshold, err = positiveIntEnv(breakerThresholdEnvName,
+		defaultBreakerThreshold)
+	if err != nil {
+		return CacheSettings{}, err
+	}
+	settings.BreakerCooldownSeconds, err = positiveIntEnv(breakerCooldownEnvName,
+		defaultBreakerCooldownSeconds)
+	if err != nil {
+		return CacheSettings{}, err
+	}
+	settings.FallbackConcurrency, err = positiveIntEnv(fallbackConcurrencyEnvName,
+		defaultFallbackConcurrency)
+	if err != nil {
+		return CacheSettings{}, err
+	}
 	settings.URL = strings.TrimSpace(os.Getenv("RAG_REDIS_URL"))
 	settings.Prefix = strings.TrimSpace(envOrDefault("RAG_REDIS_PREFIX", "rag:state:v1"))
 	settings.TTLSeconds = ttl
@@ -95,6 +225,15 @@ func CacheSettingsFromEnv() (CacheSettings, error) {
 		return CacheSettings{}, err
 	}
 	return settings, nil
+}
+
+// positiveIntEnv reads one strictly positive integer setting.
+func positiveIntEnv(name string, fallback int) (int, error) {
+	value, err := strconv.Atoi(strings.TrimSpace(envOrDefault(name, strconv.Itoa(fallback))))
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return value, nil
 }
 
 func envOrDefault(name, fallback string) string {
@@ -114,6 +253,15 @@ func (s CacheSettings) Validate() error {
 	}
 	if s.Prefix == "" {
 		return fmt.Errorf("RAG_REDIS_PREFIX must not be empty")
+	}
+	if s.BreakerThreshold <= 0 {
+		return fmt.Errorf("%s must be a positive integer", breakerThresholdEnvName)
+	}
+	if s.BreakerCooldownSeconds <= 0 {
+		return fmt.Errorf("%s must be a positive integer", breakerCooldownEnvName)
+	}
+	if s.FallbackConcurrency <= 0 {
+		return fmt.Errorf("%s must be a positive integer", fallbackConcurrencyEnvName)
 	}
 	return nil
 }

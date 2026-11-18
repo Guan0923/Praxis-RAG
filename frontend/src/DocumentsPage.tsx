@@ -92,6 +92,13 @@ export function DocumentsPage({
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [listError, setListError] = useState("");
+  // loadedOnce marks that the current knowledge base's document list has been
+  // fetched successfully at least once; stale marks that the visible list is
+  // that earlier snapshot (a refresh failed with e.g. 503). Together they keep
+  // the last good list visible instead of turning an outage into "no
+  // documents".
+  const [loadedOnce, setLoadedOnce] = useState(false);
+  const [stale, setStale] = useState(false);
   const [access, setAccess] = useState<AccessView>();
   // entitlements carries the membership quota of this knowledge base: who owns
   // it, how many files it may hold and (for the owner only) the Embedding
@@ -132,11 +139,21 @@ export function DocumentsPage({
         connection,
         { signal: controller.signal },
       );
-      if (!lifetime.current.signal.aborted && sequence === listSequence.current)
+      if (!lifetime.current.signal.aborted && sequence === listSequence.current) {
         setDocuments(data.documents);
+        setLoadedOnce(true);
+        setStale(false);
+      }
     } catch (error) {
       if (!controller.signal.aborted && !lifetime.current.signal.aborted) {
-        setDocuments([]);
+        // 刷新失败时保留当前知识库上一次成功加载的列表；首次加载（或刚
+        // 切换知识库）失败则不展示任何旧数据，只显示错误和重试入口。
+        if (loadedOnce) {
+          setStale(true);
+        } else {
+          setDocuments([]);
+          setStale(false);
+        }
         setListError(errorText(error));
       }
     } finally {
@@ -203,6 +220,16 @@ export function DocumentsPage({
     void loadDocuments();
     void loadEntitlements();
   }, [active]);
+  // The Console remounts this page on a workspace switch; this reset is the
+  // safety net for any non-remount switch path, so the next workspace never
+  // starts with the previous workspace's list (which would look like real data
+  // of the wrong knowledge base).
+  useEffect(() => {
+    setDocuments([]);
+    setLoadedOnce(false);
+    setStale(false);
+    setListError("");
+  }, [connection.namespace]);
   // Restore unfinished batches once on mount (after a page reload); leaving
   // the page never cancels an upload because the parent keeps this component
   // mounted.
@@ -714,10 +741,23 @@ export function DocumentsPage({
       {listError && (
         <Alert
           className="page-alert"
-          type="error"
+          type={stale ? "warning" : "error"}
           showIcon
-          title="文档读取失败"
-          description={listError}
+          title={stale ? "刷新失败，当前显示上次加载的数据" : "文档读取失败"}
+          description={
+            <>
+              <div>{listError}</div>
+              <Button
+                size="small"
+                style={{ marginTop: 8 }}
+                icon={<ReloadOutlined />}
+                loading={loading}
+                onClick={() => void loadDocuments()}
+              >
+                重试
+              </Button>
+            </>
+          }
         />
       )}
       <Table<DocumentInfo>
@@ -737,7 +777,10 @@ export function DocumentsPage({
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
               description={
-                listError ? "无法读取文档" : "当前工作区暂无知识文档"
+                // 只有同一知识库查询成功且确实为空，才显示“暂无文档”；首次
+                // 加载失败展示错误。刷新失败（stale）时旧列表即便为空也来
+                // 自一次成功查询，仍按真实空数据处理。
+                listError && !stale ? "无法读取文档" : "当前工作区暂无知识文档"
               }
             />
           ),

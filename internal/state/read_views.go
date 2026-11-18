@@ -77,6 +77,14 @@ func NewCachedReadViews(stores *Stores) *CachedReadViews {
 func (v *CachedReadViews) getOrLoad(ctx context.Context, kind, scope string) (any, error) {
 	value, err := v.stores.CacheSync.GetOrLoad(ctx, kind, scope)
 	if err != nil {
+		// The display-query fallback budget being exhausted must stay
+		// recognizable all the way to REST/MCP: retrying it against MySQL
+		// elsewhere is exactly what the guard refuses to allow. Every other
+		// error keeps its existing sanitized business semantics.
+		var backpressure *ViewBackpressureError
+		if errors.As(err, &backpressure) {
+			return nil, err
+		}
 		var stateErr *StateError
 		if errors.As(err, &stateErr) {
 			return nil, err
