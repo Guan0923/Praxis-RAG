@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-reembed-worker
+  labels:
+    app.kubernetes.io/name: praxis-rag
+    app.kubernetes.io/component: reembed-worker
+    app.kubernetes.io/part-of: praxis-rag
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: praxis-rag
+      app.kubernetes.io/component: reembed-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: praxis-rag
+        app.kubernetes.io/component: reembed-worker
+        app.kubernetes.io/part-of: praxis-rag
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: rag-reembed-worker
+          image: praxis-rag:1.0.0
+          imagePullPolicy: IfNotPresent
+          command: ["/app/bin/rag-reembed-worker"]
+          envFrom:
+            - configMapRef:
+                name: praxis-rag-config
+          ports:
+            - name: probe
+              containerPort: 8099
+          startupProbe:
+            httpGet: {path: /live, port: probe}
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet: {path: /live, port: probe}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /ready, port: probe}
+            periodSeconds: 5
+          env:
+            - name: RAG_WORKER_PROBE_ADDR
+              value: ":8099"
+            - name: RAG_SERVICE_HOST
+              value: "127.0.0.1"
+            - name: RAG_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_MYSQL_PASSWORD
+            - name: RAG_STATE_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_STATE_ENCRYPTION_KEY
+            - name: RAG_REDIS_LOCK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_REDIS_LOCK_URL
+                  optional: true
+            - name: RAG_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_REDIS_URL
+                  optional: true
+            - name: RAG_KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: praxis-rag-secrets
+                  key: RAG_KAFKA_SASL_PASSWORD
+                  optional: true
+            - name: TMPDIR
+              value: /var/tmp/rag
+          volumeMounts:
+            - name: tmp
+              mountPath: /var/tmp/rag
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi

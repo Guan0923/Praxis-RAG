@@ -15,6 +15,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/redisstate"
 	"github.com/Guan0923/Praxis-RAG/internal/runtime"
 	"github.com/Guan0923/Praxis-RAG/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/workerprobe"
 )
 
 func main() {
@@ -97,6 +98,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	closeProbe, err := workerprobe.Serve(ctx, consumer.ProbeStatus)
+	if err != nil {
+		return err
+	}
+	defer closeProbe()
 	if err := consumer.Start(ctx); err != nil {
 		return err
 	}

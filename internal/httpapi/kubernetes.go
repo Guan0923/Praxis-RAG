@@ -18,6 +18,7 @@ import (
 type KubernetesRuntime interface {
 	// Configured reports whether cluster credentials were resolved.
 	Configured() bool
+	ScaleWorker(ctx context.Context, namespace, name, uid string, current, target int32) error
 	Memory(context.Context) (*k8sops.MemoryView, error)
 	// ClusterInfo identifies the connected cluster (no API server URL).
 	ClusterInfo() k8sops.ClusterInfo
@@ -54,6 +55,7 @@ const (
 func (s *Server) registerKubernetesRoutes() {
 	s.router.add("GET", "/v1/admin/k8s/workloads", authAdminSession, s.handleKubernetesWorkloads)
 	s.router.add("GET", "/v1/admin/k8s/memory", authAdminSession, s.handleKubernetesMemory)
+	s.router.add("POST", "/v1/admin/k8s/workloads/deployments/{namespace}/{name}/scale", authAdminSession, s.handleKubernetesScale)
 	s.router.add("GET", "/v1/admin/k8s/pods", authAdminSession, s.handleKubernetesPods)
 	s.router.add("POST", "/v1/admin/k8s/workloads/{resource}/{namespace}/{name}/restart",
 		authAdminSession, s.handleKubernetesRestart)
@@ -133,6 +135,41 @@ func (s *Server) handleKubernetesMemory(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) handleKubernetesScale(w http.ResponseWriter, r *http.Request) {
+	cluster, ok := s.kubernetesReadRuntime(w)
+	if !ok {
+		return
+	}
+	var body struct {
+		UID     string `json:"uid"`
+		Current *int32 `json:"current_replicas"`
+		Target  *int32 `json:"replicas"`
+	}
+	if details := decodeJSONBody(r, &body); details != nil {
+		writeValidation(w, http.StatusUnprocessableEntity, details)
+		return
+	}
+	if body.UID == "" || body.Current == nil || *body.Current < 0 || body.Target == nil || *body.Target < 0 || *body.Target > 64 {
+		writeDetail(w, http.StatusBadRequest, "请提供工作负载标识、当前副本数及 0 至 64 的目标副本数")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), kubernetesRequestTimeout)
+	defer cancel()
+	err := cluster.ScaleWorker(ctx, pathParam(r, "namespace"), pathParam(r, "name"), body.UID, *body.Current, *body.Target)
+	switch {
+	case errors.Is(err, k8sops.ErrScaleConflict):
+		writeDetail(w, http.StatusConflict, "工作负载或副本数已变化，请刷新后重试")
+	case errors.Is(err, k8sops.ErrNotFound):
+		writeDetail(w, http.StatusNotFound, "工作负载不存在")
+	case errors.Is(err, k8sops.ErrForbidden):
+		writeDetail(w, http.StatusForbidden, "请检查目标 Worker 和集群权限")
+	case err != nil:
+		writeDetail(w, http.StatusBadGateway, "Kubernetes 扩缩容请求失败")
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"replicas": *body.Target})
+	}
 }
 
 // handleKubernetesPods implements GET /v1/admin/k8s/pods: the all-pods snapshot

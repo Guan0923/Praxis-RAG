@@ -63,7 +63,7 @@ deploy/k8s/
 | workspace 归属按 `os.Hostname()` 判定 | `internal/state/upload_coordinator.go`（`Node`） | Pod 名就是 hostname；重建后新 Pod 不会认领旧 Pod 的目录 |
 | 文档正文/切块/artifact 存在 MySQL（`artifact_blobs` 等），Qdrant 只存向量 | `internal/state/blobs.go` | `/app/data` 不是数据卷，默认无需 PVC（§10） |
 | `RAG_LOG_FILE` 不会自建父目录 | `internal/logging/logs.go`（`openLogFile`） | 启用文件日志时路径只能落在已存在的挂载根下 |
-| `/health` 固定返回 200，不做依赖探测 | `internal/httpapi/server.go`（`handleHealth`） | HTTP 探针只证明进程能响应；依赖就绪要靠 §7/§8 的检查 |
+| `/health` 固定返回 200，不做依赖探测 | `internal/httpapi/server.go`（`handleHealth`） | 兼容状态接口；Kubernetes 探针见 §11 |
 | `/healthz` 始终 200，配置错误体现在响应体 `status=degraded` | `python-workers/pdf-service/app/main.py` | 同上 |
 | 文档任务租约 300s、每 20s 续租、扫描间隔 30s | `internal/state/document_jobs.go`、`cmd/rag-document-worker/main.go` | Pod 被强杀后约 5 分钟才会重投 |
 | consumer 并发默认 1、上限 64 | `internal/mq/settings.go` | 首版每 Pod 1 个并发，避免内存放大 |
@@ -627,7 +627,7 @@ kubectl -n praxis-rag delete pod <worker-pod>
 kubectl -n praxis-rag delete pod <worker-pod> --grace-period=0 --force
 ```
 
-预期时间线：A/B 都会立刻取消消费循环与进行中的解析；`document_jobs.lease_until`
+正常终止会停止接收新任务，给当前 Kafka 处理最多 15 秒收尾。强杀或未能及时完成时，`document_jobs.lease_until`
 停在最后一次续租处（≤ 终止时刻 + 300s），`RAG_DOCUMENT_WORKER_RECOVER_SECONDS=30`
 的扫描在其后把任务重新投递（递增 `schedule_version`，Debezium 发新通知），
 新副本领取并完成。
@@ -747,9 +747,9 @@ pdf-parser 10Gi、API 2Gi、死信/缓存 256Mi~512Mi。超过 `sizeLimit` 会�
 
 | 工作负载 | 探针 | 真实含义 |
 | --- | --- | --- |
-| rag-service | `/health`（readiness + liveness） | 进程能响应 HTTP；**不代表** MySQL/Qdrant/Kafka/Connect 就绪 |
+| rag-service | `/live`、`/ready` | 存活检查 HTTP 响应；就绪要求 MySQL 可访问，服务退出时停止就绪 |
 | pdf-parser | `/healthz`（readiness + liveness） | 进程能响应；配置错误只体现在响应体 `status=degraded` |
-| 文档 worker / 死信 / 缓存 worker | 无探针 | 存活 = 进程退出后 kubelet 重启；状态看心跳 + 消费进度 |
+| 全部 Go Worker | Pod 内 8099 端口的 `/live`、`/ready` | 观察消费循环；SAG 同时观察数据库抽取循环。开始退出即撤销就绪。 |
 
 依赖就绪的**独立验收**（替代「探针通过」）：
 
@@ -796,8 +796,7 @@ worker 的「活着」证据（三选一即可）：`runtime_heartbeats` 有新�
 - `RAG_PDF_SERVICE_PARSE_TIMEOUT`(120s) 必须**小于** `RAG_PDF_SERVICE_TIMEOUT`(900s)，
   否则启动即报配置错误；临时提高总预算时两个一起调。
 - `terminationGracePeriodSeconds`：API 30s（HTTP 优雅关闭 5s + 连接池关闭）、
-  worker 30s、pdf-parser 60s。注意 worker 收到 SIGTERM 会立刻取消进行中的解析，
-  宽限期再长也救不回长解析——重投由租约保证（§9）。
+  worker 30s、pdf-parser 60s。收到 SIGTERM 时，Kafka 已开始的处理有 15 秒收尾时间，超时取消，未完成的文档通过租约恢复（§9）。
 - `RAG_DOCUMENT_JOB_LEASE_SECONDS`(300s) 与 `RAG_DOCUMENT_JOB_HEARTBEAT_SECONDS`(20s) 的关系：
   进程活着就每 20s 续租，所以**单次解析再长也不会被误判**超时；只有进程消失（被强杀、
   节点故障）时才等满约 300s 才重投。要缩短故障恢复时间就调小租约（并保持续租间隔约为

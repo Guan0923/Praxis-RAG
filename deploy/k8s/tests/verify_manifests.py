@@ -133,6 +133,8 @@ def check_go_workload(entry: str, deployment: dict) -> None:
     refs = [ref["configMapRef"]["name"] for ref in container.get("envFrom", []) if "configMapRef" in ref]
     check(CONFIGMAP_NAME in refs, f"{where}: envFrom does not reference {CONFIGMAP_NAME}")
 
+    for probe, path in [("readinessProbe", "/ready"), ("livenessProbe", "/live")]:
+        check(container.get(probe, {}).get("httpGet", {}).get("path") == path, f"{where}: {probe} must use {path}")
     env = env_of(container)
     # Parse staging (os.TempDir) and the upload workspace root must be a writable
     # per-pod emptyDir; see README §10.
@@ -197,12 +199,6 @@ def check_overlay(entry: str, deployments_expected: set[str], engine: str, cache
         keys = secret_keys(container, f"{entry}/{API}")
         for key in ("RAG_SERVICE_TOKEN", "RAG_MYSQL_PASSWORD", "RAG_STATE_ENCRYPTION_KEY"):
             check(key in keys, f"{entry}/{API}: missing secret key {key}")
-        probes = {
-            probe["httpGet"]["path"]
-            for probe in (container.get("readinessProbe"), container.get("livenessProbe"))
-            if probe and "httpGet" in probe
-        }
-        check(probes == {"/health"}, f"{entry}/{API}: probes must use /health, got {probes}")
         if cache:
             check("RAG_REDIS_URL" in keys, f"{entry}/{API}: cache enabled but RAG_REDIS_URL is not injected")
 
@@ -219,7 +215,6 @@ def check_overlay(entry: str, deployments_expected: set[str], engine: str, cache
             "RAG_SERVICE_TOKEN" not in secret_keys(container, f"{entry}/{DOC_WORKER}"),
             f"{entry}: {DOC_WORKER} must not receive RAG_SERVICE_TOKEN",
         )
-        check("readinessProbe" not in container, f"{entry}: {DOC_WORKER} has no HTTP port, so no probe")
 
     sag_worker = find(deployments, SAG_WORKER)
     if sag_worker is not None:
@@ -386,25 +381,25 @@ def main() -> int:
 
     check_overlay(
         "overlays/go",
-        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document"},
+        {API, DOC_WORKER, SAG_WORKER, "rag-reembed-worker", "rag-delete-worker", "rag-dead-letter-document"},
         engine="go",
         cache=False,
     )
     check_overlay(
         "overlays/vision",
-        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document", PDF},
+        {API, DOC_WORKER, SAG_WORKER, "rag-reembed-worker", "rag-delete-worker", "rag-dead-letter-document", PDF},
         engine="vision",
         cache=False,
     )
     check_overlay(
         "overlays/go-cache",
-        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document", CACHE_WORKER, "rag-dead-letter-cache"},
+        {API, DOC_WORKER, SAG_WORKER, "rag-reembed-worker", "rag-delete-worker", "rag-dead-letter-document", CACHE_WORKER, "rag-dead-letter-cache"},
         engine="go",
         cache=True,
     )
     check_overlay(
         "overlays/vision-cache",
-        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document", PDF, CACHE_WORKER, "rag-dead-letter-cache"},
+        {API, DOC_WORKER, SAG_WORKER, "rag-reembed-worker", "rag-delete-worker", "rag-dead-letter-document", PDF, CACHE_WORKER, "rag-dead-letter-cache"},
         engine="vision",
         cache=True,
     )

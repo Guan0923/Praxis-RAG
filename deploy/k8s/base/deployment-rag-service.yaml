@@ -103,19 +103,16 @@ spec:
             limits:
               cpu: "1"
               memory: 1Gi
-          # /health 固定返回 200（handleHealth 不探测依赖），所以这两个探针
-          # 只证明「进程能响应 HTTP」。MySQL/Qdrant/Kafka/Connect 是否就绪
-          # 必须用 README §7 的独立验收命令检查。
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
           livenessProbe:
             httpGet:
-              path: /health
+              path: /live
               port: http
             initialDelaySeconds: 15
             periodSeconds: 20

@@ -43,6 +43,10 @@ func (f *fakeKubernetesRuntime) Memory(context.Context) (*k8sops.MemoryView, err
 	return &k8sops.MemoryView{}, nil
 }
 
+func (f *fakeKubernetesRuntime) ScaleWorker(context.Context, string, string, string, int32, int32) error {
+	return nil
+}
+
 func (f *fakeKubernetesRuntime) Configured() bool { return f.configured }
 
 func (f *fakeKubernetesRuntime) ClusterInfo() k8sops.ClusterInfo { return f.info }
@@ -112,6 +116,7 @@ func TestKubernetesRoutesRequireSession(t *testing.T) {
 	runtime := &fakeKubernetesRuntime{configured: true}
 	handler := newKubernetesTestServer(t, runtime).Handler()
 	requests := []testRequest{
+		{method: "POST", target: "/v1/admin/k8s/workloads/deployments/praxis-rag/rag-delete-worker/scale", remote: "127.0.0.1:5000"},
 		{method: "GET", target: "/v1/admin/k8s/memory", remote: "127.0.0.1:5000"},
 		{method: "GET", target: "/v1/admin/k8s/workloads", remote: "127.0.0.1:5000"},
 		{method: "GET", target: "/v1/admin/k8s/pods", remote: "127.0.0.1:5000"},
@@ -506,5 +511,25 @@ func TestKubernetesReadFilterValidation(t *testing.T) {
 	}
 	if len(runtime.workloadFilters) != 0 || len(runtime.podFilters) != 0 {
 		t.Fatalf("invalid filters reached the runtime")
+	}
+}
+func TestKubernetesScaleRequiresAdminAndObservedReplicas(t *testing.T) {
+	handler := newKubernetesTestServer(t, &fakeKubernetesRuntime{configured: true}).Handler()
+	const target = "/v1/admin/k8s/workloads/deployments/praxis-rag/rag-sag-worker/scale"
+	const valid = `{"uid":"uid","current_replicas":2,"replicas":0}`
+	cases := []struct {
+		token, body string
+		code        int
+	}{
+		{kubernetesUserToken, valid, http.StatusForbidden},
+		{kubernetesAdminToken, `{"uid":"uid","replicas":0}`, http.StatusBadRequest},
+		{kubernetesAdminToken, `{"uid":"uid","current_replicas":2,"replicas":65}`, http.StatusBadRequest},
+		{kubernetesAdminToken, valid, http.StatusOK},
+	}
+	for _, tc := range cases {
+		r := performRequest(handler, testRequest{method: "POST", target: target, body: tc.body, headers: kubernetesBearer(tc.token)})
+		if r.Code != tc.code {
+			t.Errorf("scale %s: got %d want %d (%s)", tc.body, r.Code, tc.code, r.Body)
+		}
 	}
 }

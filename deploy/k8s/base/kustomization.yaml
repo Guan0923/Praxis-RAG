@@ -18,5 +18,6 @@ resources:
   - deployment-rag-document-worker.yaml
   - deployment-rag-sag-worker.yaml
   - deployment-rag-delete-worker.yaml
+  - deployment-rag-reembed-worker.yaml
   - deployment-rag-dead-letter-document.yaml
   - rbac-monitor-ops.yaml

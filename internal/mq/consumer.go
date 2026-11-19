@@ -3,7 +3,10 @@ package mq
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/Guan0923/Praxis-RAG/internal/workerprobe"
 )
 
 // defaultCommitTimeout bounds one commit call so a dead broker cannot hang
@@ -137,9 +140,13 @@ func (c ConsumerConfig) Validate() error {
 // MaxAttempts the raw body is published to DLQTopic (when set), OnExhausted runs,
 // and the record is committed so the group advances.
 type PullConsumer struct {
-	Config    ConsumerConfig
-	transport PullTransport
-	handler   Handler
+	pulse         workerprobe.Pulse
+	receiveFailed atomic.Bool
+	commitBlocked atomic.Bool
+	drainTimeout  time.Duration
+	Config        ConsumerConfig
+	transport     PullTransport
+	handler       Handler
 	// OnExhausted runs after the DLQ publish and before the commit.
 	OnExhausted func(ctx context.Context, message ReceivedMessage) error
 	// DLQ publishes exhausted raw payloads; nil (or empty DLQTopic) skips it.
@@ -199,6 +206,7 @@ func NewKafkaPullConsumer(settings Settings, config ConsumerConfig, handler Hand
 		return nil, newSafeError(ErrConsumerFailed, "consumer start", err)
 	}
 	consumer := NewPullConsumer(config, transport, handler)
+	consumer.drainTimeout = 15 * time.Second
 	if config.DLQTopic != "" {
 		raw, err := newSDKRawPublisher(settings, config.DLQTopic)
 		if err != nil {
@@ -208,6 +216,13 @@ func NewKafkaPullConsumer(settings Settings, config ConsumerConfig, handler Hand
 		consumer.DLQ = raw
 	}
 	return consumer, nil
+}
+
+// ProbeStatus observes the fetch loop. An idle partition still polls, while a
+// broker error makes the worker unready without triggering a restart.
+func (c *PullConsumer) ProbeStatus() (bool, bool) {
+	live := c.pulse.Recent(time.Minute) && !c.commitBlocked.Load()
+	return live, live && !c.receiveFailed.Load()
 }
 
 // Start validates, starts the transport and launches the pull loop plus the
@@ -248,11 +263,12 @@ func (c *PullConsumer) Start(ctx context.Context) error {
 	}
 	c.tracker = newCommitTracker()
 	c.deliver = make(chan delivery, c.prefetchDepth())
+	workContext, cancelWork := context.WithCancel(context.WithoutCancel(loopContext))
 	c.workers.Add(concurrency)
 	for worker := 0; worker < concurrency; worker++ {
-		go c.worker(loopContext)
+		go c.worker(loopContext, workContext)
 	}
-	go c.loop(loopContext)
+	go c.loop(loopContext, cancelWork)
 	return nil
 }
 
@@ -317,10 +333,15 @@ func (c *PullConsumer) prefetchDepth() int {
 
 // loop pulls batches from the transport and feeds the local queue. It blocks on
 // a full queue, which stops fetching until the handlers catch up.
-func (c *PullConsumer) loop(ctx context.Context) {
+func (c *PullConsumer) loop(ctx context.Context, cancelWork context.CancelFunc) {
+	pulseTicker := time.NewTicker(10 * time.Second)
+	defer pulseTicker.Stop()
 	defer func() {
 		close(c.deliver)
+		timer := time.AfterFunc(c.drainTimeout, cancelWork)
 		c.workers.Wait()
+		timer.Stop()
+		cancelWork()
 		close(c.doneCh)
 	}()
 	for {
@@ -329,17 +350,20 @@ func (c *PullConsumer) loop(ctx context.Context) {
 			return
 		default:
 		}
+		c.pulse.Beat()
 		messages, err := c.transport.Receive(ctx, int32(c.prefetchDepth()), c.Config.VisibilityTimeout)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
+			c.receiveFailed.Store(true)
 			c.setLastError(newSafeError(ErrReceiveFailed, "consumer receive", err))
 			if !c.sleep(ctx) {
 				return
 			}
 			continue
 		}
+		c.receiveFailed.Store(false)
 		for _, message := range messages {
 			tracked := c.tracker.track(message)
 			if tracked == nil {
@@ -348,10 +372,16 @@ func (c *PullConsumer) loop(ctx context.Context) {
 				// stays uncommitted and is redelivered later.
 				continue
 			}
-			select {
-			case c.deliver <- delivery{message: message, tracked: tracked}:
-			case <-ctx.Done():
-				return
+		enqueue:
+			for {
+				select {
+				case c.deliver <- delivery{message: message, tracked: tracked}:
+					break enqueue
+				case <-pulseTicker.C:
+					c.pulse.Beat() // healthy backpressure from active handlers
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 	}
@@ -359,23 +389,23 @@ func (c *PullConsumer) loop(ctx context.Context) {
 
 // worker drains the local queue. It returns when the queue is closed or the
 // context is cancelled; unprocessed records stay uncommitted and are redelivered.
-func (c *PullConsumer) worker(ctx context.Context) {
+func (c *PullConsumer) worker(ctx, workContext context.Context) {
 	defer c.workers.Done()
 	for item := range c.deliver {
 		if ctx.Err() != nil {
 			return
 		}
-		c.processMessage(ctx, item)
+		c.processMessage(ctx, workContext, item)
 	}
 }
 
 // processMessage runs one delivery through handler until it is committed,
 // exhausted, or the context is cancelled. The commit-tracking entry travels with
 // the message so an out-of-order completion cannot commit a later offset.
-func (c *PullConsumer) processMessage(ctx context.Context, item delivery) {
+func (c *PullConsumer) processMessage(ctx, workContext context.Context, item delivery) {
 	for attempt := 1; ; attempt++ {
 		item.message.DeliveryAttempt = attempt
-		if c.handler(ctx, item.message) {
+		if c.handler(workContext, item.message) {
 			c.commit(ctx, item.tracked)
 			return
 		}
@@ -383,7 +413,10 @@ func (c *PullConsumer) processMessage(ctx context.Context, item delivery) {
 			return
 		}
 		if c.Config.MaxAttempts > 0 && attempt >= c.Config.MaxAttempts {
-			c.deadLetter(ctx, item.message)
+			c.deadLetter(workContext, item.message)
+			if ctx.Err() != nil {
+				return
+			}
 			c.commit(ctx, item.tracked)
 			return
 		}
@@ -407,6 +440,7 @@ func (c *PullConsumer) commit(parent context.Context, entry *trackedMessage) {
 			// Never advance past a failed commit: block the partition so its
 			// records are redelivered instead of being skipped by a later offset.
 			c.tracker.block(partitionKeyOf(message))
+			c.commitBlocked.Store(true) // Only a new consumer can resume this partition.
 			c.setLastError(newSafeError(ErrConsumerFailed, "consumer commit", err))
 			return
 		}

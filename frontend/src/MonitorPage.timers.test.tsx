@@ -584,6 +584,25 @@ describe("MonitorPage Kubernetes workloads", () => {
     expect(apiButton.disabled).toBe(false);
   });
 
+  it("submits the observed worker identity and replica count when scaling down", async () => {
+    const worker = webWorkload({ name: "rag-sag-worker", scalable: true, desired: 2 });
+    workloadsResponder = () => jsonResponse(workloadsView([webWorkload(), worker]));
+    renderPage("admin");
+    await openKubernetes();
+    expect(within(tableRow("web")).queryByText("调整副本数")).toBeNull();
+    fireEvent.click(within(tableRow(worker.name)).getByText("调整副本数"));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByRole("spinbutton"), { target: { value: "1" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "应用" }));
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/rag-sag-worker/scale"));
+      expect(call).toBeTruthy();
+      expect(JSON.parse(String((call![1] as RequestInit).body))).toEqual({
+        uid: worker.uid, current_replicas: 2, replicas: 1,
+      });
+    });
+  });
+
   it("confirms a rolling restart and keeps the submitted row disabled", async () => {
     let restarted = false;
     workloadsResponder = () => jsonResponse(workloadsView([

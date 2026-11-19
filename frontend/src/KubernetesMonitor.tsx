@@ -7,6 +7,7 @@ import {
   Descriptions,
   Flex,
   Input,
+  InputNumber,
   Modal,
   Segmented,
   Select,
@@ -24,6 +25,7 @@ import {
   fetchKubernetesPods,
   fetchKubernetesWorkloads,
   restartKubernetesWorkload,
+  scaleKubernetesWorker,
   type K8sPod,
   type K8sPodView,
   type K8sRestartState,
@@ -216,6 +218,9 @@ export function KubernetesMonitor({ tick, active, onUpdated, workerScale }: Kube
   const [error, setError] = useState("");
   const [expandedRowKeys, setExpandedRowKeys] = useState<readonly Key[]>([]);
   const [restartTarget, setRestartTarget] = useState<K8sWorkload | null>(null);
+  const [scaleTarget, setScaleTarget] = useState<K8sWorkload | null>(null);
+  const [replicas, setReplicas] = useState<number | null>(null);
+  const [scaling, setScaling] = useState(false);
   const [restarting, setRestarting] = useState(false);
 
   // The applied filter lives in a ref: the input/selection update it at once,
@@ -333,6 +338,23 @@ export function KubernetesMonitor({ tick, active, onUpdated, workerScale }: Kube
     }
   }, [message, restartTarget]);
 
+  const validScale = scaleTarget && replicas !== null && Number.isInteger(replicas) &&
+    replicas >= 0 && replicas <= 64 && replicas !== scaleTarget.desired;
+  async function submitScale() {
+    if (!validScale || !scaleTarget || replicas === null || scaling) return;
+    setScaling(true);
+    try {
+      await scaleKubernetesWorker(scaleTarget, replicas);
+      message.success(`已将 ${scaleTarget.name} 的期望副本数设为 ${replicas}`);
+      setScaleTarget(null);
+    } catch (cause) {
+      message.error(errorText(cause));
+      setScaleTarget(null);
+    } finally {
+      setScaling(false);
+    }
+  }
+
   const namespaceOptions = [
     { value: "", label: "全部命名空间" },
     ...namespaces.map((item) => ({ value: item, label: item })),
@@ -398,6 +420,12 @@ export function KubernetesMonitor({ tick, active, onUpdated, workerScale }: Kube
               const busy = restart?.status === "submitted" || restart?.status === "rolling";
               return (
                 <Flex vertical gap={4}>
+                  {workload.scalable && (
+                    <Button size="small" disabled={busy} onClick={() => {
+                      setScaleTarget(workload);
+                      setReplicas(workload.desired);
+                    }}>调整副本数</Button>
+                  )}
                   {workload.restartable ? (
                     <Button
                       size="small"
@@ -496,6 +524,16 @@ export function KubernetesMonitor({ tick, active, onUpdated, workerScale }: Kube
         )}
       </Card>
 
+      <Modal open={scaleTarget !== null} title="调整 Worker 副本数" okText="应用" cancelText="取消"
+        confirmLoading={scaling} okButtonProps={{ disabled: !validScale }}
+        onOk={() => void submitScale()} onCancel={() => { if (!scaling) setScaleTarget(null); }}>
+        {scaleTarget && <Flex vertical gap={8}>
+          <strong>{scaleTarget.namespace}/{scaleTarget.name}</strong>
+          <span>当前期望 {scaleTarget.desired}，就绪 {scaleTarget.ready}</span>
+          <InputNumber aria-label="目标副本数" min={0} max={64} value={replicas} onChange={setReplicas} />
+          {replicas === 0 && <Alert type="warning" showIcon title="此 Worker 将停止处理任务，直到恢复副本。" />}
+        </Flex>}
+      </Modal>
       <Modal
         open={restartTarget !== null}
         title="滚动重启"

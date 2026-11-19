@@ -28,12 +28,13 @@ func sagExtractionChunkIDs(chunks []qdrant.Chunk) []string {
 
 // RunSagExtraction drains due chunks after Kafka wakeups and periodically
 // recovers work whose notification was missed, retry is due, or lease expired.
-func (s *Service) RunSagExtraction(ctx context.Context, wake <-chan struct{}, logger *slog.Logger) {
+func (s *Service) RunSagExtraction(ctx context.Context, wake <-chan struct{}, logger *slog.Logger, beat func()) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	qdrantClient := qdrant.NewClient(s.config.QdrantURL, "", nil)
 
 	for ctx.Err() == nil {
+		beat()
 		// Re-read the model between batches so Console changes take effect.
 		filled, err := s.drainSagExtractions(ctx, qdrantClient, logger)
 		if err != nil && ctx.Err() == nil {

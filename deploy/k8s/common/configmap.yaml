@@ -48,8 +48,10 @@ data:
   RAG_MYSQL_DATABASE: praxis_rag
   RAG_MYSQL_USER: rag
 
-  # --- Kafka：两个业务 topic 与两个死信 topic --------------------------
+  # --- Kafka：业务 topic 与死信 topic --------------------------
   RAG_KAFKA_BOOTSTRAP_SERVERS: kafka.infra.svc.cluster.local:9092
+  RAG_REEMBED_TOPIC: praxis_reembed
+  RAG_REEMBED_GROUP: praxis_reembed_workers
   RAG_DELETE_TOPIC: praxis_index_cleanup
   RAG_DELETE_GROUP: praxis_index_cleanup_workers
   RAG_KAFKA_CLIENT_ID: praxis-rag

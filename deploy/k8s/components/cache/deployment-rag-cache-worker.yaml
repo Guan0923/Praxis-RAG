@@ -38,7 +38,22 @@ spec:
           envFrom:
             - configMapRef:
                 name: praxis-rag-config
+          ports:
+            - name: probe
+              containerPort: 8099
+          startupProbe:
+            httpGet: {path: /live, port: probe}
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet: {path: /live, port: probe}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /ready, port: probe}
+            periodSeconds: 5
           env:
+            - name: RAG_WORKER_PROBE_ADDR
+              value: ":8099"
             - name: RAG_SERVICE_HOST
               value: "127.0.0.1"
             - name: RAG_MYSQL_PASSWORD

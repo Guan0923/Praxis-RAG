@@ -116,6 +116,7 @@ type Workload struct {
 	Owner *OwnerRef `json:"owner,omitempty"`
 	// Restartable is false when the update strategy cannot roll, with a
 	// Chinese RestartBlockedReason shown inline on the row.
+	Scalable             bool   `json:"scalable,omitempty"`
 	Restartable          bool   `json:"restartable"`
 	RestartBlockedReason string `json:"restart_blocked_reason,omitempty"`
 	// Restart is the tracked progress of the last rolling restart of this

@@ -29,6 +29,8 @@ type openAPIRoute struct {
 }
 
 var openAPIRoutes = []openAPIRoute{
+	{Method: "GET", Path: "/live", Summary: "Process liveness", Tag: "health", Response: "200"},
+	{Method: "GET", Path: "/ready", Summary: "Service readiness", Tag: "health", Response: "200"},
 	{Method: "GET", Path: "/health", Summary: "Service health", Tag: "health", Response: "200"},
 	{Method: "GET", Path: "/v1/chunking/strategies", Summary: "List chunking strategies", Tag: "chunking", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/knowledge-bases/defaults", Summary: "Knowledge-base defaults", Tag: "knowledge-bases", Response: "200"},
@@ -121,6 +123,7 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "GET", Path: "/v1/admin/monitor/logs", Summary: "Read-only monitor log page (memory ring or RAG_LOG_FILE)", Tag: "admin", Query: []string{"source", "component", "level", "query", "limit", "offset"}, Response: "200"},
 	{Method: "POST", Path: "/v1/admin/monitor/actions/requeue-jobs", Summary: "Requeue due retries and expired document-job leases now (sweep semantics)", Tag: "admin", Response: "200"},
 	{Method: "POST", Path: "/v1/admin/monitor/actions/connectors/{connector}/restart", Summary: "Restart one capture connector (fixed names only) and reset its restart budget", Tag: "admin", QueryBoolean: []string{"includeTasks"}, Response: "200"},
+	{Method: "POST", Path: "/v1/admin/k8s/workloads/deployments/{namespace}/{name}/scale", Summary: "Adjust a Praxis worker Deployment replica count", Tag: "admin", Request: "KubernetesWorkerScaleBody", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/k8s/memory", Summary: "Read node memory pressure and Pod memory samples", Tag: "admin", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/monitor/actions/worker-deployment", Summary: "Read the document worker Deployment replica state (Kubernetes only)", Tag: "admin", Response: "200"},
 	{Method: "POST", Path: "/v1/admin/monitor/actions/worker-deployment/scale", Summary: "Scale the document worker Deployment (kubectl scale equivalent)", Tag: "admin", Request: "WorkerScaleBody", Response: "200"},
@@ -390,6 +393,10 @@ func openAPISchemas() map[string]any {
 				"base_url": map[string]any{"type": "string", "title": "Base Url"},
 				"apikey":   map[string]any{"type": "string", "title": "Apikey"},
 			},
+		},
+		"KubernetesWorkerScaleBody": map[string]any{
+			"type": "object", "additionalProperties": false, "required": []string{"uid", "current_replicas", "replicas"},
+			"properties": map[string]any{"uid": map[string]any{"type": "string", "minLength": 1}, "current_replicas": map[string]any{"type": "integer", "minimum": 0}, "replicas": map[string]any{"type": "integer", "minimum": 0, "maximum": 64}},
 		},
 		"WorkerScaleBody": map[string]any{
 			"type":                 "object",

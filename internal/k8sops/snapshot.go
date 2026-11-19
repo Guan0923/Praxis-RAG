@@ -100,6 +100,7 @@ func (cluster *Cluster) Workloads(ctx context.Context, filter Filter) (*Workload
 			if !ok {
 				continue
 			}
+			row.Scalable = spec.resource == ResourceDeployments && meta.Labels["app.kubernetes.io/part-of"] == "praxis-rag" && cluster.managedWorker(meta.Namespace, meta.Name)
 			key := restartKey(spec.resource, meta.Namespace, meta.Name)
 			// A tracker for a deleted object must not leak onto a new object
 			// that happens to reuse the same namespaced name; it is rendered as

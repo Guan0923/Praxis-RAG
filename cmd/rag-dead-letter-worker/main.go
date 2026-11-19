@@ -42,6 +42,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/mq"
 	"github.com/Guan0923/Praxis-RAG/internal/state"
 	"github.com/Guan0923/Praxis-RAG/internal/version"
+	"github.com/Guan0923/Praxis-RAG/internal/workerprobe"
 )
 
 // Exit codes: 0 graceful stop, 1 runtime failure, 2 configuration/usage error.
@@ -164,6 +165,11 @@ func run(args []string) error {
 		"group", target.group,
 		"source_group", target.sourceGroup,
 	)
+	closeProbe, err := workerprobe.Serve(ctx, consumer.ProbeStatus)
+	if err != nil {
+		return err
+	}
+	defer closeProbe()
 	if err := consumer.Start(ctx); err != nil {
 		return err
 	}

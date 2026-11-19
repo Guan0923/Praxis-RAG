@@ -6,12 +6,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Guan0923/Praxis-RAG/internal/config"
 	"github.com/Guan0923/Praxis-RAG/internal/logging"
 	"github.com/Guan0923/Praxis-RAG/internal/mq"
 	"github.com/Guan0923/Praxis-RAG/internal/runtime"
 	"github.com/Guan0923/Praxis-RAG/internal/state"
+	"github.com/Guan0923/Praxis-RAG/internal/workerprobe"
 )
 
 const consumerGroup = "praxis_sag_extraction_workers"
@@ -62,6 +64,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	wake := make(chan struct{}, 1)
+	var consumer *mq.PullConsumer
 	if mqSettings.Configured() {
 		if consumerGroup == mqSettings.CacheGroup {
 			return fmt.Errorf("RAG_CACHE_GROUP must differ from %s", consumerGroup)
@@ -69,7 +72,7 @@ func run() error {
 		// The notification only wakes a database drain. The cache worker owns
 		// the cache DLQ and is responsible for reporting invalid CDC records.
 		mqSettings.CacheDLQTopic = ""
-		consumer, err := mq.NewKafkaPullConsumer(mqSettings,
+		consumer, err = mq.NewKafkaPullConsumer(mqSettings,
 			mq.DefaultConsumerConfig(mqSettings.CacheTopic, consumerGroup), wakeOnPublication(wake))
 		if err != nil {
 			return err
@@ -81,7 +84,20 @@ func run() error {
 		logger.Info("SAG worker subscribed", "topic", mqSettings.CacheTopic, "group", consumerGroup)
 	}
 	logger.Info("SAG extraction worker started")
-	service.RunSagExtraction(ctx, wake, logger)
+	var pulse workerprobe.Pulse
+	closeProbe, err := workerprobe.Serve(ctx, func() (bool, bool) {
+		live := pulse.Recent(5 * time.Minute)
+		if consumer == nil {
+			return live, live
+		}
+		kafkaLive, kafkaReady := consumer.ProbeStatus()
+		return live && kafkaLive, live && kafkaReady
+	})
+	if err != nil {
+		return err
+	}
+	defer closeProbe()
+	service.RunSagExtraction(ctx, wake, logger, pulse.Beat)
 	return nil
 }
 

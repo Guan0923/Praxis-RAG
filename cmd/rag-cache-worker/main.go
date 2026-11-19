@@ -28,6 +28,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/redisstate"
 	"github.com/Guan0923/Praxis-RAG/internal/state"
 	"github.com/Guan0923/Praxis-RAG/internal/version"
+	"github.com/Guan0923/Praxis-RAG/internal/workerprobe"
 )
 
 // Exit codes: 0 graceful stop, 1 runtime failure, 2 configuration/usage error.
@@ -167,6 +168,11 @@ func run() error {
 		"max_attempts", consumerConfig.MaxAttempts,
 		"concurrency", consumerConfig.Concurrency,
 	)
+	closeProbe, err := workerprobe.Serve(ctx, consumer.ProbeStatus)
+	if err != nil {
+		return err
+	}
+	defer closeProbe()
 	runErr := processor.RunConsumer(ctx, consumer)
 	processor.Stop()
 	<-recoveryDone

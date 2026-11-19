@@ -376,7 +376,15 @@ func run() error {
 	if !feishuService.Enabled() {
 		logger.Info("Feishu document import is disabled: set RAG_FEISHU_APP_ID, RAG_FEISHU_APP_SECRET and RAG_FEISHU_REDIRECT_URI to enable it")
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	httpOptions := []httpapi.Option{
+		httpapi.WithReadiness(func(probeCtx context.Context) error {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return stores.Ping(probeCtx)
+		}),
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseSelfCreateRuntime(wire.HTTPRuntime{Service: service}),
@@ -416,9 +424,6 @@ func run() error {
 		"console", api.WebRoot(),
 		"upload_mode", "async",
 	)
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	serveError := make(chan error, 1)
 	go func() {

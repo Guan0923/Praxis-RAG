@@ -4,13 +4,14 @@ package k8sops
 // snapshots need. Every cached object is immutable once inserted, so snapshots
 // can hand out pointers without copying.
 type objectMeta struct {
-	Name              string           `json:"name"`
-	Namespace         string           `json:"namespace"`
-	UID               string           `json:"uid"`
-	Generation        int64            `json:"generation"`
-	ResourceVersion   string           `json:"resourceVersion"`
-	CreationTimestamp string           `json:"creationTimestamp"`
-	OwnerReferences   []ownerReference `json:"ownerReferences"`
+	Labels            map[string]string `json:"labels"`
+	Name              string            `json:"name"`
+	Namespace         string            `json:"namespace"`
+	UID               string            `json:"uid"`
+	Generation        int64             `json:"generation"`
+	ResourceVersion   string            `json:"resourceVersion"`
+	CreationTimestamp string            `json:"creationTimestamp"`
+	OwnerReferences   []ownerReference  `json:"ownerReferences"`
 }
 
 // ownerReference is the Kubernetes ownership edge used by the restart tracker

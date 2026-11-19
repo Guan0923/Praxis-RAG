@@ -11,9 +11,7 @@
 #   * 单任务租约默认 300s、每 20s 续租；Pod 被强制删除后，任务在租约
 #     到期（+30s 扫描间隔）后由 Sweep 递增 schedule_version 重新投递，
 #     不需要人工重放。
-#   * SIGTERM 会立刻取消消费循环，进行中的解析随 context 取消；因此
-#     terminationGracePeriodSeconds 给再大也救不回一次长时间解析，
-#     重投由租约完成。
+#   * SIGTERM 后停止拉取，已开始的处理有 15 秒收尾窗口。
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -53,8 +51,23 @@ spec:
           envFrom:
             - configMapRef:
                 name: praxis-rag-config
+          ports:
+            - name: probe
+              containerPort: 8099
+          startupProbe:
+            httpGet: {path: /live, port: probe}
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet: {path: /live, port: probe}
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: {path: /ready, port: probe}
+            periodSeconds: 5
           env:
-            # worker 不监听端口，但仍会解析 ServiceSettingsFromEnv。
+            - name: RAG_WORKER_PROBE_ADDR
+              value: ":8099"
+            # worker 的探针独立监听，业务配置仍会解析 ServiceSettingsFromEnv。
             # 镜像内 /app/config.toml 把 RAG_SERVICE_HOST 设为 0.0.0.0，
             # 那样会要求 RAG_SERVICE_TOKEN；显式改回 loopback，
             # 让服务 Token 只存在于需要它的 API 副本里（最小权限）。
@@ -91,9 +104,6 @@ spec:
             limits:
               cpu: "2"
               memory: 2Gi
-          # 没有 HTTP 端口，因此没有 readiness/liveness 探针：
-          # 存活判定 = 进程退出后由 kubelet 重启 + runtime_heartbeats
-          # + Kafka 消费进度（README §8）。
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

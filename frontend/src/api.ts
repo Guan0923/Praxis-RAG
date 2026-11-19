@@ -1871,6 +1871,7 @@ export type K8sWorkload = {
   schedule?: string;
   suspended?: boolean;
   owner?: K8sPodOwner;
+  scalable?: boolean;
   restartable: boolean;
   restart_blocked_reason?: string;
   restart?: K8sRestartState;
@@ -1969,6 +1970,14 @@ export type K8sMemoryView = {
 
 export function fetchKubernetesMemory(signal?: AbortSignal) {
   return api<K8sMemoryView>("/v1/admin/k8s/memory", undefined, { signal, cache: "no-store" });
+}
+
+export function scaleKubernetesWorker(workload: K8sWorkload, replicas: number) {
+  return api<{ replicas: number }>(
+    `/v1/admin/k8s/workloads/deployments/${encodeURIComponent(workload.namespace)}/${encodeURIComponent(workload.name)}/scale`,
+    undefined,
+    { method: "POST", body: JSON.stringify({ uid: workload.uid, current_replicas: workload.desired, replicas }) },
+  );
 }
 
 // restartKubernetesWorkload triggers a rolling restart (the kubectl rollout

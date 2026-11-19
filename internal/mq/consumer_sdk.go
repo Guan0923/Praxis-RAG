@@ -2,6 +2,7 @@ package mq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -46,7 +47,12 @@ func (t *sdkPullTransport) Stop() error { return t.reader.Close() }
 // Receive fetches exactly one record (Kafka has no visibility timeout; the
 // consumer implements retries in-process without committing).
 func (t *sdkPullTransport) Receive(ctx context.Context, _ int32, _ time.Duration) ([]ReceivedMessage, error) {
-	message, err := t.reader.FetchMessage(ctx)
+	poll, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	message, err := t.reader.FetchMessage(poll)
+	if errors.Is(err, context.DeadlineExceeded) && poll.Err() != nil && ctx.Err() == nil {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}

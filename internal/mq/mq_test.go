@@ -725,6 +725,9 @@ func TestConsumerCommitFailureStopsPartitionAdvance(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	time.Sleep(50 * time.Millisecond)
+	if live, ready := consumer.ProbeStatus(); live || ready {
+		t.Fatal("a permanently blocked partition must trigger worker recovery")
+	}
 	if err := consumer.Stop(); err != nil {
 		t.Fatalf("Stop() error = %v", err)
 	}

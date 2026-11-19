@@ -79,7 +79,12 @@ func WithChangeNotifier(notifier ChangeNotifier) Option {
 }
 
 // Server hosts the REST API, MCP endpoint, and Console static assets.
+func WithReadiness(check func(context.Context) error) Option {
+	return func(s *Server) { s.readiness = check }
+}
+
 type Server struct {
+	readiness      func(context.Context) error
 	settings       config.ServiceSettings
 	status         StatusProvider
 	keys           KeyLookup
@@ -146,6 +151,8 @@ func (s *Server) WebRoot() string { return s.webRoot }
 func (s *Server) Handler() http.Handler { return s.handler }
 
 func (s *Server) registerRoutes() {
+	s.router.add("GET", "/live", authNone, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	s.router.add("GET", "/ready", authNone, s.handleReady)
 	s.router.add("GET", "/health", authNone, s.handleHealth)
 	s.router.add("GET", "/v1/chunking/strategies", authTenant, s.handleChunkingStrategies)
 	s.router.add("GET", "/v1/admin/knowledge-bases/defaults", authAdmin, s.handleKnowledgeBaseDefaults)
@@ -420,6 +427,16 @@ type pathParamsContext struct{}
 func NamespaceFromContext(ctx context.Context) (string, bool) {
 	value, ok := ctx.Value(namespaceContextKey{}).(string)
 	return value, ok
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if s.readiness == nil || s.readiness(ctx) != nil {
+		writeDetail(w, http.StatusServiceUnavailable, "服务尚未就绪")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
