@@ -31,7 +31,7 @@ Server 进程。
 
 | 连接器 | 模板 | 采集范围 | 目标 topic | schema history |
 | --- | --- | --- | --- | --- |
-| `praxis-document-cdc` | `connectors/document-cdc.json` | `document_jobs` 的新增与调度版本变更、`reembed_jobs` 的新增 | `RAG_DOCUMENT_TOPIC`（默认 `praxis_document_ingest`）、`RAG_REEMBED_TOPIC`（默认 `praxis_reembed`） | `praxis_cdc_document_schema_history` |
+| `praxis-document-cdc` | `connectors/document-cdc.json` | `document_jobs` 的新增与调度版本变更、`reembed_jobs` 的新增、`index_cleanup_jobs` 的新增与调度版本变更 | `RAG_DOCUMENT_TOPIC`（默认 `praxis_document_ingest`）、`RAG_REEMBED_TOPIC`（默认 `praxis_reembed`）、`RAG_DELETE_TOPIC`（默认 `praxis_index_cleanup`） | `praxis_cdc_document_schema_history` |
 | `praxis-cache-cdc` | `connectors/cache-cdc.json` | 7 张读模型表，全部 c/u/d | `RAG_CACHE_TOPIC`（默认 `praxis_state_cache_refresh`） | `praxis_cdc_cache_schema_history` |
 
 连接器名称是**固定契约**：注册、监控、自动重启都按这两个名字寻址。修改名称需要

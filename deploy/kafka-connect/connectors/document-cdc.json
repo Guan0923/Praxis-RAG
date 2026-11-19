@@ -13,8 +13,8 @@
 
     "topic.prefix": "praxis_rag",
     "database.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}",
-    "table.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs,${RAG_MYSQL_DATABASE:-praxis_rag}.reembed_jobs",
-    "column.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.artifact_id,${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.schedule_version,${RAG_MYSQL_DATABASE:-praxis_rag}.reembed_jobs.job_id,${RAG_MYSQL_DATABASE:-praxis_rag}.reembed_jobs.namespace",
+    "table.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs,${RAG_MYSQL_DATABASE:-praxis_rag}.reembed_jobs,${RAG_MYSQL_DATABASE:-praxis_rag}.index_cleanup_jobs",
+    "column.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.artifact_id,${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.schedule_version,${RAG_MYSQL_DATABASE:-praxis_rag}.reembed_jobs.job_id,${RAG_MYSQL_DATABASE:-praxis_rag}.reembed_jobs.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.index_cleanup_jobs.job_id,${RAG_MYSQL_DATABASE:-praxis_rag}.index_cleanup_jobs.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.index_cleanup_jobs.schedule_version",
     "skip.messages.without.change": "true",
     "skipped.operations": "d",
     "include.schema.changes": "false",
@@ -30,7 +30,7 @@
     "key.converter.schemas.enable": "false",
     "value.converter.schemas.enable": "false",
 
-    "transforms": "RouteDocumentJobs,RouteReembedJobs",
+    "transforms": "RouteDocumentJobs,RouteReembedJobs,RouteCleanup",
     "transforms.RouteDocumentJobs.type": "io.debezium.transforms.ByLogicalTableRouter",
     "transforms.RouteDocumentJobs.topic.regex": "(.*)document_jobs",
     "transforms.RouteDocumentJobs.topic.replacement": "${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}",
@@ -39,6 +39,11 @@
     "transforms.RouteReembedJobs.topic.regex": "(.*)reembed_jobs$",
     "transforms.RouteReembedJobs.topic.replacement": "${RAG_REEMBED_TOPIC:-praxis_reembed}",
     "transforms.RouteReembedJobs.key.enforce.uniqueness": "false",
+
+    "transforms.RouteCleanup.type": "io.debezium.transforms.ByLogicalTableRouter",
+    "transforms.RouteCleanup.topic.regex": "(.*)index_cleanup_jobs$",
+    "transforms.RouteCleanup.topic.replacement": "${RAG_DELETE_TOPIC:-praxis_index_cleanup}",
+    "transforms.RouteCleanup.key.enforce.uniqueness": "false",
 
     "producer.override.acks": "all",
     "producer.override.enable.idempotence": "true",

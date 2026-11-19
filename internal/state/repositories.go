@@ -1149,6 +1149,9 @@ func (r *DocumentRepository) DeleteTx(ctx context.Context, tx *sql.Tx, namespace
 		return false, err
 	}
 	if changed > 0 {
+		if err := queueDeletedIndexes(ctx, tx, "d.namespace = ? AND d.document_id = ?", namespace, documentID); err != nil {
+			return false, err
+		}
 		if err := deleteDocumentContentRefsTx(ctx, tx, namespace, documentID); err != nil {
 			return false, err
 		}

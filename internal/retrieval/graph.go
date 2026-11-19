@@ -42,6 +42,7 @@ type GraphOptions struct {
 	// IncludeEntities asks the sidecar to return entity and relation names,
 	// which land in Candidate.Metadata for console rendering.
 	IncludeEntities bool
+	VisibleContexts func(context.Context, []lightrag.Context) ([]lightrag.Context, error)
 }
 
 // GraphRetriever queries the LightRAG sidecar for one namespace. The
@@ -106,6 +107,12 @@ func (r *GraphRetriever) Search(
 	}
 	if result == nil || len(result.Contexts) == 0 {
 		return []contracts.Candidate{}, nil
+	}
+	if r.options.VisibleContexts != nil {
+		result.Contexts, err = r.options.VisibleContexts(ctx, result.Contexts)
+		if err != nil {
+			return nil, err
+		}
 	}
 	candidates := make([]contracts.Candidate, 0, len(result.Contexts))
 	for _, item := range result.Contexts {

@@ -983,7 +983,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/knowledge-bases/batch-delete `
   -d '{"namespaces":["team-kb","old-kb"]}'
 ```
 
-知识库的列表是「配置记录 ∪ 文档工作区」的合并视图，所以只删配置记录会留下一个「缺少配置记录」的条目。`DELETE /v1/admin/knowledge-bases/{namespace}` 因此先删除该命名空间下的全部文档、再删除配置记录：文档走与单文档删除相同的逻辑删除（`del_flag`，Qdrant 向量按现有语义保留，不删 collection）；任一文档删除失败（例如正在上传/更新）时保留配置记录，返回 409 `{"detail":"部分文档删除失败，知识库未删除","namespace":"...","failed_documents":[{"name":"...","error":"..."}]}`，可修复后重试。
+知识库的列表是「配置记录 ∪ 文档工作区」的合并视图，所以只删配置记录会留下一个「缺少配置记录」的条目。`DELETE /v1/admin/knowledge-bases/{namespace}` 因此先删除该命名空间下的全部文档、再删除配置记录：文档走与单文档删除相同的逻辑删除（`del_flag`，外部副本进入后台回收，按命名空间和版本清理向量）；任一文档删除失败（例如正在上传/更新）时保留配置记录，返回 409 `{"detail":"部分文档删除失败，知识库未删除","namespace":"...","failed_documents":[{"name":"...","error":"..."}]}`，可修复后重试。
 
 `batch-delete` 逐条执行同样的删除，返回 `{"deleted":["<namespace>"],"missing":["<namespace>"],"failed":[{"namespace":"...","error":"...","failed_documents":[...]}],"documents_deleted":N,"configurations_deleted":N}`：`deleted` 为已删除，`missing` 为配置和文档都不存在的命名空间，`failed` 为部分文档删除失败或运行时报错（该命名空间保留，Console 保持选中以便重试）；请求体校验失败（缺失、空数组、非法命名空间、超过 100 项、未知字段）返回 422。
 
@@ -1115,7 +1115,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/search `
 - 未配置抽取模型或文档未建索引时，`sag` 自动**降级为 hybrid 召回**（不报错、不静默无结果）。
 - 可以搭配任意 `rerank`（`none` 或 `cross_encoder`）：排序是种子分与超边共享实体数的融合分，cross-encoder 二段精排合法（区别于 `sag2`）。
 - 每个文档版本最多抽取 512 个片段，实体按 casefold 归一化。抽取结果含 `metadata.sag_event`（该 chunk 的事件句），便于核对证据链。
-- 删除文档时事件与关联级联清理，实体行保留（共享数据），不会留下悬空超边。
+- 删除文档时事件与关联级联清理，实体的最后一条关联消失后，维护循环在保留期后回收孤立实体。
 - 受限账号（任何非全库可读账号，含全库 `read` + 文件级 deny）调用 `sag` 会被**明确拒绝**：该模式的动态超边扩展无法在召回前可靠限定文档范围，这是明确的拒绝而非静默泄露；其余检索模式按可读文档过滤（见 [权限管理](PERMISSIONS.md) §11）。
 
 ```powershell
@@ -1456,3 +1456,23 @@ PDF 默认由独立的 `pdf-parser` 微服务解析（本地 PyMuPDF 读取/渲�
 
 
 
+
+## 到期删除外部索引
+
+REST 和 MCP 的单文档逻辑删除仍同步提交。MySQL 在同一事务保存每个清理目标的命名空间、文档 ID、collection、发布版本和源文件 SHA-256。最后一个文件引用移除后保留 8 天；只有保留期已过且对应内容对象已回收，维护循环才把该目标置为 `ready`。文档连接器将 `index_cleanup_jobs` 的定位标识和调度版本发往 `RAG_DELETE_TOPIC`（默认 `praxis_index_cleanup`）。启动 `rag-delete-worker` 后，它以独立消费组 `RAG_DELETE_GROUP`（默认 `praxis_index_cleanup_workers`）领取任务。进程重启会补领已就绪任务。外部请求失败进入退避重试，单个目标的失败不会撤销其他目标的完成记录。
+
+- 普通 RAG 和 SAG2 使用相同的 Qdrant 分块。清理只匹配原 collection 内的 namespace、文档和发布版本。整库清理还会扫描该命名空间的遗留分块。空 collection 保留，共享 collection 中其他命名空间的点继续可用。
+- LightRAG 按侧车持久化的登记版本做条件删除。同名重传、重新登记或同名工作区重建会使旧删除失效。MySQL 已下线的图谱证据会在检索返回前过滤。整库清理仅在原命名空间仍未启用且对应内容已过保留期时清空工作区。
+- SAG 的任务、事件及其关联在 MySQL 的删除事务内清理。共享实体在最后一条关联消失并超过保留期后回收。
+
+旧索引对账复用同一可执行文件。运行 `rag-delete-worker --reconcile` 扫描 MySQL 已知的知识库及 collection。已知归属、但 MySQL 已无相应知识库配置时，可显式提供 `--namespace <知识库> --collection <集合>`。新写入的向量和图谱登记携带源文件 SHA-256。对账分页读取 Qdrant 点的定位字段和 LightRAG 文档登记，排除仍在使用或上传中的目标，对首次发现的孤儿给予完整的 8 天保留期。若图谱部署曾绕过侧车写入，底层图数据库中缺乏文档归属的数据需要另行核对。
+
+可用以下 SQL 查看各目标的进度。失败计数记录在 `failures`，等待下一次调度的时间为 `due_at`（Unix 秒）。
+
+```sql
+SELECT target, status, COUNT(*) AS jobs, MAX(failures) AS max_failures
+FROM index_cleanup_jobs
+GROUP BY target, status;
+```
+
+升级时先用新版 `rag-state-migrate --apply` 创建新任务表（自动建表的开发部署启动服务时建表），更新 LightRAG 侧车，再注册连接器配置并启动 Go 服务及 worker。消费组需要新 topic 的读取权限，连接器需要写入权限。worker 与文档服务使用同一个 MySQL、Redis 文档锁、Qdrant 和 LightRAG 配置。

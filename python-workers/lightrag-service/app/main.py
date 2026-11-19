@@ -46,7 +46,7 @@ import sys
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
@@ -444,6 +444,47 @@ def create_app(settings: Settings | None = None, engine: GraphEngine | None = No
             payload["deleted"],
         )
         return JSONResponse(payload)
+
+    @app.get("/v1/workspaces/{namespace}/revision")
+    async def workspace_revision(namespace: str, request: Request):
+        validate_namespace_name(namespace)
+        return {"revision": request.app.state.service.workspace_revision(namespace)}
+
+    @app.post("/v1/workspaces/{namespace}/prune")
+    async def prune_workspace(namespace: str, request: Request, revision: str = Query(...)):
+        validate_namespace_name(namespace)
+        state = request.app.state
+        try:
+            async with state.gate.slot():
+                return await asyncio.wait_for(state.service.prune_workspace(namespace, revision),
+                                              timeout=state.settings.operation_timeout)
+        except Exception as error:
+            return _handle_failure(request, "prune_workspace", error)
+
+    @app.get("/v1/workspaces/{namespace}/inventory")
+    async def inventory(namespace: str, request: Request, after: str = "", limit: int = Query(200, ge=1, le=500)):
+        validate_namespace_name(namespace)
+        return {"documents": request.app.state.service.inventory(namespace, after, limit)}
+
+    @app.get("/v1/workspaces/{namespace}/documents/{document_id}/revision")
+    async def revision(namespace: str, document_id: str, request: Request):
+        validate_namespace_name(namespace)
+        validate_document_id(document_id)
+        return {"revision": request.app.state.service.document_revision(namespace, document_id)}
+
+    @app.post("/v1/workspaces/{namespace}/documents/{document_id}/prune")
+    async def prune(namespace: str, document_id: str, request: Request, revision: str = Query(...),
+                    binding: WorkspaceRequest | None = None, publication: str | None = None,
+                    allow_legacy: bool = True):
+        validate_namespace_name(namespace)
+        validate_document_id(document_id)
+        state = request.app.state
+        try:
+            async with state.gate.slot():
+                return await asyncio.wait_for(state.service.prune_document(namespace, document_id, revision, binding, publication, allow_legacy),
+                                              timeout=state.settings.operation_timeout)
+        except Exception as error:
+            return _handle_failure(request, "prune_document", error)
 
     @app.post("/v1/workspaces/{namespace}/query")
     async def query(namespace: str, body: QueryRequest, request: Request) -> Response:

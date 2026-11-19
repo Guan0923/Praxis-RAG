@@ -115,6 +115,7 @@ func (s *Service) publishDocument(
 	artifactDir string,
 	task *state.DocumentJobTask,
 	chunks []qdrant.Chunk,
+	graph *graphMirror,
 ) error {
 	transaction, err := s.stores.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -155,6 +156,11 @@ func (s *Service) publishDocument(
 	if err := s.stores.SagIndex.QueueExtraction(ctx, transaction, operation.Namespace, documentID,
 		operation.ID, sagExtractionChunkIDs(chunks)); err != nil {
 		return err
+	}
+	if graph != nil {
+		if err := s.stores.LightRAGDocuments.RegisterPending(ctx, transaction, operation.Namespace, documentID, record.Name, graph.fingerprint); err != nil {
+			return err
+		}
 	}
 	if err := transaction.Commit(); err != nil {
 		return err

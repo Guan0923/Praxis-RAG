@@ -25,6 +25,8 @@ import hashlib
 import json
 import os
 import threading
+import time
+from uuid import uuid4
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +77,9 @@ class DocumentMeta:
     document_name: str
     chunks: tuple[ChunkRef, ...]
     updated_at: str
+    revision: str = ""
+    publication_version: str = ""
+    source_hash: str = ""
 
 
 def utc_now() -> str:
@@ -84,7 +89,7 @@ def utc_now() -> str:
         ISO-8601 timestamp, for example ``2026-01-01T00:00:00+00:00``.
     """
 
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _document_filename(document_id: str) -> str:
@@ -167,12 +172,12 @@ class ChunkRegistry:
         with self._lock:
             self._load(namespace)
             documents = self._documents.setdefault(namespace, {})
+            self._write(namespace, document)
             previous = documents.get(document.document_id)
             if previous is not None:
                 self._unindex(namespace, previous)
             documents[document.document_id] = document
             self._index(namespace, document)
-            self._write(namespace, document)
 
     def remove_document(self, namespace: str, document_id: str) -> bool:
         """Remove one document's metadata.
@@ -188,14 +193,11 @@ class ChunkRegistry:
         with self._lock:
             self._load(namespace)
             documents = self._documents.setdefault(namespace, {})
+            self._path(namespace, document_id).unlink(missing_ok=True)
             document = documents.pop(document_id, None)
             if document is None:
                 return False
             self._unindex(namespace, document)
-            try:
-                self._path(namespace, document_id).unlink(missing_ok=True)
-            except OSError:
-                return True
             return True
 
     def clear(self, namespace: str) -> None:
@@ -217,10 +219,7 @@ class ChunkRegistry:
             directory = self._namespace_dir(namespace)
             if directory.exists():
                 for path in directory.glob("*.json"):
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
+                    path.unlink(missing_ok=True)
                 try:
                     directory.rmdir()
                 except OSError:
@@ -378,12 +377,22 @@ class ChunkRegistry:
         directory = self._namespace_dir(namespace)
         directory.mkdir(parents=True, exist_ok=True)
         path = self._path(namespace, document.document_id)
-        temporary = path.with_suffix(".json.tmp")
+        temporary = path.with_suffix(f".{uuid4().hex}.tmp")
         temporary.write_text(
             json.dumps(self._document_to_json(document), ensure_ascii=False),
             encoding="utf-8",
         )
-        os.replace(temporary, path)
+        # Windows readers (including filesystem indexing) can briefly deny
+        # replacement of the just-written pending registration.
+        for attempt in range(6):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 5:
+                    temporary.unlink(missing_ok=True)
+                    raise
+                time.sleep(0.01 * 2**attempt)
 
     @staticmethod
     def _document_to_json(document: DocumentMeta) -> dict:
@@ -401,6 +410,9 @@ class ChunkRegistry:
             "document_id": document.document_id,
             "document_name": document.document_name,
             "updated_at": document.updated_at,
+            "revision": document.revision,
+            "publication_version": document.publication_version,
+            "source_hash": document.source_hash,
             "chunks": [
                 {
                     "chunk_id": chunk.chunk_id,
@@ -460,4 +472,7 @@ class ChunkRegistry:
             document_name=document_name,
             chunks=tuple(chunks),
             updated_at=updated_at if isinstance(updated_at, str) else utc_now(),
+            revision=str(payload.get("revision") or ""),
+            publication_version=str(payload.get("publication_version") or ""),
+            source_hash=str(payload.get("source_hash") or ""),
         )

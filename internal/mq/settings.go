@@ -27,6 +27,8 @@ const (
 	DefaultDocumentTopic = "praxis_document_ingest"
 	DefaultDocumentGroup = "praxis_document_ingest_workers"
 
+	DefaultDeleteTopic  = "praxis_index_cleanup"
+	DefaultDeleteGroup  = "praxis_index_cleanup_workers"
 	DefaultReembedTopic = "praxis_reembed"
 	DefaultReembedGroup = "praxis_reembed_workers"
 
@@ -89,6 +91,8 @@ type Settings struct {
 	CacheDLQTopic string
 	CacheDLQGroup string
 
+	DeleteTopic  string
+	DeleteGroup  string
 	ReembedTopic string
 	ReembedGroup string
 
@@ -126,6 +130,8 @@ func SettingsFromEnv() (Settings, error) {
 		DocumentDLQTopic: strings.TrimSpace(envOrDefault("RAG_DOCUMENT_DLQ_TOPIC", DefaultDocumentDLQTopic)),
 		CacheDLQTopic:    strings.TrimSpace(envOrDefault("RAG_CACHE_DLQ_TOPIC", DefaultCacheDLQTopic)),
 		CacheDLQGroup:    strings.TrimSpace(envOrDefault("RAG_CACHE_DLQ_GROUP", DefaultCacheDLQGroup)),
+		DeleteTopic:      strings.TrimSpace(envOrDefault("RAG_DELETE_TOPIC", DefaultDeleteTopic)),
+		DeleteGroup:      strings.TrimSpace(envOrDefault("RAG_DELETE_GROUP", DefaultDeleteGroup)),
 		ReembedTopic:     strings.TrimSpace(envOrDefault("RAG_REEMBED_TOPIC", DefaultReembedTopic)),
 		ReembedGroup:     strings.TrimSpace(envOrDefault("RAG_REEMBED_GROUP", DefaultReembedGroup)),
 		PublishTimeout:   publishTimeout,
@@ -187,6 +193,21 @@ func (s Settings) Validate() error {
 	if s.CacheDLQGroup != "" {
 		if s.CacheDLQGroup == s.DocumentGroup || s.CacheDLQGroup == s.CacheGroup {
 			return newConfigError("Cache dead-letter group must be separate from the business consumer groups")
+		}
+	}
+	if s.DeleteTopic != "" || s.DeleteGroup != "" {
+		if s.DeleteTopic == "" || s.DeleteGroup == "" {
+			return newConfigError("Delete topic and group must not be empty")
+		}
+		for _, topic := range []string{s.DocumentTopic, s.CacheTopic, s.ReembedTopic, s.DocumentDLQTopic, s.CacheDLQTopic} {
+			if s.DeleteTopic == topic {
+				return newConfigError("Delete topic must be separate from other queues")
+			}
+		}
+		for _, group := range []string{s.DocumentGroup, s.CacheGroup, s.ReembedGroup, s.CacheDLQGroup, envOrDefault("RAG_DOCUMENT_DLQ_GROUP", "praxis_document_dead_letters")} {
+			if s.DeleteGroup == group {
+				return newConfigError("Delete group must be separate from other consumer groups")
+			}
 		}
 	}
 	if s.ReembedTopic != "" || s.ReembedGroup != "" {

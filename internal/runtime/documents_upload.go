@@ -478,11 +478,6 @@ func (s *Service) deleteDocumentByName(ctx context.Context, namespace, name stri
 		}
 		return nil, &apierrors.KnowledgeError{Message: "知识文件删除失败"}
 	}
-	// The deletion already committed. Removing the graph copy is best effort:
-	// a sidecar outage must not make a successful delete look failed, and the
-	// ledger row is removed with the graph copy so a stale copy cannot be
-	// mistaken for a current one.
-	s.removeDocumentGraph(ctx, namespace, documentID)
 	documents, err := s.ListDocuments(ctx, namespace)
 	if err != nil {
 		return nil, err
@@ -751,10 +746,14 @@ func (s *Service) storeAndIndex(
 				logging.WrapStage("embedding", err))
 		}
 	}
+	for i := range indexed.qdrantChunks {
+		indexed.qdrantChunks[i].SourceHash = sha256Value
+	}
 	assetPayloads := make([]map[string]any, 0, len(indexed.result.Assets))
 	for _, asset := range indexed.result.Assets {
 		payload := asset.Payload(indexed.result.Chunks[0].Source)
 		payload["document_id"] = indexed.result.Chunks[0].DocumentID
+		payload["source_hash"] = sha256Value
 		assetPayloads = append(assetPayloads, payload)
 	}
 	if err := s.documentJobProgress(ctx, options.Task, "indexing"); err != nil {
@@ -807,14 +806,14 @@ func (s *Service) storeAndIndex(
 			logging.WrapStage("publishing", err))
 	}
 	if err := s.publishDocument(ctx, operation, record, metadata, options.Content,
-		indexed.artifactBucket, indexed.result.StagingDir, options.Task, indexed.qdrantChunks); err != nil {
+		indexed.artifactBucket, indexed.result.StagingDir, options.Task, indexed.qdrantChunks, resources.graph); err != nil {
 		return s.failDocumentOperation(ctx, journal, coordinator, operation,
 			logging.WrapStage("publishing", err))
 	}
 	// The publication is durable, so the knowledge-graph mirror is scheduled
 	// afterwards and never affects the upload outcome: a sidecar outage leaves
 	// a failed ledger row, not a failed document.
-	s.scheduleGraphMirror(ctx, namespace, name, documentID, resources.graph, indexed.result.Chunks)
+	s.scheduleGraphMirror(ctx, namespace, name, documentID, operation.ID, sha256Value, resources.graph, indexed.result.Chunks)
 	if _, cleanupErr := coordinator.CleanupWorkspace(ctx, operation); cleanupErr != nil {
 		logUploadWarning(ctx, "Committed workspace cleanup pending", operation.ID, cleanupErr)
 	}

@@ -129,7 +129,8 @@ if (-not $env:RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD) {
     $env:RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD = $env:RAG_MYSQL_DEBEZIUM_PASSWORD
 }
 
-$normalTopics = @($env:RAG_CACHE_TOPIC, $env:RAG_DOCUMENT_TOPIC, $env:RAG_REEMBED_TOPIC)
+if (-not $env:RAG_DELETE_TOPIC) { $env:RAG_DELETE_TOPIC = "praxis_index_cleanup" }
+$normalTopics = @($env:RAG_DELETE_TOPIC, $env:RAG_CACHE_TOPIC, $env:RAG_DOCUMENT_TOPIC, $env:RAG_REEMBED_TOPIC)
 $dlqTopics = @($env:RAG_DOCUMENT_DLQ_TOPIC, $env:RAG_CACHE_DLQ_TOPIC)
 $normalGroups = @($env:RAG_CACHE_GROUP, $env:RAG_DOCUMENT_GROUP, $env:RAG_REEMBED_GROUP)
 $dlqGroups = @($env:RAG_DOCUMENT_DLQ_GROUP, $env:RAG_CACHE_DLQ_GROUP)
@@ -435,13 +436,17 @@ if (Test-Path $sagWorker) {
 else {
     Write-Warning "rag-sag-worker executable not found. Run scripts\build-go.ps1 to enable SAG extraction for new uploads."
 }
+$deleteWorker = Join-Path $binDir "rag-delete-worker.exe"
+$deleteWorkerProcess = $null
 $reembedWorkerProcess = $null
 try {
+    $deleteWorkerProcess = Start-Process -FilePath $deleteWorker -WindowStyle Hidden -PassThru
     Write-Host "Starting rag-reembed-worker (consumes $($env:RAG_REEMBED_TOPIC) as group $($env:RAG_REEMBED_GROUP))..."
     $reembedWorkerProcess = Start-Process -FilePath $reembedWorker -WindowStyle Hidden -PassThru
     & $ragService
 }
 finally {
+    if ($deleteWorkerProcess) { Stop-Process -Id $deleteWorkerProcess.Id -Force -ErrorAction SilentlyContinue }
     if ($reembedWorkerProcess) {
         Stop-Process -Id $reembedWorkerProcess.Id -Force -ErrorAction SilentlyContinue
     }
