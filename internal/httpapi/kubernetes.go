@@ -18,6 +18,7 @@ import (
 type KubernetesRuntime interface {
 	// Configured reports whether cluster credentials were resolved.
 	Configured() bool
+	Memory(context.Context) (*k8sops.MemoryView, error)
 	// ClusterInfo identifies the connected cluster (no API server URL).
 	ClusterInfo() k8sops.ClusterInfo
 	// Workloads returns the filtered workload snapshot.
@@ -52,6 +53,7 @@ const (
 // session and never accepts the local loopback break-glass.
 func (s *Server) registerKubernetesRoutes() {
 	s.router.add("GET", "/v1/admin/k8s/workloads", authAdminSession, s.handleKubernetesWorkloads)
+	s.router.add("GET", "/v1/admin/k8s/memory", authAdminSession, s.handleKubernetesMemory)
 	s.router.add("GET", "/v1/admin/k8s/pods", authAdminSession, s.handleKubernetesPods)
 	s.router.add("POST", "/v1/admin/k8s/workloads/{resource}/{namespace}/{name}/restart",
 		authAdminSession, s.handleKubernetesRestart)
@@ -115,6 +117,21 @@ func (s *Server) handleKubernetesWorkloads(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, view)
+}
+
+func (s *Server) handleKubernetesMemory(w http.ResponseWriter, r *http.Request) {
+	runtime, ok := s.kubernetesReadRuntime(w)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), kubernetesRequestTimeout)
+	defer cancel()
+	view, err := runtime.Memory(ctx)
+	if err != nil {
+		s.writeKubernetesReadError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, view)
 }
 

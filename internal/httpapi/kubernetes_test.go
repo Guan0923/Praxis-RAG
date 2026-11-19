@@ -39,6 +39,10 @@ type fakeKubernetesRestartCall struct {
 	name      string
 }
 
+func (f *fakeKubernetesRuntime) Memory(context.Context) (*k8sops.MemoryView, error) {
+	return &k8sops.MemoryView{}, nil
+}
+
 func (f *fakeKubernetesRuntime) Configured() bool { return f.configured }
 
 func (f *fakeKubernetesRuntime) ClusterInfo() k8sops.ClusterInfo { return f.info }
@@ -108,6 +112,7 @@ func TestKubernetesRoutesRequireSession(t *testing.T) {
 	runtime := &fakeKubernetesRuntime{configured: true}
 	handler := newKubernetesTestServer(t, runtime).Handler()
 	requests := []testRequest{
+		{method: "GET", target: "/v1/admin/k8s/memory", remote: "127.0.0.1:5000"},
 		{method: "GET", target: "/v1/admin/k8s/workloads", remote: "127.0.0.1:5000"},
 		{method: "GET", target: "/v1/admin/k8s/pods", remote: "127.0.0.1:5000"},
 		{method: "POST", target: kubernetesRestartTarget("deployments", "alpha", "web"), remote: "127.0.0.1:5000"},

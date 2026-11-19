@@ -60,6 +60,12 @@ metadata:
     app.kubernetes.io/component: api
     app.kubernetes.io/part-of: praxis-rag
 rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["list"]
   # 全部 Pod 视图（控制器创建的 Pod 与独立 Pod 都要列出），以及
   # ReplicationController、独立 Pod 的 ownerReferences 解析。
   - apiGroups: [""]

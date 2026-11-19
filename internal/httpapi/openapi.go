@@ -121,6 +121,7 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "GET", Path: "/v1/admin/monitor/logs", Summary: "Read-only monitor log page (memory ring or RAG_LOG_FILE)", Tag: "admin", Query: []string{"source", "component", "level", "query", "limit", "offset"}, Response: "200"},
 	{Method: "POST", Path: "/v1/admin/monitor/actions/requeue-jobs", Summary: "Requeue due retries and expired document-job leases now (sweep semantics)", Tag: "admin", Response: "200"},
 	{Method: "POST", Path: "/v1/admin/monitor/actions/connectors/{connector}/restart", Summary: "Restart one capture connector (fixed names only) and reset its restart budget", Tag: "admin", QueryBoolean: []string{"includeTasks"}, Response: "200"},
+	{Method: "GET", Path: "/v1/admin/k8s/memory", Summary: "Read node memory pressure and Pod memory samples", Tag: "admin", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/monitor/actions/worker-deployment", Summary: "Read the document worker Deployment replica state (Kubernetes only)", Tag: "admin", Response: "200"},
 	{Method: "POST", Path: "/v1/admin/monitor/actions/worker-deployment/scale", Summary: "Scale the document worker Deployment (kubectl scale equivalent)", Tag: "admin", Request: "WorkerScaleBody", Response: "200"},
 	{Method: "GET", Path: "/v1/users", Summary: "List accounts available for an invitation", Tag: "sharing", Response: "200"},

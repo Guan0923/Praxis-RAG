@@ -1271,6 +1271,50 @@ body.drag-selecting * {
    (MonitorMasonry) because native CSS masonry is still behind browser flags:
    .monitor-masonry is the flex row of equal-width columns, .monitor-stack is the
    full-width flow above and below those columns. */
+.monitor-page {
+  container: monitor / inline-size;
+  min-width: 0;
+}
+.monitor-refresh {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  font-variant-numeric: tabular-nums;
+}
+.monitor-key-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+.monitor-key-metrics .monitor-stat {
+  padding: 12px;
+  border-radius: 6px;
+  background: var(--sidebar);
+  overflow-wrap: anywhere;
+}
+.monitor-key-metrics .ant-statistic-content {
+  font-size: 24px;
+  font-variant-numeric: tabular-nums;
+}
+@container monitor (max-width: 760px) {
+  .monitor-key-metrics {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@container monitor (max-width: 500px) {
+  .monitor-page .page-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .monitor-key-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .monitor-key-metrics .monitor-stat:last-child {
+    grid-column: 1 / -1;
+  }
+}
 .monitor-stack {
   display: flex;
   flex-direction: column;
@@ -1302,12 +1346,12 @@ body.drag-selecting * {
 }
 /* Snapshot blocks are read at a glance: trim the default card padding and the
    value sizes so a tab fits a screen instead of scrolling. */
-.monitor-stack .ant-card-body {
-  padding: 12px 14px;
+.monitor-page .ant-card-body {
+  padding: 14px 16px;
 }
-.monitor-stack .ant-card-head {
+.monitor-page .ant-card-head {
   min-height: 40px;
-  padding: 0 14px;
+  padding: 0 16px;
 }
 .monitor-stack .ant-descriptions-item {
   padding-bottom: 4px;
@@ -1318,7 +1362,7 @@ body.drag-selecting * {
   line-height: 1.5;
 }
 .monitor-stack .monitor-note {
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.55;
 }
 .monitor-stack .monitor-subheading {
@@ -1380,7 +1424,7 @@ body.drag-selecting * {
   border-top: 1px solid var(--line);
 }
 .monitor-stat .ant-statistic-title {
-  font-size: 11px;
+  font-size: 12px;
   overflow-wrap: anywhere;
 }
 .monitor-stat .ant-statistic-content {
@@ -1429,8 +1473,17 @@ body.drag-selecting * {
 }
 /* Log panel: every filter stays on one wrapping row, and the table scrolls
    sideways so long messages never widen the card. */
-.monitor-log-filters {
+.monitor-log-filters,
+.monitor-k8s-filters {
+  padding-bottom: 12px;
   margin-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+.monitor-page .ant-table-cell {
+  vertical-align: top;
+}
+.monitor-page .ant-table-thead > tr > th {
+  white-space: normal;
 }
 .monitor-log-filters > * {
   min-width: 0;
@@ -1458,9 +1511,16 @@ body.drag-selecting * {
   .monitor-tabs .ant-tabs-nav-list {
     flex-wrap: nowrap;
   }
+  .monitor-k8s-filters .ant-segmented-group {
+    flex-wrap: wrap;
+  }
+  .monitor-k8s-filters > .ant-segmented,
   .monitor-log-filters > .ant-segmented {
     width: 100%;
   }
+  .monitor-k8s-filters > .ant-select,
+  .monitor-k8s-filters > .ant-input-affix-wrapper,
+  .monitor-log-filters > .ant-input-affix-wrapper,
   .monitor-log-filters > .ant-input,
   .monitor-log-filters > .ant-select {
     flex: 1 1 140px;

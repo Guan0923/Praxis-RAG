@@ -266,6 +266,15 @@ function installFetchMock() {
       restartCalls.push(url);
       return await restartResponder(url);
     }
+    if (url === "/v1/admin/k8s/memory") {
+      return jsonResponse({
+        generated_at: "2026-11-19T00:00:00Z",
+        warnings: ["Pod 用量不可用"],
+        nodes: [{ name: "node-a", pressure: "True", capacity: "8Gi", allocatable: "7Gi", usage: "7168Mi" }],
+        pods: [{ name: "doc", namespace: "rag", node: "node-a", priority: 0, priority_class: "",
+          containers: [{ name: "worker", kind: "应用", request: "512Mi", limit: "2Gi", termination: "OOMKilled" }] }],
+      });
+    }
     if (url.startsWith("/v1/admin/k8s/workloads")) {
       workloadCalls.push(url);
       return await workloadsResponder(url);
@@ -491,6 +500,20 @@ describe("MonitorPage Kubernetes workloads", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Kubernetes" }));
     await screen.findByText("web");
   }
+
+  it("shows node pressure and Pod specifications when Pod metrics are missing", async () => {
+    renderPage("admin");
+    await openKubernetes();
+    fireEvent.click(screen.getByText("节点与内存"));
+    expect(await screen.findByText("有压力")).toBeTruthy();
+    expect(within(tableRow("有压力")).getByText("1.0 GiB")).toBeTruthy();
+    expect(screen.getByText("Pod 用量不可用")).toBeTruthy();
+    const row = tableRow("rag/doc");
+    expect(within(row).getByText("worker：512Mi / 2Gi")).toBeTruthy();
+    expect(within(row).getByText("0")).toBeTruthy();
+    fireEvent.click(within(row).getByRole("button"));
+    expect(await screen.findByText("OOMKilled")).toBeTruthy();
+  });
 
   it("shows kind-specific counters and blocked reasons inline", async () => {
     workloadsResponder = () => jsonResponse(workloadsView([
