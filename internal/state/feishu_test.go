@@ -63,7 +63,11 @@ func TestFeishuConnectionRoundTripProtectsTokens(t *testing.T) {
 	if err != nil || !deleted {
 		t.Fatalf("Delete() = %v, %v", deleted, err)
 	}
-	if missing, _ := stores.FeishuConnections.Get(ctx, "u1"); missing != nil {
+	missing, err := stores.FeishuConnections.Get(ctx, "u1")
+	if err != nil {
+		t.Fatalf("Get() after delete error = %v", err)
+	}
+	if missing != nil {
 		t.Fatalf("connection still present: %+v", missing)
 	}
 }

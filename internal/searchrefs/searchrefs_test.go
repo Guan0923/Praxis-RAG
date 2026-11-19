@@ -130,16 +130,6 @@ func hitArtifacts(t *testing.T, hit map[string]any) []map[string]any {
 	}
 }
 
-func assertNumeric(t *testing.T, value any) {
-	t.Helper()
-	switch value.(type) {
-	case json.Number, float64, int:
-		return
-	default:
-		t.Fatalf("value is not numeric: %#v", value)
-	}
-}
-
 func TestCaptureRegistersSourceArtifacts(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()

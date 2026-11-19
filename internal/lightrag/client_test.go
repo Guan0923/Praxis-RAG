@@ -511,3 +511,81 @@ func TestClientRejectsEmptyArguments(t *testing.T) {
 		t.Fatal("an invalid argument still sent a request to the sidecar")
 	}
 }
+
+// TestClientGraphCleanupContract pins the three cleanup-locator methods:
+// Inventory pages documents under an advancing cursor, DocumentRevision
+// requires the sidecar's revision field, and PruneRevision accepts only the
+// terminal outcomes — anything else means the graph changed mid-cleanup.
+func TestClientGraphCleanupContract(t *testing.T) {
+	server, call := newSidecar(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK,
+			`{"documents":[{"document_id":"doc-2","publication_version":"v2","source_hash":"h2"}]}`)
+	})
+	client := newTestClient(t, server, "secret-token")
+	documents, err := client.Inventory(context.Background(), "kb-acme", "doc-1")
+	if err != nil {
+		t.Fatalf("Inventory() error = %v", err)
+	}
+	if len(documents) != 1 || documents[0].ID != "doc-2" ||
+		documents[0].Version != "v2" || documents[0].Hash != "h2" {
+		t.Fatalf("Inventory() = %+v", documents)
+	}
+	if call.method != http.MethodGet || call.path != workspacesPath+"/kb-acme/inventory" {
+		t.Fatalf("inventory request = %s %s", call.method, call.path)
+	}
+	if !strings.Contains(call.requestURI, "after=doc-1") {
+		t.Fatalf("inventory query = %q, want the after cursor", call.requestURI)
+	}
+
+	// A page that does not advance past the cursor is rejected.
+	regressedServer, _ := newSidecar(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK,
+			`{"documents":[{"document_id":"doc-0","publication_version":"v1","source_hash":"h1"}]}`)
+	})
+	regressedClient := newTestClient(t, regressedServer, "secret-token")
+	if _, err := regressedClient.Inventory(context.Background(), "kb-acme", "doc-1"); err == nil ||
+		!strings.Contains(err.Error(), "invalid graph inventory cursor") {
+		t.Fatalf("Inventory(regressed cursor) = %v, want the cursor error", err)
+	}
+
+	revisionServer, revisionCall := newSidecar(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{"revision":"rev-9"}`)
+	})
+	revisionClient := newTestClient(t, revisionServer, "secret-token")
+	revision, err := revisionClient.DocumentRevision(context.Background(), "kb-acme", "doc-1")
+	if err != nil || revision != "rev-9" {
+		t.Fatalf("DocumentRevision() = %q, %v", revision, err)
+	}
+	if revisionCall.method != http.MethodGet ||
+		revisionCall.path != workspacesPath+"/kb-acme/documents/doc-1/revision" {
+		t.Fatalf("revision request = %s %s", revisionCall.method, revisionCall.path)
+	}
+	missingServer, _ := newSidecar(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{}`)
+	})
+	missingClient := newTestClient(t, missingServer, "secret-token")
+	if _, err := missingClient.DocumentRevision(context.Background(), "kb-acme", "doc-1"); err == nil ||
+		!strings.Contains(err.Error(), "missing graph revision") {
+		t.Fatalf("DocumentRevision(missing) = %v, want the missing-revision error", err)
+	}
+
+	for _, outcome := range []string{"absent", "deleted", "superseded"} {
+		pruneServer, _ := newSidecar(t, func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusOK, `{"outcome":"`+outcome+`"}`)
+		})
+		pruneClient := newTestClient(t, pruneServer, "secret-token")
+		if err := pruneClient.PruneRevision(context.Background(), "kb-acme", "doc-1",
+			"rev-9", "pub-1", true, nil); err != nil {
+			t.Fatalf("PruneRevision(%s) error = %v", outcome, err)
+		}
+	}
+	changedServer, _ := newSidecar(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, `{"outcome":"replaced"}`)
+	})
+	changedClient := newTestClient(t, changedServer, "secret-token")
+	if err := changedClient.PruneRevision(context.Background(), "kb-acme", "doc-1",
+		"rev-9", "pub-1", true, nil); err == nil ||
+		!strings.Contains(err.Error(), "graph document changed during cleanup") {
+		t.Fatalf("PruneRevision(changed) = %v, want the mid-cleanup change error", err)
+	}
+}

@@ -317,6 +317,18 @@ func TestKnowledgeBaseAdminUpdate(t *testing.T) {
 	if rejected.Code != http.StatusConflict {
 		t.Fatalf("rejected status = %d", rejected.Code)
 	}
+
+	runtime.updateErr = &apierrors.UploadConflict{Message: "another operation is in flight"}
+	conflicted := performRequest(handler, testRequest{
+		method: "PATCH", target: "/v1/admin/knowledge-bases/alpha", remote: "127.0.0.1:5000",
+		body: `{"embedding_model":"other"}`,
+	})
+	if conflicted.Code != http.StatusConflict {
+		t.Fatalf("conflicted status = %d", conflicted.Code)
+	}
+	if detail := decodeBody(t, conflicted)["detail"]; detail != "Upload conflicts with another operation or idempotency key." {
+		t.Fatalf("conflicted detail = %v", detail)
+	}
 }
 
 func TestKnowledgeBaseAdminValidationParity(t *testing.T) {

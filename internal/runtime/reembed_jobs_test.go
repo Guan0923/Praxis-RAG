@@ -72,3 +72,50 @@ func TestReembedJobPublishesAndRefreshesCachedIndex(t *testing.T) {
 		t.Fatalf("terminal job still pending: %v, %v", pending, err)
 	}
 }
+
+// TestReembedJobFailsWhenSourceChanged pins the failure path: when the
+// knowledge-base snapshot moved on after the job was queued, the worker must
+// fail the job with the source-changed message instead of rebuilding into a
+// stale collection, and the failed job must leave the pending queue.
+func TestReembedJobFailsWhenSourceChanged(t *testing.T) {
+	modelURL, _ := newFakeModelAPI(t, kbModelHandler(nil))
+	_, qdrantURL := newFakeKBQdrant(t, kbScrollPoints)
+	service, stores := newKBService(t, qdrantURL)
+	ctx := context.Background()
+	if _, err := service.CreateKnowledgeBase(ctx, testCreateInput("alpha", modelURL)); err != nil {
+		t.Fatal(err)
+	}
+	seedReembedDocuments(t, stores)
+	input := kbconfig.UpdateInput{Values: map[string]any{"embedding_model": "embed-b"}}
+	job, err := service.SubmitReembed(ctx, "alpha", input)
+	if err != nil || job.Status != state.ReembedQueued {
+		t.Fatalf("SubmitReembed() = %v, %v", job, err)
+	}
+
+	// Move the snapshot forward behind the queue's back: the job's fenced
+	// base_version no longer matches, so the worker must observe the change.
+	if _, err := stores.DB.ExecContext(ctx,
+		"UPDATE reembed_jobs SET base_version = base_version + 1 WHERE job_id = ?", job.ID); err != nil {
+		t.Fatalf("corrupt base_version: %v", err)
+	}
+
+	worker, err := New(service.Config(), stores, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = worker.Close(ctx) })
+	if err := worker.ProcessReembed(ctx, "alpha", job.ID); err != nil {
+		t.Fatalf("ProcessReembed() error = %v", err)
+	}
+
+	finished, err := service.LatestReembed(ctx, "alpha")
+	if err != nil || finished == nil || finished.Status != state.ReembedFailed {
+		t.Fatalf("LatestReembed() = %v, %v, want %q", finished, err, state.ReembedFailed)
+	}
+	if finished.Error != state.ErrReembedSourceChanged.Error() {
+		t.Fatalf("failed error = %q, want %q", finished.Error, state.ErrReembedSourceChanged.Error())
+	}
+	if pending, err := stores.ReembedJobs.Pending(ctx, "alpha", job.ID); err != nil || pending != nil {
+		t.Fatalf("failed job still pending: %v, %v", pending, err)
+	}
+}

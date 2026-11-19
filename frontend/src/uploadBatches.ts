@@ -212,11 +212,7 @@ const defaultTimers: UploadBatchTimers = {
   clearTimeout: (handle) =>
     globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>),
 };
-let timers: UploadBatchTimers = defaultTimers;
-
-export function __setTimersForTests(next?: Partial<UploadBatchTimers>) {
-  timers = { ...defaultTimers, ...next };
-}
+const timers: UploadBatchTimers = defaultTimers;
 
 // --- Internal state ---------------------------------------------------------
 

@@ -155,14 +155,6 @@ func (f *fakeStateCache) failNextPuts(count int) {
 	f.failPuts = count
 }
 
-func (f *fakeStateCache) clear() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.values = map[string]any{}
-	f.revisions = map[string]int64{}
-	f.locks = map[string]string{}
-}
-
 // ---------------------------------------------------------------------------
 // journalIngester: the runtime ingestion seam. Success mimics the real runtime
 // publication: it commits an upload journal operation (the Reconcile proof) and

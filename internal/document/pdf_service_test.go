@@ -440,6 +440,40 @@ func TestPDFServiceParserRejectsUnsafeArchives(t *testing.T) {
 	}
 }
 
+// TestPDFServiceParserRejectsUnsafeManifestImageRefs pins the manifest-side
+// picture validation: hostile ImageFile references are rejected even though
+// every archive member name is safe, and a safe reference to a file the
+// service never wrote is rejected as well.
+func TestPDFServiceParserRejectsUnsafeManifestImageRefs(t *testing.T) {
+	cases := []struct {
+		name     string
+		imageRef string
+	}{
+		{name: "parent_traversal", imageRef: "../evil.png"},
+		{name: "absolute_path", imageRef: "/tmp/evil.png"},
+		{name: "windows_traversal", imageRef: `..\evil.png`},
+		{name: "safe_but_absent", imageRef: "pictures/absent.png"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			manifest := pdfServiceManifestFixture(PDFParserVersionService)
+			manifest.Assets[0].ImageFile = testCase.imageRef
+			archive := pdfServiceManifestArchive(t, manifest,
+				pdfServiceZipMember{name: "pictures/picture-0.png", data: []byte(pdfServiceTestImage)})
+			server, _ := newPDFServiceServer(t, func(w http.ResponseWriter, r *http.Request) {
+				writePDFServiceZip(w, archive)
+			})
+			parser := &PDFServiceParser{BaseURL: server.URL}
+			_, err := parser.ParseInto(context.Background(), writeValidPDF(t, "manual.pdf"), t.TempDir())
+			var parseErr *PDFParseError
+			if !errors.As(err, &parseErr) ||
+				!strings.Contains(parseErr.Message, "清单引用了缺失的图片文件") {
+				t.Fatalf("error = %v, want *PDFParseError containing the missing-image message", err)
+			}
+		})
+	}
+}
+
 func TestPDFServiceParserArchiveLimits(t *testing.T) {
 	manifest := pdfServiceManifestFixture(PDFParserVersionService)
 	raw, err := json.Marshal(manifest)

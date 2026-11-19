@@ -45,6 +45,16 @@ type fakeAccessControl struct {
 	revokedGrantee string
 	revokeGrantErr error
 
+	setRuleVal  access.GrantView
+	setRuleErr  error
+	setRuleNS   string
+	lastSetRule access.RuleRequest
+
+	clearDenyVal access.GrantView
+	clearDenyErr error
+	clearedDeny  string
+	clearedDoc   string
+
 	namespaceInvitations []access.InvitationView
 	namespaceInvErr      error
 
@@ -125,6 +135,19 @@ func (f *fakeAccessControl) ListGrants(context.Context, state.User, string) ([]a
 func (f *fakeAccessControl) RevokeGrant(_ context.Context, _ state.User, _, granteeUserID string) error {
 	f.revokedGrantee = granteeUserID
 	return f.revokeGrantErr
+}
+
+func (f *fakeAccessControl) SetRule(_ context.Context, _ state.User, namespace string, request access.RuleRequest) (access.GrantView, error) {
+	f.setRuleNS = namespace
+	f.lastSetRule = request
+	return f.setRuleVal, f.setRuleErr
+}
+
+func (f *fakeAccessControl) ClearDeny(_ context.Context, _ state.User, namespace, granteeUserID, documentName string) (access.GrantView, error) {
+	f.setRuleNS = namespace
+	f.clearedDeny = granteeUserID
+	f.clearedDoc = documentName
+	return f.clearDenyVal, f.clearDenyErr
 }
 
 func (f *fakeAccessControl) ListNamespaceInvitations(context.Context, state.User, string) ([]access.InvitationView, error) {
@@ -508,6 +531,74 @@ func TestPermissionsAndInvitationEndpoints(t *testing.T) {
 	})
 	if missingToken.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("missing token status = %d body = %s", missingToken.Code, missingToken.Body.String())
+	}
+}
+
+func TestSetKnowledgeBasePermissionAndClearDeny(t *testing.T) {
+	users := &fakeUserAuth{sessions: map[string]*auth.SessionUser{"admin-token": adminSession("admin-token")}}
+	control := &fakeAccessControl{
+		scopes: map[string]access.ScopeSet{"u-admin|kb1": fullTestScope()},
+		setRuleVal: access.GrantView{UserID: "u-user", Username: "bob", Permission: "write",
+			GrantedBy: "u-admin", GrantedByUsername: "alice",
+			CreatedAt: "2026-11-09T10:00:00.000000+00:00", UpdatedAt: "2026-11-09T10:00:00.000000+00:00"},
+		clearDenyVal: access.GrantView{UserID: "u-user", Permission: "read"},
+	}
+	handler := newAccessTestServer(t, users, control, nil).Handler()
+	headers := sessionHeaders("admin-token", "")
+
+	rule := performRequest(handler, testRequest{
+		method: "PUT", target: "/v1/knowledge-bases/kb1/permissions/u-user", remote: "10.0.0.9:5000",
+		headers: mergeHeaders(headers, map[string]string{"Content-Type": "application/json"}),
+		body:    `{"permission":"write","allow_mask":15,"deny_mask":2,"document_name":"a.md"}`,
+	})
+	if rule.Code != http.StatusOK {
+		t.Fatalf("set rule status = %d body = %s", rule.Code, rule.Body.String())
+	}
+	if control.setRuleNS != "kb1" || control.lastSetRule.GranteeUserID != "u-user" ||
+		control.lastSetRule.DocumentName != "a.md" || control.lastSetRule.Permission != "write" {
+		t.Fatalf("captured = %q %+v", control.setRuleNS, control.lastSetRule)
+	}
+	if control.lastSetRule.AllowMask == nil || *control.lastSetRule.AllowMask != 15 ||
+		control.lastSetRule.DenyMask == nil || *control.lastSetRule.DenyMask != 2 {
+		t.Fatalf("captured masks = %+v", control.lastSetRule)
+	}
+	grant, _ := decodeBody(t, rule)["permission"].(map[string]any)
+	if grant["user_id"] != "u-user" || grant["permission"] != "write" {
+		t.Fatalf("permission body = %v", grant)
+	}
+
+	empty := performRequest(handler, testRequest{
+		method: "PUT", target: "/v1/knowledge-bases/kb1/permissions/u-user", remote: "10.0.0.9:5000",
+		headers: mergeHeaders(headers, map[string]string{"Content-Type": "application/json"}),
+		body:    `{}`,
+	})
+	if empty.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("empty rule status = %d body = %s", empty.Code, empty.Body.String())
+	}
+
+	cleared := performRequest(handler, testRequest{
+		method: "POST", target: "/v1/knowledge-bases/kb1/permissions/u-user/clear-deny", remote: "10.0.0.9:5000",
+		headers: mergeHeaders(headers, map[string]string{"Content-Type": "application/json"}),
+		body:    `{"document_name":"a.md"}`,
+	})
+	if cleared.Code != http.StatusOK {
+		t.Fatalf("clear deny status = %d body = %s", cleared.Code, cleared.Body.String())
+	}
+	if control.clearedDeny != "u-user" || control.clearedDoc != "a.md" {
+		t.Fatalf("cleared = %q %q", control.clearedDeny, control.clearedDoc)
+	}
+	if _, present := decodeBody(t, cleared)["permission"]; !present {
+		t.Fatalf("clear deny body = %s", cleared.Body.String())
+	}
+
+	control.setRuleErr = access.NewError(access.KindForbidden, "只有管理员可以修改权限")
+	forbidden := performRequest(handler, testRequest{
+		method: "PUT", target: "/v1/knowledge-bases/kb1/permissions/u-user", remote: "10.0.0.9:5000",
+		headers: mergeHeaders(headers, map[string]string{"Content-Type": "application/json"}),
+		body:    `{"permission":"write"}`,
+	})
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("forbidden rule status = %d body = %s", forbidden.Code, forbidden.Body.String())
 	}
 }
 
@@ -1038,14 +1129,6 @@ type documentsChanged struct {
 	namespace string
 	before    []map[string]any
 	after     []map[string]any
-}
-
-func (f *recordingNotifier) PromptsChanged(namespace string) {
-	f.namespaces = append(f.namespaces, namespace)
-}
-
-func (f *recordingNotifier) ToolsChanged(namespace string) {
-	f.namespaces = append(f.namespaces, namespace)
 }
 
 func (f *recordingNotifier) DocumentsChanged(namespace string, before, after []map[string]any) {

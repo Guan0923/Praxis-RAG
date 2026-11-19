@@ -230,3 +230,44 @@ func TestGraphRetrieverRequiresClient(t *testing.T) {
 		t.Fatalf("error = %v, want a not-configured message", err)
 	}
 }
+
+// TestGraphRetrieverAppliesVisibleContextsHook pins the visibility seam: the
+// configured hook filters the sidecar's contexts before candidates are built,
+// and a hook failure fails the search instead of leaking evidence.
+func TestGraphRetrieverAppliesVisibleContextsHook(t *testing.T) {
+	contexts := []map[string]any{
+		{"chunk_id": "c-1", "document_id": "doc-1", "text": "允许的证据", "score": 0.9},
+		{"chunk_id": "c-2", "document_id": "doc-2", "text": "被拒绝的证据", "score": 0.8},
+	}
+	server := graphTestServer(t, contexts, nil)
+	defer server.Close()
+
+	retriever := newGraphRetrieverForTest(t, server.URL, GraphOptions{
+		VisibleContexts: func(_ context.Context, items []lightrag.Context) ([]lightrag.Context, error) {
+			visible := make([]lightrag.Context, 0, len(items))
+			for _, item := range items {
+				if item.DocumentID != "doc-2" {
+					visible = append(visible, item)
+				}
+			}
+			return visible, nil
+		},
+	})
+	candidates, err := retriever.Search(context.Background(), "问题", 3, nil)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].DocumentID != "doc-1" {
+		t.Fatalf("candidates = %+v, want only the visible context", candidates)
+	}
+
+	failing := newGraphRetrieverForTest(t, server.URL, GraphOptions{
+		VisibleContexts: func(context.Context, []lightrag.Context) ([]lightrag.Context, error) {
+			return nil, errors.New("visibility lookup failed")
+		},
+	})
+	if _, err := failing.Search(context.Background(), "问题", 3, nil); err == nil ||
+		!strings.Contains(err.Error(), "visibility lookup failed") {
+		t.Fatalf("Search(hook error) = %v, want the propagated failure", err)
+	}
+}

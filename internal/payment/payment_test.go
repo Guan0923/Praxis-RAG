@@ -1,6 +1,7 @@
 package payment
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -482,6 +483,45 @@ func decodeBizContent(t *testing.T, form url.Values) map[string]string {
 }
 
 func TestQuery(t *testing.T) {
+	t.Run("transport failures map to their error categories", func(t *testing.T) {
+		unavailable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "gateway maintenance", http.StatusServiceUnavailable)
+		}))
+		t.Cleanup(unavailable.Close)
+		_, err := newTestClient(t, unavailable.URL).Query(context.Background(), testOrderID)
+		if !errors.Is(err, ErrGatewayUnavailable) ||
+			!strings.Contains(err.Error(), "支付宝网关返回 HTTP 503") {
+			t.Fatalf("http-503 error = %v, want ErrGatewayUnavailable with the status", err)
+		}
+
+		oversize := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(bytes.Repeat([]byte("x"), 1024*1024+1))
+		}))
+		t.Cleanup(oversize.Close)
+		_, err = newTestClient(t, oversize.URL).Query(context.Background(), testOrderID)
+		if !errors.Is(err, ErrInvalidResponse) ||
+			!strings.Contains(err.Error(), "支付宝返回内容超过 1 MiB") {
+			t.Fatalf("oversize error = %v, want ErrInvalidResponse with the size message", err)
+		}
+
+		empty := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write(nil)
+		}))
+		t.Cleanup(empty.Close)
+		_, err = newTestClient(t, empty.URL).Query(context.Background(), testOrderID)
+		if !errors.Is(err, ErrInvalidResponse) ||
+			!strings.Contains(err.Error(), "支付宝返回内容为空") {
+			t.Fatalf("empty error = %v, want ErrInvalidResponse with the empty message", err)
+		}
+
+		closed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		closed.Close()
+		_, err = newTestClient(t, closed.URL).Query(context.Background(), testOrderID)
+		if !errors.Is(err, ErrGatewayUnavailable) {
+			t.Fatalf("transport error = %v, want ErrGatewayUnavailable", err)
+		}
+	})
+
 	t.Run("success", func(t *testing.T) {
 		payload := `{"code":"10000","msg":"Success","trade_no":"` + testTradeNo +
 			`","out_trade_no":"` + testOrderID +

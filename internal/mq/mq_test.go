@@ -515,10 +515,6 @@ func TestConsumerConstructorsValidationAndLifecycle(t *testing.T) {
 	if err := consumer.Start(context.Background()); !errors.Is(err, ErrConsumerFailed) {
 		t.Fatalf("Start() after Stop() = %v", err)
 	}
-	var iface Consumer = consumer
-	if iface == nil {
-		t.Fatal("consumer interface is nil")
-	}
 }
 
 func TestConsumerMaxAttemptsZeroRetriesUntilCancelled(t *testing.T) {

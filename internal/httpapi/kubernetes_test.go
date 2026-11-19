@@ -27,6 +27,7 @@ type fakeKubernetesRuntime struct {
 	podsErr      error
 	restart      *k8sops.RestartState
 	restartErr   error
+	scaleErr     error
 
 	workloadFilters []k8sops.Filter
 	podFilters      []k8sops.Filter
@@ -44,7 +45,7 @@ func (f *fakeKubernetesRuntime) Memory(context.Context) (*k8sops.MemoryView, err
 }
 
 func (f *fakeKubernetesRuntime) ScaleWorker(context.Context, string, string, string, int32, int32) error {
-	return nil
+	return f.scaleErr
 }
 
 func (f *fakeKubernetesRuntime) Configured() bool { return f.configured }
@@ -531,5 +532,56 @@ func TestKubernetesScaleRequiresAdminAndObservedReplicas(t *testing.T) {
 		if r.Code != tc.code {
 			t.Errorf("scale %s: got %d want %d (%s)", tc.body, r.Code, tc.code, r.Body)
 		}
+	}
+}
+
+func TestKubernetesScaleErrorMapping(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+		detail string
+	}{
+		{
+			name:   "scale conflict",
+			err:    fmt.Errorf("%w: deployment changed", k8sops.ErrScaleConflict),
+			status: http.StatusConflict,
+			detail: "工作负载或副本数已变化，请刷新后重试",
+		},
+		{
+			name:   "not found",
+			err:    fmt.Errorf("%w: alpha/web", k8sops.ErrNotFound),
+			status: http.StatusNotFound,
+			detail: "工作负载不存在",
+		},
+		{
+			name:   "forbidden",
+			err:    k8sops.ErrForbidden,
+			status: http.StatusForbidden,
+			detail: "请检查目标 Worker 和集群权限",
+		},
+		{
+			name:   "other",
+			err:    errors.New("apiserver timeout"),
+			status: http.StatusBadGateway,
+			detail: "Kubernetes 扩缩容请求失败",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			runtime := &fakeKubernetesRuntime{configured: true, scaleErr: testCase.err}
+			handler := newKubernetesTestServer(t, runtime).Handler()
+			response := performRequest(handler, testRequest{
+				method: "POST", target: "/v1/admin/k8s/workloads/deployments/praxis-rag/rag-sag-worker/scale",
+				body:   `{"uid":"uid","current_replicas":2,"replicas":3}`,
+				remote: "10.0.0.9:5000", headers: kubernetesBearer(kubernetesAdminToken),
+			})
+			if response.Code != testCase.status {
+				t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+			}
+			if detail := decodeBody(t, response)["detail"]; detail != testCase.detail {
+				t.Fatalf("detail = %v, want %q", detail, testCase.detail)
+			}
+		})
 	}
 }

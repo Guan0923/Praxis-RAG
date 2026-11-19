@@ -216,3 +216,76 @@ func TestJevClientBatchesLargeRounds(t *testing.T) {
 		}
 	}
 }
+
+// TestJevClientRequiresEndpointAndModel pins the configuration guards: a
+// missing service URL or model name fails the round before any request, while
+// an empty candidate list short-circuits ahead of the guards.
+func TestJevClientRequiresEndpointAndModel(t *testing.T) {
+	client := NewJevClient(ModelConnection{}, DefaultTimeout)
+	_, err := client.Score(context.Background(), JevScoreRequest{
+		Question:   "q",
+		Candidates: []JevCandidate{{ID: "0", Title: "t", Passage: "p"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "尚未配置 JEV 决策模型服务地址") {
+		t.Fatalf("missing endpoint error = %v", err)
+	}
+
+	client = NewJevClient(ModelConnection{BaseURL: "http://127.0.0.1:1/v1"}, DefaultTimeout)
+	_, err = client.Score(context.Background(), JevScoreRequest{
+		Question:   "q",
+		Candidates: []JevCandidate{{ID: "0", Title: "t", Passage: "p"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "尚未配置 JEV 决策模型名称") {
+		t.Fatalf("missing model error = %v", err)
+	}
+
+	// Zero candidates never start a round, so the unconfigured client answers
+	// an empty score slice without touching the network.
+	result, err := client.Score(context.Background(), JevScoreRequest{Question: "q"})
+	if err != nil || len(result.Scores) != 0 {
+		t.Fatalf("empty candidates = %+v, %v", result, err)
+	}
+}
+
+// TestJevClientRejectsBadAnswerValues pins the response-value guards: an
+// unknown answer type and an out-of-range score both fail the round with the
+// frozen messages instead of being scored.
+func TestJevClientRejectsBadAnswerValues(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Questions map[string]json.RawMessage `json:"questions"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		answers := make(map[string]map[string]any, len(body.Questions))
+		for key := range body.Questions {
+			answers[key] = payload
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"answers": answers, "model": "jev-test"})
+	}))
+	defer server.Close()
+	client := NewJevClient(ModelConnection{BaseURL: server.URL, Model: "jev-latest"}, DefaultTimeout)
+	client.backoff = func(int) time.Duration { return 0 }
+	request := JevScoreRequest{
+		Question:   "q",
+		Candidates: []JevCandidate{{ID: "0", Title: "t", Passage: "p"}},
+	}
+
+	payload = map[string]any{"type": "boolean", "noul": 0.5}
+	if _, err := client.Score(context.Background(), request); err == nil ||
+		!strings.Contains(err.Error(), "JEV 决策服务返回了未知的答案类型") {
+		t.Fatalf("unknown answer type error = %v", err)
+	}
+
+	payload = map[string]any{"type": "noul", "noul": 1.5}
+	if _, err := client.Score(context.Background(), request); err == nil ||
+		!strings.Contains(err.Error(), "JEV 决策服务返回了无效的证据分值") {
+		t.Fatalf("above-range score error = %v", err)
+	}
+
+	payload = map[string]any{"type": "noul", "noul": -0.25}
+	if _, err := client.Score(context.Background(), request); err == nil ||
+		!strings.Contains(err.Error(), "JEV 决策服务返回了无效的证据分值") {
+		t.Fatalf("below-range score error = %v", err)
+	}
+}
