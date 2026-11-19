@@ -94,7 +94,7 @@ func (s *Service) rebuildKnowledgeBaseIndex(ctx context.Context, token *state.Lo
 	if err := s.stores.Uploads.RenewLock(ctx, token); err != nil {
 		return err
 	}
-	settings := kbconfig.ActivateReembed(task.TargetSettings, staging, s.clock())
+	settings := kbconfig.ActivateReembed(task.TargetSettings, staging, s.now())
 	err = s.stores.ReembedJobs.Publish(ctx, token, task, settings)
 	if errors.Is(err, state.ErrReembedSourceChanged) {
 		return s.failReembed(ctx, token, task, err.Error())
