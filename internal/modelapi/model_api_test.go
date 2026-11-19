@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -581,5 +580,4 @@ func TestRequestUsesInjectedClient(t *testing.T) {
 	if err != nil || payload["ok"] != true {
 		t.Fatalf("Request() = %v, %v", payload, err)
 	}
-	_ = strings.TrimSpace("")
 }

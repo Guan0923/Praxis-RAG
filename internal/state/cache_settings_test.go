@@ -32,13 +32,14 @@ func TestCacheSettingsDefaultsAndEnvironment(t *testing.T) {
 	if !settings.backendEnabled() {
 		t.Fatal("configured Redis URL did not enable the backend")
 	}
-	enabled := false
 	t.Setenv("RAG_REDIS_ENABLED", "off")
 	settings, err = CacheSettingsFromEnv()
 	if err != nil {
 		t.Fatalf("CacheSettingsFromEnv() error = %v", err)
 	}
-	settings.Enabled = &enabled
+	if settings.Enabled == nil || *settings.Enabled {
+		t.Fatalf("RAG_REDIS_ENABLED=off parsed into %+v", settings.Enabled)
+	}
 	if settings.backendEnabled() {
 		t.Fatal("RAG_REDIS_ENABLED=off did not disable the backend")
 	}

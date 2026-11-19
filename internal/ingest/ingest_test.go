@@ -425,11 +425,18 @@ func TestPrepareWordVisionIntegration(t *testing.T) {
 func TestPrepareCancelledContextAndStagingCleanupOnFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	staging := filepath.Join(t.TempDir(), "staging-failure")
 	_, err := Prepare(ctx, writeText(t, "paper.pdf", "%PDF-1.7"), Options{
 		SourceName: "paper.pdf",
+		StagingDir: staging,
 		PDF:        PDFOptions{Parser: &fakePDFParser{err: context.Canceled}},
 	})
 	if err == nil {
 		t.Fatalf("cancelled context was ignored")
+	}
+	// A caller-provided staging directory is kept (the caller owns removing
+	// it), but the failure path must not leave half-written artifacts behind.
+	if entries, readErr := os.ReadDir(staging); readErr != nil || len(entries) != 0 {
+		t.Fatalf("failed Prepare left staging artifacts: entries=%d err=%v", len(entries), readErr)
 	}
 }

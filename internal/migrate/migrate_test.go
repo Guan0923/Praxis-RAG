@@ -11,8 +11,7 @@ import (
 )
 
 func TestNamespaceForLegacyUser(t *testing.T) {
-	if got := NamespaceForLegacyUser("alice"); got != "user-"+"2bd806c97f0e00af"[:16] && len(got) != 21 {
-		// Value check is anchored below via determinism and shape.
+	if got := NamespaceForLegacyUser("alice"); got != "user-2bd806c97f0e00af" {
 		t.Fatalf("unexpected namespace %q", got)
 	}
 	if NamespaceForLegacyUser("alice") != NamespaceForLegacyUser("alice") {
