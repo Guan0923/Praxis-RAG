@@ -6,6 +6,8 @@ package retrieval
 // required.
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Guan0923/Praxis-RAG/internal/contracts"
@@ -62,8 +64,9 @@ func (f *fakeSagIndex) EventsByEntities(_ context.Context, _ string, entityIDs [
 // fakeSagStore returns fixed hybrid recall points and hydrates from a chunk
 // map (the hyperedge-only candidates' evidence source).
 type fakeSagStore struct {
-	points []SagPoint
-	chunks map[string]SagPoint
+	points     []SagPoint
+	chunks     map[string]SagPoint
+	hydrateErr error
 }
 
 func (f *fakeSagStore) HybridSearch(_ context.Context, _ []float64, _ sparse.SparseEmbedding, _ int, _ map[string]any) ([]SagPoint, error) {
@@ -71,6 +74,9 @@ func (f *fakeSagStore) HybridSearch(_ context.Context, _ []float64, _ sparse.Spa
 }
 
 func (f *fakeSagStore) HydrateChunks(_ context.Context, chunkIDs []string) ([]SagPoint, error) {
+	if f.hydrateErr != nil {
+		return nil, f.hydrateErr
+	}
 	result := make([]SagPoint, 0, len(chunkIDs))
 	for _, chunkID := range chunkIDs {
 		if point, ok := f.chunks[chunkID]; ok {
@@ -196,5 +202,64 @@ func TestSagRetrieverZeroLimit(t *testing.T) {
 	results, err := retriever.Search(context.Background(), "q", 0, nil)
 	if err != nil || len(results) != 0 {
 		t.Fatalf("Search(limit=0) = (%v, %v), want empty", results, err)
+	}
+}
+
+// TestSagRetrieverRequiresIndex pins the misconfiguration guard: a nil index
+// fails the search with the frozen unavailable-index message.
+func TestSagRetrieverRequiresIndex(t *testing.T) {
+	retriever := NewSagRetriever("ns", nil, fakeSagEmbedder{}, nil, &fakeSagStore{}, SagOptions{})
+	_, err := retriever.Search(context.Background(), "q", 5, nil)
+	if err == nil || !strings.Contains(err.Error(), "事件-实体索引不可用") {
+		t.Fatalf("error = %v, want the unavailable-index message", err)
+	}
+	var operation *contracts.RagOperationError
+	if !errors.As(err, &operation) {
+		t.Fatalf("error = %v, want *contracts.RagOperationError", err)
+	}
+}
+
+// TestSagRetrieverHydrationContract pins the evidence-hydration behaviour: a
+// store failure fails the whole search with the frozen message, and a
+// hyperedge candidate the store cannot hydrate is dropped from the output
+// instead of surviving with empty evidence text.
+func TestSagRetrieverHydrationContract(t *testing.T) {
+	index := &fakeSagIndex{
+		eventsByChunk: map[string]SagEvent{
+			"chunk-1": {ID: "ev-1", ChunkID: "chunk-1", DocumentID: "doc-1", Event: "Project Atlas started in 2024."},
+		},
+		entitiesByEv: map[string][]SagEntity{
+			"ev-1": {
+				{ID: "ent-atlas", NormalizedKey: "atlas", DisplayName: "Atlas"},
+			},
+		},
+		eventsByEntity: map[string][]SagEvent{
+			// chunk-3 is only reachable through the shared-entity hyperedge,
+			// so its evidence text must come from HydrateChunks.
+			"ent-atlas": {
+				{ID: "ev-3", ChunkID: "chunk-3", DocumentID: "doc-2", Event: "Atlas released version 2."},
+			},
+		},
+	}
+	points := []SagPoint{
+		{DocumentID: "doc-1", ChunkID: "chunk-1", Title: "Doc One", Source: "one.md",
+			Text: "Project Atlas started in 2024.", Score: 0.9, Metadata: map[string]any{}},
+	}
+
+	failing := &fakeSagStore{points: points, hydrateErr: errors.New("corpus scroll failed")}
+	retriever := NewSagRetriever("ns", index, fakeSagEmbedder{}, nil, failing, SagOptions{})
+	if _, err := retriever.Search(context.Background(), "who released Atlas 2", 5, nil); err == nil ||
+		!strings.Contains(err.Error(), "证据补水失败") {
+		t.Fatalf("hydrate failure error = %v, want the frozen hydration message", err)
+	}
+
+	unhydratable := &fakeSagStore{points: points, chunks: map[string]SagPoint{}}
+	retriever = NewSagRetriever("ns", index, fakeSagEmbedder{}, nil, unhydratable, SagOptions{})
+	results, err := retriever.Search(context.Background(), "who released Atlas 2", 5, nil)
+	if err != nil {
+		t.Fatalf("Search() error = %v", err)
+	}
+	if len(results) != 1 || results[0].ChunkID != "chunk-1" {
+		t.Fatalf("Search() = %+v, want only the hydrated direct chunk (textless hyperedge dropped)", results)
 	}
 }

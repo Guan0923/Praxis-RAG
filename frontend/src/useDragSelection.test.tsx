@@ -92,9 +92,6 @@ function TableHarness({
           </table>
         )}
       </div>
-      <button type="button" data-testid="outside-button">
-        外部
-      </button>
       <div
         data-testid="outside-row"
         data-row-key="outside"

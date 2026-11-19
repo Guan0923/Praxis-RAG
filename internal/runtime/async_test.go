@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -237,5 +238,35 @@ func TestAddDocumentAsyncValidationAndStatus(t *testing.T) {
 		t.Fatalf("unknown artifact id accepted")
 	} else if !errors.As(err, &validation) || validation.Message != "Document upload not found" {
 		t.Fatalf("unknown artifact id error = %v", err)
+	}
+}
+
+// TestAsyncDocumentErrorMapsLockUnavailable pins the retryable 503 branch:
+// an unavailable document-lock backend must map to the dedicated
+// KnowledgeError text (retry with the same idempotency key), never to the
+// conflict 400 text.
+func TestAsyncDocumentErrorMapsLockUnavailable(t *testing.T) {
+	mapped := asyncDocumentError(state.NewLockUnavailable())
+	knowledge, ok := mapped.(*apierrors.KnowledgeError)
+	if !ok {
+		t.Fatalf("mapped = %T (%v), want *apierrors.KnowledgeError", mapped, mapped)
+	}
+	if knowledge.Message != documentLockUnavailableMessage {
+		t.Fatalf("message = %q, want %q", knowledge.Message, documentLockUnavailableMessage)
+	}
+
+	// A wrapped lock failure maps the same way: admission annotates its errors.
+	wrapped := asyncDocumentError(fmt.Errorf("admission: %w", state.NewLockUnavailable()))
+	knowledge, ok = wrapped.(*apierrors.KnowledgeError)
+	if !ok || knowledge.Message != documentLockUnavailableMessage {
+		t.Fatalf("wrapped mapping = %T (%v)", wrapped, wrapped)
+	}
+
+	// Contrast: a name/idempotency conflict stays a validation-flavoured 400
+	// with the frozen conflict text, not the retryable lock text.
+	conflicted := asyncDocumentError(&state.UploadConflict{Message: "same name"})
+	validationError, ok := conflicted.(*apierrors.KnowledgeValidationError)
+	if !ok || validationError.Message != asyncUploadConflictMessage {
+		t.Fatalf("conflict mapping = %T (%v)", conflicted, conflicted)
 	}
 }

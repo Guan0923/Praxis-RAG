@@ -21,17 +21,13 @@ type fakeBloomBackend struct {
 	building  *UploadBloomGeneration
 	disabled bool
 	bits     map[int64]map[int64]struct{}
-	ttl      map[int64]time.Duration
 
-	hooks      map[string]error
-	setBits    []string
-	stateReads int
+	hooks map[string]error
 }
 
 func newFakeBloomBackend() *fakeBloomBackend {
 	return &fakeBloomBackend{
 		bits:  map[int64]map[int64]struct{}{},
-		ttl:   map[int64]time.Duration{},
 		hooks: map[string]error{},
 	}
 }
@@ -54,7 +50,6 @@ func (f *fakeBloomBackend) State(context.Context) (UploadBloomState, error) {
 	}
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
-	f.stateReads++
 	var active, building *UploadBloomGeneration
 	if f.active != nil {
 		copy := *f.active
@@ -73,7 +68,6 @@ func (f *fakeBloomBackend) SetBits(_ context.Context, generation UploadBloomGene
 	}
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
-	f.setBits = append(f.setBits, ids...)
 	shardBits := f.bits[generation.Generation]
 	if shardBits == nil {
 		shardBits = map[int64]struct{}{}
@@ -117,7 +111,6 @@ func (f *fakeBloomBackend) AcquireBuild(_ context.Context, generation int64, par
 	}
 	pinned := UploadBloomGeneration{Generation: generation, Params: params}
 	f.building = &pinned
-	f.ttl[generation] = ttl
 	return pinned, true, nil
 }
 
@@ -127,7 +120,6 @@ func (f *fakeBloomBackend) RenewBuild(_ context.Context, generation int64, ttl t
 	if f.building == nil || f.building.Generation != generation {
 		return NewBloomUnavailable()
 	}
-	f.ttl[generation] = ttl
 	return nil
 }
 
@@ -165,7 +157,6 @@ func (f *fakeBloomBackend) Disable(context.Context) (bool, error) {
 func (f *fakeBloomBackend) ExpireGeneration(_ context.Context, generation UploadBloomGeneration, ttl time.Duration) error {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
-	f.ttl[generation.Generation] = ttl
 	return nil
 }
 

@@ -365,3 +365,43 @@ func TestSearchProjectsEntities(t *testing.T) {
 		t.Fatalf("search metadata = %+v", page)
 	}
 }
+
+// TestAccessTokenRefreshMapsAuthFailureToReauth pins the refresh-failure
+// classification: a revoked refresh grant maps to ErrReauthRequired so the
+// user is sent back through OAuth, while an app-credential failure stays an
+// actionable deployment error instead of a re-auth loop.
+func TestAccessTokenRefreshMapsAuthFailureToReauth(t *testing.T) {
+	seed := func(t *testing.T, connections *fakeConnections) {
+		t.Helper()
+		if err := connections.Upsert(context.Background(), &state.FeishuConnection{
+			UserID: "u1", AccessToken: "u-expired", RefreshToken: "r-old",
+			AccessExpiresAt:  time.Now().Add(-time.Hour).Unix(),
+			RefreshExpiresAt: time.Now().Add(time.Hour).Unix(),
+			Scope:            ScopeDriveRead + " " + ScopeDocxRead + " " + ScopeOffline,
+		}); err != nil {
+			t.Fatalf("Upsert() error = %v", err)
+		}
+	}
+
+	// A revoked refresh token (code 20026) requires re-authorization.
+	service, connections, _, _ := testService(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, map[string]any{"code": 20026, "error": "refresh token revoked"})
+	})
+	seed(t, connections)
+	if _, err := service.ReadDocument(context.Background(), "u1", "doxcn1"); err != ErrReauthRequired {
+		t.Fatalf("ReadDocument(revoked refresh) = %v, want ErrReauthRequired", err)
+	}
+
+	// Invalid app credentials (code 20002) stay a deployment error.
+	deployService, deployConnections, _, _ := testService(t, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, map[string]any{"code": 20002, "error": "invalid client_id"})
+	})
+	seed(t, deployConnections)
+	_, err := deployService.ReadDocument(context.Background(), "u1", "doxcn1")
+	if err == ErrReauthRequired {
+		t.Fatalf("ReadDocument(bad credentials) = ErrReauthRequired, want the deployment error to pass through")
+	}
+	if err == nil || !strings.Contains(err.Error(), "App ID/App Secret") {
+		t.Fatalf("ReadDocument(bad credentials) = %v, want the app-credential message", err)
+	}
+}

@@ -21,7 +21,6 @@ type memoryCache struct {
 	down          bool
 	closed        bool
 	puts          int
-	lockedDown    bool
 	entries       map[CacheKey]any
 	watermarks    map[CacheKey]int64
 	backfillLocks map[CacheKey]string
@@ -101,9 +100,6 @@ func (m *memoryCache) AcquireBackfillLock(_ context.Context, kind, scope, token 
 	if m.down {
 		return false, newCacheUnavailable("unreachable")
 	}
-	if m.lockedDown {
-		return false, newCacheUnavailable("locked down")
-	}
 	key := CacheKey{Kind: kind, Scope: scope}
 	if holder, ok := m.backfillLocks[key]; ok && holder != token {
 		return false, nil
@@ -115,7 +111,7 @@ func (m *memoryCache) AcquireBackfillLock(_ context.Context, kind, scope, token 
 func (m *memoryCache) RenewBackfillLock(_ context.Context, kind, scope, token string, _ time.Duration) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.down || m.lockedDown {
+	if m.down {
 		return false, newCacheUnavailable("unreachable")
 	}
 	holder, ok := m.backfillLocks[CacheKey{Kind: kind, Scope: scope}]

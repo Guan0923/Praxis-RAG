@@ -65,9 +65,6 @@ func TestMonitorLightRAGUnconfigured(t *testing.T) {
 	if item.Upstream != nil {
 		t.Fatalf("lightrag.upstream = %+v, want nil when unconfigured", item.Upstream)
 	}
-	if item.LatencyMS < 0 {
-		t.Fatalf("lightrag latency = %v", item.LatencyMS)
-	}
 	if overview["status"] != statusOK || overview["ok"] != true {
 		t.Fatalf("status/ok = %v/%v, want ok/true", overview["status"], overview["ok"])
 	}
@@ -239,6 +236,54 @@ func TestMonitorLightRAGInvalidAddress(t *testing.T) {
 			}
 			if overview["status"] != statusError {
 				t.Fatalf("status = %v, want error", overview["status"])
+			}
+		})
+	}
+}
+
+// TestMonitorLightRAGStatusVerdicts pins the health-status mapping branches:
+// a "degraded" sidecar downgrades the row while still rendering the workspace
+// detail, an empty status is reported as its own degraded verdict, and an
+// unknown status escalates the row to error.
+func TestMonitorLightRAGStatusVerdicts(t *testing.T) {
+	cases := []struct {
+		name       string
+		payload    string
+		wantStatus string
+		wantDetail string
+	}{
+		{
+			name: "degraded",
+			payload: `{"status":"degraded","service":"praxis-lightrag-service","version":"0.1.0",` +
+				`"upstream":null,"workspaces":2,"config_error":null}`,
+			wantStatus: statusDegraded,
+			wantDetail: "工作区 2 个",
+		},
+		{
+			name: "empty status",
+			payload: `{"status":"","service":"praxis-lightrag-service","version":"0.1.0",` +
+				`"upstream":null,"workspaces":0,"config_error":null}`,
+			wantStatus: statusDegraded,
+			wantDetail: "健康检查未返回状态",
+		},
+		{
+			name: "unknown status",
+			payload: `{"status":"melting","service":"praxis-lightrag-service","version":"0.1.0",` +
+				`"upstream":null,"workspaces":0,"config_error":null}`,
+			wantStatus: statusError,
+			wantDetail: "LightRAG 服务状态为 melting",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := jsonServer(t, "/healthz", http.StatusOK, testCase.payload)
+			overview := New(lightragProbeOptions(t, server.URL)).MonitorOverview(context.Background())
+			item := dependencyByName(t, overview, "lightrag")
+			if item.Status != testCase.wantStatus {
+				t.Fatalf("lightrag status = %q, want %q (%+v)", item.Status, testCase.wantStatus, item)
+			}
+			if !strings.Contains(item.Detail, testCase.wantDetail) {
+				t.Fatalf("lightrag detail = %q, want %q", item.Detail, testCase.wantDetail)
 			}
 		})
 	}

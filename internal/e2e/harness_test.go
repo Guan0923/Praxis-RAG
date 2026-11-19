@@ -148,7 +148,6 @@ func newFakeModelServer(t *testing.T) (string, *httpRecorder) {
 type fakeQdrant struct {
 	mutex       sync.Mutex
 	requests    []recordedRequest
-	created     map[string]bool
 	queryPoints string
 }
 
@@ -160,25 +159,9 @@ func (f *fakeQdrant) all() []recordedRequest {
 	return copied
 }
 
-func (f *fakeQdrant) count(method, suffix string) int {
-	count := 0
-	for _, request := range f.all() {
-		if request.Method == method && strings.HasSuffix(request.Path, suffix) {
-			count++
-		}
-	}
-	return count
-}
-
-func (f *fakeQdrant) wasCreated(collection string) bool {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	return f.created[collection]
-}
-
 func newFakeQdrantServer(t *testing.T, queryPoints string) (*fakeQdrant, string) {
 	t.Helper()
-	fake := &fakeQdrant{created: map[string]bool{}, queryPoints: queryPoints}
+	fake := &fakeQdrant{queryPoints: queryPoints}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		recorded := recordAndDecode(t, &httpRecorder{}, request)
 		fake.mutex.Lock()
@@ -204,10 +187,6 @@ func newFakeQdrantServer(t *testing.T, queryPoints string) (*fakeQdrant, string)
 		case request.Method == http.MethodPut && strings.HasSuffix(path, "/points"):
 			_, _ = writer.Write([]byte(`{"result":{"status":"completed"}}`))
 		case request.Method == http.MethodPut:
-			name := collectionFromPath(path)
-			fake.mutex.Lock()
-			fake.created[name] = true
-			fake.mutex.Unlock()
 			_, _ = writer.Write([]byte(`{"result":true}`))
 		case request.Method == http.MethodDelete:
 			_, _ = writer.Write([]byte(`{"result":true}`))
@@ -219,14 +198,6 @@ func newFakeQdrantServer(t *testing.T, queryPoints string) (*fakeQdrant, string)
 	}))
 	t.Cleanup(server.Close)
 	return fake, server.URL
-}
-
-func collectionFromPath(path string) string {
-	trimmed := strings.TrimPrefix(path, "/collections/")
-	if index := strings.Index(trimmed, "/"); index >= 0 {
-		return trimmed[:index]
-	}
-	return trimmed
 }
 
 // newTestStores opens the shared MySQL test store with the suite encryption key.
@@ -297,9 +268,6 @@ type harness struct {
 	Qdrant  *fakeQdrant
 	Model   *httpRecorder
 	Cache   *redisstate.Client
-	// Redis is the in-process miniredis backing Cache; FlushAll() proves the
-	// MySQL fact source can rebuild a read-model view after a cache loss.
-	Redis *miniredis.Miniredis
 
 	mutex sync.Mutex
 	// artifacts lists the document artifact ids whose notifications the fake
@@ -364,7 +332,6 @@ func newHarness(t *testing.T, queryPoints string) *harness {
 		Qdrant:   qdrant,
 		Model:    modelRecorder,
 		Cache:    cache,
-		Redis:    mr,
 		ModelURL: modelURL,
 	}
 	t.Cleanup(func() {
@@ -438,13 +405,12 @@ func encodeNotification(t *testing.T, value any) []byte {
 	return body
 }
 
-// fakePullTransport is an mq.PullTransport fed by the test; it records acked and
-// nacked deliveries so assertions can verify the worker ack policy.
+// fakePullTransport is an mq.PullTransport fed by the test; it records acked
+// deliveries so assertions can verify the worker ack policy.
 type fakePullTransport struct {
 	mutex    sync.Mutex
 	messages []mq.ReceivedMessage
 	acked    []mq.ReceivedMessage
-	nacked   []mq.ReceivedMessage
 	// offsets assigns deterministic per-topic offsets to pushes that carry none,
 	// so the consumer's commit tracking sees a realistic record sequence.
 	offsets map[string]int64
@@ -492,9 +458,6 @@ func (f *fakePullTransport) Ack(_ context.Context, message mq.ReceivedMessage) e
 }
 
 func (f *fakePullTransport) ChangeInvisibleDuration(_ context.Context, message mq.ReceivedMessage, _ time.Duration) error {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	f.nacked = append(f.nacked, message)
 	return nil
 }
 
@@ -502,12 +465,6 @@ func (f *fakePullTransport) ackCount() int {
 	f.mutex.Lock()
 	defer f.mutex.Unlock()
 	return len(f.acked)
-}
-
-func (f *fakePullTransport) nackCount() int {
-	f.mutex.Lock()
-	defer f.mutex.Unlock()
-	return len(f.nacked)
 }
 
 // runDocumentWorkerUntil starts a real mq.PullConsumer over the in-process

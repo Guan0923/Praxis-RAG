@@ -2,7 +2,6 @@ package state
 
 import (
 	"encoding/base64"
-	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -14,10 +13,6 @@ const platformLegacyMessage = "apikey 需要由保存它的系统账号读取"
 // Windows uses current-user DPAPI, every other platform uses private-file:.
 func TestLegacyProtectPlatformBehavior(t *testing.T) {
 	isolateStateEnv(t)
-	key := os.Getenv(EncryptionKeyEnv)
-	if key != "" {
-		t.Fatalf("test environment still has %s set: %q", EncryptionKeyEnv, key)
-	}
 	protected, err := Protect("legacy-secret", "")
 	if err != nil {
 		t.Fatalf("Protect() error = %v", err)

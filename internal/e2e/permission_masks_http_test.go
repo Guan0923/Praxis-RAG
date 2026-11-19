@@ -3,6 +3,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -44,6 +45,37 @@ func TestPermissionMaskAcceptanceScenarios(t *testing.T) {
 		requireStatus(t, recorder, http.StatusAccepted, "admin uploads "+name)
 		waitRestBatchSucceeded(t, h, recorder)
 	}
+
+	// Serve both documents' evidence from the fake Qdrant so the restricted
+	// retrieval check below exercises a non-empty candidate set: without this
+	// corpus the leak assertion can never fire.
+	documentIDs := map[string]string{}
+	rows, err := h.Stores.DB.QueryContext(context.Background(),
+		"SELECT name, document_id FROM documents WHERE namespace = ? AND name IN (?, ?)", "mask", "A.pdf.md", "B.pdf.md")
+	if err != nil {
+		t.Fatalf("query documents: %v", err)
+	}
+	for rows.Next() {
+		var name, documentID string
+		if err := rows.Scan(&name, &documentID); err != nil {
+			t.Fatalf("scan document row: %v", err)
+		}
+		documentIDs[name] = documentID
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("close document rows: %v", err)
+	}
+	if len(documentIDs) != 2 {
+		t.Fatalf("seeded documents = %v, want A.pdf.md and B.pdf.md", documentIDs)
+	}
+	h.Qdrant.queryPoints = fmt.Sprintf(`[
+		{"id":"mask-p1","version":1,"score":0.95,"payload":{
+		"record_type":"chunk","document_id":%q,"chunk_id":"chunk-mask-a",
+		"text":%q,"title":"a","source":"A.pdf.md","metadata":{"kind":"test"}}},
+		{"id":"mask-p2","version":1,"score":0.94,"payload":{
+		"record_type":"chunk","document_id":%q,"chunk_id":"chunk-mask-b",
+		"text":%q,"title":"b","source":"B.pdf.md","metadata":{"kind":"test"}}}
+	]`, documentIDs["A.pdf.md"], documentText[:20], documentIDs["B.pdf.md"], documentText[:20])
 
 	// A rule carrying only a deny takes effect immediately (setting the deny
 	// needs no invitation acceptance).
@@ -194,6 +226,9 @@ func TestPermissionMaskAcceptanceScenarios(t *testing.T) {
 	recorder, payload = member.json(http.MethodPost, "/v1/search", "mask", searchPayload)
 	requireStatus(t, recorder, http.StatusOK, "restricted retrieval runs with the narrowed set")
 	results, _ := payload["results"].([]any)
+	if len(results) == 0 {
+		t.Fatalf("restricted retrieval returned no results; the fake corpus is broken: %v", payload)
+	}
 	for _, raw := range results {
 		item, _ := raw.(map[string]any)
 		if source, _ := item["source"].(string); source == "B.pdf.md" {

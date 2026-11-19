@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -238,5 +239,32 @@ func TestSupervisorStatusErrorDoesNotRestart(t *testing.T) {
 	supervisor.Tick(context.Background())
 	if client.restartCount() != 0 {
 		t.Fatalf("restarted = %v, want none when the status is unreadable", client.restarted)
+	}
+}
+
+// TestSupervisorHealthMergesCachedStatusOnReadFailure pins the degraded
+// merge: when the REST status read fails after a healthy observation, Health
+// returns the last observed status with a read-failure reason instead of an
+// empty placeholder.
+func TestSupervisorHealthMergesCachedStatusOnReadFailure(t *testing.T) {
+	supervisor, client, _ := supervisorFixture(t)
+	client.setTasks("doc-cdc", StateRunning)
+	supervisor.Tick(context.Background())
+	client.mu.Lock()
+	client.errors["doc-cdc"] = errors.New("connection refused")
+	client.mu.Unlock()
+
+	health, err := supervisor.Health(context.Background(), "doc-cdc")
+	if err == nil || !contains(err.Error(), "connection refused") {
+		t.Fatalf("Health() error = %v, want the propagated status failure", err)
+	}
+	if health.Connector != "doc-cdc" || health.State != StateRunning ||
+		!health.SupervisorEnabled ||
+		!contains(health.FailureReason, "状态读取失败") ||
+		!contains(health.FailureReason, "connection refused") {
+		t.Fatalf("health = %+v, want the cached RUNNING status with the read-failure reason", health)
+	}
+	if len(health.Tasks) != 1 || health.Tasks[0].State != StateRunning {
+		t.Fatalf("health tasks = %+v, want the cached running task", health.Tasks)
 	}
 }

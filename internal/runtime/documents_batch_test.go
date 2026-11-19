@@ -153,6 +153,41 @@ func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
 	}
 }
 
+// TestGetDocumentBatchIsolatesForeignOwner pins the cross-account isolation of
+// the Console progress read: a batch owned by another account is reported as
+// absent instead of leaking file names, while the owner and the unfiltered
+// (administrator) view still read it.
+func TestGetDocumentBatchIsolatesForeignOwner(t *testing.T) {
+	service, _ := newAsyncService(t)
+	ctx := context.Background()
+	payload, err := service.SubmitDocumentBatch(ctx, "alpha",
+		[]UploadFile{{Name: "note.md", Content: []byte("# ok")}}, "batch-owned", "u-alice")
+	if err != nil {
+		t.Fatalf("SubmitDocumentBatch() error = %v", err)
+	}
+	batchID, _ := payload["batch_id"].(string)
+	if batchID == "" {
+		t.Fatalf("payload = %v", payload)
+	}
+
+	absent, err := service.GetDocumentBatch(ctx, "alpha", batchID, "u-bob")
+	if err != nil {
+		t.Fatalf("GetDocumentBatch(foreign viewer) error = %v", err)
+	}
+	if absent != nil {
+		t.Fatalf("GetDocumentBatch(foreign viewer) = %v, want absent", absent)
+	}
+
+	owned, err := service.GetDocumentBatch(ctx, "alpha", batchID, "u-alice")
+	if err != nil || owned == nil {
+		t.Fatalf("GetDocumentBatch(owner) = %v, %v", owned, err)
+	}
+	unfiltered, err := service.GetDocumentBatch(ctx, "alpha", batchID, "")
+	if err != nil || unfiltered == nil {
+		t.Fatalf("GetDocumentBatch(unfiltered) = %v, %v", unfiltered, err)
+	}
+}
+
 // TestSubmitDocumentBatchRejectsOversizedInput keeps the batch contract at the
 // ten-file limit of the batch upload endpoint.
 // TestSubmitDocumentBatchOrdersQuotaRejections covers the "9 files, last slot"

@@ -268,16 +268,14 @@ const (
 	connectCacheName    = "praxis-cache-cdc"
 )
 
-// fakeConnectorProbe returns fixed health documents and records the connector
-// names the monitor asked about.
+// fakeConnectorProbe returns fixed health documents for the connectors the
+// monitor asks about.
 type fakeConnectorProbe struct {
 	health map[string]connect.ConnectorHealth
 	errs   map[string]error
-	calls  []string
 }
 
 func (f *fakeConnectorProbe) Health(_ context.Context, connector string) (connect.ConnectorHealth, error) {
-	f.calls = append(f.calls, connector)
 	if err, ok := f.errs[connector]; ok {
 		return f.health[connector], err
 	}
@@ -374,9 +372,6 @@ func TestMonitorOverviewHealthy(t *testing.T) {
 		}
 		if item.Label == "" || item.Detail == "" {
 			t.Fatalf("dependency %q = %+v", name, item)
-		}
-		if item.LatencyMS < 0 {
-			t.Fatalf("dependency %q latency = %v", name, item.LatencyMS)
 		}
 	}
 	// The Qdrant row reports the collections the pipeline actually writes to.
@@ -884,6 +879,24 @@ func TestMonitorPipelineConnect(t *testing.T) {
 		}
 		if view.Debezium.Tasks.CaptureProgress != nil || view.Debezium.Cache.CaptureProgress != nil {
 			t.Fatalf("capture_progress must stay null: %+v", view.Debezium)
+		}
+	})
+
+	t.Run("RUNNING 但尚未调度 task", func(t *testing.T) {
+		unscheduled := runningConnector(connectDocumentName, "connect-1:8083")
+		unscheduled.Tasks = nil
+		probe := healthyConnectProbe()
+		probe.health[connectDocumentName] = unscheduled
+		options := pipelineTestOptions(sampleStats())
+		options.ConnectorProbe = probe
+		view := pipelineOf(t, New(options).MonitorOverview(context.Background()))
+		if view.Debezium.Tasks.Status != statusDegraded ||
+			!strings.Contains(view.Debezium.Tasks.Detail, "尚未调度 task") {
+			t.Fatalf("pipeline.debezium.tasks = %+v", view.Debezium.Tasks)
+		}
+		// The other capture route keeps its healthy verdict.
+		if view.Debezium.Cache.Status != statusOK {
+			t.Fatalf("pipeline.debezium.cache = %+v", view.Debezium.Cache)
 		}
 	})
 

@@ -169,7 +169,10 @@ func TestSettingsValidateDeleteAndReembedSeparation(t *testing.T) {
 			t.Fatalf("delete topic clash %q error = %v", clash, err)
 		}
 	}
-	deleteGroupClashes := []string{"doc-group", "cache-group", "cache-dlq-group"}
+	// The document dead-letter consumer group is fenced off too, whatever
+	// RAG_DOCUMENT_DLQ_GROUP names it.
+	documentDLQGroup := envOrDefault("RAG_DOCUMENT_DLQ_GROUP", "praxis_document_dead_letters")
+	deleteGroupClashes := []string{"doc-group", "cache-group", "cache-dlq-group", documentDLQGroup}
 	for _, clash := range deleteGroupClashes {
 		settings := testSettings(true)
 		settings.DeleteTopic = "delete-topic"
@@ -203,7 +206,7 @@ func TestSettingsValidateDeleteAndReembedSeparation(t *testing.T) {
 			t.Fatalf("reembed topic clash %q error = %v", clash, err)
 		}
 	}
-	reembedGroupClashes := []string{"doc-group", "cache-group", "cache-dlq-group"}
+	reembedGroupClashes := []string{"doc-group", "cache-group", "cache-dlq-group", documentDLQGroup}
 	for _, clash := range reembedGroupClashes {
 		settings := testSettings(true)
 		settings.ReembedTopic = "reembed-topic"
@@ -212,6 +215,25 @@ func TestSettingsValidateDeleteAndReembedSeparation(t *testing.T) {
 			!strings.Contains(err.Error(), "Re-embedding group must be separate") {
 			t.Fatalf("reembed group clash %q error = %v", clash, err)
 		}
+	}
+
+	// A custom RAG_DOCUMENT_DLQ_GROUP rename keeps the fence: both the delete
+	// and the re-embedding groups must stay separate from the renamed
+	// document dead-letter consumer group.
+	t.Setenv("RAG_DOCUMENT_DLQ_GROUP", "custom-doc-dlq-group")
+	deleteDLQRename := testSettings(true)
+	deleteDLQRename.DeleteTopic = "delete-topic"
+	deleteDLQRename.DeleteGroup = "custom-doc-dlq-group"
+	if err := deleteDLQRename.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "Delete group must be separate") {
+		t.Fatalf("delete group clash with renamed document DLQ group error = %v", err)
+	}
+	reembedDLQRename := testSettings(true)
+	reembedDLQRename.ReembedTopic = "reembed-topic"
+	reembedDLQRename.ReembedGroup = "custom-doc-dlq-group"
+	if err := reembedDLQRename.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "Re-embedding group must be separate") {
+		t.Fatalf("reembed group clash with renamed document DLQ group error = %v", err)
 	}
 
 	// Fully separate delete/reembed queues validate cleanly.

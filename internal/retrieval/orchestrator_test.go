@@ -38,8 +38,7 @@ func (r *recordingRetriever) Search(
 }
 
 type recordingReranker struct {
-	candidates []contracts.Candidate
-	calls      int
+	calls int
 }
 
 func (r *recordingReranker) Rerank(

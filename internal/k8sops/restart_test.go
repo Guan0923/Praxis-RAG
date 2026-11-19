@@ -23,15 +23,6 @@ func currentRestart(cluster *Cluster, name string) (*RestartState, bool) {
 	return nil, false
 }
 
-func testedRestart(t *testing.T, cluster *Cluster, name string) *RestartState {
-	t.Helper()
-	state, ok := currentRestart(cluster, name)
-	if !ok || state == nil {
-		t.Fatalf("workload %q has no restart state", name)
-	}
-	return state
-}
-
 func testPatchResponse(name, namespace, uid string, generation int64) map[string]any {
 	return map[string]any{
 		"metadata": map[string]any{
