@@ -77,8 +77,8 @@ func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
 	if !ok || len(items) != 3 {
 		t.Fatalf("items = %v", payload["items"])
 	}
-	// Which of the two same-name files wins the admission race is arbitrary;
-	// what matters is exactly one accepted item and one queued skip.
+	// Admission runs serially in input order, so the first same-named file is
+	// deterministically accepted and the last one is the queued skip.
 	oneNameStatuses := make([]any, 0, 2)
 	for _, item := range items {
 		switch item["name"] {
@@ -99,8 +99,8 @@ func TestSubmitDocumentBatchAdmitsAndClassifies(t *testing.T) {
 			}
 		}
 	}
-	if len(oneNameStatuses) != 2 || oneNameStatuses[0] == oneNameStatuses[1] {
-		t.Fatalf("same-name outcomes = %v", oneNameStatuses)
+	if len(oneNameStatuses) != 2 || oneNameStatuses[0] != "accepted" || oneNameStatuses[1] != "skipped" {
+		t.Fatalf("same-name outcomes = %v, want [accepted skipped] in input order", oneNameStatuses)
 	}
 	var jobs int
 	if err := stores.DB.QueryRowContext(ctx,

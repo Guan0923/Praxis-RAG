@@ -8,7 +8,6 @@ import (
 	"image/jpeg"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -126,13 +125,5 @@ func writeStagingFile(t *testing.T, dir, relative string, data []byte) {
 	}
 	if err := os.WriteFile(target, data, 0o644); err != nil {
 		t.Fatalf("write staging file: %v", err)
-	}
-}
-
-// assertContains fails with a readable diff message.
-func assertContains(t *testing.T, haystack, needle string) {
-	t.Helper()
-	if !strings.Contains(haystack, needle) {
-		t.Fatalf("text %q does not contain %q", haystack, needle)
 	}
 }

@@ -141,3 +141,86 @@ func TestSettingsValidateAndDLQTopicFor(t *testing.T) {
 		t.Fatalf("cache DLQ group validation error = %v", err)
 	}
 }
+
+// TestSettingsValidateDeleteAndReembedSeparation pins the delete and
+// re-embedding queue contracts: a half-configured pair is rejected, and each
+// topic/group must stay separate from every other queue's topic/group.
+func TestSettingsValidateDeleteAndReembedSeparation(t *testing.T) {
+	deleteMissingTopic := testSettings(true)
+	deleteMissingTopic.DeleteGroup = "delete-group"
+	if err := deleteMissingTopic.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "Delete topic and group must not be empty") {
+		t.Fatalf("half-configured delete error = %v", err)
+	}
+	deleteMissingGroup := testSettings(true)
+	deleteMissingGroup.DeleteTopic = "delete-topic"
+	if err := deleteMissingGroup.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "Delete topic and group must not be empty") {
+		t.Fatalf("half-configured delete error = %v", err)
+	}
+
+	deleteTopicClashes := []string{"doc-topic", "cache-topic", "doc-dlq", "cache-dlq"}
+	for _, clash := range deleteTopicClashes {
+		settings := testSettings(true)
+		settings.DeleteTopic = clash
+		settings.DeleteGroup = "delete-group"
+		if err := settings.Validate(); err == nil ||
+			!strings.Contains(err.Error(), "Delete topic must be separate") {
+			t.Fatalf("delete topic clash %q error = %v", clash, err)
+		}
+	}
+	deleteGroupClashes := []string{"doc-group", "cache-group", "cache-dlq-group"}
+	for _, clash := range deleteGroupClashes {
+		settings := testSettings(true)
+		settings.DeleteTopic = "delete-topic"
+		settings.DeleteGroup = clash
+		if err := settings.Validate(); err == nil ||
+			!strings.Contains(err.Error(), "Delete group must be separate") {
+			t.Fatalf("delete group clash %q error = %v", clash, err)
+		}
+	}
+
+	reembedMissingTopic := testSettings(true)
+	reembedMissingTopic.ReembedGroup = "reembed-group"
+	if err := reembedMissingTopic.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "Re-embedding topic and group must not be empty") {
+		t.Fatalf("half-configured reembed error = %v", err)
+	}
+	reembedMissingGroup := testSettings(true)
+	reembedMissingGroup.ReembedTopic = "reembed-topic"
+	if err := reembedMissingGroup.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "Re-embedding topic and group must not be empty") {
+		t.Fatalf("half-configured reembed error = %v", err)
+	}
+
+	reembedTopicClashes := []string{"doc-topic", "cache-topic", "doc-dlq", "cache-dlq"}
+	for _, clash := range reembedTopicClashes {
+		settings := testSettings(true)
+		settings.ReembedTopic = clash
+		settings.ReembedGroup = "reembed-group"
+		if err := settings.Validate(); err == nil ||
+			!strings.Contains(err.Error(), "Re-embedding topic must be separate") {
+			t.Fatalf("reembed topic clash %q error = %v", clash, err)
+		}
+	}
+	reembedGroupClashes := []string{"doc-group", "cache-group", "cache-dlq-group"}
+	for _, clash := range reembedGroupClashes {
+		settings := testSettings(true)
+		settings.ReembedTopic = "reembed-topic"
+		settings.ReembedGroup = clash
+		if err := settings.Validate(); err == nil ||
+			!strings.Contains(err.Error(), "Re-embedding group must be separate") {
+			t.Fatalf("reembed group clash %q error = %v", clash, err)
+		}
+	}
+
+	// Fully separate delete/reembed queues validate cleanly.
+	both := testSettings(true)
+	both.DeleteTopic = "delete-topic"
+	both.DeleteGroup = "delete-group"
+	both.ReembedTopic = "reembed-topic"
+	both.ReembedGroup = "reembed-group"
+	if err := both.Validate(); err != nil {
+		t.Fatalf("separate delete/reembed queues rejected: %v", err)
+	}
+}

@@ -26,11 +26,22 @@ func viewDocumentRecord(name string) DocumentRecord {
 	}
 }
 
-func cachedEntry(t *testing.T, cache *memoryCache, kind, scope string) any {
+func cachedEntry(t *testing.T, cache *memoryCache, kind, scope string) (any, bool) {
 	t.Helper()
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
-	return cache.entries[CacheKey{Kind: kind, Scope: scope}]
+	value, found := cache.entries[CacheKey{Kind: kind, Scope: scope}]
+	return value, found
+}
+
+// mustCachedEntry returns the cached value and fails when nothing was cached.
+func mustCachedEntry(t *testing.T, cache *memoryCache, kind, scope string) any {
+	t.Helper()
+	value, found := cachedEntry(t, cache, kind, scope)
+	if !found {
+		t.Fatalf("no cache entry for %s/%s", kind, scope)
+	}
+	return value
 }
 
 func TestPublicSettingsRedactsProviderCredentials(t *testing.T) {
@@ -82,7 +93,11 @@ func TestMissingViewsAreCachedPerNamespace(t *testing.T) {
 	if value, err := stores.Views.KnowledgeBase(ctx, "other"); err != nil || value["namespace"] != "other" {
 		t.Fatalf("KnowledgeBase(other) = %+v, %v", value, err)
 	}
-	if entry := cachedEntry(t, cache, "kb_public", "absent"); entry != nil {
+	// The missing view must be cached as a present nil marker (found), not
+	// merely absent from the cache.
+	if entry, found := cachedEntry(t, cache, "kb_public", "absent"); !found {
+		t.Fatal("missing view was not cached per namespace")
+	} else if entry != nil {
 		t.Fatalf("missing view cache entry = %#v, want nil", entry)
 	}
 }
@@ -130,7 +145,7 @@ func TestKnowledgeBaseListMergesConfigurationAndDocumentCounts(t *testing.T) {
 			t.Fatalf("KnowledgeBases()[%d] = %+v, want %+v", index, summaries[index], want)
 		}
 	}
-	payload := fmt.Sprintf("%v", cachedEntry(t, cache, "kb_list", ""))
+	payload := fmt.Sprintf("%v", mustCachedEntry(t, cache, "kb_list", ""))
 	if strings.Contains(payload, "secret-provider-key") {
 		t.Fatalf("kb_list cache leaked a credential: %s", payload)
 	}

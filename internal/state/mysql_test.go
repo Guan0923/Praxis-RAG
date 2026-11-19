@@ -119,8 +119,6 @@ func TestMySQLStoreRoundTrip(t *testing.T) {
 	}
 }
 
-// cleanupMySQLRows removes the rows a MySQL test case created; the shared test
-// database is never dropped.
 // TestMySQLG7StateMachines gates the document-job state machine on
 // RAG_TEST_MYSQL_URL. Search is synchronous and has no table-backed task state.
 func TestMySQLG7StateMachines(t *testing.T) {
@@ -176,6 +174,8 @@ func TestMySQLG7StateMachines(t *testing.T) {
 	})
 }
 
+// cleanupMySQLRows removes the rows a MySQL test case created; the shared test
+// database is never dropped.
 func cleanupMySQLRows(t *testing.T, stores *Stores, namespace, keyID string) {
 	t.Helper()
 	ctx := context.Background()

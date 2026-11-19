@@ -131,6 +131,30 @@ func TestClientStatusDecodesTasksAndBoundedTrace(t *testing.T) {
 		status.Tasks[1].State != StateFailed || status.Tasks[1].WorkerID != "connect-2:8083" {
 		t.Fatalf("status = %+v", status)
 	}
+
+	// A megabyte task trace is collapsed to a bounded, single-line string:
+	// embedded whitespace (tabs and newlines) collapses to single spaces.
+	rawTrace := strings.Repeat("stack\tline\n", 500)
+	escapedTrace := strings.ReplaceAll(strings.ReplaceAll(rawTrace, `\`, `\\`), `"`, `\"`)
+	escapedTrace = strings.ReplaceAll(strings.ReplaceAll(escapedTrace, "\t", `\t`), "\n", `\n`)
+	fake.status["doc"] = `{"name":"doc","connector":{"state":"FAILED","worker_id":"connect-1:8083",` +
+		`"trace":"` + strings.Repeat("x", 2000) + `"},` +
+		`"tasks":[{"id":0,"state":"FAILED","worker_id":"connect-1:8083","trace":"` + escapedTrace + `"}]}`
+	status, err = client.Status(context.Background(), "doc")
+	if err != nil {
+		t.Fatalf("Status with traces: %v", err)
+	}
+	// boundedTrace collapses the whitespace first ("stack\tline\n" folds to
+	// "stack line " = 11 bytes per repetition), then truncates at 400 bytes
+	// plus the 3-byte ellipsis rune: 403 bytes on one line.
+	if trace := status.Tasks[0].Trace; len(trace) != 403 || !strings.HasSuffix(trace, "…") ||
+		strings.ContainsAny(trace, "\t\n") {
+		t.Fatalf("bounded task trace = %d bytes %q, want 403 bytes ending in … on one line",
+			len(trace), trace[:min(len(trace), 60)])
+	}
+	if trace := status.ConnectorTrace; len(trace) != 403 || !strings.HasSuffix(trace, "…") {
+		t.Fatalf("bounded connector trace = %d bytes, want 403 bytes ending in …", len(trace))
+	}
 }
 
 func TestClientStatusNormalizesMissingState(t *testing.T) {

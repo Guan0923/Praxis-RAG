@@ -224,7 +224,7 @@ func collectionFromPath(path string) string {
 	return trimmed
 }
 
-// newKBService builds a Service over a real SQLite store.
+// newKBService builds a Service over a real MySQL test store.
 func newKBService(t *testing.T, qdrantURL string) (*Service, *state.Stores) {
 	t.Helper()
 	stores := newSearchTestStores(t)

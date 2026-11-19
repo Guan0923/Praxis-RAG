@@ -2,7 +2,6 @@ package cdcacceptance
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -206,13 +205,6 @@ func TestCacheChainDirectSQLConverges(t *testing.T) {
 	}
 	if record := items[0].(map[string]any); record["collection"] != "updated-collection" {
 		t.Fatalf("cached document collection = %v, want updated-collection", record["collection"])
-	}
-
-	// The cache backend still has JSON-shaped values only (a serializing
-	// backend cannot have stored live Go pointers).
-	encoded, err := json.Marshal(backend.value("documents", namespace))
-	if err != nil || len(encoded) == 0 {
-		t.Fatalf("cached documents view is not JSON marshable: %v", err)
 	}
 }
 

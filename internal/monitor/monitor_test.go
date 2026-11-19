@@ -328,9 +328,6 @@ func pipelineTestOptions(stats *state.MonitorStats) Options {
 	}
 }
 
-// int64Pointer is the pointer form the pipeline JSON uses for known numbers.
-func int64Pointer(value int64) *int64 { return &value }
-
 // TestMonitorOverviewHealthy asserts the full snapshot shape and every
 // dependency transition on a healthy process.
 func TestMonitorOverviewHealthy(t *testing.T) {

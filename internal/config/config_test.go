@@ -251,3 +251,31 @@ func TestRagConfigVLMEndpoint(t *testing.T) {
 		t.Fatalf("timeout bound error = %v", err)
 	}
 }
+
+// TestBooleanEnvSpellings pins the boolean environment parser end to end
+// through RagConfigFromEnv: every accepted spelling resolves, and any other
+// spelling is rejected with the actionable "must be true or false" error.
+func TestBooleanEnvSpellings(t *testing.T) {
+	isolateEnv(t)
+	for _, accepted := range []struct {
+		raw  string
+		want bool
+	}{
+		{"1", true}, {"true", true}, {"YES", true}, {" on ", true},
+		{"0", false}, {"false", false}, {"No", false}, {" off ", false},
+	} {
+		t.Setenv("RAG_PRELOAD_MODEL", accepted.raw)
+		cfg, err := RagConfigFromEnv()
+		if err != nil {
+			t.Fatalf("RAG_PRELOAD_MODEL=%q error = %v", accepted.raw, err)
+		}
+		if cfg.PreloadModel != accepted.want {
+			t.Fatalf("RAG_PRELOAD_MODEL=%q resolved to %v, want %v", accepted.raw, cfg.PreloadModel, accepted.want)
+		}
+	}
+
+	t.Setenv("RAG_PRELOAD_MODEL", "maybe")
+	if _, err := RagConfigFromEnv(); err == nil || !strings.Contains(err.Error(), "RAG_PRELOAD_MODEL must be true or false") {
+		t.Fatalf("RAG_PRELOAD_MODEL=maybe error = %v, want the true-or-false guidance", err)
+	}
+}
