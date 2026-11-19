@@ -126,10 +126,7 @@ class WorkspaceStore:
             ``None``.
         """
 
-        try:
-            self._path(namespace).unlink(missing_ok=True)
-        except OSError:
-            pass
+        self._path(namespace).unlink(missing_ok=True)
 
     def namespaces(self) -> tuple[str, ...]:
         """List every namespace that has a binding on disk.

@@ -200,14 +200,18 @@ func (t *SchemaTable) DDL() string {
 func (t *SchemaTable) IndexDDL() []string {
 	statements := make([]string, 0, len(t.Indexes))
 	for _, index := range t.Indexes {
-		quoted := make([]string, len(index.Columns))
-		for position, name := range index.Columns {
-			quoted[position] = quoteIdentifier(name)
-		}
-		statements = append(statements, "CREATE INDEX "+quoteIdentifier(index.Name)+
-			" ON "+quoteIdentifier(t.Name)+" ("+strings.Join(quoted, ", ")+")")
+		statements = append(statements, index.ddl(t.Name))
 	}
 	return statements
+}
+
+func (i SchemaIndex) ddl(table string) string {
+	quoted := make([]string, len(i.Columns))
+	for position, name := range i.Columns {
+		quoted[position] = quoteIdentifier(name)
+	}
+	return "CREATE INDEX " + quoteIdentifier(i.Name) +
+		" ON " + quoteIdentifier(table) + " (" + strings.Join(quoted, ", ") + ")"
 }
 
 // Bucket names used by the blob store. They are part of the persisted data
@@ -268,6 +272,11 @@ func index(name string, columns ...string) SchemaIndex {
 	return SchemaIndex{Name: name, Columns: columns}
 }
 
+var (
+	knowledgeBaseOwnerIndex       = index("ix_knowledge_bases_owner", "owner_user_id")
+	uploadOperationsDocumentIndex = index("ix_upload_operations_document", "namespace", "document_id")
+)
+
 // schemaTables is the ordered port of schema.py::metadata. Tables are listed in
 // the same order as the Python module; no table has foreign keys, so this is
 // also the dependency-free creation order.
@@ -307,7 +316,10 @@ var schemaTables = []*SchemaTable{
 			// NULL means "unowned" (a row created before ownership existed).
 			identifier("owner_user_id", 32).Null(),
 		},
-		Indexes: []SchemaIndex{index("ix_knowledge_bases_collection", "collection")},
+		Indexes: []SchemaIndex{
+			index("ix_knowledge_bases_collection", "collection"),
+			knowledgeBaseOwnerIndex,
+		},
 	},
 	{
 		Name: "documents",
@@ -379,7 +391,10 @@ var schemaTables = []*SchemaTable{
 			double("updated_at"),
 		},
 		Uniques: []SchemaUnique{unique("uq_upload_idempotency", "namespace", "idempotency_key")},
-		Indexes: []SchemaIndex{index("ix_upload_unfinished", "namespace", "status")},
+		Indexes: []SchemaIndex{
+			index("ix_upload_unfinished", "namespace", "status"),
+			uploadOperationsDocumentIndex,
+		},
 	},
 	{
 		Name: "upload_steps",
@@ -554,6 +569,24 @@ var schemaTables = []*SchemaTable{
 			index("ix_document_job_name", "namespace", "name_key", "status"),
 			index("ix_document_job_recovery", "status", "lease_until"),
 		},
+	},
+	{
+		Name: "reembed_jobs",
+		Columns: []SchemaColumn{
+			identifier("job_id", 36).PK(),
+			identifier("namespace", 64),
+			identifier("active_namespace", 64).Null(),
+			bigint("base_version"),
+			identifier("base_collection", 255),
+			longText("target_settings").Null(),
+			identifier("staging_collection", 255),
+			identifier("status", 24),
+			text("error").Null(),
+			identifier("created_at", 40),
+			identifier("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_reembed_active_namespace", "active_namespace")},
+		Indexes: []SchemaIndex{index("ix_reembed_namespace_created", "namespace", "created_at")},
 	},
 	// search_tasks is a retained historical table: search is synchronous and no
 	// longer queues tasks. The DDL is kept so existing databases and audit data
@@ -1148,12 +1181,38 @@ var schemaTables = []*SchemaTable{
 			index("ix_lightrag_documents_status", "status", "updated_at"),
 		},
 	},
+	{
+		Name: "index_cleanup_jobs",
+		Columns: []SchemaColumn{
+			identifier("job_id", 36).PK(), identifier("target", 16),
+			identifier("namespace", 64), identifier("document_id", 64),
+			identifier("collection", 128), identifier("version", 64), identifier("source_hash", 64),
+			identifier("status", 16), double("due_at"), bigint("schedule_version").Default("0"),
+			integer("failures").Default("0"),
+		},
+		Uniques: []SchemaUnique{unique("uq_index_cleanup_target", "namespace", "document_id", "collection", "version", "target")},
+		Indexes: []SchemaIndex{index("ix_index_cleanup_due", "status", "due_at")},
+	},
 	// The sag_* tables are the offline index of the SAG retrieval architecture
 	// (Zleap-AI/SAG): every chunk gets one event (its complete semantic unit)
 	// and several normalized entities; the event-entity associations are what
 	// query-time SQL joins turn into dynamic hyperedges. MySQL is the source of
 	// truth for this data; Qdrant only holds the semantic representations of the
 	// same rows (record_type sag_event / sag_entity points) for seed recall.
+	{
+		Name: "sag_extraction_jobs",
+		Columns: []SchemaColumn{
+			identifier("namespace", 64).PK(),
+			identifier("document_id", 64).PK(),
+			identifier("version", 32).PK(),
+			identifier("chunk_id", 36).PK(),
+			double("ready_at").Null(),
+			bigint("lease_generation").Default("0"),
+			integer("failures").Default("0"),
+			varchar("last_error", 64).Null(),
+		},
+		Indexes: []SchemaIndex{index("ix_sag_extraction_ready", "ready_at")},
+	},
 	{
 		Name: "sag_events",
 		Columns: []SchemaColumn{

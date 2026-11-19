@@ -40,8 +40,8 @@ func doclingIntegrationOptions(t *testing.T, name string, staging string) Option
 // paragraph. The real service must preserve the table structure and the Go
 // association must attach the explicit caption to the picture.
 func TestDoclingIntegrationDOCX(t *testing.T) {
-	body := headingParagraphXML("X7 系统手册", 1) +
-		paragraphXML("本文档描述 X7 的安装、配置与故障处理流程。") +
+	body := headingParagraphXML("部署指南", 1) +
+		paragraphXML("本文档描述检索服务的安装与配置流程。") +
 		headingParagraphXML("硬件参数", 2) +
 		paragraphXML("表 1 硬件参数表") +
 		tableXML([]string{"部件", "规格", "数量"}, []string{"处理器", "8 核 3.2GHz", "1"}, []string{"内存", "32 GB", "2"}) +
@@ -113,9 +113,9 @@ func TestDoclingIntegrationDOCX(t *testing.T) {
 // runs it through the same entry point. HTML chunks must carry
 // html_parser_version, never word_parser_version.
 func TestDoclingIntegrationHTML(t *testing.T) {
-	html := `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>X7 网页手册</title></head>
+	html := `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>部署指南</title></head>
 <body>
-<h1>X7 网页手册</h1><p>本页描述网页版的安装说明与硬件参数。</p>
+<h1>部署指南</h1><p>本页描述网页版的安装说明与硬件参数。</p>
 <h2>硬件参数</h2>
 <table border="1"><caption>表 1 硬件参数表</caption>
 <tr><th>部件</th><th colspan="2">规格</th></tr>

@@ -7,6 +7,7 @@ import (
 
 	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 	"github.com/Guan0923/Praxis-RAG/internal/chunking"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 var knowledgeBaseKinds = map[string]struct{}{"embedding": {}, "reranker": {}, "vlm": {}, "graph": {}}
@@ -65,6 +66,11 @@ type KnowledgeBaseAdminRuntime interface {
 	// no longer shows the namespaces. FailedDocuments reports per-namespace
 	// failures (an active upload), whose data stays untouched.
 	PurgeKnowledgeBases(ctx context.Context, namespaces []string) ([]KnowledgeBasePurgeResult, error)
+}
+
+type knowledgeBaseReembedRuntime interface {
+	SubmitReembed(context.Context, string, KnowledgeBaseUpdateInput) (*state.ReembedJob, error)
+	LatestReembed(context.Context, string) (*state.ReembedJob, error)
 }
 
 // KnowledgeBasePurgeResult is the transport-neutral outcome of purging one
@@ -232,6 +238,8 @@ func (s *Server) registerKnowledgeBaseAdminRoutes() {
 	s.router.add("GET", "/v1/admin/knowledge-bases/{namespace}", authAdmin, s.handleKnowledgeBaseDetails)
 	s.router.add("GET", "/v1/admin/knowledge-bases/{namespace}/key/{kind}", authAdmin, s.handleKnowledgeBaseKey)
 	s.router.add("PATCH", "/v1/admin/knowledge-bases/{namespace}", authAdmin, s.handleUpdateKnowledgeBase)
+	s.router.add("POST", "/v1/admin/knowledge-bases/{namespace}/reembed-jobs", authAdmin, s.handleSubmitReembed)
+	s.router.add("GET", "/v1/admin/knowledge-bases/{namespace}/reembed-jobs", authAdmin, s.handleLatestReembed)
 	s.router.add("DELETE", "/v1/admin/knowledge-bases/{namespace}", authAdmin, s.handlePurgeKnowledgeBase)
 }
 
@@ -469,6 +477,29 @@ func (s *Server) handleKnowledgeBaseModels(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleUpdateKnowledgeBase(w http.ResponseWriter, r *http.Request) {
+	s.updateKnowledgeBase(w, r, false)
+}
+
+func (s *Server) handleSubmitReembed(w http.ResponseWriter, r *http.Request) {
+	s.updateKnowledgeBase(w, r, true)
+}
+
+func (s *Server) handleLatestReembed(w http.ResponseWriter, r *http.Request) {
+	runtime, ok := s.kbAdmin.(knowledgeBaseReembedRuntime)
+	if !ok {
+		writeDetail(w, http.StatusServiceUnavailable, "重新向量化任务不可用")
+		return
+	}
+	job, err := runtime.LatestReembed(r.Context(), pathParam(r, "namespace"))
+	if err != nil {
+		writeUpdateKnowledgeBaseError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) updateKnowledgeBase(w http.ResponseWriter, r *http.Request, async bool) {
 	if !s.requireKBAdmin(w) {
 		return
 	}
@@ -511,11 +542,28 @@ func (s *Server) handleUpdateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	payload, err := s.kbAdmin.UpdateKnowledgeBase(r.Context(), pathParam(r, "namespace"), KnowledgeBaseUpdateInput{
+	namespace := pathParam(r, "namespace")
+	input := KnowledgeBaseUpdateInput{
 		Values:                 body.values(),
 		Reembed:                body.Reembed,
 		EmbeddingBillingSource: body.EmbeddingBillingSource,
-	})
+	}
+	if async {
+		runtime, ok := s.kbAdmin.(knowledgeBaseReembedRuntime)
+		if !ok {
+			writeDetail(w, http.StatusServiceUnavailable, "重新向量化任务不可用")
+			return
+		}
+		job, err := runtime.SubmitReembed(r.Context(), namespace, input)
+		if err != nil {
+			writeUpdateKnowledgeBaseError(w, err)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusAccepted, job)
+		return
+	}
+	payload, err := s.kbAdmin.UpdateKnowledgeBase(r.Context(), namespace, input)
 	if err != nil {
 		writeUpdateKnowledgeBaseError(w, err)
 		return
@@ -694,5 +742,3 @@ func validateNamespaceField(namespace string) []validationDetail {
 		Msg: "String should match pattern '^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'",
 	}}
 }
-
-

@@ -15,9 +15,12 @@ import {
   Tag,
   Typography,
 } from "antd";
-import type { Key } from "react";
+import { KubernetesMemory } from "./KubernetesMemory";
+import type { Key, ReactNode } from "react";
 import {
   errorText,
+  fetchKubernetesMemory,
+  type K8sMemoryView,
   fetchKubernetesPods,
   fetchKubernetesWorkloads,
   restartKubernetesWorkload,
@@ -42,11 +45,13 @@ import {
 // effect with the next tick (the request is built from the current input at
 // tick time), which avoids one request per keystroke.
 
-type KubernetesSubview = "workloads" | "pods";
+type KubernetesSubview = "workloads" | "pods" | "memory" | "scale";
 
 const subviewOptions: Array<{ value: KubernetesSubview; label: string }> = [
   { value: "workloads", label: "工作负载" },
   { value: "pods", label: "全部 Pod" },
+  { value: "memory", label: "节点与内存" },
+  { value: "scale", label: "文档 Worker 扩缩容" },
 ];
 
 // phaseColors maps the standard pod phases to the tag palette the rest of the
@@ -60,6 +65,7 @@ const phaseColors: Record<string, string> = {
 };
 
 type KubernetesMonitorProps = {
+  workerScale: ReactNode;
   // tick is the page-level per-second counter: every panel of the page shares
   // one timer instead of running its own interval.
   tick: number;
@@ -106,7 +112,7 @@ function podsColumns(scope: "all" | "nested") {
     { title: "节点", dataIndex: "node", width: 160, render: (value: string) => <span className="break-text">{value || "—"}</span> },
     ...(scope === "all"
       ? [{
-        title: "Owner",
+        title: "所属资源",
         dataIndex: "owner",
         width: 200,
         render: (_value: unknown, pod: K8sPod) => (
@@ -198,12 +204,13 @@ function RestartStateText({ restart }: { restart: K8sRestartState }) {
   }
 }
 
-export function KubernetesMonitor({ tick, active, onUpdated }: KubernetesMonitorProps) {
+export function KubernetesMonitor({ tick, active, onUpdated, workerScale }: KubernetesMonitorProps) {
   const { message } = App.useApp();
   const [subview, setSubview] = useState<KubernetesSubview>("workloads");
   const [namespace, setNamespace] = useState("");
   const [nameDraft, setNameDraft] = useState("");
   const [workloadView, setWorkloadView] = useState<K8sWorkloadView>();
+  const [memory, setMemory] = useState<K8sMemoryView>();
   const [podView, setPodView] = useState<K8sPodView>();
   const [namespaces, setNamespaces] = useState<string[]>([]);
   const [error, setError] = useState("");
@@ -230,6 +237,10 @@ export function KubernetesMonitor({ tick, active, onUpdated }: KubernetesMonitor
     // Single-flight: a slow request makes this panel skip the tick (the next
     // tick picks the newest filter); only a subview switch (force) replaces an
     // in-flight request for the view the operator just left.
+    if (target === "scale") {
+      request.current?.abort();
+      return;
+    }
     if (request.current && !force) return;
     request.current?.abort();
     const controller = new AbortController();
@@ -240,6 +251,13 @@ export function KubernetesMonitor({ tick, active, onUpdated }: KubernetesMonitor
         if (!controller.signal.aborted) {
           setWorkloadView(view);
           setNamespaces(Array.isArray(view.namespaces) ? view.namespaces : []);
+          setError("");
+          onUpdatedRef.current?.(view.generated_at);
+        }
+      } else if (target === "memory") {
+        const view = await fetchKubernetesMemory(controller.signal);
+        if (!controller.signal.aborted) {
+          setMemory(view);
           setError("");
           onUpdatedRef.current?.(view.generated_at);
         }
@@ -320,7 +338,7 @@ export function KubernetesMonitor({ tick, active, onUpdated }: KubernetesMonitor
     ...namespaces.map((item) => ({ value: item, label: item })),
   ];
   const cluster = subview === "workloads" ? workloadView?.cluster : undefined;
-  const hasData = subview === "workloads" ? Boolean(workloadView) : Boolean(podView);
+  const hasData = subview === "workloads" ? Boolean(workloadView) : subview === "memory" ? Boolean(memory) : Boolean(podView);
 
   const workloadsTable = (
     <section aria-label="Kubernetes 工作负载">
@@ -422,37 +440,40 @@ export function KubernetesMonitor({ tick, active, onUpdated }: KubernetesMonitor
             value={subview}
             onChange={(value) => setSubview(value as KubernetesSubview)}
           />
-          <Select
-            size="small"
-            virtual={false}
-            showSearch
-            optionFilterProp="label"
-            aria-label="Kubernetes 命名空间"
-            value={namespace}
-            onChange={(value: string) => {
-              setNamespace(value);
-              filter.current = { ...filter.current, namespace: value };
-            }}
-            options={namespaceOptions}
-            style={{ minWidth: 180 }}
-          />
-          <Input
-            size="small"
-            allowClear
-            aria-label="Kubernetes 名称过滤"
-            placeholder="名称过滤"
-            value={nameDraft}
-            onChange={(event) => {
-              const value = event.target.value;
-              setNameDraft(value);
-              filter.current = { ...filter.current, name: value.trim() };
-            }}
-            style={{ maxWidth: 220, minWidth: 150 }}
-          />
-          <span className="secondary monitor-note">筛选在下一秒刷新时生效</span>
+          {(subview === "workloads" || subview === "pods") && (
+            <>
+              <Select
+                size="small"
+                virtual={false}
+                showSearch
+                optionFilterProp="label"
+                aria-label="Kubernetes 命名空间"
+                value={namespace}
+                onChange={(value: string) => {
+                  setNamespace(value);
+                  filter.current = { ...filter.current, namespace: value };
+                }}
+                options={namespaceOptions}
+                style={{ minWidth: 180 }}
+              />
+              <Input
+                size="small"
+                allowClear
+                aria-label="Kubernetes 名称过滤"
+                placeholder={subview === "pods" ? "按 Pod 名称筛选" : "按工作负载名称筛选"}
+                value={nameDraft}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setNameDraft(value);
+                  filter.current = { ...filter.current, name: value.trim() };
+                }}
+                style={{ maxWidth: 220, minWidth: 150 }}
+              />
+            </>
+          )}
         </Flex>
 
-        {error && (
+        {subview !== "scale" && error && (
           <Alert
             className="page-alert"
             type="error"
@@ -462,10 +483,12 @@ export function KubernetesMonitor({ tick, active, onUpdated }: KubernetesMonitor
           />
         )}
 
-        {!error && !hasData ? (
+        {subview === "scale" ? workerScale : !error && !hasData ? (
           <Spin description="正在读取 Kubernetes 快照…" />
         ) : subview === "workloads" ? (
           workloadsTable
+        ) : subview === "memory" ? (
+          memory && <KubernetesMemory view={memory} />
         ) : (
           <section aria-label="Kubernetes Pod">
             <PodsTable pods={podView?.pods ?? []} scope="all" emptyText="暂无 Pod" />
@@ -496,7 +519,7 @@ export function KubernetesMonitor({ tick, active, onUpdated }: KubernetesMonitor
               ]}
             />
             <p className="secondary monitor-note">
-              重启会逐个替换 Pod（与 kubectl rollout restart 等价），不会中断全部副本。
+              控制器将按工作负载的更新策略替换 Pod，期望副本数保持不变。
             </p>
           </>
         )}

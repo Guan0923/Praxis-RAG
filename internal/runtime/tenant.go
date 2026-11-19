@@ -10,6 +10,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
+	"github.com/Guan0923/Praxis-RAG/internal/lightrag"
 	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
 	"github.com/Guan0923/Praxis-RAG/internal/qdrant"
 	"github.com/Guan0923/Praxis-RAG/internal/retrieval"
@@ -24,38 +25,43 @@ const runtimeImplementation = "rag-service-qdrant-hybrid-rerank-v1"
 // rag_mcp.service_knowledge.TenantResources: the orchestrator, its Qdrant store,
 // and the resolved model connections.
 type tenantResources struct {
-	settings     map[string]any
-	collection   string
-	store        *qdrant.Store
-	orchestrator *retrieval.Orchestrator
-	embedding    modelapi.ModelConnection
-	reranker     modelapi.ModelConnection
+	configurationVersion int
+	settings             map[string]any
+	collection           string
+	store                *qdrant.Store
+	orchestrator         *retrieval.Orchestrator
+	embedding            modelapi.ModelConnection
+	reranker             modelapi.ModelConnection
 }
 
-// tenant returns the cached tenant resources, rebuilding them from the
-// authoritative knowledge-base row on first use. The cache is keyed by
-// namespace and invalidated explicitly by configuration mutations
-// (SearchEngine.Invalidate), matching the runtime's _tenants dict.
+// tenant checks the authoritative index identity so a configuration switch
+// committed by a separate worker invalidates this process's cached resources.
 func (e *SearchEngine) tenant(ctx context.Context, namespace string) (*tenantResources, error) {
+	version, collection, err := e.indexVersion(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if tenant, ok := e.tenants[namespace]; ok {
-		return tenant, nil
-	}
 	if e.closed {
 		return nil, &apierrors.KnowledgeError{Message: "RAG service runtime is not available"}
 	}
-	settings, err := e.stores.KnowledgeBases.Get(ctx, namespace)
+	if tenant, ok := e.tenants[namespace]; ok && tenant.configurationVersion == version && tenant.collection == collection {
+		return tenant, nil
+	}
+	snapshot, err := e.stores.KnowledgeBases.Snapshot(ctx, namespace)
 	if err != nil {
 		return nil, err
 	}
-	if settings == nil {
+	if snapshot == nil {
+		delete(e.tenants, namespace)
 		return nil, &apierrors.KnowledgeValidationError{Message: kbconfig.MessageKnowledgeBaseMissing}
 	}
-	tenant, err := e.buildTenant(namespace, settings)
+	tenant, err := e.buildTenant(namespace, snapshot.Settings)
 	if err != nil {
 		return nil, err
 	}
+	tenant.configurationVersion = snapshot.Version
 	e.tenants[namespace] = tenant
 	return tenant, nil
 }
@@ -131,6 +137,24 @@ func (e *SearchEngine) buildTenant(namespace string, settings map[string]any) (*
 	if e.lightrag != nil {
 		graph = retrieval.NewGraphRetriever(e.lightrag, namespace, retrieval.GraphOptions{
 			IncludeEntities: true,
+			VisibleContexts: func(ctx context.Context, items []lightrag.Context) ([]lightrag.Context, error) {
+				ids := make([]string, 0, len(items))
+				for _, item := range items {
+					ids = append(ids, item.DocumentID)
+				}
+				heads, legacy, err := e.stores.LightRAGDocuments.VisibleHeads(ctx, namespace, ids)
+				if err != nil {
+					return nil, err
+				}
+				visible := items[:0]
+				for _, item := range items {
+					head, live := heads[item.DocumentID]
+					if live && ((item.PublicationVersion != "" && item.PublicationVersion == head) || (item.PublicationVersion == "" && legacy[item.DocumentID])) {
+						visible = append(visible, item)
+					}
+				}
+				return visible, nil
+			},
 		})
 	}
 	// sag consumes the MySQL event-entity index written by the extraction
@@ -153,9 +177,9 @@ func (e *SearchEngine) buildTenant(namespace string, settings map[string]any) (*
 			contracts.RetrievalBM25:      retrieval.NewBm25Retriever(encoder, store),
 			contracts.RetrievalEmbedding: retrieval.NewDenseRetriever(embedder, store),
 			contracts.RetrievalHybrid:    retrieval.NewHybridRetriever(embedder, encoder, store),
-			contracts.RetrievalSAG2:       sag2,
-			contracts.RetrievalGraph:      graph,
-			contracts.RetrievalSAG:        sagRetriever,
+			contracts.RetrievalSAG2:      sag2,
+			contracts.RetrievalGraph:     graph,
+			contracts.RetrievalSAG:       sagRetriever,
 		},
 		map[contracts.RerankMode]retrieval.Reranker{
 			contracts.RerankCrossEncoder: reranker,

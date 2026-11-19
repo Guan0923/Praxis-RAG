@@ -183,6 +183,8 @@ type cronJobObject struct {
 func (c *cronJobObject) meta() *objectMeta { return &c.Metadata }
 
 type containerStatus struct {
+	LastState struct{ Terminated *struct{ Reason string } }
+
 	Name         string `json:"name"`
 	Ready        bool   `json:"ready"`
 	RestartCount int32  `json:"restartCount"`
@@ -198,20 +200,33 @@ type containerStatus struct {
 	} `json:"state"`
 }
 
+type memoryResources struct {
+	Requests map[string]string
+	Limits   map[string]string
+}
+type podContainer struct {
+	Name      string
+	Resources memoryResources
+}
 type podObject struct {
 	Metadata objectMeta `json:"metadata"`
 	Spec     struct {
-		NodeName   string `json:"nodeName"`
-		Containers []struct {
-			Name string `json:"name"`
-		} `json:"containers"`
+		NodeName            string `json:"nodeName"`
+		Containers          []podContainer
+		InitContainers      []podContainer
+		EphemeralContainers []podContainer
+		Priority            *int32
+		PriorityClassName   string
+		Resources           memoryResources
 	} `json:"spec"`
 	Status struct {
-		Phase             string            `json:"phase"`
-		Reason            string            `json:"reason"`
-		Message           string            `json:"message"`
-		Conditions        []condition       `json:"conditions"`
-		ContainerStatuses []containerStatus `json:"containerStatuses"`
+		Phase                      string            `json:"phase"`
+		Reason                     string            `json:"reason"`
+		Message                    string            `json:"message"`
+		Conditions                 []condition       `json:"conditions"`
+		ContainerStatuses          []containerStatus `json:"containerStatuses"`
+		InitContainerStatuses      []containerStatus
+		EphemeralContainerStatuses []containerStatus
 	} `json:"status"`
 }
 

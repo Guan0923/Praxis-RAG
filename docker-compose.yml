@@ -120,6 +120,7 @@ services:
   # connector tails the binlog and publishes the async pipeline (no
   # transactional outbox):
   #   * praxis-document-cdc  document_jobs -> RAG_DOCUMENT_TOPIC
+  #                          reembed_jobs -> RAG_REEMBED_TOPIC
   #   * praxis-cache-cdc     eight read-model tables -> RAG_CACHE_TOPIC
   # Connector configs, source offsets and task status live in the three internal
   # Kafka topics below, so losing a worker only rebalances its tasks: the peer
@@ -180,6 +181,26 @@ services:
   # by fixed name; an unchanged configuration is left alone. Re-run it with
   # `docker compose --profile app up -d --force-recreate connect-init` after
   # changing a template or credential.
+  reembed-topic-init:
+    image: ${RAG_KAFKA_IMAGE:-apache/kafka:3.9.0}
+    profiles: ["app"]
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command: ["--bootstrap-server", "kafka:9092", "--create", "--if-not-exists", "--topic", "${RAG_REEMBED_TOPIC:-praxis_reembed}", "--partitions", "4", "--replication-factor", "1"]
+
+  delete-topic-init:
+    image: ${RAG_KAFKA_IMAGE:-apache/kafka:3.9.0}
+    profiles: ["app"]
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command: ["--bootstrap-server", "kafka:9092", "--create", "--if-not-exists", "--topic", "${RAG_DELETE_TOPIC:-praxis_index_cleanup}", "--partitions", "4", "--replication-factor", "1"]
+
   connect-init:
     image: ${RAG_APP_IMAGE:-praxis-rag:local}
     container_name: praxis-rag-connect-init
@@ -192,6 +213,10 @@ services:
         condition: service_started
       connect-2:
         condition: service_started
+      delete-topic-init:
+        condition: service_completed_successfully
+      reembed-topic-init:
+        condition: service_completed_successfully
     entrypoint:
       - /bin/sh
       - -c
@@ -214,6 +239,8 @@ services:
       RAG_CONNECT_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
       RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
       RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
+      RAG_DELETE_TOPIC: ${RAG_DELETE_TOPIC:-praxis_index_cleanup}
+      RAG_REEMBED_TOPIC: ${RAG_REEMBED_TOPIC:-praxis_reembed}
       RAG_CDC_DOCUMENT_SCHEMA_HISTORY_TOPIC: ${RAG_CDC_DOCUMENT_SCHEMA_HISTORY_TOPIC:-praxis_cdc_document_schema_history}
       RAG_CDC_CACHE_SCHEMA_HISTORY_TOPIC: ${RAG_CDC_CACHE_SCHEMA_HISTORY_TOPIC:-praxis_cdc_cache_schema_history}
       DEBEZIUM_SERVER_ID: ${DEBEZIUM_SERVER_ID:-184054}
@@ -413,6 +440,8 @@ services:
       connect-init:
         condition: service_completed_successfully
     environment:
+      RAG_LIGHTRAG_SERVICE_URL: ${RAG_APP_LIGHTRAG_SERVICE_URL:-${RAG_LIGHTRAG_SERVICE_URL:-}}
+      RAG_LIGHTRAG_SERVICE_TOKEN: ${RAG_LIGHTRAG_SERVICE_TOKEN:-}
       RAG_SERVICE_TOKEN: ${RAG_SERVICE_TOKEN:-}
       RAG_SERVICE_HOST: "0.0.0.0"
       RAG_SERVICE_PORT: "8011"
@@ -547,6 +576,115 @@ services:
       RAG_CACHE_GROUP: ${RAG_CACHE_GROUP:-praxis_state_cache_refresh_workers}
       RAG_CACHE_DLQ_TOPIC: ${RAG_CACHE_DLQ_TOPIC:-praxis_state_cache_refresh_dead_letters}
       RAG_CACHE_DLQ_GROUP: ${RAG_CACHE_DLQ_GROUP:-praxis_state_cache_refresh_dead_letters}
+  rag-reembed-worker:
+    image: ${RAG_APP_IMAGE:-praxis-rag:local}
+    container_name: praxis-rag-reembed-worker
+    restart: unless-stopped
+    profiles: ["app"]
+    depends_on:
+      app:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    entrypoint: ["/app/bin/rag-reembed-worker"]
+    environment:
+      QDRANT_URL: ${RAG_APP_QDRANT_URL:-http://qdrant:6333}
+      RAG_MYSQL_HOST: ${RAG_APP_MYSQL_HOST:-mysql}
+      RAG_MYSQL_PORT: "3306"
+      RAG_MYSQL_USER: ${RAG_MYSQL_USER:-rag}
+      RAG_MYSQL_PASSWORD: ${RAG_MYSQL_PASSWORD:-}
+      RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
+      RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
+      RAG_REDIS_LOCK_URL: ${RAG_APP_REDIS_LOCK_URL:-redis://redis:6379/0}
+      RAG_REDIS_LOCK_PREFIX: ${RAG_REDIS_LOCK_PREFIX:-rag:lock:v1}
+      RAG_REDIS_LOCK_TTL_SECONDS: ${RAG_REDIS_LOCK_TTL_SECONDS:-120}
+      RAG_REDIS_LOCK_TIMEOUT_SECONDS: ${RAG_REDIS_LOCK_TIMEOUT_SECONDS:-1}
+      RAG_REDIS_LOCK_WAIT_SECONDS: ${RAG_REDIS_LOCK_WAIT_SECONDS:-2}
+      RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
+      RAG_DOCUMENT_GROUP: ${RAG_DOCUMENT_GROUP:-praxis_document_ingest_workers}
+      RAG_DOCUMENT_DLQ_TOPIC: ${RAG_DOCUMENT_DLQ_TOPIC:-praxis_document_ingest_dead_letters}
+      RAG_DOCUMENT_DLQ_GROUP: ${RAG_DOCUMENT_DLQ_GROUP:-praxis_document_dead_letters}
+      RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
+      RAG_CACHE_GROUP: ${RAG_CACHE_GROUP:-praxis_state_cache_refresh_workers}
+      RAG_CACHE_DLQ_TOPIC: ${RAG_CACHE_DLQ_TOPIC:-praxis_state_cache_refresh_dead_letters}
+      RAG_CACHE_DLQ_GROUP: ${RAG_CACHE_DLQ_GROUP:-praxis_state_cache_refresh_dead_letters}
+      RAG_REEMBED_TOPIC: ${RAG_REEMBED_TOPIC:-praxis_reembed}
+      RAG_REEMBED_GROUP: ${RAG_REEMBED_GROUP:-praxis_reembed_workers}
+      RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-info}
+      RAG_LOG_FORMAT: ${RAG_LOG_FORMAT:-text}
+
+  rag-delete-worker:
+    image: ${RAG_APP_IMAGE:-praxis-rag:local}
+    container_name: praxis-rag-delete-worker
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    profiles: ["app"]
+    depends_on:
+      app:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    entrypoint: ["/app/bin/rag-delete-worker"]
+    environment:
+      RAG_SERVICE_HOST: "127.0.0.1"
+      QDRANT_URL: ${RAG_APP_QDRANT_URL:-http://qdrant:6333}
+      RAG_MYSQL_HOST: ${RAG_APP_MYSQL_HOST:-mysql}
+      RAG_MYSQL_PORT: "3306"
+      RAG_MYSQL_USER: ${RAG_MYSQL_USER:-rag}
+      RAG_MYSQL_PASSWORD: ${RAG_MYSQL_PASSWORD:-}
+      RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
+      RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
+      RAG_REDIS_LOCK_URL: ${RAG_APP_REDIS_LOCK_URL:-redis://redis:6379/0}
+      RAG_REDIS_LOCK_PREFIX: ${RAG_REDIS_LOCK_PREFIX:-rag:lock:v1}
+      RAG_REDIS_LOCK_TTL_SECONDS: ${RAG_REDIS_LOCK_TTL_SECONDS:-120}
+      RAG_REDIS_LOCK_TIMEOUT_SECONDS: ${RAG_REDIS_LOCK_TIMEOUT_SECONDS:-1}
+      RAG_REDIS_LOCK_WAIT_SECONDS: ${RAG_REDIS_LOCK_WAIT_SECONDS:-2}
+      RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      RAG_DOCUMENT_TOPIC: ${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}
+      RAG_DOCUMENT_GROUP: ${RAG_DOCUMENT_GROUP:-praxis_document_ingest_workers}
+      RAG_DOCUMENT_DLQ_TOPIC: ${RAG_DOCUMENT_DLQ_TOPIC:-praxis_document_ingest_dead_letters}
+      RAG_DOCUMENT_DLQ_GROUP: ${RAG_DOCUMENT_DLQ_GROUP:-praxis_document_dead_letters}
+      RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
+      RAG_CACHE_GROUP: ${RAG_CACHE_GROUP:-praxis_state_cache_refresh_workers}
+      RAG_CACHE_DLQ_TOPIC: ${RAG_CACHE_DLQ_TOPIC:-praxis_state_cache_refresh_dead_letters}
+      RAG_CACHE_DLQ_GROUP: ${RAG_CACHE_DLQ_GROUP:-praxis_state_cache_refresh_dead_letters}
+      RAG_DELETE_TOPIC: ${RAG_DELETE_TOPIC:-praxis_index_cleanup}
+      RAG_DELETE_GROUP: ${RAG_DELETE_GROUP:-praxis_index_cleanup_workers}
+      RAG_LIGHTRAG_SERVICE_URL: ${RAG_APP_LIGHTRAG_SERVICE_URL:-${RAG_LIGHTRAG_SERVICE_URL:-}}
+      RAG_LIGHTRAG_SERVICE_TOKEN: ${RAG_LIGHTRAG_SERVICE_TOKEN:-}
+      RAG_REEMBED_TOPIC: ${RAG_REEMBED_TOPIC:-praxis_reembed}
+      RAG_REEMBED_GROUP: ${RAG_REEMBED_GROUP:-praxis_reembed_workers}
+      RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-info}
+      RAG_LOG_FORMAT: ${RAG_LOG_FORMAT:-text}
+
+  rag-sag-worker:
+    image: ${RAG_APP_IMAGE:-praxis-rag:local}
+    restart: unless-stopped
+    profiles: ["app"]
+    depends_on:
+      app:
+        condition: service_healthy
+    entrypoint: ["/app/bin/rag-sag-worker"]
+    environment:
+      RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-info}
+      RAG_LOG_FORMAT: ${RAG_LOG_FORMAT:-text}
+      RAG_LOG_FILE: ${RAG_LOG_FILE:-}
+      RAG_MYSQL_HOST: ${RAG_APP_MYSQL_HOST:-mysql}
+      RAG_MYSQL_PORT: "3306"
+      RAG_MYSQL_USER: ${RAG_MYSQL_USER:-rag}
+      RAG_MYSQL_PASSWORD: ${RAG_MYSQL_PASSWORD:-}
+      RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
+      RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
+      RAG_STATE_AUTO_SCHEMA: "false"
+      RAG_SERVICE_DATA_ROOT: /app/data
+      RAG_BACKEND: qdrant
+      QDRANT_URL: ${RAG_APP_QDRANT_URL:-http://qdrant:6333}
+      RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
+      RAG_CACHE_GROUP: ${RAG_CACHE_GROUP:-praxis_state_cache_refresh_workers}
+
 volumes:
   kafka_data:
   lightrag_data:

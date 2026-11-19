@@ -187,7 +187,7 @@ REST documents=0 supported=.doc,.docx,.md,.pdf,.txt
 REST knowledge-base (missing)=404
 REST admin prompts PUT changed=true
 MCP initialize=200 (Mcp-Session-Id) -> initialized=202 -> tools/list 6 tools
-MCP prompts/list has summary; prompts/get renders "Summarize E03"
+MCP prompts/list has summary; prompts/get renders the summary prompt
 MCP tools/call search -> isError=true, "该知识库没有配置记录，请先创建知识库"
 MCP unauthenticated GET -> 401 + WWW-Authenticate: Bearer
 REST /v1/admin/tools -> 6 tools

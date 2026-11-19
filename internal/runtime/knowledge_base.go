@@ -536,8 +536,7 @@ type KnowledgeBasePurgeResult struct {
 // a Console batch delete costs one database operation instead of one per
 // namespace (and one per document). Namespaces with an active upload lease are
 // reported as failed and left untouched. Payload bytes are only dropped from
-// content_objects when no reference row points at them anymore, and each purged
-// knowledge base has its own Qdrant collection deleted with one request.
+// content_objects when no reference row points at them anymore, and the cleanup worker retires external index data after the retention period.
 func (s *Service) PurgeKnowledgeBases(ctx context.Context, namespaces []string) ([]KnowledgeBasePurgeResult, error) {
 	ordered := make([]string, 0, len(namespaces))
 	seen := make(map[string]struct{}, len(namespaces))
@@ -577,7 +576,6 @@ func (s *Service) PurgeKnowledgeBases(ctx context.Context, namespaces []string) 
 		results[index].DocumentsDeleted = report.DocumentsByNamespace[namespace]
 		results[index].ConfigurationDeleted = report.Present[namespace]
 	}
-	s.cleanupPurgedCollections(ctx, report)
 	for namespace := range report.Present {
 		s.Invalidate(namespace)
 	}
@@ -594,53 +592,6 @@ func (s *Service) PurgeKnowledgeBase(ctx context.Context, namespace string) (Kno
 		return KnowledgeBasePurgeResult{Namespace: namespace}, nil
 	}
 	return results[0], nil
-}
-
-// cleanupPurgedCollections deletes one Qdrant collection per purged knowledge
-// base with a single request each. Collections that another knowledge base still
-// references are kept. Failures are best-effort: MySQL is the source of truth
-// and an orphan collection only costs storage.
-func (s *Service) cleanupPurgedCollections(ctx context.Context, report state.KnowledgeBasePurgeReport) {
-	if len(report.Collections) == 0 {
-		return
-	}
-	collections := make([]string, 0, len(report.Collections))
-	seen := make(map[string]struct{}, len(report.Collections))
-	for _, collection := range report.Collections {
-		if collection == "" {
-			continue
-		}
-		if _, duplicate := seen[collection]; duplicate {
-			continue
-		}
-		seen[collection] = struct{}{}
-		collections = append(collections, collection)
-	}
-	if len(collections) == 0 {
-		return
-	}
-	inUse, err := s.stores.KnowledgeBases.CollectionsInUse(ctx, collections)
-	if err != nil {
-		logBackgroundFailure(ctx, "collection usage lookup", err)
-		return
-	}
-	for _, collection := range collections {
-		if inUse[collection] {
-			continue
-		}
-		s.deleteQdrantCollection(collection)
-	}
-}
-
-// deleteQdrantCollection removes one whole collection in one HTTP request.
-func (s *Service) deleteQdrantCollection(collection string) {
-	if collection == "" {
-		return
-	}
-	httpClient := &http.Client{Timeout: qdrant.DefaultTimeout}
-	defer httpClient.CloseIdleConnections()
-	client := qdrant.NewClient(s.config.QdrantURL, "", httpClient)
-	_ = client.Do(context.Background(), http.MethodDelete, "/collections/"+url.PathEscape(collection), nil, nil, nil)
 }
 
 // KnowledgeBaseKey reveals the decrypted provider API key for the local admin

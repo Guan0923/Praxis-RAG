@@ -7,9 +7,9 @@ import (
 
 func TestDocumentURIRoundTrip(t *testing.T) {
 	namespace := "user-0123456789abcdef"
-	name := "X7 终端手册.md"
+	name := "API 使用指南.md"
 	uri := DocumentURI(namespace, name)
-	if uri != "rag://knowledge/user-0123456789abcdef/X7%20%E7%BB%88%E7%AB%AF%E6%89%8B%E5%86%8C.md" {
+	if uri != "rag://knowledge/user-0123456789abcdef/API%20%E4%BD%BF%E7%94%A8%E6%8C%87%E5%8D%97.md" {
 		t.Fatalf("uri = %q", uri)
 	}
 	parsedName, page, version, err := ParseURI(namespace, uri)

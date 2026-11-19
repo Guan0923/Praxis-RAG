@@ -52,18 +52,15 @@ func (s *Service) sagExtractionEnabled(ctx context.Context) (*modelapi.Extractio
 	return client, nil
 }
 
-// sagExtractionBudget bounds one document's extraction calls: chunks beyond
-// the cap keep direct-chunk candidacy but are not extracted this round (the
-// backfill CLI can cover them later).
+// The cap applies to queued extraction and to the legacy backfill CLI.
 const (
 	sagExtractionMaxChunks   = 512
 	sagExtractionMaxParallel = 4
 )
 
-// extractSagIndex extracts and persists one document's SAG index rows after a
-// committed publication. Every failure is logged and swallowed: the stage is
-// additive and never changes the publication outcome.
-func (s *Service) extractSagIndex(
+// extractSagBackfill builds the index for one published document from the CLI.
+// A failed fragment is logged while other documents can still be processed.
+func (s *Service) extractSagBackfill(
 	ctx context.Context,
 	namespace, documentID, version string,
 	chunks []qdrant.Chunk,
@@ -126,7 +123,7 @@ func (s *Service) extractSagIndex(
 			failed++
 		}
 	}
-	if err := s.stores.SagIndex.ReplaceDocument(ctx, namespace, documentID, version, extractions); err != nil {
+	if err := s.stores.SagIndex.BackfillDocument(ctx, namespace, documentID, version, extractions); err != nil {
 		s.sagExtractionLog(namespace, documentID, "SAG index write failed", err)
 		return
 	}
@@ -167,6 +164,10 @@ func (s *Service) BackfillSagIndex(ctx context.Context, namespace string) (int, 
 	if err != nil {
 		return 0, err
 	}
+	versions, err := s.stores.Documents.VisibleVersions(ctx, namespace)
+	if err != nil {
+		return 0, err
+	}
 	processed := 0
 	for _, documentID := range documentIDs {
 		chunks, err := s.scrollDocumentChunks(ctx, namespace, tenant.store, documentID)
@@ -179,7 +180,7 @@ func (s *Service) BackfillSagIndex(ctx context.Context, namespace string) (int, 
 			processed++
 			continue
 		}
-		s.extractSagIndex(ctx, namespace, documentID, "", chunks)
+		s.extractSagBackfill(ctx, namespace, documentID, versions[documentID], chunks)
 		processed++
 	}
 	return processed, nil

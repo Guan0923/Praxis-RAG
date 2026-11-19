@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"time"
 )
 
 // sagIDNamespace is the fixed UUID namespace for the SAG index rows.
@@ -93,6 +94,18 @@ func (r *SagRepository) ReplaceDocument(
 	namespace, documentID, version string,
 	extractions []SagExtraction,
 ) error {
+	return r.replaceDocument(ctx, namespace, documentID, version, extractions, false)
+}
+
+// BackfillDocument publishes CLI results only while the document snapshot is
+// current and has no fragment jobs managed by the worker.
+func (r *SagRepository) BackfillDocument(ctx context.Context, namespace, documentID, version string,
+	extractions []SagExtraction) error {
+	return r.replaceDocument(ctx, namespace, documentID, version, extractions, true)
+}
+
+func (r *SagRepository) replaceDocument(ctx context.Context, namespace, documentID, version string,
+	extractions []SagExtraction, backfill bool) error {
 	if strings.TrimSpace(namespace) == "" {
 		return newStateError("SAG 索引写入失败：namespace 不能为空")
 	}
@@ -102,56 +115,69 @@ func (r *SagRepository) ReplaceDocument(
 	}
 	defer func() { _ = transaction.Rollback() }()
 
-	// Delete previous events of this document and their associations.
-	if _, err := transaction.ExecContext(ctx,
-		"DELETE FROM sag_event_entities WHERE namespace = ? AND event_id IN "+
-			"(SELECT id FROM sag_events WHERE namespace = ? AND document_id = ?)",
-		namespace, namespace, documentID); err != nil {
-		return sagWriteError(err)
+	if backfill {
+		current, active, err := lockSagDocumentVersion(ctx, transaction, namespace, documentID)
+		if err != nil || !active || current != version {
+			return err
+		}
+		var managed bool
+		err = transaction.QueryRowContext(ctx,
+			"SELECT EXISTS (SELECT 1 FROM sag_extraction_jobs WHERE namespace = ? AND document_id = ?)",
+			namespace, documentID).Scan(&managed)
+		if err != nil || managed {
+			return err
+		}
 	}
-	if _, err := transaction.ExecContext(ctx,
-		"DELETE FROM sag_events WHERE namespace = ? AND document_id = ?",
-		namespace, documentID); err != nil {
-		return sagWriteError(err)
+	if err := deleteSagEvents(ctx, transaction, namespace, documentID); err != nil {
+		return err
 	}
 
 	now := nowSag()
 	for position, extraction := range extractions {
-		if strings.TrimSpace(extraction.ChunkID) == "" || strings.TrimSpace(extraction.Event) == "" {
-			return newStateError("SAG 索引写入失败：chunk_id 与事件不能为空")
-		}
-		eventID := sagEventID(namespace, extraction.ChunkID, position)
-		if _, err := transaction.ExecContext(ctx,
-			"INSERT INTO sag_events (id, namespace, document_id, chunk_id, event, version, created_at) "+
-				"VALUES (?, ?, ?, ?, ?, ?, ?)",
-			eventID, namespace, documentID, extraction.ChunkID, extraction.Event, version, now); err != nil {
-			if isUniqueViolation(err) {
-				return newStateError("SAG 索引写入失败：chunk 重复")
-			}
-			return sagWriteError(err)
-		}
-		for _, name := range extraction.Entities {
-			trimmed := strings.TrimSpace(name)
-			if trimmed == "" {
-				continue
-			}
-			entity, err := upsertSagEntity(ctx, transaction, namespace, trimmed, now)
-			if err != nil {
-				return err
-			}
-			if _, err := transaction.ExecContext(ctx,
-				"INSERT INTO sag_event_entities (event_id, entity_id, namespace, created_at) VALUES (?, ?, ?, ?)",
-				eventID, entity.ID, namespace, now); err != nil {
-				if isUniqueViolation(err) {
-					// The same entity mentioned twice in one chunk is stored once.
-					continue
-				}
-				return sagWriteError(err)
-			}
+		if err := insertSagExtraction(ctx, transaction, namespace, documentID, version, now, position, extraction); err != nil {
+			return err
 		}
 	}
 	if err := transaction.Commit(); err != nil {
 		return sagWriteError(err)
+	}
+	return nil
+}
+
+// insertSagExtraction adds one fragment and its entity links to the caller's transaction.
+func insertSagExtraction(ctx context.Context, transaction *sql.Tx, namespace, documentID, version, now string,
+	position int, extraction SagExtraction) error {
+	if strings.TrimSpace(extraction.ChunkID) == "" || strings.TrimSpace(extraction.Event) == "" {
+		return newStateError("SAG 索引写入失败：chunk_id 与事件不能为空")
+	}
+	eventID := sagEventID(namespace, extraction.ChunkID, position)
+	if _, err := transaction.ExecContext(ctx,
+		"INSERT INTO sag_events (id, namespace, document_id, chunk_id, event, version, created_at) "+
+			"VALUES (?, ?, ?, ?, ?, ?, ?)",
+		eventID, namespace, documentID, extraction.ChunkID, extraction.Event, version, now); err != nil {
+		if isUniqueViolation(err) {
+			return newStateError("SAG 索引写入失败：chunk 重复")
+		}
+		return sagWriteError(err)
+	}
+	for _, name := range extraction.Entities {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		entity, err := upsertSagEntity(ctx, transaction, namespace, trimmed, now)
+		if err != nil {
+			return err
+		}
+		if _, err := transaction.ExecContext(ctx,
+			"INSERT INTO sag_event_entities (event_id, entity_id, namespace, created_at) VALUES (?, ?, ?, ?)",
+			eventID, entity.ID, namespace, now); err != nil {
+			if isUniqueViolation(err) {
+				// The same entity mentioned twice in one chunk is stored once.
+				continue
+			}
+			return sagWriteError(err)
+		}
 	}
 	return nil
 }
@@ -165,7 +191,7 @@ func upsertSagEntity(ctx context.Context, transaction *sql.Tx, namespace, name, 
 	for {
 		row := transaction.QueryRowContext(ctx,
 			"SELECT id, namespace, normalized_key, entity_key, display_name, mention_count, created_at, updated_at "+
-				"FROM sag_entities WHERE namespace = ? AND entity_key = ?",
+				"FROM sag_entities WHERE namespace = ? AND entity_key = ? FOR UPDATE",
 			namespace, entityKey)
 		entity, err := scanSagEntity(row)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -363,7 +389,9 @@ func (r *SagRepository) ListDocumentsWithoutEvents(ctx context.Context, namespac
 	rows, err := r.db.QueryContext(ctx,
 		"SELECT d.document_id FROM documents d LEFT JOIN sag_events e "+
 			"ON e.namespace = d.namespace AND e.document_id = d.document_id "+
-			"WHERE d.namespace = ? AND d.del_flag = 0 AND e.id IS NULL",
+			"WHERE d.namespace = ? AND d.del_flag = 0 AND e.id IS NULL "+
+			"AND NOT EXISTS (SELECT 1 FROM sag_extraction_jobs j "+
+			"WHERE j.namespace = d.namespace AND j.document_id = d.document_id)",
 		namespace)
 	if err != nil {
 		return nil, newStateError("SAG 索引读取失败")
@@ -388,16 +416,8 @@ func (r *SagRepository) DeleteDocument(ctx context.Context, namespace, documentI
 		return newStateError("SAG 索引删除失败")
 	}
 	defer func() { _ = transaction.Rollback() }()
-	if _, err := transaction.ExecContext(ctx,
-		"DELETE FROM sag_event_entities WHERE namespace = ? AND event_id IN "+
-			"(SELECT id FROM sag_events WHERE namespace = ? AND document_id = ?)",
-		namespace, namespace, documentID); err != nil {
-		return sagWriteError(err)
-	}
-	if _, err := transaction.ExecContext(ctx,
-		"DELETE FROM sag_events WHERE namespace = ? AND document_id = ?",
-		namespace, documentID); err != nil {
-		return sagWriteError(err)
+	if err := deleteSagEvents(ctx, transaction, namespace, documentID); err != nil {
+		return err
 	}
 	if err := transaction.Commit(); err != nil {
 		return sagWriteError(err)
@@ -439,4 +459,32 @@ func sagNormalizedKey(name string) string {
 		return name
 	}
 	return normalized
+}
+
+func deleteSagEvents(ctx context.Context, transaction *sql.Tx, namespace, documentID string) error {
+	// Start the retention clock when associations disappear, including replacement.
+	if _, err := transaction.ExecContext(ctx, "UPDATE sag_entities n JOIN sag_event_entities a ON a.namespace=n.namespace AND a.entity_id=n.id "+
+		"JOIN sag_events e ON e.id=a.event_id AND e.namespace=a.namespace SET n.updated_at=? WHERE e.namespace=? AND e.document_id=?", nowISO(), namespace, documentID); err != nil {
+		return sagWriteError(err)
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM sag_event_entities WHERE namespace = ? AND event_id IN "+
+			"(SELECT id FROM sag_events WHERE namespace = ? AND document_id = ?)",
+		namespace, namespace, documentID); err != nil {
+		return sagWriteError(err)
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"DELETE FROM sag_events WHERE namespace = ? AND document_id = ?",
+		namespace, documentID); err != nil {
+		return sagWriteError(err)
+	}
+	return nil
+}
+
+// PurgeUnusedSagEntities runs after the content-retention window. An entity
+// mentioned by any remaining event survives, regardless of mention_count.
+func (s *Stores) PurgeUnusedSagEntities(ctx context.Context) error {
+	cutoff := time.Now().UTC().Add(-time.Duration(ContentObjectRetentionSeconds) * time.Second).Format(isoTimestampFormat)
+	_, err := s.DB.ExecContext(ctx, "DELETE FROM sag_entities WHERE updated_at<? AND NOT EXISTS (SELECT 1 FROM sag_event_entities a WHERE a.namespace=sag_entities.namespace AND a.entity_id=sag_entities.id) LIMIT 200", cutoff)
+	return err
 }

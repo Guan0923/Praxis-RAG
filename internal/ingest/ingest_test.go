@@ -16,7 +16,7 @@ import (
 )
 
 func TestPrepareTextTXTMatchesChunkDocument(t *testing.T) {
-	path := writeText(t, "notes.txt", "Manual X7\n\nE03 temperature fault. Reset the sensor.")
+	path := writeText(t, "notes.txt", "Indexing Guide\n\nSplit documents into chunks before indexing.")
 	config := mustConfig(t, "token", 512, 64)
 	result, err := Prepare(t.Context(), path, Options{
 		SourceName: "notes.txt",
@@ -28,7 +28,7 @@ func TestPrepareTextTXTMatchesChunkDocument(t *testing.T) {
 	if len(result.Chunks) == 0 {
 		t.Fatalf("no chunks")
 	}
-	if result.Title != "Manual X7" {
+	if result.Title != "Indexing Guide" {
 		t.Fatalf("title = %q", result.Title)
 	}
 	if result.Metadata["document_suffix"] != ".txt" {
@@ -125,7 +125,7 @@ func TestPrepareDOCXAssetsArtifactsAndMetadata(t *testing.T) {
 	manifest := newManifestBuilder().
 		heading("#/texts/0", "设备手册", []string{"设备手册"}).
 		paragraph("#/texts/1", "正常使用。", "设备手册").
-		table("#/tables/0", "table-1", [][]string{{"错误码", "处理方法"}, {"E03", "检查传感器连接"}}, "设备手册").
+		table("#/tables/0", "table-1", [][]string{{"环节", "操作"}, {"索引", "写入片段向量"}}, "设备手册").
 		picture("#/pictures/0", "picture-1", "图 1: 状态灯", "设备手册").
 		build()
 	source := plainDocxPackage(t, paragraphXML("正文"), false)
@@ -425,36 +425,22 @@ func TestPrepareWordVisionIntegration(t *testing.T) {
 func TestPrepareCancelledContextAndStagingCleanupOnFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	// A caller-provided staging directory is kept (the caller owns removing
+	// it), but the failure path must not leave half-written artifacts behind.
+	staging := t.TempDir()
+	nested := filepath.Join(staging, "nested")
 	_, err := Prepare(ctx, writeText(t, "paper.pdf", "%PDF-1.7"), Options{
 		SourceName: "paper.pdf",
+		StagingDir: nested,
 		PDF:        PDFOptions{Parser: &fakePDFParser{err: context.Canceled}},
 	})
 	if err == nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled context error = %v, want context.Canceled", err)
 	}
-	// A failed attempt must clean the temporary staging directory it created.
-	staging := t.TempDir()
-	if _, err := os.Stat(staging); err != nil {
-		t.Fatalf("staging fixture: %v", err)
+	if info, statErr := os.Stat(nested); statErr != nil || !info.IsDir() {
+		t.Fatalf("caller staging after failure = %v (%v), want kept", info, statErr)
 	}
-	_, err = Prepare(ctx, writeText(t, "paper.pdf", "%PDF-1.7"), Options{
-		SourceName: "paper.pdf",
-		StagingDir: filepath.Join(staging, "nested"),
-		PDF:        PDFOptions{Parser: &fakePDFParser{err: context.Canceled}},
-	})
-	if err == nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled context error = %v, want context.Canceled", err)
-	}
-	// The caller-provided staging directory is kept (only files prepared by
-	// the attempt are removed), so the directory itself must still exist.
-	if info, err := os.Stat(filepath.Join(staging, "nested")); err != nil || !info.IsDir() {
-		t.Fatalf("caller staging after failure = %v (%v), want kept", info, err)
-	}
-	entries, readErr := os.ReadDir(filepath.Join(staging, "nested"))
-	if readErr != nil {
-		t.Fatalf("read staging: %v", readErr)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("failed attempt left staging artifacts: %v", entries)
+	if entries, readErr := os.ReadDir(nested); readErr != nil || len(entries) != 0 {
+		t.Fatalf("failed Prepare left staging artifacts: entries=%d err=%v", len(entries), readErr)
 	}
 }

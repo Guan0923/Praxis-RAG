@@ -42,12 +42,14 @@ type fakeGroupControl struct {
 
 	previewVal access.GroupInvitationView
 	previewErr error
+	lastPreviewToken string
 
 	acceptVal access.GroupInvitationView
 	acceptErr error
 
 	declineVal access.GroupInvitationView
 	declineErr error
+	lastDeclineToken string
 
 	revokedInvitationID string
 	revokeInvitationErr error
@@ -103,7 +105,8 @@ func (f *fakeGroupControl) GroupInvitationInbox(context.Context, state.User) ([]
 	return f.inboxVal, f.inboxErr
 }
 
-func (f *fakeGroupControl) PreviewGroupInvitation(context.Context, state.User, string) (access.GroupInvitationView, error) {
+func (f *fakeGroupControl) PreviewGroupInvitation(_ context.Context, _ state.User, token string) (access.GroupInvitationView, error) {
+	f.lastPreviewToken = token
 	return f.previewVal, f.previewErr
 }
 
@@ -111,7 +114,8 @@ func (f *fakeGroupControl) AcceptGroupInvitation(context.Context, state.User, st
 	return f.acceptVal, f.acceptErr
 }
 
-func (f *fakeGroupControl) DeclineGroupInvitation(context.Context, state.User, string) (access.GroupInvitationView, error) {
+func (f *fakeGroupControl) DeclineGroupInvitation(_ context.Context, _ state.User, token string) (access.GroupInvitationView, error) {
+	f.lastDeclineToken = token
 	return f.declineVal, f.declineErr
 }
 
@@ -233,6 +237,8 @@ func TestGroupTransportRoundTrip(t *testing.T) {
 		createGroupVal: access.GroupView{ID: "g2", Name: "新组", Status: "active"},
 		createInviteVal: access.GroupInvitationView{ID: "gi2", GroupID: "g1", Status: "pending"},
 		createInviteToken: "group-token",
+		previewVal: access.GroupInvitationView{ID: "gi1", GroupID: "g1", Status: "pending"},
+		declineVal: access.GroupInvitationView{ID: "gi1", GroupID: "g1", Status: "declined"},
 		grants: []access.GroupGrantView{{
 			GroupID: "g1", GroupName: "研究组", Namespace: "kb1",
 			DocumentName: "", AllowMask: 6, GrantedByUsername: "carol",
@@ -298,12 +304,40 @@ func TestGroupTransportRoundTrip(t *testing.T) {
 	if inbox.Code != http.StatusOK || decodeBody(t, inbox)["invitations"] == nil {
 		t.Fatalf("inbox status = %d body = %s", inbox.Code, inbox.Body.String())
 	}
+	preview := performRequest(handler, testRequest{
+		method: "POST", target: "/v1/group-invitations/preview", remote: "10.0.0.9:5000",
+		headers: headers, body: `{"token":"raw-token"}`,
+	})
+	if preview.Code != http.StatusOK {
+		t.Fatalf("preview status = %d body = %s", preview.Code, preview.Body.String())
+	}
+	previewInvitation, _ := decodeBody(t, preview)["invitation"].(map[string]any)
+	if previewInvitation == nil || previewInvitation["status"] != "pending" {
+		t.Fatalf("preview invitation = %v, want the pending invitation", previewInvitation)
+	}
+	if control.lastPreviewToken != "raw-token" {
+		t.Fatalf("lastPreviewToken = %q", control.lastPreviewToken)
+	}
 	accept := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/group-invitations/accept", remote: "10.0.0.9:5000",
 		headers: headers, body: `{"token":"raw-token"}`,
 	})
 	if accept.Code != http.StatusOK || decodeBody(t, accept)["invitation"] == nil {
 		t.Fatalf("accept status = %d body = %s", accept.Code, accept.Body.String())
+	}
+	decline := performRequest(handler, testRequest{
+		method: "POST", target: "/v1/group-invitations/decline", remote: "10.0.0.9:5000",
+		headers: headers, body: `{"token":"raw-token"}`,
+	})
+	if decline.Code != http.StatusOK {
+		t.Fatalf("decline status = %d body = %s", decline.Code, decline.Body.String())
+	}
+	declineInvitation, _ := decodeBody(t, decline)["invitation"].(map[string]any)
+	if declineInvitation == nil || declineInvitation["status"] != "declined" {
+		t.Fatalf("decline invitation = %v, want the declined invitation", declineInvitation)
+	}
+	if control.lastDeclineToken != "raw-token" {
+		t.Fatalf("lastDeclineToken = %q", control.lastDeclineToken)
 	}
 
 	// Remove member / leave / dissolve / revoke invitation.

@@ -39,6 +39,7 @@ TAG = "1.0.0"
 # Secret keys the manifests may reference (see README §4.1).
 ALLOWED_SECRET_KEYS = {
     "RAG_SERVICE_TOKEN",
+    "RAG_REDIS_LOCK_URL", "RAG_LIGHTRAG_SERVICE_TOKEN", "RAG_KAFKA_SASL_PASSWORD",
     "RAG_MYSQL_PASSWORD",
     "RAG_STATE_ENCRYPTION_KEY",
     "RAG_MYSQL_DEBEZIUM_PASSWORD",
@@ -50,6 +51,7 @@ ALLOWED_SECRET_KEYS = {
 }
 
 DOC_WORKER = "rag-document-worker"
+SAG_WORKER = "rag-sag-worker"
 API = "rag-service"
 PDF = "pdf-parser"
 CACHE_WORKER = "rag-cache-worker"
@@ -165,9 +167,12 @@ def check_overlay(entry: str, deployments_expected: set[str], engine: str, cache
     documents = render(entry)
 
     for doc in documents:
+        kind = doc.get("kind")
+        metadata = doc.get("metadata", {})
+        expected_namespace = None if kind in {"ClusterRole", "ClusterRoleBinding"} else NAMESPACE
         check(
-            doc.get("metadata", {}).get("namespace") == NAMESPACE,
-            f"{entry}: {doc.get('kind')}/{doc.get('metadata', {}).get('name')} is not in namespace {NAMESPACE}",
+            metadata.get("namespace") == expected_namespace,
+            f"{entry}: {kind}/{metadata.get('name')} namespace must be {expected_namespace!r}",
         )
 
     deployments = of_kind(documents, "Deployment")
@@ -215,6 +220,15 @@ def check_overlay(entry: str, deployments_expected: set[str], engine: str, cache
             f"{entry}: {DOC_WORKER} must not receive RAG_SERVICE_TOKEN",
         )
         check("readinessProbe" not in container, f"{entry}: {DOC_WORKER} has no HTTP port, so no probe")
+
+    sag_worker = find(deployments, SAG_WORKER)
+    if sag_worker is not None:
+        container = pod_of(sag_worker)
+        check(container.get("command") == ["/app/bin/rag-sag-worker"], f"{entry}: SAG worker command")
+        check(
+            secret_keys(container, f"{entry}/{SAG_WORKER}") == {"RAG_MYSQL_PASSWORD", "RAG_STATE_ENCRYPTION_KEY"},
+            f"{entry}: SAG worker must receive the MySQL password and state encryption key",
+        )
 
     document_dlq = find(deployments, "rag-dead-letter-document")
     check(document_dlq is not None, f"{entry}: document dead-letter deployment missing")
@@ -372,25 +386,25 @@ def main() -> int:
 
     check_overlay(
         "overlays/go",
-        {API, DOC_WORKER, "rag-dead-letter-document"},
+        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document"},
         engine="go",
         cache=False,
     )
     check_overlay(
         "overlays/vision",
-        {API, DOC_WORKER, "rag-dead-letter-document", PDF},
+        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document", PDF},
         engine="vision",
         cache=False,
     )
     check_overlay(
         "overlays/go-cache",
-        {API, DOC_WORKER, "rag-dead-letter-document", CACHE_WORKER, "rag-dead-letter-cache"},
+        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document", CACHE_WORKER, "rag-dead-letter-cache"},
         engine="go",
         cache=True,
     )
     check_overlay(
         "overlays/vision-cache",
-        {API, DOC_WORKER, "rag-dead-letter-document", PDF, CACHE_WORKER, "rag-dead-letter-cache"},
+        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document", PDF, CACHE_WORKER, "rag-dead-letter-cache"},
         engine="vision",
         cache=True,
     )

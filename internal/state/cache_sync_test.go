@@ -798,10 +798,11 @@ func TestGetOrLoadParallelScopesBackfillIndependently(t *testing.T) {
 	}
 }
 
-// TestGetOrLoadWaiterTakesOverAfterHolderExits covers the takeover row: the
-// first holder fills and releases; a waiter that missed both the payload and
-// the lock window acquires the freed lock and performs its own backfill.
-func TestGetOrLoadWaiterTakesOverAfterHolderExits(t *testing.T) {
+// TestGetOrLoadWaiterJoinsInFlightBackfill pins the actual takeover row: the
+// first holder fills and publishes; a waiter that arrives while the backfill
+// is still in flight joins it (the guard merges concurrent callers) and
+// reuses the leader's result instead of performing a second backfill.
+func TestGetOrLoadWaiterJoinsInFlightBackfill(t *testing.T) {
 	stores, cache := newFastCacheTestStores(t)
 	ctx := context.Background()
 	if err := stores.KnowledgeBases.Create(ctx, cacheTestKnowledgeBase("c")); err != nil {
@@ -843,8 +844,8 @@ func TestGetOrLoadWaiterTakesOverAfterHolderExits(t *testing.T) {
 			t.Fatal("GetOrLoad did not finish after the holder released")
 		}
 	}
-	if fills < 1 {
-		t.Fatalf("backfill fills = %d, want at least 1", fills)
+	if fills != 1 {
+		t.Fatalf("backfill fills = %d, want exactly 1 (the waiter must join the in-flight backfill)", fills)
 	}
 	if hit, _, err := cache.Get(ctx, "documents", "ns"); err != nil || !hit {
 		t.Fatalf("cache hit after takeover = (%v, %v), want a hit", hit, err)

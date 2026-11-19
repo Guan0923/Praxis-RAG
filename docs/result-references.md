@@ -25,7 +25,7 @@ POST /v1/search（REST/Console/本地调试）或 MCP search
 
 ```json
 {
-  "query": "E03 供水不足",
+  "query": "文档分块",
   "retrieval": "hybrid",
   "rerank": "cross_encoder",
   "candidate_k": 10,

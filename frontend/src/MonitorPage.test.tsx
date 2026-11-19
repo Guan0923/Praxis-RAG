@@ -1077,11 +1077,11 @@ describe("MonitorPage", () => {
   // 三个操作按钮都在能力开关（overview.actions）为真时才渲染；POST 都带 CSRF
   // 头（fetchMock 断言 headers）；成功后刷新快照。
 
-  function renderPageWithActions() {
+  function renderPageWithActions(role?: "admin") {
     return render(
       <ConfigProvider button={{ autoInsertSpace: false }}>
         <AntApp>
-          <MonitorPage />
+          <MonitorPage role={role} />
         </AntApp>
       </ConfigProvider>,
     );
@@ -1183,7 +1183,7 @@ describe("MonitorPage", () => {
     expect(await screen.findByText(/已请求重启连接器 praxis-cache-cdc/)).toBeTruthy();
   });
 
-  it("renders the worker scale card, reads the deployment and applies a new replica count", async () => {
+  it.each(["文档 Worker", "Kubernetes"])("reads and scales the document worker from %s", async (tab) => {
     overviewPayload = () => jsonResponse(overviewFixture({
       actions: { requeue_jobs: false, restart_connectors: false, scale_worker: true, worker_deployment: true },
     }));
@@ -1210,10 +1210,11 @@ describe("MonitorPage", () => {
       }
       return overviewPayload();
     });
-    renderPageWithActions();
+    renderPageWithActions("admin");
     await waitFor(() => expect(screen.getByText("0.4.0")).toBeTruthy());
 
-    await openTab("文档 Worker");
+    await openTab(tab);
+    if (tab === "Kubernetes") fireEvent.click(await screen.findByText("文档 Worker 扩缩容"));
     const scaleBlock = await screen.findByLabelText("Worker 扩缩容");
     // 副本读数分两个文本节点（数字与标签间的全角空格被拆分）。
     await waitFor(() => expect(within(scaleBlock).getByText(/期望副本 1/)).toBeTruthy());
@@ -1243,7 +1244,7 @@ describe("MonitorPage", () => {
 
     await openTab("文档 Worker");
     const scaleBlock = await screen.findByLabelText("Worker 扩缩容");
-    expect(within(scaleBlock).getByText(/需要在 Kubernetes 内部署/)).toBeTruthy();
+    expect(within(scaleBlock).getByText(/ServiceAccount 或 kubeconfig/)).toBeTruthy();
     const calls = fetchMock.mock.calls.filter((item) => String(item[0]).includes("worker-deployment"));
     expect(calls).toHaveLength(0);
   });

@@ -331,7 +331,7 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_STATE_POOL_SIZE` / `RAG_STATE_MAX_OVERFLOW` | `10` / `20` | 连接池 |
 | `RAG_STATE_POOL_RECYCLE` / `RAG_STATE_POOL_TIMEOUT` | `1800` / `30` 秒 | 连接回收与等待 |
 | `RAG_STATE_ECHO` | `false` | SQL 回显（调试用，勿在生产开启） |
-| `RAG_STATE_AUTO_SCHEMA` | `true` | 启动时创建缺失表；生产可关闭并由部署账号预建 |
+| `RAG_STATE_AUTO_SCHEMA` | `true` | 启动时创建缺失表并执行增量迁移；生产可关闭并由部署账号执行 `rag-state-migrate --apply` |
 | `RAG_UPLOAD_LEASE_SECONDS` | `120` | 上传事务业务租约时长 |
 | `RAG_UPLOAD_CLEANUP_DELAY_SECONDS` | `3600` | 已完成上传工作区清理延迟 |
 
@@ -518,7 +518,7 @@ PDF 总解析容量上限为 `RAG_PDF_SERVICE_WORKERS × RAG_PDF_SERVICE_CONCURR
    ```
 
 3. 打开 [Console](http://127.0.0.1:8011/console)。首次启动时注册账号，在「模型配置」添加 Embedding 模型，然后创建知识库并选用该模型。
-4. 上传 [X7 智能终端维护手册](../examples/knowledge/x7-maintenance-manual.md)。等文档索引成功后，在「检索调试」选择混合检索，输入「X7 终端出现 E03 温度保护后怎么处理？」。检查命中片段的来源章节，手册第 6.2 节列出了普通用户的处理步骤。[查看示例结果](images/console-search.png)
+4. 上传 [Agentic RAG 基础](../examples/knowledge/agentic-rag.md)。等文档索引成功后，在「检索调试」选择混合检索，输入「谁决定是否再次检索？」。打开命中片段，核对原文与来源文件名。
 
 首次只想查看证据结构时，可以运行 [README 的 5 分钟示例](../README.md#5-分钟快速开始)。
 
@@ -769,12 +769,18 @@ curl.exe "http://127.0.0.1:8011/v1/admin/monitor/logs?source=file&query=timeout"
 
 **入口与鉴权**：Console 侧边栏「系统监控」→「Kubernetes」，标签只对已登录的管理员渲染。这组接口使用严格的 `authAdminSession`：只接受 Console 登录会话（Cookie 或 Bearer 会话令牌），**没有本机直连（loopback）兜底**——即使请求来自 `127.0.0.1`，没有会话也返回 401；普通用户返回 403；API Key 与服务 Token 不是管理员会话，同样不能访问。Cookie 会话的写请求（滚动重启）必须带 `X-CSRF-Token`，Bearer 会话令牌不需要。
 
-**两个视图**：
+**工作负载与 Pod 列表**
 
 - **工作负载（默认）**：范围是已连接集群的**全部命名空间**，包含 `kube-system` 等系统命名空间和 Praxis-RAG 以外的应用。列出 Deployment、StatefulSet、DaemonSet、ReplicaSet、ReplicationController、Job、CronJob，列显示命名空间、类型、名称、状态，以及按类型的就绪副本数（`desired`/`ready`/`available`/`updated`）、Job 完成数（`completions`/`succeeded`/`failed`/`active`）或 CronJob 调度（`schedule`/`suspended`）。展开一行按 `ownerReferences` 显示归属 Pod（Deployment → ReplicaSet → Pod、CronJob → Job → Pod）。
 - **全部 Pod**：控制器创建的 Pod 和独立 Pod 都列出，显示命名空间、名称、就绪容器数（`ready_containers`/`total_containers`）、运行/等待原因（`phase`/`reason`/`message`）、重启次数、节点。
 
 两个视图都支持 `namespace`（精确匹配，空 = 全部命名空间）和 `name`（大小写不敏感子串，空 = 全部，最长 128 字符）筛选；命名空间列表随每次快照返回。每秒最多为每个数据类发一个请求，上一次未结束时跳过该次 tick；失败时保留上次成功数据并在下一秒自动重试。集群未配置或接口返回 503 时，标签页显示配置提示，而不是空表。
+
+**节点与内存**
+
+管理员打开「节点与内存」可查看每个节点的 `MemoryPressure`、容量、可分配内存、工作集用量和估算可用内存（容量减工作集）。按节点筛选下方 Pod，可以对照容器用量、请求、上限及 Pod 优先级。展开可看到初始化容器和最近终止原因，例如 `OOMKilled`。发生驱逐时，仍在清单中的 Pod 会显示集群报告的原因和消息。
+
+`GET /v1/admin/k8s/memory` 使用管理员会话。节点状态需要核心 API 的 `nodes/list`，用量需要集群提供 `metrics.k8s.io/v1beta1`（通常由 Metrics Server 提供），并授予其 `nodes`、`pods` 的 `list` 权限。已有部署需更新 `deploy/k8s/base/rbac-monitor-ops.yaml` 中的权限。页面沿用每秒刷新；服务按需缓存节点和用量样本 15 秒。用量旁显示指标来源提供的采样时间；缺少样本时显示「无数据」，仍可查看已取得的规格和压力状态。
 
 **滚动重启**：
 
@@ -797,12 +803,14 @@ curl.exe "http://127.0.0.1:8011/v1/admin/monitor/logs?source=file&query=timeout"
 
 | API 组 | 资源 | verbs | 用途 |
 | --- | --- | --- | --- |
+| 核心组 `""` | `nodes` | `list` | 节点容量和 MemoryPressure |
+| `metrics.k8s.io` | `nodes`、`pods` | `list` | 节点与容器工作集用量 |
 | 核心组 `""` | `pods`、`replicationcontrollers` | `get`、`list`、`watch` | 全部 Pod 视图、ReplicationController 与 owner 展开 |
 | `apps` | `deployments`、`statefulsets`、`daemonsets`、`replicasets` | `get`、`list`、`watch` | 工作负载列表、副本数状态与 Deployment→ReplicaSet→Pod 展开 |
 | `batch` | `jobs`、`cronjobs` | `get`、`list`、`watch` | Job/CronJob 状态与 CronJob→Job→Pod 展开 |
 | `apps` | `deployments`、`statefulsets`、`daemonsets` | `patch` | 滚动重启只写 Pod 模板的 `kubectl.kubernetes.io/restartedAt` 注解 |
 
-清单**不授予** `create`/`update`/`delete`，也不授权 `pods/exec`、Secret、ConfigMap 等；页面没有创建或删除集群资源的入口。未应用清单或权限不足时，读接口返回 502「Kubernetes 数据读取失败」，重启接口返回 502「Kubernetes 拒绝操作，请检查 RBAC 清单」，页面显示对应错误提示。
+清单**不授予** `create`/`update`/`delete`，也不授权 `pods/exec`、Secret、ConfigMap 等；页面没有创建或删除集群资源的入口。未应用清单或权限不足时，工作负载和 Pod 列表读取失败时返回 502「Kubernetes 数据读取失败」，重启接口返回 502「Kubernetes 拒绝操作，请检查 RBAC 清单」，页面显示对应错误提示。
 
 **接口示例**（全部 `Cache-Control: no-store`，仅管理员会话）：
 
@@ -838,7 +846,7 @@ curl.exe -b cookies.txt -X POST `
 
 - **立即重投**：把「到期重试」与「租约过期的卡死处理中」任务立即重新投递（worker 的周期扫描默认 30 秒一轮；这个按钮用于不想等扫描的人工补救）。语义与周期扫描完全一致：递增 `schedule_version`（Debezium 发一条替代通知）、尊重 3 次执行预算、终态判定共享，**不会**产生第四次执行或重复可检索版本。响应 `{"requeued": N}`。Compose/宿主机部署同样可用。
 - **重启连接器**：面向 supervisor 重启预算耗尽（`restart_exhausted`）或 FAILED task 的采集行；重启连接器及其任务（Kafka Connect REST 的 `includeTasks=true`）同时清空该连接器的自动重启预算。只接受两个固定连接器名（`praxis-document-cdc` / `praxis-cache-cdc`），未知名字 400。Kafka Connect 未配置时 503（`Kafka Connect 未配置`）。
-- **worker 扩缩容**：读 `rag-document-worker` Deployment 的期望/就绪副本数，输入目标副本数（0..64）后发 merge patch（与 `kubectl scale` 等价，admission/quota 同样生效）。与 Kubernetes 标签共用已解析的凭据来源：集群内使用挂载的 ServiceAccount，集群外使用 `RAG_K8S_KUBECONFIG`（可选 `RAG_K8S_CONTEXT`）。清单 `deploy/k8s/base/rbac-monitor-ops.yaml` 已升级为 ClusterRole + ClusterRoleBinding：`get` 包含在 `deployments` 的 list/watch 规则中，`patch` 授权覆盖扩缩容与滚动重启（扩缩容仍只对 Deployment 的 `spec.replicas` 做 merge patch）；原 `resourceNames` 限定 `rag-document-worker` 的单资源 Role 已不再使用，扩缩容卡片仍可用。两者都未配置（Compose/宿主机部署的默认情况）时返回 503（`Kubernetes 操作未启用`），页面显示「未启用」说明而不是假装可用；RBAC 未授权时返回 403（提示应用 RBAC 清单），Deployment 不存在时 404。
+- **worker 扩缩容**：在「系统监控 → Kubernetes → 文档 Worker 扩缩容」或「系统监控 → 文档 Worker」可操作同一个 Deployment。读 `rag-document-worker` Deployment 的期望/就绪副本数，输入目标副本数（0..64）后发 merge patch（与 `kubectl scale` 等价，admission/quota 同样生效）。与 Kubernetes 标签共用已解析的凭据来源：集群内使用挂载的 ServiceAccount，集群外使用 `RAG_K8S_KUBECONFIG`（可选 `RAG_K8S_CONTEXT`）。清单 `deploy/k8s/base/rbac-monitor-ops.yaml` 已升级为 ClusterRole + ClusterRoleBinding：`get` 包含在 `deployments` 的 list/watch 规则中，`patch` 授权覆盖扩缩容与滚动重启（扩缩容仍只对 Deployment 的 `spec.replicas` 做 merge patch）；原 `resourceNames` 限定 `rag-document-worker` 的单资源 Role 已不再使用，扩缩容卡片仍可用。两者都未配置（Compose/宿主机部署的默认情况）时返回 503（`Kubernetes 操作未启用`），页面显示「未启用」说明而不是假装可用；RBAC 未授权时返回 403（提示应用 RBAC 清单），Deployment 不存在时 404。
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:8011/v1/admin/monitor/actions/requeue-jobs
@@ -893,6 +901,11 @@ JEV 条目（TypeSafe System One 决策模型）保存名称、服务地址、�
 `PATCH` 只在服务地址、模型或 Key 实际变化时重新探测；只改名称或原样保存不会调用 provider，已记录的 Embedding 维度保持不变。修改服务地址但未提交新 Key 时保存的 Key 会被清除（与知识库连接表单的 `DraftConnection` 语义一致）。
 
 管理员的创建知识库表单现在只从该列表选择模型（Embedding 必填；Reranker、VLM、知识图谱通过开关启用，**创建页默认全部开启**，可按需关闭），编辑知识库的抽屉（知识库列表 → 配置）同样选择模型：保存时 Console 读取所选条目的 Key，并把该配置的服务地址、模型名和 Key 复制进原有的知识库请求；**切换 Embedding 到不同连接仍要求「重新向量化并保存」确认**。知识库已有连接不在列表中时，编辑抽屉保留「当前配置」选项，保存时沿用原连接、不触发重新向量化。删除或编辑模型配置不会修改已保存到知识库里的连接。知识库 REST 契约不变（仍接受内联 `embedding`/`reranker`/`vlm`/`graph` 连接与 `graph_enabled` 开关），模型列表只服务于 Console 管理员表单。
+
+Console 的「重新向量化并保存」先校验新模型，再提交 MySQL 任务，页面可在显示「已排队」后关闭。Debezium 文档连接器采集 `reembed_jobs` 并将任务 ID 和知识库发送到 topic `praxis_reembed`，由独立的 Go 进程 `rag-reembed-worker` 消费。重新打开知识库配置可查看最近一次任务。执行阶段会分批重算并核对新索引，成功后才把新模型和集合一起发布。配置在任务等待期间如有变更，需重新提交。worker 中断后，未提交 Kafka 位点的任务从头重建临时索引。
+
+异步 API 通过 `POST /v1/admin/knowledge-bases/{namespace}/reembed-jobs` 提交，复用知识库 PATCH 的模型字段，返回 `202` 和任务状态。同路径 `GET` 查询最近一次任务，空历史返回 `null`。同一个知识库同时只能有一个排队或执行中的任务。已有 `PATCH` 的同步响应仍然可用。
+
 
 > 知识库打开 `graph_enabled` 后，该库每次上传都会在发布成功后把块异步镜像进图谱；此时若知识库没有可用的知识图谱模型，或部署未配置 `RAG_LIGHTRAG_SERVICE_URL`，上传会在**受理阶段**被拒绝并提示去「模型配置」补齐，而不是先入库再静默缺图。
 
@@ -970,7 +983,7 @@ curl.exe -X POST http://127.0.0.1:8011/v1/admin/knowledge-bases/batch-delete `
   -d '{"namespaces":["team-kb","old-kb"]}'
 ```
 
-知识库的列表是「配置记录 ∪ 文档工作区」的合并视图，所以只删配置记录会留下一个「缺少配置记录」的条目。`DELETE /v1/admin/knowledge-bases/{namespace}` 因此先删除该命名空间下的全部文档、再删除配置记录：文档走与单文档删除相同的逻辑删除（`del_flag`，Qdrant 向量按现有语义保留，不删 collection）；任一文档删除失败（例如正在上传/更新）时保留配置记录，返回 409 `{"detail":"部分文档删除失败，知识库未删除","namespace":"...","failed_documents":[{"name":"...","error":"..."}]}`，可修复后重试。
+知识库的列表是「配置记录 ∪ 文档工作区」的合并视图，所以只删配置记录会留下一个「缺少配置记录」的条目。`DELETE /v1/admin/knowledge-bases/{namespace}` 因此先删除该命名空间下的全部文档、再删除配置记录：文档走与单文档删除相同的逻辑删除（`del_flag`，外部副本进入后台回收，按命名空间和版本清理向量）；任一文档删除失败（例如正在上传/更新）时保留配置记录，返回 409 `{"detail":"部分文档删除失败，知识库未删除","namespace":"...","failed_documents":[{"name":"...","error":"..."}]}`，可修复后重试。
 
 `batch-delete` 逐条执行同样的删除，返回 `{"deleted":["<namespace>"],"missing":["<namespace>"],"failed":[{"namespace":"...","error":"...","failed_documents":[...]}],"documents_deleted":N,"configurations_deleted":N}`：`deleted` 为已删除，`missing` 为配置和文档都不存在的命名空间，`failed` 为部分文档删除失败或运行时报错（该命名空间保留，Console 保持选中以便重试）；请求体校验失败（缺失、空数组、非法命名空间、超过 100 项、未知字段）返回 422。
 
@@ -1040,12 +1053,12 @@ curl.exe -X DELETE "http://127.0.0.1:8011/v1/documents/guide.md" -H $headers
 ```powershell
 curl.exe -X POST http://127.0.0.1:8011/v1/search `
   -H $headers `
-  -d '{"query":"E03 怎么处理？","retrieval":"hybrid","rerank":"cross_encoder","candidate_k":10,"top_k":5,"filters":{}}'
+  -d '{"query":"谁决定是否再次检索？","retrieval":"hybrid","rerank":"cross_encoder","candidate_k":10,"top_k":5,"filters":{}}'
 
 # 同步搜索（一次调用直接返回证据，无任务 ID/轮询）
 curl.exe -X POST http://127.0.0.1:8011/v1/search `
   -H $headers `
-  -d '{"query":"E03 怎么处理？","retrieval":"hybrid","rerank":"cross_encoder","candidate_k":10,"top_k":5,"filters":{}}'
+  -d '{"query":"谁决定是否再次检索？","retrieval":"hybrid","rerank":"cross_encoder","candidate_k":10,"top_k":5,"filters":{}}'
 
 # artifact（源文件/图片/表格 JSON）
 curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>" -H $headers
@@ -1071,7 +1084,7 @@ curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>/content" -H $headers
 ```powershell
 curl.exe -X POST http://127.0.0.1:8011/v1/search `
   -H $headers `
-  -d '{"query":"E03 怎么处理？","retrieval":"sag2","rerank":"none","candidate_k":100,"top_k":5,"filters":{}}'
+  -d '{"query":"谁决定是否再次检索？","retrieval":"sag2","rerank":"none","candidate_k":100,"top_k":5,"filters":{}}'
 ```
 
 #### 知识图谱检索（`retrieval: graph`）
@@ -1098,11 +1111,11 @@ curl.exe -X POST http://127.0.0.1:8011/v1/search `
 
 使用要求与行为：
 
-- 管理员先在 Console「模型配置」添加 `kind=extraction` 条目（任意 OpenAI 兼容 chat 端点，建议低价快速模型如 qwen-flash / deepseek-chat；存在多条时取**最近更新**的一条）。添加后，**新上传**的文档在发布完成后自动抽取（非致命阶段，失败只记日志不影响文档状态）；存量文档用 `rag-sag-backfill` CLI 补建。
+- 管理员先在 Console「模型配置」添加 `kind=extraction` 条目（任意 OpenAI 兼容 chat 端点，建议低价快速模型如 qwen-flash / deepseek-chat；存在多条时取**最近更新**的一条）。添加后，**新上传或替换**的文档发布时会登记 SAG 片段任务，由独立的 `rag-sag-worker` 后台抽取。文档可先通过普通检索使用，SAG 事件与实体随片段完成逐步可用。存量文档用 `rag-sag-backfill` CLI 补建。
 - 未配置抽取模型或文档未建索引时，`sag` 自动**降级为 hybrid 召回**（不报错、不静默无结果）。
 - 可以搭配任意 `rerank`（`none` 或 `cross_encoder`）：排序是种子分与超边共享实体数的融合分，cross-encoder 二段精排合法（区别于 `sag2`）。
-- 每文档抽取上限 512 chunk（超出部分留给回填 CLI），实体归一化为 casefold；抽取结果含 `metadata.sag_event`（该 chunk 的事件句），便于核对证据链。
-- 删除文档时事件与关联级联清理，实体行保留（共享数据），不会留下悬空超边。
+- 每个文档版本最多抽取 512 个片段，实体按 casefold 归一化。抽取结果含 `metadata.sag_event`（该 chunk 的事件句），便于核对证据链。
+- 删除文档时事件与关联级联清理，实体的最后一条关联消失后，维护循环在保留期后回收孤立实体。
 - 受限账号（任何非全库可读账号，含全库 `read` + 文件级 deny）调用 `sag` 会被**明确拒绝**：该模式的动态超边扩展无法在召回前可靠限定文档范围，这是明确的拒绝而非静默泄露；其余检索模式按可读文档过滤（见 [权限管理](PERMISSIONS.md) §11）。
 
 ```powershell
@@ -1201,6 +1214,8 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 .\dist\bin\rag-state-migrate.exe --data-root D:/praxis-rag/data
 ```
 
+增量迁移会为已有 MySQL 库补齐 `knowledge_bases(owner_user_id)` 和 `upload_operations(namespace, document_id)` 索引，分别用于知识库配额查询和按文档清理上传内容引用。
+
 环境同服务（`RAG_STATE_URL`/`RAG_MYSQL_*`/`RAG_SERVICE_DATA_ROOT`）。退出码：`0` schema 就绪，`1` 不完整/失败，`2` 配置错误。
 
 ### rag-service-migrate（旧知识源导入 / 旧表下线）
@@ -1268,7 +1283,7 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 
 ```powershell
 .\dist\bin\rag-mcp-debug.exe "RRF 怎么融合 BM25 和 Dense？"
-.\dist\bin\rag-mcp-debug.exe --query "E03" --limit 3
+.\dist\bin\rag-mcp-debug.exe --query "RRF" --limit 3
 ```
 
 ## 8. Docker 与 Compose
@@ -1441,3 +1456,23 @@ PDF 默认由独立的 `pdf-parser` 微服务解析（本地 PyMuPDF 读取/渲�
 
 
 
+
+## 到期删除外部索引
+
+REST 和 MCP 的单文档逻辑删除仍同步提交。MySQL 在同一事务保存每个清理目标的命名空间、文档 ID、collection、发布版本和源文件 SHA-256。最后一个文件引用移除后保留 8 天；只有保留期已过且对应内容对象已回收，维护循环才把该目标置为 `ready`。文档连接器将 `index_cleanup_jobs` 的定位标识和调度版本发往 `RAG_DELETE_TOPIC`（默认 `praxis_index_cleanup`）。启动 `rag-delete-worker` 后，它以独立消费组 `RAG_DELETE_GROUP`（默认 `praxis_index_cleanup_workers`）领取任务。进程重启会补领已就绪任务。外部请求失败进入退避重试，单个目标的失败不会撤销其他目标的完成记录。
+
+- 普通 RAG 和 SAG2 使用相同的 Qdrant 分块。清理只匹配原 collection 内的 namespace、文档和发布版本。整库清理还会扫描该命名空间的遗留分块。空 collection 保留，共享 collection 中其他命名空间的点继续可用。
+- LightRAG 按侧车持久化的登记版本做条件删除。同名重传、重新登记或同名工作区重建会使旧删除失效。MySQL 已下线的图谱证据会在检索返回前过滤。整库清理仅在原命名空间仍未启用且对应内容已过保留期时清空工作区。
+- SAG 的任务、事件及其关联在 MySQL 的删除事务内清理。共享实体在最后一条关联消失并超过保留期后回收。
+
+旧索引对账复用同一可执行文件。运行 `rag-delete-worker --reconcile` 扫描 MySQL 已知的知识库及 collection。已知归属、但 MySQL 已无相应知识库配置时，可显式提供 `--namespace <知识库> --collection <集合>`。新写入的向量和图谱登记携带源文件 SHA-256。对账分页读取 Qdrant 点的定位字段和 LightRAG 文档登记，排除仍在使用或上传中的目标，对首次发现的孤儿给予完整的 8 天保留期。若图谱部署曾绕过侧车写入，底层图数据库中缺乏文档归属的数据需要另行核对。
+
+可用以下 SQL 查看各目标的进度。失败计数记录在 `failures`，等待下一次调度的时间为 `due_at`（Unix 秒）。
+
+```sql
+SELECT target, status, COUNT(*) AS jobs, MAX(failures) AS max_failures
+FROM index_cleanup_jobs
+GROUP BY target, status;
+```
+
+升级时先用新版 `rag-state-migrate --apply` 创建新任务表（自动建表的开发部署启动服务时建表），更新 LightRAG 侧车，再注册连接器配置并启动 Go 服务及 worker。消费组需要新 topic 的读取权限，连接器需要写入权限。worker 与文档服务使用同一个 MySQL、Redis 文档锁、Qdrant 和 LightRAG 配置。

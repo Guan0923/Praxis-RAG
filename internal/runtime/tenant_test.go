@@ -29,12 +29,12 @@ var testEncryptionKey = statetest.TestEncryptionKey
 // testQueryPoints is the Qdrant query response used by the search tests.
 const testQueryPoints = `[
 	{"id":"p1","version":1,"score":0.9,"payload":{
-		"record_type":"chunk","document_id":"doc-e03","chunk_id":"chunk-e03",
-		"text":"错误代码 E03 表示水路供水不足","title":"e03","source":"e03.md",
+		"record_type":"chunk","document_id":"doc-index","chunk_id":"chunk-index",
+		"text":"文档索引包含分块和向量化","title":"index","source":"index.md",
 		"metadata":{"kind":"test"},"upload_version":"v1"}},
 	{"id":"p2","version":1,"score":0.4,"payload":{
-		"record_type":"chunk","document_id":"doc-temp","chunk_id":"chunk-temp",
-		"text":"咖啡温度偏低时先预热杯子","title":"temperature","source":"temperature.md",
+		"record_type":"chunk","document_id":"doc-access","chunk_id":"chunk-access",
+		"text":"知识库可以按文档分配读取权限","title":"permissions","source":"permissions.md",
 		"metadata":{"kind":"test"},"upload_version":"v1"}}
 ]`
 

@@ -135,6 +135,13 @@ func (r *LightRAGDocumentRepository) Upsert(ctx context.Context, document *Light
 	return err
 }
 
+// RegisterPending records ownership before graph work leaves MySQL.
+func (r *LightRAGDocumentRepository) RegisterPending(ctx context.Context, tx *sql.Tx, ns, id, name, fingerprint string) error {
+	_, err := tx.ExecContext(ctx, "INSERT INTO lightrag_documents (namespace,document_id,document_name,config_fingerprint,chunk_count,status,attempts,updated_at) "+
+		"VALUES (?,?,?,?,0,'pending',0,?) ON DUPLICATE KEY UPDATE document_name=VALUES(document_name),config_fingerprint=VALUES(config_fingerprint),status='pending',updated_at=VALUES(updated_at)", ns, id, name, fingerprint, nowISO())
+	return err
+}
+
 // MarkFailed records one failed mirror attempt without destroying a previous
 // successful index timestamp: a retry that fails must not make an older graph
 // copy look newer than it is.
@@ -209,4 +216,32 @@ func (r *LightRAGDocumentRepository) ListPending(ctx context.Context, limit int)
 		pending = append(pending, row)
 	}
 	return pending, rows.Err()
+}
+
+// VisibleHeads filters retained graph evidence before it reaches a reranker.
+// Unversioned legacy hits remain readable until their document id is retired.
+func (r *LightRAGDocumentRepository) VisibleHeads(ctx context.Context, ns string, ids []string) (map[string]string, map[string]bool, error) {
+	heads := map[string]string{}
+	legacy := map[string]bool{}
+	if len(ids) == 0 {
+		return heads, legacy, nil
+	}
+	args := append([]any{ns}, stringArguments(ids)...)
+	rows, err := r.stores.DB.QueryContext(ctx, "SELECT d.document_id,COALESCE(h.version,''),NOT EXISTS(SELECT 1 FROM index_cleanup_jobs j "+
+		"WHERE j.namespace=d.namespace AND j.document_id=d.document_id) FROM documents d LEFT JOIN document_heads h ON d.namespace=h.namespace AND d.document_id=h.document_id "+
+		"WHERE d.namespace=? AND d.del_flag=0 AND d.document_id IN ("+inPlaceholders(len(ids))+")", args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, head string
+		var old bool
+		if err := rows.Scan(&id, &head, &old); err != nil {
+			return nil, nil, err
+		}
+		heads[id] = head
+		legacy[id] = old
+	}
+	return heads, legacy, rows.Err()
 }

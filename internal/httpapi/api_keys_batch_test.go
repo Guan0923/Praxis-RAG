@@ -78,7 +78,7 @@ func batchDeleteBody(t *testing.T, ids ...string) string {
 	return `{"ids":[` + strings.Join(quoted, ",") + `]}`
 }
 
-func TestAPIKeyBatchDeleteAgainstSQLiteState(t *testing.T) {
+func TestAPIKeyBatchDeleteAgainstMySQLState(t *testing.T) {
 	handler := newStateBackedServer(t).Handler()
 	firstID, firstSecret := createAPIKeyForBatchTest(t, handler, "batch-one")
 	secondID, secondSecret := createAPIKeyForBatchTest(t, handler, "batch-two")

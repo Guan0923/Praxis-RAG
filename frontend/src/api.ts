@@ -1930,6 +1930,47 @@ export async function fetchKubernetesPods(
   );
 }
 
+export type K8sNodeMemory = {
+  name: string;
+  capacity: string;
+  allocatable: string;
+  pressure: string;
+  usage?: string;
+  timestamp?: string;
+};
+
+export type K8sPodMemory = {
+  namespace: string;
+  name: string;
+  node: string;
+  priority: number | null;
+  priority_class: string;
+  request?: string;
+  limit?: string;
+  reason?: string;
+  message?: string;
+  timestamp?: string;
+  containers: Array<{
+    name: string;
+    kind: string;
+    termination?: string;
+    request?: string;
+    limit?: string;
+    usage?: string;
+  }>;
+};
+
+export type K8sMemoryView = {
+  generated_at: string;
+  nodes: K8sNodeMemory[];
+  pods: K8sPodMemory[];
+  warnings: string[];
+};
+
+export function fetchKubernetesMemory(signal?: AbortSignal) {
+  return api<K8sMemoryView>("/v1/admin/k8s/memory", undefined, { signal, cache: "no-store" });
+}
+
 // restartKubernetesWorkload triggers a rolling restart (the kubectl rollout
 // restart equivalent: the pod template annotation is bumped). The path names
 // the target, so the request has an empty body; the shared api() adds the CSRF

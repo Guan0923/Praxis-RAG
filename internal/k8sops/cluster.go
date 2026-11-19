@@ -174,7 +174,9 @@ type Cluster struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 
-	caches map[string]*resourceCache
+	caches       map[string]*resourceCache
+	memoryMu     sync.Mutex
+	memorySample *clusterMemorySample
 
 	// restartSubmitMu serializes the "check for an in-flight restart, PATCH,
 	// record the tracker" sequence so two concurrent clicks cannot both PATCH.

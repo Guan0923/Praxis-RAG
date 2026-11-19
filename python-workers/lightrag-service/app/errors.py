@@ -24,6 +24,10 @@ class InputError(ServiceError):
     status_code = 400
 
 
+class RevisionChanged(ServiceError):
+    status_code = 409
+
+
 class UnauthorizedError(ServiceError):
     """The bearer token is missing or does not match (HTTP 401)."""
 

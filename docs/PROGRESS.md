@@ -58,7 +58,7 @@ Agent 决定检索动作
 - [x] 使用 Qdrant Query API 和服务端 RRF 实现 `HybridRetriever`。
 - [x] Web 上传和 CLI 入库同时生成 Dense + Sparse 双向量。
 - [x] 为 Dense-only Collection 增加安全迁移错误，不自动删除旧数据。
-- [x] 使用 E03 测试文档对比 BM25、Dense 和 Hybrid 的真实结果。
+- [x] 使用测试文档对比 BM25、Dense 和 Hybrid 的真实结果。
 - [ ] 建立带人工相关性标注的 Recall@K 回归数据集。
 
 ## Phase 4：Reranking
@@ -187,23 +187,12 @@ Points: 3（两个用户 namespace，共两个源文档）
 Legacy collection: mini_agent_phase2_demo（保留，未删除）
 ```
 
-同一个问题“X7 终端出现 E03 应该怎么处理？”的真实检索结果：
-
-```text
-BM25: 2 results; top score=4.034924; E03=True
-Dense: 2 results; top score=0.626848; E03=True
-Hybrid RRF: 2 results; top score=0.833333; E03=True
-Implementation: qdrant-hybrid-v1
-```
-
 真实 Mini-Agent MCP 宿主验证：
 
 ```text
 Loaded tool: mcp_rag_search
 Server health: rag=healthy
 Call mode: hybrid / rerank=none
-First source: rag-upload-test.md
-First evidence contains E03: true
 Focused backend/RAG regression: 57 passed
 Ruff: All checks passed
 Frontend typecheck/build: passed
@@ -220,15 +209,11 @@ Phase 2 的 Dense-only Collection 无法原地增加 Sparse Vector。迁移采�
 Fake-model RAG suite: 27 passed
 Real standalone rerank:
   first download/load: 123.56s
-  E03 evidence score: 0.995823
-  irrelevant filter evidence score: 0.001262
 
 Real Hybrid + Cross Encoder:
   implementation: qdrant-hybrid-rerank-v1
   retrieval_ms: 13658.938（冷加载）
   rerank_ms: 7699.693（冷加载）
-  first source: rag-upload-test.md
-  first score: 0.998717
 
 Real Mini-Agent MCP host with cached models:
   tool: mcp_rag_search

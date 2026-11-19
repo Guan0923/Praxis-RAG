@@ -601,7 +601,7 @@ func TestTenantReadRoutesHonourScope(t *testing.T) {
 	search := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/search", remote: "10.0.0.9:5000",
 		headers: mergeHeaders(sessionHeaders("user-token", "alpha"), map[string]string{"Content-Type": "application/json"}),
-		body:    `{"query":"E03"}`,
+		body:    `{"query":"索引"}`,
 	})
 	if search.Code != http.StatusOK {
 		t.Fatalf("search status = %d body = %s", search.Code, search.Body.String())
@@ -625,7 +625,7 @@ func TestTenantReadRoutesHonourScope(t *testing.T) {
 	adminSearch := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/search", remote: "10.0.0.9:5000",
 		headers: mergeHeaders(sessionHeaders("admin-token", "alpha"), map[string]string{"Content-Type": "application/json"}),
-		body:    `{"query":"E03"}`,
+		body:    `{"query":"索引"}`,
 	})
 	if adminSearch.Code != http.StatusOK || runtime.searchRequest.DocumentIDs != nil {
 		t.Fatalf("admin search status = %d DocumentIDs = %v", adminSearch.Code, runtime.searchRequest.DocumentIDs)
@@ -722,7 +722,7 @@ func TestTenantRoutesWithoutAccessControlKeepLegacyBehaviour(t *testing.T) {
 	search := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/search", remote: "10.0.0.9:5000",
 		headers: mergeHeaders(sessionHeaders("user-token", "alpha"), map[string]string{"Content-Type": "application/json"}),
-		body:    `{"query":"E03"}`,
+		body:    `{"query":"索引"}`,
 	})
 	if search.Code != http.StatusOK || runtime.searchRequest.DocumentIDs != nil {
 		t.Fatalf("search status = %d DocumentIDs = %v", search.Code, runtime.searchRequest.DocumentIDs)
@@ -1024,4 +1024,141 @@ func TestUploadWriteGateRunsBeforeAnyUploadSideEffect(t *testing.T) {
 		t.Fatalf("batch leaked side effects: files=%+v", runtime.batchFiles)
 	}
 
+}
+
+// recordingNotifier captures what the document change notifications actually
+// carried, not just how many were emitted: unlike fakeNotifier it keeps the
+// before/after snapshots passed to DocumentsChanged.
+type recordingNotifier struct {
+	namespaces []string
+	documents  []documentsChanged
+}
+
+type documentsChanged struct {
+	namespace string
+	before    []map[string]any
+	after     []map[string]any
+}
+
+func (f *recordingNotifier) PromptsChanged(namespace string) {
+	f.namespaces = append(f.namespaces, namespace)
+}
+
+func (f *recordingNotifier) ToolsChanged(namespace string) {
+	f.namespaces = append(f.namespaces, namespace)
+}
+
+func (f *recordingNotifier) DocumentsChanged(namespace string, before, after []map[string]any) {
+	f.namespaces = append(f.namespaces, namespace)
+	f.documents = append(f.documents, documentsChanged{namespace: namespace, before: before, after: after})
+}
+
+// TestDeleteAndReplacePublishDocumentChangeNotifications pins the positive
+// DocumentsChanged path: a successful delete or replace publishes the
+// namespace plus the before/after document snapshots (the MCP
+// resources/list_changed data source), not only the denied paths staying
+// silent.
+// multipartReplacementFile builds one replace body with the single "file"
+// field the replace endpoint requires.
+func multipartReplacementFile(t *testing.T, name string) (string, string) {
+	t.Helper()
+	buffer := &bytes.Buffer{}
+	writer := multipart.NewWriter(buffer)
+	part, err := writer.CreateFormFile("file", name)
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := part.Write([]byte("replacement of " + name)); err != nil {
+		t.Fatalf("write content: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	return buffer.String(), writer.FormDataContentType()
+}
+
+func TestDeleteAndReplacePublishDocumentChangeNotifications(t *testing.T) {
+	users := &fakeUserAuth{sessions: map[string]*auth.SessionUser{"admin-token": adminSession("admin-token")}}
+	control := &fakeAccessControl{scopes: map[string]access.ScopeSet{
+		"u-admin|alpha": fullTestScope(),
+	}}
+	runtime := newScopedDocRuntime()
+	runtime.deletePayload = map[string]any{"deleted": map[string]any{}, "documents": []any{}}
+	notifier := &recordingNotifier{}
+	handler := newAccessTestServer(t, users, control, runtime,
+		WithDocumentNotifier(notifier)).Handler()
+
+	deleted := performRequest(handler, testRequest{
+		method: "DELETE", target: "/v1/documents/a.md", remote: "10.0.0.9:5000",
+		headers: sessionHeaders("admin-token", "alpha"),
+	})
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body = %s", deleted.Code, deleted.Body.String())
+	}
+	if len(notifier.namespaces) != 1 || notifier.namespaces[0] != "alpha" {
+		t.Fatalf("delete notifications = %v", notifier.namespaces)
+	}
+	if len(notifier.documents) != 1 {
+		t.Fatalf("change notifications = %d (raw %+v)", len(notifier.documents), notifier.documents)
+	}
+	change := notifier.documents[0]
+	if len(change.before) != 2 {
+		t.Fatalf("delete before snapshot = %+v", change.before)
+	}
+	if len(change.after) != 0 {
+		t.Fatalf("delete after snapshot = %+v", change.after)
+	}
+
+	replaceBody, replaceType := multipartReplacementFile(t, "replacement.md")
+	replaced := performRequest(handler, testRequest{
+		method: "POST", target: "/v1/documents/a.md/replace", remote: "10.0.0.9:5000",
+		headers: mergeHeaders(sessionHeaders("admin-token", "alpha"),
+			map[string]string{"Content-Type": replaceType}),
+		body: replaceBody,
+	})
+	if replaced.Code != http.StatusOK {
+		t.Fatalf("replace status = %d body = %s", replaced.Code, replaced.Body.String())
+	}
+	if len(notifier.namespaces) != 2 {
+		t.Fatalf("notifications after replace = %v", notifier.namespaces)
+	}
+	if len(notifier.documents) != 2 {
+		t.Fatalf("change notifications = %d", len(notifier.documents))
+	}
+	// The replace notification carries the same before snapshot and the
+	// post-write documents from the runtime payload.
+	second := notifier.documents[1]
+	if second.namespace != "alpha" || len(second.before) != 2 {
+		t.Fatalf("replace before snapshot = %+v", second)
+	}
+	if len(second.after) != 1 {
+		t.Fatalf("replace after snapshot = %+v", second)
+	}
+}
+
+// TestRestrictedAccountCannotUseSAGRetrieval pins the explicit 403 branch: a
+// restricted grantee cannot call retrieval=sag, because the SAG dynamic
+// hyperedge cannot be bounded to the readable set before recall.
+func TestRestrictedAccountCannotUseSAGRetrieval(t *testing.T) {
+	users := &fakeUserAuth{sessions: map[string]*auth.SessionUser{"user-token": userSession("user-token")}}
+	control := &fakeAccessControl{scopes: map[string]access.ScopeSet{
+		"u-user|alpha": readFilesScope("a.md"),
+	}}
+	runtime := newScopedDocRuntime()
+	handler := newAccessTestServer(t, users, control, runtime).Handler()
+
+	denied := performRequest(handler, testRequest{
+		method: "POST", target: "/v1/search", remote: "10.0.0.9:5000",
+		headers: mergeHeaders(sessionHeaders("user-token", "alpha"), map[string]string{"Content-Type": "application/json"}),
+		body:    `{"query":"索引","retrieval":"sag"}`,
+	})
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("restricted sag status = %d body = %s", denied.Code, denied.Body.String())
+	}
+	if detail := decodeBody(t, denied)["detail"]; detail != "该检索模式暂不支持受限账号调用：sag" {
+		t.Fatalf("restricted sag detail = %v", detail)
+	}
+	if runtime.searchNamespace != "" {
+		t.Fatalf("restricted sag reached the runtime: namespace=%q", runtime.searchNamespace)
+	}
 }

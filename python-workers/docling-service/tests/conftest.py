@@ -52,11 +52,11 @@ def docx_bytes(tmp_path: Path) -> bytes:
     image_path = tmp_path / "figure.png"
     image_path.write_bytes(_png_bytes((30, 90, 160)))
     document = Document()
-    document.add_heading("X7 系统手册", level=1)
-    document.add_paragraph("本文档描述 X7 的安装、配置与故障处理流程。")
+    document.add_heading("部署指南", level=1)
+    document.add_paragraph("本文档描述检索服务的安装与配置流程。")
     document.add_heading("安装步骤", level=2)
-    document.add_paragraph("1. 连接电源。")
-    document.add_paragraph("2. 按下启动按钮。")
+    document.add_paragraph("1. 配置数据库。")
+    document.add_paragraph("2. 启动检索服务。")
     document.add_heading("硬件参数", level=2)
     document.add_paragraph("表 1 硬件参数表")
     table = document.add_table(rows=3, cols=3)
@@ -80,9 +80,9 @@ def docx_bytes(tmp_path: Path) -> bytes:
 def html_bytes(tmp_path: Path) -> bytes:
     png = base64.b64encode(_png_bytes((120, 60, 20))).decode()
     html = f"""<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>X7 网页手册</title></head>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>部署指南</title></head>
 <body>
-<h1>X7 网页手册</h1>
+<h1>部署指南</h1>
 <p>本页描述网页版的安装说明与硬件参数。</p>
 <h2>硬件参数</h2>
 <table border="1">

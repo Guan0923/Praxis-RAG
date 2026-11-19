@@ -52,6 +52,7 @@ type Store struct {
 
 // Chunk is the storage-facing projection of a document chunk.
 type Chunk struct {
+	SourceHash string
 	DocumentID string
 	ChunkID    string
 	Text       string
@@ -352,6 +353,9 @@ func (s *Store) StageVersion(
 			"source":         chunk.Source,
 			"metadata":       metadata,
 			"upload_version": version,
+		}
+		if chunk.SourceHash != "" {
+			payload["source_hash"] = chunk.SourceHash
 		}
 		if s.namespace != "" {
 			payload["namespace"] = s.namespace
@@ -669,6 +673,53 @@ func (s *Store) matchesNamespace(payload map[string]any) bool {
 	}
 	text, ok := value.(string)
 	return ok && text == s.namespace
+}
+
+// WalkCleanupTargets scans the owned namespace, including points hidden from search.
+// The cursor stays in its original JSON type for older numeric point IDs.
+func (s *Store) WalkCleanupTargets(ctx context.Context, visit func(string, string, string) error) error {
+	exists, err := s.CollectionExists(ctx)
+	if err != nil || !exists {
+		return err
+	}
+	var cursor json.RawMessage
+	for {
+		body := map[string]any{"limit": 200, "with_vector": false, "with_payload": []string{"document_id", "upload_version", "source_hash"}, "filter": s.versionScopeFilter(nil)}
+		if len(cursor) > 0 {
+			body["offset"] = cursor
+		}
+		var page struct {
+			Points []Point
+			Next   json.RawMessage `json:"next_page_offset"`
+		}
+		if err := s.client.post(ctx, s.collectionPath("/points/scroll"), nil, body, &page); err != nil {
+			return err
+		}
+		seen := map[[3]string]bool{}
+		for _, p := range page.Points {
+			doc, _ := p.Payload["document_id"].(string)
+			version, _ := p.Payload["upload_version"].(string)
+			if doc == "" || (version == "" && p.Payload["upload_version"] != nil) {
+				continue
+			}
+			hash, _ := p.Payload["source_hash"].(string)
+			key := [3]string{doc, version, hash}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			if err := visit(doc, version, hash); err != nil {
+				return err
+			}
+		}
+		if len(page.Next) == 0 || string(page.Next) == "null" {
+			return nil
+		}
+		if string(cursor) == string(page.Next) {
+			return fmt.Errorf("Qdrant repeated scroll offset")
+		}
+		cursor = page.Next
+	}
 }
 
 // DeleteVersion deletes only this document's version in this namespace.

@@ -16,12 +16,12 @@ import (
 
 const evidencePoints = `[
 	{"id":"p1","score":0.9,"payload":{
-		"record_type":"chunk","document_id":"doc-e03","chunk_id":"chunk-e03",
-		"text":"错误代码 E03 表示水路供水不足","title":"e03","source":"e03.md",
+		"record_type":"chunk","document_id":"doc-index","chunk_id":"chunk-index",
+		"text":"索引请求超限时返回 HTTP 429","title":"index","source":"index.md",
 		"metadata":{"kind":"test"},"upload_version":"v1"}},
 	{"id":"p2","score":0.4,"payload":{
-		"record_type":"chunk","document_id":"doc-temp","chunk_id":"chunk-temp",
-		"text":"咖啡温度偏低时先预热杯子","title":"temperature","source":"temperature.md",
+		"record_type":"chunk","document_id":"doc-access","chunk_id":"chunk-access",
+		"text":"知识库可以按文档分配读取权限","title":"permissions","source":"permissions.md",
 		"metadata":{"kind":"test"},"upload_version":"v1"}}
 ]`
 
@@ -37,8 +37,8 @@ func TestDenseRetrieverProjectsCitableEvidence(t *testing.T) {
 		t.Fatalf("results = %v", results)
 	}
 	first := results[0]
-	if first.DocumentID != "doc-e03" || first.ChunkID != "chunk-e03" || first.Source != "e03.md" ||
-		first.Text != "错误代码 E03 表示水路供水不足" || first.Score != 0.9 {
+	if first.DocumentID != "doc-index" || first.ChunkID != "chunk-index" || first.Source != "index.md" ||
+		first.Text != "索引请求超限时返回 HTTP 429" || first.Score != 0.9 {
 		t.Errorf("candidate = %+v", first)
 	}
 	if embedder.calls != 1 {
@@ -94,11 +94,11 @@ func TestBm25RetrieverPrioritizesAnExactErrorCode(t *testing.T) {
 	fake, server := newTestQdrant(t, queryResult(evidencePoints))
 	store := newTestStore(t, server)
 	encoder := sparse.NewDefaultEncoder()
-	results, err := NewBm25Retriever(encoder, store).Search(context.Background(), "E03 怎么处理", 5, nil)
+	results, err := NewBm25Retriever(encoder, store).Search(context.Background(), "HTTP 429 如何处理", 5, nil)
 	if err != nil {
 		t.Fatalf("Search() error: %v", err)
 	}
-	if len(results) != 2 || results[0].DocumentID != "doc-e03" || results[0].Source != "e03.md" {
+	if len(results) != 2 || results[0].DocumentID != "doc-index" || results[0].Source != "index.md" {
 		t.Fatalf("results = %+v", results)
 	}
 	queries := fake.find(http.MethodPost, "/points/query")
@@ -136,7 +136,7 @@ func TestBm25RetrieverWrapsErrors(t *testing.T) {
 	}
 	_, server := newTestQdrant(t, handler)
 	store := newTestStore(t, server)
-	_, err := NewBm25Retriever(sparse.NewDefaultEncoder(), store).Search(context.Background(), "E03", 5, nil)
+	_, err := NewBm25Retriever(sparse.NewDefaultEncoder(), store).Search(context.Background(), "索引", 5, nil)
 	if err == nil || !strings.HasPrefix(err.Error(), "BM25 retrieval failed: ") {
 		t.Fatalf("error = %v", err)
 	}
@@ -148,11 +148,11 @@ func TestHybridRetrieverUsesServerSideRRF(t *testing.T) {
 	store := newTestStore(t, server)
 	embedder := &fakeQueryEmbedder{vector: []float64{1, 0, 0, 0}}
 	results, err := NewHybridRetriever(embedder, sparse.NewDefaultEncoder(), store).
-		Search(context.Background(), "E03 供水", 2, map[string]any{"document_id": "doc-e03"})
+		Search(context.Background(), "文档索引", 2, map[string]any{"document_id": "doc-index"})
 	if err != nil {
 		t.Fatalf("Search() error: %v", err)
 	}
-	if len(results) != 2 || results[0].DocumentID != "doc-e03" {
+	if len(results) != 2 || results[0].DocumentID != "doc-index" {
 		t.Fatalf("results = %+v", results)
 	}
 	queries := fake.find(http.MethodPost, "/points/query")
@@ -218,7 +218,7 @@ func TestHybridRetrieverWrapsEmbedderErrors(t *testing.T) {
 	store := newTestStore(t, server)
 	embedder := &fakeQueryEmbedder{err: fmt.Errorf("model down")}
 	_, err := NewHybridRetriever(embedder, sparse.NewDefaultEncoder(), store).
-		Search(context.Background(), "E03", 5, nil)
+		Search(context.Background(), "索引", 5, nil)
 	const want = "Hybrid retrieval failed: model down"
 	if err == nil || err.Error() != want {
 		t.Fatalf("error = %v, want %q", err, want)
@@ -241,7 +241,7 @@ func TestHybridRetrieverReRaisesModelAPIErrorsUnchanged(t *testing.T) {
 	store := newTestStore(t, server)
 	embedder := &fakeQueryEmbedder{err: &modelapi.ModelAPIError{Message: "模型服务请求超时"}}
 	_, err := NewHybridRetriever(embedder, sparse.NewDefaultEncoder(), store).
-		Search(context.Background(), "E03", 5, nil)
+		Search(context.Background(), "索引", 5, nil)
 	if err == nil || err.Error() != "模型服务请求超时" {
 		t.Fatalf("error = %v", err)
 	}

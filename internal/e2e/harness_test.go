@@ -46,12 +46,12 @@ var testEncryptionKey = statetest.TestEncryptionKey
 // documentText is long enough for several chunks with the seeded character
 // chunking configuration.
 const documentText = "One document paragraph with enough text for chunking. " +
-	"E03 水路供水不足的处理步骤需要排出管路空气。 " +
+	"索引任务负责将上传的文档切分为可检索的片段。 " +
 	"Another sentence keeps the chunk boundaries meaningful.\n\n" +
-	"Second paragraph repeats the operational procedure for the water loop. " +
-	"E04 压力异常时先关闭进水阀再检查过滤器。\n\n" +
-	"Third paragraph documents the cooling check and the filter replacement. " +
-	"E05 冷却水温过高时检查风扇与散热片。\n\n"
+	"Second paragraph repeats the steps for preparing a document index. " +
+	"索引任务完成后即可按片段检索。\n\n" +
+	"Third paragraph documents how to trace evidence to its source. " +
+	"检索结果会标注来源文件和片段编号。\n\n"
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))

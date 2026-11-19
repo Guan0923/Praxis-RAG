@@ -432,7 +432,9 @@ func TestDocumentConnectorTemplateCaptureOnlyLocators(t *testing.T) {
 		t.Fatalf("skipped.operations = %q", config["skipped.operations"])
 	}
 	expected := map[string]map[string]bool{
-		"document_jobs": {"artifact_id": true, "namespace": true, "schedule_version": true},
+		"document_jobs":      {"artifact_id": true, "namespace": true, "schedule_version": true},
+		"reembed_jobs":       {"namespace": true, "job_id": true},
+		"index_cleanup_jobs": {"namespace": true, "job_id": true, "schedule_version": true},
 	}
 	captured := map[string]map[string]bool{}
 	for _, qualified := range splitPropertyList(config["column.include.list"]) {

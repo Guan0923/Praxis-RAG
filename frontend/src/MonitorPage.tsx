@@ -552,14 +552,11 @@ function KeyMetricsCard({ overview }: { overview: MonitorOverview }) {
 
   return (
     <Card size="small" title="关键指标">
-      <Row gutter={[16, 12]}>
+      <div className="monitor-key-metrics">
         {metrics.map((metric) => (
-          // 整行铺开：五个指标在宽屏上排成一行，窄屏回落 2/行。
-          <Col key={metric.key} xs={12} sm={8} lg={4}>
-            <Statistic className="monitor-stat" title={metric.title} value={metric.value} />
-          </Col>
+          <Statistic key={metric.key} className="monitor-stat" title={metric.title} value={metric.value} />
         ))}
-      </Row>
+      </div>
     </Card>
   );
 }
@@ -845,8 +842,7 @@ function WorkerScaleCard({ active }: { active: boolean }) {
     return (
       <section className="monitor-block" aria-label="Worker 扩缩容">
         <p className="secondary monitor-note">
-          扩缩容操作未启用：需要在 Kubernetes 内部署 rag-service 并应用 RBAC 清单
-          （deploy/k8s/base/rbac-monitor-ops.yaml）。Compose/宿主机部署不受影响。
+          扩缩容操作未启用。请检查集群凭据（ServiceAccount 或 kubeconfig）与文档 Worker 的 Deployment 权限。
         </p>
       </section>
     );
@@ -861,6 +857,7 @@ function WorkerScaleCard({ active }: { active: boolean }) {
   return (
     <section className="monitor-block" aria-label="Worker 扩缩容">
       <Flex vertical gap={8}>
+        {deployment && <strong>{deployment.namespace}/{deployment.name}</strong>}
         <Flex wrap gap={12} align="center">
           <span className="secondary">
             {deployment
@@ -878,19 +875,22 @@ function WorkerScaleCard({ active }: { active: boolean }) {
           <Button
             size="small"
             loading={applying}
-            disabled={replicas === null || (deployment !== undefined && replicas === deployment.desired_replicas)}
+            disabled={!deployment || replicas === null || !Number.isInteger(replicas) || replicas < 0 || replicas > 64 || replicas === deployment.desired_replicas}
             onClick={() => {
               if (replicas === null || !actions) return;
               setApplying(true);
-              void actions.scale(() => scaleWorker(replicas)).finally(() => setApplying(false));
+              void actions.scale(async () => {
+                const result = await scaleWorker(replicas);
+                await load();
+                return result;
+              }).finally(() => setApplying(false));
             }}
           >
             应用副本数
           </Button>
         </Flex>
         <p className="secondary monitor-note">
-          缩容时正在处理的分区会 rebalance 给存活副本；未提交消息重新投递，由 schedule_version 与租约保证幂等。
-          修改的是 Deployment 的 spec.replicas（与 kubectl scale 等价）。
+          目标副本数可设为 0 至 64。设为 0 会暂停文档 Worker 消费任务，恢复副本后继续处理。
         </p>
       </Flex>
     </section>
@@ -1749,6 +1749,7 @@ export function MonitorPage({ role }: { role?: Role } = {}) {
       <KubernetesMonitor
         tick={tick}
         active={kubernetesActive}
+        workerScale={overview ? <WorkerScaleCard active={kubernetesActive} /> : <Alert type="warning" title="等待监控概览返回扩缩容能力" />}
         onUpdated={(generatedAt) => setLastUpdatedAt(generatedAt)}
       />
     ),
@@ -1759,13 +1760,13 @@ export function MonitorPage({ role }: { role?: Role } = {}) {
     : baseTabs;
 
   return (
-    <section aria-label="系统监控页面">
+    <section className="monitor-page" aria-label="系统监控页面">
       <div className="page-heading">
         <div className="page-heading-title">
           <h1>系统监控</h1>
           {status && <Tag color={overallStatusColors[status]}>{overallStatusLabels[status]}</Tag>}
         </div>
-        <div className="toolbar">
+        <div className="monitor-refresh">
           <span className="secondary">自动刷新 · 每 1 秒</span>
           <span className="secondary">
             {lastUpdatedAt ? `更新于 ${formatClock(lastUpdatedAt)}` : "正在获取监控快照"}

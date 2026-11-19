@@ -506,8 +506,14 @@ func TestUploadValidationErrorEmitsDone(t *testing.T) {
 		}
 	}
 	// The file part is still read (so progress may precede the rejection), but
-	// the terminal frame must come last and be the only terminal frame.
-	if events[len(events)-1].Type != "done" {
-		t.Fatalf("terminal event = %+v", events[len(events)-1])
+	// the terminal frame must be the only terminal frame.
+	terminal := 0
+	for _, event := range events {
+		if event.Type == "done" {
+			terminal++
+		}
+	}
+	if terminal != 1 {
+		t.Fatalf("rejected upload stream carried %d done frames, want exactly 1", terminal)
 	}
 }

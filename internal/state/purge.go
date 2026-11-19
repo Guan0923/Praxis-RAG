@@ -23,8 +23,8 @@ type KnowledgeBasePurgeReport struct {
 	Collections map[string]string
 	// DocumentsByNamespace counts the documents that were still visible,
 	// gathered before they are soft-deleted.
-	DocumentsByNamespace map[string]int
-	DocumentsDeleted     int
+	DocumentsByNamespace  map[string]int
+	DocumentsDeleted      int
 	ConfigurationsDeleted int
 }
 
@@ -134,6 +134,20 @@ func (r *KnowledgeBaseRepository) Purge(ctx context.Context, namespaces []string
 		return report, err
 	}
 
+	if err := queueDeletedIndexes(ctx, tx, "d.namespace IN ("+inClause+") AND d.del_flag = 0", arguments...); err != nil {
+		return report, err
+	}
+	for _, target := range []string{"qdrant_scan", "graph_workspace"} {
+		query := "INSERT INTO index_cleanup_jobs (job_id,target,namespace,document_id,collection,version,source_hash,status,due_at) " +
+			"SELECT UUID(),?,k.namespace,'',k.collection,'','','waiting',? FROM knowledge_bases k WHERE k.namespace IN (" + inClause + ")"
+		if target == "graph_workspace" {
+			query += " AND (JSON_UNQUOTE(JSON_EXTRACT(k.settings,'$.graph_enabled'))='true' OR EXISTS(SELECT 1 FROM lightrag_documents g WHERE g.namespace=k.namespace))"
+		}
+		query += " ON DUPLICATE KEY UPDATE due_at=VALUES(due_at),status='waiting',schedule_version=schedule_version+1"
+		if _, err := tx.ExecContext(ctx, query, append([]any{target, unixSeconds() + float64(ContentObjectRetentionSeconds)}, arguments...)...); err != nil {
+			return report, err
+		}
+	}
 	result, err := tx.ExecContext(ctx,
 		"UPDATE documents SET del_flag = 1 WHERE namespace IN ("+inClause+") AND del_flag = 0", arguments...)
 	if err != nil {
@@ -236,6 +250,10 @@ func (r *KnowledgeBaseRepository) purgeNamespaceRows(ctx context.Context, tx *sq
 		{"DELETE FROM mcp_catalogs WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM artifact_snapshots WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM document_heads WHERE namespace IN (" + inClause + ")", true},
+		{"DELETE FROM sag_extraction_jobs WHERE namespace IN (" + inClause + ")", true},
+		{"DELETE FROM sag_event_entities WHERE namespace IN (" + inClause + ")", true},
+		{"DELETE FROM sag_events WHERE namespace IN (" + inClause + ")", true},
+		{"DELETE FROM sag_entities WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM document_leases WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM kb_permissions WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM kb_invitations WHERE namespace IN (" + inClause + ")", true},

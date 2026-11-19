@@ -30,6 +30,7 @@ var expectedSchema = []struct {
 	{"artifact_snapshots", []string{"id", "namespace", "identity", "document_id", "version", "kind", "name", "mime_type", "content", "created_at", "expires_at"}},
 	{"document_tasks", []string{"artifact_id", "namespace", "name", "name_key", "content", "sha256", "idempotency_key", "configuration_version", "status", "stage", "attempts", "owner", "lease_until", "operation_id", "error", "created_at", "updated_at"}},
 	{"document_jobs", []string{"artifact_id", "namespace", "name", "name_key", "content", "size", "sha256", "configuration_version", "idempotency_key", "status", "stage", "attempts", "owner", "execution_id", "lease_until", "operation_id", "retry_at", "error", "created_at", "updated_at", "schedule_version"}},
+	{"reembed_jobs", []string{"job_id", "namespace", "active_namespace", "base_version", "base_collection", "target_settings", "staging_collection", "status", "error", "created_at", "updated_at"}},
 	{"search_tasks", []string{"result_id", "namespace", "arguments", "status", "stage", "attempts", "owner", "lease_until", "retry_at", "deadline", "created_at", "updated_at"}},
 	{"users", []string{"id", "username", "password_hash", "role", "enabled", "created_at", "updated_at", "last_login_at", "email", "email_verified", "age", "gender"}},
 	{"user_sessions", []string{"id", "user_id", "token_digest", "csrf_token", "expires_at", "created_at", "last_seen_at", "revoked"}},
@@ -74,6 +75,8 @@ var expectedSchema = []struct {
 	{"lightrag_documents", []string{"namespace", "document_id", "document_name", "config_fingerprint", "chunk_count", "status", "attempts", "last_error", "indexed_at", "updated_at"}},
 	// SAG event-entity index (retrieval mode sag): one event per chunk plus
 	// normalized entities and their associations.
+	{"index_cleanup_jobs", []string{"job_id", "target", "namespace", "document_id", "collection", "version", "source_hash", "status", "due_at", "schedule_version", "failures"}},
+	{"sag_extraction_jobs", []string{"namespace", "document_id", "version", "chunk_id", "ready_at", "lease_generation", "failures", "last_error"}},
 	{"sag_events", []string{"id", "namespace", "document_id", "chunk_id", "event", "version", "created_at"}},
 	{"sag_entities", []string{"id", "namespace", "normalized_key", "entity_key", "display_name", "mention_count", "created_at", "updated_at"}},
 	{"sag_event_entities", []string{"event_id", "entity_id", "namespace", "created_at"}},
@@ -95,6 +98,7 @@ var expectedPrimaryKeys = map[string][]string{
 	"artifact_snapshots":       {"id"},
 	"document_tasks":           {"artifact_id"},
 	"document_jobs":            {"artifact_id"},
+	"reembed_jobs":             {"job_id"},
 	"search_tasks":             {"result_id"},
 	"users":                    {"id"},
 	"user_sessions":            {"id"},
@@ -123,18 +127,22 @@ var expectedPrimaryKeys = map[string][]string{
 	"embedding_usage":          {"id"},
 	"billing_events":           {"id"},
 	"lightrag_documents":       {"namespace", "document_id"},
+	"index_cleanup_jobs":       {"job_id"},
+	"sag_extraction_jobs":      {"namespace", "document_id", "version", "chunk_id"},
 	"sag_events":               {"id"},
 	"sag_entities":             {"id"},
 	"sag_event_entities":       {"event_id", "entity_id"},
 }
 
 var expectedUniques = map[string][]string{
+	"index_cleanup_jobs":      {"uq_index_cleanup_target"},
 	"api_keys":                {"uq_api_keys_digest"},
 	"documents":               {"uq_documents_namespace_id"},
 	"upload_operations":       {"uq_upload_idempotency"},
 	"artifact_snapshots":      {"uq_artifact_identity"},
 	"document_tasks":          {"uq_document_task_idempotency"},
 	"document_jobs":           {"uq_document_job_idempotency"},
+	"reembed_jobs":            {"uq_reembed_active_namespace"},
 	"users":                   {"uq_users_username", "uq_users_email"},
 	"user_sessions":           {"uq_user_sessions_token_digest"},
 	"kb_permissions":          {"uq_kb_permissions_scope"},
@@ -155,16 +163,17 @@ var expectedUniques = map[string][]string{
 
 var expectedIndexes = map[string][]string{
 	"api_keys":                 {"ix_api_keys_owner"},
-	"knowledge_bases":          {"ix_knowledge_bases_collection"},
+	"knowledge_bases":          {"ix_knowledge_bases_collection", "ix_knowledge_bases_owner"},
 	"documents":                {"ix_documents_namespace_sha256"},
 	"blobs":                    {"ix_blobs_document", "ix_blobs_sha256"},
 	"upload_objects":           {"ix_upload_objects_content"},
 	"content_objects":          {"ix_content_objects_retired"},
-	"upload_operations":        {"ix_upload_unfinished"},
+	"upload_operations":        {"ix_upload_unfinished", "ix_upload_operations_document"},
 	"search_result_snapshots":  {"ix_search_result_expiry", "ix_search_result_namespace"},
 	"artifact_snapshots":       {"ix_artifact_expiry", "ix_artifact_namespace"},
 	"document_tasks":           {"ix_document_tasks_name", "ix_document_tasks_recovery"},
 	"document_jobs":            {"ix_document_job_name", "ix_document_job_recovery"},
+	"reembed_jobs":             {"ix_reembed_namespace_created"},
 	"search_tasks":             {"ix_search_tasks_deadline", "ix_search_tasks_recovery", "ix_search_tasks_namespace"},
 	"user_sessions":            {"ix_user_sessions_user_id"},
 	"kb_permissions":           {"ix_kb_permissions_grantee"},
@@ -185,6 +194,8 @@ var expectedIndexes = map[string][]string{
 	"embedding_usage":          {"ix_embedding_usage_user", "ix_embedding_usage_review"},
 	"billing_events":           {"ix_billing_events_order"},
 	"lightrag_documents":       {"ix_lightrag_documents_status"},
+	"index_cleanup_jobs":       {"ix_index_cleanup_due"},
+	"sag_extraction_jobs":      {"ix_sag_extraction_ready"},
 	"sag_events":               {"ix_sag_events_document", "ix_sag_events_version"},
 	"sag_entities":             {"ix_sag_entities_normalized"},
 	"sag_event_entities":       {"ix_sag_event_entities_entity", "ix_sag_event_entities_event"},
@@ -274,6 +285,8 @@ func TestMySQLSchemaCompilesWithLongColumns(t *testing.T) {
 		"`key` VARCHAR(512) COLLATE utf8mb4_bin NOT NULL",
 		"`del_flag` BOOL NOT NULL DEFAULT 0",
 		"CONSTRAINT `uq_documents_namespace_id` UNIQUE (`namespace`, `document_id`)",
+		"CREATE INDEX `ix_knowledge_bases_owner` ON `knowledge_bases` (`owner_user_id`)",
+		"CREATE INDEX `ix_upload_operations_document` ON `upload_operations` (`namespace`, `document_id`)",
 	} {
 		if !strings.Contains(ddl, want) {
 			t.Fatalf("MySQL DDL does not contain %q", want)
@@ -286,6 +299,42 @@ func TestBucketConstants(t *testing.T) {
 		WordAssetBucket != "word-assets" || HTMLAssetBucket != "html-assets" {
 		t.Fatalf("unexpected bucket constants: %q %q %q %q",
 			SourceBucket, PDFAssetBucket, WordAssetBucket, HTMLAssetBucket)
+	}
+}
+
+func TestMySQLMigratesKnowledgeBaseAndUploadIndexes(t *testing.T) {
+	mysqlTestURL(t)
+	stores := openMySQLTestStores(t)
+	ctx := context.Background()
+	indexes := []struct {
+		table   string
+		name    string
+		columns string
+	}{
+		{"knowledge_bases", "ix_knowledge_bases_owner", "owner_user_id"},
+		{"upload_operations", "ix_upload_operations_document", "namespace,document_id"},
+	}
+	for _, index := range indexes {
+		statement := "DROP INDEX " + quoteIdentifier(index.name) + " ON " + quoteIdentifier(index.table)
+		if _, err := stores.DB.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("drop index %s: %v", index.name, err)
+		}
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := stores.ensureSchema(ctx); err != nil {
+			t.Fatalf("ensureSchema() attempt %d: %v", attempt+1, err)
+		}
+		for _, index := range indexes {
+			const query = "SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index) " +
+				"FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?"
+			var columns string
+			if err := stores.DB.QueryRowContext(ctx, query, index.table, index.name).Scan(&columns); err != nil {
+				t.Fatalf("read columns for %s: %v", index.name, err)
+			}
+			if columns != index.columns {
+				t.Errorf("%s columns = %s, want %s", index.name, columns, index.columns)
+			}
+		}
 	}
 }
 

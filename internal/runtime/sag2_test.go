@@ -31,7 +31,7 @@ func TestSag2DocumentProjection(t *testing.T) {
 		"record_type": "chunk",
 		"chunk_id":    "doc-1:0",
 		"document_id": "doc-1",
-		"text":        "E03 表示传感器超时。",
+		"text":        "索引包含文档片段。",
 		"title":        "维护手册",
 		"source":       "manual.md",
 		"metadata":    map[string]any{"pages": []any{float64(3)}},
@@ -44,7 +44,7 @@ func TestSag2DocumentProjection(t *testing.T) {
 		document.Title != "维护手册" || document.Source != "manual.md" {
 		t.Fatalf("document = %+v", document)
 	}
-	if document.Text != "E03 表示传感器超时。" {
+	if document.Text != "索引包含文档片段。" {
 		t.Fatalf("text = %q", document.Text)
 	}
 

@@ -66,6 +66,20 @@ func ValidateDocumentNotification(payload any) (DocumentNotification, error) {
 	}, nil
 }
 
+// DecodeReembedNotification extracts the locating columns from the re-embedding CDC topic.
+func DecodeReembedNotification(body []byte) (namespace, jobID string, err error) {
+	fields, err := notificationFields(body, 0)
+	if err != nil {
+		return "", "", err
+	}
+	namespace, err = notificationNamespace(fields)
+	if err != nil {
+		return "", "", err
+	}
+	jobID, err = canonicalNotificationID(fields, "job_id")
+	return namespace, jobID, err
+}
+
 // DocumentJobEnvelope builds the content-free schema-4 notification of one job.
 func DocumentJobEnvelope(job *DocumentJob) (DocumentNotification, error) {
 	if job == nil {
@@ -229,4 +243,24 @@ func integerValue(value any) (int64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// DecodeCleanupNotification skips the initial retention record (generation zero).
+func DecodeCleanupNotification(body []byte) (IndexCleanup, error) {
+	fields, err := notificationFields(body, 0)
+	if err != nil {
+		return IndexCleanup{}, err
+	}
+	var j IndexCleanup
+	if j.Namespace, err = notificationNamespace(fields); err != nil {
+		return j, err
+	}
+	if j.ID, err = canonicalNotificationID(fields, "job_id"); err != nil {
+		return j, err
+	}
+	if n, ok := integerValue(fields["schedule_version"]); ok && n == 0 {
+		return j, ErrIgnorableCDCChange
+	}
+	j.Generation, err = notificationScheduleVersion(fields)
+	return j, err
 }
