@@ -1,7 +1,7 @@
 # Praxis-RAG Kubernetes 部署（Kustomize，第一版）
 
-本目录只负责**应用层**：把 Praxis-RAG 的 Go 镜像（API/MCP/Console + 三个
-worker）和可选的 PDF 高保真微服务部署到已有集群里。MySQL、Qdrant、Kafka、
+本目录负责将 Praxis-RAG 的 API/MCP/Console、worker 和可选的 PDF 高保真微服务
+部署到已有集群。MySQL、Qdrant、Kafka、
 分布式 Kafka Connect（装好匹配版本的 Debezium MySQL Connector）以及可选 Redis
 都由使用方提供，**不在**本仓库的部署范围内。
 
@@ -24,7 +24,7 @@ worker）和可选的 PDF 高保真微服务部署到已有集群里。MySQL、Q
 ```
 deploy/k8s/
 ├── common/                     # ConfigMap（普通参数）——先于一切 apply
-├── base/                       # 公共工作负载：API、文档 worker、文档死信 worker
+├── base/                       # API、文档 worker、SAG worker、文档死信 worker
 │                               #   + rbac-monitor-ops.yaml（监控页 Kubernetes 标签与扩缩容的 SA/ClusterRole/ClusterRoleBinding）
 ├── overlays/
 │   ├── go/                     # 完整安装入口：Go 进程内 PDF 解析
@@ -368,8 +368,11 @@ kubectl apply -k deploy/k8s/overlays/go
 
 kubectl -n praxis-rag rollout status deploy/rag-service --timeout=180s
 kubectl -n praxis-rag rollout status deploy/rag-document-worker --timeout=180s
+kubectl -n praxis-rag rollout status deploy/rag-sag-worker --timeout=180s
 kubectl -n praxis-rag get pods -o wide
 ```
+
+四个 overlay 都部署一个 `rag-sag-worker` 副本。启用 SAG 抽取前，在 Console「模型配置」添加 `kind=extraction` 模型。升级时用包含 `rag-sag-worker` 的 Go 镜像先运行 §6.2 的 `state-migrate` Job，创建 `sag_extraction_jobs`，再更新应用。启用 Kafka ACL 的环境需允许消费组 `praxis_sag_extraction_workers` 读取 `RAG_CACHE_TOPIC`。可用 `kubectl -n praxis-rag logs deploy/rag-sag-worker` 查看订阅与抽取日志。
 
 切换入口（go ↔ vision）用同一条 `apply` 覆盖即可；从 vision 切回 go 时
 `pdf-parser` 不会被自动删除，需要显式清理：
@@ -779,6 +782,7 @@ worker 的「活着」证据（三选一即可）：`runtime_heartbeats` 有新�
 | --- | --- | --- | --- |
 | rag-service | 200m / 512Mi | 1 CPU / 1Gi | 同步检索 + Console 静态资源 + 监控聚合；检索批量大小与 rerank 候选数决定峰值 |
 | rag-document-worker | 250m / 512Mi | 2 CPU / 2Gi | 一个 PDF 解析在内存里要放下页面位图与切块文本；`RAG_DOCUMENT_WORKER_CONCURRENCY` 每加 1 大致再要一份 |
+| rag-sag-worker | 50m / 128Mi | 500m / 512Mi | 每个进程最多并行抽取 4 个片段，模型在远端执行 |
 | pdf-parser | 500m / 1Gi | 2 CPU / 2Gi | PyMuPDF 渲染单页约几十 MB 峰值；`WORKERS × CONCURRENCY` 决定并发 |
 | 死信 / 缓存 worker | 50~100m / 128~256Mi | 300~500m / 256~512Mi | 只做状态/水位更新 |
 

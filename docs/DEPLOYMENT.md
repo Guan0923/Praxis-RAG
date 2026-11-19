@@ -827,3 +827,11 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 - Console「系统监控 → 概览」：读模型缓存启用时 `Redis` 依赖行探测展示缓存；`RAG_REDIS_ENABLED=false` 时，该行改报**文档锁后端**的连接状态（只显示连接是否正常，不暴露键与 token）。
 - `GET /v1/admin/upload-leases`：`expires_at`/`expired` 用锁后端实时 TTL 计算（长任务不再被误判过期），Redis 不可用时回退 MySQL 登记值；接口不返回原始 owner token，`holder_id` 是短哈希。
 - 失败语义：Redis 冲突仍是 409 冲突（同一份文档被其他 worker 锁定）；Redis 不可用返回可重试错误（异步受理 5xx），单实例不会回退 MySQL 锁；提交成功但释放锁失败时不重复执行已提交操作，最多等到租约 TTL 过期。
+
+## SAG 抽取 worker
+
+Compose 的 `app` profile 和 Windows 的 `scripts/start-stack.ps1` 会启动 `rag-sag-worker`。分开部署时，使用与文档 worker 相同的 MySQL、状态加密密钥、Qdrant 和 Kafka 配置，单独运行 `rag-sag-worker`。关闭自动建表的环境先用有 DDL 权限的账号执行 `rag-state-migrate --apply`，创建 `sag_extraction_jobs`。
+
+Kubernetes 的四个 Kustomize 入口均包含 `rag-sag-worker` Deployment。按 Kubernetes 部署手册先用新镜像运行 schema 迁移 Job，再更新应用工作负载。[Kubernetes 部署手册](../deploy/k8s/README.md#64-启动应用)
+
+worker 用独立消费组 `praxis_sag_extraction_workers` 读现有 `RAG_CACHE_TOPIC` 中的文档发布事件。MySQL 保存任务和重试状态，worker 每 15 秒检查到期工作，启动时也立即检查。每篇文档最多入队 512 个片段，每个 worker 进程最多并行抽取 4 个。片段调用失败最多记录 3 次失败，前两次分别延迟 30 秒和 60 秒再试。最终失败时 `sag_extraction_jobs.last_error` 可用于定位，其他片段继续处理。替换或删除文档时会清理旧版本任务。此前发布的无 SAG 事件文档可用 `rag-sag-backfill` 补建。

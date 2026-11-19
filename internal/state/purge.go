@@ -23,8 +23,8 @@ type KnowledgeBasePurgeReport struct {
 	Collections map[string]string
 	// DocumentsByNamespace counts the documents that were still visible,
 	// gathered before they are soft-deleted.
-	DocumentsByNamespace map[string]int
-	DocumentsDeleted     int
+	DocumentsByNamespace  map[string]int
+	DocumentsDeleted      int
 	ConfigurationsDeleted int
 }
 
@@ -236,6 +236,10 @@ func (r *KnowledgeBaseRepository) purgeNamespaceRows(ctx context.Context, tx *sq
 		{"DELETE FROM mcp_catalogs WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM artifact_snapshots WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM document_heads WHERE namespace IN (" + inClause + ")", true},
+		{"DELETE FROM sag_extraction_jobs WHERE namespace IN (" + inClause + ")", true},
+		{"DELETE FROM sag_event_entities WHERE namespace IN (" + inClause + ")", true},
+		{"DELETE FROM sag_events WHERE namespace IN (" + inClause + ")", true},
+		{"DELETE FROM sag_entities WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM document_leases WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM kb_permissions WHERE namespace IN (" + inClause + ")", true},
 		{"DELETE FROM kb_invitations WHERE namespace IN (" + inClause + ")", true},

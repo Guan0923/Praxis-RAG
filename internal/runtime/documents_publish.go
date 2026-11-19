@@ -114,6 +114,7 @@ func (s *Service) publishDocument(
 	artifactBucket string,
 	artifactDir string,
 	task *state.DocumentJobTask,
+	chunks []qdrant.Chunk,
 ) error {
 	transaction, err := s.stores.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -149,6 +150,10 @@ func (s *Service) publishDocument(
 		}
 	}
 	if _, err := s.stores.Uploads.Commit(ctx, operation, metadata, transaction); err != nil {
+		return err
+	}
+	if err := s.stores.SagIndex.QueueExtraction(ctx, transaction, operation.Namespace, documentID,
+		operation.ID, sagExtractionChunkIDs(chunks)); err != nil {
 		return err
 	}
 	if err := transaction.Commit(); err != nil {

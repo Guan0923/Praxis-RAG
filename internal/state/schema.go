@@ -1155,6 +1155,20 @@ var schemaTables = []*SchemaTable{
 	// truth for this data; Qdrant only holds the semantic representations of the
 	// same rows (record_type sag_event / sag_entity points) for seed recall.
 	{
+		Name: "sag_extraction_jobs",
+		Columns: []SchemaColumn{
+			identifier("namespace", 64).PK(),
+			identifier("document_id", 64).PK(),
+			identifier("version", 32).PK(),
+			identifier("chunk_id", 36).PK(),
+			double("ready_at").Null(),
+			bigint("lease_generation").Default("0"),
+			integer("failures").Default("0"),
+			varchar("last_error", 64).Null(),
+		},
+		Indexes: []SchemaIndex{index("ix_sag_extraction_ready", "ready_at")},
+	},
+	{
 		Name: "sag_events",
 		Columns: []SchemaColumn{
 			identifier("id", 36).PK(),
