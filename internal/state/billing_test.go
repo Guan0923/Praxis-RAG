@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -242,6 +243,33 @@ func TestBillingPendingOrderReuseAndConflict(t *testing.T) {
 	}); err == nil {
 		t.Fatal("CreateOrder(invalid plan) did not fail")
 	}
+}
+
+// TestBillingOrderMutationsRejectUnknownOrder pins the operator-error row: a
+// mistyped or repeated order id makes every mutating transition return the
+// same lookup error instead of failing silently or creating state.
+func TestBillingOrderMutationsRejectUnknownOrder(t *testing.T) {
+	stores := newMembershipTestStores(t)
+	ctx := context.Background()
+	now := time.Date(2027, 3, 1, 2, 0, 0, 0, time.UTC)
+
+	if _, err := stores.Billing.CloseOrder(ctx, "PR-does-not-exist", now); !isBillingLookupError(err) {
+		t.Fatalf("CloseOrder(unknown) = %v", err)
+	}
+	if _, err := stores.Billing.MarkManual(ctx, "PR-does-not-exist", "operator note", now); !isBillingLookupError(err) {
+		t.Fatalf("MarkManual(unknown) = %v", err)
+	}
+	if _, _, err := stores.Billing.ConfirmPayment(ctx, "PR-does-not-exist", "2027030122001400000001", 1_990, now); !isBillingLookupError(err) {
+		t.Fatalf("ConfirmPayment(unknown) = %v", err)
+	}
+	if _, err := stores.Billing.BeginRefund(ctx, "PR-does-not-exist", "2027030122001400000002", 1_990, "wrong order", now); !isBillingLookupError(err) {
+		t.Fatalf("BeginRefund(unknown) = %v", err)
+	}
+}
+
+func isBillingLookupError(err error) bool {
+	var lookup *LookupError
+	return errors.As(err, &lookup) && lookup.Message == "订单不存在"
 }
 
 func TestBillingMonthlyAnchorClamp(t *testing.T) {

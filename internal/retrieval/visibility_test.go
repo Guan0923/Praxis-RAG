@@ -51,14 +51,17 @@ func TestVisibilityFiltersApplyBeforeRecall(t *testing.T) {
 		{DocumentID: "doc-a", ChunkID: "c1", Title: "A", Source: "a.md", Text: "alpha"},
 		{DocumentID: "doc-b", ChunkID: "c2", Title: "B", Source: "b.md", Text: "gamma"},
 	})
-	// deny "doc-b" by allowing only "doc-a"
+	reranker := &countingReranker{}
+	// deny "doc-b" by allowing only "doc-a"; the query term "alpha" only
+	// matches the allowed chunk, so recall stays non-empty and the assertions
+	// below actually observe candidates.
 	restrictor := NewOrchestrator(
 		map[contracts.RetrievalMode]Retriever{contracts.RetrievalEmbedding: retriever},
-		map[contracts.RerankMode]Reranker{contracts.RerankCrossEncoder: &countingReranker{}},
+		map[contracts.RerankMode]Reranker{contracts.RerankCrossEncoder: reranker},
 		"mock-v1", nil, nil, nil,
 	)
 	request := contracts.SearchRequest{
-		Query: "Mock", Retrieval: contracts.RetrievalEmbedding,
+		Query: "alpha", Retrieval: contracts.RetrievalEmbedding,
 		Rerank: contracts.RerankCrossEncoder, CandidateK: 10, TopK: 10,
 		DocumentIDs: []string{"doc-a"},
 	}
@@ -66,14 +69,18 @@ func TestVisibilityFiltersApplyBeforeRecall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restricted search: %v", err)
 	}
-	items, _ := payload["results"].([]any)
-	for _, raw := range items {
-		item, _ := raw.(map[string]any)
+	items := payload["results"].([]map[string]any)
+	if len(items) == 0 {
+		t.Fatal("the allowed document must still be recalled and returned")
+	}
+	for _, item := range items {
 		if id, _ := item["document_id"].(string); id != "doc-a" {
 			t.Fatalf("non-allowed document leaked into results: %#v", item)
 		}
 	}
-	reranker := restrictor.rerankers[contracts.RerankCrossEncoder].(*countingReranker)
+	if len(reranker.seen) == 0 {
+		t.Fatal("the reranker must receive the allowed candidates for this check to bite")
+	}
 	for _, candidate := range reranker.seen {
 		if candidate.DocumentID != "doc-a" {
 			t.Fatalf("denied document reached the reranker: %+v", candidate)

@@ -579,10 +579,11 @@ func TestUploadBloomSettingsValidation(t *testing.T) {
 	}
 }
 
-// TestUploadReadViewBloomGate wires the gate into the real read view: a
-// definitely-absent ID must not execute the upload-status SQL (the loader's
-// MySQL query counter stays untouched), while everything else keeps the
-// original behavior.
+// TestUploadBloomReadViewDetailQueryNoSQL covers the read-view side of the
+// bloom gate: a definitely-absent ID must not execute the upload-status SQL
+// (the loader's MySQL query counter stays untouched), while everything else
+// keeps the original behavior.
+//
 // TestUploadBloomBeginRegistersOnBothLockPaths drives the real journal Begin
 // with the bloom filter attached: a created operation must be registered
 // before its transaction commits, stay queryable through the read view, and a

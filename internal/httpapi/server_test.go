@@ -674,7 +674,7 @@ func newStateBackedServer(t *testing.T) *Server {
 	)
 }
 
-func TestAPIKeyLifecycleAgainstSQLiteState(t *testing.T) {
+func TestAPIKeyLifecycleAgainstMySQLState(t *testing.T) {
 	handler := newStateBackedServer(t).Handler()
 
 	created := performRequest(handler, testRequest{

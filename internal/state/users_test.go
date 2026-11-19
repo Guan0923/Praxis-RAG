@@ -82,9 +82,6 @@ func TestUserRepositoryReadAndUpdate(t *testing.T) {
 	if err != nil || byName == nil || hash != "hash-a" || byName.ID != created.ID {
 		t.Fatalf("ByUsername() = %+v, %q, %v", byName, hash, err)
 	}
-	if _, _, err := stores.Users.ByUsername(ctx, "missing"); err != nil {
-		t.Fatalf("ByUsername(missing) error = %v", err)
-	}
 	missing, _, err := stores.Users.ByUsername(ctx, "missing")
 	if err != nil || missing != nil {
 		t.Fatalf("ByUsername(missing) = %+v, %v", missing, err)
