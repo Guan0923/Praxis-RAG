@@ -186,6 +186,78 @@ func (c *Client) DeleteDocument(ctx context.Context, namespace, documentID strin
 	return c.do(ctx, http.MethodDelete, workspace+"/documents/"+url.PathEscape(documentID), nil, nil, true)
 }
 
+type InventoryDocument struct {
+	ID      string `json:"document_id"`
+	Version string `json:"publication_version"`
+	Hash    string `json:"source_hash"`
+}
+
+// Inventory lists cleanup locators without returning document content.
+func (c *Client) Inventory(ctx context.Context, namespace, after string) ([]InventoryDocument, error) {
+	workspace, err := workspacePath(namespace)
+	if err != nil {
+		return nil, err
+	}
+	var page struct {
+		Documents []InventoryDocument
+	}
+	err = c.do(ctx, http.MethodGet, workspace+"/inventory?after="+url.QueryEscape(after), nil, &page, true)
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range page.Documents {
+		if d.ID <= after {
+			return nil, fmt.Errorf("invalid graph inventory cursor")
+		}
+		after = d.ID
+	}
+	return page.Documents, nil
+}
+
+func cleanupResource(workspace, id string) string {
+	if id == "" {
+		return workspace
+	}
+	return workspace + "/documents/" + url.PathEscape(id)
+}
+
+func (c *Client) DocumentRevision(ctx context.Context, ns, id string) (string, error) {
+	workspace, err := workspacePath(ns)
+	if err != nil {
+		return "", err
+	}
+	var result struct{ Revision *string }
+	err = c.do(ctx, http.MethodGet, cleanupResource(workspace, id)+"/revision", nil, &result, true)
+	if err != nil {
+		return "", err
+	}
+	if result.Revision == nil {
+		return "", fmt.Errorf("missing graph revision")
+	}
+	return *result.Revision, nil
+}
+
+func (c *Client) PruneRevision(ctx context.Context, ns, id, revision, publication string, allowLegacy bool, binding *WorkspaceConfig) error {
+	workspace, err := workspacePath(ns)
+	if err != nil {
+		return err
+	}
+	var result struct{ Outcome string }
+	params := url.Values{"revision": {revision}}
+	if id != "" {
+		params.Set("publication", publication)
+		params.Set("allow_legacy", fmt.Sprint(allowLegacy))
+	}
+	err = c.do(ctx, http.MethodPost, cleanupResource(workspace, id)+"/prune?"+params.Encode(), binding, &result, true)
+	if err != nil {
+		return err
+	}
+	if result.Outcome != "absent" && result.Outcome != "deleted" && result.Outcome != "superseded" {
+		return fmt.Errorf("graph document changed during cleanup")
+	}
+	return nil
+}
+
 // Query runs one graph retrieval (POST /v1/workspaces/{namespace}/query).
 // namespace selects the workspace and request carries the question, the
 // document restriction and the top-k bound; the reply is graph evidence, never

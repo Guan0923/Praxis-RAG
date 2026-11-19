@@ -39,6 +39,7 @@ TAG = "1.0.0"
 # Secret keys the manifests may reference (see README §4.1).
 ALLOWED_SECRET_KEYS = {
     "RAG_SERVICE_TOKEN",
+    "RAG_REDIS_LOCK_URL", "RAG_LIGHTRAG_SERVICE_TOKEN", "RAG_KAFKA_SASL_PASSWORD",
     "RAG_MYSQL_PASSWORD",
     "RAG_STATE_ENCRYPTION_KEY",
     "RAG_MYSQL_DEBEZIUM_PASSWORD",
@@ -385,25 +386,25 @@ def main() -> int:
 
     check_overlay(
         "overlays/go",
-        {API, DOC_WORKER, SAG_WORKER, "rag-dead-letter-document"},
+        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document"},
         engine="go",
         cache=False,
     )
     check_overlay(
         "overlays/vision",
-        {API, DOC_WORKER, SAG_WORKER, "rag-dead-letter-document", PDF},
+        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document", PDF},
         engine="vision",
         cache=False,
     )
     check_overlay(
         "overlays/go-cache",
-        {API, DOC_WORKER, SAG_WORKER, "rag-dead-letter-document", CACHE_WORKER, "rag-dead-letter-cache"},
+        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document", CACHE_WORKER, "rag-dead-letter-cache"},
         engine="go",
         cache=True,
     )
     check_overlay(
         "overlays/vision-cache",
-        {API, DOC_WORKER, SAG_WORKER, "rag-dead-letter-document", PDF, CACHE_WORKER, "rag-dead-letter-cache"},
+        {API, DOC_WORKER, SAG_WORKER, "rag-delete-worker", "rag-dead-letter-document", PDF, CACHE_WORKER, "rag-dead-letter-cache"},
         engine="vision",
         cache=True,
     )

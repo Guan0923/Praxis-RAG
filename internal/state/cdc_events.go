@@ -244,3 +244,23 @@ func integerValue(value any) (int64, bool) {
 		return 0, false
 	}
 }
+
+// DecodeCleanupNotification skips the initial retention record (generation zero).
+func DecodeCleanupNotification(body []byte) (IndexCleanup, error) {
+	fields, err := notificationFields(body, 0)
+	if err != nil {
+		return IndexCleanup{}, err
+	}
+	var j IndexCleanup
+	if j.Namespace, err = notificationNamespace(fields); err != nil {
+		return j, err
+	}
+	if j.ID, err = canonicalNotificationID(fields, "job_id"); err != nil {
+		return j, err
+	}
+	if n, ok := integerValue(fields["schedule_version"]); ok && n == 0 {
+		return j, ErrIgnorableCDCChange
+	}
+	j.Generation, err = notificationScheduleVersion(fields)
+	return j, err
+}

@@ -10,6 +10,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 	"github.com/Guan0923/Praxis-RAG/internal/contracts"
 	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
+	"github.com/Guan0923/Praxis-RAG/internal/lightrag"
 	"github.com/Guan0923/Praxis-RAG/internal/modelapi"
 	"github.com/Guan0923/Praxis-RAG/internal/qdrant"
 	"github.com/Guan0923/Praxis-RAG/internal/retrieval"
@@ -136,6 +137,24 @@ func (e *SearchEngine) buildTenant(namespace string, settings map[string]any) (*
 	if e.lightrag != nil {
 		graph = retrieval.NewGraphRetriever(e.lightrag, namespace, retrieval.GraphOptions{
 			IncludeEntities: true,
+			VisibleContexts: func(ctx context.Context, items []lightrag.Context) ([]lightrag.Context, error) {
+				ids := make([]string, 0, len(items))
+				for _, item := range items {
+					ids = append(ids, item.DocumentID)
+				}
+				heads, legacy, err := e.stores.LightRAGDocuments.VisibleHeads(ctx, namespace, ids)
+				if err != nil {
+					return nil, err
+				}
+				visible := items[:0]
+				for _, item := range items {
+					head, live := heads[item.DocumentID]
+					if live && ((item.PublicationVersion != "" && item.PublicationVersion == head) || (item.PublicationVersion == "" && legacy[item.DocumentID])) {
+						visible = append(visible, item)
+					}
+				}
+				return visible, nil
+			},
 		})
 	}
 	// sag consumes the MySQL event-entity index written by the extraction

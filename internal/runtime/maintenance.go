@@ -200,6 +200,12 @@ func (s *Service) maintenancePass(ctx context.Context) {
 	if _, err := s.stores.PurgeUnreferencedContent(ctx, state.ContentObjectRetentionSeconds, 100); err != nil {
 		logBackgroundFailure(ctx, "content purge", err)
 	}
+	if err := s.stores.PurgeUnusedSagEntities(ctx); err != nil {
+		logBackgroundFailure(ctx, "SAG entity cleanup", err)
+	}
+	if err := s.stores.ScheduleIndexCleanup(ctx); err != nil {
+		logBackgroundFailure(ctx, "index cleanup scheduling", err)
+	}
 	if s.stores.Membership != nil {
 		// Unknown embedding outcomes stay reserved for 24 hours. After that the
 		// platform absorbs the uncertainty and releases the unconsumed hold.

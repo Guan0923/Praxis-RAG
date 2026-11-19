@@ -1,7 +1,7 @@
 // Package runtime: the knowledge-graph mirror.
 //
 // mirrorDocumentGraph copies one published document's chunks into the LightRAG
-// sidecar and removeDocumentGraph deletes it from the graph again. The graph is
+// sidecar. The index cleanup worker retires its graph copy. The graph is
 // a derived index, not a source of truth: a mirror failure never fails the
 // upload, it only leaves a failed ledger row an operator can retry from
 // lightrag_documents.
@@ -14,6 +14,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -185,7 +186,7 @@ func (m *graphMirror) workspaceConfig(namespace string) lightrag.WorkspaceConfig
 // the document.
 func (s *Service) scheduleGraphMirror(
 	ctx context.Context,
-	namespace, name, documentID string,
+	namespace, name, documentID, version, sourceHash string,
 	mirror *graphMirror,
 	chunks []chunking.Chunk,
 ) {
@@ -200,7 +201,7 @@ func (s *Service) scheduleGraphMirror(
 	go func() {
 		runContext, cancel := context.WithTimeout(detached, graphMirrorBudget)
 		defer cancel()
-		s.mirrorDocumentGraph(runContext, namespace, name, documentID, mirror, payload)
+		s.mirrorDocumentGraph(runContext, namespace, name, documentID, version, sourceHash, mirror, payload)
 	}()
 }
 
@@ -209,7 +210,7 @@ func (s *Service) scheduleGraphMirror(
 // never returned to the upload path.
 func (s *Service) mirrorDocumentGraph(
 	ctx context.Context,
-	namespace, name, documentID string,
+	namespace, name, documentID, version, sourceHash string,
 	mirror *graphMirror,
 	chunks []lightrag.Chunk,
 ) {
@@ -217,11 +218,35 @@ func (s *Service) mirrorDocumentGraph(
 		s.recordGraphFailure(ctx, namespace, documentID, err)
 		return
 	}
-	result, err := mirror.client.IngestChunks(ctx, namespace, lightrag.IngestRequest{
-		DocumentID:   documentID,
-		DocumentName: name,
-		Chunks:       chunks,
-	})
+	// Read the sidecar generation first, then the publication head. If
+	// another mirror or prune wins the race, repeat both reads.
+	var result *lightrag.IngestResult
+	var err error
+	for ctx.Err() == nil {
+		var revision string
+		revision, err = mirror.client.DocumentRevision(ctx, namespace, documentID)
+		if err != nil {
+			break
+		}
+		var versions map[string]string
+		versions, err = s.stores.Documents.VisibleVersions(ctx, namespace)
+		if err != nil {
+			break
+		}
+		if versions[documentID] != version {
+			return
+		}
+		result, err = mirror.client.IngestChunks(ctx, namespace, lightrag.IngestRequest{
+			DocumentID: documentID, DocumentName: name, Chunks: chunks, PublicationVersion: version, SourceHash: sourceHash, ExpectedRevision: &revision,
+		})
+		var changed *lightrag.Error
+		if !errors.As(err, &changed) || changed.Status != 409 {
+			break
+		}
+	}
+	if ctx.Err() != nil {
+		return
+	}
 	if err != nil {
 		s.recordGraphFailure(ctx, namespace, documentID, err)
 		return
@@ -259,30 +284,6 @@ func (s *Service) recordGraphFailure(ctx context.Context, namespace, documentID 
 	if writeErr := s.stores.LightRAGDocuments.MarkFailed(ctx, namespace, documentID, message); writeErr != nil {
 		logging.FromContext(ctx).Warn("Knowledge-graph failure ledger write failed",
 			append([]any{"namespace", namespace}, logging.ErrorAttrs(writeErr)...)...)
-	}
-}
-
-// removeDocumentGraph deletes one document from the graph and the ledger. It is
-// best effort: the MySQL deletion already committed, so a sidecar outage must
-// not turn a successful delete into an error.
-func (s *Service) removeDocumentGraph(ctx context.Context, namespace, documentID string) {
-	client, err := s.graphClient()
-	if err != nil || client == nil {
-		return
-	}
-	runContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.config.LightRAGServiceTimeout)
-	defer cancel()
-	if err := client.DeleteDocument(runContext, namespace, documentID); err != nil {
-		logging.FromContext(runContext).Warn("Knowledge-graph document removal failed",
-			append([]any{"namespace", namespace, "document_id", documentID},
-				logging.ErrorAttrs(err)...)...)
-		return
-	}
-	if s.stores != nil && s.stores.LightRAGDocuments != nil {
-		if err := s.stores.LightRAGDocuments.Delete(runContext, namespace, documentID); err != nil {
-			logging.FromContext(runContext).Warn("Knowledge-graph ledger delete failed",
-				append([]any{"namespace", namespace}, logging.ErrorAttrs(err)...)...)
-		}
 	}
 }
 

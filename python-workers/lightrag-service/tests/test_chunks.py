@@ -131,3 +131,46 @@ def test_delete_rejects_invalid_path_document_id(client):
     response = client.delete("/v1/workspaces/legal/documents/bad%20id")
     assert response.status_code == 400
     assert "detail" in response.json()
+
+
+def test_deferred_prune_is_fenced_by_registration(client):
+    register_workspace(client)
+    ingest_document(client)
+    path = "/v1/workspaces/legal/documents/doc-1"
+    old = client.get(path + "/revision").json()["revision"]
+    ingest_document(client)
+    page = client.get("/v1/workspaces/legal/inventory").json()["documents"]
+    assert [row["document_id"] for row in page] == ["doc-1"]
+    current = page[0]["revision"]
+    assert current != old
+    assert client.post(path + "/prune", params={"revision": old}).json()["outcome"] == "changed"
+    assert client.post(path + "/prune", params={"revision": current}).json()["outcome"] == "deleted"
+    assert client.get("/v1/workspaces/legal/inventory").json()["documents"] == []
+
+
+def test_old_mirror_and_workspace_prune_reject_new_registration(client):
+    register_workspace(client)
+    path = "/v1/workspaces/legal"
+    first = client.get(path + "/revision").json()["revision"]
+    payload = chunks_payload()
+    payload["expected_revision"] = ""
+    assert client.post(path + "/chunks", json=payload).status_code == 200
+    assert client.post(path + "/chunks", json=payload).status_code == 409
+    assert client.post(path + "/prune", params={"revision": first}).json()["outcome"] == "changed"
+    current = client.get(path + "/revision").json()["revision"]
+    assert client.post(path + "/prune", params={"revision": current}).json()["outcome"] == "deleted"
+
+
+def test_cleanup_checks_publication_even_with_current_registration(client):
+    register_workspace(client)
+    path = "/v1/workspaces/legal"
+    body = chunks_payload()
+    body["publication_version"] = "second"
+    body["source_hash"] = "a" * 64
+    assert client.post(path + "/chunks", json=body).status_code == 200
+    doc = client.get(path + "/inventory").json()["documents"][0]
+    assert (doc["publication_version"], doc["source_hash"]) == ("second", "a" * 64)
+    response = client.post(path + "/documents/doc-1/prune",
+                           params={"revision": doc["revision"], "publication": "first"})
+    assert response.json()["outcome"] == "superseded"
+    assert client.post(path + "/query", json=query_payload()).json()["contexts"][0]["publication_version"] == "second"

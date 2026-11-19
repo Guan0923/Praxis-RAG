@@ -101,6 +101,9 @@ type Chunk struct {
 
 // IngestRequest is the POST /v1/workspaces/{namespace}/chunks body.
 type IngestRequest struct {
+	SourceHash         string  `json:"source_hash,omitempty"`
+	PublicationVersion string  `json:"publication_version,omitempty"`
+	ExpectedRevision   *string `json:"expected_revision,omitempty"`
 	// DocumentID is the artifact-backed document identifier.
 	DocumentID string `json:"document_id"`
 	// DocumentName is the display name used in sidecar logs.
@@ -162,6 +165,7 @@ type Relation struct {
 // Context is one retrieved evidence context: a text chunk, its relevance score
 // and the graph elements extracted from it.
 type Context struct {
+	PublicationVersion string `json:"publication_version,omitempty"`
 	// ChunkID is the cited chunk identifier.
 	ChunkID string `json:"chunk_id"`
 	// DocumentID is the cited document identifier.

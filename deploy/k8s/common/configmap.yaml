@@ -50,6 +50,8 @@ data:
 
   # --- Kafka：两个业务 topic 与两个死信 topic --------------------------
   RAG_KAFKA_BOOTSTRAP_SERVERS: kafka.infra.svc.cluster.local:9092
+  RAG_DELETE_TOPIC: praxis_index_cleanup
+  RAG_DELETE_GROUP: praxis_index_cleanup_workers
   RAG_KAFKA_CLIENT_ID: praxis-rag
   RAG_DOCUMENT_TOPIC: praxis_document_ingest
   RAG_DOCUMENT_GROUP: praxis_document_ingest_workers

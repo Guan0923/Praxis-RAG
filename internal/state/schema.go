@@ -1181,6 +1181,18 @@ var schemaTables = []*SchemaTable{
 			index("ix_lightrag_documents_status", "status", "updated_at"),
 		},
 	},
+	{
+		Name: "index_cleanup_jobs",
+		Columns: []SchemaColumn{
+			identifier("job_id", 36).PK(), identifier("target", 16),
+			identifier("namespace", 64), identifier("document_id", 64),
+			identifier("collection", 128), identifier("version", 64), identifier("source_hash", 64),
+			identifier("status", 16), double("due_at"), bigint("schedule_version").Default("0"),
+			integer("failures").Default("0"),
+		},
+		Uniques: []SchemaUnique{unique("uq_index_cleanup_target", "namespace", "document_id", "collection", "version", "target")},
+		Indexes: []SchemaIndex{index("ix_index_cleanup_due", "status", "due_at")},
+	},
 	// The sag_* tables are the offline index of the SAG retrieval architecture
 	// (Zleap-AI/SAG): every chunk gets one event (its complete semantic unit)
 	// and several normalized entities; the event-entity associations are what

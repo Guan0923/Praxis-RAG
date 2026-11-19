@@ -14,6 +14,13 @@ exercised by the test double without importing ``lightrag-hku``.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
+from dataclasses import replace
+from weakref import WeakValueDictionary
+from uuid import uuid4
+
 from .engine import (
     ChunkInput,
     DocumentInput,
@@ -22,7 +29,7 @@ from .engine import (
     InsertResult,
     chunk_content_hash,
 )
-from .errors import NotFoundError
+from .errors import NotFoundError, RevisionChanged
 from .models import ChunksRequest, QueryRequest, WorkspaceRequest
 from .registry import ChunkRef, ChunkRegistry, DocumentMeta, utc_now
 from .workspaces import WorkspaceState, WorkspaceStore
@@ -45,6 +52,7 @@ class GraphService:
     def __init__(self, engine: GraphEngine, registry: ChunkRegistry, store: WorkspaceStore) -> None:
         """Store the collaborators; the service is stateless apart from them."""
 
+        self._mutation_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._engine = engine
         self._registry = registry
         self._store = store
@@ -59,6 +67,10 @@ class GraphService:
         return len(self._store.namespaces())
 
     async def ensure_workspace(self, request: WorkspaceRequest) -> dict:
+        async with self._mutation_locks.setdefault(request.namespace, asyncio.Lock()):
+            return await self._ensure_workspace(request)
+
+    async def _ensure_workspace(self, request: WorkspaceRequest) -> dict:
         """Create, re-bind or rebuild the workspace of a namespace.
 
         Semantics required by the Go backend:
@@ -133,6 +145,10 @@ class GraphService:
         }
 
     async def insert_chunks(self, namespace: str, request: ChunksRequest) -> dict:
+        async with self._mutation_locks.setdefault(namespace, asyncio.Lock()):
+            return await self._insert_chunks(namespace, request)
+
+    async def _insert_chunks(self, namespace: str, request: ChunksRequest) -> dict:
         """Ingest one document's pre-split chunks, replacing a previous upload.
 
         A repeated ``document_id`` is delete-then-insert. LightRAG's custom-chunk
@@ -163,9 +179,18 @@ class GraphService:
                 for chunk in request.chunks
             ),
         )
+        # Persist ownership before touching the engine so even an interrupted
+        # first insert is visible to reconciliation.
+        revision = uuid4().hex
+        if request.expected_revision is not None and self.document_revision(namespace, document.document_id) != request.expected_revision:
+            raise RevisionChanged("文档版本已经变化")
+        previous = self._registry.document(namespace, document.document_id)
+        pending = (replace(previous, revision=revision, source_hash=request.source_hash) if previous else
+                   DocumentMeta(document.document_id, document.document_name, (), utc_now(), revision, request.publication_version, request.source_hash))
+        self._registry.remember(namespace, pending)
         await self._engine.delete_document(state.workspace, document.document_id)
         result = await self._engine.insert_document(state.workspace, document)
-        self._registry.remember(namespace, self._document_meta(document, result))
+        self._registry.remember(namespace, self._document_meta(document, result, revision, request.publication_version, request.source_hash))
         return {
             "document_id": document.document_id,
             "accepted": result.accepted,
@@ -175,6 +200,10 @@ class GraphService:
         }
 
     async def delete_document(self, namespace: str, document_id: str) -> dict:
+        async with self._mutation_locks.setdefault(namespace, asyncio.Lock()):
+            return await self._delete_document(namespace, document_id)
+
+    async def _delete_document(self, namespace: str, document_id: str) -> dict:
         """Delete one document and its Praxis metadata.
 
         Args:
@@ -192,6 +221,59 @@ class GraphService:
         removed = await self._engine.delete_document(state.workspace, document_id)
         self._registry.remove_document(namespace, document_id)
         return {"document_id": document_id, "deleted": bool(existed or removed)}
+
+    def inventory(self, namespace: str, after: str, limit: int) -> list[dict]:
+        rows = sorted(self._registry.documents(namespace), key=lambda row: row.document_id)
+        return [{"document_id": row.document_id, "revision": row.revision or row.updated_at,
+                 "publication_version": row.publication_version, "source_hash": row.source_hash}
+                for row in rows if row.document_id > after][:limit]
+
+    def document_revision(self, namespace: str, document_id: str) -> str:
+        row = self._registry.document(namespace, document_id)
+        return (row.revision or row.updated_at) if row else ""
+
+    def workspace_revision(self, namespace: str) -> str:
+        binding = self._store.load(namespace)
+        if binding is None:
+            return ""
+        rows = sorted((row.document_id, row.revision or row.updated_at)
+                      for row in self._registry.documents(namespace))
+        payload = json.dumps([binding.created_at, binding.config_fingerprint, rows])
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    async def prune_workspace(self, namespace: str, revision: str) -> dict:
+        async with self._mutation_locks.setdefault(namespace, asyncio.Lock()):
+            current = self.workspace_revision(namespace)
+            if current != revision:
+                return {"outcome": "changed"}
+            if not current:
+                return {"outcome": "absent"}
+            await self._clear_workspace(namespace)
+            return {"outcome": "deleted"}
+
+    async def prune_document(self, namespace: str, document_id: str, revision: str,
+                             binding: WorkspaceRequest | None = None, publication: str | None = None,
+                             allow_legacy: bool = True) -> dict:
+        async with self._mutation_locks.setdefault(namespace, asyncio.Lock()):
+            current = self.document_revision(namespace, document_id)
+            if current != revision:
+                return {"outcome": "changed"}
+            meta = self._registry.document(namespace, document_id)
+            if meta and publication is not None:
+                if meta.publication_version and meta.publication_version != publication:
+                    return {"outcome": "superseded"}
+                if not meta.publication_version and not allow_legacy:
+                    return {"outcome": "superseded"}
+            state = self._store.load(namespace)
+            if state is None:
+                return {"outcome": "absent"}
+            if binding and binding.namespace == namespace and binding.config_fingerprint == state.config_fingerprint:
+                # Rebind a cold engine without rebuilding or changing the workspace.
+                await self._engine.ensure_workspace(binding.to_config())
+            # Even an older, unregistered engine document can be removed by
+            # its canonical id. Empty expected revision matches only that case.
+            await self._delete_document(namespace, document_id)
+            return {"outcome": "deleted"}
 
     async def query(self, namespace: str, request: QueryRequest) -> dict:
         """Retrieve context only and map it back to Praxis evidence metadata.
@@ -221,6 +303,10 @@ class GraphService:
         return self._build_query_response(namespace, request, result, requested_documents)
 
     async def clear_workspace(self, namespace: str) -> dict:
+        async with self._mutation_locks.setdefault(namespace, asyncio.Lock()):
+            return await self._clear_workspace(namespace)
+
+    async def _clear_workspace(self, namespace: str) -> dict:
         """Delete every document, graph row and binding of a namespace.
 
         Args:
@@ -236,7 +322,7 @@ class GraphService:
         self._store.delete(namespace)
         return {"namespace": namespace, "cleared": True}
 
-    def _document_meta(self, document: DocumentInput, result: InsertResult) -> DocumentMeta:
+    def _document_meta(self, document: DocumentInput, result: InsertResult, revision: str, publication_version: str, source_hash: str) -> DocumentMeta:
         """Build the registry row for a freshly ingested document.
 
         Args:
@@ -270,6 +356,9 @@ class GraphService:
             document_name=document.document_name,
             chunks=tuple(chunks),
             updated_at=utc_now(),
+            revision=revision,
+            publication_version=publication_version,
+            source_hash=source_hash,
         )
 
     def _build_query_response(
@@ -325,9 +414,11 @@ class GraphService:
                 continue
             if allowed_documents and ref.document_id not in allowed_documents:
                 continue
+            meta = self._registry.document(namespace, ref.document_id)
             seen_chunks.add(ref.chunk_id)
             contexts.append(
                 {
+                    **({"publication_version": meta.publication_version} if meta and meta.publication_version else {}),
                     "chunk_id": ref.chunk_id,
                     "document_id": ref.document_id,
                     "document_name": ref.document_name,

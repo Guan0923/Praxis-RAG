@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"time"
 )
 
 // sagIDNamespace is the fixed UUID namespace for the SAG index rows.
@@ -190,7 +191,7 @@ func upsertSagEntity(ctx context.Context, transaction *sql.Tx, namespace, name, 
 	for {
 		row := transaction.QueryRowContext(ctx,
 			"SELECT id, namespace, normalized_key, entity_key, display_name, mention_count, created_at, updated_at "+
-				"FROM sag_entities WHERE namespace = ? AND entity_key = ?",
+				"FROM sag_entities WHERE namespace = ? AND entity_key = ? FOR UPDATE",
 			namespace, entityKey)
 		entity, err := scanSagEntity(row)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -461,6 +462,11 @@ func sagNormalizedKey(name string) string {
 }
 
 func deleteSagEvents(ctx context.Context, transaction *sql.Tx, namespace, documentID string) error {
+	// Start the retention clock when associations disappear, including replacement.
+	if _, err := transaction.ExecContext(ctx, "UPDATE sag_entities n JOIN sag_event_entities a ON a.namespace=n.namespace AND a.entity_id=n.id "+
+		"JOIN sag_events e ON e.id=a.event_id AND e.namespace=a.namespace SET n.updated_at=? WHERE e.namespace=? AND e.document_id=?", nowISO(), namespace, documentID); err != nil {
+		return sagWriteError(err)
+	}
 	if _, err := transaction.ExecContext(ctx,
 		"DELETE FROM sag_event_entities WHERE namespace = ? AND event_id IN "+
 			"(SELECT id FROM sag_events WHERE namespace = ? AND document_id = ?)",
@@ -473,4 +479,12 @@ func deleteSagEvents(ctx context.Context, transaction *sql.Tx, namespace, docume
 		return sagWriteError(err)
 	}
 	return nil
+}
+
+// PurgeUnusedSagEntities runs after the content-retention window. An entity
+// mentioned by any remaining event survives, regardless of mention_count.
+func (s *Stores) PurgeUnusedSagEntities(ctx context.Context) error {
+	cutoff := time.Now().UTC().Add(-time.Duration(ContentObjectRetentionSeconds) * time.Second).Format(isoTimestampFormat)
+	_, err := s.DB.ExecContext(ctx, "DELETE FROM sag_entities WHERE updated_at<? AND NOT EXISTS (SELECT 1 FROM sag_event_entities a WHERE a.namespace=sag_entities.namespace AND a.entity_id=sag_entities.id) LIMIT 200", cutoff)
+	return err
 }

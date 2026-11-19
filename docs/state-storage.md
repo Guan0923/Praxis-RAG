@@ -543,4 +543,4 @@ Cluster/Sentinel topologies and `-race` stress runs are not verified yet.
 
 ## UUID 结果与逻辑删除
 
-artifact 以 MySQL `artifact_snapshots` 为事实来源，沿用 `RAG_RESULT_TTL_SECONDS=3600`（语义为 artifact TTL）；已签发 artifact 的版本固定及到期前保留保证不变。`search_tasks`/`search_result_snapshots` 保留历史数据但不再读写，因此不存在“搜索结果 UUID 回源”路径，重新检索即可获得新证据。文档删除通过 del_flag 隐藏，并在同一事务中删除该文档的 `upload_objects`/`blobs` 引用行；失去所有引用的 `content_objects` 行会写入 `retired_at`，由维护循环在 8 天（>1 周）保留期后回收，期间若被重新引用会自动清除 `retired_at`。Qdrant 数据仍不随单文档删除物理删除；删除整个知识库时才按集合删除（每库一次请求）。正常自动 schema 为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [产物引用](result-references.md)。
+artifact 以 MySQL `artifact_snapshots` 为事实来源，沿用 `RAG_RESULT_TTL_SECONDS=3600`（语义为 artifact TTL）；已签发 artifact 的版本固定及到期前保留保证不变。`search_tasks`/`search_result_snapshots` 保留历史数据但不再读写，因此不存在“搜索结果 UUID 回源”路径，重新检索即可获得新证据。文档删除通过 del_flag 隐藏，并在同一事务中删除该文档的 `upload_objects`/`blobs` 引用行；失去所有引用的 `content_objects` 行会写入 `retired_at`，由维护循环在 8 天（>1 周）保留期后回收，期间若被重新引用会自动清除 `retired_at`。删除事务生成 `index_cleanup_jobs`。删除 worker 在源内容过期后按版本回收 Qdrant 和 LightRAG 的派生数据，进度按目标分别持久化，详见 [使用指南](USAGE.md#到期删除外部索引)。正常自动 schema 为旧 documents 表补充 del_flag，DDL 禁用部署需手动升级。见 [产物引用](result-references.md)。

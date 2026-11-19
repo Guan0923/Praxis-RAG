@@ -344,6 +344,9 @@ class ChunksRequest(_RequestModel):
             is treated as an empty list, matching the Go client's zero value.
     """
 
+    source_hash: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
+    publication_version: str = Field(default="", max_length=64)
+    expected_revision: str | None = Field(default=None, max_length=128)
     document_id: str = Field(pattern=DOCUMENT_ID_PATTERN.pattern)
     document_name: str = Field(default="", max_length=500)
     chunks: list[ChunkInput] = Field(default_factory=list, max_length=10000)

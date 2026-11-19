@@ -372,6 +372,8 @@ kubectl -n praxis-rag rollout status deploy/rag-sag-worker --timeout=180s
 kubectl -n praxis-rag get pods -o wide
 ```
 
+四个 overlay 同时部署 `rag-delete-worker`。它使用与文档写入相同的 Redis 锁地址、前缀和 MySQL，读取 `RAG_DELETE_TOPIC`。先运行 state-migrate、注册更新后的连接器。启用图谱时为清理进程设置相同的侧车地址和 token。
+
 四个 overlay 都部署一个 `rag-sag-worker` 副本。启用 SAG 抽取前，在 Console「模型配置」添加 `kind=extraction` 模型。升级时用包含 `rag-sag-worker` 的 Go 镜像先运行 §6.2 的 `state-migrate` Job，创建 `sag_extraction_jobs`，再更新应用。启用 Kafka ACL 的环境需允许消费组 `praxis_sag_extraction_workers` 读取 `RAG_CACHE_TOPIC`。可用 `kubectl -n praxis-rag logs deploy/rag-sag-worker` 查看订阅与抽取日志。
 
 切换入口（go ↔ vision）用同一条 `apply` 覆盖即可；从 vision 切回 go 时
