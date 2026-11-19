@@ -1,7 +1,6 @@
 package chunking
 
 import (
-	"archive/zip"
 	"context"
 	"os"
 	"path/filepath"
@@ -12,14 +11,6 @@ import (
 
 	"github.com/Guan0923/Praxis-RAG/internal/document"
 )
-
-const testWordNamespaces = `xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"` +
-	` xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"` +
-	` xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"` +
-	` xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"` +
-	` xmlns:v="urn:schemas-microsoft-com:vml"` +
-	` xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"` +
-	` xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"`
 
 func writeTextFile(t *testing.T, name, content string) string {
 	t.Helper()
@@ -37,47 +28,6 @@ func mustConfig(t *testing.T, strategy string, size, overlap int) Config {
 		t.Fatalf("NewConfig(%q,%d,%d) error = %v", strategy, size, overlap, err)
 	}
 	return config
-}
-
-func buildDOCXFixture(t *testing.T, body string) string {
-	t.Helper()
-	styles := `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-		`<w:styles ` + testWordNamespaces + `>` +
-		`<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style>` +
-		`<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Heading1"/></w:style>` +
-		`</w:styles>`
-	entries := []struct{ name, body string }{
-		{"[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-			`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
-			`<Default Extension="xml" ContentType="application/xml"/>` +
-			`<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
-			`</Types>`},
-		{"word/styles.xml", styles},
-		{"word/document.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
-			`<w:document ` + testWordNamespaces + `><w:body>` + body + `</w:body></w:document>`},
-	}
-	path := filepath.Join(t.TempDir(), "guide.docx")
-	file, err := os.Create(path)
-	if err != nil {
-		t.Fatalf("create docx: %v", err)
-	}
-	writer := zip.NewWriter(file)
-	for _, entry := range entries {
-		handle, err := writer.Create(entry.name)
-		if err != nil {
-			t.Fatalf("create zip entry: %v", err)
-		}
-		if _, err := handle.Write([]byte(entry.body)); err != nil {
-			t.Fatalf("write zip entry: %v", err)
-		}
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatalf("close zip: %v", err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatalf("close docx: %v", err)
-	}
-	return path
 }
 
 // checkTokenChunks ports tests/test_chunk_strategies.py::check_chunks with an

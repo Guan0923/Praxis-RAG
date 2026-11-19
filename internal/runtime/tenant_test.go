@@ -383,8 +383,9 @@ func TestTenantReportsUnreadableCredentials(t *testing.T) {
 	}
 	// Python lets the AEAD InvalidTag surface as an unhandled error (HTTP 500);
 	// the Go engine keeps the same parity and never returns a partial tenant.
+	// The error identity stays observable for regression detection.
 	if !strings.Contains(err.Error(), "cipher") && !strings.Contains(err.Error(), "authentication") {
-		t.Logf("tenant() credential failure surfaced as %T: %v", err, err)
+		t.Errorf("tenant() credential failure surfaced as %T (%v), want a cipher/authentication failure", err, err)
 	}
 }
 

@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -23,18 +22,14 @@ type fakeAPI struct {
 
 	mu             sync.Mutex
 	lists          map[string][]any
-	objects        map[string]any
 	patchResponses map[string]any
 	patchStatuses  map[string]int
 	patchBodies    map[string][]byte
 	patchTypes     map[string]string
 	patchCount     int
 	listStatuses   map[string]int
-	watchStatuses  map[string]int
 	watchers       map[string][]chan string
 	watchSeen      map[string]int
-	lastQueries    map[string]url.Values
-	listQueries    map[string][]url.Values
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
@@ -42,17 +37,13 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 	fake := &fakeAPI{
 		t:              t,
 		lists:          make(map[string][]any),
-		objects:        make(map[string]any),
 		patchResponses: make(map[string]any),
 		patchStatuses:  make(map[string]int),
 		patchBodies:    make(map[string][]byte),
 		patchTypes:     make(map[string]string),
 		listStatuses:   make(map[string]int),
-		watchStatuses:  make(map[string]int),
 		watchers:       make(map[string][]chan string),
 		watchSeen:      make(map[string]int),
-		lastQueries:    make(map[string]url.Values),
-		listQueries:    make(map[string][]url.Values),
 	}
 	for _, spec := range resourceSpecs {
 		fake.lists[spec.apiPath+"/"+spec.resource] = []any{}
@@ -85,13 +76,6 @@ func (fake *fakeAPI) setList(resource string, objects ...any) {
 	fake.lists[fake.collectionPath(resource)] = objects
 }
 
-// setObject installs one live GET payload (restart fallback).
-func (fake *fakeAPI) setObject(resource, namespace, name string, object any) {
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	fake.objects[fake.objectPath(resource, namespace, name)] = object
-}
-
 // setPatchResponse installs the merge-patch response (with metadata.generation
 // and metadata.uid) for one object.
 func (fake *fakeAPI) setPatchResponse(resource, namespace, name string, object any) {
@@ -104,12 +88,6 @@ func (fake *fakeAPI) setPatchStatus(resource, namespace, name string, status int
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	fake.patchStatuses[fake.objectPath(resource, namespace, name)] = status
-}
-
-func (fake *fakeAPI) setWatchStatus(resource string, status int) {
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	fake.watchStatuses[fake.collectionPath(resource)] = status
 }
 
 // setListStatus makes the LIST endpoint answer the given status (0 restores the
@@ -173,38 +151,11 @@ func (fake *fakeAPI) waitWatchers(resource string, count int) {
 	}
 }
 
-// lastQuery returns the query parameters of the most recent non-watch request
-// for the resource (the LIST, normally).
-func (fake *fakeAPI) lastQuery(resource string) url.Values {
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	return fake.lastQueries[fake.collectionPath(resource)]
-}
-
-// lastListQuery returns the query parameters of the most recent LIST request,
-// even after a watch request overwrote lastQueries.
-func (fake *fakeAPI) lastListQuery(resource string) url.Values {
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	queries := fake.listQueries[fake.collectionPath(resource)]
-	if len(queries) == 0 {
-		return nil
-	}
-	return queries[len(queries)-1]
-}
-
-// watchQuery returns the query parameters of the most recent watch request.
-func (fake *fakeAPI) watchQuery(resource string) url.Values {
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	return fake.lastQueries[fake.collectionPath(resource)]
-}
-
 func (fake *fakeAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	query := r.URL.Query()
 	if query.Get("watch") == "true" {
-		fake.serveWatch(w, r, path, query)
+		fake.serveWatch(w, r, path)
 		return
 	}
 	if r.Method == http.MethodPatch {
@@ -214,9 +165,7 @@ func (fake *fakeAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 
 	fake.mu.Lock()
 	items, isList := fake.lists[path]
-	object, isObject := fake.objects[path]
 	listStatus := fake.listStatuses[path]
-	fake.lastQueries[path] = query
 	fake.mu.Unlock()
 
 	switch {
@@ -225,32 +174,20 @@ func (fake *fakeAPI) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(listStatus)
 			return
 		}
-		fake.mu.Lock()
-		fake.listQueries[path] = append(fake.listQueries[path], query)
-		fake.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"metadata": map[string]any{"resourceVersion": "100"},
 			"items":    items,
 		})
-	case isObject:
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(object)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
-func (fake *fakeAPI) serveWatch(w http.ResponseWriter, r *http.Request, path string, query url.Values) {
+func (fake *fakeAPI) serveWatch(w http.ResponseWriter, r *http.Request, path string) {
 	fake.mu.Lock()
-	status := fake.watchStatuses[path]
 	fake.watchSeen[path]++
-	fake.lastQueries[path] = query
 	fake.mu.Unlock()
-	if status != 0 {
-		w.WriteHeader(status)
-		return
-	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)

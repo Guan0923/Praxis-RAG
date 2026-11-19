@@ -219,6 +219,77 @@ func TestScopeSearchCannotBeForgedByClientHeader(t *testing.T) {
 	}
 }
 
+// TestScopeSearchRefusesSAGRetrievalForRestrictedCaller pins the security
+// branch: the SAG event-entity mode expands a dynamic hyperedge that cannot be
+// bounded to the readable document set, so a restricted caller is refused
+// with the explicit message and the runtime is never reached.
+func TestScopeSearchRefusesSAGRetrievalForRestrictedCaller(t *testing.T) {
+	runtime := newFakeRuntime()
+	runtime.listDocuments = []DocumentRecord{{"name": "a.md"}, {"name": "b.md"}}
+	scopes := map[string]access.ScopeSet{
+		"full":  testWholeScope(),
+		"files": testFileScope([]string{"a.md"}, nil),
+	}
+	_, server := newScopeTestServer(t, runtime, Options{}, scopes)
+	rpc := newRawRPC(t, server.URL, manualsNS)
+	initializeScoped(t, rpc, "full")
+
+	restricted := callToolScoped(t, rpc, "files", searchToolName, map[string]any{
+		"query":     "hello",
+		"retrieval": "sag",
+	})
+	if len(runtime.searchCalls) != 0 {
+		t.Fatalf("restricted SAG search reached the runtime: %#v", runtime.searchCalls)
+	}
+	result, _ := restricted["result"].(map[string]any)
+	if result == nil {
+		t.Fatalf("restricted SAG search payload = %#v, want a result envelope", restricted)
+	}
+	if text := searchResultText(t, restricted); !strings.Contains(text, messageRetrievalRestricted) ||
+		!strings.Contains(text, "sag") {
+		t.Fatalf("restricted SAG search text = %q, want the restricted-retrieval message mentioning sag", text)
+	}
+
+	// An unrestricted caller keeps the SAG mode available: the call reaches
+	// the runtime with the requested mode and no document-id bound.
+	unrestricted := callToolScoped(t, rpc, "full", searchToolName, map[string]any{
+		"query":     "hello",
+		"retrieval": "sag",
+	})
+	if len(runtime.searchCalls) != 1 {
+		t.Fatalf("unrestricted SAG search did not reach the runtime: %#v", unrestricted)
+	}
+	if runtime.searchCalls[0].Retrieval != contracts.RetrievalSAG {
+		t.Fatalf("unrestricted retrieval = %q, want sag", runtime.searchCalls[0].Retrieval)
+	}
+	if got := runtime.searchCalls[0].DocumentIDs; got != nil {
+		t.Fatalf("unrestricted SAG DocumentIDs = %#v, want nil", got)
+	}
+}
+
+// searchResultText extracts the concatenated text content of one tools/call
+// result envelope.
+func searchResultText(t *testing.T, payload map[string]any) string {
+	t.Helper()
+	result, _ := payload["result"].(map[string]any)
+	if result == nil {
+		if errText, _ := payload["error"].(map[string]any); errText != nil {
+			message, _ := errText["message"].(string)
+			return message
+		}
+		return ""
+	}
+	content, _ := result["content"].([]any)
+	var text strings.Builder
+	for _, item := range content {
+		block, _ := item.(map[string]any)
+		if value, _ := block["text"].(string); value != "" {
+			text.WriteString(value)
+		}
+	}
+	return text.String()
+}
+
 func TestScopeResourcesFiltered(t *testing.T) {
 	runtime := newFakeRuntime()
 	runtime.listDocuments = []DocumentRecord{

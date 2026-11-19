@@ -8,14 +8,6 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
-// newGroupFixture builds one sharing scenario plus a group-owner (vip), a
-// plain member and a stranger account.
-func newGroupFixture(t *testing.T) *fixture {
-	t.Helper()
-	base := newFixture(t)
-	return base
-}
-
 // createGroup creates one group directly through the service.
 func createGroup(t *testing.T, f *fixture, user state.User, name string) GroupView {
 	t.Helper()
@@ -51,7 +43,7 @@ func acceptGroupInvite(t *testing.T, f *fixture, invitee state.User, token strin
 // TestGroupCreateRoleRules pins the role contract: enabled vip/admin may create
 // groups, plain users and disabled accounts may not.
 func TestGroupCreateRoleRules(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 
 	if _, err := f.service.CreateGroup(ctx, f.user0(t), CreateGroupRequest{Name: "nope"}); err == nil {
@@ -109,7 +101,7 @@ func errorKind(err error) ErrorKind {
 // TestGroupInvitationFlow pins the invitation lifecycle: only the invitee may
 // accept, the inviter must keep the role, and acceptance lands a membership.
 func TestGroupInvitationFlow(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	group := createGroup(t, f, f.owner, "研究组")
 
@@ -158,7 +150,7 @@ func TestGroupInvitationFlow(t *testing.T) {
 // the inviter is demoted to user, a pending invitation no longer adds members,
 // while the already-landed membership and grant stay effective.
 func TestGroupInvitationAcceptRechecksInviterRole(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	group := createGroup(t, f, f.owner, "降级组")
 
@@ -214,7 +206,7 @@ func TestGroupInvitationAcceptRechecksInviterRole(t *testing.T) {
 // the personal grant and every applicable group rule, and (with the first
 // version being allow-only) a member keeps its personal rights untouched.
 func TestGroupPermissionMerge(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	group := createGroup(t, f, f.owner, "行业研究组")
 
@@ -263,7 +255,7 @@ func TestGroupPermissionMerge(t *testing.T) {
 // group contribution is the union of each group's bits. The kb owner owns both
 // groups, per the ownership rules.
 func TestGroupMultipleGroupsUnion(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	readGroup := createGroup(t, f, f.owner, "阅读组")
 	writeGroup := createGroup(t, f, f.owner, "修改组")
@@ -297,7 +289,7 @@ func TestGroupMultipleGroupsUnion(t *testing.T) {
 // TestGroupFileLevelGrant pins per-file group grants: only the named document
 // gains the bits, and create on a file-level grant is refused.
 func TestGroupFileLevelGrant(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	group := createGroup(t, f, f.owner, "文件组")
 	if err := f.stores.Documents.Upsert(ctx, "kb1", state.DocumentRecord{
@@ -343,7 +335,7 @@ func TestGroupFileLevelGrant(t *testing.T) {
 // being removed, revoking the grant and dissolving the group each removes the
 // group contribution on the next request, while other sources stay.
 func TestGroupMembershipRemovalKillsAccess(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	groupA := createGroup(t, f, f.owner, "组A")
 	groupB := createGroup(t, f, f.owner, "组B")
@@ -431,7 +423,7 @@ func TestGroupMembershipRemovalKillsAccess(t *testing.T) {
 // accepted link stays idempotent (no error) but never re-adds an account that
 // left or was removed.
 func TestGroupInvitationIdempotentRetry(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	group := createGroup(t, f, f.owner, "重试组")
 
@@ -482,7 +474,7 @@ func TestGroupInvitationIdempotentRetry(t *testing.T) {
 // grant on knowledge bases they own; a stranger cannot manage someone else's
 // group or grant.
 func TestGroupGrantOwnership(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	group := createGroup(t, f, f.owner, "归属组")
 
@@ -513,7 +505,7 @@ func TestGroupGrantOwnership(t *testing.T) {
 // TestGroupVisibleNamespaces pins the namespace visibility merge: a group
 // grant exposes the knowledge base to its current members only.
 func TestGroupVisibleNamespaces(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	group := createGroup(t, f, f.owner, "可见组")
 
@@ -558,7 +550,7 @@ func TestGroupVisibleNamespaces(t *testing.T) {
 // TestGroupPermissionSources pins the source explanation: role, personal and
 // named-group origins are all reported with their bits.
 func TestGroupPermissionSources(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	group := createGroup(t, f, f.owner, "行业研究组")
 
@@ -591,7 +583,7 @@ func TestGroupPermissionSources(t *testing.T) {
 // TestGroupGrantOnForeignKbAndMaskValidation pins the payload validation of
 // group grants.
 func TestGroupGrantOnForeignKbAndMaskValidation(t *testing.T) {
-	f := newGroupFixture(t)
+	f := newFixture(t)
 	ctx := context.Background()
 	group := createGroup(t, f, f.owner, "校验组")
 

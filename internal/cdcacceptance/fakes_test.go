@@ -42,7 +42,6 @@ type fakeStateCache struct {
 	revisions map[string]int64
 	locks     map[string]string
 	failPuts  int
-	puts      int
 }
 
 func newFakeStateCache() *fakeStateCache {
@@ -94,7 +93,6 @@ func (f *fakeStateCache) Put(_ context.Context, kind, scope, token string, revis
 		f.values[key] = detached
 	}
 	f.revisions[key] = revision
-	f.puts++
 	return true, nil
 }
 

@@ -737,7 +737,9 @@ func TestUploadPurgeDocumentObjects(t *testing.T) {
 	commitTestUpload(t, stores, journal, first, map[string]any{"ok": true})
 	second := beginTestUpload(t, journal, "ns", "file.txt", "doc", "collection", BeginOptions{})
 	commitTestUpload(t, stores, journal, second, map[string]any{"ok": true})
-	if err := journal.PutObject(ctx, first, SourceBucket, "file.txt", []byte("old"), nil); err != nil {
+	if err := journal.PutObject(ctx, first, SourceBucket, "file.txt", []byte("old"), nil); err == nil {
+		t.Fatal("PutObject on a committed operation must fail")
+	} else {
 		// first is committed; PutObject rejects committed operations by design.
 		mustBeError[*LeaseLost](t, err)
 	}

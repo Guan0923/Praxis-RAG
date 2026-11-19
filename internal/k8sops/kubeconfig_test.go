@@ -61,9 +61,10 @@ contexts:
       user: ops
       namespace: praxis-rag
 `)
-	// An explicit API endpoint must lose to the explicit kubeconfig.
-	t.Setenv("RAG_K8S_API_ENDPOINT", "https://ignored.example:6443")
 	useKubeconfig(t, path, "")
+	// An explicit API endpoint must lose to the explicit kubeconfig: the env
+	// override stays non-empty so the priority is actually exercised.
+	t.Setenv("RAG_K8S_API_ENDPOINT", "https://ignored.example:6443")
 
 	settings, err := SettingsFromEnv()
 	if err != nil {

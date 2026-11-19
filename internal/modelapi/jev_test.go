@@ -10,23 +10,6 @@ import (
 	"time"
 )
 
-// jevTestServer counts requests and answers every candidate with a fixed score.
-type jevTestServer struct {
-	server   *httptest.Server
-	requests int
-	handler  func(w http.ResponseWriter, r *http.Request, calls *int)
-}
-
-func newJevTestServer(t *testing.T, handler func(w http.ResponseWriter, r *http.Request, calls *int)) *jevTestServer {
-	t.Helper()
-	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handler(w, r, &calls)
-	}))
-	t.Cleanup(server.Close)
-	return &jevTestServer{server: server, requests: 0, handler: handler}
-}
-
 // jevAnswerPayload writes a valid response that echoes candidate_ keys with
 // the given score.
 func jevAnswerPayload(w http.ResponseWriter, r *http.Request, calls *int) {

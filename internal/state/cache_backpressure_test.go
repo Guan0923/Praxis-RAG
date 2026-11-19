@@ -474,10 +474,12 @@ func TestGetOrLoadCorruptionAndCancelDoNotTripBreaker(t *testing.T) {
 	cache.mu.Unlock()
 
 	// After all that, the breaker never tripped: Redis reads still happen and
-	// a real miss backfills normally. Reads: 1 initial + 5 cancel pairs'
-	// initial + 5 double-checked (the per-key backfill lock re-reads before
-	// every guarded fill) + 1 repaired hit + 1 final-miss initial = 13; the
-	// double-checked reads are the lock protocol, not breaker skips.
+	// a real miss backfills normally. Reads: 1 initial + 1 corrupt-phase
+	// re-check (the per-key backfill lock re-reads before every guarded fill)
+	// + 1 repaired hit + 5 cancel pairs' initial + 5 cancel pairs' lock
+	// re-check = 13; the re-checked reads are the lock protocol, not breaker
+	// skips. The final-miss initial read is asserted through stored entries
+	// below, after this counter snapshot.
 	if gets, _ := cache.snapshotCounts(); gets != 13 {
 		t.Fatalf("Redis reads = %d, want 13 (breaker never skipped reads)", gets)
 	}
