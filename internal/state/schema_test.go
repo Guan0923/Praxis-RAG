@@ -157,12 +157,12 @@ var expectedUniques = map[string][]string{
 
 var expectedIndexes = map[string][]string{
 	"api_keys":                 {"ix_api_keys_owner"},
-	"knowledge_bases":          {"ix_knowledge_bases_collection"},
+	"knowledge_bases":          {"ix_knowledge_bases_collection", "ix_knowledge_bases_owner"},
 	"documents":                {"ix_documents_namespace_sha256"},
 	"blobs":                    {"ix_blobs_document", "ix_blobs_sha256"},
 	"upload_objects":           {"ix_upload_objects_content"},
 	"content_objects":          {"ix_content_objects_retired"},
-	"upload_operations":        {"ix_upload_unfinished"},
+	"upload_operations":        {"ix_upload_unfinished", "ix_upload_operations_document"},
 	"search_result_snapshots":  {"ix_search_result_expiry", "ix_search_result_namespace"},
 	"artifact_snapshots":       {"ix_artifact_expiry", "ix_artifact_namespace"},
 	"document_tasks":           {"ix_document_tasks_name", "ix_document_tasks_recovery"},
@@ -277,6 +277,8 @@ func TestMySQLSchemaCompilesWithLongColumns(t *testing.T) {
 		"`key` VARCHAR(512) COLLATE utf8mb4_bin NOT NULL",
 		"`del_flag` BOOL NOT NULL DEFAULT 0",
 		"CONSTRAINT `uq_documents_namespace_id` UNIQUE (`namespace`, `document_id`)",
+		"CREATE INDEX `ix_knowledge_bases_owner` ON `knowledge_bases` (`owner_user_id`)",
+		"CREATE INDEX `ix_upload_operations_document` ON `upload_operations` (`namespace`, `document_id`)",
 	} {
 		if !strings.Contains(ddl, want) {
 			t.Fatalf("MySQL DDL does not contain %q", want)
@@ -289,6 +291,42 @@ func TestBucketConstants(t *testing.T) {
 		WordAssetBucket != "word-assets" || HTMLAssetBucket != "html-assets" {
 		t.Fatalf("unexpected bucket constants: %q %q %q %q",
 			SourceBucket, PDFAssetBucket, WordAssetBucket, HTMLAssetBucket)
+	}
+}
+
+func TestMySQLMigratesKnowledgeBaseAndUploadIndexes(t *testing.T) {
+	mysqlTestURL(t)
+	stores := openMySQLTestStores(t)
+	ctx := context.Background()
+	indexes := []struct {
+		table   string
+		name    string
+		columns string
+	}{
+		{"knowledge_bases", "ix_knowledge_bases_owner", "owner_user_id"},
+		{"upload_operations", "ix_upload_operations_document", "namespace,document_id"},
+	}
+	for _, index := range indexes {
+		statement := "DROP INDEX " + quoteIdentifier(index.name) + " ON " + quoteIdentifier(index.table)
+		if _, err := stores.DB.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("drop index %s: %v", index.name, err)
+		}
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := stores.ensureSchema(ctx); err != nil {
+			t.Fatalf("ensureSchema() attempt %d: %v", attempt+1, err)
+		}
+		for _, index := range indexes {
+			const query = "SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index) " +
+				"FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?"
+			var columns string
+			if err := stores.DB.QueryRowContext(ctx, query, index.table, index.name).Scan(&columns); err != nil {
+				t.Fatalf("read columns for %s: %v", index.name, err)
+			}
+			if columns != index.columns {
+				t.Errorf("%s columns = %s, want %s", index.name, columns, index.columns)
+			}
+		}
 	}
 }
 

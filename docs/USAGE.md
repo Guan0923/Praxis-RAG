@@ -331,7 +331,7 @@ Console 的「知识文档」页提供「从飞书导入」按钮（仅登录账
 | `RAG_STATE_POOL_SIZE` / `RAG_STATE_MAX_OVERFLOW` | `10` / `20` | 连接池 |
 | `RAG_STATE_POOL_RECYCLE` / `RAG_STATE_POOL_TIMEOUT` | `1800` / `30` 秒 | 连接回收与等待 |
 | `RAG_STATE_ECHO` | `false` | SQL 回显（调试用，勿在生产开启） |
-| `RAG_STATE_AUTO_SCHEMA` | `true` | 启动时创建缺失表；生产可关闭并由部署账号预建 |
+| `RAG_STATE_AUTO_SCHEMA` | `true` | 启动时创建缺失表并执行增量迁移；生产可关闭并由部署账号执行 `rag-state-migrate --apply` |
 | `RAG_UPLOAD_LEASE_SECONDS` | `120` | 上传事务业务租约时长 |
 | `RAG_UPLOAD_CLEANUP_DELAY_SECONDS` | `3600` | 已完成上传工作区清理延迟 |
 
@@ -1200,6 +1200,8 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 .\dist\bin\rag-state-migrate.exe --apply         # 幂等创建缺失表/增量迁移
 .\dist\bin\rag-state-migrate.exe --data-root D:/praxis-rag/data
 ```
+
+增量迁移会为已有 MySQL 库补齐 `knowledge_bases(owner_user_id)` 和 `upload_operations(namespace, document_id)` 索引，分别用于知识库配额查询和按文档清理上传内容引用。
 
 环境同服务（`RAG_STATE_URL`/`RAG_MYSQL_*`/`RAG_SERVICE_DATA_ROOT`）。退出码：`0` schema 就绪，`1` 不完整/失败，`2` 配置错误。
 
