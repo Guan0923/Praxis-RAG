@@ -182,13 +182,17 @@ func (d *DocumentBatches) Create(
 		}
 		return nil, false, err
 	}
+	values := make([]string, 0, len(names))
+	args := make([]any, 0, len(names)*6)
 	for position, name := range names {
-		if _, err := transaction.ExecContext(ctx,
-			"INSERT INTO document_batch_items (batch_id, position, name, status, reason, "+
-				"artifact_id, error, created_at, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
-			batchID, position, name, DocumentBatchItemSaving, now, now); err != nil {
-			return nil, false, err
-		}
+		values = append(values, "(?, ?, ?, ?, NULL, NULL, NULL, ?, ?)")
+		args = append(args, batchID, position, name, DocumentBatchItemSaving, now, now)
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"INSERT INTO document_batch_items (batch_id, position, name, status, reason, "+
+			"artifact_id, error, created_at, updated_at) VALUES "+strings.Join(values, ", "),
+		args...); err != nil {
+		return nil, false, err
 	}
 	if err := transaction.Commit(); err != nil {
 		return nil, false, err
