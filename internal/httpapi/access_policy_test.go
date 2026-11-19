@@ -601,7 +601,7 @@ func TestTenantReadRoutesHonourScope(t *testing.T) {
 	search := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/search", remote: "10.0.0.9:5000",
 		headers: mergeHeaders(sessionHeaders("user-token", "alpha"), map[string]string{"Content-Type": "application/json"}),
-		body:    `{"query":"E03"}`,
+		body:    `{"query":"索引"}`,
 	})
 	if search.Code != http.StatusOK {
 		t.Fatalf("search status = %d body = %s", search.Code, search.Body.String())
@@ -625,7 +625,7 @@ func TestTenantReadRoutesHonourScope(t *testing.T) {
 	adminSearch := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/search", remote: "10.0.0.9:5000",
 		headers: mergeHeaders(sessionHeaders("admin-token", "alpha"), map[string]string{"Content-Type": "application/json"}),
-		body:    `{"query":"E03"}`,
+		body:    `{"query":"索引"}`,
 	})
 	if adminSearch.Code != http.StatusOK || runtime.searchRequest.DocumentIDs != nil {
 		t.Fatalf("admin search status = %d DocumentIDs = %v", adminSearch.Code, runtime.searchRequest.DocumentIDs)
@@ -722,7 +722,7 @@ func TestTenantRoutesWithoutAccessControlKeepLegacyBehaviour(t *testing.T) {
 	search := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/search", remote: "10.0.0.9:5000",
 		headers: mergeHeaders(sessionHeaders("user-token", "alpha"), map[string]string{"Content-Type": "application/json"}),
-		body:    `{"query":"E03"}`,
+		body:    `{"query":"索引"}`,
 	})
 	if search.Code != http.StatusOK || runtime.searchRequest.DocumentIDs != nil {
 		t.Fatalf("search status = %d DocumentIDs = %v", search.Code, runtime.searchRequest.DocumentIDs)

@@ -361,8 +361,8 @@ func TestBuildQdrantDependenciesWiresStore(t *testing.T) {
 
 func TestBuildQdrantOrchestratorEndToEnd(t *testing.T) {
 	qdrantPoints := `[{"id":"p1","score":0.9,"payload":{
-		"record_type":"chunk","document_id":"doc-e03","chunk_id":"chunk-e03",
-		"text":"错误代码 E03 表示水路供水不足","title":"e03","source":"e03.md",
+		"record_type":"chunk","document_id":"doc-index","chunk_id":"chunk-index",
+		"text":"文档索引包含分块和向量化","title":"index","source":"index.md",
 		"metadata":{"kind":"test"},"upload_version":"v1"}}]`
 	handler := func(request testRequest) (int, string) {
 		if strings.HasSuffix(request.Path, "/points/query") {
@@ -408,7 +408,7 @@ func TestBuildQdrantOrchestratorEndToEnd(t *testing.T) {
 		t.Fatalf("BuildQdrantOrchestrator() error: %v", err)
 	}
 	request, err := contracts.SearchRequestFromArguments(map[string]any{
-		"query": "E03 怎么处理", "retrieval": "hybrid", "rerank": "cross_encoder",
+		"query": "如何索引文档", "retrieval": "hybrid", "rerank": "cross_encoder",
 		"candidate_k": 5, "top_k": 2,
 	})
 	if err != nil {
@@ -423,7 +423,7 @@ func TestBuildQdrantOrchestratorEndToEnd(t *testing.T) {
 		t.Errorf("implementation = %v", debug["implementation"])
 	}
 	results := result["results"].([]map[string]any)
-	if len(results) != 1 || results[0]["document_id"] != "doc-e03" {
+	if len(results) != 1 || results[0]["document_id"] != "doc-index" {
 		t.Fatalf("results = %v", results)
 	}
 	if results[0]["score"] != 0.88 {

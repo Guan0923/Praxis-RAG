@@ -4,11 +4,9 @@
 
 [5 分钟快速开始](#5-分钟快速开始) · [使用指南](docs/USAGE.md) · [部署指南](docs/DEPLOYMENT.md) · [MIT 许可证](LICENSE)
 
-## 演示
+## 检索方式
 
-![Console 检索 X7 终端的 E03 故障码并显示手册原文与来源章节](docs/images/console-search.gif)
-
-Console 使用示例响应展示混合检索。输入 E03 故障问题后，可以看到 [X7 维护手册](examples/knowledge/x7-maintenance-manual.md)中的处理步骤和来源章节。除 BM25 / Embedding / Hybrid 外，配置抽取模型后还可启用 SAG 事件-实体检索，跨 chunk 追溯共享实体的关联证据（见[使用指南](docs/USAGE.md#sag-事件-实体检索retrieval-sag)）。启用知识图谱后还可用图谱模式回答"这几份文件里的条款彼此是什么关系"这类跨文档关联问题，同样只提供证据、不生成答案（见[使用指南](docs/USAGE.md#知识图谱检索retrieval-graph)）。
+除 BM25 / Embedding / Hybrid 外，配置抽取模型后还可启用 SAG 事件-实体检索，跨 chunk 追溯共享实体的关联证据（见[使用指南](docs/USAGE.md#sag-事件-实体检索retrieval-sag)）。启用知识图谱后还可用图谱模式回答"这几份文件里的条款彼此是什么关系"这类跨文档关联问题，同样只提供证据、不生成答案（见[使用指南](docs/USAGE.md#知识图谱检索retrieval-graph)）。
 
 ## 5 分钟快速开始
 
@@ -22,7 +20,7 @@ go run ./cmd/rag-mcp-debug --query "RRF 怎么融合 BM25 和 Dense？" --limit 
 
 看到 `mode=mock` 和 `results=2` 即可验证示例。第一条结果的 `Text` 是原文片段，`Source` 是来源，`ChunkID` 标识片段。首次下载依赖的时间取决于网络。
 
-[启动完整服务并导入 X7 手册](docs/USAGE.md#用-console-跑通文档导入与检索)
+[启动完整服务并导入示例文档](docs/USAGE.md#用-console-跑通文档导入与检索)
 
 ## 架构
 

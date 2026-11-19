@@ -92,7 +92,7 @@ func TestSearchEndpoint(t *testing.T) {
 		method:  "POST",
 		target:  "/v1/search",
 		headers: tenantAuth(),
-		body:    `{"query":"E03","retrieval":"bm25","rerank":"none","candidate_k":20,"top_k":5,"filters":{"document_id":"doc-1"},"extra":"ignored"}`,
+		body:    `{"query":"索引","retrieval":"bm25","rerank":"none","candidate_k":20,"top_k":5,"filters":{"document_id":"doc-1"},"extra":"ignored"}`,
 	})
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
@@ -101,7 +101,7 @@ func TestSearchEndpoint(t *testing.T) {
 		t.Fatalf("namespace = %q", runtime.searchNamespace)
 	}
 	request := runtime.searchRequest
-	if request.Query != "E03" || request.Retrieval != contracts.RetrievalBM25 ||
+	if request.Query != "索引" || request.Retrieval != contracts.RetrievalBM25 ||
 		request.Rerank != contracts.RerankNone || request.CandidateK != 20 || request.TopK != 5 {
 		t.Fatalf("request = %+v", request)
 	}
@@ -128,7 +128,7 @@ func TestSearchEndpoint(t *testing.T) {
 
 	invalidRerank := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/search", headers: tenantAuth(),
-		body: `{"query":"E03","rerank":"bi_encoder"}`,
+		body: `{"query":"索引","rerank":"bi_encoder"}`,
 	})
 	if invalidRerank.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("rerank status = %d", invalidRerank.Code)
@@ -141,7 +141,7 @@ func TestSearchEndpoint(t *testing.T) {
 	}
 
 	invalidRetrieval := performRequest(handler, testRequest{
-		method: "POST", target: "/v1/search", headers: tenantAuth(), body: `{"query":"E03","retrieval":"sql"}`,
+		method: "POST", target: "/v1/search", headers: tenantAuth(), body: `{"query":"索引","retrieval":"sql"}`,
 	})
 	if invalidRetrieval.Code != http.StatusBadRequest {
 		t.Fatalf("retrieval status = %d body = %s", invalidRetrieval.Code, invalidRetrieval.Body.String())

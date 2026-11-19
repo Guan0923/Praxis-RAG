@@ -62,7 +62,7 @@ func TestDefaultCounterDeterministicApproximation(t *testing.T) {
 		{"中文句子", 4},
 		{"hello world", 4}, // two 5-rune words -> 4 subword pieces
 		{"a b c", 3},       // whitespace is not counted
-		{"终端 X7", 3},       // 2 CJK runes + one 2-rune word piece
+		{"索引 v2", 3},       // 2 CJK runes + one 2-rune word piece
 		{"。！？", 3},         // punctuation runes are separate tokens
 		{"\n\n\t ", 0},     // whitespace only
 	}
@@ -83,7 +83,7 @@ func TestDefaultCounterOffsetsInvariants(t *testing.T) {
 	if !ok {
 		t.Fatalf("DefaultCounter does not implement TokenOffsetter")
 	}
-	text := "终端 X7 故障 code"
+	text := "索引 v2 版本 code"
 	offsets := offsetter.TokenStartOffsets(text)
 	if len(offsets) != DefaultCounter.Count(text) {
 		t.Fatalf("offsets = %d, count = %d", len(offsets), DefaultCounter.Count(text))

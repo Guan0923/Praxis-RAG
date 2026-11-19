@@ -20,7 +20,7 @@ import (
 )
 
 const uploadDocumentText = "One document paragraph with enough text for chunking. " +
-	"E03 水路供水不足的处理步骤需要排出管路空气。 " +
+	"索引任务负责将上传的文档切分为可检索的片段。 " +
 	"Another sentence keeps the chunk boundaries meaningful. "
 
 // newUploadService builds a Service with a committed knowledge-base row, a fake

@@ -275,7 +275,7 @@ func TestWordSectionsTablesAndLongRows(t *testing.T) {
 	longCell := strings.Repeat("检查传感器然后重启。", 100)
 	rows := [][]string{
 		{"代码", "处理方法"},
-		{"E03", longCell},
+		{"索引", longCell},
 	}
 	tableNumber := 1
 	blocks := []document.Block{

@@ -518,7 +518,7 @@ PDF 总解析容量上限为 `RAG_PDF_SERVICE_WORKERS × RAG_PDF_SERVICE_CONCURR
    ```
 
 3. 打开 [Console](http://127.0.0.1:8011/console)。首次启动时注册账号，在「模型配置」添加 Embedding 模型，然后创建知识库并选用该模型。
-4. 上传 [X7 智能终端维护手册](../examples/knowledge/x7-maintenance-manual.md)。等文档索引成功后，在「检索调试」选择混合检索，输入「X7 终端出现 E03 温度保护后怎么处理？」。检查命中片段的来源章节，手册第 6.2 节列出了普通用户的处理步骤。[查看示例结果](images/console-search.png)
+4. 上传 [Agentic RAG 基础](../examples/knowledge/agentic-rag.md)。等文档索引成功后，在「检索调试」选择混合检索，输入「谁决定是否再次检索？」。打开命中片段，核对原文与来源文件名。
 
 首次只想查看证据结构时，可以运行 [README 的 5 分钟示例](../README.md#5-分钟快速开始)。
 
@@ -1040,12 +1040,12 @@ curl.exe -X DELETE "http://127.0.0.1:8011/v1/documents/guide.md" -H $headers
 ```powershell
 curl.exe -X POST http://127.0.0.1:8011/v1/search `
   -H $headers `
-  -d '{"query":"E03 怎么处理？","retrieval":"hybrid","rerank":"cross_encoder","candidate_k":10,"top_k":5,"filters":{}}'
+  -d '{"query":"谁决定是否再次检索？","retrieval":"hybrid","rerank":"cross_encoder","candidate_k":10,"top_k":5,"filters":{}}'
 
 # 同步搜索（一次调用直接返回证据，无任务 ID/轮询）
 curl.exe -X POST http://127.0.0.1:8011/v1/search `
   -H $headers `
-  -d '{"query":"E03 怎么处理？","retrieval":"hybrid","rerank":"cross_encoder","candidate_k":10,"top_k":5,"filters":{}}'
+  -d '{"query":"谁决定是否再次检索？","retrieval":"hybrid","rerank":"cross_encoder","candidate_k":10,"top_k":5,"filters":{}}'
 
 # artifact（源文件/图片/表格 JSON）
 curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>" -H $headers
@@ -1071,7 +1071,7 @@ curl.exe "http://127.0.0.1:8011/v1/artifacts/<artifact_id>/content" -H $headers
 ```powershell
 curl.exe -X POST http://127.0.0.1:8011/v1/search `
   -H $headers `
-  -d '{"query":"E03 怎么处理？","retrieval":"sag2","rerank":"none","candidate_k":100,"top_k":5,"filters":{}}'
+  -d '{"query":"谁决定是否再次检索？","retrieval":"sag2","rerank":"none","candidate_k":100,"top_k":5,"filters":{}}'
 ```
 
 #### 知识图谱检索（`retrieval: graph`）
@@ -1268,7 +1268,7 @@ MCP **始终**要求 `Authorization`（loopback 也不例外）；本地管理�
 
 ```powershell
 .\dist\bin\rag-mcp-debug.exe "RRF 怎么融合 BM25 和 Dense？"
-.\dist\bin\rag-mcp-debug.exe --query "E03" --limit 3
+.\dist\bin\rag-mcp-debug.exe --query "RRF" --limit 3
 ```
 
 ## 8. Docker 与 Compose

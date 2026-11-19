@@ -20,8 +20,8 @@ import (
 // document row + source blob).
 const syncQueryPoints = `[
 	{"id":"sync-p1","version":1,"score":0.95,"payload":{
-		"record_type":"chunk","document_id":"doc-e03","chunk_id":"chunk-e03",
-		"text":"错误代码 E03 表示水路供水不足","title":"e03","source":"e03.md",
+		"record_type":"chunk","document_id":"doc-index","chunk_id":"chunk-index",
+		"text":"文档索引包含分块和向量化","title":"index","source":"index.md",
 		"metadata":{"kind":"test"}}}
 ]`
 
@@ -85,7 +85,7 @@ func requireNoSnapshotFields(t *testing.T, payload map[string]any) {
 
 func syncSearchRequest() contracts.SearchRequest {
 	return contracts.SearchRequest{
-		Query:      "E03 供水不足",
+		Query:      "文档索引",
 		Retrieval:  contracts.RetrievalHybrid,
 		Rerank:     contracts.RerankCrossEncoder,
 		CandidateK: 10,
@@ -100,7 +100,7 @@ func syncSearchRequest() contracts.SearchRequest {
 func TestSyncSearchReturnsArtifacts(t *testing.T) {
 	h := newHarness(t, syncQueryPoints)
 	ctx := context.Background()
-	seedLegacyDocument(t, h, "doc-e03", "e03.md", []byte("E03 水路供水不足的处理步骤"))
+	seedLegacyDocument(t, h, "doc-index", "index.md", []byte("索引任务会切分上传的文档"))
 	h.Service.SearchEngine().SetReferenceCapture(searchrefs.New(h.Stores, testLogger()))
 
 	payload, err := h.Service.Search(ctx, "alpha", syncSearchRequest())
@@ -113,7 +113,7 @@ func TestSyncSearchReturnsArtifacts(t *testing.T) {
 		t.Fatalf("payload results = %#v, want non-empty []any", payload["results"])
 	}
 	firstHit, ok := results[0].(map[string]any)
-	if !ok || firstHit["document_id"] != "doc-e03" {
+	if !ok || firstHit["document_id"] != "doc-index" {
 		t.Fatalf("first result = %#v", results[0])
 	}
 
@@ -124,7 +124,7 @@ func TestSyncSearchReturnsArtifacts(t *testing.T) {
 		t.Fatalf("payload artifacts empty, want at least the source reference: %v", payload["artifacts"])
 	}
 	source := references[0]
-	if source["kind"] != "source" || source["name"] != "e03.md" || source["document_id"] != "doc-e03" {
+	if source["kind"] != "source" || source["name"] != "index.md" || source["document_id"] != "doc-index" {
 		t.Fatalf("source artifact reference = %v", source)
 	}
 	artifactID, _ := source["artifact_id"].(string)
@@ -146,7 +146,7 @@ func TestSyncSearchReturnsArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetArtifact(%s) error = %v", artifactID, err)
 	}
-	if chunk["artifact_id"] != artifactID || chunk["document_id"] != "doc-e03" {
+	if chunk["artifact_id"] != artifactID || chunk["document_id"] != "doc-index" {
 		t.Fatalf("artifact chunk = %v", chunk)
 	}
 
@@ -172,11 +172,11 @@ func TestSyncSearchReturnsArtifacts(t *testing.T) {
 func TestSyncSearchHonorsDocumentIDs(t *testing.T) {
 	h := newHarness(t, syncQueryPoints)
 	ctx := context.Background()
-	seedLegacyDocument(t, h, "doc-e03", "e03.md", []byte("E03 水路供水不足的处理步骤"))
+	seedLegacyDocument(t, h, "doc-index", "index.md", []byte("索引任务会切分上传的文档"))
 	h.Service.SearchEngine().SetReferenceCapture(searchrefs.New(h.Stores, testLogger()))
 
 	visible := syncSearchRequest()
-	visible.DocumentIDs = []string{"doc-e03"}
+	visible.DocumentIDs = []string{"doc-index"}
 	payload, err := h.Service.Search(ctx, "alpha", visible)
 	if err != nil {
 		t.Fatalf("Search(visible) error = %v", err)

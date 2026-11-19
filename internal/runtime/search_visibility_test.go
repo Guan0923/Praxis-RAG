@@ -17,7 +17,7 @@ func TestRestrictedSearchRequestWidensInternalBounds(t *testing.T) {
 		Rerank:      contracts.RerankNone,
 		CandidateK:  5,
 		TopK:        2,
-		DocumentIDs: []string{"doc-e03"},
+		DocumentIDs: []string{"doc-index"},
 	}
 	restricted := restrictedSearchRequest(request)
 	if restricted.CandidateK != restrictedCandidateK {
@@ -175,13 +175,13 @@ func TestSearchHonorsDocumentIDs(t *testing.T) {
 	request := mustSearchRequest(t, map[string]any{
 		"query": "证据", "retrieval": "embedding", "rerank": "none", "candidate_k": 5, "top_k": 2,
 	})
-	request.DocumentIDs = []string{"doc-e03"}
+	request.DocumentIDs = []string{"doc-index"}
 	payload, err := engine.Search(context.Background(), "alpha", request)
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
 	}
 	results := payloadResults(t, payload)
-	if len(results) != 1 || results[0]["document_id"] != "doc-e03" || results[0]["rank"] != 1 {
+	if len(results) != 1 || results[0]["document_id"] != "doc-index" || results[0]["rank"] != 1 {
 		t.Fatalf("results = %v", results)
 	}
 	if payload["candidate_k"] != 5 || payload["top_k"] != 2 {
@@ -226,13 +226,13 @@ func TestSearchRawHonorsDocumentIDs(t *testing.T) {
 	request := mustSearchRequest(t, map[string]any{
 		"query": "证据", "retrieval": "embedding", "rerank": "none", "candidate_k": 5, "top_k": 2,
 	})
-	request.DocumentIDs = []string{"doc-temp"}
+	request.DocumentIDs = []string{"doc-access"}
 	payload, err := engine.SearchRaw(context.Background(), "alpha", request)
 	if err != nil {
 		t.Fatalf("SearchRaw() error = %v", err)
 	}
 	results := payloadResults(t, payload)
-	if len(results) != 1 || results[0]["document_id"] != "doc-temp" || results[0]["rank"] != 1 {
+	if len(results) != 1 || results[0]["document_id"] != "doc-access" || results[0]["rank"] != 1 {
 		t.Fatalf("results = %v", results)
 	}
 	if payload["top_k"] != 2 || payload["candidate_k"] != 5 {

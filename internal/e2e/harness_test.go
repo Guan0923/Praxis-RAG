@@ -46,23 +46,23 @@ var testEncryptionKey = statetest.TestEncryptionKey
 // documentText is long enough for several chunks with the seeded character
 // chunking configuration.
 const documentText = "One document paragraph with enough text for chunking. " +
-	"E03 水路供水不足的处理步骤需要排出管路空气。 " +
+	"索引任务负责将上传的文档切分为可检索的片段。 " +
 	"Another sentence keeps the chunk boundaries meaningful.\n\n" +
-	"Second paragraph repeats the operational procedure for the water loop. " +
-	"E04 压力异常时先关闭进水阀再检查过滤器。\n\n" +
-	"Third paragraph documents the cooling check and the filter replacement. " +
-	"E05 冷却水温过高时检查风扇与散热片。\n\n"
+	"Second paragraph repeats the steps for preparing a document index. " +
+	"索引任务完成后即可按片段检索。\n\n" +
+	"Third paragraph documents how to trace evidence to its source. " +
+	"检索结果会标注来源文件和片段编号。\n\n"
 
 // searchQueryPoints mimics a Qdrant query response with chunk records the
 // projector turns into search results.
 const searchQueryPoints = `[
 	{"id":"p1","version":1,"score":0.93,"payload":{
-		"record_type":"chunk","document_id":"doc-e03","chunk_id":"chunk-e03",
-		"text":"错误代码 E03 表示水路供水不足","title":"e03","source":"e03.md",
+		"record_type":"chunk","document_id":"doc-index","chunk_id":"chunk-index",
+		"text":"文档索引包含分块和向量化","title":"index","source":"index.md",
 		"metadata":{"kind":"test"},"upload_version":"v1"}},
 	{"id":"p2","version":1,"score":0.41,"payload":{
-		"record_type":"chunk","document_id":"doc-temp","chunk_id":"chunk-temp",
-		"text":"咖啡温度偏低时先预热杯子","title":"temperature","source":"temperature.md",
+		"record_type":"chunk","document_id":"doc-access","chunk_id":"chunk-access",
+		"text":"知识库可以按文档分配读取权限","title":"permissions","source":"permissions.md",
 		"metadata":{"kind":"test"},"upload_version":"v1"}}
 ]`
 

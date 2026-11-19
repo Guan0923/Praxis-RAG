@@ -91,7 +91,7 @@ func TestSearchEmbeddingPayload(t *testing.T) {
 		t.Fatalf("results = %v", results)
 	}
 	first := results[0]
-	if first["document_id"] != "doc-e03" || first["chunk_id"] != "chunk-e03" || first["source"] != "e03.md" {
+	if first["document_id"] != "doc-index" || first["chunk_id"] != "chunk-index" || first["source"] != "index.md" {
 		t.Errorf("first result = %v", first)
 	}
 	if first["rank"] != 1 || first["score"] != 0.9 {
@@ -133,14 +133,14 @@ func TestSearchBM25Payload(t *testing.T) {
 	engine, _ := newSearchEngineForTest(t, qdrantURL, modelURL)
 
 	request := mustSearchRequest(t, map[string]any{
-		"query": "E03 怎么处理", "retrieval": "bm25", "rerank": "none", "candidate_k": 5, "top_k": 1,
+		"query": "如何索引文档", "retrieval": "bm25", "rerank": "none", "candidate_k": 5, "top_k": 1,
 	})
 	payload, err := engine.Search(context.Background(), "alpha", request)
 	if err != nil {
 		t.Fatalf("Search() error = %v", err)
 	}
 	results := payloadResults(t, payload)
-	if len(results) != 1 || results[0]["document_id"] != "doc-e03" {
+	if len(results) != 1 || results[0]["document_id"] != "doc-index" {
 		t.Fatalf("results = %v", results)
 	}
 	body := lastQueryBody(t, qdrantCalls)
@@ -161,7 +161,7 @@ func TestSearchHybridWithCrossEncoder(t *testing.T) {
 	engine, _ := newSearchEngineForTest(t, qdrantURL, modelURL)
 
 	request := mustSearchRequest(t, map[string]any{
-		"query": "E03 供水", "retrieval": "hybrid", "rerank": "cross_encoder",
+		"query": "文档索引", "retrieval": "hybrid", "rerank": "cross_encoder",
 		"candidate_k": 5, "top_k": 2,
 	})
 	payload, err := engine.Search(context.Background(), "alpha", request)
@@ -175,7 +175,7 @@ func TestSearchHybridWithCrossEncoder(t *testing.T) {
 	if len(results) != 2 {
 		t.Fatalf("results = %v", results)
 	}
-	if results[0]["document_id"] != "doc-e03" || results[0]["score"] != 1.0 {
+	if results[0]["document_id"] != "doc-index" || results[0]["score"] != 1.0 {
 		t.Errorf("reranked first result = %v", results[0])
 	}
 	metadata, _ := results[0]["metadata"].(map[string]any)
@@ -236,7 +236,7 @@ func TestSearchMapsModelAPIErrorsToRagOperationError(t *testing.T) {
 	// subclasses RagOperationError); the engine folds it into the HTTP 503
 	// category with its message intact.
 	request := mustSearchRequest(t, map[string]any{
-		"query": "E03", "retrieval": "hybrid", "rerank": "none",
+		"query": "索引", "retrieval": "hybrid", "rerank": "none",
 	})
 	_, err := engine.Search(context.Background(), "alpha", request)
 	var operation *contracts.RagOperationError
@@ -399,16 +399,16 @@ func TestNormalizeSearchPayloadShapes(t *testing.T) {
 		t.Fatalf("normalizeSearchPayload(nil) = %v, want nil", normalized)
 	}
 
-	absent := map[string]any{"query": "E03"}
+	absent := map[string]any{"query": "索引"}
 	normalizedAbsent := normalizeSearchPayload(absent)
 	if _, present := normalizedAbsent["results"]; present {
 		t.Fatalf("result-less payload gained a results key: %v", normalizedAbsent)
 	}
-	if normalizedAbsent["query"] != "E03" {
+	if normalizedAbsent["query"] != "索引" {
 		t.Fatalf("result-less payload lost its other fields: %v", normalizedAbsent)
 	}
 
-	emptyTyped := map[string]any{"query": "E03", "results": []map[string]any{}}
+	emptyTyped := map[string]any{"query": "索引", "results": []map[string]any{}}
 	normalizedEmpty := normalizeSearchPayload(emptyTyped)
 	emptyResults, ok := normalizedEmpty["results"].([]any)
 	if !ok || emptyResults == nil || len(emptyResults) != 0 {
@@ -419,11 +419,11 @@ func TestNormalizeSearchPayloadShapes(t *testing.T) {
 	}
 
 	typed := map[string]any{
-		"query":            "E03",
+		"query":            "索引",
 		"snapshot_context": map[string]any{"collection": "knowledge_test"},
 		"results": []map[string]any{
-			{"rank": 1, "document_id": "doc-e03"},
-			{"rank": 2, "document_id": "doc-temp"},
+			{"rank": 1, "document_id": "doc-index"},
+			{"rank": 2, "document_id": "doc-access"},
 		},
 	}
 	normalized := normalizeSearchPayload(typed)
@@ -432,10 +432,10 @@ func TestNormalizeSearchPayloadShapes(t *testing.T) {
 		t.Fatalf("normalized results = %#v", normalized["results"])
 	}
 	first, ok := results[0].(map[string]any)
-	if !ok || first["document_id"] != "doc-e03" {
+	if !ok || first["document_id"] != "doc-index" {
 		t.Fatalf("normalized first result = %#v", results[0])
 	}
-	if normalized["query"] != "E03" {
+	if normalized["query"] != "索引" {
 		t.Fatalf("normalized payload lost query: %v", normalized)
 	}
 	if contextMap, ok := normalized["snapshot_context"].(map[string]any); !ok || contextMap["collection"] != "knowledge_test" {

@@ -16,7 +16,7 @@ import (
 )
 
 func TestPrepareTextTXTMatchesChunkDocument(t *testing.T) {
-	path := writeText(t, "notes.txt", "Manual X7\n\nE03 temperature fault. Reset the sensor.")
+	path := writeText(t, "notes.txt", "Indexing Guide\n\nSplit documents into chunks before indexing.")
 	config := mustConfig(t, "token", 512, 64)
 	result, err := Prepare(t.Context(), path, Options{
 		SourceName: "notes.txt",
@@ -28,7 +28,7 @@ func TestPrepareTextTXTMatchesChunkDocument(t *testing.T) {
 	if len(result.Chunks) == 0 {
 		t.Fatalf("no chunks")
 	}
-	if result.Title != "Manual X7" {
+	if result.Title != "Indexing Guide" {
 		t.Fatalf("title = %q", result.Title)
 	}
 	if result.Metadata["document_suffix"] != ".txt" {
@@ -125,7 +125,7 @@ func TestPrepareDOCXAssetsArtifactsAndMetadata(t *testing.T) {
 	manifest := newManifestBuilder().
 		heading("#/texts/0", "设备手册", []string{"设备手册"}).
 		paragraph("#/texts/1", "正常使用。", "设备手册").
-		table("#/tables/0", "table-1", [][]string{{"错误码", "处理方法"}, {"E03", "检查传感器连接"}}, "设备手册").
+		table("#/tables/0", "table-1", [][]string{{"环节", "操作"}, {"索引", "写入片段向量"}}, "设备手册").
 		picture("#/pictures/0", "picture-1", "图 1: 状态灯", "设备手册").
 		build()
 	source := plainDocxPackage(t, paragraphXML("正文"), false)
