@@ -12,6 +12,7 @@ import (
 	"github.com/Guan0923/Praxis-RAG/internal/kbconfig"
 	"github.com/Guan0923/Praxis-RAG/internal/mcp"
 	"github.com/Guan0923/Praxis-RAG/internal/runtime"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // HTTPRuntime adapts *runtime.Service to httpapi.Runtime.
@@ -276,6 +277,17 @@ func (a HTTPRuntime) UpdateKnowledgeBase(ctx context.Context, namespace string, 
 		Reembed:                input.Reembed,
 		EmbeddingBillingSource: input.EmbeddingBillingSource,
 	})
+}
+
+func (a HTTPRuntime) SubmitReembed(ctx context.Context, namespace string, input httpapi.KnowledgeBaseUpdateInput) (*state.ReembedJob, error) {
+	return a.Service.SubmitReembed(ctx, namespace, kbconfig.UpdateInput{
+		Values:                 input.Values,
+		EmbeddingBillingSource: input.EmbeddingBillingSource,
+	})
+}
+
+func (a HTTPRuntime) LatestReembed(ctx context.Context, namespace string) (*state.ReembedJob, error) {
+	return a.Service.LatestReembed(ctx, namespace)
 }
 
 // KnowledgeBaseKey implements httpapi.KnowledgeBaseAdminRuntime.

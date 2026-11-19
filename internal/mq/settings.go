@@ -27,6 +27,9 @@ const (
 	DefaultDocumentTopic = "praxis_document_ingest"
 	DefaultDocumentGroup = "praxis_document_ingest_workers"
 
+	DefaultReembedTopic = "praxis_reembed"
+	DefaultReembedGroup = "praxis_reembed_workers"
+
 	DefaultDocumentDLQTopic = "praxis_document_ingest_dead_letters"
 	DefaultCacheDLQTopic    = "praxis_state_cache_refresh_dead_letters"
 
@@ -86,6 +89,9 @@ type Settings struct {
 	CacheDLQTopic string
 	CacheDLQGroup string
 
+	ReembedTopic string
+	ReembedGroup string
+
 	PublishTimeout time.Duration
 }
 
@@ -120,6 +126,8 @@ func SettingsFromEnv() (Settings, error) {
 		DocumentDLQTopic: strings.TrimSpace(envOrDefault("RAG_DOCUMENT_DLQ_TOPIC", DefaultDocumentDLQTopic)),
 		CacheDLQTopic:    strings.TrimSpace(envOrDefault("RAG_CACHE_DLQ_TOPIC", DefaultCacheDLQTopic)),
 		CacheDLQGroup:    strings.TrimSpace(envOrDefault("RAG_CACHE_DLQ_GROUP", DefaultCacheDLQGroup)),
+		ReembedTopic:     strings.TrimSpace(envOrDefault("RAG_REEMBED_TOPIC", DefaultReembedTopic)),
+		ReembedGroup:     strings.TrimSpace(envOrDefault("RAG_REEMBED_GROUP", DefaultReembedGroup)),
 		PublishTimeout:   publishTimeout,
 	}
 	if settings.ClientID == "" {
@@ -179,6 +187,19 @@ func (s Settings) Validate() error {
 	if s.CacheDLQGroup != "" {
 		if s.CacheDLQGroup == s.DocumentGroup || s.CacheDLQGroup == s.CacheGroup {
 			return newConfigError("Cache dead-letter group must be separate from the business consumer groups")
+		}
+	}
+	if s.ReembedTopic != "" || s.ReembedGroup != "" {
+		if s.ReembedTopic == "" || s.ReembedGroup == "" {
+			return newConfigError("Re-embedding topic and group must not be empty")
+		}
+		if s.ReembedTopic == s.DocumentTopic || s.ReembedTopic == s.CacheTopic ||
+			s.ReembedTopic == s.DocumentDLQTopic || s.ReembedTopic == s.CacheDLQTopic {
+			return newConfigError("Re-embedding topic must be separate from other queues")
+		}
+		if s.ReembedGroup == s.DocumentGroup || s.ReembedGroup == s.CacheGroup || s.ReembedGroup == s.CacheDLQGroup ||
+			s.ReembedGroup == strings.TrimSpace(envOrDefault("RAG_DOCUMENT_DLQ_GROUP", "praxis_document_dead_letters")) {
+			return newConfigError("Re-embedding group must be separate from other consumer groups")
 		}
 	}
 	return nil

@@ -41,11 +41,15 @@ func searchServiceWithRetriever(t *testing.T, retriever retrieval.Retriever, tim
 		nil,
 	)
 	engine := &SearchEngine{
+		indexVersion: func(context.Context, string) (int, string, error) {
+			return 1, "knowledge_timeout_test", nil
+		},
 		tenants: map[string]*tenantResources{
 			"alpha": {
-				settings:     map[string]any{},
-				collection:   "knowledge_timeout_test",
-				orchestrator: orchestrator,
+				configurationVersion: 1,
+				settings:             map[string]any{},
+				collection:           "knowledge_timeout_test",
+				orchestrator:         orchestrator,
 			},
 		},
 	}

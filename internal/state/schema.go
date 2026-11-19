@@ -555,6 +555,24 @@ var schemaTables = []*SchemaTable{
 			index("ix_document_job_recovery", "status", "lease_until"),
 		},
 	},
+	{
+		Name: "reembed_jobs",
+		Columns: []SchemaColumn{
+			identifier("job_id", 36).PK(),
+			identifier("namespace", 64),
+			identifier("active_namespace", 64).Null(),
+			bigint("base_version"),
+			identifier("base_collection", 255),
+			longText("target_settings").Null(),
+			identifier("staging_collection", 255),
+			identifier("status", 24),
+			text("error").Null(),
+			identifier("created_at", 40),
+			identifier("updated_at", 40),
+		},
+		Uniques: []SchemaUnique{unique("uq_reembed_active_namespace", "active_namespace")},
+		Indexes: []SchemaIndex{index("ix_reembed_namespace_created", "namespace", "created_at")},
+	},
 	// search_tasks is a retained historical table: search is synchronous and no
 	// longer queues tasks. The DDL is kept so existing databases and audit data
 	// are not altered; physical removal is a separate operation (same precedent

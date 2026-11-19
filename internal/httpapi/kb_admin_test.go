@@ -10,6 +10,7 @@ import (
 
 	"github.com/Guan0923/Praxis-RAG/internal/apierrors"
 	"github.com/Guan0923/Praxis-RAG/internal/auth"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 type fakeKBAdminRuntime struct {
@@ -26,6 +27,7 @@ type fakeKBAdminRuntime struct {
 	updateInput     KnowledgeBaseUpdateInput
 	updatePayload   map[string]any
 	updateErr       error
+	reembedJob      *state.ReembedJob
 
 	keyPayload string
 	keyErr     error
@@ -55,6 +57,20 @@ func (f *fakeKBAdminRuntime) UpdateKnowledgeBase(_ context.Context, namespace st
 	f.updateNamespace = namespace
 	f.updateInput = input
 	return f.updatePayload, f.updateErr
+}
+
+func (f *fakeKBAdminRuntime) SubmitReembed(_ context.Context, namespace string, input KnowledgeBaseUpdateInput) (*state.ReembedJob, error) {
+	f.updateNamespace = namespace
+	f.updateInput = input
+	f.reembedJob = &state.ReembedJob{ID: "job-test", Namespace: namespace, Status: state.ReembedQueued}
+	return f.reembedJob, nil
+}
+
+func (f *fakeKBAdminRuntime) LatestReembed(_ context.Context, namespace string) (*state.ReembedJob, error) {
+	if f.reembedJob != nil && f.reembedJob.Namespace == namespace {
+		return f.reembedJob, nil
+	}
+	return nil, nil
 }
 
 func (f *fakeKBAdminRuntime) KnowledgeBaseKey(context.Context, string, string) (string, error) {
@@ -191,7 +207,6 @@ func TestKnowledgeBaseAdminCreate(t *testing.T) {
 		input.VLMValues["base_url"] != "http://vlm.local/v1" || input.VLMValues["apikey"] != "vlm-sekret" {
 		t.Fatalf("vlm input = %+v values = %v", input, input.VLMValues)
 	}
-
 
 	invalidNamespace := performRequest(handler, testRequest{
 		method: "POST", target: "/v1/admin/knowledge-bases", remote: "127.0.0.1:5000",
@@ -330,7 +345,6 @@ func TestKnowledgeBaseAdminValidationParity(t *testing.T) {
 		{"patch empty embedding_model", `{"embedding_model":""}`, "embedding_model", "string_too_short", true},
 		{"patch long embedding_model", `{"embedding_model":"` + longText(513) + `"}`, "embedding_model", "string_too_long", true},
 		{"patch long reranker_model", `{"reranker_model":"` + longText(513) + `"}`, "reranker_model", "string_too_long", true},
-
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -683,5 +697,21 @@ func TestNamespaceListAccessServiceErrors(t *testing.T) {
 				t.Fatalf("detail = %v", detail)
 			}
 		})
+	}
+}
+
+func TestKnowledgeBaseReembedJobEndpoints(t *testing.T) {
+	runtime := &fakeKBAdminRuntime{fakeDocRuntime: newFakeDocRuntime()}
+	handler := newKBAdminServer(t, runtime)
+	const path = "/v1/admin/knowledge-bases/alpha/reembed-jobs"
+	accepted := performRequest(handler, testRequest{
+		method: "POST", target: path, remote: "127.0.0.1:5000", body: `{"embedding_model":"embed-b"}`,
+	})
+	if accepted.Code != http.StatusAccepted || runtime.updateNamespace != "alpha" || runtime.updateInput.Values["embedding_model"] != "embed-b" {
+		t.Fatalf("submit re-embedding: status %d body %s", accepted.Code, accepted.Body.String())
+	}
+	status := performRequest(handler, testRequest{method: "GET", target: path, remote: "127.0.0.1:5000"})
+	if status.Code != http.StatusOK || status.Body.String() != accepted.Body.String() {
+		t.Fatalf("read re-embedding: status %d body %s", status.Code, status.Body.String())
 	}
 }

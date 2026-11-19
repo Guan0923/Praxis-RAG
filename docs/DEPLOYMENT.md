@@ -827,3 +827,8 @@ systemctl enable --now praxis-rag-dead-letter-worker@cache.service
 - Console「系统监控 → 概览」：读模型缓存启用时 `Redis` 依赖行探测展示缓存；`RAG_REDIS_ENABLED=false` 时，该行改报**文档锁后端**的连接状态（只显示连接是否正常，不暴露键与 token）。
 - `GET /v1/admin/upload-leases`：`expires_at`/`expired` 用锁后端实时 TTL 计算（长任务不再被误判过期），Redis 不可用时回退 MySQL 登记值；接口不返回原始 owner token，`holder_id` 是短哈希。
 - 失败语义：Redis 冲突仍是 409 冲突（同一份文档被其他 worker 锁定）；Redis 不可用返回可重试错误（异步受理 5xx），单实例不会回退 MySQL 锁；提交成功但释放锁失败时不重复执行已提交操作，最多等到租约 TTL 过期。
+
+
+## 整库重新向量化 Worker
+
+Windows `scripts/start-stack.ps1` 和 Docker Compose 的 `app` profile 会创建 `RAG_REEMBED_TOPIC`（默认 `praxis_reembed`）并启动 `rag-reembed-worker`。消费组由 `RAG_REEMBED_GROUP` 指定，默认 `praxis_reembed_workers`。手动部署时，先通过状态库迁移创建 `reembed_jobs`、在 Kafka 上预建 topic 并重新注册文档 Debezium 连接器，然后运行该 worker。worker 和 API 使用相同的 MySQL、状态加密密钥、Qdrant、Redis 文档锁与 Kafka 配置。Kafka 消息只含任务定位字段，任务参数与结果都在 MySQL。

@@ -820,6 +820,19 @@ func (r *KnowledgeBaseRepository) Version(ctx context.Context, namespace string)
 	return int(version), true, nil
 }
 
+// IndexVersion identifies the live index without reading the provider settings.
+// Collection distinguishes knowledge bases recreated with the same namespace and version.
+func (r *KnowledgeBaseRepository) IndexVersion(ctx context.Context, namespace string) (int, string, error) {
+	var version int
+	var collection string
+	err := r.db.QueryRowContext(ctx, "SELECT version, collection FROM knowledge_bases WHERE namespace = ?", namespace).
+		Scan(&version, &collection)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", nil
+	}
+	return version, collection, err
+}
+
 // Snapshot returns settings and version atomically; nil when absent.
 func (r *KnowledgeBaseRepository) Snapshot(ctx context.Context, namespace string) (*KnowledgeBaseSnapshot, error) {
 	var raw string

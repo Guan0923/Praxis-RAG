@@ -13,8 +13,8 @@
 
     "topic.prefix": "praxis_rag",
     "database.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}",
-    "table.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs",
-    "column.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.artifact_id,${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.schedule_version",
+    "table.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs,${RAG_MYSQL_DATABASE:-praxis_rag}.reembed_jobs",
+    "column.include.list": "${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.artifact_id,${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.namespace,${RAG_MYSQL_DATABASE:-praxis_rag}.document_jobs.schedule_version,${RAG_MYSQL_DATABASE:-praxis_rag}.reembed_jobs.job_id,${RAG_MYSQL_DATABASE:-praxis_rag}.reembed_jobs.namespace",
     "skip.messages.without.change": "true",
     "skipped.operations": "d",
     "include.schema.changes": "false",
@@ -30,11 +30,15 @@
     "key.converter.schemas.enable": "false",
     "value.converter.schemas.enable": "false",
 
-    "transforms": "RouteDocumentJobs",
+    "transforms": "RouteDocumentJobs,RouteReembedJobs",
     "transforms.RouteDocumentJobs.type": "io.debezium.transforms.ByLogicalTableRouter",
     "transforms.RouteDocumentJobs.topic.regex": "(.*)document_jobs",
     "transforms.RouteDocumentJobs.topic.replacement": "${RAG_DOCUMENT_TOPIC:-praxis_document_ingest}",
     "transforms.RouteDocumentJobs.key.enforce.uniqueness": "false",
+    "transforms.RouteReembedJobs.type": "io.debezium.transforms.ByLogicalTableRouter",
+    "transforms.RouteReembedJobs.topic.regex": "(.*)reembed_jobs$",
+    "transforms.RouteReembedJobs.topic.replacement": "${RAG_REEMBED_TOPIC:-praxis_reembed}",
+    "transforms.RouteReembedJobs.key.enforce.uniqueness": "false",
 
     "producer.override.acks": "all",
     "producer.override.enable.idempotence": "true",

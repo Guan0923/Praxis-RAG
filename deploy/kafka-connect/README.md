@@ -31,7 +31,7 @@ Server 进程。
 
 | 连接器 | 模板 | 采集范围 | 目标 topic | schema history |
 | --- | --- | --- | --- | --- |
-| `praxis-document-cdc` | `connectors/document-cdc.json` | 仅 `document_jobs`，仅 INSERT 与 `schedule_version` 增长的 UPDATE | `RAG_DOCUMENT_TOPIC`（默认 `praxis_document_ingest`） | `praxis_cdc_document_schema_history` |
+| `praxis-document-cdc` | `connectors/document-cdc.json` | `document_jobs` 的新增与调度版本变更、`reembed_jobs` 的新增 | `RAG_DOCUMENT_TOPIC`（默认 `praxis_document_ingest`）、`RAG_REEMBED_TOPIC`（默认 `praxis_reembed`） | `praxis_cdc_document_schema_history` |
 | `praxis-cache-cdc` | `connectors/cache-cdc.json` | 7 张读模型表，全部 c/u/d | `RAG_CACHE_TOPIC`（默认 `praxis_state_cache_refresh`） | `praxis_cdc_cache_schema_history` |
 
 连接器名称是**固定契约**：注册、监控、自动重启都按这两个名字寻址。修改名称需要
@@ -39,7 +39,7 @@ Server 进程。
 
 两个连接器的关键差异：
 
-- **文档连接器**只保留定位列（`artifact_id`、`namespace`、`schedule_version`），
+- **文档连接器**只保留定位列（文档任务的 `artifact_id`、`namespace`、`schedule_version`，以及重新向量化任务的 `job_id`、`namespace`），
   `skip.messages.without.change=true`，`skipped.operations=d`，所以删除业务文档
   不会产生 Kafka 通知；`schedule_version` 变化的重试才会重新投递。
 - **缓存连接器**必须保留删除前镜像（`tombstones.on.delete=false`），因为

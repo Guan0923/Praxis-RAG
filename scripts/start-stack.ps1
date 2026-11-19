@@ -105,6 +105,8 @@ if (-not $env:RAG_CACHE_TOPIC) { $env:RAG_CACHE_TOPIC = "praxis_state_cache_refr
 if (-not $env:RAG_CACHE_GROUP) { $env:RAG_CACHE_GROUP = "praxis_state_cache_refresh_workers" }
 if (-not $env:RAG_DOCUMENT_TOPIC) { $env:RAG_DOCUMENT_TOPIC = "praxis_document_ingest" }
 if (-not $env:RAG_DOCUMENT_GROUP) { $env:RAG_DOCUMENT_GROUP = "praxis_document_ingest_workers" }
+if (-not $env:RAG_REEMBED_TOPIC) { $env:RAG_REEMBED_TOPIC = "praxis_reembed" }
+if (-not $env:RAG_REEMBED_GROUP) { $env:RAG_REEMBED_GROUP = "praxis_reembed_workers" }
 if (-not $env:RAG_DOCUMENT_DLQ_TOPIC) { $env:RAG_DOCUMENT_DLQ_TOPIC = "praxis_document_ingest_dead_letters" }
 if (-not $env:RAG_CACHE_DLQ_TOPIC) { $env:RAG_CACHE_DLQ_TOPIC = "praxis_state_cache_refresh_dead_letters" }
 if (-not $env:RAG_DOCUMENT_DLQ_GROUP) { $env:RAG_DOCUMENT_DLQ_GROUP = "praxis_document_dead_letters" }
@@ -127,18 +129,18 @@ if (-not $env:RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD) {
     $env:RAG_MYSQL_DEBEZIUM_CACHE_PASSWORD = $env:RAG_MYSQL_DEBEZIUM_PASSWORD
 }
 
-$normalTopics = @($env:RAG_CACHE_TOPIC, $env:RAG_DOCUMENT_TOPIC)
+$normalTopics = @($env:RAG_CACHE_TOPIC, $env:RAG_DOCUMENT_TOPIC, $env:RAG_REEMBED_TOPIC)
 $dlqTopics = @($env:RAG_DOCUMENT_DLQ_TOPIC, $env:RAG_CACHE_DLQ_TOPIC)
-$normalGroups = @($env:RAG_CACHE_GROUP, $env:RAG_DOCUMENT_GROUP)
+$normalGroups = @($env:RAG_CACHE_GROUP, $env:RAG_DOCUMENT_GROUP, $env:RAG_REEMBED_GROUP)
 $dlqGroups = @($env:RAG_DOCUMENT_DLQ_GROUP, $env:RAG_CACHE_DLQ_GROUP)
 if (@($normalTopics | Sort-Object -Unique).Count -ne $normalTopics.Count) {
-    throw "RAG_CACHE_TOPIC and RAG_DOCUMENT_TOPIC must be distinct."
+    throw "Cache, document and re-embedding topics must be distinct."
 }
 if (@($dlqTopics | Sort-Object -Unique).Count -ne $dlqTopics.Count) {
     throw "RAG_CACHE_DLQ_TOPIC and RAG_DOCUMENT_DLQ_TOPIC must be distinct."
 }
 if (@($normalGroups | Sort-Object -Unique).Count -ne $normalGroups.Count) {
-    throw "RAG_CACHE_GROUP and RAG_DOCUMENT_GROUP must be distinct."
+    throw "Cache, document and re-embedding consumer groups must be distinct."
 }
 if (@($dlqGroups | Sort-Object -Unique).Count -ne $dlqGroups.Count) {
     throw "DLQ handler groups must be distinct from each other."
@@ -153,7 +155,8 @@ if (@($dlqTopics | Where-Object { $_ -in $normalTopics }).Count) {
 $binDir = Join-Path $root "dist\bin"
 $ragService = Join-Path $binDir "rag-service.exe"
 $connectExe = Join-Path $binDir "rag-connect.exe"
-if (-not (Test-Path $ragService) -or -not (Test-Path $connectExe)) {
+$reembedWorker = Join-Path $binDir "rag-reembed-worker.exe"
+if (-not (Test-Path $ragService) -or -not (Test-Path $connectExe) -or -not (Test-Path $reembedWorker)) {
     Write-Host "Building the Go backend (dist/bin) before starting..."
     & (Join-Path $PSScriptRoot "build-go.ps1") -SkipFrontend
     if ($LASTEXITCODE -ne 0) { throw "Go build failed; run scripts/build-go.ps1 and retry." }
@@ -293,7 +296,7 @@ for ($attempt = 0; $attempt -lt 30; $attempt++) {
 }
 if (-not $topicsReady) { throw "Kafka topic creation failed. Check docker compose logs kafka." }
 Write-Host "Kafka topics ready: $((& docker exec praxis-rag-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list) -join ', ')"
-Write-Host "Consumers: rag-document-worker and rag-cache-worker are started automatically with rag-service below; MCP/REST search is synchronous and needs no worker."
+Write-Host "Consumers: rag-document-worker, rag-cache-worker and rag-reembed-worker are started automatically with rag-service below; MCP/REST search is synchronous and needs no worker."
 Write-Host "REST/Console batch uploads return after durable admission; rag-document-worker processes them afterwards."
 Write-Host "Document workers retry in-process and publish exhausted messages to RAG_DOCUMENT_DLQ_TOPIC; run rag-dead-letter-worker --kind document|cache for them."
 Write-Host "Task/cache notifications come from the Kafka Connect Debezium connectors instead of an outbox: the document connector carries only document_jobs schema-4 locator ids plus schedule_version; the cache connector publishes locator-only c/u/d events to RAG_CACHE_TOPIC. Deploy API and workers together."
@@ -383,7 +386,7 @@ function Invoke-ConnectRegistration {
 
 Write-Host "Registering the two Debezium connectors (idempotent, by fixed name)..."
 Invoke-ConnectRegistration -Executable $connectExe -Urls ($connectUrls -join ',') -ExpectedVersion $env:DEBEZIUM_CONNECT_VERSION
-Write-Host "Kafka Connect is capturing MySQL binlog -> topics $($env:RAG_DOCUMENT_TOPIC), $($env:RAG_CACHE_TOPIC)."
+Write-Host "Kafka Connect is capturing MySQL binlog -> topics $($env:RAG_DOCUMENT_TOPIC), $($env:RAG_CACHE_TOPIC), $($env:RAG_REEMBED_TOPIC)."
 
 if ($MigrateOnly) {
     Write-Host "Dependencies started and migration finished."
@@ -423,10 +426,16 @@ else {
     Write-Host "Starting rag-cache-worker (consumes $($env:RAG_CACHE_TOPIC) as group $($env:RAG_CACHE_GROUP))..."
     $cacheWorkerProcess = Start-Process -FilePath $cacheWorker -NoNewWindow -PassThru
 }
+$reembedWorkerProcess = $null
 try {
+    Write-Host "Starting rag-reembed-worker (consumes $($env:RAG_REEMBED_TOPIC) as group $($env:RAG_REEMBED_GROUP))..."
+    $reembedWorkerProcess = Start-Process -FilePath $reembedWorker -WindowStyle Hidden -PassThru
     & $ragService
 }
 finally {
+    if ($reembedWorkerProcess) {
+        Stop-Process -Id $reembedWorkerProcess.Id -Force -ErrorAction SilentlyContinue
+    }
     foreach ($docWorkerProcess in $docWorkerProcesses) {
         Write-Host "Stopping rag-document-worker (pid $($docWorkerProcess.Id))..."
         Stop-Process -Id $docWorkerProcess.Id -Force -ErrorAction SilentlyContinue

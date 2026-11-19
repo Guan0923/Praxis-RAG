@@ -66,6 +66,20 @@ func ValidateDocumentNotification(payload any) (DocumentNotification, error) {
 	}, nil
 }
 
+// DecodeReembedNotification extracts the locating columns from the re-embedding CDC topic.
+func DecodeReembedNotification(body []byte) (namespace, jobID string, err error) {
+	fields, err := notificationFields(body, 0)
+	if err != nil {
+		return "", "", err
+	}
+	namespace, err = notificationNamespace(fields)
+	if err != nil {
+		return "", "", err
+	}
+	jobID, err = canonicalNotificationID(fields, "job_id")
+	return namespace, jobID, err
+}
+
 // DocumentJobEnvelope builds the content-free schema-4 notification of one job.
 func DocumentJobEnvelope(job *DocumentJob) (DocumentNotification, error) {
 	if job == nil {

@@ -33,10 +33,11 @@ import (
 // are serialized by mu; retrieval itself runs outside the lock and relies on the
 // stateless HTTP/Qdrant clients.
 type SearchEngine struct {
-	config     config.RagConfig
-	stores     *state.Stores
-	encoder    *sparse.Encoder
-	httpClient *http.Client
+	config       config.RagConfig
+	stores       *state.Stores
+	indexVersion func(context.Context, string) (int, string, error)
+	encoder      *sparse.Encoder
+	httpClient   *http.Client
 	// lightrag is the knowledge-graph sidecar client. It is nil when
 	// RAG_LIGHTRAG_SERVICE_URL is unset; graph retrieval then reports an
 	// explicit unavailable error instead of failing an unrelated search.
@@ -71,12 +72,13 @@ func NewSearchEngine(cfg config.RagConfig, stores *state.Stores) (*SearchEngine,
 		graphClient = client
 	}
 	return &SearchEngine{
-		config:     cfg,
-		stores:     stores,
-		encoder:    sparse.NewDefaultEncoder(),
-		httpClient: &http.Client{Timeout: qdrant.DefaultTimeout},
-		lightrag:   graphClient,
-		tenants:    make(map[string]*tenantResources),
+		config:       cfg,
+		stores:       stores,
+		indexVersion: stores.KnowledgeBases.IndexVersion,
+		encoder:      sparse.NewDefaultEncoder(),
+		httpClient:   &http.Client{Timeout: qdrant.DefaultTimeout},
+		lightrag:     graphClient,
+		tenants:      make(map[string]*tenantResources),
 	}, nil
 }
 

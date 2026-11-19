@@ -115,6 +115,7 @@ type Stores struct {
 
 	DocumentJobs    *DocumentJobs
 	DocumentBatches *DocumentBatches
+	ReembedJobs     *ReembedJobs
 
 	// DocumentLocks is the cross-instance lease backend (Redis in production)
 	// attached by the process entry point. Nil keeps the legacy MySQL lease mode;
@@ -260,6 +261,7 @@ func New(settings StateSettings, createSchema bool) (*Stores, error) {
 	}
 	stores.DocumentJobs = documentJobs
 	stores.DocumentBatches = NewDocumentBatches(stores)
+	stores.ReembedJobs = &ReembedJobs{stores: stores}
 	stores.FeishuConnections = NewFeishuConnectionRepository(stores, settings.EncryptionKey)
 	stores.FeishuOAuthStates = NewFeishuOAuthStateRepository(stores)
 	stores.LightRAGDocuments = NewLightRAGDocumentRepository(stores)

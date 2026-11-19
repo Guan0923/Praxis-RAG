@@ -37,6 +37,8 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "POST", Path: "/v1/admin/knowledge-bases/models/{kind}", Summary: "List provider models", Tag: "knowledge-bases", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/knowledge-bases/{namespace}", Summary: "Knowledge-base details", Tag: "knowledge-bases", Response: "200"},
 	{Method: "PATCH", Path: "/v1/admin/knowledge-bases/{namespace}", Summary: "Update a knowledge base", Tag: "knowledge-bases", Request: "UpdateKnowledgeBaseBody", Response: "200"},
+	{Method: "POST", Path: "/v1/admin/knowledge-bases/{namespace}/reembed-jobs", Summary: "Queue a knowledge-base re-embedding job", Tag: "knowledge-bases", Request: "UpdateKnowledgeBaseBody", Response: "202"},
+	{Method: "GET", Path: "/v1/admin/knowledge-bases/{namespace}/reembed-jobs", Summary: "Read the latest re-embedding job", Tag: "knowledge-bases", Response: "200"},
 	{Method: "DELETE", Path: "/v1/admin/knowledge-bases/{namespace}", Summary: "Delete a knowledge base and its documents", Tag: "knowledge-bases", Response: "204"},
 	{Method: "POST", Path: "/v1/admin/knowledge-bases/batch-delete", Summary: "Delete knowledge bases in bulk", Tag: "knowledge-bases", Request: "BatchDeleteKnowledgeBasesBody", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/knowledge-bases/{namespace}/key/{kind}", Summary: "Reveal a provider key", Tag: "knowledge-bases", Response: "200"},

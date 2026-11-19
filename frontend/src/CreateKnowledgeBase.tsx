@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
 import { Alert, App, Button, Descriptions, Form, Input, InputNumber, Select, Switch, Tooltip } from "antd";
 import { PlusOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
 import {
@@ -110,6 +110,11 @@ export function CreateKnowledgeBase({ active, disabled, onCreated, connection, o
 }
 
 type ResolvedProvider = { provider: ProviderValues; model: string };
+type ReembedJob = {
+  job_id: string;
+  status: "queued" | "processing" | "succeeded" | "failed";
+  error?: string;
+};
 
 export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, active, connection, onOpenModelProfiles }: {
   initial?: KnowledgeBase; disabled: boolean; onSaved: (item: KnowledgeBase) => void;
@@ -129,6 +134,11 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
   const [profilesError, setProfilesError] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [reembedJob, setReembedJob] = useState<ReembedJob | null>(null);
+  const [submittedReembedID, setSubmittedReembedID] = useState<string>();
+  const knowledgeBasePath = initial && "/v1/admin/knowledge-bases/" + encodeURIComponent(initial.namespace);
+  const reembedPath = knowledgeBasePath && knowledgeBasePath + "/reembed-jobs";
+  const reembedPending = reembedJob?.status === "queued" || reembedJob?.status === "processing";
   // 创建页默认开启全部可选模型（Reranker / VLM 开关默认打开，模型仍需
   // 逐个选择）；编辑页沿用知识库当前是否配置了该类模型。
   const [rerankerEnabled, setRerankerEnabled] = useState(initial ? Boolean(initial.reranker_model) : true);
@@ -140,7 +150,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
   const running = useRef(false);
   const strategy = Form.useWatch("strategy", form);
   const embeddingSelection = Form.useWatch("embedding_profile", form);
-  const locked = disabled || saving;
+  const locked = disabled || saving || reembedPending;
   const unit = defaults?.strategies.find((item) => item.id === strategy)?.unit === "characters" ? "字符" : "token";
   // 模型配置按账号严格隔离：管理员的总览视图会带别人的行，但创建/编辑知识库只能
   // 使用自己的配置——别人的 Key 不可读，服务端也不会接受。
@@ -152,6 +162,44 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
     && (Boolean(profilesError) || embeddingProfiles.length === 0);
   const embeddingProfile = ownProfiles.find((profile) => profile.id === embeddingSelection);
   const reembedRequired = profileNeedsReembed(initial, embeddingProfile);
+
+  const finishReembed = useEffectEvent(async (path: string, signal: AbortSignal) => {
+    const updated = await api<KnowledgeBase>(path, undefined, { signal });
+    if (signal.aborted) return;
+    void message.success("重新向量化完成，配置已切换");
+    onSaved(updated);
+  });
+
+  useEffect(() => {
+    if (!reembedPath || !knowledgeBasePath) return;
+    const controller = new AbortController();
+    let timer: number | undefined;
+    let watchedID = submittedReembedID;
+
+    async function refresh(path: string, configPath: string) {
+      try {
+        const job = await api<ReembedJob | null>(path, undefined, { signal: controller.signal });
+        if (controller.signal.aborted) return;
+        setReembedJob(job);
+        if (job?.status === "queued" || job?.status === "processing") {
+          watchedID = job.job_id;
+          timer = window.setTimeout(() => void refresh(path, configPath), 2000);
+        } else if (job?.status === "succeeded" && watchedID === job.job_id) {
+          await finishReembed(configPath, controller.signal);
+        }
+      } catch {
+        if (!controller.signal.aborted && watchedID) {
+          timer = window.setTimeout(() => void refresh(path, configPath), 4000);
+        }
+      }
+    }
+
+    void refresh(reembedPath, knowledgeBasePath);
+    return () => {
+      controller.abort();
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [reembedPath, knowledgeBasePath, submittedReembedID]);
 
   function currentUrl(kind: Kind) {
     if (!initial) return "";
@@ -348,6 +396,18 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
       };
       // 创建走会话级自建接口：任何角色都可以提交自己模型配置对应的 provider
       // 字段（每个账号用自己的配置建库）；编辑仍沿用管理员的知识库配置接口。
+      if (reembed && reembedPath) {
+        const job = await api<ReembedJob>(reembedPath, undefined, {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        if (!lifetime.current.signal.aborted) {
+          setReembedJob(job);
+          setSubmittedReembedID(job.job_id);
+          void message.success("重新向量化任务已受理");
+        }
+        return;
+      }
       const result = await api<KnowledgeBase>(
         initial ? "/v1/admin/knowledge-bases/" + initial.namespace : "/v1/knowledge-bases",
         undefined,
@@ -363,7 +423,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
         },
       );
       if (!lifetime.current.signal.aborted) {
-        void message.success(initial ? reembed ? "重新向量化完成，配置已切换" : "知识库配置已保存" : "知识库已创建");
+        void message.success(initial ? "知识库配置已保存" : "知识库已创建");
         if (!initial) {
           try { sessionStorage.removeItem(draftKey); } catch { /* Draft cleanup is best effort. */ }
           form.resetFields();
@@ -380,7 +440,7 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
   }
 
   function submit(values: Values, reembed = reembedRequired) {
-    if (reembed) modal.confirm({ title: "重新向量化并保存", content: "将使用新配置重新向量化该知识库的全部文档。全部成功后才切换；失败保留原配置和索引。",
+    if (reembed) modal.confirm({ title: "重新向量化并保存", content: "将使用新配置重新向量化该知识库的全部文档。任务将在后台执行，全部成功后才切换配置和索引。",
       okText: "开始重新向量化", cancelText: "取消", onOk: () => save(values, true) });
     else void save(values, false);
   }
@@ -471,6 +531,13 @@ export function KnowledgeBaseForm({ initial, disabled, onSaved, onBusyChange, ac
   });
 
   return <div className={"knowledge-base-form" + (initial ? "" : " knowledge-base-form-wide")}>
+    {reembedPending && <Alert type="info" showIcon className="page-alert"
+      title={reembedJob?.status === "queued" ? "重新向量化已排队" : "正在重新向量化"}
+      description="可以关闭此窗口，任务会继续运行。" />}
+    {reembedJob?.status === "succeeded" && <Alert type="success" showIcon className="page-alert"
+      title="最近一次重新向量化已完成" />}
+    {reembedJob?.status === "failed" && <Alert type="error" showIcon className="page-alert"
+      title="最近一次重新向量化失败" description={reembedJob.error} />}
     {error && <Alert type="error" showIcon className="page-alert" title="知识库配置失败" description={error}
       action={!defaults ? <Button icon={<ReloadOutlined />} aria-label="重新读取切分配置" onClick={() => void loadDefaults()} /> : undefined} />}
     {profilesError && <Alert type="error" showIcon className="page-alert" title="模型列表读取失败" description={profilesError}
