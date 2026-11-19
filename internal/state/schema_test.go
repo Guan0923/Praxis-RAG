@@ -74,6 +74,7 @@ var expectedSchema = []struct {
 	{"lightrag_documents", []string{"namespace", "document_id", "document_name", "config_fingerprint", "chunk_count", "status", "attempts", "last_error", "indexed_at", "updated_at"}},
 	// SAG event-entity index (retrieval mode sag): one event per chunk plus
 	// normalized entities and their associations.
+	{"sag_extraction_jobs", []string{"namespace", "document_id", "version", "chunk_id", "ready_at", "lease_generation", "failures", "last_error"}},
 	{"sag_events", []string{"id", "namespace", "document_id", "chunk_id", "event", "version", "created_at"}},
 	{"sag_entities", []string{"id", "namespace", "normalized_key", "entity_key", "display_name", "mention_count", "created_at", "updated_at"}},
 	{"sag_event_entities", []string{"event_id", "entity_id", "namespace", "created_at"}},
@@ -123,6 +124,7 @@ var expectedPrimaryKeys = map[string][]string{
 	"embedding_usage":          {"id"},
 	"billing_events":           {"id"},
 	"lightrag_documents":       {"namespace", "document_id"},
+	"sag_extraction_jobs":      {"namespace", "document_id", "version", "chunk_id"},
 	"sag_events":               {"id"},
 	"sag_entities":             {"id"},
 	"sag_event_entities":       {"event_id", "entity_id"},
@@ -185,6 +187,7 @@ var expectedIndexes = map[string][]string{
 	"embedding_usage":          {"ix_embedding_usage_user", "ix_embedding_usage_review"},
 	"billing_events":           {"ix_billing_events_order"},
 	"lightrag_documents":       {"ix_lightrag_documents_status"},
+	"sag_extraction_jobs":      {"ix_sag_extraction_ready"},
 	"sag_events":               {"ix_sag_events_document", "ix_sag_events_version"},
 	"sag_entities":             {"ix_sag_entities_normalized"},
 	"sag_event_entities":       {"ix_sag_event_entities_entity", "ix_sag_event_entities_event"},

@@ -1098,10 +1098,10 @@ curl.exe -X POST http://127.0.0.1:8011/v1/search `
 
 使用要求与行为：
 
-- 管理员先在 Console「模型配置」添加 `kind=extraction` 条目（任意 OpenAI 兼容 chat 端点，建议低价快速模型如 qwen-flash / deepseek-chat；存在多条时取**最近更新**的一条）。添加后，**新上传**的文档在发布完成后自动抽取（非致命阶段，失败只记日志不影响文档状态）；存量文档用 `rag-sag-backfill` CLI 补建。
+- 管理员先在 Console「模型配置」添加 `kind=extraction` 条目（任意 OpenAI 兼容 chat 端点，建议低价快速模型如 qwen-flash / deepseek-chat；存在多条时取**最近更新**的一条）。添加后，**新上传或替换**的文档发布时会登记 SAG 片段任务，由独立的 `rag-sag-worker` 后台抽取。文档可先通过普通检索使用，SAG 事件与实体随片段完成逐步可用。存量文档用 `rag-sag-backfill` CLI 补建。
 - 未配置抽取模型或文档未建索引时，`sag` 自动**降级为 hybrid 召回**（不报错、不静默无结果）。
 - 可以搭配任意 `rerank`（`none` 或 `cross_encoder`）：排序是种子分与超边共享实体数的融合分，cross-encoder 二段精排合法（区别于 `sag2`）。
-- 每文档抽取上限 512 chunk（超出部分留给回填 CLI），实体归一化为 casefold；抽取结果含 `metadata.sag_event`（该 chunk 的事件句），便于核对证据链。
+- 每个文档版本最多抽取 512 个片段，实体按 casefold 归一化。抽取结果含 `metadata.sag_event`（该 chunk 的事件句），便于核对证据链。
 - 删除文档时事件与关联级联清理，实体行保留（共享数据），不会留下悬空超边。
 - 受限账号（任何非全库可读账号，含全库 `read` + 文件级 deny）调用 `sag` 会被**明确拒绝**：该模式的动态超边扩展无法在召回前可靠限定文档范围，这是明确的拒绝而非静默泄露；其余检索模式按可读文档过滤（见 [权限管理](PERMISSIONS.md) §11）。
 

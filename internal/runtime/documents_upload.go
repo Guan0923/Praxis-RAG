@@ -807,7 +807,7 @@ func (s *Service) storeAndIndex(
 			logging.WrapStage("publishing", err))
 	}
 	if err := s.publishDocument(ctx, operation, record, metadata, options.Content,
-		indexed.artifactBucket, indexed.result.StagingDir, options.Task); err != nil {
+		indexed.artifactBucket, indexed.result.StagingDir, options.Task, indexed.qdrantChunks); err != nil {
 		return s.failDocumentOperation(ctx, journal, coordinator, operation,
 			logging.WrapStage("publishing", err))
 	}
@@ -818,9 +818,6 @@ func (s *Service) storeAndIndex(
 	if _, cleanupErr := coordinator.CleanupWorkspace(ctx, operation); cleanupErr != nil {
 		logUploadWarning(ctx, "Committed workspace cleanup pending", operation.ID, cleanupErr)
 	}
-	// The publication is durable: run the non-fatal SAG extraction stage. Its
-	// failures are logged inside and never change the publication outcome.
-	s.extractSagIndex(ctx, namespace, indexed.document.DocumentID, operation.ID, indexed.qdrantChunks)
 	return metadata, nil
 }
 

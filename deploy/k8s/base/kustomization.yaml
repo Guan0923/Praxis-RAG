@@ -1,4 +1,4 @@
-# 公共工作负载：API/MCP/Console、文档 worker、文档死信 worker。
+# 公共工作负载：API/MCP/Console、文档 worker、SAG worker、文档死信 worker。
 #
 # 这里只有「两种入口都需要」的对象。PDF 高保真（pdf-parser）在
 # overlays/vision 里，缓存消费者与 Redis 相关配置在 components/cache 里，
@@ -16,5 +16,6 @@ resources:
   - service-rag-service.yaml
   - deployment-rag-service.yaml
   - deployment-rag-document-worker.yaml
+  - deployment-rag-sag-worker.yaml
   - deployment-rag-dead-letter-document.yaml
   - rbac-monitor-ops.yaml
