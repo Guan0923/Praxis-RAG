@@ -211,10 +211,8 @@ func TestMarkdownParagraphsInsideListsDoNotBecomeHeadings(t *testing.T) {
 }
 
 func TestReadDocumentUnsupportedSuffixHasNoDot(t *testing.T) {
-	if _, err := ReadDocument(strings.ToUpper(SuffixTXT)); err == nil {
-		// A bare ".TXT" path is absolute on Windows and unsupported; the point
-		// is only that suffix handling is case-insensitive for real files.
-		t.Fatalf("expected an error for a dot-only path")
+	if _, err := ReadDocument(filepath.Join(t.TempDir(), "noextension")); err == nil || err.Error() != "暂不支持该文件类型：<none>" {
+		t.Fatalf("no-extension ReadDocument() error = %v", err)
 	}
 	path := writeTemp(t, "UPPER.TXT", []byte("hello"))
 	if _, err := ReadDocument(path); err != nil {

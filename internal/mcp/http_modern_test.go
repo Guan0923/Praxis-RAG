@@ -107,24 +107,29 @@ func TestModernToolValidationErrors(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
 		name      string
+		tool      string
 		arguments map[string]any
 		want      string
 	}{
-		{"removed wait argument", map[string]any{"query": "x", "wait_seconds": -1}, "Unknown search arguments: wait_seconds"},
-		{"unknown search argument", map[string]any{"query": "x", "namespace": "other"}, "Unknown search arguments: namespace"},
-		{"unknown document argument", map[string]any{"name": "a.txt", "content": "x", "path": "C:/x"}, "Unknown document arguments"},
-		{"bad artifact uuid", map[string]any{"artifact_id": "nope"}, "artifact_id must be a canonical UUID"},
+		{"removed wait argument", "search", map[string]any{"query": "x", "wait_seconds": -1}, "Unknown search arguments: wait_seconds"},
+		{"unknown search argument", "search", map[string]any{"query": "x", "namespace": "other"}, "Unknown search arguments: namespace"},
+		{"unknown document argument", "update_document", map[string]any{"name": "a.txt", "content": "x", "path": "C:/x"}, "Unknown document arguments"},
+		{"bad artifact uuid", "get_document_status", map[string]any{"artifact_id": "nope"}, "artifact_id must be a canonical UUID"},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			result, err := session.CallTool(ctx, &sdk.CallToolParams{
-				Name: "search", Arguments: testCase.arguments,
+				Name: testCase.tool, Arguments: testCase.arguments,
 			})
 			if err != nil {
 				t.Fatalf("call %s: %v", testCase.name, err)
 			}
 			if !result.IsError {
 				t.Fatalf("%s must be a tool error", testCase.name)
+			}
+			text, ok := result.Content[0].(*sdk.TextContent)
+			if !ok || text.Text != testCase.want {
+				t.Fatalf("%s error text = %q, want %q", testCase.name, text.Text, testCase.want)
 			}
 		})
 	}

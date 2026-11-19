@@ -318,8 +318,8 @@ func TestProcessDocumentJobValidatesPublicationInTransaction(t *testing.T) {
 	if records, _ := stores.Documents.List(ctx, "alpha"); len(records) != 0 {
 		t.Errorf("rejected publication wrote documents: %+v", records)
 	}
-	if len(qdrantFake.find("PUT", "/points")) == 0 {
-		t.Logf("staged points were compensated after the rejected publication")
+	if len(qdrantFake.find("POST", "/points/delete")) == 0 {
+		t.Errorf("staged points were not compensated after the rejected publication")
 	}
 }
 

@@ -84,7 +84,7 @@ func TestArtifactReadsEnforceDocumentGate(t *testing.T) {
 	}
 
 	// Unknown or expired ids keep the frozen 410 contract for every caller.
-	missing := strings.Repeat("0", 7) + "-0000-4000-8000-" + strings.Repeat("0", 12)
+	missing := strings.Repeat("0", 8) + "-0000-4000-8000-" + strings.Repeat("0", 12)
 	_, err = service.GetArtifact(gated, "alpha", missing, 0, 1024)
 	requireSnapshotUnavailable(t, err)
 	_, _, _, err = service.DownloadArtifact(ctx, "alpha", missing)

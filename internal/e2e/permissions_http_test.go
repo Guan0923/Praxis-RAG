@@ -152,24 +152,6 @@ func detailOf(payload map[string]any) string {
 	return detail
 }
 
-// createLegacyKnowledgeBase creates one knowledge base through the local
-// administrator route (owner stays NULL, like pre-sharing data).
-func createLegacyKnowledgeBase(t *testing.T, admin *consoleClient, handler http.Handler, namespace, modelURL string) {
-	t.Helper()
-	client := &consoleClient{handler: handler, t: t, cookie: admin.cookie, csrf: admin.csrf}
-	recorder, _ := client.json(http.MethodPost, "/v1/admin/knowledge-bases", "", map[string]any{
-		"namespace":       namespace,
-		"embedding":       map[string]any{"base_url": modelURL, "apikey": ""},
-		"embedding_model": "embed-a",
-		"reranker":        map[string]any{"base_url": modelURL, "apikey": ""},
-		"reranker_model":  "rank-a",
-		"strategy":        "character",
-		"chunk_size":      120,
-		"chunk_overlap":   20,
-	})
-	requireStatus(t, recorder, http.StatusCreated, "create knowledge base "+namespace)
-}
-
 // TestPermissionsInvitationFlowEndToEnd walks the complete sharing workflow:
 // role management, ownership visibility, a read invitation accepted through
 // its link, document read/write gates, a write grant, self-creation from the
@@ -210,9 +192,7 @@ func TestPermissionsInvitationFlowEndToEnd(t *testing.T) {
 		t.Fatalf("invitable users = %v, want 2", users)
 	}
 
-	// The administrator creates the default template (legacy route, NULL owner)
-	// and one owned knowledge base through the tenant self-create route.
-	createLegacyKnowledgeBase(t, admin, handler, "default", h.ModelURL)
+	// One owned knowledge base is created through the tenant self-create route.
 	recorder, _ = admin.json(http.MethodPost, "/v1/knowledge-bases", "", map[string]any{
 		"namespace":       "team",
 		"embedding":       map[string]any{"base_url": h.ModelURL, "apikey": ""},

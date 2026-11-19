@@ -62,6 +62,14 @@ func TestUploadBloomBackendRoundTrip(t *testing.T) {
 	if err != nil || ok {
 		t.Fatalf("second AcquireBuild must lose the lease: (%v, %v)", ok, err)
 	}
+	// Renewing the live lease extends its TTL.
+	if err := backend.RenewBuild(ctx, 1, 2*time.Minute); err != nil {
+		t.Fatalf("RenewBuild(live) = %v", err)
+	}
+	leaseTTL, err := client.TTL(ctx, backend.buildingKey()).Result()
+	if err != nil || leaseTTL <= time.Minute {
+		t.Fatalf("building TTL after RenewBuild = (%v, %v), want extended beyond one minute", leaseTTL, err)
+	}
 
 	// Register an ID and probe it.
 	id := fmt.Sprintf("%032x", 7)
@@ -131,7 +139,6 @@ func TestUploadBloomBackendRoundTrip(t *testing.T) {
 		t.Fatalf("shard TTL after ExpireGeneration = (%v, %v)", ttl, err)
 	}
 }
-
 // TestUploadBloomBackendUnavailable verifies every failure surfaces as
 // *state.BloomUnavailable (callers fall back to MySQL rather than fail).
 func TestUploadBloomBackendUnavailable(t *testing.T) {

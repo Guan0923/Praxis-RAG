@@ -370,3 +370,98 @@ func TestModelProfileJEVConfiguration(t *testing.T) {
 		t.Fatalf("jev update probed the provider: %+v", calls.all())
 	}
 }
+
+// TestModelProfileViewerIsolation pins the ownership boundary: another
+// account's row is indistinguishable from a missing one for every by-id
+// operation, and an administrator's read-only view sees the row but never gets
+// the key or any write on it.
+func TestModelProfileViewerIsolation(t *testing.T) {
+	modelURL, calls := newFakeModelAPI(t, kbModelHandler(nil))
+	service, _ := newKBService(t, "http://127.0.0.1:1")
+	ctx := context.Background()
+	const owner, foreign, admin = "user-1", "user-2", "admin-1"
+
+	created, err := service.CreateModelProfile(ctx, owner, false, modelProfileDraft(
+		"embedding", "bge-m3", modelURL, "embed-a", "owner-key"))
+	if err != nil {
+		t.Fatalf("CreateModelProfile() error = %v", err)
+	}
+	id, _ := created["id"].(string)
+	if !modelProfileIDPattern.MatchString(id) {
+		t.Fatalf("created id = %q", id)
+	}
+
+	// A foreign account sees another account's row exactly like a missing one.
+	var validation *apierrors.KnowledgeValidationError
+	operations := map[string]func() error{
+		"ModelProfile": func() error {
+			_, err := service.ModelProfile(ctx, foreign, false, id)
+			return err
+		},
+		"ModelProfileKey": func() error {
+			_, err := service.ModelProfileKey(ctx, foreign, false, id)
+			return err
+		},
+		"UpdateModelProfile": func() error {
+			_, err := service.UpdateModelProfile(ctx, foreign, false, id, kbconfig.ModelProfileDraft{Name: "hijacked"})
+			return err
+		},
+		"DeleteModelProfile": func() error {
+			_, err := service.DeleteModelProfile(ctx, foreign, false, id)
+			return err
+		},
+		"ModelProfileModels": func() error {
+			_, err := service.ModelProfileModels(ctx, foreign, false, id)
+			return err
+		},
+	}
+	for name, operation := range operations {
+		if err := operation(); err == nil || !errors.As(err, &validation) ||
+			validation.Message != kbconfig.MessageModelProfileMissing {
+			t.Fatalf("%s(foreign) = %v, want MessageModelProfileMissing", name, err)
+		}
+	}
+	if detail, err := service.ModelProfile(ctx, foreign, false, id); err == nil || detail != nil {
+		t.Fatalf("ModelProfile(foreign) = %v, %v", detail, err)
+	}
+	// The foreign account's list stays empty.
+	foreignList, err := service.ListModelProfiles(ctx, foreign, false)
+	if err != nil || len(foreignList) != 0 {
+		t.Fatalf("foreign ListModelProfiles() = %v, %v", foreignList, err)
+	}
+
+	// The administrator's read-only overview sees the row (mine=false, owner
+	// fields present) but never gets the key, models come through, and every
+	// write on the foreign row is still rejected.
+	detail, err := service.ModelProfile(ctx, admin, true, id)
+	if err != nil {
+		t.Fatalf("ModelProfile(admin) error = %v", err)
+	}
+	if detail["mine"] != false || detail["owner_user_id"] != owner || detail["owner_username"] != "" {
+		t.Fatalf("admin detail = %v", detail)
+	}
+	if key, err := service.ModelProfileKey(ctx, admin, true, id); err == nil || key != "" {
+		t.Fatalf("ModelProfileKey(admin) = %q, %v, want the missing-profile validation", key, err)
+	} else if !errors.As(err, &validation) || validation.Message != kbconfig.MessageModelProfileMissing {
+		t.Fatalf("ModelProfileKey(admin) error = %v", err)
+	}
+	if _, err := service.UpdateModelProfile(ctx, admin, true, id, kbconfig.ModelProfileDraft{Name: "admin-edit"}); !errors.As(err, &validation) {
+		t.Fatalf("UpdateModelProfile(admin) = %v, want validation", err)
+	}
+	if deleted, err := service.DeleteModelProfile(ctx, admin, true, id); deleted || err == nil ||
+		!errors.As(err, &validation) || validation.Message != kbconfig.MessageModelProfileMissing {
+		t.Fatalf("DeleteModelProfile(admin) = %v, %v, want no delete with MessageModelProfileMissing", deleted, err)
+	}
+	adminList, err := service.ListModelProfiles(ctx, admin, true)
+	if err != nil || len(adminList) != 1 || adminList[0]["mine"] != false {
+		t.Fatalf("admin ListModelProfiles() = %v, %v", adminList, err)
+	}
+	// The owner's key is still only revealed to the owner, and nothing above
+	// disturbed the stored row.
+	if key, err := service.ModelProfileKey(ctx, owner, false, id); err != nil || key != "owner-key" {
+		t.Fatalf("owner key = %q, %v", key, err)
+	}
+	if probes := calls.find(http.MethodPost, "/embeddings"); len(probes) != 1 {
+		t.Fatalf("embedding probes = %d, want a single creation probe", len(probes))
+	}
+}

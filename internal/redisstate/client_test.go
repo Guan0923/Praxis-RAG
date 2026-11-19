@@ -34,6 +34,19 @@ func newTestBackend(t *testing.T) (*Client, *miniredis.Miniredis) {
 	return backend, server
 }
 
+// hashSlotOf extracts the Redis Cluster hash tag between '{' and '}'.
+func hashSlotOf(key string) string {
+	open := strings.Index(key, "{")
+	if open < 0 {
+		return ""
+	}
+	closing := strings.Index(key[open:], "}")
+	if closing < 0 {
+		return ""
+	}
+	return key[open+1 : open+closing]
+}
+
 // lockManuals prepares a live lease for the document-list cache tests.
 func lockManuals(t *testing.T, backend *Client, ctx context.Context) string {
 	t.Helper()
@@ -86,8 +99,10 @@ func TestKeyPairAndCacheRoundTrip(t *testing.T) {
 	if !strings.HasSuffix(revisionKey, "}:revision") {
 		t.Fatalf("revision key = %q", revisionKey)
 	}
-	if strings.SplitN(payloadKey, ":", 4)[2] != strings.SplitN(revisionKey, ":", 4)[2] {
-		t.Fatalf("payload and revision must share one hash slot")
+	payloadSlot := hashSlotOf(payloadKey)
+	revisionSlot := hashSlotOf(revisionKey)
+	if payloadSlot == "" || payloadSlot != revisionSlot {
+		t.Fatalf("payload/revision keys must share one hash slot: %q vs %q", payloadSlot, revisionSlot)
 	}
 
 	token := lockManuals(t, backend, ctx)

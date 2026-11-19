@@ -48,8 +48,8 @@ func TestVisibilityFiltersApplyBeforeRecall(t *testing.T) {
 	// End to end through the orchestrator: the mock retriever applies the
 	// allow-list, the counting reranker never sees the denied document.
 	retriever := NewMockRetrieverWithChunks([]KnowledgeChunk{
-		{DocumentID: "doc-a", ChunkID: "c1", Title: "A", Source: "a.md", Text: "alpha"},
-		{DocumentID: "doc-b", ChunkID: "c2", Title: "B", Source: "b.md", Text: "gamma"},
+		{DocumentID: "doc-a", ChunkID: "c1", Title: "A", Source: "a.md", Text: "alpha mock"},
+		{DocumentID: "doc-b", ChunkID: "c2", Title: "B", Source: "b.md", Text: "gamma mock"},
 	})
 	// deny "doc-b" by allowing only "doc-a"
 	restrictor := NewOrchestrator(
@@ -58,7 +58,7 @@ func TestVisibilityFiltersApplyBeforeRecall(t *testing.T) {
 		"mock-v1", nil, nil, nil,
 	)
 	request := contracts.SearchRequest{
-		Query: "Mock", Retrieval: contracts.RetrievalEmbedding,
+		Query: "mock", Retrieval: contracts.RetrievalEmbedding,
 		Rerank: contracts.RerankCrossEncoder, CandidateK: 10, TopK: 10,
 		DocumentIDs: []string{"doc-a"},
 	}
@@ -66,14 +66,17 @@ func TestVisibilityFiltersApplyBeforeRecall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restricted search: %v", err)
 	}
-	items, _ := payload["results"].([]any)
-	for _, raw := range items {
-		item, _ := raw.(map[string]any)
-		if id, _ := item["document_id"].(string); id != "doc-a" {
-			t.Fatalf("non-allowed document leaked into results: %#v", item)
-		}
+	items, _ := payload["results"].([]map[string]any)
+	if len(items) != 1 {
+		t.Fatalf("restricted results = %#v, want exactly the allowed document", items)
+	}
+	if id, _ := items[0]["document_id"].(string); id != "doc-a" {
+		t.Fatalf("non-allowed document leaked into results: %#v", items[0])
 	}
 	reranker := restrictor.rerankers[contracts.RerankCrossEncoder].(*countingReranker)
+	if len(reranker.seen) == 0 {
+		t.Fatal("the allowed document never reached the reranker")
+	}
 	for _, candidate := range reranker.seen {
 		if candidate.DocumentID != "doc-a" {
 			t.Fatalf("denied document reached the reranker: %+v", candidate)

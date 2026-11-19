@@ -225,8 +225,8 @@ func TestOwnedKnowledgeBaseLimitIsAtomic(t *testing.T) {
 			t.Fatalf("create owned library %d error = %v", index, err)
 		}
 	}
-	// Concurrent sixth/seventh attempts: exactly one must lose, and the winner
-	// still cannot produce two rows.
+	// Concurrent sixth/seventh attempts with the limit already reached: both
+	// are rejected (the limit cannot be exceeded) and no sixth row appears.
 	errs := make(chan error, 2)
 	for _, namespace := range []string{"owned-sixth", "owned-seventh"} {
 		go func(namespace string) {

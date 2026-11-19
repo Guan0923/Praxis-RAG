@@ -85,15 +85,20 @@ func TestParagraphPages(t *testing.T) {
 }
 
 func TestParagraphPagesProtectsFormulaBlocks(t *testing.T) {
-	prefix := strings.Repeat("a", 7900)
+	// The formula spans the 8000-code-point page boundary, so the naive cut
+	// would slice it in half and the protection has to move the cut.
+	prefix := strings.Repeat("a", 7994) + "\n"
 	formula := "$$\nE = mc^2\n$$\n"
 	text := prefix + formula + strings.Repeat("b", 1000)
 	pages := ParagraphPages(text, false)
-	if len(pages) < 2 {
+	if len(pages) != 2 {
 		t.Fatalf("page count = %d", len(pages))
 	}
-	if !strings.Contains(pages[0], formula) {
-		t.Fatalf("formula block was split across pages: %q", pages[0][len(pages[0])-40:])
+	if strings.Contains(pages[0], "$$") {
+		t.Fatalf("formula leaked into the first page: %q", pages[0][len(pages[0])-40:])
+	}
+	if !strings.Contains(pages[1], formula) {
+		t.Fatalf("formula block was split across pages: %q", pages[1][:40])
 	}
 	if strings.Join(pages, "") != text {
 		t.Fatalf("pages do not round-trip")
@@ -101,15 +106,20 @@ func TestParagraphPagesProtectsFormulaBlocks(t *testing.T) {
 }
 
 func TestParagraphPagesProtectsInlineMath(t *testing.T) {
-	prefix := strings.Repeat("a", 7995)
+	// The inline formula straddles the page boundary: with protection the cut
+	// moves before it, without protection it is sliced mid-formula.
+	prefix := strings.Repeat("a", 7997)
 	text := prefix + "$x+y$" + strings.Repeat("b", 1000)
 	pages := ParagraphPages(text, true)
-	if !strings.Contains(pages[0], "$x+y$") {
-		t.Fatalf("inline math was split")
+	if len(pages) != 2 || strings.Contains(pages[0], "$") {
+		t.Fatalf("protected inline math was split: %q", pages[0][len(pages[0])-20:])
+	}
+	if !strings.Contains(pages[1], "$x+y$") {
+		t.Fatalf("inline math not kept whole on the second page: %q", pages[1][:20])
 	}
 	unprotected := ParagraphPages(text, false)
-	if len(unprotected) < 1 {
-		t.Fatalf("unprotected pages = %q", unprotected)
+	if len(unprotected) < 2 || strings.Contains(unprotected[0], "$x+y$") {
+		t.Fatalf("unprotected split must cut through the math: %q", unprotected[0][len(unprotected[0])-20:])
 	}
 }
 

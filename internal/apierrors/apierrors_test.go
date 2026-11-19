@@ -17,6 +17,7 @@ func TestErrorCategories(t *testing.T) {
 		{"knowledge", &KnowledgeError{Message: "知识库暂时不可用"}, "knowledge_error"},
 		{"validation", &KnowledgeValidationError{Message: "参数无效"}, "validation_error"},
 		{"snapshot", &SnapshotUnavailable{Message: "快照已过期"}, "snapshot_unavailable"},
+		{"artifact_forbidden", &ArtifactForbiddenError{Message: "无权访问该知识库"}, "artifact_forbidden"},
 		{"upload_conflict", &UploadConflict{Message: "文档已存在"}, "upload_conflict"},
 		{"knowledge_conflict", &KnowledgeConflictError{Message: "知识库冲突"}, "knowledge_conflict"},
 	}

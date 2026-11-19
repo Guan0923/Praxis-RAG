@@ -25,7 +25,6 @@ func TestPermissionMaskAcceptanceScenarios(t *testing.T) {
 	member := newConsoleClient(t, handler)
 	member.register("mask-user", permissionsPlainPassword)
 
-	createLegacyKnowledgeBase(t, admin, handler, "default", h.ModelURL)
 	recorder, _ := admin.json(http.MethodPost, "/v1/knowledge-bases", "", map[string]any{
 		"namespace":       "mask",
 		"embedding":       map[string]any{"base_url": h.ModelURL, "apikey": ""},

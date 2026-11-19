@@ -135,6 +135,18 @@ func TestDocumentBatchListActiveLoadsItemsForSelectedBatches(t *testing.T) {
 	}
 }
 
+func TestDocumentBatchCreateRejectsEmptyNames(t *testing.T) {
+	stores := newTestStores(t)
+	_, reused, err := stores.DocumentBatches.Create(context.Background(), "manuals", nil, "batch-key", nil)
+	if err == nil || reused {
+		t.Fatalf("Create(no names) = reused %v, err %v; want rejected", reused, err)
+	}
+	var valueErr *ValueError
+	if !errors.As(err, &valueErr) || valueErr.Message != "A document batch needs at least one file" {
+		t.Fatalf("Create(no names) error = %v (%T)", err, err)
+	}
+}
+
 func TestDocumentBatchPrune(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()
@@ -203,8 +215,9 @@ func TestDocumentBatchDerivedStatus(t *testing.T) {
 }
 
 // TestConcurrentSameNameAdmissionsSerialize proves the per-name lease keeps the
-// check-then-insert race out of the async admission path: exactly one of two
-// concurrent same-name uploads is queued, the other is reported as queued.
+// check-then-insert race out of the async admission path: exactly one of the
+// concurrent same-name uploads is queued, the others are rejected as queued
+// duplicates (DocumentQueuedConflict).
 func TestConcurrentSameNameAdmissionsSerialize(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()

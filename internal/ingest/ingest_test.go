@@ -429,7 +429,32 @@ func TestPrepareCancelledContextAndStagingCleanupOnFailure(t *testing.T) {
 		SourceName: "paper.pdf",
 		PDF:        PDFOptions{Parser: &fakePDFParser{err: context.Canceled}},
 	})
-	if err == nil {
-		t.Fatalf("cancelled context was ignored")
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled context error = %v, want context.Canceled", err)
+	}
+	// A failed attempt must clean the temporary staging directory it created.
+	staging := t.TempDir()
+	if _, err := os.Stat(staging); err != nil {
+		t.Fatalf("staging fixture: %v", err)
+	}
+	_, err = Prepare(ctx, writeText(t, "paper.pdf", "%PDF-1.7"), Options{
+		SourceName: "paper.pdf",
+		StagingDir: filepath.Join(staging, "nested"),
+		PDF:        PDFOptions{Parser: &fakePDFParser{err: context.Canceled}},
+	})
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled context error = %v, want context.Canceled", err)
+	}
+	// The caller-provided staging directory is kept (only files prepared by
+	// the attempt are removed), so the directory itself must still exist.
+	if info, err := os.Stat(filepath.Join(staging, "nested")); err != nil || !info.IsDir() {
+		t.Fatalf("caller staging after failure = %v (%v), want kept", info, err)
+	}
+	entries, readErr := os.ReadDir(filepath.Join(staging, "nested"))
+	if readErr != nil {
+		t.Fatalf("read staging: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed attempt left staging artifacts: %v", entries)
 	}
 }

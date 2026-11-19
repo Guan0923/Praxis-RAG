@@ -167,10 +167,8 @@ func TestPublicSettingsMatchesStateProjection(t *testing.T) {
 	kbcPublic := PublicSettings(settings)
 	statePublic := state.PublicSettings(settings)
 	// internal/state keeps an equivalent copy of this projection for cached
-	// read models. The graph provider is being wired into internal/state by the
-	// parallel LightRAG change, so a credential kind that copy does not emit yet
-	// is skipped instead of failing ahead of that change; every field both
-	// projections know about is compared exactly.
+	// read models: every credential kind both sides know about must agree
+	// exactly, and so must every non-provider field.
 	for key, want := range statePublic {
 		if IsKind(key) {
 			continue
@@ -180,12 +178,21 @@ func TestPublicSettingsMatchesStateProjection(t *testing.T) {
 		}
 	}
 	for _, kind := range CredentialKinds {
-		want, ok := statePublic[kind]
-		if !ok {
+		if _, ok := statePublic[kind]; !ok {
+			// "extraction" is a model-profile kind (the SAG event-entity
+			// extractor), never stored in knowledge-base settings, so the
+			// state projection does not emit it while kbconfig answers with
+			// the credential-free stub. Pin that exact divergence.
+			if kind != "extraction" {
+				t.Fatalf("state.PublicSettings lacks credential kind %q", kind)
+			}
+			if !reflect.DeepEqual(kbcPublic[kind], map[string]any{"base_url": "", "api_key_set": false}) {
+				t.Fatalf("extraction stub = %#v, want the empty credential-free stub", kbcPublic[kind])
+			}
 			continue
 		}
-		if !reflect.DeepEqual(kbcPublic[kind], want) {
-			t.Fatalf("provider %q diverged: kbconfig=%#v state=%#v", kind, kbcPublic[kind], want)
+		if !reflect.DeepEqual(kbcPublic[kind], statePublic[kind]) {
+			t.Fatalf("provider %q diverged: kbconfig=%#v state=%#v", kind, kbcPublic[kind], statePublic[kind])
 		}
 	}
 }

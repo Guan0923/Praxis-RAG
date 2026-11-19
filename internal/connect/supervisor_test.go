@@ -132,8 +132,26 @@ func TestSupervisorRecoversAndResetsBudgetAfterStableWindow(t *testing.T) {
 		health.LastRecoveredAt == "" {
 		t.Fatalf("health = %+v", health)
 	}
-	// Before the stability window the attempt budget is kept.
+	// Before the stability window the attempt budget is kept: a new failure
+	// within the window continues the same episode and restarts again.
 	*now = now.Add(5 * time.Second)
+	supervisor.Tick(context.Background())
+	client.setTasks("cache-cdc", StateFailed)
+	*now = now.Add(time.Second)
+	supervisor.Tick(context.Background())
+	if client.restartCount() != 2 {
+		t.Fatalf("restarted = %v, want the same-episode restart inside the window", client.restarted)
+	}
+	within, err := supervisor.Health(context.Background(), "cache-cdc")
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if within.RestartAttempts != 2 {
+		t.Fatalf("restart attempts inside the window = %d, want the kept budget of 2", within.RestartAttempts)
+	}
+	// The task runs again before the boundary so the episode can settle.
+	client.setTasks("cache-cdc", StateRunning)
+	*now = now.Add(time.Second)
 	supervisor.Tick(context.Background())
 	// After the window a new failure starts at attempt one again.
 	*now = now.Add(30 * time.Second)
@@ -141,8 +159,8 @@ func TestSupervisorRecoversAndResetsBudgetAfterStableWindow(t *testing.T) {
 	client.setTasks("cache-cdc", StateFailed)
 	*now = now.Add(time.Second)
 	supervisor.Tick(context.Background())
-	if client.restartCount() != 2 {
-		t.Fatalf("restarted = %v, want one restart in the new failure episode", client.restarted)
+	if client.restartCount() != 3 {
+		t.Fatalf("restarted = %v, want the new-episode restart after the window", client.restarted)
 	}
 	health, _ = supervisor.Health(context.Background(), "cache-cdc")
 	if health.RestartAttempts != 1 {

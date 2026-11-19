@@ -53,19 +53,6 @@ const documentText = "One document paragraph with enough text for chunking. " +
 	"Third paragraph documents the cooling check and the filter replacement. " +
 	"E05 冷却水温过高时检查风扇与散热片。\n\n"
 
-// searchQueryPoints mimics a Qdrant query response with chunk records the
-// projector turns into search results.
-const searchQueryPoints = `[
-	{"id":"p1","version":1,"score":0.93,"payload":{
-		"record_type":"chunk","document_id":"doc-e03","chunk_id":"chunk-e03",
-		"text":"错误代码 E03 表示水路供水不足","title":"e03","source":"e03.md",
-		"metadata":{"kind":"test"},"upload_version":"v1"}},
-	{"id":"p2","version":1,"score":0.41,"payload":{
-		"record_type":"chunk","document_id":"doc-temp","chunk_id":"chunk-temp",
-		"text":"咖啡温度偏低时先预热杯子","title":"temperature","source":"temperature.md",
-		"metadata":{"kind":"test"},"upload_version":"v1"}}
-]`
-
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

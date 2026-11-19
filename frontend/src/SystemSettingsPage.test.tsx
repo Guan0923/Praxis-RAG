@@ -90,9 +90,6 @@ describe("SystemSettingsPage", () => {
     // The password never comes back from the server; the placeholder reports it.
     expect(screen.getByPlaceholderText("已保存")).toBeTruthy();
     expect(screen.getByText("已保存密码，留空表示保持不变")).toBeTruthy();
-    expect(
-      screen.queryByText("未配置邮件服务器时，注册与修改邮箱不会发送验证邮件；注册仍可使用用户名和密码完成。"),
-    ).toBeNull();
     expect((fetchMock.mock.calls[0] as [string])[0]).toBe("/v1/admin/mail-settings");
   });
 

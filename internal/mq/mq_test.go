@@ -307,6 +307,59 @@ func TestConsumerExhaustionPublishesDLQAndCommits(t *testing.T) {
 	}
 }
 
+// TestConsumerExhaustionDLQPublishFailureStillCommits pins the outage branch:
+// the DLQ publish fails, the sanitized ErrPublishFailed is recorded (the raw
+// broker detail never leaks), and the poison message is still committed.
+func TestConsumerExhaustionDLQPublishFailureStillCommits(t *testing.T) {
+	transport := &fakePullTransport{batches: [][]ReceivedMessage{{
+		{Topic: "doc-topic", Key: "poison", Body: []byte("raw-payload")},
+	}}}
+	dlq := &fakeRawPublisher{err: errors.New("broker down with credentials")}
+	exhausted := make(chan ReceivedMessage, 1)
+	consumer := NewPullConsumer(testConsumerConfig(), transport, func(context.Context, ReceivedMessage) bool {
+		return false
+	})
+	consumer.Config.MaxAttempts = 2
+	consumer.Config.DLQTopic = "doc-dlq"
+	consumer.DLQ = dlq
+	consumer.OnExhausted = func(_ context.Context, message ReceivedMessage) error {
+		exhausted <- message
+		return nil
+	}
+	if err := consumer.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if acked, _, _ := transport.snapshot(); len(acked) == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := consumer.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if acked, changed, _ := transport.snapshot(); len(acked) != 1 || acked[0].Key != "poison" || len(changed) != 0 {
+		t.Fatalf("acked = %+v, changed = %+v", acked, changed)
+	}
+	dlq.mutex.Lock()
+	published := len(dlq.published)
+	dlq.mutex.Unlock()
+	if published != 0 {
+		t.Fatalf("DLQ publish = %d, want none on failure", published)
+	}
+	if lastErr := consumer.LastError(); lastErr == nil || !errors.Is(lastErr, ErrPublishFailed) {
+		t.Fatalf("LastError() = %v, want ErrPublishFailed", lastErr)
+	} else if strings.Contains(lastErr.Error(), "broker down") {
+		t.Fatalf("LastError() leaked the raw broker detail: %v", lastErr)
+	}
+	select {
+	case <-exhausted:
+	default:
+		t.Fatal("OnExhausted did not run despite the DLQ failure")
+	}
+}
+
 func TestConsumerExhaustionWithoutDLQTopic(t *testing.T) {
 	transport := &fakePullTransport{batches: [][]ReceivedMessage{{
 		{Topic: "doc-topic", Key: "no-dlq", Body: []byte("raw")},

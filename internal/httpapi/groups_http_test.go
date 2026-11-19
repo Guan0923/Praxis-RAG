@@ -294,13 +294,6 @@ func TestGroupTransportRoundTrip(t *testing.T) {
 	}
 
 	// Inbox / preview / accept / decline.
-	for _, item := range []struct {
-		method string
-		target string
-		body   string
-	}{} {
-		_ = item
-	}
 	inbox := performRequest(handler, testRequest{method: "GET", target: "/v1/group-invitations", remote: "10.0.0.9:5000", headers: sessionHeaders("vip-token", "")})
 	if inbox.Code != http.StatusOK || decodeBody(t, inbox)["invitations"] == nil {
 		t.Fatalf("inbox status = %d body = %s", inbox.Code, inbox.Body.String())

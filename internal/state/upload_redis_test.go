@@ -294,7 +294,7 @@ func TestDocumentLockRedisConflictMatrix(t *testing.T) {
 	}
 	// A rejected multi-resource acquisition must not leave the otherwise free
 	// name resource behind.
-	if owner := locker.heldOwner("ns", nameUploadResource("b.txt")); owner != "" {
+	if owner := locker.heldOwner("ns", nameUploadResource("other.txt")); owner != "" {
 		t.Fatalf("partial lease left behind for a free resource (owner %q)", owner)
 	}
 	// Different documents keep running in parallel.
@@ -433,12 +433,16 @@ func TestDocumentLockRedisTakeoverFencesOldWorker(t *testing.T) {
 	if recovery.Owner == first.Owner || recovery.Status != UploadRollingBack {
 		t.Fatalf("recovery = %+v", recovery)
 	}
-	// Stale renew/release must not disturb the new holder.
-	_ = journalA.RenewLock(ctx, &LockToken{Namespace: "ns", Resource: documentUploadResource("doc"), Owner: first.Owner})
-	if err := journalA.ReleaseOperation(ctx, first); err == nil || !isLockBackendError(err) {
-		// The fake reports LockUnavailable only when the backend is unavailable;
-		// a plain release is a no-op for a foreign token. Either way the lease
-		// must still belong to B.
+	// Stale renew/release must not disturb the new holder: the renew is fenced
+	// off, the release is a no-op for a foreign token, and the lease still
+	// belongs to B.
+	if err := journalA.RenewLock(ctx, &LockToken{Namespace: "ns", Resource: documentUploadResource("doc"), Owner: first.Owner}); err == nil {
+		t.Fatal("RenewLock() succeeded for the stale owner")
+	} else {
+		mustBeError[*LeaseLost](t, err)
+	}
+	if err := journalA.ReleaseOperation(ctx, first); err != nil {
+		t.Fatalf("ReleaseOperation() by the stale owner = %v, want no-op nil", err)
 	}
 	if owner := locker.heldOwner("ns", documentUploadResource("doc")); owner != recovery.Owner {
 		t.Fatalf("lease owner = %q, want the recovery owner", owner)
@@ -682,12 +686,4 @@ func findLeaseRecord(t *testing.T, stores *Stores, namespace, resource string) m
 	}
 	t.Fatalf("leases = %+v, missing %q", leases, resource)
 	return nil
-}
-
-// isLockBackendError reports whether err is a lease-backend ownership or
-// availability failure.
-func isLockBackendError(err error) bool {
-	var unavailable *LockUnavailable
-	var lost *LeaseLost
-	return errors.As(err, &unavailable) || errors.As(err, &lost)
 }

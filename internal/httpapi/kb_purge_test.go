@@ -238,6 +238,46 @@ func TestBatchDeleteKnowledgeBasesValidation(t *testing.T) {
 	}
 }
 
+// TestBatchDeleteKnowledgeBasesRuntimeErrorFailsEveryNamespace pins the whole-batch
+// runtime failure branch: the response stays 200 with every requested namespace in
+// failed (sharing the runtime error detail) and nothing deleted or missing.
+func TestBatchDeleteKnowledgeBasesRuntimeErrorFailsEveryNamespace(t *testing.T) {
+	runtime := &fakeKBAdminRuntime{
+		purgeBatchErr: &apierrors.KnowledgeError{Message: "知识库文档无法读取"},
+	}
+	handler := newPurgeKBHandler(t, runtime)
+	response := performRequest(handler, testRequest{
+		method:  "POST",
+		target:  "/v1/admin/knowledge-bases/batch-delete",
+		remote:  "127.0.0.1:5000",
+		headers: map[string]string{"Content-Type": "application/json"},
+		body:    `{"namespaces":["alpha","beta"]}`,
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+	body := decodeBody(t, response)
+	if deleted, _ := body["deleted"].([]any); len(deleted) != 0 {
+		t.Fatalf("deleted = %v", body["deleted"])
+	}
+	if missing, _ := body["missing"].([]any); len(missing) != 0 {
+		t.Fatalf("missing = %v", body["missing"])
+	}
+	failed, _ := body["failed"].([]any)
+	if len(failed) != 2 {
+		t.Fatalf("failed = %v", body["failed"])
+	}
+	for index, namespace := range []string{"alpha", "beta"} {
+		item, _ := failed[index].(map[string]any)
+		if item["namespace"] != namespace || item["error"] != "知识库文档无法读取" {
+			t.Fatalf("failed[%d] = %v", index, item)
+		}
+	}
+	if body["documents_deleted"] != float64(0) || body["configurations_deleted"] != float64(0) {
+		t.Fatalf("counters = %v / %v", body["documents_deleted"], body["configurations_deleted"])
+	}
+}
+
 func TestBatchDeleteKnowledgeBasesRequiresAdminForNonLoopback(t *testing.T) {
 	handler := newPurgeKBHandler(t, &fakeKBAdminRuntime{})
 	response := performRequest(handler, testRequest{
