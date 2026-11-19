@@ -599,6 +599,32 @@ services:
       RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-info}
       RAG_LOG_FORMAT: ${RAG_LOG_FORMAT:-text}
 
+  rag-sag-worker:
+    image: ${RAG_APP_IMAGE:-praxis-rag:local}
+    restart: unless-stopped
+    profiles: ["app"]
+    depends_on:
+      app:
+        condition: service_healthy
+    entrypoint: ["/app/bin/rag-sag-worker"]
+    environment:
+      RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-info}
+      RAG_LOG_FORMAT: ${RAG_LOG_FORMAT:-text}
+      RAG_LOG_FILE: ${RAG_LOG_FILE:-}
+      RAG_MYSQL_HOST: ${RAG_APP_MYSQL_HOST:-mysql}
+      RAG_MYSQL_PORT: "3306"
+      RAG_MYSQL_USER: ${RAG_MYSQL_USER:-rag}
+      RAG_MYSQL_PASSWORD: ${RAG_MYSQL_PASSWORD:-}
+      RAG_MYSQL_DATABASE: ${RAG_MYSQL_DATABASE:-praxis_rag}
+      RAG_STATE_ENCRYPTION_KEY: ${RAG_STATE_ENCRYPTION_KEY:-}
+      RAG_STATE_AUTO_SCHEMA: "false"
+      RAG_SERVICE_DATA_ROOT: /app/data
+      RAG_BACKEND: qdrant
+      QDRANT_URL: ${RAG_APP_QDRANT_URL:-http://qdrant:6333}
+      RAG_KAFKA_BOOTSTRAP_SERVERS: ${RAG_APP_KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      RAG_CACHE_TOPIC: ${RAG_CACHE_TOPIC:-praxis_state_cache_refresh}
+      RAG_CACHE_GROUP: ${RAG_CACHE_GROUP:-praxis_state_cache_refresh_workers}
+
 volumes:
   kafka_data:
   lightrag_data:

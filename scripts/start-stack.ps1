@@ -426,6 +426,15 @@ else {
     Write-Host "Starting rag-cache-worker (consumes $($env:RAG_CACHE_TOPIC) as group $($env:RAG_CACHE_GROUP))..."
     $cacheWorkerProcess = Start-Process -FilePath $cacheWorker -NoNewWindow -PassThru
 }
+$sagWorkerProcess = $null
+$sagWorker = Join-Path $binDir "rag-sag-worker.exe"
+if (Test-Path $sagWorker) {
+    Write-Host "Starting rag-sag-worker..."
+    $sagWorkerProcess = Start-Process -FilePath $sagWorker -WindowStyle Hidden -PassThru
+}
+else {
+    Write-Warning "rag-sag-worker executable not found. Run scripts\build-go.ps1 to enable SAG extraction for new uploads."
+}
 $reembedWorkerProcess = $null
 try {
     Write-Host "Starting rag-reembed-worker (consumes $($env:RAG_REEMBED_TOPIC) as group $($env:RAG_REEMBED_GROUP))..."
@@ -435,6 +444,10 @@ try {
 finally {
     if ($reembedWorkerProcess) {
         Stop-Process -Id $reembedWorkerProcess.Id -Force -ErrorAction SilentlyContinue
+    }
+    if ($sagWorkerProcess) {
+        Write-Host "Stopping rag-sag-worker (pid $($sagWorkerProcess.Id))..."
+        Stop-Process -Id $sagWorkerProcess.Id -Force -ErrorAction SilentlyContinue
     }
     foreach ($docWorkerProcess in $docWorkerProcesses) {
         Write-Host "Stopping rag-document-worker (pid $($docWorkerProcess.Id))..."

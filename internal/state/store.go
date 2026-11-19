@@ -497,6 +497,12 @@ func (s *Stores) ensureSchema(ctx context.Context) error {
 	if err := s.migrateKnowledgeBaseOwner(ctx); err != nil {
 		return err
 	}
+	if err := s.ensureTableIndex(ctx, "knowledge_bases", knowledgeBaseOwnerIndex); err != nil {
+		return err
+	}
+	if err := s.ensureTableIndex(ctx, "upload_operations", uploadOperationsDocumentIndex); err != nil {
+		return err
+	}
 	if err := s.migrateAPIKeyOwner(ctx); err != nil {
 		return err
 	}
@@ -660,7 +666,7 @@ func (s *Stores) migrateModelProfileOwners(ctx context.Context) error {
 			}
 		}
 	}
-	return s.ensureTableIndex(ctx, table, ownerKeyIx, column)
+	return s.ensureTableIndex(ctx, table, index(ownerKeyIx, column))
 }
 
 // migrateContentStore adds the content-addressed reference columns and indexes
@@ -671,16 +677,16 @@ func (s *Stores) migrateContentStore(ctx context.Context) error {
 	if err := s.ensureTableColumn(ctx, "upload_objects", "content_hash", "VARCHAR(64) COLLATE utf8mb4_bin NULL"); err != nil {
 		return err
 	}
-	if err := s.ensureTableIndex(ctx, "upload_objects", "ix_upload_objects_content", "content_hash"); err != nil {
+	if err := s.ensureTableIndex(ctx, "upload_objects", index("ix_upload_objects_content", "content_hash")); err != nil {
 		return err
 	}
-	if err := s.ensureTableIndex(ctx, "blobs", "ix_blobs_sha256", "sha256"); err != nil {
+	if err := s.ensureTableIndex(ctx, "blobs", index("ix_blobs_sha256", "sha256")); err != nil {
 		return err
 	}
 	if err := s.ensureTableColumn(ctx, "content_objects", "retired_at", "DOUBLE NULL"); err != nil {
 		return err
 	}
-	return s.ensureTableIndex(ctx, "content_objects", "ix_content_objects_retired", "retired_at")
+	return s.ensureTableIndex(ctx, "content_objects", index("ix_content_objects_retired", "retired_at"))
 }
 
 // ensureTableColumn adds one nullable column to an existing table. Concurrent
@@ -711,18 +717,16 @@ func (s *Stores) ensureTableColumn(ctx context.Context, table, column, definitio
 }
 
 // ensureTableIndex creates one secondary index when it is absent.
-func (s *Stores) ensureTableIndex(ctx context.Context, table, indexName, column string) error {
+func (s *Stores) ensureTableIndex(ctx context.Context, table string, definition SchemaIndex) error {
 	exists, err := s.hasTable(ctx, table)
 	if err != nil || !exists {
 		return err
 	}
-	if found, indexErr := s.hasIndex(ctx, table, indexName); indexErr != nil || found {
+	if found, indexErr := s.hasIndex(ctx, table, definition.Name); indexErr != nil || found {
 		return indexErr
 	}
-	statement := "CREATE INDEX " + quoteIdentifier(indexName) +
-		" ON " + quoteIdentifier(table) + " (" + quoteIdentifier(column) + ")"
-	if _, execErr := s.DB.ExecContext(ctx, statement); execErr != nil {
-		confirmed, confirmErr := s.hasIndex(ctx, table, indexName)
+	if _, execErr := s.DB.ExecContext(ctx, definition.ddl(table)); execErr != nil {
+		confirmed, confirmErr := s.hasIndex(ctx, table, definition.Name)
 		if confirmErr == nil && confirmed {
 			return nil
 		}

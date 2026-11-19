@@ -1152,6 +1152,9 @@ func (r *DocumentRepository) DeleteTx(ctx context.Context, tx *sql.Tx, namespace
 		if err := deleteDocumentContentRefsTx(ctx, tx, namespace, documentID); err != nil {
 			return false, err
 		}
+		if err := clearSagDocument(ctx, tx, namespace, documentID); err != nil {
+			return false, err
+		}
 	}
 	return changed > 0, nil
 }
