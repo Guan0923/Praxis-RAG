@@ -435,11 +435,7 @@ func TestDocumentLockRedisTakeoverFencesOldWorker(t *testing.T) {
 	}
 	// Stale renew/release must not disturb the new holder.
 	_ = journalA.RenewLock(ctx, &LockToken{Namespace: "ns", Resource: documentUploadResource("doc"), Owner: first.Owner})
-	if err := journalA.ReleaseOperation(ctx, first); err == nil || !isLockBackendError(err) {
-		// The fake reports LockUnavailable only when the backend is unavailable;
-		// a plain release is a no-op for a foreign token. Either way the lease
-		// must still belong to B.
-	}
+	_ = journalA.ReleaseOperation(ctx, first)
 	if owner := locker.heldOwner("ns", documentUploadResource("doc")); owner != recovery.Owner {
 		t.Fatalf("lease owner = %q, want the recovery owner", owner)
 	}
@@ -682,12 +678,4 @@ func findLeaseRecord(t *testing.T, stores *Stores, namespace, resource string) m
 	}
 	t.Fatalf("leases = %+v, missing %q", leases, resource)
 	return nil
-}
-
-// isLockBackendError reports whether err is a lease-backend ownership or
-// availability failure.
-func isLockBackendError(err error) bool {
-	var unavailable *LockUnavailable
-	var lost *LeaseLost
-	return errors.As(err, &unavailable) || errors.As(err, &lost)
 }
