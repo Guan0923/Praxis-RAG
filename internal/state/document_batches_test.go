@@ -82,6 +82,59 @@ func TestDocumentBatchCreateFinishAndRead(t *testing.T) {
 	}
 }
 
+func TestDocumentBatchListActiveLoadsItemsForSelectedBatches(t *testing.T) {
+	stores := newTestStores(t)
+	ctx := context.Background()
+	configureTestNamespace(t, stores, "manuals")
+	var now float64 = 1000
+	stores.DocumentBatches.Clock = func() float64 { return now }
+	owner := "user-1"
+
+	old, _, err := stores.DocumentBatches.Create(ctx, "manuals", &owner, "", []string{"skipped.md", "current.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := submitTestDocument(t, stores, "manuals", "current.md", []byte("current"), nil)
+	if err := stores.DocumentBatches.Finish(ctx, "manuals", old.ID, []DocumentBatchItemResult{
+		{Position: 0, Status: DocumentBatchItemSkipped, Reason: DocumentBatchReasonExists},
+		{Position: 1, Status: DocumentBatchItemAccepted, ArtifactID: current.ArtifactID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	now++
+	latest, _, err := stores.DocumentBatches.Create(ctx, "manuals", &owner, "", []string{"pruned.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pruned := submitTestDocument(t, stores, "manuals", "pruned.md", []byte("pruned"), nil)
+	if err := stores.DocumentBatches.Finish(ctx, "manuals", latest.ID, []DocumentBatchItemResult{
+		{Position: 0, Status: DocumentBatchItemAccepted, ArtifactID: pruned.ArtifactID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stores.DB.ExecContext(ctx, "DELETE FROM document_jobs WHERE artifact_id = ?", pruned.ArtifactID); err != nil {
+		t.Fatal(err)
+	}
+
+	batches, err := stores.DocumentBatches.ListActive(ctx, "manuals", &owner, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batches) != 2 || batches[0].ID != latest.ID || batches[1].ID != old.ID {
+		t.Fatalf("ListActive() = %+v, want latest then old", batches)
+	}
+	if items := batches[0].Items; len(items) != 1 || items[0].Name != "pruned.md" ||
+		items[0].ArtifactID == nil || *items[0].ArtifactID != pruned.ArtifactID || items[0].Job != nil {
+		t.Fatalf("latest items = %+v, want the accepted item with a missing job", items)
+	}
+	if items := batches[1].Items; len(items) != 2 || items[0].Name != "skipped.md" || items[0].Job != nil ||
+		items[1].Name != "current.md" || items[1].Job == nil || items[1].Job.ArtifactID != current.ArtifactID ||
+		items[1].Job.Status != DocumentJobQueued {
+		t.Fatalf("old items = %+v, want skipped item then queued item", items)
+	}
+}
+
 func TestDocumentBatchPrune(t *testing.T) {
 	stores := newTestStores(t)
 	ctx := context.Background()

@@ -117,9 +117,6 @@ func (d *DocumentBatches) now() float64 {
 const documentBatchColumns = "id, namespace, owner, idempotency_key, status, total, " +
 	"accepted, skipped, failed, created_at, updated_at"
 
-const documentBatchItemColumns = "batch_id, position, name, status, reason, artifact_id, " +
-	"error, created_at, updated_at"
-
 // Create records the batch header and one "saving" item per file. A repeated
 // Idempotency-Key returns the original batch (reused=true) instead of a second
 // record, so a client retry after a lost response never duplicates the work.
@@ -311,10 +308,8 @@ func (d *DocumentBatches) ListActive(
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	for _, batch := range batches {
-		if err := d.loadItems(ctx, batch); err != nil {
-			return nil, err
-		}
+	if err := d.loadItems(ctx, batches...); err != nil {
+		return nil, err
 	}
 	return batches, nil
 }
@@ -427,88 +422,57 @@ func (d *DocumentBatches) scanBatch(scanner interface{ Scan(...any) error }) (*D
 	return &batch, nil
 }
 
-func (d *DocumentBatches) loadItems(ctx context.Context, batch *DocumentBatch) error {
+// loadItems loads the file rows and their optional jobs for all selected batches.
+func (d *DocumentBatches) loadItems(ctx context.Context, batches ...*DocumentBatch) error {
+	if len(batches) == 0 {
+		return nil
+	}
+	batchesByID := make(map[string]*DocumentBatch, len(batches))
+	args := make([]any, 0, len(batches))
+	for _, batch := range batches {
+		batchesByID[batch.ID] = batch
+		args = append(args, batch.ID)
+		batch.Items = make([]DocumentBatchItem, 0, batch.Total)
+	}
 	rows, err := d.stores.DB.QueryContext(ctx,
-		"SELECT "+documentBatchItemColumns+" FROM document_batch_items "+
-			"WHERE batch_id = ? ORDER BY position", batch.ID)
+		"SELECT i.batch_id, i.position, i.name, i.status, i.reason, i.artifact_id, "+
+			"i.error, i.created_at, i.updated_at, j.artifact_id, j.status, j.stage, j.error "+
+			"FROM document_batch_items i LEFT JOIN document_jobs j ON j.artifact_id = i.artifact_id "+
+			"WHERE i.batch_id IN ("+inPlaceholders(len(args))+") ORDER BY i.batch_id, i.position", args...)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = rows.Close() }()
-	items := make([]DocumentBatchItem, 0, batch.Total)
 	for rows.Next() {
 		var (
-			item       DocumentBatchItem
-			reason     sql.NullString
-			artifactID sql.NullString
-			errorText  sql.NullString
+			item                                 DocumentBatchItem
+			reason, artifactID, errorText        sql.NullString
+			jobID, jobStatus, jobStage, jobError sql.NullString
 		)
 		if err := rows.Scan(&item.BatchID, &item.Position, &item.Name, &item.Status, &reason,
-			&artifactID, &errorText, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			&artifactID, &errorText, &item.CreatedAt, &item.UpdatedAt,
+			&jobID, &jobStatus, &jobStage, &jobError); err != nil {
 			return err
 		}
 		item.Reason = nullStringPointer(reason)
 		item.ArtifactID = nullStringPointer(artifactID)
 		item.Error = nullStringPointer(errorText)
-		items = append(items, item)
+		if jobID.Valid {
+			item.Job = &DocumentJobStatus{
+				ArtifactID: jobID.String,
+				Status:     jobStatus.String,
+				Stage:      jobStage.String,
+				Error:      nullStringPointer(jobError),
+			}
+		}
+		batch := batchesByID[item.BatchID]
+		batch.Items = append(batch.Items, item)
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	batch.Items = items
-	if err := d.attachJobs(ctx, batch.Items); err != nil {
-		return err
-	}
-	batch.Status = d.deriveStatus(batch)
-	return nil
-}
-
-// attachJobs joins the accepted items with their document job status, so one
-// batch read shows both the admission outcome and the processing stage.
-func (d *DocumentBatches) attachJobs(ctx context.Context, items []DocumentBatchItem) error {
-	ids := make([]string, 0, len(items))
-	for index := range items {
-		if items[index].ArtifactID != nil && *items[index].ArtifactID != "" {
-			ids = append(ids, *items[index].ArtifactID)
-		}
-	}
-	if len(ids) == 0 {
-		return nil
-	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
-	arguments := make([]any, 0, len(ids))
-	for _, id := range ids {
-		arguments = append(arguments, id)
-	}
-	rows, err := d.stores.DB.QueryContext(ctx,
-		"SELECT artifact_id, status, stage, error FROM document_jobs WHERE artifact_id IN ("+
-			placeholders+")", arguments...)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = rows.Close() }()
-	statuses := make(map[string]*DocumentJobStatus, len(ids))
-	for rows.Next() {
-		var (
-			status DocumentJobStatus
-			text   sql.NullString
-		)
-		if err := rows.Scan(&status.ArtifactID, &status.Status, &status.Stage, &text); err != nil {
-			return err
-		}
-		status.Error = nullStringPointer(text)
-		statuses[status.ArtifactID] = &status
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for index := range items {
-		if items[index].ArtifactID == nil {
-			continue
-		}
-		if status, found := statuses[*items[index].ArtifactID]; found {
-			items[index].Job = status
-		}
+	for _, batch := range batches {
+		batch.Status = d.deriveStatus(batch)
 	}
 	return nil
 }
