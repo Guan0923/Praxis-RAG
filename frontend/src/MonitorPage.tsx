@@ -238,7 +238,7 @@ function DependencyTable({ dependencies }: { dependencies: MonitorDependency[] }
         pagination={false}
         dataSource={dependencies}
         tableLayout="fixed"
-        scroll={{ x: 520 }}
+        scroll={{ x: 390 }}
         locale={{ emptyText: "暂无依赖信息" }}
         columns={[
           {
@@ -251,7 +251,7 @@ function DependencyTable({ dependencies }: { dependencies: MonitorDependency[] }
           {
             title: "状态",
             dataIndex: "status",
-            width: 84,
+            width: 64,
             render: (status: MonitorDependency["status"]) => (
               <Tag color={monitorDependencyStatusColors[status] || "default"}>
                 {monitorDependencyStatusLabels[status] || status}
@@ -261,7 +261,7 @@ function DependencyTable({ dependencies }: { dependencies: MonitorDependency[] }
           {
             title: "延迟",
             dataIndex: "latency_ms",
-            width: 92,
+            width: 68,
             render: (_latency: number, dependency) => latencyText(dependency),
           },
           {
@@ -1350,7 +1350,7 @@ function MonitorLogPanel({
           loading={loading}
           dataSource={entries}
           locale={{ emptyText: "暂无日志" }}
-          scroll={{ x: 860 }}
+          scroll={{ x: 620 }}
           pagination={{
             pageSize: allFilters ? 20 : 10,
             size: "small",
@@ -1376,13 +1376,13 @@ function MonitorLogPanel({
             {
               title: "时间",
               dataIndex: "time",
-              width: 180,
+              width: 112,
               render: (value: string) => <span className="break-text">{formatDateTime(value)}</span>,
             },
             {
               title: "级别",
               dataIndex: "level",
-              width: 90,
+              width: 72,
               render: (value: string) => (
                 <Tag color={logLevelColors[value] || "default"}>
                   {logLevelLabels[value] || value || "未知"}
@@ -1392,7 +1392,7 @@ function MonitorLogPanel({
             {
               title: "组件",
               dataIndex: "component",
-              width: 130,
+              width: 88,
               render: (value: string, entry) => (
                 <span className="break-text">
                   {entry.component_label || monitorComponentLabels[value] || value || "未知"}
@@ -1409,7 +1409,7 @@ function MonitorLogPanel({
               // never the memory/file log source; that is the page-level filter.
               title: "代码位置",
               dataIndex: "source",
-              width: 220,
+              width: 144,
               render: (value: string) => (
                 <span className="break-text">{value || "—"}</span>
               ),

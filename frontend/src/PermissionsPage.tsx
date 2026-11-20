@@ -703,13 +703,13 @@ export function PermissionsPage({
     {
       title: "用户",
       dataIndex: "username",
-      width: 160,
+      width: 96,
       render: (value: string) => <span className="break-text">{value}</span>,
     },
     {
       title: "范围",
       key: "scope",
-      width: 150,
+      width: 92,
       render: (_, item) => (
         <span className="break-text">
           {item.document_name
@@ -744,7 +744,7 @@ export function PermissionsPage({
     {
       title: "当前允许",
       key: "allow",
-      width: 170,
+      width: 108,
       render: (_, item) => (
         <span className="break-text">
           <Tag color={item.allow_mask ? "blue" : "default"}>允许：{maskToText(item.allow_mask, "无")}</Tag>
@@ -755,19 +755,19 @@ export function PermissionsPage({
     {
       title: "授权人",
       dataIndex: "granted_by_username",
-      width: 130,
+      width: 80,
       render: (value: string) => <span className="break-text">{value || "—"}</span>,
     },
     {
       title: "更新时间",
       dataIndex: "updated_at",
-      width: 180,
+      width: 108,
       render: (value: string) => <span className="secondary">{formatDateTime(value)}</span>,
     },
     {
       title: "操作",
       key: "actions",
-      width: 210,
+      width: 124,
       render: (_, item) => {
         const key = grantRuleKey(item.user_id, item.document_name);
         const busy = savingKey === key || revokingKey === key || clearingKey === key;
@@ -832,13 +832,13 @@ export function PermissionsPage({
     {
       title: "被邀请人",
       dataIndex: "invitee_username",
-      width: 150,
+      width: 92,
       render: (value: string) => <span className="break-text">{value}</span>,
     },
     {
       title: "允许的操作",
       key: "allow_mask",
-      width: 170,
+      width: 108,
       render: (_, invitation) => {
         // 优先展示掩码翻译的中文操作标签；旧邀请没有掩码时回退到只读/读写投影。
         if (invitation.allow_mask !== undefined && invitation.allow_mask !== 0)
@@ -855,13 +855,13 @@ export function PermissionsPage({
     {
       title: "范围",
       key: "scope",
-      width: 130,
+      width: 80,
       render: (_, invitation) => <InvitationScope invitation={invitation} />,
     },
     {
       title: "状态",
       key: "status",
-      width: 90,
+      width: 64,
       render: (_, invitation) => {
         const status = invitationStatus(invitation);
         return (
@@ -874,19 +874,19 @@ export function PermissionsPage({
     {
       title: "邀请人",
       dataIndex: "inviter_username",
-      width: 130,
+      width: 80,
       render: (value: string) => <span className="break-text">{value}</span>,
     },
     {
       title: "失效时间",
       dataIndex: "expires_at",
-      width: 180,
+      width: 108,
       render: (value: string) => <span className="secondary">{formatDateTime(value)}</span>,
     },
     {
       title: "操作",
       key: "actions",
-      width: 90,
+      width: 64,
       render: (_, invitation) => invitationStatus(invitation) === "pending" ? (
         <Popconfirm
           title="撤销邀请"
@@ -915,13 +915,13 @@ export function PermissionsPage({
     {
       title: "用户组",
       dataIndex: "group_name",
-      width: 160,
+      width: 96,
       render: (value: string) => <span className="break-text">{value}</span>,
     },
     {
       title: "全库权限",
       key: "whole",
-      width: 150,
+      width: 92,
       render: (_, item) => renderPermissionBits(item.wholeBits),
     },
     {
@@ -939,19 +939,19 @@ export function PermissionsPage({
     {
       title: "授权人",
       dataIndex: "granted_by_username",
-      width: 130,
+      width: 80,
       render: (value: string) => <span className="break-text">{value || "—"}</span>,
     },
     {
       title: "更新时间",
       dataIndex: "updated_at",
-      width: 180,
+      width: 108,
       render: (value: string) => <span className="secondary">{formatDateTime(value)}</span>,
     },
     {
       title: "操作",
       key: "actions",
-      width: 90,
+      width: 64,
       render: (_, item) => (
         <Popconfirm
           title="撤销组授权"
@@ -980,7 +980,7 @@ export function PermissionsPage({
     {
       title: "权限",
       dataIndex: "bit_name",
-      width: 90,
+      width: 64,
       render: (_, source) => (
         <Tag>{permissionBits.find((bit) => bit.value === source.bit)?.label || source.bit_name}</Tag>
       ),
@@ -988,7 +988,7 @@ export function PermissionsPage({
     {
       title: "来源",
       dataIndex: "kind",
-      width: 110,
+      width: 84,
       render: (value: PermissionSourceView["kind"]) => (
         <Tag color={value === "group" ? "geekblue" : value === "personal" ? "blue" : "gold"}>
           {permissionSourceKindLabels[value]}
@@ -1115,7 +1115,7 @@ export function PermissionsPage({
             dataSource={grants}
             loading={grantsLoading}
             size="middle"
-            scroll={{ x: 1080 }}
+            scroll={{ x: 740 }}
             pagination={{ pageSize: 10, hideOnSinglePage: true }}
             locale={{
               emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有授权记录，可创建邀请或直接新增规则。" />,
@@ -1137,7 +1137,7 @@ export function PermissionsPage({
             dataSource={invitations}
             loading={invitationsLoading}
             size="middle"
-            scroll={{ x: 940 }}
+            scroll={{ x: 620 }}
             pagination={{ pageSize: 10, hideOnSinglePage: true }}
             locale={{
               emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有邀请记录。" />,
@@ -1157,7 +1157,7 @@ export function PermissionsPage({
             dataSource={aggregatedGroupGrants}
             loading={groupGrantsLoading}
             size="middle"
-            scroll={{ x: 860 }}
+            scroll={{ x: 580 }}
             pagination={{ pageSize: 10, hideOnSinglePage: true }}
             locale={{
               emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有用户组授权；可用自己的用户组对该知识库设置全库或单文件权限。" />,
@@ -1176,7 +1176,7 @@ export function PermissionsPage({
               rowKey={(source) => `${source.kind}:${source.origin}:${source.bit}`}
               dataSource={sources}
               size="middle"
-              scroll={{ x: 760 }}
+              scroll={{ x: 420 }}
               pagination={{ pageSize: 10, hideOnSinglePage: true }}
               locale={{
                 emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前账号在该知识库暂无权限来源。" />,
@@ -1243,6 +1243,11 @@ export function PermissionsPage({
             )}
             <Form form={form} layout="vertical" requiredMark={false}
               disabled={creating}
+              onValuesChange={(changed: Partial<InviteFormValues>, values: InviteFormValues) => {
+                if (changed.scope === "files" && (values.allow_mask & PERM_CREATE)) {
+                  form.setFieldValue("allow_mask", values.allow_mask & ~PERM_CREATE);
+                }
+              }}
               onFinish={(values) => void submitInvite(values)}>
               <Form.Item name="username" label="用户名" rules={[{ required: true, message: "请选择被邀请的用户" }]}>
                 <Select
@@ -1257,6 +1262,10 @@ export function PermissionsPage({
                 />
               </Form.Item>
               <Form.Item name="allow_mask" label="允许的操作" initialValue={PERM_READ}
+                getValueProps={(mask: number) => ({
+                  value: permissionBits.filter(({ bit }) => (mask & bit) !== 0).map(({ bit }) => bit),
+                })}
+                getValueFromEvent={(checked: number[]) => checked.reduce((mask, bit) => mask | bit, 0)}
                 rules={[{
                   validator: (_, value: number | undefined) => value
                     ? Promise.resolve()
@@ -1267,16 +1276,6 @@ export function PermissionsPage({
                     ? permissionBits.filter(({ bit }) => bit !== PERM_CREATE)
                     : permissionBits
                   ).map(({ bit, label }) => ({ value: bit, label }))}
-                  onChange={(checked) => {
-                    // scope=files 时不允许带 create 位：切换范围时立即剪掉。
-                    const next = normalizeMask(
-                      Array.isArray(checked) ? (checked as number[]).reduce((mask, bit) => mask | bit, 0) : 0,
-                    );
-                    form.setFieldValue(
-                      "allow_mask",
-                      scopeValue === "files" ? next & ~PERM_CREATE : next,
-                    );
-                  }}
                 />
               </Form.Item>
               {scopeValue === "files" && (

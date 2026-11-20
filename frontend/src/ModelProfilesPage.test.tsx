@@ -145,11 +145,14 @@ describe("ModelProfilesPage", () => {
     expect(screen.getByText("已保存")).toBeTruthy();
     expect(screen.getByText("1024")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "模型配置" })).toBeTruthy();
-    expect(screen.getByRole("tab", { name: "Embedding（1）" })).toBeTruthy();
-    expect(screen.getByRole("tab", { name: "Reranker（1）" })).toBeTruthy();
-    expect(screen.getByRole("tab", { name: "VLM（0）" })).toBeTruthy();
-    expect(screen.getByRole("tab", { name: "JEV（0）" })).toBeTruthy();
-    expect(screen.queryByRole("tab", { name: /OCR/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "向量检索 · Embedding 1 项" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "结果重排 · Reranker 1 项" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "PDF 解析 · VLM 0 项" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "SAG2 · JEV 证据判定 0 项" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "SAG · 事件与实体抽取 0 项" }));
+    expect(screen.getByRole("button", { name: /SAG · 事件与实体抽取/, pressed: true })).toBeTruthy();
+    expect(screen.getByText(/SAG 使用最近更新的抽取配置/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /OCR/ })).toBeNull();
     // Only the active kind's rows are rendered.
     expect(screen.queryByText("默认 Reranker")).toBeNull();
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/model-profiles");
@@ -160,10 +163,10 @@ describe("ModelProfilesPage", () => {
     renderPage();
     await screen.findByText("默认 Embedding");
 
-    fireEvent.click(screen.getByRole("tab", { name: "VLM（0）" }));
-    expect(await screen.findByText("还没有 VLM 模型，点击「添加模型」创建")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "PDF 解析 · VLM 0 项" }));
+    expect(await screen.findByText("尚未添加此用途的模型")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("tab", { name: "Reranker（1）" }));
+    fireEvent.click(screen.getByRole("button", { name: "结果重排 · Reranker 1 项" }));
     expect(await screen.findByText("默认 Reranker")).toBeTruthy();
   });
 
@@ -172,10 +175,10 @@ describe("ModelProfilesPage", () => {
     renderPage();
     await screen.findByText("默认 Embedding");
 
-    // 「知识图谱」是与其它凭据类 kind 同级的分页签，标签带计数。
-    const tab = screen.getByRole("tab", { name: "知识图谱（1）" });
-    expect(tab).toBeTruthy();
-    fireEvent.click(tab);
+    // 每个用途显示当前可见的配置数。
+    const usage = screen.getByRole("button", { name: "LightRAG · 知识图谱 1 项" });
+    expect(usage).toBeTruthy();
+    fireEvent.click(usage);
 
     expect(await screen.findByText("图谱抽取")).toBeTruthy();
     expect(screen.getByText("https://graph.example.com/v1")).toBeTruthy();
@@ -194,10 +197,10 @@ describe("ModelProfilesPage", () => {
       return jsonResponse({ model_profiles: [] });
     });
     const { onChanged } = renderPage();
-    await screen.findByText(/还没有模型配置/);
+    await screen.findByText(/尚未添加/);
 
-    // 先切到「知识图谱」页签，新增的配置就带上该 kind。
-    fireEvent.click(screen.getByRole("tab", { name: "知识图谱（0）" }));
+    // 从 LightRAG 用途进入时，新增配置自动带上 graph 类型。
+    fireEvent.click(screen.getByRole("button", { name: "LightRAG · 知识图谱 0 项" }));
     fireEvent.click(screen.getAllByRole("button", { name: /添加模型/ })[0]);
     const dialog = await screen.findByRole("dialog");
     fireEvent.change(within(dialog).getByLabelText("配置名称"), { target: { value: "图谱抽取（生产）" } });
@@ -226,7 +229,7 @@ describe("ModelProfilesPage", () => {
     renderPage();
 
     expect(
-      await screen.findByText("还没有模型配置，请先添加 Embedding / Reranker / VLM / 知识图谱 / JEV 模型；创建知识库时只能从其中的 Embedding / Reranker / VLM / 知识图谱 选择"),
+      await screen.findByText("尚未添加此用途的模型"),
     ).toBeTruthy();
     expect(screen.getAllByRole("button", { name: /添加模型/ })[0]).toBeTruthy();
   });
@@ -234,7 +237,7 @@ describe("ModelProfilesPage", () => {
   it("opens the add drawer and validates the required fields", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ model_profiles: [] }));
     renderPage();
-    await screen.findByText(/还没有模型配置/);
+    await screen.findByText(/尚未添加/);
 
     fireEvent.click(screen.getAllByRole("button", { name: /添加模型/ })[0]);
     const dialog = await screen.findByRole("dialog");
@@ -297,9 +300,9 @@ describe("ModelProfilesPage", () => {
       return jsonResponse({ model_profiles: [] });
     });
     const { onChanged } = renderPage();
-    await screen.findByText(/还没有模型配置/);
+    await screen.findByText(/尚未添加/);
 
-    fireEvent.click(screen.getByRole("tab", { name: "JEV（0）" }));
+    fireEvent.click(screen.getByRole("button", { name: "SAG2 · JEV 证据判定 0 项" }));
     fireEvent.click(screen.getAllByRole("button", { name: /添加模型/ })[0]);
     const dialog = await screen.findByRole("dialog");
     // JEV 只保存连接配置：有服务地址与 Key，但没有 /models 探测按钮。
@@ -387,7 +390,7 @@ describe("ModelProfilesPage", () => {
     });
   });
 
-  it("offers only the four remote model kinds in the model-type picker", async () => {
+  it("offers all six model usages in the model-type picker", async () => {
     fetchMock.mockResolvedValue(jsonResponse({ model_profiles: [embeddingProfile] }));
     renderPage();
     await screen.findByText("默认 Embedding");
@@ -399,7 +402,7 @@ describe("ModelProfilesPage", () => {
     expect(within(dialog).getByText("API Key")).toBeTruthy();
 
     fireEvent.mouseDown(within(dialog).getByLabelText("模型类型"));
-    for (const kind of ["Embedding", "Reranker", "VLM", "JEV"]) {
+    for (const kind of ["向量检索 · Embedding", "结果重排 · Reranker", "PDF 解析 · VLM", "LightRAG · 知识图谱", "SAG · 事件与实体抽取", "SAG2 · JEV 证据判定"]) {
       expect((await screen.findAllByTitle(kind)).length).toBeGreaterThan(0);
     }
     // OCR 已并入 VLM：模型类型里不再提供 OCR 引擎。
@@ -450,7 +453,7 @@ describe("ModelProfilesPage", () => {
       return jsonResponse({});
     });
     renderPage({ role: "user" });
-    await screen.findByText(/还没有模型配置/);
+    await screen.findByText(/尚未添加/);
 
     fireEvent.click(screen.getAllByRole("button", { name: /添加模型/ })[0]);
     const dialog = await screen.findByRole("dialog");
@@ -487,7 +490,7 @@ describe("ModelProfilesPage", () => {
     });
     const { onChanged } = renderPage();
     await screen.findByText("默认 Embedding");
-    fireEvent.click(screen.getByRole("tab", { name: "VLM（1）" }));
+    fireEvent.click(screen.getByRole("button", { name: "PDF 解析 · VLM 1 项" }));
 
     expect(await screen.findByText("视觉模型")).toBeTruthy();
     expect(screen.getByRole("columnheader", { name: "模型" })).toBeTruthy();

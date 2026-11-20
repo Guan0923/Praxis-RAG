@@ -346,7 +346,7 @@ export function FeishuImportModal({
     {
       title: "选择",
       key: "select",
-      width: 56,
+      width: 44,
       render: (_, file) => (
         <Checkbox
           aria-label={`选择 ${file.name}`}
@@ -391,13 +391,13 @@ export function FeishuImportModal({
     {
       title: "类型",
       dataIndex: "type",
-      width: 110,
+      width: 80,
       render: (value: string) => <Tag>{feishuTypeLabel(value)}</Tag>,
     },
     {
       title: "状态",
       key: "status",
-      width: 190,
+      width: 120,
       render: (_, file) =>
         file.importable ? (
           <Tag color="green">可导入</Tag>
@@ -421,7 +421,7 @@ export function FeishuImportModal({
     {
       title: "选择",
       key: "select",
-      width: 56,
+      width: 44,
       render: (_, item) => (
         <Checkbox
           aria-label={`选择 ${item.title}`}
@@ -448,7 +448,7 @@ export function FeishuImportModal({
     {
       title: "类型",
       dataIndex: "type",
-      width: 110,
+      width: 80,
       render: (value: string) => <Tag>{feishuTypeLabel(value)}</Tag>,
     },
   ];
@@ -471,7 +471,7 @@ export function FeishuImportModal({
     {
       title: "结果",
       key: "status",
-      width: 100,
+      width: 72,
       render: (_, item) => (
         <Tag color={feishuImportStatusColors[item.status]}>
           {feishuImportStatusLabels[item.status]}
@@ -488,7 +488,7 @@ export function FeishuImportModal({
     {
       title: "索引状态",
       key: "index",
-      width: 150,
+      width: 112,
       render: (_, item) => {
         const job = item.artifact_id
           ? jobs.get(item.artifact_id) ?? item.job

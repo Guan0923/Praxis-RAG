@@ -220,7 +220,7 @@ export function ApiKeysPage({
           </ul>} />
       )}
       <div ref={listRef} className="api-keys-table" aria-label="API Key 列表">
-        <Table<ApiKey> rowKey="id" dataSource={keys} loading={loading} size="small" scroll={{ x: showOwner ? 860 : 720 }}
+        <Table<ApiKey> rowKey="id" dataSource={keys} loading={loading} size="small" scroll={{ x: showOwner ? 620 : 532 }}
           rowSelection={{
             selectedRowKeys: selectedKeys,
             onChange: (next) => setSelectedKeys(next.map(String)),
@@ -228,15 +228,15 @@ export function ApiKeysPage({
           }}
           locale={{ emptyText: authorized ? "暂无 API Key" : "尚未连接" }} pagination={{ pageSize: 10, hideOnSinglePage: true, size: "small" }}
           columns={[
-            { title: "名称", dataIndex: "name", width: 160, render: (name: string) => <span className="break-text">{name}</span> },
+            { title: "名称", dataIndex: "name", width: 112, render: (name: string) => <span className="break-text">{name}</span> },
             ...(showOwner ? [{
-              title: "所有者", dataIndex: "owner_username", width: 130,
+              title: "所有者", dataIndex: "owner_username", width: 88,
               render: (owner: string | undefined) => <span className="break-text">{apiKeyOwnerText(owner)}</span>,
             }] : []),
-            { title: "密钥", dataIndex: "prefix", width: 140, render: (prefix: string) => <code>{prefix}…</code> },
+            { title: "密钥", dataIndex: "prefix", width: 106, render: (prefix: string) => <code>{prefix}…</code> },
             { title: "授权 Namespace", dataIndex: "namespaces", render: (values: string[]) => <div className="key-namespaces">{values.map((value) => <Tag key={value}>{value}</Tag>)}</div> },
-            { title: "启用", width: 70, render: (_, key) => <Switch aria-label={"启用 " + key.name} size="small" checked={key.enabled} disabled={busy || loading} onChange={(enabled) => void setEnabled(key, enabled)} /> },
-            { title: "操作", width: 120, render: (_, key) => <div className="toolbar">
+            { title: "启用", width: 50, render: (_, key) => <Switch aria-label={"启用 " + key.name} size="small" checked={key.enabled} disabled={busy || loading} onChange={(enabled) => void setEnabled(key, enabled)} /> },
+            { title: "操作", width: 96, render: (_, key) => <div className="toolbar">
               <Tooltip title={!key.exportable ? "旧密钥无法恢复，请重新创建" : !key.enabled ? "密钥已停用" : "复制 MCP JSON"}><Button type="text" size="small" aria-label={"复制 MCP JSON " + key.name} icon={<CopyOutlined />} disabled={busy || loading || !key.enabled || !key.exportable} onClick={() => void copyMcp(key)} /></Tooltip>
               <Tooltip title="编辑"><Button type="text" size="small" aria-label={"编辑 " + key.name} icon={<EditOutlined />} disabled={busy || loading} onClick={() => edit(key)} /></Tooltip>
               <Tooltip title="删除"><Button type="text" size="small" danger aria-label={"删除 " + key.name} icon={<DeleteOutlined />} disabled={busy || loading} onClick={() => remove(key)} /></Tooltip>

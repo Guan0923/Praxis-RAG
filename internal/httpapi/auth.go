@@ -148,10 +148,14 @@ func (s *Server) tenantFromRequestWith(w http.ResponseWriter, r *http.Request, n
 			}
 		}
 		writeDetail(w, http.StatusForbidden, "API Key 未获授权访问此 Namespace")
+		s.recordRejection(r, actor, "access_denied")
 		return tenantIdentity{}, false
 	}
 
 	if authorization == "" && s.settings.Token == "" && localModelRequest(r) {
+		if s.rejectInvalidLocalSession(w, r) {
+			return tenantIdentity{}, false
+		}
 		if namespaceOptional {
 			return tenantIdentity{}, true
 		}
@@ -179,6 +183,7 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (*auth.Ses
 				return nil, false
 			}
 			if !session.User.IsAdmin() {
+				s.recordRejection(r, sessionActor(session), "access_denied")
 				writeDetail(w, http.StatusForbidden, "需要管理员权限")
 				return nil, false
 			}
@@ -186,10 +191,26 @@ func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (*auth.Ses
 		}
 	}
 	if localModelRequest(r) {
+		if s.rejectInvalidLocalSession(w, r) {
+			return nil, false
+		}
 		return nil, true
 	}
 	writeDetail(w, http.StatusForbidden, "仅允许本机直接访问管理接口")
 	return nil, false
+}
+
+// A presented session that failed authentication cannot borrow loopback trust.
+func (s *Server) rejectInvalidLocalSession(w http.ResponseWriter, r *http.Request) bool {
+	if !s.authEnabled() {
+		return false
+	}
+	token, _ := s.sessionTokenFromRequest(r)
+	if token == "" {
+		return false
+	}
+	writeDetail(w, http.StatusUnauthorized, auth.MessageSessionInvalid)
+	return true
 }
 
 func secureEqual(left, right string) bool {

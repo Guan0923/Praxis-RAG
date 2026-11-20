@@ -2,6 +2,12 @@
 
 ## 操作审计
 
+「用户列表」向已登录的管理员显示全部账号、最近活动和有效登录会话数。账号在近 5 分钟内用有效会话访问过服务时显示「在线」，仍有有效会话但超过 5 分钟未访问时显示「暂离」，其余显示「离线」。页面每 30 秒刷新，后台标签页的请求也算活动。独立 API Key 调用不计入账号在线状态。
+
+管理员可以对其他账号执行「强制下线」。所有设备的有效 Console 登录会话在下一次认证时失效，账号可以重新登录。踢出操作与对应的审计记录在同一个 MySQL 事务内提交。管理员会话接口为 `GET /v1/admin/session-users` 和 `POST /v1/admin/users/{user_id}/force-logout`，后者返回实际撤销的会话数。
+
+「异常行为」显示登录失败、连续登录失败触发限流、CSRF 校验失败和权限检查拒绝，可按类别或操作人筛选。失败的登录以未认证请求记账，已知目标账号标为尝试账号。连续失败达到限流阈值时记录一次限流事件。访问拒绝记录请求方法和路由模板，不保存请求参数。接口使用 `outcome=rejected` 先筛选再分页。
+
 管理员可在 Console 的「操作审计」按操作人、知识库、操作类型和完整文件名或产物 ID 查询记录。使用 API Key 的请求显示密钥 ID，有所属账号时也显示账号 ID。共享服务令牌和本机直连分别标记，无法据此区分共用凭据的个人。
 
 记录覆盖知识库创建、配置查看与修改、删除，以及 REST 和 MCP 的文档提交、替换、删除、阅读、列表、检索与产物访问。检索按返回的来源去重，批量上传和飞书导入按文件保留受理结果。每条记录对应一次请求的结果，使用同一幂等键重试仍可能看到重复的受理记录。文档是否完成索引请查看文档任务状态。查询词、正文、令牌和密钥原值不写入审计表。
@@ -94,6 +100,8 @@ dist/web/                            # Console（服务通过 RAG_WEB_ROOT 读�
 脚本默认把 Console 复制到 `dist/web`；直接运行 `dist/bin/rag-service` 时请设置 `RAG_WEB_ROOT=<repo>/dist/web`，否则服务只探测当前目录/可执行文件邻居的 `web` 或 `build/web`。构建脚本的 smoke 模式会自动设置临时端口、临时 config 与数据目录。
 
 ### 前端构建与开发
+
+控制台表格采用紧凑列宽。状态、数量和操作列占用较少空间，长文件名或标识符可在单元格内换行。多列管理表在窄窗口中支持横向滚动。
 
 Console 使用 React + TypeScript + Ant Design；vite 输出到 `build/web`（`.gitignore` 忽略），Go 构建脚本会再复制到 `dist/web`。手工构建：
 
@@ -900,16 +908,16 @@ API Key 管理列表直接读取 MySQL。本机直连可以看到并管理全部
 
 ### 模型配置（模型列表）
 
-管理员在 Console 侧边栏「模型配置」（`#/model-profiles`）维护可复用的 Embedding / Reranker / VLM / JEV / 知识图谱 列表，不再在创建知识库时手工填写服务地址、Key 和模型名。页面按模型类型分页签，表格展示 名称 / 模型 / 服务地址 / Key / 向量维度（仅 Embedding）/ 更新时间 / 操作，支持「添加模型」抽屉、编辑和删除。API Key 只在服务端用 `RAG_STATE_ENCRYPTION_KEY` 加密保存，列表与详情只返回 `api_key_set`；编辑时留空表示沿用已保存的 Key，显式提交空字符串会清除。`(kind, name)` 唯一，重名返回 409。VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 的版面/OCR/表格/公式/图片描述统一由它完成；OCR 不再作为独立模型类型。知识图谱模型（`kind=graph`）供 LightRAG 侧车做实体关系抽取与查询关键词抽取——两个角色共用同一连接，选择非思考型快模型可显著降低索引成本。
+在 Console 的「模型配置」（`#/model-profiles`）里，先选择使用场景，再查看已有配置或点击「添加模型」。在「解析与基础检索」中管理 Embedding、Reranker 和 VLM，在「图谱与多跳检索」中管理 LightRAG 图谱模型、SAG 抽取模型和 SAG2 的 JEV 模型。添加表单默认选中当前用途。API Key 只在服务端用 `RAG_STATE_ENCRYPTION_KEY` 加密保存，列表与详情只返回 `api_key_set`；编辑时留空表示沿用已保存的 Key，显式提交空字符串会清除。`(kind, name)` 唯一，重名返回 409。VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 的版面/OCR/表格/公式/图片描述统一由它完成；OCR 不再作为独立模型类型。知识图谱模型（`kind=graph`）供 LightRAG 侧车做实体关系抽取与查询关键词抽取——两个角色共用同一连接，选择非思考型快模型可显著降低索引成本。
 
-JEV 条目（TypeSafe System One 决策模型）保存名称、服务地址、模型标识和加密 Key；创建与修改都不探测 provider，`/{id}/models` 对 JEV 直接返回空数组。JEV 不是知识库模型，创建/编辑知识库时不会出现该选项，当前仅保存配置，尚未接入检索或决策调用。常见取值：TypeSafe 服务地址 `https://api.typesafe.ai/v1`（模型 `jev-latest` / `jev-preview` / `jev-1.13.0`），OpenRouter 服务地址 `https://openrouter.ai/api/alpha`（模型 `typesafe/jev-1.13`）。
+JEV 条目（TypeSafe System One 决策模型）保存名称、服务地址、模型标识和加密 Key；创建与修改都不探测 provider，`/{id}/models` 对 JEV 直接返回空数组。SAG2 检索会读取最近更新的 JEV 配置进行证据判定。SAG 在文档发布后使用最近更新的抽取配置。常见取值：TypeSafe 服务地址 `https://api.typesafe.ai/v1`（模型 `jev-latest` / `jev-preview` / `jev-1.13.0`），OpenRouter 服务地址 `https://openrouter.ai/api/alpha`（模型 `typesafe/jev-1.13`）。
 
 保存时会先探测 provider：
 
 - Embedding：真实执行一次 Embedding 调用，把返回的稠密向量维度记录到 `vector_size`；探测失败则不写入。
 - Reranker：执行一次有界的 rerank 调用，只验证服务可达与鉴权。
 - VLM：不做探测，因此半配置的 VLM 端点也可以先保存。
-- JEV：不做探测，直接保存配置（只保存连接，供后续决策能力使用）。
+- JEV：保存配置时跳过探测，查询时由 SAG2 调用。
 - 知识图谱：不做探测；该连接只被 LightRAG 侧车使用，知识库启用图谱后才会真正发起抽取调用。
 
 `PATCH` 只在服务地址、模型或 Key 实际变化时重新探测；只改名称或原样保存不会调用 provider，已记录的 Embedding 维度保持不变。修改服务地址但未提交新 Key 时保存的 Key 会被清除（与知识库连接表单的 `DraftConnection` 语义一致）。

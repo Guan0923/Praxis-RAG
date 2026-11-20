@@ -334,25 +334,25 @@ export function GroupsPage({
     {
       title: "成员",
       dataIndex: "username",
-      width: 150,
+      width: 104,
       render: (value: string) => <span className="break-text">{value}</span>,
     },
     {
       title: "角色",
       dataIndex: "role",
-      width: 100,
+      width: 72,
       render: (value: Role) => <Tag>{roleLabel(value)}</Tag>,
     },
     {
       title: "加入时间",
       dataIndex: "joined_at",
-      width: 180,
+      width: 112,
       render: (value: string) => <span className="secondary">{formatDateTime(value)}</span>,
     },
     {
       title: "操作",
       key: "actions",
-      width: 90,
+      width: 64,
       render: (_, member) => detail && detail.owner_user_id === member.user_id ? "—" : (
         <Popconfirm
           title="移除成员"
@@ -381,25 +381,25 @@ export function GroupsPage({
     {
       title: "被邀请人",
       dataIndex: "invitee_username",
-      width: 140,
+      width: 96,
       render: (value: string) => <span className="break-text">{value}</span>,
     },
     {
       title: "状态",
       key: "status",
-      width: 90,
+      width: 64,
       render: (_, invitation) => groupInvitationStatusTag(invitation),
     },
     {
       title: "失效时间",
       dataIndex: "expires_at",
-      width: 180,
+      width: 112,
       render: (value: string) => <span className="secondary">{formatDateTime(value)}</span>,
     },
     {
       title: "操作",
       key: "actions",
-      width: 90,
+      width: 64,
       render: (_, invitation) => groupInvitationStatus(invitation) === "pending" ? (
         <Popconfirm
           title="撤销邀请"
@@ -486,7 +486,7 @@ export function GroupsPage({
           dataSource={owned}
           loading={loading}
           size="middle"
-          scroll={{ x: 900 }}
+          scroll={{ x: 600 }}
           pagination={{ pageSize: 10, hideOnSinglePage: true }}
           locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无内容" /> }}
           columns={[
@@ -505,19 +505,19 @@ export function GroupsPage({
             {
               title: "成员数",
               dataIndex: "member_count",
-              width: 90,
+              width: 64,
               render: (value: number) => value ?? 0,
             },
             {
               title: "创建时间",
               dataIndex: "created_at",
-              width: 180,
+              width: 112,
               render: (value: string) => <span className="secondary">{formatDateTime(value)}</span>,
             },
             {
               title: "操作",
               key: "actions",
-              width: 200,
+              width: 148,
               render: (_, group) => (
                 <Space size={4}>
                   <Button
@@ -566,7 +566,7 @@ export function GroupsPage({
         dataSource={joined}
         loading={loading}
         size="middle"
-        scroll={{ x: 860 }}
+        scroll={{ x: 540 }}
         pagination={{ pageSize: 10, hideOnSinglePage: true }}
         locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有加入任何用户组；可让组创建者邀请你。" /> }}
         columns={[
@@ -578,25 +578,25 @@ export function GroupsPage({
           {
             title: "创建者",
             dataIndex: "owner_username",
-            width: 130,
+            width: 88,
             render: (value: string) => <span className="break-text">{value || "—"}</span>,
           },
           {
             title: "成员数",
             dataIndex: "member_count",
-            width: 90,
+            width: 64,
             render: (value: number) => value ?? 0,
           },
           {
             title: "加入时间",
             key: "joined",
-            width: 180,
+            width: 112,
             render: () => <span className="secondary">—</span>,
           },
           {
             title: "操作",
             key: "actions",
-            width: 90,
+            width: 64,
             render: (_, group) => (
               <Popconfirm
                 title="退出用户组"
@@ -625,38 +625,38 @@ export function GroupsPage({
         dataSource={inbox}
         loading={inboxLoading}
         size="middle"
-        scroll={{ x: 900 }}
+        scroll={{ x: 600 }}
         pagination={{ pageSize: 10, hideOnSinglePage: true }}
         locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无组邀请。" /> }}
         columns={[
           {
             title: "用户组",
             dataIndex: "group_name",
-            width: 150,
+            width: 104,
             render: (value: string) => <span className="break-text">{value}</span>,
           },
           {
             title: "邀请人",
             dataIndex: "inviter_username",
-            width: 130,
+            width: 88,
             render: (value: string) => <span className="break-text">{value || "—"}</span>,
           },
           {
             title: "状态",
             key: "status",
-            width: 90,
+            width: 64,
             render: (_, invitation) => groupInvitationStatusTag(invitation),
           },
           {
             title: "失效时间",
             dataIndex: "expires_at",
-            width: 180,
+            width: 112,
             render: (value: string) => <span className="secondary">{formatDateTime(value)}</span>,
           },
           {
             title: "操作",
             key: "actions",
-            width: 150,
+            width: 104,
             render: (_, invitation) => groupInvitationStatus(invitation) === "pending" ? (
               <span className="secondary">接受需要邀请链接（仅邀请人持有），请在下方粘贴链接</span>
             ) : "—",

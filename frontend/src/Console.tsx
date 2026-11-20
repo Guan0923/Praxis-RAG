@@ -755,13 +755,11 @@ export function Console({
           {view === "system-settings" && authUser?.role === "admin" && (
             <SystemSettingsPage />
           )}
-          {view === "audit-events" && canViewConsolePage("audit-events", sessionMode, authUser?.role) && <AuditEventsPage />}
+          {view === "audit-events" && canViewConsolePage("audit-events", sessionMode, authUser?.role) && <AuditEventsPage currentUserId={authUser?.id} />}
           {view === "monitor" && canViewConsolePage("monitor", sessionMode, authUser?.role) && (
             <MonitorPage role={authUser?.role} />
           )}
-          {view === "permissions" && authUser
-            && (authUser.role === "admin" || authUser.role === "vip"
-              || planName === "Plus" || planName === "Pro") && (
+          {view === "permissions" && sessionMode && authUser && (
             <PermissionsPage
               connection={connection}
               currentUserId={authUser.id}

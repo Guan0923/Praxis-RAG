@@ -268,7 +268,7 @@ function AdminBillingSection() {
     {
       title: "用户",
       key: "username",
-      width: 110,
+      width: 84,
       render: (_, row) => <span className="break-text">{row.username || "—"}</span>,
     },
     {
@@ -284,7 +284,7 @@ function AdminBillingSection() {
     {
       title: "套餐",
       key: "plan",
-      width: 150,
+      width: 112,
       render: (_, row) => (
         <span className="break-text">
           {row.plan_name} · {row.period_label} · {row.kind_label}
@@ -294,13 +294,13 @@ function AdminBillingSection() {
     {
       title: "金额",
       key: "amount",
-      width: 100,
+      width: 72,
       render: (_, row) => <span>¥{row.amount_yuan}</span>,
     },
     {
       title: "状态",
       key: "status",
-      width: 110,
+      width: 84,
       render: (_, row) => (
         <Tag color={orderStatusColor(row)}>{orderStatusText(row)}</Tag>
       ),
@@ -308,7 +308,7 @@ function AdminBillingSection() {
     {
       title: "操作",
       key: "actions",
-      width: 220,
+      width: 156,
       render: (_, row) => (
         <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
           <Button size="small" loading={busy === row.id} onClick={() => void queryOrder(row)}>
@@ -640,7 +640,7 @@ export function MembershipPage({ role, onPlanName }: Props) {
     {
       title: "套餐",
       key: "plan",
-      width: 170,
+      width: 120,
       render: (_, row) => (
         <span className="break-text">
           {row.plan_name} · {row.period_label} · {row.kind_label}
@@ -650,19 +650,19 @@ export function MembershipPage({ role, onPlanName }: Props) {
     {
       title: "金额",
       key: "amount",
-      width: 100,
+      width: 72,
       render: (_, row) => <span>¥{row.amount_yuan}</span>,
     },
     {
       title: "状态",
       key: "status",
-      width: 110,
+      width: 84,
       render: (_, row) => <Tag color={orderStatusColor(row)}>{orderStatusText(row)}</Tag>,
     },
     {
       title: "支付信息",
       key: "paid",
-      width: 200,
+      width: 136,
       render: (_, row) => (
         <div className="secondary break-text">
           {row.paid_at ? `支付于 ${formatDateTime(row.paid_at)}` : "尚未支付"}
@@ -673,7 +673,7 @@ export function MembershipPage({ role, onPlanName }: Props) {
     {
       title: "操作",
       key: "actions",
-      width: 130,
+      width: 104,
       render: (_, row) => {
         if (!orderActionable(row)) return <span className="secondary">—</span>;
         return (

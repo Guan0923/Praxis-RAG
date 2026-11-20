@@ -37,7 +37,7 @@ type Entry struct {
 	Target    string `json:"target"`
 	Outcome   string `json:"outcome"`
 }
-type Filter struct{ Namespace, Actor, Action, Target, Before string }
+type Filter struct{ Namespace, Actor, Action, Target, Before, Outcome string }
 type Writer interface {
 	Append(context.Context, []Entry) error
 }
@@ -45,7 +45,19 @@ type Repository interface {
 	Writer
 	List(context.Context, Filter, int) ([]Entry, error)
 }
-type Store struct{ DB *sql.DB }
+type Store struct {
+	DB interface {
+		ExecContext(context.Context, string, ...any) (sql.Result, error)
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	}
+}
+
+func NewEntry(ctx context.Context, now time.Time, channel, action, namespace string, target Target) Entry {
+	return Entry{
+		ID: fmt.Sprintf("%019d-%s", now.UnixNano(), rand.Text()), CreatedAt: now.UTC().Format(time.RFC3339Nano),
+		Actor: Actor(ctx), Channel: channel, Action: action, Namespace: namespace, Target: target.Name, Outcome: target.Outcome,
+	}
+}
 
 // Record writes the outcomes of one operation together. A disconnected client
 // cannot cancel the audit of a mutation that has already completed.
@@ -54,14 +66,9 @@ func Record(ctx context.Context, writer Writer, logger *slog.Logger, channel, ac
 		return
 	}
 	now := time.Now().UTC()
-	actor := Actor(ctx)
 	entries := make([]Entry, 0, len(targets))
 	for _, target := range targets {
-		entries = append(entries, Entry{
-			ID: fmt.Sprintf("%019d-%s", now.UnixNano(), rand.Text()), CreatedAt: now.Format(time.RFC3339Nano),
-			Actor: actor, Channel: channel, Action: action, Namespace: namespace,
-			Target: target.Name, Outcome: target.Outcome,
-		})
+		entries = append(entries, NewEntry(ctx, now, channel, action, namespace, target))
 	}
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
@@ -90,6 +97,7 @@ func (s Store) List(ctx context.Context, filter Filter, limit int) ([]Entry, err
 		{"LOCATE(?,actor) > 0", filter.Actor},
 		{"target = ?", filter.Target},
 		{"action = ?", filter.Action},
+		{"outcome = ?", filter.Outcome},
 		{"id < ?", filter.Before},
 	}
 	for _, f := range filters {

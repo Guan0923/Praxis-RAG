@@ -567,7 +567,7 @@ export function DocumentsPage({
     documentColumns.push({
       title: "操作",
       key: "actions",
-      width: 92,
+      width: 76,
       render: (_, doc) => {
         const replaceable = canReplaceDocument(access, authEnabled, doc.name);
         const deletable = canDeleteDocument(access, authEnabled, doc.name);

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert, App, AutoComplete, Button, Drawer, Empty, Form, Input, Popconfirm, Select, Table,
-  Tabs, Tag, Tooltip, type TableProps,
+  Tag, Tooltip, type TableProps,
 } from "antd";
 import { DeleteOutlined, EditOutlined, PlusOutlined, ReloadOutlined } from "@ant-design/icons";
 import {
@@ -13,13 +13,27 @@ import {
   fetchModelProfiles,
   formatDateTime,
   modelKindLabels,
-  modelKinds,
   revealModelProfileKey,
   updateModelProfile,
   type ModelKind,
   type ModelProfile,
   type Role,
 } from "./api";
+import "./ModelProfilesPage.css";
+
+const usageGroups = [
+  { name: "解析与基础检索", kinds: ["embedding", "reranker", "vlm"] },
+  { name: "图谱与多跳检索", kinds: ["graph", "extraction", "jev"] },
+] as const;
+
+const modelUsage: Record<ModelKind, { title: string; guide: string }> = {
+  embedding: { title: "向量检索 · Embedding", guide: "在知识库设置中选择，用于文档分块和查询文本的向量化。" },
+  reranker: { title: "结果重排 · Reranker", guide: "在知识库设置中选择，启用重排时用于调整候选片段的顺序。" },
+  vlm: { title: "PDF 解析 · VLM", guide: "在知识库设置中选择，用于识别 PDF 中的正文、表格和图片。" },
+  graph: { title: "LightRAG · 知识图谱", guide: "保存后，在知识库设置中启用知识图谱并选择此模型，用于抽取实体、关系和查询关键词。" },
+  extraction: { title: "SAG · 事件与实体抽取", guide: "文档发布后，SAG 使用最近更新的抽取配置从片段中提取事件和实体。" },
+  jev: { title: "SAG2 · JEV 证据判定", guide: "执行 SAG2 检索时，系统使用最近更新的 JEV 配置判断哪些候选片段能支持当前查询。" },
+};
 
 type ProfileValues = {
   kind: ModelKind;
@@ -41,7 +55,7 @@ const jevModelSuggestions = [
   { value: "typesafe/jev-1.13" },
 ];
 const jevModelHint =
-  "JEV 是 TypeSafe System One 决策模型，没有 /models 接口，可直接输入模型名且仅保存配置供后续使用";
+  "请选择建议值或输入服务商提供的 JEV 模型名称。";
 
 // extraction 是 SAG 事件-实体抽取用的 OpenAI 兼容 chat 模型：文档入库时
 // 每个 chunk 调用一次，产出该 chunk 的完整事件句与实体名列表。
@@ -55,7 +69,7 @@ const extractionModelHint =
 // VLM 是唯一的远端 OpenAI 兼容视觉模型，PDF 版面/OCR/表格/公式/图片描述都由它完成。
 // 知识图谱（graph）是 LightRAG 实体关系抽取用的 OpenAI 兼容模型，由知识库表单
 // 的「启用知识图谱」开关选用；Key 与其它 kind 一样只写不读（列表中只显示是否已保存）。
-// JEV（TypeSafe System One 决策模型）仅保存 Console 配置供后续使用，不会出现在
+// JEV（TypeSafe System One 决策模型）供 SAG2 查询使用，不会出现在
 // 知识库表单中，也没有 OpenAI /models 模型列表接口。
 // 抽取（extraction）模型驱动 SAG 检索的事件-实体索引：文档发布后按 chunk 抽取
 // 事件与实体写入 MySQL，未配置时该阶段整体跳过（不影响文档发布）。
@@ -191,6 +205,7 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
       setSaving(false);
     }
     setClearKey(false);
+    setKind(values.kind);
     setOpen(false);
     onChanged?.();
     void load();
@@ -301,7 +316,7 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
     {
       title: "名称",
       dataIndex: "name",
-      width: 160,
+      width: 116,
       render: (name: string) => <span className="break-text">{name}</span>,
     },
     // 管理员拿到所有人的配置，用「所有者」列区分归属；普通账号只有自己的行，
@@ -310,7 +325,7 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
       ? [{
           title: "所有者",
           dataIndex: "owner_username",
-          width: 140,
+          width: 88,
           render: (username: string, profile: ModelProfile) => profile.mine
             ? <Tag color="blue">自己</Tag>
             : <span className="break-text">{username || profile.owner_user_id || "—"}</span>,
@@ -319,7 +334,7 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
     {
       title: "模型",
       dataIndex: "model",
-      width: 180,
+      width: 128,
       render: (model: string) => <span className="break-text">{model}</span>,
     },
     {
@@ -330,27 +345,27 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
     {
       title: "Key",
       dataIndex: "api_key_set",
-      width: 80,
+      width: 68,
       render: (saved: boolean) => saved ? <Tag color="green">已保存</Tag> : <Tag>未设置</Tag>,
     },
     ...(kind === "embedding"
       ? [{
           title: "向量维度",
           dataIndex: "vector_size",
-          width: 90,
+          width: 68,
           render: (value: ModelProfile["vector_size"]) => value ?? "—",
         }]
       : []),
     {
       title: "更新时间",
       dataIndex: "updated_at",
-      width: 160,
+      width: 116,
       render: (value: string | undefined, profile: ModelProfile) =>
         formatDateTime(value || profile.created_at),
     },
     {
       title: "操作",
-      width: 80,
+      width: 68,
       render: (_: unknown, profile: ModelProfile) => {
         // 别人的配置只读：管理员能看，但不能编辑、删除或读取 Key（服务端同样
         // 以 404 拒绝），因此这里直接禁用入口而不是让请求失败。
@@ -392,15 +407,8 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
     },
   ];
 
-  const emptyText = loading ? undefined : profiles.length === 0
-    ? (
-      <Empty description="还没有模型配置，请先添加 Embedding / Reranker / VLM / 知识图谱 / JEV 模型；创建知识库时只能从其中的 Embedding / Reranker / VLM / 知识图谱 选择">
-        <Button type="primary" icon={<PlusOutlined />} disabled={disabled} onClick={openCreate}>
-          添加模型
-        </Button>
-      </Empty>
-    )
-    : <Empty description={`还没有 ${modelKindLabels[kind]} 模型，点击「添加模型」创建`} />;
+  const emptyText = loading || error ? undefined
+    : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未添加此用途的模型" />;
 
   return <section aria-label="模型配置页面">
     <div className="page-heading">
@@ -414,9 +422,6 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
             onClick={() => void load()}
           />
         </Tooltip>
-        <Button type="primary" icon={<PlusOutlined />} disabled={disabled || saving} onClick={openCreate}>
-          添加模型
-        </Button>
       </div>
     </div>
     {error && (
@@ -438,20 +443,34 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
         description="你正在查看所有账号的模型配置；只能编辑、删除和读取自己的配置，别人的配置只读。"
       />
     )}
-    <Tabs
-      activeKey={kind}
-      onChange={(key) => setKind(key as ModelKind)}
-      items={modelKinds.map((value) => ({
-        key: value,
-        label: `${modelKindLabels[value]}（${counts[value]}）`,
-      }))}
-    />
+    <div className="model-usage-groups">
+      {usageGroups.map((group) => <section key={group.name} aria-label={group.name}>
+        <h2>{group.name}</h2>
+        <div className="model-usage-options">
+          {group.kinds.map((value) => <button key={value} type="button"
+            aria-label={loading || error ? modelUsage[value].title : `${modelUsage[value].title} ${counts[value]} 项`}
+            aria-pressed={kind === value} onClick={() => setKind(value)}>
+            <span>{modelUsage[value].title}</span>
+            <span className="model-usage-count">{loading || error ? "—" : counts[value] + " 项"}</span>
+          </button>)}
+        </div>
+      </section>)}
+    </div>
+    <div className="model-usage-heading">
+      <div>
+        <h2>{modelUsage[kind].title}</h2>
+        <p>{modelUsage[kind].guide}</p>
+      </div>
+      <Button type="primary" icon={<PlusOutlined />} disabled={disabled || saving} onClick={openCreate}>
+        添加模型
+      </Button>
+    </div>
     <Table<ModelProfile>
       rowKey="id"
       dataSource={visible}
       loading={loading}
       size="small"
-      scroll={{ x: 920 }}
+      scroll={{ x: adminView ? 760 : 672 }}
       locale={{ emptyText }}
       pagination={{ pageSize: 10, hideOnSinglePage: true, size: "small" }}
       columns={columns}
@@ -499,11 +518,14 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
           }
         }}
       >
-        <Form.Item name="kind" label="模型类型" rules={[{ required: true, message: "请选择模型类型" }]}>
+        <Form.Item name="kind" label="模型类型" extra={modelUsage[formKind].guide} rules={[{ required: true, message: "请选择模型类型" }]}>
           <Select
             virtual={false}
             disabled={Boolean(editing)}
-            options={modelKinds.map((value) => ({ value, label: modelKindLabels[value] }))}
+            options={usageGroups.map((group) => ({
+              label: group.name,
+              options: group.kinds.map((value) => ({ value, label: modelUsage[value].title })),
+            }))}
           />
         </Form.Item>
         <Form.Item
@@ -514,7 +536,7 @@ export function ModelProfilesPage({ disabled, onChanged, role }: {
             { max: 80, message: "配置名称最多 80 个字符" },
           ]}
         >
-          <Input maxLength={80} autoComplete="off" placeholder="例如 生产环境 Embedding" />
+          <Input maxLength={80} autoComplete="off" placeholder={`例如 生产环境 ${modelKindLabels[formKind]}`} />
         </Form.Item>
         <Form.Item
           name="base_url"

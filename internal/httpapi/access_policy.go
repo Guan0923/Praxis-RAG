@@ -137,6 +137,7 @@ func (s *Server) requireAdminSession(w http.ResponseWriter, r *http.Request) (*a
 		return nil, false
 	}
 	if !session.User.IsAdmin() {
+		s.recordRejection(r, sessionActor(session), "access_denied")
 		writeDetail(w, http.StatusForbidden, "需要管理员权限")
 		return nil, false
 	}

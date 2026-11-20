@@ -389,6 +389,7 @@ func run() error {
 			return stores.Ping(probeCtx)
 		}),
 		httpapi.WithAudit(auditStore),
+		httpapi.WithSessionAdmin(stores.Sessions),
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseSelfCreateRuntime(wire.HTTPRuntime{Service: service}),

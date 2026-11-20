@@ -85,6 +85,7 @@ func WithReadiness(check func(context.Context) error) Option {
 }
 
 type Server struct {
+	sessionAdmin   sessionAdmin
 	audit          audit.Repository
 	readiness      func(context.Context) error
 	settings       config.ServiceSettings
@@ -198,6 +199,8 @@ func (s *Server) registerRoutes() {
 	s.registerModelProfileRoutes()
 	s.registerMembershipRoutes()
 	s.registerUserAuthRoutes()
+	s.router.add("GET", "/v1/admin/session-users", authAdminSession, s.handleSessionAccounts)
+	s.router.add("POST", "/v1/admin/users/{user_id}/force-logout", authAdminSession, s.handleForceLogout)
 	s.registerProfileRoutes()
 	s.registerAccessRoutes()
 	s.registerGroupRoutes()
@@ -325,7 +328,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, session))
+			r = r.WithContext(audit.WithActor(r.Context(), sessionActor(session)))
 			break
+		}
+		if s.rejectInvalidLocalSession(recorder, r) {
+			return
 		}
 		if !localModelRequest(r) {
 			writeDetail(recorder, http.StatusForbidden, "仅允许本机直接访问或登录后访问")
@@ -347,6 +354,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, session))
+		r = r.WithContext(audit.WithActor(r.Context(), sessionActor(session)))
 	case authMCP:
 		// MCP requires credentials even on loopback; the protocol endpoint
 		// answers 401 with a Bearer challenge instead of the local-admin
@@ -374,6 +382,9 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result.route.handler(recorder, r)
+	if recorder.status == http.StatusForbidden && audit.Actor(r.Context()) != "" {
+		s.recordRejection(r, "", "access_denied")
+	}
 }
 
 func (s *Server) logRequest(r *http.Request, recorder *statusRecorder, started time.Time) {

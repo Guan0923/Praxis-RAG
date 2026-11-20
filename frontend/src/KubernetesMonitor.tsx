@@ -105,18 +105,18 @@ function PodStateCell({ pod }: { pod: K8sPod }) {
 function podsColumns(scope: "all" | "nested") {
   const columns = [
     ...(scope === "all"
-      ? [{ title: "命名空间", dataIndex: "namespace", width: 140, render: (value: string) => <span className="break-text">{value || "—"}</span> }]
+      ? [{ title: "命名空间", dataIndex: "namespace", width: 96, render: (value: string) => <span className="break-text">{value || "—"}</span> }]
       : []),
     { title: "名称", dataIndex: "name", render: (value: string) => <span className="break-text">{value || "—"}</span> },
-    { title: "就绪容器", dataIndex: "ready_containers", width: 96, render: (_value: number, pod: K8sPod) => podReadyText(pod) },
-    { title: "状态/原因", dataIndex: "phase", width: 220, render: (_value: string, pod: K8sPod) => <PodStateCell pod={pod} /> },
+    { title: "就绪容器", dataIndex: "ready_containers", width: 68, render: (_value: number, pod: K8sPod) => podReadyText(pod) },
+    { title: "状态/原因", dataIndex: "phase", width: 152, render: (_value: string, pod: K8sPod) => <PodStateCell pod={pod} /> },
     { title: "重启次数", dataIndex: "restarts", width: 96 },
-    { title: "节点", dataIndex: "node", width: 160, render: (value: string) => <span className="break-text">{value || "—"}</span> },
+    { title: "节点", dataIndex: "node", width: 112, render: (value: string) => <span className="break-text">{value || "—"}</span> },
     ...(scope === "all"
       ? [{
         title: "所属资源",
         dataIndex: "owner",
-        width: 200,
+        width: 144,
         render: (_value: unknown, pod: K8sPod) => (
           <span className="break-text">{pod.owner ? `${pod.owner.kind}/${pod.owner.name}` : "—"}</span>
         ),
@@ -143,7 +143,7 @@ function PodsTable({ pods, scope, emptyText }: {
       size="small"
       pagination={false}
       dataSource={pods}
-      scroll={{ x: scope === "all" ? 1040 : 760 }}
+      scroll={{ x: scope === "all" ? 760 : 540 }}
       locale={{ emptyText }}
       columns={podsColumns(scope)}
     />
@@ -368,7 +368,7 @@ export function KubernetesMonitor({ tick, active, onUpdated, workerScale }: Kube
         rowKey={workloadRowKey}
         size="small"
         dataSource={workloadView?.workloads ?? []}
-        scroll={{ x: 1120 }}
+        scroll={{ x: 820 }}
         locale={{ emptyText: "暂无工作负载" }}
         pagination={{ pageSize: 20, size: "small", hideOnSinglePage: true, showSizeChanger: false }}
         expandable={{
@@ -383,13 +383,13 @@ export function KubernetesMonitor({ tick, active, onUpdated, workerScale }: Kube
           {
             title: "命名空间",
             dataIndex: "namespace",
-            width: 140,
+            width: 96,
             render: (value: string) => <span className="break-text">{value || "—"}</span>,
           },
           {
             title: "类型",
             dataIndex: "kind",
-            width: 130,
+            width: 96,
             render: (value: string) => <span className="break-text">{value || "—"}</span>,
           },
           {
@@ -400,7 +400,7 @@ export function KubernetesMonitor({ tick, active, onUpdated, workerScale }: Kube
           {
             title: "状态",
             dataIndex: "status",
-            width: 110,
+            width: 84,
             render: (value: string) => (
               <Tag color={workloadStatusColor(value)}>{value || "未知"}</Tag>
             ),
@@ -408,13 +408,13 @@ export function KubernetesMonitor({ tick, active, onUpdated, workerScale }: Kube
           {
             title: "就绪/完成计数",
             dataIndex: "ready",
-            width: 220,
+            width: 152,
             render: (_value: number, workload) => <span className="break-text">{workloadCountText(workload)}</span>,
           },
           {
             title: "操作",
             dataIndex: "restartable",
-            width: 240,
+            width: 172,
             render: (_value: boolean, workload) => {
               const restart = workload.restart;
               const busy = restart?.status === "submitted" || restart?.status === "rolling";

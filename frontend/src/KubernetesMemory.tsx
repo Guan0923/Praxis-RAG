@@ -42,7 +42,7 @@ export function KubernetesMemory({ view }: { view: K8sMemoryView }) {
       {view.warnings.map(message => <Alert key={message} type="warning" showIcon title={message} />)}
       <section aria-label="节点内存">
         <h3>节点内存</h3>
-        <Table<K8sNodeMemory> size="small" rowKey="name" dataSource={view.nodes} scroll={{ x: 900 }}
+        <Table<K8sNodeMemory> size="small" rowKey="name" dataSource={view.nodes} scroll={{ x: 660 }}
           pagination={{ pageSize: 10, hideOnSinglePage: true }} columns={[
             { title: "节点", dataIndex: "name" },
             { title: "内存压力", dataIndex: "pressure", render: (v: string) =>
@@ -62,7 +62,7 @@ export function KubernetesMemory({ view }: { view: K8sMemoryView }) {
             options={names.map(name => ({ value: name, label: name }))} onChange={setNode} style={{ minWidth: 180 }} />
         </Flex>
         <Table<K8sPodMemory> size="small" rowKey={p => p.namespace + "/" + p.name}
-          dataSource={view.pods.filter(p => !node || p.node === node)} scroll={{ x: 1080 }}
+          dataSource={view.pods.filter(p => !node || p.node === node)} scroll={{ x: 820 }}
           pagination={{ pageSize: 20, hideOnSinglePage: true }} columns={[
             { title: "命名空间 / Pod", render: (_, p) => <span className="break-text">{p.namespace}/{p.name}</span> },
             { title: "节点", dataIndex: "node", render: v => v || "未调度" },

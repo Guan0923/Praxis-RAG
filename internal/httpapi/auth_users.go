@@ -90,7 +90,7 @@ func (l *loginLimiter) allow(key string) (bool, time.Duration) {
 }
 
 // fail records one failed attempt.
-func (l *loginLimiter) fail(key string) {
+func (l *loginLimiter) fail(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	attempt, found := l.attempts[key]
@@ -99,6 +99,7 @@ func (l *loginLimiter) fail(key string) {
 	}
 	attempt.count++
 	l.attempts[key] = attempt
+	return attempt.count == loginAttemptLimit
 }
 
 // reset clears the counter after a successful login.
@@ -205,7 +206,15 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var authError *auth.Error
 		if errors.As(err, &authError) && authError.Kind == auth.KindUnauthorized {
-			s.limiter.fail(key)
+			action := "login_failed"
+			if s.limiter.fail(key) {
+				action = "login_throttled"
+			}
+			actor := "未认证请求"
+			if authError.LoginAccount != "" {
+				actor += "（尝试账号 " + authError.LoginAccount + "）"
+			}
+			s.recordRejection(r, actor, action)
 		}
 		writeAuthError(w, err)
 		return
@@ -399,7 +408,11 @@ func (s *Server) validateCSRF(r *http.Request, user *auth.SessionUser, viaCookie
 		return true
 	}
 	provided := strings.TrimSpace(r.Header.Get(csrfHeaderName))
-	return provided != "" && secureEqual(provided, user.CSRF)
+	valid := provided != "" && secureEqual(provided, user.CSRF)
+	if !valid {
+		s.recordRejection(r, sessionActor(user), "csrf_rejected")
+	}
+	return valid
 }
 
 // loginAttemptKey scopes the limiter to one client address and username.

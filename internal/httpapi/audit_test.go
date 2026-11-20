@@ -5,14 +5,73 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"github.com/Guan0923/Praxis-RAG/internal/auth"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 type auditCapture struct {
 	entries []audit.Entry
 	filter  audit.Filter
+}
+
+type testSessionAdmin struct{ actor string }
+
+func (s *testSessionAdmin) ListSessionAccounts(context.Context, time.Time) ([]state.SessionAccount, error) {
+	return []state.SessionAccount{}, nil
+}
+func (s *testSessionAdmin) ForceLogout(ctx context.Context, id string) (int64, error) {
+	s.actor = audit.Actor(ctx)
+	return 2, nil
+}
+
+func TestAuditSessionManagementAndRejections(t *testing.T) {
+	users := &fakeUserAuth{sessions: map[string]*auth.SessionUser{"admin-token": adminSession("admin-token"), "user-token": userSession("user-token")}, loginErr: &auth.Error{Kind: auth.KindUnauthorized, Message: auth.MessageCredentials, LoginAccount: "bob"}}
+	settings := testSettings("")
+	settings.AuthEnabled = true
+	capture := &auditCapture{}
+	sessions := &testSessionAdmin{}
+	handler := New(settings, nil, nil, nil, WithUserAuth(users), WithSessionAdmin(sessions), WithAudit(capture)).Handler()
+	for _, tc := range []struct {
+		method, path, token, csrf string
+		status                    int
+	}{
+		{"GET", "/v1/admin/session-users", "", "", 401},
+		{"GET", "/v1/admin/session-users", "user-token", "", 403},
+		{"POST", "/v1/admin/users/u-user/force-logout", "admin-token", "", 403},
+		{"POST", "/v1/admin/users/u-admin/force-logout", "admin-token", "csrf-admin-token", 400},
+		{"POST", "/v1/admin/users/u-user/force-logout", "admin-token", "csrf-admin-token", 200},
+		{"GET", "/v1/admin/session-users", "admin-token", "", 200},
+		{"GET", "/v1/admin/users", "revoked", "", 401},
+		{"GET", "/v1/documents", "revoked", "", 401},
+		{"GET", "/v1/admin/api-keys", "revoked", "", 401},
+	} {
+		headers := cookieFor(tc.token)
+		headers[csrfHeaderName] = tc.csrf
+		headers["X-RAG-Namespace"] = "manuals"
+		response := performRequest(handler, testRequest{method: tc.method, target: tc.path, headers: headers, remote: "127.0.0.1:4444"})
+		if response.Code != tc.status {
+			t.Fatalf("%s = %d want %d", tc.path, response.Code, tc.status)
+		}
+	}
+	if sessions.actor != "用户 alice（u-admin）" {
+		t.Fatal(sessions.actor)
+	}
+	for i := 0; i < loginAttemptLimit+1; i++ {
+		performRequest(handler, testRequest{method: "POST", target: "/v1/auth/login", body: `{"username":"bob","password":"test-password"}`})
+	}
+	counts := map[string]int{}
+	for _, event := range capture.entries {
+		if event.Outcome != "rejected" {
+			t.Fatal(event)
+		}
+		counts[event.Action]++
+	}
+	if counts["access_denied"] != 1 || counts["csrf_rejected"] != 1 || counts["login_failed"] != loginAttemptLimit-1 || counts["login_throttled"] != 1 {
+		t.Fatal(counts)
+	}
 }
 
 func (c *auditCapture) Append(_ context.Context, entries []audit.Entry) error {

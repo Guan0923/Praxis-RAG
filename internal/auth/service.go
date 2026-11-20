@@ -41,6 +41,9 @@ const (
 type Error struct {
 	Kind    ErrorKind
 	Message string
+	// LoginAccount identifies the stored target of a failed login for audit only.
+	// It is never returned in an authentication response.
+	LoginAccount string
 }
 
 // Error implements error.
@@ -180,10 +183,14 @@ func (s *Service) Login(ctx context.Context, username, password string) (Login, 
 		return Login{}, err
 	}
 	if user == nil || hash == "" || !VerifyPassword(hash, password) {
-		return Login{}, newError(KindUnauthorized, MessageCredentials)
+		failure := newError(KindUnauthorized, MessageCredentials)
+		if user != nil {
+			failure.LoginAccount = user.Username
+		}
+		return Login{}, failure
 	}
 	if !user.Enabled {
-		return Login{}, newError(KindUnauthorized, MessageAccountDisabled)
+		return Login{}, &Error{Kind: KindUnauthorized, Message: MessageAccountDisabled, LoginAccount: user.Username}
 	}
 	if err := s.users.TouchLogin(ctx, user.ID); err != nil {
 		return Login{}, err

@@ -120,6 +120,14 @@ afterEach(() => {
 });
 
 describe("Console workspace selection", () => {
+  it("renders permission management for a signed-in Free owner on a direct link", async () => {
+    mockApi([], { user: { ...user, role: "user" } });
+    window.history.replaceState(null, "", "#/permissions");
+    renderConsole();
+
+    expect(await screen.findByRole("heading", { name: "权限管理" })).toBeTruthy();
+  });
+
   it("auto-loads namespaces and gates the pages with an empty accessible list", async () => {
     mockApi([]);
     renderConsole();

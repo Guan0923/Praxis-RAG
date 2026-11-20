@@ -102,12 +102,12 @@ export function UsersPage({ currentUserId }: { currentUserId?: string }) {
           {
             title: "角色",
             dataIndex: "role",
-            width: 130,
+            width: 106,
             render: (role: AuthUser["role"], user) => (
               <Select
                 size="small"
                 value={role}
-                style={{ width: 110 }}
+                style={{ width: 92 }}
                 loading={savingId === user.id}
                 options={roleOptions}
                 onChange={(value) => void change(user, { role: value as AuthUser["role"] })}
@@ -117,7 +117,7 @@ export function UsersPage({ currentUserId }: { currentUserId?: string }) {
           {
             title: "状态",
             dataIndex: "enabled",
-            width: 100,
+            width: 68,
             render: (enabled: boolean, user) => (
               <Switch
                 size="small"
@@ -132,18 +132,18 @@ export function UsersPage({ currentUserId }: { currentUserId?: string }) {
           {
             title: "最后登录",
             dataIndex: "last_login_at",
-            width: 170,
+            width: 112,
             render: (value?: string) => value ? new Date(value).toLocaleString() : "—",
           },
           {
             title: "创建时间",
             dataIndex: "created_at",
-            width: 170,
+            width: 112,
             render: (value?: string) => value ? new Date(value).toLocaleString() : "—",
           },
           {
             title: "操作",
-            width: 70,
+            width: 48,
             render: (_, user) => (
               <Popconfirm
                 title="删除用户"
