@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"net/http"
 	"strings"
 
@@ -183,6 +184,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeRuntimeError(w, err, true)
 		return
 	}
+	audit.Record(r.Context(), s.audit, s.logger, "REST", "search", namespace, audit.SearchTargets(payload)...)
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -236,6 +238,7 @@ func (s *Server) handleGetArtifactContent(w http.ResponseWriter, r *http.Request
 		writeRuntimeError(w, err, true)
 		return
 	}
+	s.record(r, "read_artifact", namespace, artifactID, "success")
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -288,6 +291,7 @@ func (s *Server) handleDownloadArtifact(w http.ResponseWriter, r *http.Request) 
 		writeRuntimeError(w, err, true)
 		return
 	}
+	s.record(r, "download_artifact", namespace, artifactID, "success")
 	disposition, safeType := artifactDisposition(name, mimeType)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")

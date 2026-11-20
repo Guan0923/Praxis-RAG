@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"net/http"
 	"sort"
 	"strconv"
@@ -16,6 +17,7 @@ const documentBatchListLimit = 20
 // documentBatchEventItem is the subset of one admitted-batch payload item the
 // upload SSE stream needs: the per-file outcome the Console renders as a row.
 type documentBatchEventItem struct {
+	Name     string  `json:"name"`
 	Position int     `json:"position"`
 	Status   string  `json:"status"`
 	Reason   *string `json:"reason"`
@@ -98,6 +100,12 @@ func (s *Server) handleCreateDocumentBatch(w http.ResponseWriter, r *http.Reques
 		writeRuntimeError(w, err, false)
 		return
 	}
+	_, items := documentBatchEventItems(payload)
+	targets := make([]audit.Target, 0, len(items))
+	for _, item := range items {
+		targets = append(targets, audit.Target{Name: item.Name, Outcome: item.Status})
+	}
+	audit.Record(r.Context(), s.audit, s.logger, "REST", "add_document", namespace, targets...)
 	if eventKey != "" {
 		s.publishDocumentBatchOutcome(eventKey, payload)
 	}

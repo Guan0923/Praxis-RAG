@@ -2,9 +2,11 @@ package mcp
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"io"
 	"log/slog"
 	"net/http"
@@ -158,6 +160,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if request.Header == nil {
 		request.Header = http.Header{}
 	}
+	request.Header.Set(actorHeaderName, base64.RawURLEncoding.EncodeToString([]byte(audit.Actor(r.Context()))))
 	if scope, ok := access.ScopeFromContext(r.Context()); ok {
 		request.Header.Set(scopeHeaderName, encodeScopeHeader(scope))
 	} else {

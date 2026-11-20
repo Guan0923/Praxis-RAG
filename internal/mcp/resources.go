@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"math"
 	"net/url"
 	"reflect"
@@ -66,6 +67,7 @@ func (e *Endpoint) listResources(ctx context.Context, namespace string, params *
 	if err != nil {
 		return nil, invalidParams(err.Error())
 	}
+	audit.Record(ctx, e.opts.Audit, e.logger, "MCP", "list_documents", namespace, audit.Target{Outcome: "success"})
 	return &sdk.ListResourcesResult{Resources: available[start:end], NextCursor: next}, nil
 }
 
@@ -126,6 +128,7 @@ func (e *Endpoint) readResource(ctx context.Context, namespace string, params *s
 			public["next_uri"] = artifactURI(namespace, artifactID) +
 				"?offset=" + nextOffset + "&length=" + strconv.Itoa(length)
 		}
+		audit.Record(ctx, e.opts.Audit, e.logger, "MCP", "read_artifact", namespace, audit.Target{Name: artifactID, Outcome: "success"})
 		return jsonResourceResult(uri, public), nil
 	}
 
@@ -146,6 +149,7 @@ func (e *Endpoint) readResource(ctx context.Context, namespace string, params *s
 	if err != nil {
 		return nil, invalidParams(err.Error())
 	}
+	audit.Record(ctx, e.opts.Audit, e.logger, "MCP", "read_document", namespace, audit.Target{Name: name, Outcome: "success"})
 	return jsonResourceResult(uri, payload), nil
 }
 

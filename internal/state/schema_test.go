@@ -80,9 +80,11 @@ var expectedSchema = []struct {
 	{"sag_events", []string{"id", "namespace", "document_id", "chunk_id", "event", "version", "created_at"}},
 	{"sag_entities", []string{"id", "namespace", "normalized_key", "entity_key", "display_name", "mention_count", "created_at", "updated_at"}},
 	{"sag_event_entities", []string{"event_id", "entity_id", "namespace", "created_at"}},
+	{"audit_events", []string{"id", "created_at", "actor", "channel", "action", "namespace", "target", "outcome"}},
 }
 
 var expectedPrimaryKeys = map[string][]string{
+	"audit_events":             {"id"},
 	"api_keys":                 {"id"},
 	"knowledge_bases":          {"namespace"},
 	"documents":                {"namespace", "name"},
@@ -162,6 +164,7 @@ var expectedUniques = map[string][]string{
 }
 
 var expectedIndexes = map[string][]string{
+	"audit_events":             {"ix_audit_namespace", "ix_audit_actor", "ix_audit_action"},
 	"api_keys":                 {"ix_api_keys_owner"},
 	"knowledge_bases":          {"ix_knowledge_bases_collection", "ix_knowledge_bases_owner"},
 	"documents":                {"ix_documents_namespace_sha256"},

@@ -862,7 +862,6 @@ export function __resetForTests() {
   serverBatchIds.clear();
   filesByItem.clear();
   localSequence = 0;
-  timers = defaultTimers;
   snapshot = emptySnapshot;
   listeners.clear();
   trackedNamespace = undefined;

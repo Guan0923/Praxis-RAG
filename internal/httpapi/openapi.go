@@ -120,6 +120,7 @@ var openAPIRoutes = []openAPIRoute{
 	{Method: "GET", Path: "/v1/admin/published-versions", Summary: "List published versions", Tag: "admin", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/upload-leases", Summary: "List upload leases", Tag: "admin", Response: "200"},
 	{Method: "GET", Path: "/v1/admin/monitor/overview", Summary: "Read-only monitoring snapshot", Tag: "admin", Response: "200"},
+	{Method: "GET", Path: "/v1/admin/audit-events", Summary: "查询知识库操作审计", Tag: "admin", Query: []string{"namespace", "actor", "action", "target", "before", "limit"}, Response: "200"},
 	{Method: "GET", Path: "/v1/admin/monitor/logs", Summary: "Read-only monitor log page (memory ring or RAG_LOG_FILE)", Tag: "admin", Query: []string{"source", "component", "level", "query", "limit", "offset"}, Response: "200"},
 	{Method: "POST", Path: "/v1/admin/monitor/actions/requeue-jobs", Summary: "Requeue due retries and expired document-job leases now (sweep semantics)", Tag: "admin", Response: "200"},
 	{Method: "POST", Path: "/v1/admin/monitor/actions/connectors/{connector}/restart", Summary: "Restart one capture connector (fixed names only) and reset its restart budget", Tag: "admin", QueryBoolean: []string{"includeTasks"}, Response: "200"},

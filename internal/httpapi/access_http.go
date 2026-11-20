@@ -205,6 +205,7 @@ func (s *Server) handleCreateKnowledgeBaseForUser(w http.ResponseWriter, r *http
 		writeKnowledgeBaseSelfCreateError(w, err)
 		return
 	}
+	s.record(r, "create_kb", body.Namespace, "", "success")
 	writeJSON(w, http.StatusCreated, payload)
 }
 

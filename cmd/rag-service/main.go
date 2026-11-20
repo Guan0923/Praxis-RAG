@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"net"
 	"net/http"
 	"os"
@@ -326,7 +327,9 @@ func run() error {
 		defer kubernetesCluster.Close()
 	}
 	catalogStore := catalog.StateStore{Repository: stores.Catalogs}
+	auditStore := audit.Store{DB: stores.DB}
 	mcpEndpoint, err := mcp.NewEndpoint(mcp.Options{
+		Audit:   auditStore,
 		Runtime: wire.MCPRuntime{Service: service},
 		Catalog: catalogStore,
 		Logger:  logger,
@@ -385,6 +388,7 @@ func run() error {
 			}
 			return stores.Ping(probeCtx)
 		}),
+		httpapi.WithAudit(auditStore),
 		httpapi.WithRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseAdminRuntime(wire.HTTPRuntime{Service: service}),
 		httpapi.WithKnowledgeBaseSelfCreateRuntime(wire.HTTPRuntime{Service: service}),

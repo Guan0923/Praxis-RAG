@@ -1,5 +1,13 @@
 # Praxis-RAG 使用与部署（Go 后端）
 
+## 操作审计
+
+管理员可在 Console 的「操作审计」按操作人、知识库、操作类型和完整文件名或产物 ID 查询记录。使用 API Key 的请求显示密钥 ID，有所属账号时也显示账号 ID。共享服务令牌和本机直连分别标记，无法据此区分共用凭据的个人。
+
+记录覆盖知识库创建、配置查看与修改、删除，以及 REST 和 MCP 的文档提交、替换、删除、阅读、列表、检索与产物访问。检索按返回的来源去重，批量上传和飞书导入按文件保留受理结果。每条记录对应一次请求的结果，使用同一幂等键重试仍可能看到重复的受理记录。文档是否完成索引请查看文档任务状态。查询词、正文、令牌和密钥原值不写入审计表。
+
+服务按现有 MySQL schema 初始化流程新增 `audit_events` 表，关闭 `RAG_STATE_AUTO_SCHEMA` 的部署需先运行 `rag-state-migrate --apply`。升级前的操作没有历史明细。查询接口为 `GET /v1/admin/audit-events`，沿用管理员会话或可信本机直连权限。支持 `actor` 包含匹配以及 `namespace`、`action`、`target` 精确筛选。默认每页 50 条，`limit` 可设为 1–200，将返回的 `next_cursor` 作为下一页的 `before`。业务操作和审计独立写入，若审计写入失败，服务输出错误日志，已完成的业务操作仍然生效。
+
 本文面向运行 **Go 后端**（`rag-service` + 文档/缓存/死信三个 worker）的用户，介绍构建、配置、启动、REST/MCP 使用、worker、迁移与切换 CLI、Docker 与验证边界。产品概览见 [README](../README.md)；迁移背景与阶段见 [GO_MIGRATION](GO_MIGRATION.md)；契约差异见 [GO_PARITY_AUDIT](GO_PARITY_AUDIT.md)；容器与 systemd 示例见 [DEPLOYMENT](DEPLOYMENT.md)。
 
 ```text

@@ -11,6 +11,7 @@ package mcp
 import (
 	"context"
 	"errors"
+	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"log/slog"
 
 	"github.com/Guan0923/Praxis-RAG/internal/catalog"
@@ -115,6 +116,7 @@ type Runtime interface {
 
 // Options configures one MCP Endpoint.
 type Options struct {
+	Audit audit.Writer
 	// Runtime is required.
 	Runtime Runtime
 	// Catalog is required; it persists per-namespace tool overrides and prompts.

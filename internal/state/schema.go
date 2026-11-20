@@ -1268,6 +1268,14 @@ var schemaTables = []*SchemaTable{
 			index("ix_sag_event_entities_event", "namespace", "event_id"),
 		},
 	},
+	{
+		Name: "audit_events",
+		Columns: []SchemaColumn{
+			identifier("id", 64).PK(), varchar("created_at", 40), identifier("actor", 512),
+			varchar("channel", 16), identifier("action", 48), identifier("namespace", 64), text("target"), varchar("outcome", 32),
+		},
+		Indexes: []SchemaIndex{index("ix_audit_namespace", "namespace", "id"), index("ix_audit_actor", "actor", "id"), index("ix_audit_action", "action", "id")},
+	},
 }
 
 // SchemaTables returns the schema tables in creation order. The returned slice

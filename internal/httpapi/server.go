@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"log/slog"
 	"net/http"
 	"os"
@@ -84,6 +85,7 @@ func WithReadiness(check func(context.Context) error) Option {
 }
 
 type Server struct {
+	audit          audit.Repository
 	readiness      func(context.Context) error
 	settings       config.ServiceSettings
 	status         StatusProvider
@@ -188,6 +190,7 @@ func (s *Server) registerRoutes() {
 	s.router.add("GET", "/v1/admin/upload-leases", authNone, s.handleUploadLeases)
 	s.router.add("GET", "/v1/admin/monitor/overview", authAdmin, s.handleMonitorOverview)
 	s.router.add("GET", "/v1/admin/monitor/logs", authAdmin, s.handleMonitorLogs)
+	s.router.add("GET", "/v1/admin/audit-events", authAdmin, s.handleAuditEvents)
 	s.registerMonitorActionRoutes()
 	s.registerKubernetesRoutes()
 	s.registerDocumentationRoutes()
@@ -269,7 +272,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
-		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, identity.namespace))
+		r = r.WithContext(context.WithValue(audit.WithActor(r.Context(), identity.actor), namespaceContextKey{}, identity.namespace))
 		if identity.session != nil {
 			// Login sessions are subject to knowledge-base ownership/permission
 			// filtering; API keys, the service token and session-less loopback
@@ -309,6 +312,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		r = r.WithContext(context.WithValue(r.Context(), sessionUserContextKey{}, session))
+		r = r.WithContext(audit.WithActor(r.Context(), sessionActor(session)))
 	case authSessionOrLocal:
 		// API-key management is the one route family every signed-in account
 		// uses for its own credentials. A session of any role is accepted (CSRF
@@ -328,9 +332,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case authAdmin:
-		if !s.requireAdmin(recorder, r) {
+		session, ok := s.requireAdmin(recorder, r)
+		if !ok {
 			return
 		}
+		r = r.WithContext(audit.WithActor(r.Context(), sessionActor(session)))
 	case authAdminSession:
 		// The Kubernetes monitor/restart endpoints act only for an explicitly
 		// signed-in administrator: no session means 401 and the loopback
@@ -354,7 +360,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
-		r = r.WithContext(context.WithValue(r.Context(), namespaceContextKey{}, identity.namespace))
+		r = r.WithContext(context.WithValue(audit.WithActor(r.Context(), identity.actor), namespaceContextKey{}, identity.namespace))
 		if identity.session != nil {
 			// A session bearer token resolves the same scope REST uses, and the
 			// MCP layer reads it through access.ScopeFromContext.

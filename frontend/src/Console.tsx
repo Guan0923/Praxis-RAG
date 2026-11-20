@@ -3,6 +3,7 @@ import {
   Alert, App, Avatar, Badge, Button, Dropdown, Spin, Tooltip, type MenuProps,
 } from "antd";
 import {
+  AuditOutlined,
   ApiOutlined,
   AppstoreOutlined,
   ArrowLeftOutlined,
@@ -50,6 +51,7 @@ import { DocumentsPage } from "./DocumentsPage";
 import { DocumentPreview } from "./DocumentPreview";
 import { KnowledgeBasesPage } from "./KnowledgeBasesPage";
 import { ModelProfilesPage } from "./ModelProfilesPage";
+import { AuditEventsPage } from "./AuditEventsPage";
 import { MonitorPage } from "./MonitorPage";
 import { ApiKeysPage } from "./ApiKeysPage";
 import { CreateKnowledgeBase } from "./CreateKnowledgeBase";
@@ -83,6 +85,7 @@ const pages = [
   { key: "knowledge-bases", label: "知识库", icon: <SettingOutlined /> },
   { key: "users", label: "用户管理", icon: <TeamOutlined /> },
   { key: "system-settings", label: "系统设置", icon: <MailOutlined /> },
+  { key: "audit-events", label: "操作审计", icon: <AuditOutlined /> },
   { key: "monitor", label: "系统监控", icon: <DashboardOutlined /> },
 ] as const;
 
@@ -752,6 +755,7 @@ export function Console({
           {view === "system-settings" && authUser?.role === "admin" && (
             <SystemSettingsPage />
           )}
+          {view === "audit-events" && canViewConsolePage("audit-events", sessionMode, authUser?.role) && <AuditEventsPage />}
           {view === "monitor" && canViewConsolePage("monitor", sessionMode, authUser?.role) && (
             <MonitorPage role={authUser?.role} />
           )}

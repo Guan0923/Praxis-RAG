@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"net/http"
 	"strconv"
 	"strings"
@@ -499,7 +500,9 @@ func (s *Server) handleFeishuImport(w http.ResponseWriter, r *http.Request) {
 		BatchID: batchID, Namespace: namespace, Total: len(items),
 		Items: items,
 	}
+	targets := make([]audit.Target, 0, len(items))
 	for _, item := range items {
+		targets = append(targets, audit.Target{Name: item.Name, Outcome: item.Status})
 		switch item.Status {
 		case "accepted":
 			response.Accepted++
@@ -510,6 +513,7 @@ func (s *Server) handleFeishuImport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	audit.Record(r.Context(), s.audit, s.logger, "REST", "import_document", namespace, targets...)
 	writeJSON(w, http.StatusAccepted, response)
 }
 

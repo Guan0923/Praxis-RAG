@@ -40,5 +40,6 @@ func (s *Server) handleDocumentJobStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	s.record(r, "read_job", namespace, pathParam(r, "artifact_id"), "success")
 	writeJSON(w, http.StatusOK, payload)
 }

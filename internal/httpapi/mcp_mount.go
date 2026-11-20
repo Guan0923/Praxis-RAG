@@ -49,6 +49,7 @@ func (s *Server) handleKnowledgeBase(w http.ResponseWriter, r *http.Request) {
 	for key, value := range payload {
 		result[key] = value
 	}
+	s.record(r, "read_kb", namespace, "", "success")
 	result["strategies"] = chunking.StrategyCatalog().Strategies
 	writeJSON(w, http.StatusOK, result)
 }

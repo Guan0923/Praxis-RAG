@@ -376,21 +376,26 @@ func (r *APIKeyRepository) DeleteMany(ctx context.Context, keyIDs []string, owne
 
 // NamespacesForKey resolves the granted namespaces of a presented secret.
 func (r *APIKeyRepository) NamespacesForKey(ctx context.Context, secret string) ([]string, error) {
+	key, err := r.AuthenticateKey(ctx, secret)
+	return key.Namespaces, err
+}
+
+// AuthenticateKey reads the public credential identity and grants in one lookup.
+func (r *APIKeyRepository) AuthenticateKey(ctx context.Context, secret string) (APIKey, error) {
+	var key APIKey
 	var namespaces string
-	var enabled bool
-	err := r.db.QueryRowContext(ctx,
-		"SELECT namespaces, enabled FROM api_keys WHERE digest = ?", sha256Hex(secret)).
-		Scan(&namespaces, &enabled)
+	err := r.db.QueryRowContext(ctx, "SELECT id, COALESCE(owner_user_id,''), namespaces, enabled FROM api_keys WHERE digest = ?", sha256Hex(secret)).Scan(&key.ID, &key.OwnerUserID, &namespaces, &key.Enabled)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, newLookupError("访问 API Key 在当前服务中不存在或已删除")
+		return key, newLookupError("访问 API Key 在当前服务中不存在或已删除")
 	}
 	if err != nil {
-		return nil, err
+		return key, err
 	}
-	if !enabled {
-		return nil, newPermissionError("访问 API Key 已停用")
+	if !key.Enabled {
+		return key, newPermissionError("访问 API Key 已停用")
 	}
-	return decodeStringList(namespaces)
+	key.Namespaces, err = decodeStringList(namespaces)
+	return key, err
 }
 
 // SecretForNamespace returns the stored plaintext for an admin export request.

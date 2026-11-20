@@ -77,6 +77,7 @@ func (s *Server) handleListDocuments(w http.ResponseWriter, r *http.Request) {
 	}
 	// A file-level reader only ever sees the documents explicitly granted to it.
 	documents = scopedDocuments(r, documents)
+	s.record(r, "list_documents", namespace, "", "success")
 	extensions := append([]string(nil), SupportedExtensions...)
 	sort.Strings(extensions)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -263,6 +264,7 @@ func (s *Server) handleDeleteDocument(w http.ResponseWriter, r *http.Request) {
 		writeRuntimeError(w, err, false)
 		return
 	}
+	s.record(r, "delete_document", namespace, pathParam(r, "name"), "success")
 	if s.docNotifier != nil {
 		s.docNotifier.DocumentsChanged(namespace, before, payloadDocuments(payload))
 	}
@@ -329,6 +331,7 @@ func (s *Server) handleReplaceDocument(w http.ResponseWriter, r *http.Request) {
 		writeRuntimeError(w, err, false)
 		return
 	}
+	s.record(r, "update_document", namespace, name, "success")
 	if s.docNotifier != nil {
 		s.docNotifier.DocumentsChanged(namespace, before, payloadDocuments(payload))
 	}
@@ -424,14 +427,17 @@ func (s *Server) handleDocumentContent(w http.ResponseWriter, r *http.Request) {
 	if !s.requireScopeReadDocument(w, r, name) {
 		return
 	}
-	writeNoStore := func() { w.Header().Set("Cache-Control", "no-store") }
+	prepareContent := func() {
+		s.record(r, "read_document", namespace, name, "success")
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	if strings.HasSuffix(strings.ToLower(name), ".pdf") {
 		content, err := s.runtime.ReadDocumentFile(r.Context(), namespace, name)
 		if err != nil {
 			writeDocumentReadError(w, err)
 			return
 		}
-		writeNoStore()
+		prepareContent()
 		w.Header().Set("Content-Type", "application/pdf")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusOK)
@@ -443,7 +449,7 @@ func (s *Server) handleDocumentContent(w http.ResponseWriter, r *http.Request) {
 		writeDocumentReadError(w, err)
 		return
 	}
-	writeNoStore()
+	prepareContent()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)

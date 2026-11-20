@@ -91,22 +91,27 @@ func (s *Store) DeleteMany(ctx context.Context, keyIDs []string, ownerUserID str
 // ApiKeyStore.namespaces_for_key: malformed secrets are rejected before the
 // digest lookup and repository errors become safe credential errors.
 func (s *Store) NamespacesForKey(ctx context.Context, secret string) ([]string, error) {
+	key, err := s.AuthenticateKey(ctx, secret)
+	return key.Namespaces, err
+}
+
+func (s *Store) AuthenticateKey(ctx context.Context, secret string) (state.APIKey, error) {
 	if !strings.HasPrefix(secret, "prk_") || len(secret) > 128 {
-		return nil, &Error{Message: "访问 API Key 格式错误，需要 prk 开头的服务 API Key"}
+		return state.APIKey{}, &Error{Message: "访问 API Key 格式错误，需要 prk 开头的服务 API Key"}
 	}
-	namespaces, err := s.repository.NamespacesForKey(ctx, secret)
+	key, err := s.repository.AuthenticateKey(ctx, secret)
 	if err != nil {
 		var lookup *state.LookupError
 		if asLookupError(err, &lookup) {
-			return nil, &Error{Message: lookup.Message}
+			return key, &Error{Message: lookup.Message}
 		}
 		var permission *state.PermissionError
 		if asPermissionError(err, &permission) {
-			return nil, &Error{Message: permission.Message}
+			return key, &Error{Message: permission.Message}
 		}
-		return nil, err
+		return key, err
 	}
-	return namespaces, nil
+	return key, nil
 }
 
 // SecretForNamespace returns the exportable secret for one namespace. Errors

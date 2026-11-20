@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"sort"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -33,6 +34,7 @@ import (
 const (
 	// scopeHeaderName is the internal header that carries one request's access
 	// scope from the HTTP adapter to the SDK handlers.
+	actorHeaderName = "X-Rag-Mcp-Audit-Actor"
 	scopeHeaderName = "X-Rag-Mcp-Scope"
 	// scopeHeaderNone marks an authenticated request that has no user scope (API
 	// key, service token, session-less loopback): legacy unrestricted behavior.
@@ -193,6 +195,10 @@ func requestScope(ctx context.Context, extra *sdk.RequestExtra) (access.ScopeSet
 
 // withRequestScope attaches the visibility resolved from one message to ctx.
 func withRequestScope(ctx context.Context, extra *sdk.RequestExtra) context.Context {
+	if extra != nil && extra.Header != nil {
+		actor, _ := base64.RawURLEncoding.DecodeString(extra.Header.Get(actorHeaderName))
+		ctx = audit.WithActor(ctx, string(actor))
+	}
 	scope, present := requestScope(ctx, extra)
 	return withResolvedScope(ctx, scope, present)
 }

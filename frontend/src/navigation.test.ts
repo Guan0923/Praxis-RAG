@@ -9,6 +9,12 @@ import {
 } from "./navigation";
 
 describe("canViewConsolePage", () => {
+  it("restricts the audit page to administrators and preserves its URL", () => {
+    expect(canViewConsolePage("audit-events", true, "admin")).toBe(true);
+    expect(canViewConsolePage("audit-events", true, "user")).toBe(false);
+    expect(routeHash(parseRoute("#/audit-events", "manuals"))).toBe("#/audit-events");
+  });
+
   it("shows the monitor page to administrators only", () => {
     expect(canViewConsolePage("monitor", true, "admin")).toBe(true);
     expect(canViewConsolePage("monitor", true, "vip")).toBe(false);

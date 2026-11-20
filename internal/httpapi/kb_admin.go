@@ -366,6 +366,7 @@ func (s *Server) handleCreateKnowledgeBase(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	s.record(r, "create_kb", body.Namespace, "", "success")
 	writeJSON(w, http.StatusCreated, payload)
 }
 
@@ -393,6 +394,7 @@ func (s *Server) handleKnowledgeBaseDetails(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	s.record(r, "read_kb", pathParam(r, "namespace"), "", "success")
 	writeJSON(w, http.StatusOK, public)
 }
 
@@ -560,6 +562,7 @@ func (s *Server) updateKnowledgeBase(w http.ResponseWriter, r *http.Request, asy
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
+		s.record(r, "reembed_kb", namespace, "", "accepted")
 		writeJSON(w, http.StatusAccepted, job)
 		return
 	}
@@ -569,6 +572,7 @@ func (s *Server) updateKnowledgeBase(w http.ResponseWriter, r *http.Request, asy
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	s.record(r, "update_kb", namespace, "", "success")
 	writeJSON(w, http.StatusOK, payload)
 }
 
@@ -658,6 +662,7 @@ func (s *Server) handlePurgeKnowledgeBase(w http.ResponseWriter, r *http.Request
 	}
 	result := results[0]
 	if len(result.FailedDocuments) > 0 {
+		s.record(r, "delete_kb", result.Namespace, "", "partial")
 		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"detail":           messageKnowledgeBasePurgePartial,
@@ -671,6 +676,7 @@ func (s *Server) handlePurgeKnowledgeBase(w http.ResponseWriter, r *http.Request
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	s.record(r, "delete_kb", result.Namespace, "", "success")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -707,6 +713,7 @@ func (s *Server) handleBatchDeleteKnowledgeBases(w http.ResponseWriter, r *http.
 		for _, result := range results {
 			switch {
 			case len(result.FailedDocuments) > 0:
+				s.record(r, "delete_kb", result.Namespace, "", "partial")
 				failed = append(failed, map[string]any{
 					"namespace":        result.Namespace,
 					"error":            messageKnowledgeBasePurgePartial,
@@ -715,6 +722,7 @@ func (s *Server) handleBatchDeleteKnowledgeBases(w http.ResponseWriter, r *http.
 			case result.DocumentsDeleted == 0 && !result.ConfigurationDeleted:
 				missing = append(missing, result.Namespace)
 			default:
+				s.record(r, "delete_kb", result.Namespace, "", "success")
 				deleted = append(deleted, result.Namespace)
 				documentsDeleted += result.DocumentsDeleted
 				if result.ConfigurationDeleted {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Guan0923/Praxis-RAG/internal/auth"
 	"github.com/Guan0923/Praxis-RAG/internal/config"
+	"github.com/Guan0923/Praxis-RAG/internal/state"
 )
 
 // namespacePattern is the tenant identifier format shared by every entry point.
@@ -35,6 +36,7 @@ func namespaceFromHeader(r *http.Request) (string, bool) {
 // API-key credential (kept from the authentication lookup so handlers such as
 // the namespace list can filter without resolving the secret twice).
 type tenantIdentity struct {
+	actor         string
 	namespace     string
 	session       *auth.SessionUser
 	keyNamespaces []string
@@ -86,7 +88,7 @@ func (s *Server) tenantFromRequestWith(w http.ResponseWriter, r *http.Request, n
 					writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
 					return tenantIdentity{}, false
 				}
-				return tenantIdentity{namespace: namespace, session: session}, true
+				return tenantIdentity{namespace: namespace, session: session, actor: sessionActor(session)}, true
 			}
 		}
 	}
@@ -100,7 +102,7 @@ func (s *Server) tenantFromRequestWith(w http.ResponseWriter, r *http.Request, n
 			writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
 			return tenantIdentity{}, false
 		}
-		return tenantIdentity{namespace: namespace}, true
+		return tenantIdentity{namespace: namespace, actor: "服务令牌"}, true
 	}
 
 	if strings.HasPrefix(authorization, "Bearer ") {
@@ -109,7 +111,22 @@ func (s *Server) tenantFromRequestWith(w http.ResponseWriter, r *http.Request, n
 			writeDetail(w, http.StatusUnauthorized, "RAG service authentication failed.")
 			return tenantIdentity{}, false
 		}
-		namespaces, err := s.keys.NamespacesForKey(r.Context(), secret)
+		var namespaces []string
+		var err error
+		actor := "API Key"
+		if lookup, ok := s.keys.(interface {
+			AuthenticateKey(context.Context, string) (state.APIKey, error)
+		}); ok {
+			var key state.APIKey
+			key, err = lookup.AuthenticateKey(r.Context(), secret)
+			namespaces = key.Namespaces
+			actor += " " + key.ID
+			if key.OwnerUserID != "" {
+				actor += "（所属账号 " + key.OwnerUserID + "）"
+			}
+		} else {
+			namespaces, err = s.keys.NamespacesForKey(r.Context(), secret)
+		}
 		if err != nil {
 			writeDetail(w, http.StatusUnauthorized, err.Error())
 			return tenantIdentity{}, false
@@ -127,7 +144,7 @@ func (s *Server) tenantFromRequestWith(w http.ResponseWriter, r *http.Request, n
 		}
 		for _, candidate := range namespaces {
 			if candidate == namespace {
-				return tenantIdentity{namespace: namespace, keyNamespaces: namespaces}, true
+				return tenantIdentity{namespace: namespace, keyNamespaces: namespaces, actor: actor}, true
 			}
 		}
 		writeDetail(w, http.StatusForbidden, "API Key 未获授权访问此 Namespace")
@@ -143,7 +160,7 @@ func (s *Server) tenantFromRequestWith(w http.ResponseWriter, r *http.Request, n
 			writeDetail(w, http.StatusBadRequest, "Invalid RAG namespace.")
 			return tenantIdentity{}, false
 		}
-		return tenantIdentity{namespace: namespace}, true
+		return tenantIdentity{namespace: namespace, actor: "本机直连"}, true
 	}
 
 	writeDetail(w, http.StatusUnauthorized, "RAG service authentication failed.")
@@ -154,25 +171,25 @@ func (s *Server) tenantFromRequestWith(w http.ResponseWriter, r *http.Request, n
 // always checked against its role (a normal user cannot borrow loopback trust);
 // requests without a session keep the local break-glass access used by dev
 // machine automation.
-func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) (*auth.SessionUser, bool) {
 	if s.authEnabled() {
 		if session, viaCookie := s.requestSessionUser(r); session != nil {
 			if !s.validateCSRF(r, session, viaCookie) {
 				writeDetail(w, http.StatusForbidden, "CSRF 校验失败，请刷新页面后重试")
-				return false
+				return nil, false
 			}
 			if !session.User.IsAdmin() {
 				writeDetail(w, http.StatusForbidden, "需要管理员权限")
-				return false
+				return nil, false
 			}
-			return true
+			return session, true
 		}
 	}
 	if localModelRequest(r) {
-		return true
+		return nil, true
 	}
 	writeDetail(w, http.StatusForbidden, "仅允许本机直接访问管理接口")
-	return false
+	return nil, false
 }
 
 func secureEqual(left, right string) bool {

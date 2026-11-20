@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"github.com/Guan0923/Praxis-RAG/internal/audit"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -212,6 +213,20 @@ func (e *Endpoint) toolHandler(namespace string, entry toolEntry) sdk.ToolHandle
 		payload, err := entry.execute(ctx, namespace, validated)
 		if err != nil {
 			return toolError(err.Error()), nil
+		}
+		switch input := validated.(type) {
+		case documentRequest:
+			outcome := "success"
+			if entry.name == addDocumentToolName {
+				outcome = "accepted"
+			}
+			audit.Record(ctx, e.opts.Audit, e.logger, "MCP", entry.name, namespace, audit.Target{Name: input.name, Outcome: outcome})
+		case documentStatusRequest:
+			audit.Record(ctx, e.opts.Audit, e.logger, "MCP", "read_job", namespace, audit.Target{Name: input.artifactID, Outcome: "success"})
+		default:
+			if entry.name == searchToolName {
+				audit.Record(ctx, e.opts.Audit, e.logger, "MCP", "search", namespace, audit.SearchTargets(payload)...)
+			}
 		}
 		return renderPayload(payload), nil
 	}
